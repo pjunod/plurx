@@ -1,17 +1,21 @@
 name: Rust dependency audit
 
 on:
+  schedule:
+    - cron: "23 9 * * 1"
   push:
     branches: [main]
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - ".github/workflows/rust-audit.yml"
+      - "scripts/vendor-audit-lock"
   pull_request:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - ".github/workflows/rust-audit.yml"
+      - "scripts/vendor-audit-lock"
 
 permissions:
   contents: read
@@ -27,10 +31,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore patched crates to registry provenance for advisory matching
+        run: scripts/vendor-audit-lock --output target/vendor-audit/Cargo.lock
       # v2.0.0, pinned so the security gate cannot move without review.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # cargo-audit intentionally skips path-sourced packages. Re-scan a
+      # synthesized lockfile so future advisories against either vendored
+      # upstream release remain visible.
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: target/vendor-audit
 
   fuzz:
     name: RustSec fuzz advisory scan

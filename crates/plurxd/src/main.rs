@@ -316,8 +316,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "plurxd starting"
     );
 
-    let state = AppState::new(
-        config.server.name.clone(),
+    let state = AppState::new_configured(
+        crate::state::AppConfig {
+            server_name: config.server.name.clone(),
+            node_id,
+            scan_prune_percent: config.storage.scan_prune_percent,
+        },
         store,
         crate::state::Dirs {
             artwork: artwork_dir,
@@ -325,7 +329,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
             cache: cache_dir,
             subs: subs_dir,
         },
-        node_id,
         encoder_caps,
         system,
         logs,

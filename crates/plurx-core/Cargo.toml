@@ -10,10 +10,13 @@ repository.workspace = true
 # Compiles `testfixtures` — the shared media-fixture builder the plurxd test
 # suite also uses. Dev-dependencies only; `cargo build` never turns it on.
 fixtures = []
+# M1b-M1d compile the replicated backend only for their dedicated harness.
+# M2 enables this on plurxd when the complete store becomes selectable.
+hiqlite-store = ["dep:hiqlite"]
 
 [dependencies]
 async-trait = { workspace = true }
-hiqlite = { workspace = true }
+hiqlite = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -53,7 +53,7 @@ impl ApiKeyStore for SqliteStore {
     async fn list_api_keys(&self) -> Result<Vec<ApiKey>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {KEY_COLS} FROM api_keys ORDER BY created_at"
+                "SELECT {KEY_COLS} FROM api_keys ORDER BY created_at, id"
             ))?;
             let rows = stmt.query_map([], key_from_row)?;
             let mut out = Vec::new();

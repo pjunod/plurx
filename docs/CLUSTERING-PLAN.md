@@ -1,11 +1,11 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 and M1a merged; M1b is green under review; M1c and
-M1d are implemented on stacked branches; import and daemon activation still
+**Status:** executing — M0, M1a, and M1b merged; M1c is green under review; M1d
+is implemented on the stacked branch; import and daemon activation still
 pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-07
+2026-08-08
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -373,7 +373,8 @@ SQL.
 
 **Acceptance:** the additive suite exercises every method against in-memory
 and file SQLite with no behavior change; `make check` remains the gate. The
-inventory is 116 methods after M1c added the two reconciliation contracts.
+inventory is 118 methods after M1c added reconciliation, root-reset, and
+derived-search recovery contracts.
 
 The executable M1a contract is `store_contract`: each scenario receives only
 `Arc<dyn Store>`, and its name inventory fails unless every `async fn` declared
@@ -389,7 +390,8 @@ Land schema/protocol election guards and quorum-aware `/readyz` here.
 
 **Acceptance:** writes through every node produce byte-identical table dumps
 on all replicas; kill leader and follower in separate runs; acknowledged
-writes survive; an older-schema voter refuses migration and cannot lead.
+writes survive; an older-schema process fails the remote preflight. M3 owns
+making that preflight an enforced gate on real membership and elections.
 
 **Backend slice delivered 2026-08-07; daemon activation remains open.**
 `HiqliteAuthStore` implements the 23 settings, user/token, and API-key methods
@@ -398,11 +400,16 @@ decoding. `make cluster-check` starts three separate voter processes, drives
 the lifecycle through every node, compares SHA-256 digests of ordered local
 table dumps, kills a follower and leader in fresh runs, and proves both
 acknowledged-write survival and no-quorum readiness failure. A remote
-schema/protocol preflight runs before a voter starts, so an incompatible
-process neither migrates nor participates in an election.
+schema/protocol preflight rejects an incompatible client before it starts a
+voter. The M1b harness does not dynamically add that process to membership;
+M3 must place this preflight in the join/start coordinator and prove a rejected
+node never appears in `voter_ids()`.
 
-This type intentionally cannot satisfy the complete `Store` trait yet, and
-`plurxd` therefore still drives `/readyz` through SQLite. The hiqlite
+This type intentionally cannot satisfy the complete `Store` trait yet. Its
+dependency is behind the `hiqlite-store` feature, enabled only by the cluster
+harness, so the ordinary daemon dependency closure remains unchanged until
+the full M1d/M2 activation. `plurxd` therefore still drives `/readyz` through
+SQLite. The hiqlite
 `SettingsStore::ping` is quorum-aware and is the route's eventual backend, but
 claiming the production route before the remaining store composition lands
 would create a hybrid source of truth. Full daemon activation stays with the
@@ -423,18 +430,23 @@ commits.
 **Backend slice delivered 2026-08-07; daemon activation remains open.**
 `HiqliteAuthStore` now also implements all library, media, and watch methods.
 Authoritative reads are quorum-consistent; search reads each voter's derived
-external-content FTS index. `reconcile_library` records root identity and puts
+contentless FTS index. A missing local index can no longer make an authoritative
+item delete fail. `reconcile_library` records root identity and puts
 the root comparison, prune budget, vanished-file delete, and empty-hierarchy
 prune in one transaction. The ordinary scanner now publishes through that
-boundary; a root mismatch or over-budget scan records an error and commits no
-delete.
+boundary with `storage.scan_prune_percent` (10% by default); a root mismatch or
+over-budget scan records an error and commits no delete. An empty first scan of
+an upgraded library cannot establish root trust. Editing paths clears the old
+identity, and the admin root-reset action covers a verified mount replacement.
 
 `make cluster-check` writes catalogue and watch state through every voter,
-compares ordered local table digests, and compares the three browse/search
-views. It then deletes voter 2's FTS rows directly, proves browse remains
-unchanged while local search empties, rebuilds from replicated `items`, and
-requires all three views to converge before the existing follower-loss and
-leader-loss cases continue. The remaining lease token is deliberately M4's
+compares ordered local table digests, and compares voter-local authoritative
+catalogue digests and search results. It then deletes voter 2's FTS
+rows directly, proves authoritative truth remains unchanged while the full
+derived-state digest and local search change, invokes the product rebuild
+contract, and requires all three views to converge before the existing
+follower-loss and leader-loss cases continue. The remaining lease token is
+deliberately M4's
 signature change: M1c owns root identity and the atomic publication boundary;
 M4 makes that same boundary reject an expired scanner.
 
@@ -571,8 +583,8 @@ mode without lowering quality or losing selected tracks.
 
 ## 8. Handoff checkpoint — M1d completes the backend, not daemon activation
 
-M0 and M1a are on `main`; M1b is green under review, M1c is stacked on its exact
-head, and M1d is stacked on M1c. Every trait now has one replicated
+M0, M1a, and M1b are on `main`; M1c is green under review, and M1d is stacked
+on M1c's current head. Every trait now has one replicated
 implementation, but keep SQLite as the daemon's selected store until the import
 gate is ready. The next implementation boundary is M2: resumable v14 import,
 content-hash comparison, failure-injected recovery, and the one-voter hiqlite

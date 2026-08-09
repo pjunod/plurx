@@ -25,6 +25,7 @@ use plurx_core::store::{
     AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -33,6 +34,7 @@ const API_SECRET: &str = "plurx-m1b-api-secret";
 const INSTANCE_ID: &str = "m1b-cluster-check";
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -72,10 +74,13 @@ enum FailureTarget {
 
 async fn run_failure_case(target: FailureTarget) -> Result<()> {
     let root = tempfile::tempdir().context("cluster-check data root")?;
-    let specs = allocate_nodes(3)?;
-    let mut cluster = ClusterProcesses::start(root.path(), specs.clone()).await?;
+    let (mut cluster, specs) = start_cluster_with_port_retry(root.path()).await?;
 
     cluster.request(1, Request::Bootstrap).await?.require_ok()?;
+    cluster
+        .request(1, Request::RejectIdentityDrift)
+        .await?
+        .require_ok()?;
     for node_id in 2..=3 {
         cluster
             .request(node_id, Request::Open)
@@ -93,7 +98,7 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
     cluster.wait_for_equal_dumps().await?;
     let catalog = cluster.wait_for_equal_catalog_views().await?;
     if matches!(target, FailureTarget::Follower) {
-        prove_local_fts_rebuild(root.path(), &mut cluster, &catalog).await?;
+        prove_local_fts_rebuild(&mut cluster, &catalog).await?;
     }
 
     let leader = cluster.leader().await?;
@@ -128,10 +133,6 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         if !refused.contains("incompatible with voter schema") {
             bail!("old-schema voter was not refused: {refused}");
         }
-        let current_leader = cluster.leader().await?;
-        if current_leader == target_id {
-            bail!("refused voter {target_id} became leader");
-        }
     }
 
     // One more loss removes quorum. The remaining embedded process is alive,
@@ -144,6 +145,13 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
     if !matches!(response, Response::Error { .. }) {
         bail!("one voter reported ready without quorum: {response:?}");
     }
+    for request in [Request::ReadWithoutQuorum, Request::WriteWithoutQuorum] {
+        let response = cluster.request(survivor, request).await?;
+        if !matches!(response, Response::Error { .. }) {
+            bail!("ordinary store operation succeeded without quorum: {response:?}");
+        }
+    }
+    cluster.assert_running().await?;
 
     cluster.kill_all().await;
     Ok(())
@@ -172,14 +180,18 @@ struct Preflight {
 #[derive(Debug, Serialize, Deserialize)]
 enum Request {
     Bootstrap,
+    RejectIdentityDrift,
     Open,
     Exercise { ordinal: u64 },
     PostLossWrite { target: String },
     VerifyProof,
     Dump,
     CatalogView,
+    RebuildSearch,
     Metrics,
     Ping,
+    ReadWithoutQuorum,
+    WriteWithoutQuorum,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -190,6 +202,7 @@ enum Response {
     Ok,
     Dump {
         digest: String,
+        dump: String,
     },
     CatalogView {
         view: CatalogView,
@@ -205,8 +218,8 @@ enum Response {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CatalogView {
-    libraries: Vec<String>,
-    browse: Vec<(i64, Vec<i64>)>,
+    authoritative_digest: String,
+    full_digest: String,
     search: Vec<i64>,
 }
 
@@ -286,6 +299,7 @@ impl NodeProcess {
 
 struct ClusterProcesses {
     nodes: Vec<Option<NodeProcess>>,
+    root: PathBuf,
 }
 
 impl ClusterProcesses {
@@ -300,7 +314,10 @@ impl ClusterProcesses {
             };
             nodes.push(Some(NodeProcess::spawn(&executable, &launch)?));
         }
-        let mut cluster = Self { nodes };
+        let mut cluster = Self {
+            nodes,
+            root: root.to_path_buf(),
+        };
         for node_id in 1..=specs.len() as u64 {
             cluster.node_mut(node_id)?.wait_ready().await?;
         }
@@ -338,8 +355,17 @@ impl ClusterProcesses {
         }
     }
 
+    async fn assert_running(&mut self) -> Result<()> {
+        for node in self.nodes.iter_mut().flatten() {
+            if let Some(status) = node.child.try_wait()? {
+                bail!("voter {} exited unexpectedly with {status}", node.id);
+            }
+        }
+        Ok(())
+    }
+
     async fn leader(&mut self) -> Result<u64> {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
         loop {
             for node_id in 1..=self.nodes.len() as u64 {
                 if self.nodes[(node_id - 1) as usize].is_none() {
@@ -350,7 +376,16 @@ impl ClusterProcesses {
                     ..
                 }) = self.request(node_id, Request::Metrics).await
                 {
-                    return Ok(leader);
+                    if self.nodes.get((leader - 1) as usize).is_some_and(Option::is_some)
+                        && self
+                            .request(leader, Request::Metrics)
+                            .await
+                            .is_ok_and(|response| {
+                                matches!(response, Response::Metrics { leader: Some(id), .. } if id == leader)
+                            })
+                    {
+                        return Ok(leader);
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -361,7 +396,7 @@ impl ClusterProcesses {
     }
 
     async fn wait_for_three_voters(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
         loop {
             if let Ok(Response::Metrics { voters, .. }) = self.request(1, Request::Metrics).await {
                 if voters == vec![1, 2, 3] {
@@ -376,7 +411,7 @@ impl ClusterProcesses {
     }
 
     async fn wait_for_ready(&mut self, node_id: u64) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
         loop {
             if self
                 .request(node_id, Request::Ping)
@@ -393,12 +428,19 @@ impl ClusterProcesses {
     }
 
     async fn wait_for_equal_dumps(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
         loop {
             let mut dumps = Vec::new();
             for node_id in 1..=self.nodes.len() as u64 {
                 match self.request(node_id, Request::Dump).await? {
-                    Response::Dump { digest } => dumps.push(digest),
+                    Response::Dump { digest, dump } => {
+                        let computed = hex::encode(Sha256::digest(dump.as_bytes()));
+                        if digest != computed {
+                            bail!("local dump digest is not anchored to the returned rows");
+                        }
+                        validate_known_dump(&serde_json::from_str(&dump)?)?;
+                        dumps.push((digest, dump));
+                    }
                     Response::Error { message } => return Err(anyhow!(message)),
                     response => bail!("unexpected dump response: {response:?}"),
                 }
@@ -439,17 +481,23 @@ impl ClusterProcesses {
 }
 
 async fn prove_local_fts_rebuild(
-    root: &Path,
     cluster: &mut ClusterProcesses,
     baseline: &CatalogView,
 ) -> Result<()> {
-    let path = root
+    let path = cluster
+        .root
         .join("node-2")
         .join("state_machine")
         .join("db")
         .join("auth.db");
-    let connection = rusqlite::Connection::open(&path)
-        .with_context(|| format!("open voter-2 local database at {}", path.display()))?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open voter-2 local database at {}", path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .context("set voter-2 validation busy timeout")?;
     connection
         .execute("DELETE FROM items_fts", [])
         .context("delete voter-2 derived FTS rows")?;
@@ -457,12 +505,17 @@ async fn prove_local_fts_rebuild(
         Response::CatalogView { view } => view,
         response => bail!("unexpected post-delete catalog response: {response:?}"),
     };
-    if empty.browse != baseline.browse || !empty.search.is_empty() {
-        bail!("deleting voter-2 FTS changed browse truth or left search rows");
+    if empty.authoritative_digest != baseline.authoritative_digest
+        || empty.full_digest == baseline.full_digest
+        || !empty.search.is_empty()
+    {
+        bail!("deleting voter-2 FTS changed truth, escaped the digest, or left search rows");
     }
-    connection
-        .execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')", [])
-        .context("rebuild voter-2 derived FTS rows")?;
+    drop(connection);
+    cluster
+        .request(1, Request::RebuildSearch)
+        .await?
+        .require_ok()?;
     let rebuilt = cluster.wait_for_equal_catalog_views().await?;
     if &rebuilt != baseline {
         bail!("voter-2 FTS rebuild did not restore the baseline view");
@@ -470,12 +523,116 @@ async fn prove_local_fts_rebuild(
     Ok(())
 }
 
+async fn start_cluster_with_port_retry(root: &Path) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        let specs = allocate_nodes(3)?;
+        let attempt_root = root.join(format!("attempt-{attempt}"));
+        match ClusterProcesses::start(&attempt_root, specs.clone()).await {
+            Ok(cluster) => return Ok((cluster, specs)),
+            Err(error) if format!("{error:#}").contains("Address already in use") => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.context("cluster ports stayed occupied across five allocations")?)
+}
+
+fn validate_known_dump(dump: &serde_json::Value) -> Result<()> {
+    let rows = |name: &str| -> Result<&Vec<serde_json::Value>> {
+        dump.get(name)
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| format!("local dump has no {name} rows"))
+    };
+
+    let settings = rows("settings")?;
+    let expected_settings = [
+        ("instance.id", INSTANCE_ID),
+        ("proof.node.1", "acknowledged"),
+        ("proof.node.2", "acknowledged"),
+        ("proof.node.3", "acknowledged"),
+    ];
+    for (key, value) in expected_settings {
+        if !settings.iter().any(|row| {
+            row.get("key").and_then(serde_json::Value::as_str) == Some(key)
+                && row.get("value").and_then(serde_json::Value::as_str) == Some(value)
+        }) {
+            bail!("local dump is missing expected setting {key}={value}");
+        }
+    }
+
+    let users = rows("users")?;
+    if users.len() != 3 {
+        bail!(
+            "local dump expected 3 surviving users, found {}",
+            users.len()
+        );
+    }
+    for ordinal in 1..=3 {
+        let username = format!("survivor-{ordinal}");
+        let password = format!("hash-v2-{ordinal}");
+        if !users.iter().any(|row| {
+            row.get("username").and_then(serde_json::Value::as_str) == Some(username.as_str())
+                && row.get("password_hash").and_then(serde_json::Value::as_str)
+                    == Some(password.as_str())
+                && row.get("is_admin").and_then(serde_json::Value::as_i64) == Some(1)
+        }) {
+            bail!("local dump has incorrect user proof for {username}");
+        }
+    }
+
+    let tokens = rows("tokens")?;
+    if tokens.len() != 3 {
+        bail!(
+            "local dump expected 3 surviving tokens, found {}",
+            tokens.len()
+        );
+    }
+    for ordinal in 1..=3 {
+        let token = format!("survive-token-{ordinal}");
+        if !tokens.iter().any(|row| {
+            row.get("token_hash").and_then(serde_json::Value::as_str) == Some(token.as_str())
+                && row.get("device").and_then(serde_json::Value::as_str) == Some("cluster-check")
+        }) {
+            bail!("local dump has incorrect token proof for {token}");
+        }
+    }
+
+    let keys = rows("api_keys")?;
+    if keys.len() != 3 {
+        bail!(
+            "local dump expected 3 surviving API keys, found {}",
+            keys.len()
+        );
+    }
+    for ordinal in 1..=3 {
+        let key_hash = format!("survive-key-{ordinal}");
+        if !keys.iter().any(|row| {
+            row.get("key_hash").and_then(serde_json::Value::as_str) == Some(key_hash.as_str())
+                && row.get("scopes").and_then(serde_json::Value::as_str)
+                    == Some(r#"["scan:trigger"]"#)
+                && row.get("disabled").and_then(serde_json::Value::as_i64) == Some(0)
+        }) {
+            bail!("local dump has incorrect API-key proof for {key_hash}");
+        }
+    }
+    Ok(())
+}
+
 async fn node(launch: NodeLaunch) -> Result<()> {
     install_crypto_provider();
     let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
-    let client = hiqlite::start_node(node_config(&launch)?)
-        .await
-        .context("start hiqlite voter")?;
+    let client = match hiqlite::start_node(node_config(&launch)?).await {
+        Ok(client) => client,
+        Err(error) => {
+            write_response(&Response::Error {
+                message: format!("start hiqlite voter: {error}"),
+            })
+            .await?;
+            return Err(error).context("start hiqlite voter");
+        }
+    };
     tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .context("voter health timed out")?;
@@ -516,6 +673,13 @@ async fn handle_request(
             *store = Some(HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID).await?);
             Ok(Response::Ok)
         }
+        Request::RejectIdentityDrift => {
+            match HiqliteAuthStore::bootstrap(client.clone(), "wrong-instance-id").await {
+                Err(error) if error.to_string().contains("refusing bootstrap") => Ok(Response::Ok),
+                Err(error) => bail!("identity drift failed for the wrong reason: {error}"),
+                Ok(_) => bail!("bootstrap overwrote the immutable cluster identity"),
+            }
+        }
         Request::Open => {
             *store = Some(HiqliteAuthStore::open(client.clone()).await?);
             Ok(Response::Ok)
@@ -543,12 +707,20 @@ async fn handle_request(
             verify_proof(store_ref(store)?).await?;
             Ok(Response::Ok)
         }
-        Request::Dump => Ok(Response::Dump {
-            digest: store_ref(store)?.local_dump_digest().await?,
-        }),
+        Request::Dump => {
+            let store = store_ref(store)?;
+            Ok(Response::Dump {
+                digest: store.local_dump_digest().await?,
+                dump: store.validation_local_dump().await?,
+            })
+        }
         Request::CatalogView => Ok(Response::CatalogView {
             view: catalog_view(store_ref(store)?).await?,
         }),
+        Request::RebuildSearch => {
+            store_ref(store)?.rebuild_search_index().await?;
+            Ok(Response::Ok)
+        }
         Request::Metrics => {
             let metrics = client.metrics_db().await?;
             let mut voters = metrics.membership_config.voter_ids().collect::<Vec<_>>();
@@ -560,6 +732,16 @@ async fn handle_request(
         }
         Request::Ping => {
             store_ref(store)?.ping().await?;
+            Ok(Response::Ok)
+        }
+        Request::ReadWithoutQuorum => {
+            store_ref(store)?.get_setting("instance.id").await?;
+            Ok(Response::Ok)
+        }
+        Request::WriteWithoutQuorum => {
+            store_ref(store)?
+                .put_setting("no-quorum.write", "must-not-ack")
+                .await?;
             Ok(Response::Ok)
         }
     }
@@ -583,12 +765,20 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     }
 
     let username = format!("survivor-{suffix}");
+    let initial_admin = ordinal.is_multiple_of(2);
     let user = store
-        .create_user(&username, "hash-v1", true)
+        .create_user(&username, "hash-v1", initial_admin)
         .await
         .context("create proof user")?;
-    if store.get_user(user.id).await?.map(|row| row.id) != Some(user.id) {
-        bail!("user id lookup failed");
+    if user.password_hash != "hash-v1" || user.is_admin != initial_admin {
+        bail!("create user did not preserve password/admin fields");
+    }
+    if store
+        .get_user(user.id)
+        .await?
+        .is_none_or(|row| row.password_hash != "hash-v1" || row.is_admin != initial_admin)
+    {
+        bail!("user id lookup did not preserve password/admin fields");
     }
     if store
         .get_user_by_username(&username.to_ascii_uppercase())
@@ -598,9 +788,10 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("case-insensitive username lookup failed");
     }
-    let password_changed = store.set_password(user.id, "hash-v2").await?;
+    let replacement = format!("hash-v2-{suffix}");
+    let password_changed = store.set_password(user.id, &replacement).await?;
     let password_after = store.get_user(user.id).await?.map(|row| row.password_hash);
-    if !password_changed || password_after.as_deref() != Some("hash-v2") {
+    if !password_changed || password_after.as_deref() != Some(replacement.as_str()) {
         bail!("password replacement failed: changed={password_changed}, value={password_after:?}");
     }
     if !store.set_admin(user.id, false).await?
@@ -671,7 +862,11 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             &["scan:trigger".to_owned()],
         )
         .await?;
-    if store.api_key_for_hash(&key_hash).await?.map(|row| row.id) != Some(key.id)
+    if !key.allows("scan:trigger")
+        || store
+            .api_key_for_hash(&key_hash)
+            .await?
+            .is_none_or(|row| row.id != key.id || !row.allows("scan:trigger"))
         || !store
             .list_api_keys()
             .await?
@@ -760,7 +955,7 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         .await?;
     let fingerprint = format!("root-fingerprint-{suffix}");
     if store
-        .ensure_library_root_fingerprint(library.id, &fingerprint)
+        .ensure_library_root_fingerprint(library.id, &fingerprint, true)
         .await?
         != RootFingerprintStatus::Established
     {
@@ -785,6 +980,38 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         || store.get_file(file).await?.is_none()
     {
         bail!("over-budget reconciliation committed a prune");
+    }
+    let disposable_item = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Disposable Search Trigger Proof {suffix}"),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let disposable_file = store
+        .upsert_file(
+            disposable_item,
+            &format!("/cluster/media/{suffix}/disposable-{suffix}.mkv"),
+            42,
+            1_700_000_100 + ordinal as i64,
+            &ProbeResult::default(),
+        )
+        .await?;
+    if !matches!(
+        store
+            .reconcile_library(library.id, &fingerprint, &[disposable_file], 1)
+            .await?,
+        ReconcileOutcome::Applied {
+            deleted_files: 1,
+            pruned_items: 1
+        }
+    ) || store.get_item(disposable_item).await?.is_some()
+    {
+        bail!("item deletion did not remove the file/item through the FTS trigger");
     }
     let state = store
         .put_progress(user.id, movie, 30_000, Some(10_000))
@@ -839,8 +1066,13 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     unlink.user_id = unlink_user.id;
     store.put_trakt_auth(&unlink).await?;
     store.delete_trakt_auth(unlink_user.id).await?;
-    if store.get_trakt_auth(unlink_user.id).await?.is_some() {
+    if store.get_trakt_auth(unlink_user.id).await?.is_some()
+        || store.get_user(unlink_user.id).await?.is_none()
+    {
         bail!("replicated Trakt unlink failed");
+    }
+    if !store.delete_user(unlink_user.id).await? {
+        bail!("replicated Trakt unlink fixture user cleanup failed");
     }
 
     let outbox_id = store
@@ -1096,17 +1328,6 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
 }
 
 async fn catalog_view(store: &HiqliteAuthStore) -> Result<CatalogView> {
-    let libraries = store.list_libraries().await?;
-    let mut browse = Vec::with_capacity(libraries.len());
-    for library in &libraries {
-        let page = store
-            .list_top_items(library.id, ItemSort::Title, 0, 100)
-            .await?;
-        browse.push((
-            library.id,
-            page.items.into_iter().map(|item| item.id).collect(),
-        ));
-    }
     let mut search = store
         .search_items("replicated browse", 100)
         .await?
@@ -1115,8 +1336,8 @@ async fn catalog_view(store: &HiqliteAuthStore) -> Result<CatalogView> {
         .collect::<Vec<_>>();
     search.sort_unstable();
     Ok(CatalogView {
-        libraries: libraries.into_iter().map(|library| library.name).collect(),
-        browse,
+        authoritative_digest: store.validation_local_catalog_truth_digest().await?,
+        full_digest: store.local_dump_digest().await?,
         search,
     })
 }

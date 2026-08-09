@@ -7020,7 +7020,11 @@ function updateStats(){
                :fed?' — throttled by a full client buffer':'';
       srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${rate.toFixed(2)}×${label}${note}</span></div>`;
     }
-    if(h.ahead_seconds!=null) srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?' · held':''}</div>`;
+    if(h.ahead_seconds!=null){
+      const release=h.suspended && h.resume_below_seconds!=null
+        ?` · time release ≤${h.resume_below_seconds} s`:'';
+      srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?` · held${release}`:''}</div>`;
+    }
     if(h.out_time_ms!=null && h.ahead_seconds==null){
       // A progressive stream has no published-media frontier to report; what
       // it can say is how much content ffmpeg has produced, which is the same

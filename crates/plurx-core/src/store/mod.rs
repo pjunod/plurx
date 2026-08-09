@@ -14,15 +14,20 @@
 
 mod sqlite;
 
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite;
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite_catalog;
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite_durable;
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
 
 pub mod replicated;
 
 use std::path::PathBuf;
 
+#[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
     ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
@@ -522,7 +527,13 @@ pub trait MediaStore: Send + Sync + 'static {
         &self,
         library_id: i64,
         fingerprint: &str,
+        allow_establish: bool,
     ) -> Result<RootFingerprintStatus, StoreError>;
+    /// Forget a library's recorded root identity after an operator has
+    /// verified a deliberate mount/path replacement.
+    async fn reset_library_root_fingerprint(&self, library_id: i64) -> Result<bool, StoreError>;
+    /// Recreate the derived full-text index from authoritative item rows.
+    async fn rebuild_search_index(&self) -> Result<u64, StoreError>;
     /// Atomically remove vanished files and their empty item hierarchy only
     /// when the scanner sees the expected roots and stays within its deletion
     /// budget. This is the M1c publication boundary; M4 adds its lease fence.
@@ -542,6 +553,7 @@ pub trait MediaStore: Send + Sync + 'static {
 pub enum RootFingerprintStatus {
     Established,
     Matched,
+    Unestablished,
     Mismatch { expected: String },
 }
 

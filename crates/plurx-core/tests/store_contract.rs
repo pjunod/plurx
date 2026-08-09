@@ -77,6 +77,8 @@ const MEDIA_METHODS: &[&str] = &[
     "files_missing_probe",
     "library_file_paths",
     "ensure_library_root_fingerprint",
+    "reset_library_root_fingerprint",
+    "rebuild_search_index",
     "reconcile_library",
     "delete_files",
     "prune_empty_items",
@@ -207,7 +209,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 116, "review the M1a method count");
+    assert_eq!(declared.len(), 118, "review the M1a method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -831,14 +833,14 @@ async fn media_contract_runs_through_dyn_store() {
 
         assert_eq!(
             store
-                .ensure_library_root_fingerprint(movies.id, "contract-root")
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
                 .await
                 .expect("establish root"),
             RootFingerprintStatus::Established
         );
         assert_eq!(
             store
-                .ensure_library_root_fingerprint(movies.id, "contract-root")
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
                 .await
                 .expect("match root"),
             RootFingerprintStatus::Matched
@@ -880,6 +882,25 @@ async fn media_contract_runs_through_dyn_store() {
                 pruned_items: 1..
             }
         ));
+        assert!(store
+            .reset_library_root_fingerprint(movies.id)
+            .await
+            .expect("reset root"));
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(movies.id, "contract-root", false)
+                .await
+                .expect("refuse empty root establishment"),
+            RootFingerprintStatus::Unestablished
+        );
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
+                .await
+                .expect("re-establish root"),
+            RootFingerprintStatus::Established
+        );
+        assert!(store.rebuild_search_index().await.expect("rebuild search") > 0);
         assert_eq!(store.delete_files(&[]).await.expect("empty delete"), 0);
         let _ = store
             .prune_empty_items(movies.id)

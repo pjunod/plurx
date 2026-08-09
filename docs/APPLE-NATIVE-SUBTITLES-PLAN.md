@@ -7,7 +7,7 @@ was deliberately stripping the RPU before AVPlayer saw it. ·
 **Landing route:** A (§4.1) · **Continues:**
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md) §8 ·
 **Reviewed:** branch `agent/native-apple-subtitles` tip `f35ada1` against
-production `787eaa6` · **Written:** 2026-08-02 · **Updated:** 2026-08-06
+production `787eaa6` · **Written:** 2026-08-02 · **Updated:** 2026-08-08
 
 Read the [handoff](APPLE-NATIVE-SUBTITLES-HANDOFF.md) first — it records what
 shipped, why each choice was made, and what the live server proved. This
@@ -358,11 +358,11 @@ track, which may, at source height.** A container default in another
 language is never a fallback. Explicit user selections may burn (that is
 the user asking); the policy governs what the player does on its own.
 
-### 3.4 Historical version snapshot; current Apple source is build 32
+### 3.4 Historical version snapshot; current Apple source is build 36
 
 At this plan's 2026-08-02 cut, the workspace was `0.2.0`, Apple was build 6,
 and Android versionCode was 3. Those numbers are historical evidence, not
-release instructions. Current source is workspace `0.2.7` and Apple build 32;
+release instructions. Current source is workspace `0.2.7` and Apple build 36;
 [clients/apple/README.md](../clients/apple/README.md) still records that build
 as not uploaded to TestFlight. Read [RELEASING.md](RELEASING.md) and
 [PUBLISHING.md](PUBLISHING.md) for the current release path.
@@ -378,7 +378,7 @@ never in a release, and an operator upgrading from `0.2.0` only ever sees the
 finished behavior.
 
 **The release itself remains Paul's call.** This historical plan does not
-choose a current version or tag. The next Apple upload is build 32 or higher;
+choose a current version or tag. The next Apple upload is build 36 or higher;
 App Store Connect requires every later upload to advance again.
 
 ## 4. Landing route — decided: Route A
@@ -468,7 +468,7 @@ format constraint (keeping the forced-at-source-height carve-out), the
 copy-origin cue shift, `-muxdelay 0 -muxpreload 0`, and the
 measured-first-PTS test class. Server fixes reach `origin/main` per §4 and
 deploy to the fleet via the ansible playbooks; at the time, the client fix was
-assigned to the next TestFlight build (≥ 6). Current source is build 32 and is
+assigned to the next TestFlight build (≥ 6). Current source is build 36 and is
 still recorded as not uploaded.
 
 **What actually landed.** P0-1: the `default` and `first` arms of automatic
@@ -653,9 +653,9 @@ same series of commits:
   shipped (Keychain token storage, search, iOS PiP).
 - [x] `OPERATIONS.md` + `CHEATSHEET.md` document the two §5.4 ladder
   variables, 2026-08-02.
-- [x] `docs/STATUS.html` refreshed 2026-08-06 with the M1–M3 landings and the
-  2026-08-03 copied-Dolby resolution.
-- [ ] Apple build 32 to TestFlight. Android native-subtitle parity shipped in a
+- [x] `docs/STATUS.html` refreshed 2026-08-08 with the M1–M3 landings, the
+  2026-08-03 copied-Dolby resolution, and the iOS system-chrome acceptance row.
+- [ ] Apple build 36 to TestFlight. Android native-subtitle parity shipped in a
   separate implementation; the remaining Android work is physical acceptance,
   not the source milestone this historical plan assigned.
 
@@ -663,7 +663,7 @@ same series of commits:
 updated in the same PR/commits as their behavior; CHANGELOG entry exists
 for every user-visible change this plan shipped.
 
-**Current status (2026-08-06):** the documentation clause is met and copied
+**Current status (2026-08-08):** the documentation clause is met and copied
 Dolby Vision has one physical Apple TV result. Build 32 is still not recorded
 as uploaded to TestFlight, the deployment ledger still ends at server
 `787eaa6`, and the broader hardware/offline matrix remains open. The parity

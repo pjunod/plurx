@@ -48,6 +48,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_BIND` | `server.bind` | `0.0.0.0:32400` | Address the HTTP API binds to |
 | `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
+| `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |
@@ -158,6 +159,25 @@ In Settings → Libraries, the Status column is the truth about each library:
 files while you can see the folder full of media. That means the path you typed
 isn't the path the server process has — under Docker, the container-side mount
 path must match. Fix the mount, not the library name.
+
+### Scan deletion and root-identity safety
+
+A complete scan refuses vanished-file cleanup when it would exceed
+`storage.scan_prune_percent`. The percentage is a hard ceiling rounded down;
+the scan still records new and changed files, but keeps every apparently
+missing row and reports the refusal in library status and logs.
+
+The first verified, non-empty scan records the library's canonical path-set
+identity. Changing a library's paths clears that identity automatically. For a
+deliberate storage replacement at the same configured path, an admin can call
+`POST /api/v1/libraries/{id}/root-identity/reset`; the next verified non-empty
+scan establishes the replacement. Never reset it merely to silence an empty
+scan—verify the mount first.
+
+Search is derived state. If one or more voters report missing search results,
+an admin can call `POST /api/v1/system/search-index/rebuild`. The server rebuilds
+the index from authoritative item rows across the cluster; library and watch
+truth are unchanged.
 
 ## Reading the Server card (Settings)
 
