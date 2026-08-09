@@ -623,7 +623,8 @@ fn time_release_threshold(limit: i64) -> Option<i64> {
 
 fn ahead_hold(
     ahead: Ahead,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
 ) -> Option<AheadHold> {
@@ -645,7 +646,17 @@ fn ahead_hold(
     // Capacity holds take precedence in telemetry because they cannot be
     // cleared merely by crossing the media-time release point.
     let global_limit = byte_limit(limits.global_max_bytes);
-    if over(global_bytes, global_limit) {
+    // Enter on total scratch so the configured cap remains a real disk
+    // bound. Release on the drainable reserve: retained bytes behind every
+    // client's frontier cannot be pruned inside RETENTION_SECS, so using
+    // total scratch for the half-cap release line can make that line
+    // structurally unreachable even after every client has caught up.
+    let global_value = if currently_suspended {
+        global_ahead_bytes
+    } else {
+        global_live_bytes
+    };
+    if over(global_value, global_limit) {
         return Some(AheadHold {
             reason: AheadHoldReason::Global,
             release_value: global_limit,
@@ -667,11 +678,19 @@ fn ahead_hold(
 #[cfg(test)]
 fn should_suspend(
     ahead: Ahead,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
 ) -> bool {
-    ahead_hold(ahead, global_bytes, limits, currently_suspended).is_some()
+    ahead_hold(
+        ahead,
+        global_live_bytes,
+        global_ahead_bytes,
+        limits,
+        currently_suspended,
+    )
+    .is_some()
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -1300,12 +1319,15 @@ async fn session_info(
     id: &str,
     s: &Session,
     limits: AheadLimits,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
 ) -> SessionInfo {
     let ahead = s.ahead().await;
     let suspended = s.suspended.load(Relaxed);
     let hold = if suspended {
-        ahead.and_then(|ahead| ahead_hold(ahead, global_bytes, limits, true))
+        ahead.and_then(|ahead| {
+            ahead_hold(ahead, global_live_bytes, global_ahead_bytes, limits, true)
+        })
     } else {
         None
     };
@@ -4349,11 +4371,14 @@ impl TranscodeManager {
     /// is created and never moves.
     pub async fn list_deliveries(&self) -> Vec<(SessionInfo, crate::delivery::Method)> {
         let limits = self.ahead_limits().await;
-        let global_bytes = self.global_live_bytes().await;
+        let (global_live_bytes, global_ahead_bytes) = self.global_flow_bytes().await;
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push((session_info(id, s, limits, global_bytes).await, s.method));
+            out.push((
+                session_info(id, s, limits, global_live_bytes, global_ahead_bytes).await,
+                s.method,
+            ));
         }
         out.sort_by_key(|(s, _)| s.started_unix);
         out
@@ -4366,8 +4391,17 @@ impl TranscodeManager {
     pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
         let limits = self.ahead_limits().await;
-        let global_bytes = self.global_live_bytes().await;
-        Some(session_info(session_id, &session, limits, global_bytes).await)
+        let (global_live_bytes, global_ahead_bytes) = self.global_flow_bytes().await;
+        Some(
+            session_info(
+                session_id,
+                &session,
+                limits,
+                global_live_bytes,
+                global_ahead_bytes,
+            )
+            .await,
+        )
     }
 
     /// End one session now. True if it existed.
@@ -4587,13 +4621,20 @@ impl TranscodeManager {
         session: &Session,
         session_id: &str,
         limits: AheadLimits,
-        global_bytes: i64,
+        global_live_bytes: i64,
+        global_ahead_bytes: i64,
     ) {
         let Some(ahead) = session.ahead().await else {
             return; // nothing published yet — nothing to hold
         };
         let suspended = session.suspended.load(Relaxed);
-        let hold = ahead_hold(ahead, global_bytes, limits, suspended);
+        let hold = ahead_hold(
+            ahead,
+            global_live_bytes,
+            global_ahead_bytes,
+            limits,
+            suspended,
+        );
         let want_suspend = hold.is_some();
         if want_suspend == suspended {
             return;
@@ -4630,7 +4671,8 @@ impl TranscodeManager {
                 hold_reason = ?hold.map(|hold| hold.reason),
                 release_value = hold.map(|hold| hold.release_value),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
-                global_bytes, max_secs = limits.max_secs, max_bytes = limits.max_bytes,
+                global_live_bytes, global_ahead_bytes,
+                max_secs = limits.max_secs, max_bytes = limits.max_bytes,
                 "suspending transcode: far enough ahead of the client"
             );
         } else {
@@ -4675,23 +4717,26 @@ impl TranscodeManager {
         *self.cached_limits.write().expect("limits lock") = None;
     }
 
-    /// Scratch in use across every live session, from each one's cached
-    /// figure — summing this must not cost a directory walk per session, or
-    /// the flow controller could not run on every segment fetch.
+    /// Both byte views across every live session, from their cached figures —
+    /// summing these must not cost a directory walk per session, or the flow
+    /// controller could not run on every segment fetch.
     ///
-    /// TOTAL bytes, not bytes-ahead. The cap this feeds is the documented
-    /// disk ceiling ([`keys::HLS_SCRATCH_MAX_BYTES`]), and a session's disk
-    /// is its whole retention window, not just its reserve: summing the
-    /// ahead figure let several healthy sessions exceed the "cap" by
-    /// [`RETENTION_SECS`] of media each (review §2.7). Pacing keeps using
-    /// each session's own ahead figure — that one is really about reserve.
-    async fn global_live_bytes(&self) -> i64 {
+    /// TOTAL bytes enforce the documented disk ceiling
+    /// ([`keys::HLS_SCRATCH_MAX_BYTES`]); drainable AHEAD bytes decide when a
+    /// global hold may release. The distinction is load-bearing: each
+    /// session's retained history is real scratch but cannot fall until its
+    /// client frontier moves beyond [`RETENTION_SECS`].
+    async fn global_flow_bytes(&self) -> (i64, i64) {
         self.sessions
             .lock()
             .await
             .values()
-            .map(|s| s.live_bytes.load(Relaxed))
-            .sum()
+            .fold((0, 0), |(live, ahead), session| {
+                (
+                    live + session.live_bytes.load(Relaxed),
+                    ahead + session.ahead_bytes.load(Relaxed),
+                )
+            })
     }
 
     /// Re-evaluate one session after a client request refreshes the published
@@ -4704,8 +4749,8 @@ impl TranscodeManager {
     async fn flow_control(&self, session: &Session, session_id: &str) {
         session.refresh_segments().await;
         let limits = self.ahead_limits().await;
-        let global = self.global_live_bytes().await;
-        self.apply_ahead_window(session, session_id, limits, global)
+        let (global_live, global_ahead) = self.global_flow_bytes().await;
+        self.apply_ahead_window(session, session_id, limits, global_live, global_ahead)
             .await;
     }
 
@@ -4761,9 +4806,10 @@ impl TranscodeManager {
                 session.refresh_segments().await;
                 gc_expired_segments(session).await;
             }
-            let global = self.global_live_bytes().await;
+            let (global_live, global_ahead) = self.global_flow_bytes().await;
             for (id, session) in &live {
-                self.apply_ahead_window(session, id, limits, global).await;
+                self.apply_ahead_window(session, id, limits, global_live, global_ahead)
+                    .await;
             }
         }
     }
@@ -5633,31 +5679,34 @@ mod tests {
         assert_eq!(time_release_threshold(1), Some(1));
         assert_eq!(time_release_threshold(0), None);
         // Running: hold once past any single window.
-        assert!(!should_suspend(secs(179), 0, limits, false));
-        assert!(should_suspend(secs(181), 0, limits, false));
-        assert!(should_suspend(bytes(2_001), 0, limits, false));
+        assert!(!should_suspend(secs(179), 0, 0, limits, false));
+        assert!(should_suspend(secs(181), 0, 0, limits, false));
+        assert!(should_suspend(bytes(2_001), 0, 0, limits, false));
         // The global budget holds a session that is individually well behaved
         // — several healthy 4K streams fill a disk between them.
-        assert!(should_suspend(secs(10), 8_001, limits, false));
+        assert!(should_suspend(secs(10), 8_001, 0, limits, false));
 
         // Held: time keeps its 30-second release gap so a fast encoder does
         // not toggle once per client segment near the ceiling.
-        assert!(should_suspend(secs(151), 0, limits, true));
-        assert!(!should_suspend(secs(150), 0, limits, true));
-        assert!(!should_suspend(secs(138), 0, limits, true));
+        assert!(should_suspend(secs(151), 0, 0, limits, true));
+        assert!(!should_suspend(secs(150), 0, 0, limits, true));
+        assert!(!should_suspend(secs(138), 0, 0, limits, true));
         assert!(
-            should_suspend(secs(186), 0, limits, true),
+            should_suspend(secs(186), 0, 0, limits, true),
             "without a client fetch, the producer can remain held"
         );
-        // Byte budgets remain hard disk bounds and release only at half.
-        assert!(should_suspend(secs(10), 4_001, limits, true));
-        assert!(!should_suspend(secs(10), 4_000, limits, true));
+        // The global byte cap enters on total scratch but releases on the
+        // drainable reserve across all sessions. Retention behind the client
+        // is intentionally absent from this half-cap comparison.
+        assert!(should_suspend(secs(10), 8_001, 4_001, limits, true));
+        assert!(!should_suspend(secs(10), 8_001, 4_000, limits, true));
         // Time is fine but bytes are not: still held.
         assert!(should_suspend(
             Ahead {
                 seconds: 10,
                 bytes: 1_001
             },
+            0,
             0,
             limits,
             true
@@ -5669,29 +5718,70 @@ mod tests {
             max_bytes: 0,
             global_max_bytes: 0,
         };
-        assert!(!should_suspend(secs(10_000), 1 << 40, off, false));
-        assert!(!should_suspend(secs(10_000), 1 << 40, off, true));
+        assert!(!should_suspend(secs(10_000), 1 << 40, 1 << 40, off, false));
+        assert!(!should_suspend(secs(10_000), 1 << 40, 1 << 40, off, true));
 
         assert_eq!(
-            ahead_hold(secs(151), 0, limits, true),
+            ahead_hold(secs(151), 0, 0, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Time,
                 release_value: 150,
             })
         );
         assert_eq!(
-            ahead_hold(bytes(1_001), 0, limits, true),
+            ahead_hold(bytes(1_001), 0, 0, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Bytes,
                 release_value: 1_000,
             })
         );
         assert_eq!(
-            ahead_hold(secs(10), 4_001, limits, true),
+            ahead_hold(secs(10), 8_001, 4_001, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Global,
                 release_value: 4_000,
             })
+        );
+    }
+
+    /// Four retention floors can sit above the old half-cap release line even
+    /// after every client has fetched through the published frontier. Those
+    /// bytes are real disk usage, so they still trigger the cap while running;
+    /// they are not drainable reserve, so they cannot keep a held producer
+    /// stopped forever.
+    #[test]
+    fn retained_floors_cannot_make_global_release_unreachable() {
+        let indexes: Vec<SegmentIndex> = (0..4)
+            .map(|session| SegmentIndex {
+                segs: (0..3)
+                    .map(|segment| SegmentMeta {
+                        index: segment,
+                        name: format!("s{session}-seg{segment}.m4s"),
+                        start_ms: segment * 4_000,
+                        end_ms: (segment + 1) * 4_000,
+                        bytes: 500,
+                        pruned: false,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let global_live: i64 = indexes.iter().map(SegmentIndex::total_bytes).sum();
+        let global_ahead: i64 = indexes
+            .iter()
+            .map(|index| ahead_of(index, 12_000).expect("published").bytes)
+            .sum();
+        assert_eq!(global_live, 6_000, "retention floors remain on disk");
+        assert_eq!(global_ahead, 0, "every client drained its reserve");
+
+        let limits = AheadLimits {
+            max_secs: 180,
+            max_bytes: 2_000,
+            global_max_bytes: 8_000,
+        };
+        assert_eq!(
+            ahead_hold(Ahead::default(), global_live, global_ahead, limits, true),
+            None,
+            "retained floors above the 4,000-byte release line are not a permanent hold"
         );
     }
 
@@ -5866,6 +5956,7 @@ mod tests {
                 max_bytes: 2_000_000_000,
                 global_max_bytes: 8_000_000_000,
             },
+            0,
             0,
         )
         .await;
@@ -6209,6 +6300,7 @@ mod tests {
                 max_bytes: 1,
                 global_max_bytes: 0,
             },
+            0,
             0,
         )
         .await;
