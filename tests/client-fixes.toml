@@ -44,3 +44,11 @@ source = "clients/apple/Sources/PlayerSurface.swift"
 source_anchor = "shouldAllowPictureInPicture"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPGSOverlayDisablesManualAndAutomaticPictureInPicture"
+
+[[fixes]]
+id = "clients.media-origin-and-seek-routing"
+commits = ["f43988d8"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "val timeline = sessionPlaybackTimeline"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/MediaOriginTest.kt"
+test_anchor = "hlsSessionOriginDrivesTheControllerTimeline"
