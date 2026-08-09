@@ -19,16 +19,18 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `23` — native viewer parity across phone, foldable,
+> Status: **v0.2.7**, build `24` — native viewer parity across phone, foldable,
 > and TV. Build 17 added app-managed offline viewing on phones and tablets;
 > build 18 carried the playback-compatibility fallback, build 19 made a
 > restored completed transfer release its server-side package and quota, and
 > build 20 retries temporary PGS extraction capacity instead of abandoning the
 > subtitle selection, build 21 coalesces hidden-control seeks, restores
 > position feedback, and pins media-origin consumption, build 22 restores
-> on-device Compose instrumentation on Android 17 with Espresso 3.7.0, and
-> build 23 reports authenticated TTFF, six-second buffering stalls, and
-> playback errors without changing recovery policy. The
+> on-device Compose instrumentation on Android 17 with Espresso 3.7.0, build
+> 23 reapplies the saved download-network policy before restoring an
+> interrupted transfer after process death, and build 24 reports authenticated
+> TTFF, six-second buffering stalls, and playback errors without changing
+> recovery policy. The
 > default-off `pgs-v1` application overlay remains available: Android
 > fetches authenticated, server-decoded PNG compositions, schedules them on the
 > source timeline, and draws them above the unchanged Dolby Vision, HDR, or SDR

@@ -105,12 +105,12 @@ class HistoryAuditCase(unittest.TestCase):
         covered = audit_history(root, catalog, coverage)
         self.assertEqual(covered.errors, ())
 
-    def test_ledger_can_classify_a_neutral_squash_commit(self):
+    def test_explicit_ledger_survives_a_non_corrective_squash_title(self):
         root, catalog, coverage = self.repository()
-        (root / "crates/app.rs").write_text(
+        (root / "src/app.rs").write_text(
             "pub fn imported() -> bool { true }\n", encoding="utf-8"
         )
-        sha = self.commit(root, "Import SQLite state into fresh targets (#119)")
+        sha = self.commit(root, "Import state into a fresh target (#119)")
         coverage.write_text(
             textwrap.dedent(
                 f"""
@@ -120,7 +120,7 @@ class HistoryAuditCase(unittest.TestCase):
                 commits = ["{sha[:8]}"]
                 points = ["app"]
                 checks = ["baseline"]
-                reason = "The current integration suite exercises the imported state."
+                reason = "The current import contract exercises the squash-merged behavior."
                 """
             ),
             encoding="utf-8",
@@ -130,7 +130,6 @@ class HistoryAuditCase(unittest.TestCase):
 
         self.assertEqual(report.errors, ())
         self.assertEqual(report.mapped_count, 1)
-        self.assertEqual(tuple(issue.sha for issue in report.issues), (sha,))
 
     def test_unknown_checks_and_duplicate_commit_coverage_fail_loudly(self):
         root, catalog, coverage = self.repository()

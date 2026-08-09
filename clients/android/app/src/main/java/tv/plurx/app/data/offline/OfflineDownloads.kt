@@ -154,6 +154,11 @@ object OfflineDownloads {
     }
 
     fun resumePending(template: OfflineQueueRequest) {
+        // DownloadManager is process-local and starts with the conservative
+        // Wi-Fi-only requirement below. Reapply the persisted viewer policy
+        // before restoring rows, otherwise an "Any network" transfer that was
+        // active before process death comes back queued and never resumes.
+        setNetworkPolicy(template.network)
         val profile = catalog.profile(template.serverInstanceId, template.userId)
         profile.forEach { record ->
             // Media3 owns transfer progress across process death, but the API
@@ -180,12 +185,7 @@ object OfflineDownloads {
     }
 
     fun setNetworkPolicy(policy: OfflineNetwork) {
-        val network = if (policy == OfflineNetwork.WifiOnly) {
-            Requirements.NETWORK_UNMETERED
-        } else {
-            Requirements.NETWORK
-        }
-        manager.requirements = Requirements(network or Requirements.DEVICE_STORAGE_NOT_LOW)
+        manager.requirements = offlineRequirements(policy)
     }
 
     fun remove(record: OfflineRecord, api: PlurxApi? = null) {
@@ -452,6 +452,15 @@ object OfflineDownloads {
         .joinToString("") { "%02x".format(it) }
 
     const val SYSTEM_TIMEOUT_REASON = 10_001
+}
+
+internal fun offlineRequirements(policy: OfflineNetwork): Requirements {
+    val network = if (policy == OfflineNetwork.WifiOnly) {
+        Requirements.NETWORK_UNMETERED
+    } else {
+        Requirements.NETWORK
+    }
+    return Requirements(network or Requirements.DEVICE_STORAGE_NOT_LOW)
 }
 
 internal val OfflineRecord.needsServerCompletion: Boolean

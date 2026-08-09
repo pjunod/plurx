@@ -262,12 +262,13 @@ def audit_history(
     coverage_path: Path = DEFAULT_COVERAGE,
     client_fixes_path: Path | None = None,
 ) -> HistoryReport:
-    catalog = catalog or load_catalog()
     entries = load_coverage(coverage_path)
-    explicit_prefixes = tuple(
-        prefix for entry in entries for prefix in entry.commits
+    catalog = catalog or load_catalog()
+    issues = discover_issues(
+        root,
+        catalog,
+        tuple(prefix for entry in entries for prefix in entry.commits),
     )
-    issues = discover_issues(root, catalog, explicit_prefixes)
     client_fixes = load_client_fixes(
         client_fixes_path or root / "tests" / "client-fixes.toml"
     )

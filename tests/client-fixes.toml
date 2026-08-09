@@ -76,3 +76,11 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "mutating func rebasePosition(at positionMs: Int)"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock"
+
+[[fixes]]
+id = "android.offline-network-policy-restore"
+commits = ["335b22a4"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineDownloads.kt"
+source_anchor = "setNetworkPolicy(template.network)"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
+test_anchor = "restoredNetworkPolicyKeepsTheSavedTransportRequirement"

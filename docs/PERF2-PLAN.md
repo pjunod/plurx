@@ -216,7 +216,7 @@ Numbered because milestones cite them.
 
 **Implementation status (2026-08-09):** server storage, ingest, lifecycle
 events, metrics, readers, census fields, the web parity slice, Apple build 46
-TTFF parity, and Android build 23 native telemetry parity are landed in
+TTFF parity, and Android build 24 native telemetry parity are landed in
 source. Named-machine acceptance runs must not be inferred from source or
 automated gates.
 
