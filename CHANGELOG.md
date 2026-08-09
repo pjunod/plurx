@@ -20,7 +20,9 @@ bump may break compatibility and a **patch** bump never does.
   default, `0` fully disables row writes and pruning). Hiqlite voters use
   independent sidecars, never Raft, with restart and non-replication coverage.
   `scripts/perf-report` prefers the durable reader and falls back to the log
-  ring on older servers.
+  ring on older servers. Apple build 44 emits one authenticated TTFF beacon at
+  the first advancing online frame, including the live HLS session id for the
+  ingest join; offline packages remain silent.
 
 ## [0.2.7] — 2026-08-09
 

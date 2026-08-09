@@ -41,6 +41,90 @@ private struct ApplePlaybackFailureLog: Encodable {
     }
 }
 
+/// One cold-start time-to-first-frame measurement. The live HLS session id is
+/// carried as a typed field so the server can join this client-observed wait to
+/// the producer and pacing state that existed when the first frame arrived.
+struct ApplePlaybackTTFFLog: Encodable {
+    let level = "info"
+    let event = "ttff"
+    let message: String
+    let method: String
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let ms: Int
+    let height: Int?
+    let encoder: String?
+    let sessionId: String?
+    let attempt: String
+    let reason = "cold-start"
+    let ua = "Apple AVPlayer"
+
+    init(
+        ms: Int,
+        method: String,
+        title: String,
+        fileId: Int,
+        vcodec: String?,
+        height: Int?,
+        encoder: String?,
+        sessionId: String?,
+        attempt: String
+    ) {
+        self.message = "first frame after \(max(0, ms)) ms"
+        self.method = method
+        self.title = title
+        self.fileId = fileId
+        self.vcodec = vcodec
+        self.ms = max(0, ms)
+        self.height = height
+        self.encoder = encoder
+        self.sessionId = sessionId
+        self.attempt = attempt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, title, vcodec, ms, height, encoder
+        case attempt, reason, ua
+        case fileId = "file_id"
+        case sessionId = "session_id"
+    }
+}
+
+/// Monotonic, one-shot first-progress gate. AVPlayer readiness is not a frame,
+/// and a playing intent can still be waiting for data, so the measurement ends
+/// only when the film clock advances while AVPlayer reports actual playback.
+struct ApplePlaybackTTFFState: Equatable {
+    private var openedAt: TimeInterval?
+    private var openedPositionMs = 0
+
+    mutating func opened(
+        at positionMs: Int,
+        observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        openedPositionMs = max(0, positionMs)
+        openedAt = observedAt
+    }
+
+    mutating func observe(
+        positionMs: Int,
+        playing: Bool,
+        observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Int? {
+        guard let openedAt,
+              playing,
+              positionMs >= openedPositionMs + 250
+        else { return nil }
+        self.openedAt = nil
+        return max(0, Int(((observedAt - openedAt) * 1_000).rounded()))
+    }
+
+    mutating func reset() {
+        openedAt = nil
+        openedPositionMs = 0
+    }
+}
+
 /// One sustained AVPlayer clock stall forwarded before the controller either
 /// reconnects the same delivery or stops after an immediate repeat. The
 /// server's existing `stall` vocabulary renders `ms` as `stall_ms`; position
@@ -645,6 +729,7 @@ final class PlayerController: ObservableObject {
     /// silently replacing a picture the viewer has already watched with SDR.
     private var attachmentRecovery = PlayerAttachmentRecoveryState()
     private var establishedHDRRetryAttempted = false
+    private var ttffMeasurement = ApplePlaybackTTFFState()
     private var stallObservation = PlaybackStallObservationState()
     /// A completed/VOD item with no usable catalog or AVPlayer duration gets
     /// one reopen. A second end at the same position finishes instead of
@@ -794,6 +879,7 @@ final class PlayerController: ObservableObject {
         canRetryCurrentItemWithTranscode = false
         compatibilityFallbackAttempted = false
         forceCompatibilityTranscode = false
+        ttffMeasurement.opened(at: currentMs)
         attachmentRecovery.opened(at: startMs)
         establishedHDRRetryAttempted = false
         stallObservation.reset()
@@ -1146,6 +1232,7 @@ final class PlayerController: ObservableObject {
         clearPGSOverlaySelection()
         pgsOverlayItemGeneration &+= 1
         playbackRecoveryMonitor.reset()
+        ttffMeasurement.reset()
         seekState.clear()
         let position = realPositionMs()
         player.pause()
@@ -1940,10 +2027,17 @@ final class PlayerController: ObservableObject {
                 // The last rate the viewer was genuinely playing at, so a
                 // pause at 1.5× is restored as 1.5× and not as the 0 the
                 // transport reports while paused (P2-5).
-                if self.player.timeControlStatus == .playing && self.player.rate > 0 {
+                let observedPosition = self.realPositionMs()
+                let isActuallyPlaying = self.player.timeControlStatus == .playing
+                    && self.player.rate > 0
+                self.reportPlaybackTTFFIfNeeded(
+                    at: observedPosition,
+                    playing: isActuallyPlaying
+                )
+                if isActuallyPlaying {
                     self.preferredRate = self.player.rate
                     self.attachmentRecovery.observe(
-                        positionMs: self.realPositionMs(),
+                        positionMs: observedPosition,
                         playing: true
                     )
                     if self.attachmentRecovery.establishedPlayback {
@@ -2076,6 +2170,30 @@ final class PlayerController: ObservableObject {
             )
         )
         postClientLog(payload)
+    }
+
+    private func reportPlaybackTTFFIfNeeded(at positionMs: Int, playing: Bool) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        guard let ms = ttffMeasurement.observe(positionMs: positionMs, playing: playing) else {
+            return
+        }
+        let method = clientLogMethod
+        let height = sessionStatus?.targetHeight
+            ?? selectedHeight
+            ?? (method == "transcode" ? nil : decision?.source?.height)
+        postClientLog(ApplePlaybackTTFFLog(
+            ms: ms,
+            method: method,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            height: height,
+            encoder: encoder,
+            sessionId: sessionId,
+            attempt: playbackId
+        ))
     }
 
     private func reportPlaybackStall(
