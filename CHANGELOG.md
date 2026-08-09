@@ -8,6 +8,8 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-08-09
+
 ### Added
 
 - **Apple artwork now survives app relaunches.** iOS and tvOS keep original
@@ -461,6 +463,12 @@ bump may break compatibility and a **patch** bump never does.
   cache and serves the file.
 
 ### Fixed
+
+- **The server refuses an explicit subtitle burn that would discard HDR.**
+  Clients now receive a specific 422 response when they ask to burn subtitles
+  into probed Dolby Vision, HDR10, or HLG video. Playback accounting and the
+  encoder are left untouched, SDR burns continue to work, and there is no
+  override that can silently trade HDR for subtitles.
 
 - **Skip Intro and Skip Credits stay compact at every Apple player width.**
   The marker action previously accepted the full playback-control width on
@@ -1194,6 +1202,9 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [0.2.0] — 2026-07-30
 
+Historical development milestone; no `v0.2.0` tag was cut. Published releases
+begin with 0.2.7.
+
 ### Added
 
 - **Big remuxes stream in segments.** A remux at or above 40 Mb/s — or one
@@ -1611,7 +1622,8 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [0.1.0] — 2026-07-22
 
-First numbered release. Everything before this point was developed under the
+First numbered development milestone; no `v0.1.0` tag was cut. Everything
+before this point was developed under the
 placeholder version `0.0.1`, which never moved and never corresponded to a tag;
 the entries below describe what that work amounts to rather than reconstructing
 a hundred commits of history.
@@ -1643,6 +1655,5 @@ a hundred commits of history.
   binary is stamped with the git commit it was built from, and `/api/v1/server`
   reports both. See [docs/RELEASING.md](docs/RELEASING.md).
 
-[Unreleased]: https://github.com/pjunod/plurx/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/pjunod/plurx/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/pjunod/plurx/releases/tag/v0.1.0
+[Unreleased]: https://github.com/pjunod/plurx/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/pjunod/plurx/releases/tag/v0.2.7

@@ -10,10 +10,10 @@
 #   docker compose up -d --build
 #
 # Compose merges docker-compose.override.yml automatically; both it and .env
-# are gitignored. There is no published registry image yet, so the service
-# builds from the Dockerfile in the repo root ('up -d --build' the first time
-# and after pulling changes). Once a registry image exists, the `build:` block
-# goes away.
+# are gitignored. This developer/fleet path deliberately builds from the
+# checked-out Dockerfile (`up -d --build` the first time and after pulling
+# changes). Tagged releases are published separately to `ghcr.io/pjunod/plurx`
+# for image-only installations such as the Unraid template.
 #
 # plurx never writes to your media; mount it read-only (`:ro`). The data
 # directory holds the database, artwork cache, and transcode scratch — every

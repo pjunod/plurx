@@ -205,10 +205,26 @@ class OperationsContractCase(unittest.TestCase):
             workflow,
         )
 
+    def test_release_registry_and_weekly_readiness_match_ci(self):
+        ci = read(".github/workflows/ci.yml")
+        unraid = read("deploy/unraid-plurx.xml")
+        readiness = read(".github/workflows/release-readiness.yml")
+
+        self.assertIn("images: ghcr.io/${{ github.repository }}", ci)
+        self.assertIn("<Repository>ghcr.io/pjunod/plurx:latest</Repository>", unraid)
+        self.assertIn(
+            "<Registry>https://github.com/pjunod/plurx/pkgs/container/plurx</Registry>",
+            unraid,
+        )
+        self.assertIn('cron: "41 16 * * 1"', readiness)
+        self.assertIn("run: make release-check", readiness)
+        self.assertIn("fetch-depth: 0", readiness)
+
     def test_every_actions_job_has_an_explicit_timeout(self):
         for path in (
             ".github/workflows/ci.yml",
             ".github/workflows/lint.yml",
+            ".github/workflows/release-readiness.yml",
             ".github/workflows/rust-audit.yml",
         ):
             with self.subTest(path=path):
