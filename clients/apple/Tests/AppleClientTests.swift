@@ -704,6 +704,72 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testEveryOpenedItemMustEstablishItsOwnBufferingRecoveryWindow() {
+        var attachment = PlayerAttachmentRecoveryState()
+        attachment.opened(at: 10_000)
+        attachment.observe(positionMs: 14_999, playing: true)
+        XCTAssertFalse(attachment.establishedPlayback)
+        attachment.observe(positionMs: 15_000, playing: true)
+        XCTAssertTrue(attachment.establishedPlayback)
+
+        attachment.opened(at: 90_000)
+        XCTAssertFalse(
+            attachment.establishedPlayback,
+            "a quality/audio/recovery open must not inherit the predecessor's gate"
+        )
+
+        var monitor = PlaybackRecoveryMonitor()
+        for check in 0...7 {
+            XCTAssertNil(monitor.sample(
+                positionMs: 90_000,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: attachment.establishedPlayback,
+                observedAt: 3_000 + Double(check * 2)
+            ))
+        }
+        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+
+        attachment.observe(positionMs: 95_000, playing: true)
+        XCTAssertTrue(attachment.establishedPlayback)
+    }
+
+    @MainActor
+    func testSubthresholdStallIsHeldForTheNextProgressReport() {
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 4_000
+
+        for check in 0...4 {
+            XCTAssertNotEqual(monitor.sample(
+                positionMs: 30_000,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(check * 2)
+            )?.action, .reopen)
+        }
+        XCTAssertNil(monitor.sample(
+            positionMs: 31_000,
+            timeControlStatus: .playing,
+            shouldMonitor: true,
+            establishedPlayback: true,
+            observedAt: beganAt + 10
+        ))
+
+        var observations = PlaybackStallObservationState()
+        observations.noteRecoveredStagnation(monitor.takeRecoveredStagnantDurationMs())
+        XCTAssertEqual(
+            observations.take(numberOfStalls: 1),
+            PlaybackStallObservation(delta: 1, stagnantDurationMs: 10_000)
+        )
+        XCTAssertNil(observations.take(numberOfStalls: 1))
+        XCTAssertEqual(
+            observations.take(numberOfStalls: 3),
+            PlaybackStallObservation(delta: 2, stagnantDurationMs: 0)
+        )
+    }
+
+    @MainActor
     func testPlaybackRecoveryPredicatesStayExclusiveAndBufferingWinsAMerge() {
         for status in [
             AVPlayer.TimeControlStatus.paused,
@@ -769,6 +835,32 @@ final class AppleClientTests: XCTestCase {
             object["detail"] as? String,
             "kind=buffering · position_ms=90000 · outcome=reopen"
         )
+    }
+
+    func testAppleObservedStallLogCarriesDeltaWithoutCapabilityData() throws {
+        let payload = ApplePlaybackObservedStallLog(
+            delta: 2,
+            positionMs: 90_000,
+            stagnantDurationMs: 8_000,
+            method: "remux",
+            title: "Fortune Feimster",
+            fileId: 42,
+            vcodec: "h264",
+            encoder: "copy"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "stall")
+        XCTAssertEqual(object["ms"] as? Int, 8_000)
+        XCTAssertEqual(
+            object["detail"] as? String,
+            "kind=access_log · position_ms=90000 · stall_delta=2 · outcome=self_recovered"
+        )
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
     }
 
     @MainActor
@@ -2622,6 +2714,33 @@ final class AppleClientTests: XCTestCase {
             isGrowingPlaylist: true,
             endedAt: 178_000
         ), .finish(durationMs: 180_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 120_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .finish(durationMs: 120_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .reopen, "a genuinely growing playlist may publish more media")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 121_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .reopen, "positional progress earns a fresh bounded retry")
     }
 
     @MainActor
@@ -2657,12 +2776,21 @@ final class AppleClientTests: XCTestCase {
         await fulfillment(of: [dismissed], timeout: 1)
         XCTAssertEqual(events, ["teardown", "dismiss"])
 
+        let duplicateDismissed = expectation(description: "late completion delivered")
         lifecycle.finish(
             teardown: { events.append("duplicate teardown") },
-            completion: { events.append("duplicate dismiss") }
+            completion: {
+                events.append("duplicate dismiss")
+                duplicateDismissed.fulfill()
+            }
         )
         lifecycle.teardown { events.append("disappear teardown") }
-        XCTAssertEqual(events, ["teardown", "dismiss"])
+        await fulfillment(of: [duplicateDismissed], timeout: 1)
+        XCTAssertEqual(
+            events,
+            ["teardown", "dismiss", "duplicate dismiss"],
+            "a late caller's completion must run even though cleanup remains idempotent"
+        )
     }
 
     @MainActor
