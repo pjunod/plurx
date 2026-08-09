@@ -29,6 +29,16 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: Run every scheduled validation
         run: make validate-nightly
+      - name: Install the PGS fuzz runner
+        run: |
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+          cargo install cargo-fuzz --locked
+        timeout-minutes: 20
+      - name: Fuzz the bounded PGS parser
+        id: pgs_fuzz
+        continue-on-error: true
+        timeout-minutes: 20
+        run: cargo +nightly-2026-08-01 fuzz run inspect_sup fuzz/corpus/inspect_sup -- -max_total_time=900
       - name: Install the mutation spot-checker
         run: cargo install cargo-mutants --locked
         timeout-minutes: 20
@@ -76,5 +86,12 @@ jobs:
             target/playback-lab
             target/ui-baseline
             target/mutants
+            fuzz/artifacts
           if-no-files-found: warn
           retention-days: 14
+      - name: Fail when the PGS fuzzer finds a crash
+        if: always() && steps.pgs_fuzz.outcome == 'failure'
+        run: |
+          echo "The bounded PGS fuzz campaign found a reproducible failure." \
+            >> "$GITHUB_STEP_SUMMARY"
+          exit 1

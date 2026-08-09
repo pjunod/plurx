@@ -1931,7 +1931,12 @@ final class PlayerController: ObservableObject {
                 if self.seekState.pendingMs == nil && !self.isChangingStream {
                     self.currentMs = self.realPositionMs()
                 }
-                self.refreshPGSOverlayWindow(at: self.currentMs)
+                if let overlayPosition = PGSOverlayPolicy.periodicRefreshPosition(
+                    currentMs: self.currentMs,
+                    overlayIsActive: self.pgsOverlayIsActive
+                ) {
+                    self.refreshPGSOverlayWindow(at: overlayPosition)
+                }
                 // The last rate the viewer was genuinely playing at, so a
                 // pause at 1.5× is restored as 1.5× and not as the 0 the
                 // transport reports while paused (P2-5).

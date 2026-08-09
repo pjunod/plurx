@@ -624,7 +624,10 @@ struct PlayerView: View {
                 player: controller.player,
                 pictureInPicture: pictureInPicture,
                 pgsOverlay: controller.pgsOverlayWindow,
-                allowsPictureInPicture: !lifecycle.isTearingDown
+                allowsPictureInPicture: PlayerSurface.shouldAllowPictureInPicture(
+                    isTearingDown: lifecycle.isTearingDown,
+                    pgsOverlayIsActive: controller.pgsOverlayIsActive
+                )
             )
                 .ignoresSafeArea()
 

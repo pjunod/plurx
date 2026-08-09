@@ -255,6 +255,13 @@ internal class AndroidPGSOverlayController(
 
     private suspend fun fetchManifest(index: Long): ManifestFetch {
         val response = api().pgsOverlayManifest(fileId, index)
+        val disposition = PGSOverlayPolicy.manifestDisposition(response.code())
+        if (disposition == PGSOverlayManifestDisposition.Preparing && response.code() == 503) {
+            response.errorBody()?.close()
+            return ManifestFetch.Preparing(
+                PGSOverlayPolicy.retryAfterMs(response.headers()["Retry-After"]),
+            )
+        }
         val body = response.body() ?: error("The server returned an empty PGS overlay response.")
         body.use {
             require(
@@ -271,14 +278,16 @@ internal class AndroidPGSOverlayController(
             require(bytes.size <= MAXIMUM_MANIFEST_BYTES) {
                 "The PGS overlay manifest is too large."
             }
-            return when (response.code()) {
-                200 -> ManifestFetch.Ready(Net.json.decodeFromString<PGSOverlayManifest>(bytes.decodeToString()))
-                202 -> {
+            return when (disposition) {
+                PGSOverlayManifestDisposition.Ready ->
+                    ManifestFetch.Ready(Net.json.decodeFromString<PGSOverlayManifest>(bytes.decodeToString()))
+                PGSOverlayManifestDisposition.Preparing -> {
                     val preparing = Net.json.decodeFromString<PGSOverlayPreparing>(bytes.decodeToString())
                     require(preparing.state == "preparing") { "invalid PGS preparation response" }
                     ManifestFetch.Preparing(preparing.retryAfterMs.coerceIn(250, 5_000))
                 }
-                else -> error("The PGS overlay request failed (${response.code()}).")
+                PGSOverlayManifestDisposition.Terminal ->
+                    error("The PGS overlay request failed (${response.code()}).")
             }
         }
     }
