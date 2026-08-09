@@ -427,6 +427,13 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Skip Intro and Skip Credits stay compact at every Apple player width.**
+  The marker action previously accepted the full playback-control width on
+  iOS, turning a short button into a bar across an iPad or other wide player.
+  It now keeps its natural width at the trailing edge above the transport,
+  while narrow layouts and accessibility text can still compress the label
+  instead of overflowing the player.
+
 - **Playback now leaves the full-screen Apple player at a title's natural
   end.** The AVPlayer end notification previously updated progress but only
   reached the view when autoplay was enabled, and no-next/autoplay-off titles

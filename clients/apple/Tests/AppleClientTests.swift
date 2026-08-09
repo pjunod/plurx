@@ -2791,6 +2791,76 @@ final class AppleClientTests: XCTestCase {
         XCTAssertGreaterThan(timelineWidth, viewportWidth / 2)
         window.isHidden = true
     }
+
+    @MainActor
+    func testSkipMarkerRowUsesProductionContentAtEveryTouchWidthAndTextSize() {
+        let horizontalPadding: CGFloat = 20
+        let sizeCategories: [ContentSizeCategory] = [
+            .large,
+            .accessibilityExtraExtraExtraLarge,
+        ]
+
+        for sizeCategory in sizeCategories {
+            var referenceButtonWidth: CGFloat?
+
+            for viewportWidth: CGFloat in [320, 390, 430, 744, 1_024, 1_366] {
+                var buttonFrame: CGRect = .null
+                let controller = UIHostingController(rootView:
+                    PlayerTrailingControlRow {
+                        Button {} label: {
+                            PlayerMarkerButtonLabel(title: "Skip Credits")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .reportLayoutFrame()
+                    }
+                    .environment(\.sizeCategory, sizeCategory)
+                    .padding(.horizontal, horizontalPadding)
+                    .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                        buttonFrame = $0
+                    }
+                )
+
+                controller.view.frame = CGRect(
+                    origin: .zero,
+                    size: CGSize(width: viewportWidth, height: 160)
+                )
+                let window = UIWindow(frame: controller.view.frame)
+                window.rootViewController = controller
+                window.makeKeyAndVisible()
+                controller.view.setNeedsLayout()
+                controller.view.layoutIfNeeded()
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+
+                let context = "width: \(viewportWidth), size: \(sizeCategory)"
+                XCTAssertFalse(buttonFrame.isNull, context)
+                XCTAssertEqual(
+                    buttonFrame.maxX,
+                    viewportWidth - horizontalPadding,
+                    accuracy: 0.5,
+                    context
+                )
+                XCTAssertLessThanOrEqual(
+                    buttonFrame.width,
+                    viewportWidth - (2 * horizontalPadding) + 0.5,
+                    context
+                )
+                if sizeCategory == .large {
+                    XCTAssertLessThan(buttonFrame.width, 180, context)
+                    if let referenceButtonWidth {
+                        XCTAssertEqual(
+                            buttonFrame.width,
+                            referenceButtonWidth,
+                            accuracy: 0.5,
+                            context
+                        )
+                    } else {
+                        referenceButtonWidth = buttonFrame.width
+                    }
+                }
+                window.isHidden = true
+            }
+        }
+    }
     #endif
 
     func testDetailViewportAndBodyNeverOutgrowTheirAvailableWidth() {
