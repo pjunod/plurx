@@ -17,6 +17,7 @@ mod schedule;
 mod state;
 mod storeprobe;
 mod subtitles;
+mod telemetry;
 mod trakt;
 mod transcode;
 mod version;
@@ -301,6 +302,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         encoders: encoder_caps.clone(),
         encoder_selected,
         tone_map,
+        pacing: crate::ffmpeg::pacing_caps().await,
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
     };
 

@@ -241,6 +241,8 @@ paths = [
   "crates/plurx-core/src/store/mod.rs",
   "crates/plurx-core/src/store/replicated.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
+  "crates/plurx-core/src/store/sqlite/telemetry.rs",
+  "crates/plurx-core/src/store/telemetry.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "spikes/hiqlite-m0/{Cargo.toml,Cargo.lock,src/lib.rs,tests/hiqlite_m0.rs}",
   "rust-toolchain.toml",
@@ -281,7 +283,7 @@ title = "Native server API and runtime"
 contract = "The single server binary exposes stable native endpoints and coordinates background work safely."
 paths = [
   "crates/plurxd/Cargo.toml",
-  "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe}.rs",
+  "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
   "crates/plurxd/src/http/{dto,error,extract,mod,system}.rs",
   "plurx.example.toml",
 ]

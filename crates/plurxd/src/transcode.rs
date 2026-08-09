@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use plurx_core::domain::PlaybackEvent;
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::{
     self, Encoder, EncoderCaps, Pacing, Pipeline, PipelineDigest, Recipe, ToneMap, TranscodeOptions,
@@ -1212,10 +1213,14 @@ struct Session {
     /// exists only when hls.js is the one fetching. The server serves every
     /// segment on every path, so it is the one place the answer always exists.
     delivery: Meter,
+    /// Effective input pace for this session; 0 means unpaced.
+    readrate: f64,
     /// True while the child is SIGSTOPped for running too far ahead of the
     /// playhead. Everything that judges a session's health has to know: a
     /// suspended encoder makes no progress *on purpose*.
     suspended: AtomicBool,
+    /// When the current held interval began, for the resume event's duration.
+    suspended_at: Mutex<Option<(Instant, AheadHoldReason)>>,
     /// Successful running→held transitions during this session. A counter,
     /// rather than only the current boolean, exposes flapping after it has
     /// already resumed.
@@ -1227,6 +1232,14 @@ struct Session {
     /// playlist reload may observe that state hundreds of times; only the
     /// transition is evidence about the EVENT/sliding experiment.
     first_slide_logged: AtomicBool,
+}
+
+#[derive(Default)]
+struct SessionEventFields<'a> {
+    reason: Option<&'a str>,
+    extra: Option<String>,
+    hold_reason: Option<AheadHoldReason>,
+    ms: Option<i64>,
 }
 
 /// How far a session's published media runs ahead of the client's download
@@ -1407,6 +1420,7 @@ async fn session_info(
         delivered_bytes: s.delivery.total_bytes(),
         delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
         delivered_idle_ms: s.delivery.idle_for_ms(),
+        readrate: s.readrate,
         suspended,
         suspend_count: s.suspend_count.load(Relaxed),
     }
@@ -1724,6 +1738,8 @@ pub struct SessionInfo {
     /// its last real value and this says how old it is, so a reader can tell a
     /// measurement from a memory.
     pub delivered_idle_ms: i64,
+    /// Effective ffmpeg input pace, matching `StreamInfo.readrate`.
+    pub readrate: f64,
     pub suspended: bool,
     /// Number of times this producer entered a held state. This stays visible
     /// after resume so a flapping session cannot look healthy merely because
@@ -2590,7 +2606,9 @@ impl TranscodeManager {
             hw_slot: std::sync::Mutex::new(None),
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
+            readrate: 0.0,
             suspended: AtomicBool::new(false),
+            suspended_at: Mutex::new(None),
             suspend_count: AtomicU64::new(0),
             typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),
@@ -2603,6 +2621,16 @@ impl TranscodeManager {
             %session_id, recipe = %hash, file = file.id,
             "serving a cached transcode — no encoder started"
         );
+        self.emit_session_event(
+            &session_id,
+            &session,
+            "session_start",
+            SessionEventFields {
+                extra: Some(serde_json::json!({ "cache": "hit" }).to_string()),
+                ..SessionEventFields::default()
+            },
+        )
+        .await;
         Some(StartInfo {
             playlist_url: format!("/api/v1/hls/{session_id}/index.m3u8"),
             session_id,
@@ -3544,6 +3572,16 @@ impl TranscodeManager {
             session.release_software();
             session.kill_child().await;
             session.discard_dir().await;
+            self.emit_session_event(
+                &session_id,
+                &session,
+                "session_end",
+                SessionEventFields {
+                    reason: Some("superseded"),
+                    ..SessionEventFields::default()
+                },
+            )
+            .await;
             tracing::info!(
                 %session_id, playback_id,
                 "reaped superseded transcode session (this player started a new one)"
@@ -3853,7 +3891,11 @@ impl TranscodeManager {
             hw_slot: std::sync::Mutex::new(hw_slot),
             sw_permit: std::sync::Mutex::new(sw_permit),
             delivery: Meter::new(),
+            readrate: pacing
+                .readrate
+                .unwrap_or(if pacing.legacy_re { 1.0 } else { 0.0 }),
             suspended: AtomicBool::new(false),
+            suspended_at: Mutex::new(None),
             suspend_count: AtomicU64::new(0),
             typeless_sliding,
             first_slide_logged: AtomicBool::new(false),
@@ -3862,6 +3904,16 @@ impl TranscodeManager {
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
+        self.emit_session_event(
+            &session_id,
+            &session,
+            "session_start",
+            SessionEventFields {
+                extra: Some(serde_json::json!({ "cache": "miss" }).to_string()),
+                ..SessionEventFields::default()
+            },
+        )
+        .await;
 
         // A hardware path can init cleanly yet produce nothing — GPU contention
         // under a second session, or a decode the GPU can't do (a 4K Dolby
@@ -4306,7 +4358,11 @@ impl TranscodeManager {
             hw_slot: std::sync::Mutex::new(None),
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
+            readrate: pacing
+                .readrate
+                .unwrap_or(if pacing.legacy_re { 1.0 } else { 0.0 }),
             suspended: AtomicBool::new(false),
+            suspended_at: Mutex::new(None),
             suspend_count: AtomicU64::new(0),
             typeless_sliding,
             first_slide_logged: AtomicBool::new(false),
@@ -4315,6 +4371,13 @@ impl TranscodeManager {
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
+        self.emit_session_event(
+            &session_id,
+            &session,
+            "session_start",
+            SessionEventFields::default(),
+        )
+        .await;
 
         // The reader task, when plurx is doing the cutting. It owns the pipe
         // for the session's life, and it owns the one fallback: a stream it
@@ -4484,6 +4547,64 @@ impl TranscodeManager {
         )
     }
 
+    async fn emit_session_event(
+        &self,
+        session_id: &str,
+        session: &Session,
+        event: &str,
+        fields: SessionEventFields<'_>,
+    ) {
+        let method = match session.method {
+            crate::delivery::Method::Direct => "direct_play",
+            crate::delivery::Method::Remux | crate::delivery::Method::HlsCopy => "remux",
+            crate::delivery::Method::Transcode => "transcode",
+        };
+        let hold_reason = if let Some(reason) = fields.hold_reason {
+            Some(reason)
+        } else if session.suspended.load(Relaxed) {
+            let limits = self.ahead_limits().await;
+            let (global_live, global_ahead) = self.global_flow_bytes().await;
+            session.ahead().await.and_then(|ahead| {
+                ahead_hold(ahead, global_live, global_ahead, limits, true).map(|hold| hold.reason)
+            })
+        } else {
+            None
+        }
+        .map(|reason| {
+            match reason {
+                AheadHoldReason::Time => "time",
+                AheadHoldReason::Bytes => "bytes",
+                AheadHoldReason::Global => "global",
+            }
+            .to_owned()
+        });
+        crate::telemetry::emit(
+            Arc::clone(&self.store),
+            PlaybackEvent {
+                at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+                session_id: Some(session_id.to_owned()),
+                file_id: Some(session.file_id),
+                event: event.to_owned(),
+                method: Some(method.to_owned()),
+                encoder: Some((*session.encoder_label.lock().await).to_owned()),
+                height: Some(session.target_height),
+                ms: fields.ms,
+                speed_recent: session.progress.recent_speed(),
+                ahead_seconds: session.ahead().await.map(|ahead| ahead.seconds),
+                suspended: Some(session.suspended.load(Relaxed)),
+                hold_reason,
+                delivered_bps: session.delivery.recent_bps().map(|bytes| bytes * 8),
+                readrate: Some(session.readrate),
+                reason: fields.reason.map(str::to_owned),
+                extra: fields.extra,
+                ..PlaybackEvent::default()
+            },
+        );
+    }
+
     /// End one session now. True if it existed.
     ///
     /// `reason` distinguishes the two callers in the log, because they mean
@@ -4498,6 +4619,23 @@ impl TranscodeManager {
         session.release_software();
         session.kill_child().await;
         session.discard_dir().await;
+        let event_reason = if reason.contains("released") {
+            "client_released"
+        } else if reason.contains("admin") {
+            "killed"
+        } else {
+            reason
+        };
+        self.emit_session_event(
+            session_id,
+            &session,
+            "session_end",
+            SessionEventFields {
+                reason: Some(event_reason),
+                ..SessionEventFields::default()
+            },
+        )
+        .await;
         tracing::info!(%session_id, reason, "transcode session ended");
         true
     }
@@ -4563,6 +4701,21 @@ impl TranscodeManager {
                                     now_unix.saturating_sub(session.started_unix),
                                 "served HLS playlist began sliding"
                             );
+                            self.emit_session_event(
+                                session_id,
+                                &session,
+                                "playlist_slide",
+                                SessionEventFields {
+                                    extra: Some(
+                                        serde_json::json!({
+                                            "first_retained_index": first_retained_index
+                                        })
+                                        .to_string(),
+                                    ),
+                                    ..SessionEventFields::default()
+                                },
+                            )
+                            .await;
                         }
                     }
                     return Some(served_live_playlist(
@@ -4765,6 +4918,10 @@ impl TranscodeManager {
         }
         session.suspended.store(want_suspend, Relaxed);
         if want_suspend {
+            let hold_reason = hold
+                .expect("a requested suspension has a hold reason")
+                .reason;
+            *session.suspended_at.lock().await = Some((Instant::now(), hold_reason));
             let suspend_count = session.suspend_count.fetch_add(1, Relaxed) + 1;
             tracing::info!(
                 session = %session_id,
@@ -4776,13 +4933,37 @@ impl TranscodeManager {
                 max_secs = limits.max_secs, max_bytes = limits.max_bytes,
                 "suspending transcode: far enough ahead of the client"
             );
+            self.emit_session_event(
+                session_id,
+                session,
+                "suspend",
+                SessionEventFields {
+                    hold_reason: Some(hold_reason),
+                    ..SessionEventFields::default()
+                },
+            )
+            .await;
         } else {
+            let held = session.suspended_at.lock().await.take();
+            let held_ms = held.map(|(at, _)| at.elapsed().as_millis().min(i64::MAX as u128) as i64);
+            let hold_reason = held.map(|(_, reason)| reason);
             tracing::info!(
                 session = %session_id,
                 suspend_count = session.suspend_count.load(Relaxed),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
                 "resuming transcode: the client caught up"
             );
+            self.emit_session_event(
+                session_id,
+                session,
+                "resume",
+                SessionEventFields {
+                    hold_reason,
+                    ms: held_ms,
+                    ..SessionEventFields::default()
+                },
+            )
+            .await;
         }
     }
 
@@ -4886,6 +5067,21 @@ impl TranscodeManager {
                 // does not need the process scheduled to take effect.
                 session.kill_child().await;
                 session.discard_dir().await;
+                let end_reason = if session.failed.load(Relaxed) {
+                    "failed"
+                } else {
+                    "idle"
+                };
+                self.emit_session_event(
+                    &id,
+                    &session,
+                    "session_end",
+                    SessionEventFields {
+                        reason: Some(end_reason),
+                        ..SessionEventFields::default()
+                    },
+                )
+                .await;
                 tracing::info!(
                     session_id = %id,
                     idle_seconds,
@@ -6080,7 +6276,9 @@ mod tests {
             hw_slot: std::sync::Mutex::new(None),
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
+            readrate: 0.0,
             suspended: AtomicBool::new(false),
+            suspended_at: Mutex::new(None),
             suspend_count: AtomicU64::new(0),
             typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),
@@ -6419,6 +6617,7 @@ mod tests {
         mgr.flow_control(&session, &info.session_id).await;
         assert!(session.suspended.load(Relaxed), "session was held");
         let status = mgr.session_status(&info.session_id).await.expect("status");
+        assert_eq!(status.readrate, 1.0, "HLS exposes its effective input pace");
         assert_eq!(status.hold_reason, Some(AheadHoldReason::Time));
         assert_eq!(status.resume_below_seconds, Some(1));
         assert_eq!(status.resume_below_bytes, None);
@@ -6452,6 +6651,46 @@ mod tests {
                 .suspend_count,
             1,
             "resume preserves the transition history"
+        );
+        let flow_events = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = store
+                    .playback_events(&plurx_core::domain::PlaybackEventQuery {
+                        since_ms: None,
+                        event: None,
+                        limit: 20,
+                    })
+                    .await
+                    .expect("flow-control telemetry query");
+                if events.iter().any(|event| event.event == "suspend")
+                    && events.iter().any(|event| event.event == "resume")
+                {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("suspend/resume telemetry persisted");
+        let suspend = flow_events
+            .iter()
+            .find(|event| event.event == "suspend")
+            .expect("suspend row");
+        assert_eq!(
+            suspend.session_id.as_deref(),
+            Some(info.session_id.as_str())
+        );
+        assert_eq!(suspend.hold_reason.as_deref(), Some("time"));
+        assert_eq!(suspend.readrate, Some(1.0));
+        let resume = flow_events
+            .iter()
+            .find(|event| event.event == "resume")
+            .expect("resume row");
+        assert_eq!(resume.hold_reason.as_deref(), Some("time"));
+        assert!(
+            resume.ms.is_some_and(|held_ms| held_ms >= 1_000),
+            "resume row carries the measured hold duration: {:?}",
+            resume.ms
         );
         let moved = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -6877,7 +7116,9 @@ mod tests {
             hw_slot: std::sync::Mutex::new(None),
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
+            readrate: 0.0,
             suspended: AtomicBool::new(false),
+            suspended_at: Mutex::new(None),
             suspend_count: AtomicU64::new(0),
             typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),

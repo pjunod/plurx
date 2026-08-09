@@ -415,6 +415,23 @@ how far ahead the session is. A held session is normally healthy — it has buil
 everything it is allowed to — but a `global` hold can remain until aggregate
 scratch across other sessions falls below its release point.
 
+### Playback telemetry
+
+Performance II stores structured playback observations beside the local
+database. They are operational data, not catalogue truth: on a Hiqlite voter
+they live in that voter's own SQLite sidecar and never pass through Raft.
+
+| Runtime setting | Default | Meaning |
+|---|---:|---|
+| `telemetry.retain_days` | 30 | Days to keep playback rows. `0` disables row writes and pruning while preserving the existing client log lines |
+
+The scheduler runs one bounded prune pass daily and records its clock in
+`jobs.last_telemetry_prune`. Administrators can query newest-first rows with
+`GET /api/v1/system/playback-events?since=<unix-ms>&event=<name>&limit=<n>`;
+the limit is capped at 2,000. Settings → System shows a small seven-day TTFF,
+stall, and suspended-time summary. `scripts/perf-report` uses the same endpoint
+and falls back to the log ring when pointed at an older server.
+
 ### Where the transcode scratch lives
 
 Session segments are written under `<data_dir>/transcode`, which is wiped at
@@ -594,7 +611,8 @@ matter most: `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
 |---|---|
 | `GET /healthz` | Liveness — the process is up |
 | `GET /readyz` | Readiness — storage is reachable (use for load-balancer health) |
-| `GET /metrics` | Prometheus text: uptime, streams, library/user counts, and bounded offline queue, quota, timing, quality, failure, and transfer metrics |
+| `GET /metrics` | Prometheus text: uptime, streams, library/user counts, playback TTFF/stall/suspend/cache/session counters, and bounded offline queue, quota, timing, quality, failure, and transfer metrics |
+| `GET /api/v1/system/playback-events` | Admin-only node-local playback rows; filter by unix-ms `since`, exact `event`, and capped `limit` |
 
 ## Hardware transcode & recent Intel GPUs
 

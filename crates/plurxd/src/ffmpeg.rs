@@ -27,7 +27,7 @@ pub fn ffprobe_bin() -> String {
 /// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
 /// `-readrate_initial_burst` in 6.1; passing either to an older build is a hard
 /// exit, not a warning, so probe rather than assume. Probed once per process.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct PacingCaps {
     pub readrate: bool,
     pub initial_burst: bool,

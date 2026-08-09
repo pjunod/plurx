@@ -214,6 +214,11 @@ Numbered because milestones cite them.
 
 ## 3. N0 — Telemetry becomes data
 
+**Implementation status (2026-08-09):** server storage, ingest, lifecycle
+events, metrics, readers, census fields, and the web parity slice are landed in
+source. Apple/Android parity and the named-machine acceptance runs remain and
+must not be inferred from this server milestone.
+
 **Objective:** the beacons plurx already emits become queryable rows that
 survive restart, get their server-side context attached at ingest, and
 exist for all three clients — because every later milestone either feeds
@@ -226,15 +231,15 @@ on this data (N2 calibration, N4 priors, N7 digests) or is judged by it
 the log line exactly as is — it is the human debugging surface — and
 *additionally* insert the structured record:
 
-- New table `playback_events` (migration v16): `id, at_unix_ms, user_id,
+- New table `playback_events` (migration v17): `id, at_unix_ms, user_id,
   session_id NULL, file_id NULL, event, level, method, encoder, height,
   ms NULL, runway NULL, bandwidth_kbps NULL, detail, attempt, reason,
   ua, extra JSON`. Indexed `(event, at_unix_ms)` and `(file_id,
   at_unix_ms)`.
 - **Join server truth at ingest.** When the beacon names a live session,
   attach the server's view *at that moment* — `recent_speed`,
-  `ahead_seconds`, `suspended`, `hold_reason`, `delivered_bps` (all
-  already in `session_info()`, `transcode.rs:1299-1345`). Today the
+  `ahead_seconds`, `suspended`, `hold_reason`, `delivered_bps`, and the
+  effective `readrate` (all in `session_info()`). Today the
   client sends `bandwidth` and `runway`, the server knows
   `recent_speed` and `ahead_seconds`, and **no record ever contains
   both** — this join is the single change that makes B18 answerable.
@@ -1117,8 +1122,9 @@ All changes flow through the single `effective_recipe()` builder
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
 - N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
-  manifest on location rows (schema **v17**; N0's telemetry table is
-  **v16** — unique versions per slice, review R8); `prefix_secs` in
+  manifest on location rows (schema **v18**; N0's telemetry table is
+  **v17** — unique versions per slice, review R8, renumbered after the
+  pre-existing offline-package v16 migration was discovered); `prefix_secs` in
   the recipe.
 - N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
   HEVC changes the `muxer`/`segment_policy` fields — its own
@@ -1206,10 +1212,10 @@ releasable.
 
 ---
 
-## 14. Decisions for the operator — the open ledger
+## 14. Decisions for the operator — ratified implementation defaults
 
-Ratify or amend these before their milestone lands; each names a
-recommendation and its reason.
+Paul ratified the recommended defaults on 2026-08-09. They remain runtime
+settings and may be amended without changing the contracts below.
 
 1. **D1 — telemetry default.** Recommended: **on**, 30-day retention.
    It is bounded megabytes, it is the referee for everything else,
@@ -1248,4 +1254,3 @@ recommendation and its reason.
 reviews land beside it as `PERF2-PLAN-REVIEW.md` →
 `PERF2-REVIEW-RESPONSE.md`, decisions migrate into §14, and §1's
 B-facts get corrected in place with dated notes rather than silently.
-

@@ -16,6 +16,7 @@
 //! - Implementations are shared via `Arc`, never cloned per-request.
 
 mod sqlite;
+mod telemetry;
 
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite;
@@ -42,7 +43,8 @@ use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
     MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
     OfflineActivityPackage, OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage,
-    OfflinePackageStats, ProbeResult, RecentItem, TraktAuth, User, WatchRollup, WatchState,
+    OfflinePackageStats, PlaybackEvent, PlaybackEventQuery, ProbeResult, RecentItem, TraktAuth,
+    User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -106,6 +108,14 @@ pub mod keys {
     pub const JOB_LAST_PROBE_RETRY: &str = "jobs.last_probe_retry";
     pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
     pub const JOB_LAST_ARTWORK_RETRY: &str = "jobs.last_artwork_retry";
+    /// Node-local playback telemetry retention, in days. Missing means
+    /// [`TELEMETRY_RETAIN_DEFAULT_DAYS`]; `0` disables both writes and pruning.
+    /// This is deliberately on by default: it is bounded local bookkeeping and
+    /// the measurement referee for every Performance II milestone.
+    pub const TELEMETRY_RETAIN_DAYS: &str = "telemetry.retain_days";
+    /// Last successful bounded telemetry-prune pass, in unix seconds.
+    pub const JOB_LAST_TELEMETRY_PRUNE: &str = "jobs.last_telemetry_prune";
+    pub const TELEMETRY_RETAIN_DEFAULT_DAYS: i64 = 30;
     /// Default artwork-retry interval, in minutes. Half-hourly: often enough
     /// that a scan interrupted by a TMDB blip repairs itself while the user is
     /// still watching that evening, rare enough to be invisible to TMDB.
@@ -1004,6 +1014,21 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
     async fn expire_offline_packages(&self, now: i64) -> Result<u64, StoreError>;
 }
 
+/// Node-local playback telemetry.
+///
+/// Unlike catalogue and watch state, these rows describe what happened on one
+/// machine and must never be submitted to Raft. The hiqlite implementation
+/// therefore owns a separate versioned SQLite sidecar per voter.
+#[async_trait]
+pub trait PlaybackTelemetryStore: Send + Sync + 'static {
+    async fn record_playback_event(&self, event: &PlaybackEvent) -> Result<i64, StoreError>;
+    async fn prune_playback_events(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError>;
+    async fn playback_events(
+        &self,
+        query: &PlaybackEventQuery,
+    ) -> Result<Vec<PlaybackEvent>, StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -1016,6 +1041,7 @@ pub trait Store:
     + WatchedOutboxStore
     + TranscodeCacheStore
     + OfflinePackageStore
+    + PlaybackTelemetryStore
     + Send
     + Sync
     + 'static
@@ -1033,6 +1059,7 @@ impl<T> Store for T where
         + WatchedOutboxStore
         + TranscodeCacheStore
         + OfflinePackageStore
+        + PlaybackTelemetryStore
         + Send
         + Sync
         + 'static

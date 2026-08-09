@@ -2549,6 +2549,9 @@ function playbackContext(){
     height:(v&&v.videoHeight)||(p.method==='transcode'?transcodeHeight():null)
            ||((p.source&&p.source.height)||null),
     encoder:p.encoder||null,
+    // Handoff §4.8 names the wire field `session`; the server accepts it as an
+    // alias of its typed `session_id`, so old and native clients stay additive.
+    session:p.sessionId||null,
     runway:v?bufferRunway(v):null,
     attempt:p.attemptId||null,
     reason:p.attemptReason||null,
@@ -6609,10 +6612,14 @@ window.addEventListener("resize",()=>{
 // Auto follows the automatic ladder; Original forces direct/remux (no video
 // transcode); a height forces a transcode. Changing it restarts at position.
 function setQuality(q){
+  let from="auto"; try{ from=localStorage.getItem("plurx_quality")||"auto"; }catch(e){}
   try{ localStorage.setItem("plurx_quality", q); }catch(e){}
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   toast("Quality: "+qualityLabel());
   if(PLAYER && PLAYER.fileId){
+    clientLog(Object.assign({level:"warn",event:"quality_switch",
+      message:`quality ${from} → ${q}`,detail:`from=${from} to=${q}`,reason:"manual"},
+      playbackContext()));
     PENDING_ATTEMPT_REASON="quality";
     const v=document.getElementById("video");
     const pos=(PLAYER.offset||0)+((v&&v.currentTime)||0);
@@ -7458,11 +7465,13 @@ let SETTINGS=null, TRAKT=null, TRAKT_EDIT=false;
 async function viewSettings(){
   if(!ME.is_admin){ location.hash="#/"; return; }
   layoutChrome("settings",`<div class="empty">Loading…</div>`);
-  const [libs,settings,status,sys,users,trakt]=await Promise.all([
+  const since7d=Date.now()-7*24*60*60*1000;
+  const [libs,settings,status,sys,users,trakt,playbackEvents]=await Promise.all([
     api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users"),
-    api("/trakt/status").catch(()=>null)]);
+    api("/trakt/status").catch(()=>null),
+    api(`/system/playback-events?since=${since7d}&limit=2000`).catch(()=>[])]);
   SETTINGS=settings; TRAKT=trakt; TRAKT_EDIT=false;
-  SETTINGS_DATA={libs,settings,status,sys,users,trakt};
+  SETTINGS_DATA={libs,settings,status,sys,users,trakt,playbackEvents};
   renderSettings();
   setPageTimer(settingsTick, 2000);
 }
@@ -7482,7 +7491,7 @@ function settingsPanel(tab,d){
   if(tab==="metadata") return metadataPanel(d.settings,d.trakt);
   if(tab==="playback") return playbackPanel(d.settings);
   if(tab==="users")    return usersPanel(d.users);
-  if(tab==="system")   return systemPanel(d.sys);
+  if(tab==="system")   return systemPanel(d.sys,d.playbackEvents);
   return librariesPanel(d.libs,d.status,d.settings);
 }
 // Intervals in minutes. Nothing under 15 — the server refuses it, because a
@@ -7561,7 +7570,15 @@ function precachePanel(settings){
   const bar = settings.cache_max_gb
     ? `<span class="muted">· ${fmtBytes(used)} of ${settings.cache_max_gb} GB used</span>`
     : `<span class="muted">· off${used?` — ${fmtBytes(used)} still stored, cleared on the next sweep`:""}</span>`;
-  return `<h2 class="section">Pre-transcoding</h2>
+  return `<h2 class="section">Playback telemetry</h2>
+    <div class="row setrow" style="gap:14px 18px">
+      <span class="schedpair">Retain events
+        <select id="telemetry-retain" title="How long node-local playback measurements are kept">
+          ${[[0,"Off"],[7,"7 days"],[14,"14 days"],[30,"30 days"],[60,"60 days"],[90,"90 days"]].map(([n,label])=>`<option value="${n}"${Number(settings.telemetry_retain_days)===n?' selected':''}>${label}</option>`).join("")}
+        </select></span>
+      <button class="ghost sm" onclick="saveTelemetry(this)">Save</button></div>
+    <div class="hint">Stores bounded, node-local playback measurements for performance reports. Off keeps the existing client log lines but writes and prunes no telemetry rows.</div>
+    <h2 class="section">Pre-transcoding</h2>
     <div class="row setrow" style="gap:14px 18px">
       <span class="schedpair">Look for work
         ${everySelect("cache-produce",PRODUCE_EVERY,settings.cache_produce_mins,"How often to check what's worth encoding ahead of time")}</span>
@@ -7578,6 +7595,15 @@ function precachePanel(settings){
       stops what it's doing and hands the hardware over, picking up later from where it stopped.
       Only sources nothing plays natively are worth it (4K, HDR, HEVC), so an ordinary 1080p file is skipped.
       Setting the budget to <b>Off</b> stops production and clears what's stored.</div>`;
+}
+async function saveTelemetry(btn){
+  btn.disabled=true;
+  try{
+    await api("/settings",{method:"PUT",body:{
+      telemetry_retain_days:Number(document.getElementById("telemetry-retain").value)}});
+    toast("Playback telemetry saved"); render();
+  }catch(e){ toast(e.message||"Couldn't save"); }
+  finally{ btn.disabled=false; }
 }
 async function saveMaintenance(btn){
   btn.disabled=true;
@@ -7865,7 +7891,23 @@ async function remeasureStorage(btn){
     renderSettings();
   }catch(e){ toast(e.message); btn.disabled=false; btn.textContent=was; }
 }
-function systemPanel(sys){
+function playbackSummaryCard(events){
+  const rows=Array.isArray(events)?events:[];
+  const starts={};
+  rows.filter(e=>e.event==="ttff"&&Number.isFinite(e.ms)).forEach(e=>
+    (starts[e.method||"unknown"]||(starts[e.method||"unknown"]=[])).push(Number(e.ms)));
+  const pct=(a,p)=>{ const s=a.slice().sort((x,y)=>x-y); return s.length?s[Math.min(s.length-1,Math.floor((s.length-1)*p))]:null; };
+  const ttff=Object.entries(starts).sort().map(([method,values])=>
+    `<span class="stgpath">${esc(method)}</span><span>p50 ${pct(values,.5)} ms · p95 ${pct(values,.95)} ms <span class="muted">(${values.length})</span></span>`).join("");
+  const stalls={supply:0,decode:0,other:0};
+  rows.filter(e=>e.event==="stall").forEach(e=>{ const d=e.detail||""; stalls[d.includes("supply")?"supply":d.includes("decode")?"decode":"other"]++; });
+  const suspended=rows.filter(e=>e.event==="resume"&&Number.isFinite(e.ms)).reduce((n,e)=>n+e.ms,0)/1000;
+  return `<div class="card"><h2 class="section" style="margin-top:0">Playback <span class="muted">(7 days)</span></h2>
+    ${ttff?`<div class="stgtable">${ttff}</div>`:`<span class="muted">No time-to-first-frame rows yet.</span>`}
+    <div class="hint">Stalls: ${stalls.supply} supply · ${stalls.decode} decode · ${stalls.other} other<br>
+      Encoder suspended: ${suspended.toFixed(1)} seconds · ${rows.length} stored event${rows.length===1?'':'s'} shown</div></div>`;
+}
+function systemPanel(sys,playbackEvents){
   const enc=sys.encoders||{};
   const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
     .map(([n,ok])=>`<span class="pill" style="${ok?'color:var(--good);border-color:var(--good)':''}">${n} ${ok?'✓':'—'}</span>`).join(" ");
@@ -7880,6 +7922,7 @@ function systemPanel(sys){
         <dt>Storage</dt><dd>${storageHtml(sys.storage)}</dd>
         <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
       </dl></div>
+    ${playbackSummaryCard(playbackEvents)}
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
       <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
           <option value="info" selected>Info+</option><option value="warn">Warnings+</option>

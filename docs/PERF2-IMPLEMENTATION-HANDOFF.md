@@ -101,10 +101,9 @@ good the feature is.
 
 ## 2. Decisions in force
 
-PERF2-PLAN §14's ledger is not yet operator-ratified. **Implement with
-the recommended defaults** — every one of them is a runtime setting, so
-ratifying differently later is a settings flip, not a code change. In
-force for implementation:
+Paul ratified PERF2-PLAN §14's recommended defaults on 2026-08-09. Every one
+remains a runtime setting, so changing one later is a settings flip, not a code
+change. In force for implementation:
 
 | Decision | Implement as |
 |---|---|
@@ -160,14 +159,14 @@ This is the full-detail slice because it is first, unblocked by any
 it. Scope guard: N0 changes **no** playback policy — no flow-control
 tuning, no rung logic, no priors. It records.
 
-### 4.1 Migration v16 — `playback_events`
+### 4.1 Migration v17 — `playback_events`
 
 Append to `MIGRATIONS` in `crates/plurx-core/src/store/sqlite/mod.rs`
 (style per v15: STRICT, commented rationale; the array-length test at
 `mod.rs:1114-1118` forces a deliberate bump):
 
 ```sql
--- v16: playback telemetry becomes rows (PERF2-PLAN §3). Node-local
+-- v17: playback telemetry becomes rows (PERF2-PLAN §3). Node-local
 -- operational data — never a replicated class; the hiqlite backend
 -- keeps it beside its derived-local tables (items_fts precedent).
 CREATE TABLE playback_events (
@@ -189,6 +188,7 @@ CREATE TABLE playback_events (
     suspended      INTEGER,          -- server join: 0/1
     hold_reason    TEXT,             -- server join: time|bytes|global
     delivered_bps  INTEGER,          -- server join
+    readrate        REAL,             -- server join: effective input pace
     detail         TEXT,
     attempt        TEXT,
     reason         TEXT,
@@ -331,7 +331,7 @@ visit).
 
 ### 4.11 Tests
 
-Migration up-from-v15 (and the `MIGRATIONS.len()` bump); ingest inserts
+Migration up-from-v16 (and the `MIGRATIONS.len()` bump); ingest inserts
 with and without a live session (join columns present/absent); ingest
 with `retain_days = 0` inserts nothing and logs identically;
 per-user bucket isolation (user A's flood doesn't silence user B);
@@ -401,7 +401,7 @@ decision).
 
 **The spike is not optional.** N3.0 proves the continuation protocol on
 fixtures (every enabled encoder family) with the §6.4 packet gates as
-its exit; only then does the v17 schema, producer `kind=prefix`, or any
+its exit; only then does the v18 schema, producer `kind=prefix`, or any
 serving change land. The serving contract is the plan's, verbatim:
 server-owned served playlist, `-output_ts_offset` + `-start_number`,
 fresh source `stat` equality before publish, artifact manifest
@@ -482,4 +482,3 @@ A milestone is done when: gate green · plan-§ acceptance run and quoted
 to nynuc and then the fleet without incident · and the next agent could
 pick up the following milestone from the plan + this handoff without
 asking what state the tree is in.
-
