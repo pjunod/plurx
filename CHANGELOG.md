@@ -8,6 +8,23 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Apple seeking works like a progress bar again.** Scrubbing, skip presses,
+  and lock-screen position commands on iPhone, iPad, and Apple TV now seek the
+  current item's own clock whenever the target sits inside the growing HLS
+  playlist's advertised window — instant, with no server round trip — and only
+  reopen the session for positions the transcoder has not published yet (or
+  retention has pruned). Out-of-window commands coalesce for 350 ms so a burst
+  of presses costs one replacement session instead of one per press. During a
+  replacement, the predecessor item's failure noise (its playlist is deleted
+  by supersession the moment the new create begins) no longer races the
+  in-flight open into SDR/transcode fallbacks, spurious "playback stopped"
+  errors, or random position jumps; a replacement that genuinely fails during
+  its own attach is still caught once the change lands. The iOS slider also
+  commits its seek before leaving scrub mode, so the thumb no longer flashes
+  back to the pre-scrub position.
+
 ### Added
 
 - **Performance II N0 makes playback telemetry durable and queryable.** Client
