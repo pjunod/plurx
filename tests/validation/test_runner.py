@@ -197,6 +197,21 @@ class CatalogCase(unittest.TestCase):
 
         self.assertFalse(scope["docs_only"])
 
+        for scheduler_path in (
+            ".github/workflows/ci.yml",
+            "validation/ci_scope.py",
+            "validation/points.toml",
+        ):
+            with self.subTest(scheduler_path=scheduler_path):
+                scheduler_scope = scope_for_paths(catalog, (scheduler_path,))
+                selected = (
+                    value
+                    for key, value in scheduler_scope.items()
+                    if key != "docs_only"
+                )
+                self.assertTrue(all(selected))
+                self.assertFalse(scheduler_scope["docs_only"])
+
     def test_ci_scope_fails_open_for_mixed_documentation_and_code(self):
         catalog = load_catalog(ROOT / "validation/points.toml")
 

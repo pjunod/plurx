@@ -178,6 +178,11 @@ T0; it cannot select or suppress a runtime suite. Selector code and
 browser, Apple, Android, cross-target, and container surfaces. An empty diff,
 unknown diff, push, or tag does not earn the shortcut.
 
+The aggregate workflow, scope selector, and functionality catalog are
+scheduler inputs. A change to any of those three fails open to every surface:
+routing code must not use the routing decision it is changing to skip its own
+acceptance evidence.
+
 The scope also reports `mobile_version` independently. That lets CI report the
 highest-frequency policy failure beside the general functionality-point and
 native-platform jobs instead of hiding their results.

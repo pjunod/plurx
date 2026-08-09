@@ -30,6 +30,15 @@ SCOPE_KEYS = (
     "docs_only",
 )
 
+# A selector or aggregate-workflow edit can change which evidence appears at
+# all. It must exercise every routed surface instead of trusting the routing it
+# is in the middle of changing.
+FULL_CI_PATHS = (
+    ".github/workflows/ci.yml",
+    "validation/ci_scope.py",
+    "validation/points.toml",
+)
+
 # Documentation can still be executable evidence: validation unit tests pin
 # inventories and links between docs and source anchors. The regression map is
 # also allowed because it is consumed only by the history audit that remains in
@@ -117,6 +126,8 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
 
     if is_docs_only(paths):
         return {key: key == "docs_only" for key in SCOPE_KEYS}
+    if any(matches(path, FULL_CI_PATHS) for path in paths):
+        return all_scope()
 
     selection = select_points(catalog, paths)
     check_ids = {
