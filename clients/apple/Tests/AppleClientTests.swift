@@ -944,6 +944,93 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNotEqual(terminal.message, PlaybackStallKind.silent.terminalState.message)
     }
 
+    func testAppleTTFFWaitsForRealProgressAndReportsOnlyOnce() {
+        var measurement = ApplePlaybackTTFFState()
+        measurement.opened(at: 90_000, observedAt: 10)
+
+        XCTAssertNil(measurement.observe(
+            positionMs: 90_249,
+            playing: true,
+            observedAt: 11
+        ))
+        XCTAssertNil(measurement.observe(
+            positionMs: 90_500,
+            playing: false,
+            observedAt: 11.5
+        ))
+        XCTAssertEqual(measurement.observe(
+            positionMs: 90_500,
+            playing: true,
+            observedAt: 12
+        ), 2_000)
+        XCTAssertNil(measurement.observe(
+            positionMs: 91_000,
+            playing: true,
+            observedAt: 13
+        ))
+    }
+
+    func testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock() {
+        var measurement = ApplePlaybackTTFFState()
+        measurement.opened(at: 90_000, observedAt: 10)
+
+        measurement.rebasePosition(at: 88_000)
+
+        XCTAssertNil(measurement.observe(
+            positionMs: 88_249,
+            playing: true,
+            observedAt: 11
+        ))
+        XCTAssertEqual(measurement.observe(
+            positionMs: 88_250,
+            playing: true,
+            observedAt: 12.5
+        ), 2_500)
+    }
+
+    func testAppleTTFFRebasesBackwardSeekBeforeFirstProgress() {
+        var measurement = ApplePlaybackTTFFState()
+        measurement.opened(at: 90_000, observedAt: 10)
+
+        measurement.rebasePosition(at: 10_000)
+
+        XCTAssertEqual(measurement.observe(
+            positionMs: 10_250,
+            playing: true,
+            observedAt: 11
+        ), 1_000)
+    }
+
+    func testAppleTTFFLogCarriesSessionJoinWithoutCapabilityData() throws {
+        let payload = ApplePlaybackTTFFLog(
+            ms: 684,
+            method: "remux",
+            title: "Fortune Feimster",
+            fileId: 42,
+            vcodec: "hevc",
+            height: 2_160,
+            encoder: "copy",
+            sessionId: "session-17",
+            attempt: "playback-9",
+            reason: "resume"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "ttff")
+        XCTAssertEqual(object["ms"] as? Int, 684)
+        XCTAssertEqual(object["method"] as? String, "remux")
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "playback-9")
+        XCTAssertEqual(object["reason"] as? String, "resume")
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(object["height"] as? Int, 2_160)
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
+    }
+
     func testAppleBufferingStallLogCarriesPositionMethodAndDuration() throws {
         let payload = ApplePlaybackStallLog(
             kind: .buffering,

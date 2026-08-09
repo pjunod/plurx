@@ -68,3 +68,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "playbackTelemetry.firstFrame(monotonicNowMs())"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackTelemetryTest.kt"
 test_anchor = "controllerWiringPostsResumeTtffFromStartThroughFirstFrame"
+
+[[fixes]]
+id = "apple.ttff-position-rebase"
+commits = ["787ea3a0"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "mutating func rebasePosition(at positionMs: Int)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock"
