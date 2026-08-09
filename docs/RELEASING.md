@@ -10,11 +10,13 @@ means. It lives in exactly one place:
 ```toml
 # Cargo.toml
 [workspace.package]
-version = "0.1.0"
+version = "0.2.7"
 ```
 
-Every crate inherits it with `version.workspace = true`. There is no second
-copy to forget.
+Every crate inherits it with `version.workspace = true`. The native apps keep
+their store-facing marketing versions aligned with the workspace separately;
+their monotonically increasing build counters advance whenever their release
+paths change, and CI enforces that contract.
 
 plurx follows [semantic versioning](https://semver.org/) under the 0.x rules,
 which are worth stating plainly because they are not what 1.x users expect:
@@ -80,12 +82,14 @@ CI passes the tag name automatically when it publishes an image.
    machine; every unavailable check is recorded as a skip rather than disguised
    as a pass.
 
-5. **Commit, tag, push.**
+5. **Merge the release commit, then tag that exact green commit.** Open a pull
+   request for the version and changelog changes, wait for its required checks,
+   merge it, update local `main`, and run `make release-check` once more before
+   creating the tag.
 
    ```sh
-   git commit -am "release: v0.2.0"
-   git tag -a v0.2.0 -m "v0.2.0"
-   git push && git push --tags
+   git tag -a v0.2.7 -m "v0.2.7"
+   git push origin v0.2.7
    ```
 
    The tag is `v` + the version. CI refuses to publish a tag that disagrees
@@ -96,6 +100,11 @@ CI passes the tag name automatically when it publishes an image.
    aarch64 binaries, and publishes a multi-arch image to GHCR tagged
    `{version}`, `{major}.{minor}`, and `latest`. Pushes to `main` build but do
    not publish, so releases are always deliberate.
+
+The weekly release-readiness workflow runs `make release-check`. A red run
+means the current workspace version is already tagged or has no dated
+changelog section; it is a visible prompt to prepare the next release, not a
+reason to move or overwrite an existing tag.
 
 ## Checking what a build reports
 
