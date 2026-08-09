@@ -7453,7 +7453,7 @@ mod tests {
 
         if !crate::ffmpeg::pacing_caps().await.readrate {
             eprintln!(
-                "skipping an_unfinished_run_keeps_its_place_but_is_never_serveable: \
+                "SKIP: an_unfinished_run_keeps_its_place_but_is_never_serveable: \
                  `{}` has no -readrate (needs ffmpeg 5.1+), so the partial budget \
                  cannot be made independent of this machine's speed",
                 crate::ffmpeg::ffmpeg_bin()
@@ -7605,6 +7605,151 @@ mod tests {
         assert_eq!(claims[0].relative_dir, format!("{}/{hash}", &hash[..2]));
     }
 
+    #[tokio::test]
+    async fn speculative_production_stands_down_while_offline_is_waiting() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+
+        mgr.offline_waiting
+            .store(true, std::sync::atomic::Ordering::Release);
+        let result = mgr
+            .produce(&file, 720, Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("producer result");
+        mgr.offline_waiting
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            result.is_none(),
+            "offline preparation must own the producer lane"
+        );
+        assert!(
+            store
+                .stale_cache_claims(NODE, i64::MAX)
+                .await
+                .expect("claims")
+                .is_empty(),
+            "standing down must happen before a recipe is claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_preempts_speculation_and_resumes_its_published_part() {
+        super::require_ffmpeg();
+        use plurx_core::domain::{NewOfflinePackage, OfflineCreateOutcome};
+        use plurx_core::store::SqliteStore;
+
+        const SECONDS: u32 = 30;
+        const READRATE: f64 = 10.0;
+        if !crate::ffmpeg::pacing_caps().await.readrate {
+            eprintln!(
+                "SKIP: offline_preempts_speculation_and_resumes_its_published_part: \
+                 `{}` has no -readrate (needs ffmpeg 5.1+)",
+                crate::ffmpeg::ffmpeg_bin()
+            );
+            return;
+        }
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store.create_user("paul", "hash", true).await.expect("user");
+        let media = tempfile::tempdir().expect("media");
+        let source = media.path().join("Heat.mkv");
+        write_real_video(&source, SECONDS);
+        let file_id = seed_real_file(&store, &source).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let package_id = "offline-preemption";
+        let requested = NewOfflinePackage {
+            id: package_id.to_owned(),
+            request_id: "offline-preemption-request".to_owned(),
+            user_id: user.id,
+            file_id,
+            node_id: NODE.to_owned(),
+            source_path: file.path.to_string_lossy().into_owned(),
+            source_size: file.size,
+            source_mtime: file.mtime,
+            target_height: 240,
+            output_width: Some(320),
+            output_height: Some(240),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".to_owned(),
+            estimated_bytes: 1_000_000,
+            reserved_bytes: 1_100_000,
+            expires_at: i64::MAX,
+        };
+        assert!(matches!(
+            store
+                .create_offline_package(&requested, 10, 10_000_000, 20_000_000)
+                .await
+                .expect("create package"),
+            OfflineCreateOutcome::Created(_)
+        ));
+        assert_eq!(
+            store
+                .claim_next_offline_package(NODE)
+                .await
+                .expect("claim package")
+                .expect("queued package")
+                .id,
+            package_id
+        );
+
+        let (mgr, _work, cache) = cached_manager(&store);
+        let mgr = Arc::new(mgr.with_producer_tuning(ProducerTuning {
+            pacing: Pacing {
+                readrate: Some(READRATE),
+                initial_burst: None,
+                legacy_re: false,
+            },
+            retry: Duration::from_millis(250),
+        }));
+        let speculative = {
+            let mgr = Arc::clone(&mgr);
+            let file = file.clone();
+            tokio::spawn(async move {
+                mgr.produce(&file, 240, Instant::now() + Duration::from_secs(180))
+                    .await
+            })
+        };
+        wait_for_part_segment(cache.path(), 0).await;
+
+        let outcome = mgr
+            .ensure_offline(
+                package_id,
+                &file,
+                &OfflineSpec {
+                    target_height: 240,
+                    audio_index: None,
+                    subtitle: OfflineSubtitle::None,
+                },
+                Instant::now() + Duration::from_secs(180),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("offline preparation");
+        assert!(
+            speculative
+                .await
+                .expect("join")
+                .expect("producer")
+                .is_none(),
+            "the speculative pass must yield rather than publish"
+        );
+        let made = match outcome {
+            OfflineProduceOutcome::Ready(made) | OfflineProduceOutcome::Cached(made) => made,
+            other => panic!("offline preparation did not finish: {other:?}"),
+        };
+        assert!(
+            made.parts >= 2,
+            "offline preparation restarted instead of resuming the preempted part"
+        );
+    }
+
     /// Preempted mid-encode, then resumed — and the film that comes out has no
     /// hole in it.
     ///
@@ -7655,7 +7800,7 @@ mod tests {
         // modern ffmpeg, so the coverage is not lost.
         if !crate::ffmpeg::pacing_caps().await.readrate {
             eprintln!(
-                "skipping a_preempted_producer_resumes_without_losing_picture: \
+                "SKIP: a_preempted_producer_resumes_without_losing_picture: \
                  `{}` has no -readrate (needs ffmpeg 5.1+), so a producer part's \
                  duration cannot be made independent of this machine's speed",
                 crate::ffmpeg::ffmpeg_bin()

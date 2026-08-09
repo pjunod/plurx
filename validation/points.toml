@@ -203,7 +203,7 @@ timeout_seconds = 600
 [[checks]]
 id = "playback-recovery"
 title = "Interrupted playback production resumes without losing media"
-command = "cargo test -p plurxd transcode::tests::a_preempted_producer_resumes_without_losing_picture -- --exact --nocapture"
+command = "cargo test -p plurxd ffmpeg::tests::nightly_runner_has_ffmpeg_readrate -- --exact --ignored --nocapture && cargo test -p plurxd transcode::tests::a_preempted_producer_resumes_without_losing_picture -- --exact --nocapture"
 profiles = ["nightly"]
 platforms = ["darwin", "linux"]
 requires = ["cargo", "ffmpeg"]

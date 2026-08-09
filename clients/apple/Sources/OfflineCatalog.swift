@@ -18,9 +18,10 @@ actor OfflineCatalog {
     private let backupURL: URL
     private var items: [String: OfflineItem]
 
-    init(fileManager: FileManager = .default) {
+    init(fileManager: FileManager = .default, directory injectedDirectory: URL? = nil) {
         let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let directory = support.appendingPathComponent("Offline", isDirectory: true)
+        let directory = injectedDirectory
+            ?? support.appendingPathComponent("Offline", isDirectory: true)
         let indexURL = directory.appendingPathComponent("index.json")
         let backupURL = directory.appendingPathComponent("index.backup.json")
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -71,6 +72,21 @@ actor OfflineCatalog {
         guard items[item.id] != nil else { return }
         items[item.id] = item
         try persist()
+    }
+
+    /// Read-modify-write without an actor reentrancy gap. Delegate callbacks
+    /// must never carry a stale item snapshot across an await and replace a
+    /// terminal state written by a later callback.
+    @discardableResult
+    func update(
+        id: String,
+        _ change: (inout OfflineItem) -> Bool
+    ) throws -> OfflineItem? {
+        guard var item = items[id], change(&item) else { return nil }
+        item.updatedAt = Date()
+        items[id] = item
+        try persist()
+        return item
     }
 
     func otherProfiles(serverInstanceId: String?, userId: Int?) -> [OfflineProfileSummary] {

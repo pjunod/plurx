@@ -50,6 +50,22 @@ private actor ArtworkDownloadProbe {
     }
 }
 
+private actor OfflineMutationGate {
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func open() {
+        opened = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
 private extension View {
     func reportLayoutWidth() -> some View {
         background {
@@ -102,6 +118,125 @@ private struct DetailNavigationTestHost<Content: View>: View {
 #endif
 
 final class AppleClientTests: XCTestCase {
+    func testSameDeliveryRecoveryKeepsOfflinePlaybackOnTheLocalAsset() {
+        XCTAssertEqual(
+            PlayerController.recoveryTransport(hasOfflineAsset: true),
+            .offlineAsset
+        )
+        XCTAssertEqual(
+            PlayerController.recoveryTransport(hasOfflineAsset: false),
+            .serverSession
+        )
+    }
+
+    #if os(iOS)
+    func testOfflineDecisionKeepsDownloadedIntroAndCreditsMarkers() {
+        let markers = [
+            Marker(kind: "intro", label: "Skip Intro", startMs: 1_000, endMs: 9_000),
+            Marker(kind: "credits", label: "Skip Credits", startMs: 80_000, endMs: 90_000),
+        ]
+        let item = OfflineItem(
+            id: "marked-download",
+            requestId: "request",
+            serverInstanceId: "server",
+            userId: 7,
+            itemId: 11,
+            fileId: 13,
+            packageId: "package",
+            leaseToken: nil,
+            manifestURL: nil,
+            title: "Flight",
+            context: nil,
+            durationMs: 90_000,
+            posterFile: nil,
+            requestedHeight: 720,
+            actualHeight: 720,
+            audioLabel: nil,
+            subtitleLabel: nil,
+            subtitleIndex: nil,
+            state: .downloaded,
+            phase: "downloaded",
+            bytesDownloaded: 10,
+            bytesTotal: 10,
+            localAssetRelativePath: "Offline/Flight.movpkg",
+            markers: markers,
+            positionMs: 0,
+            recordedAt: nil,
+            pendingProgress: false,
+            errorMessage: nil,
+            updatedAt: Date()
+        )
+
+        XCTAssertEqual(PlayerController.offlineDecision(item).markers, markers)
+    }
+    #endif
+
+    func testLateOfflineProgressCannotRegressACompletedCatalogItem() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-catalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let catalog = OfflineCatalog(directory: directory)
+        let id = "ordered-download"
+        try await catalog.upsert(OfflineItem(
+            id: id,
+            requestId: "request",
+            serverInstanceId: "server",
+            userId: 7,
+            itemId: 11,
+            fileId: 13,
+            packageId: "package",
+            leaseToken: nil,
+            manifestURL: nil,
+            title: "Flight",
+            context: nil,
+            durationMs: 90_000,
+            posterFile: nil,
+            requestedHeight: 720,
+            actualHeight: 720,
+            audioLabel: nil,
+            subtitleLabel: nil,
+            subtitleIndex: nil,
+            state: .downloading,
+            phase: "downloading",
+            bytesDownloaded: 1,
+            bytesTotal: 10,
+            localAssetRelativePath: nil,
+            markers: [],
+            positionMs: 0,
+            recordedAt: nil,
+            pendingProgress: false,
+            errorMessage: nil,
+            updatedAt: Date()
+        ))
+
+        let gate = OfflineMutationGate()
+        let lateProgress = Task {
+            await gate.wait()
+            return try await catalog.update(id: id) { item in
+                guard item.state == .downloading else { return false }
+                item.bytesDownloaded = 5
+                return true
+            }
+        }
+        let completion = Task {
+            let completed = try await catalog.update(id: id) { item in
+                item.state = .downloaded
+                item.phase = "downloaded"
+                item.bytesDownloaded = item.bytesTotal ?? item.bytesDownloaded
+                return true
+            }
+            await gate.open()
+            return completed
+        }
+
+        let completed = try await completion.value
+        let staleProgress = try await lateProgress.value
+        XCTAssertNotNil(completed)
+        XCTAssertNil(staleProgress)
+        let stored = await catalog.item(id: id)
+        XCTAssertEqual(stored?.state, .downloaded)
+        XCTAssertEqual(stored?.bytesDownloaded, 10)
+    }
     override func tearDown() {
         Session.shared.origin = ""
         Session.shared.token = nil

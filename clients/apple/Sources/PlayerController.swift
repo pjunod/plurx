@@ -532,6 +532,11 @@ enum PlayerItemEndAction: Equatable {
     case finish(durationMs: Int)
 }
 
+enum SameDeliveryRecoveryTransport: Equatable {
+    case serverSession
+    case offlineAsset
+}
+
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
@@ -615,6 +620,7 @@ final class PlayerController: ObservableObject {
     private var title = ""
     #if os(iOS)
     private var offlineId: String?
+    private var offlineAssetURL: URL?
     #endif
     private var audioOverride: Int?
     private weak var model: AppModel?
@@ -769,6 +775,10 @@ final class PlayerController: ObservableObject {
     ) {
         guard !started else { return }
         started = true
+        #if os(iOS)
+        offlineId = nil
+        offlineAssetURL = nil
+        #endif
         self.model = model
         self.itemId = itemId
         self.fileId = fileId
@@ -832,6 +842,7 @@ final class PlayerController: ObservableObject {
         started = true
         self.model = model
         offlineId = offline.id
+        offlineAssetURL = OfflineCatalog.localURL(for: path)
         itemId = offline.itemId
         fileId = offline.fileId
         knownDurationMs = offline.durationMs ?? 0
@@ -857,10 +868,11 @@ final class PlayerController: ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(true)
         installRemoteCommands()
         addPeriodicObserver()
+        startPlaybackRecoveryMonitor()
         Task { await loadOffline(url: OfflineCatalog.localURL(for: path), startMs: currentMs) }
     }
 
-    private static func offlineDecision(_ item: OfflineItem) -> Decision {
+    nonisolated static func offlineDecision(_ item: OfflineItem) -> Decision {
         let audio = item.audioLabel.map {
             [AudioTrack(index: 0, codec: "aac", channels: nil, language: nil, title: $0, default: true)]
         }
@@ -939,6 +951,14 @@ final class PlayerController: ObservableObject {
         failed = false
         attachmentRecovery.opened(at: startMs)
         updateNowPlaying()
+    }
+
+    private func reloadOffline(at positionMs: Int) async {
+        guard let offlineAssetURL, started else { return }
+        isChangingStream = true
+        playbackRecoveryMonitor.reset()
+        await loadOffline(url: offlineAssetURL, startMs: positionMs)
+        isChangingStream = false
     }
     #endif
 
@@ -1142,6 +1162,8 @@ final class PlayerController: ObservableObject {
             Task { await model?.endHlsSession(sessionId) }
         }
         #if os(iOS)
+        offlineId = nil
+        offlineAssetURL = nil
         if wasStarted {
             removeRemoteCommands()
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -1860,6 +1882,12 @@ final class PlayerController: ObservableObject {
         reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
         case .reopen:
+            #if os(iOS)
+            if Self.recoveryTransport(hasOfflineAsset: offlineAssetURL != nil) == .offlineAsset {
+                await reloadOffline(at: event.positionMs)
+                return
+            }
+            #endif
             await reopen(at: event.positionMs)
         case .stop(let terminal):
             player.pause()
@@ -1869,6 +1897,12 @@ final class PlayerController: ObservableObject {
             failed = terminal.failed
             playbackError = terminal.message
         }
+    }
+
+    nonisolated static func recoveryTransport(
+        hasOfflineAsset: Bool
+    ) -> SameDeliveryRecoveryTransport {
+        hasOfflineAsset ? .offlineAsset : .serverSession
     }
 
     private func fail(_ error: Error) {

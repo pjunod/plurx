@@ -57,6 +57,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(system::stop_session),
         )
         .route(
+            "/activity/offline/{id}",
+            axum::routing::delete(system::stop_offline_package),
+        )
+        .route(
             "/activity/producer",
             axum::routing::delete(system::stop_producer),
         )
@@ -2705,6 +2709,57 @@ mod tests {
         assert_eq!(activity["offline"][0]["title"], "Flight");
         assert_eq!(activity["offline"][0]["state"], "queued");
         assert_eq!(activity["offline"][0]["user"], "paul");
+        assert_eq!(activity["offline"][0]["id"], package_id);
+
+        let (status_code, second) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file_id}/offline-packages"),
+                Some(&admin),
+                json!({
+                    "request_id": uuid::Uuid::new_v4().to_string(),
+                    "height": 720,
+                    "audio_index": 0,
+                    "subtitle_index": 1
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::ACCEPTED, "{second}");
+        let second_id = second["id"].as_str().expect("second package id");
+        assert_eq!(
+            call(
+                &app,
+                delete(&format!("/api/v1/activity/offline/{second_id}"), None),
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            call(
+                &app,
+                delete(
+                    &format!("/api/v1/activity/offline/{second_id}"),
+                    Some(&admin),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::OK,
+        );
+        assert!(state
+            .store
+            .offline_package_for_user(second_id, 1)
+            .await
+            .expect("cancelled lookup")
+            .is_none());
+        assert!(state
+            .store
+            .offline_package_for_user(&package_id, 1)
+            .await
+            .expect("unrelated lookup")
+            .is_some());
 
         let (status_code, summary) = call(&app, get("/api/v1/activity", Some(&admin))).await;
         assert_eq!(status_code, StatusCode::OK, "{summary}");
@@ -2717,7 +2772,7 @@ mod tests {
         let (status_code, metrics) = call_text(&app, get("/metrics", None)).await;
         assert_eq!(status_code, StatusCode::OK);
         assert!(metrics.contains("plurx_offline_packages{state=\"queued\"} 1"));
-        assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 2"));
         assert!(metrics.contains("plurx_cache_protected_entries{reason=\"active_playback\"} 0"));
         assert!(
             !metrics.contains("Flight"),
@@ -2799,6 +2854,26 @@ mod tests {
         .await;
         assert_eq!(status_code, StatusCode::CREATED, "{lease}");
 
+        state
+            .store
+            .put_setting(plurx_core::store::keys::OFFLINE_ENABLED, "0")
+            .await
+            .expect("disable offline");
+        let (status_code, disabled) = call_text(
+            &app,
+            get(
+                &format!("/api/v1/offline/media/{}/index.m3u8", "a".repeat(64)),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE, "{disabled}");
+        state
+            .store
+            .put_setting(plurx_core::store::keys::OFFLINE_ENABLED, "1")
+            .await
+            .expect("enable offline");
+
         let eviction = state.transcode.begin_cache_eviction_for_test("test-recipe");
         let (status_code, _) = call_text(
             &app,
@@ -2841,7 +2916,7 @@ mod tests {
             .is_none());
         let (_, metrics) = call_text(&app, get("/metrics", None)).await;
         assert!(metrics.contains("plurx_offline_packages{state=\"ready\"} 0"));
-        assert!(metrics.contains("plurx_offline_cancellations_total 0"));
+        assert!(metrics.contains("plurx_offline_cancellations_total 1"));
         assert!(metrics.contains("plurx_offline_transfer_bytes_total 7"));
     }
 
