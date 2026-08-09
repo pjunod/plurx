@@ -5,6 +5,7 @@
 //! [`Store`](super::Store) until M2 imports existing state and activates this
 //! backend; backend completeness alone is not permission to skip that gate.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,11 +83,140 @@ impl ClusterCompatibility {
 /// A hiqlite client implementing the complete replicated [`Store`](super::Store).
 #[derive(Clone)]
 pub struct HiqliteAuthStore {
-    pub(super) client: Client,
+    client: TimedClient,
     clock: Arc<dyn Clock>,
 }
 
+/// The only application-facing path to hiqlite. Keeping the timeout at this
+/// boundary prevents new catalogue or durable-store calls from accidentally
+/// waiting forever on a wedged leader.
+#[derive(Clone)]
+pub(super) struct TimedClient(TimedClientInner);
+
+#[derive(Clone)]
+enum TimedClientInner {
+    Connected(Client),
+    #[cfg(test)]
+    Disconnected,
+}
+
+impl TimedClient {
+    fn new(client: Client) -> Self {
+        Self(TimedClientInner::Connected(client))
+    }
+
+    fn inner(&self) -> &Client {
+        match &self.0 {
+            TimedClientInner::Connected(client) => client,
+            #[cfg(test)]
+            TimedClientInner::Disconnected => {
+                panic!("validation test attempted hiqlite I/O")
+            }
+        }
+    }
+
+    pub(super) async fn query_consistent_map<T, S>(
+        &self,
+        sql: S,
+        params: hiqlite::Params,
+    ) -> Result<Vec<T>, StoreError>
+    where
+        T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
+        S: Into<Cow<'static, str>>,
+    {
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().query_consistent_map(sql, params)).await
+    }
+
+    pub(super) async fn query_map<T, S>(
+        &self,
+        sql: S,
+        params: hiqlite::Params,
+    ) -> Result<Vec<T>, StoreError>
+    where
+        T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
+        S: Into<Cow<'static, str>>,
+    {
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().query_map(sql, params)).await
+    }
+
+    pub(super) async fn execute<S>(
+        &self,
+        sql: S,
+        params: hiqlite::Params,
+    ) -> Result<usize, StoreError>
+    where
+        S: Into<Cow<'static, str>>,
+    {
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute(sql, params)).await
+    }
+
+    pub(super) async fn execute_returning_map<S, T>(
+        &self,
+        sql: S,
+        params: hiqlite::Params,
+    ) -> Result<Vec<Result<T, hiqlite::Error>>, StoreError>
+    where
+        S: Into<Cow<'static, str>>,
+        T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
+    {
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute_returning_map(sql, params)).await
+    }
+
+    pub(super) async fn execute_returning_map_one<S, T>(
+        &self,
+        sql: S,
+        params: hiqlite::Params,
+    ) -> Result<T, StoreError>
+    where
+        S: Into<Cow<'static, str>>,
+        T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
+    {
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute_returning_map_one(sql, params)).await
+    }
+
+    pub(super) async fn txn<C, Q>(
+        &self,
+        statements: Q,
+    ) -> Result<Vec<Result<usize, hiqlite::Error>>, StoreError>
+    where
+        Q: IntoIterator<Item = (C, hiqlite::Params)>,
+        C: Into<Cow<'static, str>>,
+    {
+        let statements = statements
+            .into_iter()
+            .map(|(sql, params)| (sql.into(), params))
+            .collect::<Vec<_>>();
+        for (sql, _) in &statements {
+            validate_sql(sql)?;
+        }
+        timeout_store(self.inner().txn(statements)).await
+    }
+
+    pub(super) async fn is_healthy_db(&self) -> Result<(), StoreError> {
+        timeout_store(self.inner().is_healthy_db()).await
+    }
+}
+
+#[cfg(test)]
+pub(super) fn disconnected_test_client() -> TimedClient {
+    TimedClient(TimedClientInner::Disconnected)
+}
+
 impl HiqliteAuthStore {
+    pub(super) fn client(&self) -> &TimedClient {
+        &self.client
+    }
+
     /// Create the complete durable schema on a fresh cluster and seed its
     /// logical identity.
     ///
@@ -161,7 +291,13 @@ impl HiqliteAuthStore {
         &self,
         supported: ClusterCompatibility,
     ) -> Result<(), StoreError> {
-        Self::preflight_voter(&self.client, supported).await
+        let sql = "SELECT schema_version, protocol_min, protocol_max \
+                   FROM cluster_meta WHERE singleton = 1";
+        let meta = self
+            .client()
+            .query_consistent_map::<CompatibilityRow, _>(sql, params!())
+            .await?;
+        verify_compatibility_rows(meta, supported)
     }
 
     /// Hash ordered local state for the separate-process replica-equality gate.
@@ -212,7 +348,7 @@ impl HiqliteAuthStore {
         for sql in statements {
             validate_sql(sql)?;
         }
-        timeout_store(self.client.txn(vec![
+        timeout_store(self.client().txn(vec![
             (statements[0].to_owned(), params!()),
             (statements[1].to_owned(), params!()),
             (statements[2].to_owned(), params!()),
@@ -244,7 +380,7 @@ impl HiqliteAuthStore {
     pub async fn validation_local_catalog_truth_digest(&self) -> Result<String, StoreError> {
         tokio::time::timeout(
             STORE_TIMEOUT,
-            super::hiqlite_catalog::local_catalog_truth_digest(&self.client),
+            super::hiqlite_catalog::local_catalog_truth_digest(self.client()),
         )
         .await
         .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
@@ -263,7 +399,7 @@ impl HiqliteAuthStore {
         Ok(AuthStoreDump {
             catalog_digest: tokio::time::timeout(
                 STORE_TIMEOUT,
-                super::hiqlite_catalog::local_catalog_digest(&self.client),
+                super::hiqlite_catalog::local_catalog_digest(self.client()),
             )
             .await
             .map_err(|_| {
@@ -271,36 +407,36 @@ impl HiqliteAuthStore {
             })??,
             durable_digest: tokio::time::timeout(
                 STORE_TIMEOUT,
-                super::hiqlite_durable::local_durable_digest(&self.client),
+                super::hiqlite_durable::local_durable_digest(self.client()),
             )
             .await
             .map_err(|_| {
                 StoreError::Database("replicated store operation timed out".to_owned())
             })??,
-            cluster_meta: timeout_store(self.client.query_map(
+            cluster_meta: timeout_store(self.client().query_map(
                 "SELECT singleton, schema_version, protocol_min, protocol_max, migrated_at \
                      FROM cluster_meta ORDER BY singleton",
                 params!(),
             ))
             .await?,
-            settings: timeout_store(self.client.query_map(
+            settings: timeout_store(self.client().query_map(
                 "SELECT key, value, updated_at FROM settings ORDER BY key",
                 params!(),
             ))
             .await?,
-            users: timeout_store(self.client.query_map(
+            users: timeout_store(self.client().query_map(
                 "SELECT id, username, password_hash, is_admin, created_at \
                      FROM users ORDER BY id",
                 params!(),
             ))
             .await?,
-            tokens: timeout_store(self.client.query_map(
+            tokens: timeout_store(self.client().query_map(
                 "SELECT token_hash, user_id, device, created_at, last_seen_at \
                      FROM tokens ORDER BY token_hash",
                 params!(),
             ))
             .await?,
-            api_keys: timeout_store(self.client.query_map(
+            api_keys: timeout_store(self.client().query_map(
                 "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
                      FROM api_keys ORDER BY id",
                 params!(),
@@ -310,7 +446,10 @@ impl HiqliteAuthStore {
     }
 
     fn with_clock(client: Client, clock: Arc<dyn Clock>) -> Self {
-        Self { client, clock }
+        Self {
+            client: TimedClient::new(client),
+            clock,
+        }
     }
 
     pub(super) fn now(&self) -> Result<i64, StoreError> {
@@ -323,7 +462,7 @@ impl HiqliteAuthStore {
         params: hiqlite::Params,
     ) -> Result<usize, StoreError> {
         validate_sql(sql)?;
-        timeout_store(self.client.execute(sql, params)).await
+        timeout_store(self.client().execute(sql, params)).await
     }
 
     async fn user_optional(
@@ -332,8 +471,11 @@ impl HiqliteAuthStore {
         params: hiqlite::Params,
     ) -> Result<Option<User>, StoreError> {
         validate_sql(sql)?;
-        let mut rows =
-            timeout_store(self.client.query_consistent_map::<UserRow, _>(sql, params)).await?;
+        let mut rows = timeout_store(
+            self.client()
+                .query_consistent_map::<UserRow, _>(sql, params),
+        )
+        .await?;
         Ok(rows.pop().map(Into::into))
     }
 
@@ -344,7 +486,7 @@ impl HiqliteAuthStore {
     ) -> Result<Option<ApiKey>, StoreError> {
         validate_sql(sql)?;
         let mut rows = timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<ApiKeyRow, _>(sql, params),
         )
         .await?;
@@ -355,11 +497,11 @@ impl HiqliteAuthStore {
 #[async_trait]
 impl SettingsStore for HiqliteAuthStore {
     async fn ping(&self) -> Result<(), StoreError> {
-        timeout_store(self.client.is_healthy_db()).await?;
+        timeout_store(self.client().is_healthy_db()).await?;
         let sql = "SELECT 1 AS healthy";
         validate_sql(sql)?;
         let rows = timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<PingRow, _>(sql, params!()),
         )
         .await?;
@@ -376,7 +518,7 @@ impl SettingsStore for HiqliteAuthStore {
         let sql = "SELECT value FROM settings WHERE key = $1";
         validate_sql(sql)?;
         let rows = timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<SettingValueRow, _>(sql, params!(key)),
         )
         .await?;
@@ -408,7 +550,7 @@ impl UserStore for HiqliteAuthStore {
         let sql = "SELECT COUNT(*) AS count FROM users";
         validate_sql(sql)?;
         let rows = timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<CountRow, _>(sql, params!()),
         )
         .await?;
@@ -427,7 +569,7 @@ impl UserStore for HiqliteAuthStore {
                    VALUES ($1, $2, $3, $4) \
                    RETURNING id, username, password_hash, is_admin, created_at";
         validate_sql(sql)?;
-        let row = timeout_store(self.client.execute_returning_map_one::<_, UserRow>(
+        let row = timeout_store(self.client().execute_returning_map_one::<_, UserRow>(
             sql,
             params!(username, password_hash, is_admin, now),
         ))
@@ -458,7 +600,7 @@ impl UserStore for HiqliteAuthStore {
                    FROM users ORDER BY username";
         validate_sql(sql)?;
         Ok(timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<UserRow, _>(sql, params!()),
         )
         .await?
@@ -478,7 +620,7 @@ impl UserStore for HiqliteAuthStore {
         let sql = "SELECT COUNT(*) AS count FROM users WHERE is_admin = 1";
         validate_sql(sql)?;
         let rows = timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<CountRow, _>(sql, params!()),
         )
         .await?;
@@ -580,7 +722,7 @@ impl ApiKeyStore for HiqliteAuthStore {
                    RETURNING id, name, key_hash, scopes, created_at, last_used_at, disabled";
         validate_sql(sql)?;
         let row =
-            timeout_store(self.client.execute_returning_map_one::<_, ApiKeyRow>(
+            timeout_store(self.client().execute_returning_map_one::<_, ApiKeyRow>(
                 sql,
                 params!(name, key_hash, scopes, now),
             ))
@@ -593,7 +735,7 @@ impl ApiKeyStore for HiqliteAuthStore {
                    FROM api_keys ORDER BY created_at, id";
         validate_sql(sql)?;
         Ok(timeout_store(
-            self.client
+            self.client()
                 .query_consistent_map::<ApiKeyRow, _>(sql, params!()),
         )
         .await?
@@ -757,9 +899,12 @@ pub(super) fn database_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::Database(error.to_string())
 }
 
-async fn timeout_store<T>(
-    operation: impl std::future::Future<Output = Result<T, hiqlite::Error>>,
-) -> Result<T, StoreError> {
+pub(super) async fn timeout_store<T, E>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, StoreError>
+where
+    E: std::fmt::Display,
+{
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
         .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
@@ -989,6 +1134,46 @@ dump_row!(ApiKeyDumpRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicated_store_modules_cannot_bypass_the_timed_client_accessor() {
+        for (name, source) in [
+            ("catalog", include_str!("hiqlite_catalog.rs")),
+            ("media", include_str!("hiqlite_media.rs")),
+            ("durable", include_str!("hiqlite_durable.rs")),
+        ] {
+            let compact: String = source
+                .chars()
+                .filter(|char| !char.is_whitespace())
+                .collect();
+            assert!(
+                !compact.contains("self.client."),
+                "{name} store bypasses HiqliteAuthStore::client(), which enforces the 3s timeout"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_read_accessors_reject_misordered_placeholders_before_io() {
+        let client = disconnected_test_client();
+        for error in [
+            client
+                .query_consistent_map::<CountRow, _>(
+                    "SELECT $2 AS count WHERE $1 = 1",
+                    params!(1, 2),
+                )
+                .await
+                .err()
+                .expect("consistent helper must validate SQL"),
+            client
+                .query_map::<CountRow, _>("SELECT $2 AS count WHERE $1 = 1", params!(1, 2))
+                .await
+                .err()
+                .expect("local helper must validate SQL"),
+        ] {
+            assert!(error.to_string().contains("expected $1, found $2"));
+        }
+    }
 
     #[test]
     fn replicated_auth_schema_and_writes_bind_every_clock_value() {

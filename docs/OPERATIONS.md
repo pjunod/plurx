@@ -163,9 +163,12 @@ path must match. Fix the mount, not the library name.
 ### Scan deletion and root-identity safety
 
 A complete scan refuses vanished-file cleanup when it would exceed
-`storage.scan_prune_percent`. The percentage is a hard ceiling rounded down;
-the scan still records new and changed files, but keeps every apparently
-missing row and reports the refusal in library status and logs.
+`storage.scan_prune_percent`. A non-zero percentage permits at least one
+removal from a non-empty library, so one missing file cannot permanently wedge
+a small library; `0` still disables automatic removal. Above that floor, the
+percentage is a hard ceiling rounded down. A refused scan still records new and
+changed files, but keeps every apparently missing row and reports the refusal
+in library status and logs.
 
 The first verified, non-empty scan records the library's canonical path-set
 identity. Changing a library's paths clears that identity automatically. For a

@@ -10,7 +10,7 @@ use hiqlite::Row;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore};
+use super::hiqlite::{database_error, timeout_store, validate_sql, HiqliteAuthStore, TimedClient};
 use super::{
     OfflinePackageStore, OutboxEntry, TraktStore, TranscodeCacheStore, WatchedOutboxStore,
 };
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS offline_lease_guards (
 
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
     validate_sql(DURABLE_SCHEMA)?;
-    for result in client.batch(DURABLE_SCHEMA).await.map_err(database_error)? {
+    for result in timeout_store(client.batch(DURABLE_SCHEMA)).await? {
         result.map_err(database_error)?;
     }
     Ok(())
@@ -159,8 +159,8 @@ struct DurableDump {
     offline_lease_guards: Vec<String>,
 }
 
-pub(super) async fn local_durable_digest(client: &hiqlite::Client) -> Result<String, StoreError> {
-    async fn rows(client: &hiqlite::Client, sql: &'static str) -> Result<Vec<String>, StoreError> {
+pub(super) async fn local_durable_digest(client: &TimedClient) -> Result<String, StoreError> {
+    async fn rows(client: &TimedClient, sql: &'static str) -> Result<Vec<String>, StoreError> {
         Ok(client
             .query_map::<JsonValueRow, _>(sql, params!())
             .await
@@ -344,7 +344,7 @@ impl TryFrom<SyncCandidateRow> for Option<SyncCandidate> {
 impl TraktStore for HiqliteAuthStore {
     async fn get_trakt_auth(&self, user_id: i64) -> Result<Option<TraktAuth>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<TraktAuthRow, _>(
                 format!("SELECT {TRAKT_AUTH_COLS} FROM trakt_auth WHERE user_id = $1"),
                 params!(user_id),
@@ -358,7 +358,7 @@ impl TraktStore for HiqliteAuthStore {
 
     async fn list_trakt_auth(&self) -> Result<Vec<TraktAuth>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<TraktAuthRow, _>(
                 format!("SELECT {TRAKT_AUTH_COLS} FROM trakt_auth ORDER BY user_id"),
                 params!(),
@@ -456,7 +456,7 @@ impl TraktStore for HiqliteAuthStore {
     }
 
     async fn trakt_sync_candidates(&self, user_id: i64) -> Result<Vec<SyncCandidate>, StoreError> {
-        self.client
+        self.client()
             .query_consistent_map::<SyncCandidateRow, _>(
                 "SELECT i.id AS item_id, i.kind AS kind, i.tmdb_id AS own_tmdb, \
                         i.season_number AS season_number, i.episode_number AS episode_number, \
@@ -529,7 +529,7 @@ impl WatchedOutboxStore for HiqliteAuthStore {
                  VALUES ($1, 0, '', 'pending', $2, $2, $2, 0) RETURNING id";
         validate_sql(sql)?;
         let mut rows = self
-            .client
+            .client()
             .execute_returning_map::<_, IdRow>(sql, params!(payload, now))
             .await
             .map_err(database_error)?;
@@ -550,7 +550,7 @@ impl WatchedOutboxStore for HiqliteAuthStore {
                  RETURNING id, payload, attempts, last_error, status, next_at, claim_until";
         validate_sql(sql)?;
         Ok(self
-            .client
+            .client()
             .execute_returning_map::<_, OutboxRow>(sql, params!(claim_until, now, limit))
             .await
             .map_err(database_error)?
@@ -583,8 +583,7 @@ impl WatchedOutboxStore for HiqliteAuthStore {
     }
 
     async fn watched_outbox_counts(&self) -> Result<(i64, i64, i64), StoreError> {
-        let row = self
-            .client
+        let row = self.client()
             .query_consistent_map::<OutboxCountsRow, _>(
                 "SELECT COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending, \
                         COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) AS ok, \
@@ -681,7 +680,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
         node_id: &str,
     ) -> Result<Option<CachedTranscode>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<CacheRow, _>(
                 format!(
                     "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
@@ -728,7 +727,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -783,7 +782,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
         limit: i64,
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
-            self.client
+            self.client()
                 .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
@@ -808,7 +807,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
         older_than_unix: i64,
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
-            self.client
+            self.client()
                 .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
@@ -828,7 +827,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
 
     async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
-            self.client
+            self.client()
                 .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
@@ -866,7 +865,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
         for (sql, _) in &statements {
             validate_sql(sql)?;
         }
-        self.client
+        self.client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -878,7 +877,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
 
     async fn cache_bytes(&self, node_id: &str) -> Result<i64, StoreError> {
         let row = self
-            .client
+            .client()
             .query_consistent_map::<ScalarRow, _>(
                 "SELECT COALESCE(SUM(l.bytes), 0) AS value \
                  FROM transcode_cache_locations l \
@@ -1205,7 +1204,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         validate_sql(sql)?;
         for attempt in 0..2 {
             let inserted = self
-                .client
+                .client()
                 .execute_returning_map::<_, OfflinePackageRow>(
                     sql,
                     params!(
@@ -1244,7 +1243,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             }
 
             if let Some(existing) = one_package(
-                self.client
+                self.client()
                     .query_consistent_map::<OfflinePackageRow, _>(
                         format!(
                             "SELECT {PACKAGE_COLS} FROM offline_packages \
@@ -1263,7 +1262,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             }
 
             let admission = self
-                .client
+                .client()
                 .query_consistent_map::<OfflineAdmissionRow, _>(
                     "SELECT \
                        (SELECT COUNT(*) FROM offline_packages WHERE user_id = $1) AS rows, \
@@ -1322,7 +1321,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         user_id: i64,
     ) -> Result<Option<OfflinePackage>, StoreError> {
         Ok(one_package(
-            self.client
+            self.client()
                 .query_consistent_map::<OfflinePackageRow, _>(
                     format!(
                         "SELECT {PACKAGE_COLS} FROM offline_packages \
@@ -1361,7 +1360,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let changed = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -1382,7 +1381,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         limit: i64,
     ) -> Result<Vec<OfflineActivityPackage>, StoreError> {
         let rows = self
-            .client
+            .client()
             .query_consistent_map::<OfflineActivityRow, _>(
                 format!(
                     "SELECT {}, EXISTS (SELECT 1 FROM offline_package_leases l \
@@ -1418,8 +1417,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         node_id: &str,
         now: i64,
     ) -> Result<OfflinePackageStats, StoreError> {
-        let row = self
-            .client
+        let row = self.client()
             .query_consistent_map::<OfflineStatsRow, _>(
                 "SELECT COALESCE(SUM(state = 'queued'), 0) AS queued, \
                     COALESCE(SUM(state = 'preparing'), 0) AS preparing, \
@@ -1485,7 +1483,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
                     error_message, created_at, updated_at, last_access_at, expires_at";
         validate_sql(sql)?;
         let rows = self
-            .client
+            .client()
             .execute_returning_map::<_, OfflinePackageRow>(sql, params!(now, node_id))
             .await
             .map_err(database_error)?
@@ -1613,7 +1611,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -1622,7 +1620,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             .map_err(database_error)?;
         if results.first().copied().unwrap_or(0) == 0 {
             let state = self
-                .client
+                .client()
                 .query_consistent_map::<StateRow, _>(
                     "SELECT state FROM offline_packages WHERE id = $1 AND user_id = $2",
                     params!(package_id, user_id),
@@ -1639,7 +1637,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             });
         }
         let lease = self
-            .client
+            .client()
             .query_consistent_map::<OfflineLeaseRow, _>(
                 "SELECT token_hash, package_id, created_at, last_access_at, expires_at \
                  FROM offline_package_leases WHERE package_id = $1",
@@ -1671,7 +1669,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             package_cols("p")
         );
         let package = one_package(
-            self.client
+            self.client()
                 .query_consistent_map::<OfflinePackageRow, _>(
                     query.clone(),
                     params!(token_hash, now),
@@ -1705,7 +1703,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
