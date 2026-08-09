@@ -3463,16 +3463,40 @@ final class AppleClientTests: XCTestCase {
 
     @MainActor
     func testPhoneHomeHeroKeepsEqualInsetsOnBothEdges() {
+        let backdrop = UIGraphicsImageRenderer(
+            size: CGSize(width: 160, height: 90)
+        ).image { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 160, height: 90))
+        }
+
         for viewportWidth: CGFloat in [375, 430] {
             var heroFrame: CGRect = .null
             let controller = UIHostingController(rootView:
-                Color.clear
-                    .frame(maxWidth: .infinity, minHeight: HomeHeroMetrics.compactHeight)
-                    .reportLayoutFrame()
-                    .modifier(IOSHomeHeroLayout(compact: true))
-                    .onPreferenceChange(LayoutFramePreferenceKey.self) {
-                        heroFrame = $0
+                NavigationStack {
+                    ScrollView {
+                        LazyVStack(alignment: .leading) {
+                            NavigationLink(value: 1) {
+                                ZStack {
+                                    Image(uiImage: backdrop)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: HomeHeroMetrics.compactHeight)
+                                        .clipped()
+                                }
+                                .modifier(IOSHomeHeroCardLayout())
+                                .reportLayoutFrame()
+                            }
+                            .featuredButtonStyle()
+                            .modifier(IOSHomeHeroLayout(compact: true))
+                        }
                     }
+                    .navigationDestination(for: Int.self) { _ in Color.clear }
+                }
+                .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                    heroFrame = $0
+                }
             )
 
             controller.view.frame = CGRect(
