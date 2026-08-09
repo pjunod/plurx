@@ -52,3 +52,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "val timeline = sessionPlaybackTimeline"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/MediaOriginTest.kt"
 test_anchor = "hlsSessionOriginDrivesTheControllerTimeline"
+
+[[fixes]]
+id = "apple.ttff-position-rebase"
+commits = ["787ea3a0"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "mutating func rebasePosition(at positionMs: Int)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock"
