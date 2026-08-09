@@ -22,6 +22,7 @@ audit_paths = [
   "vendor/**",
 ]
 audit_exclude = []
+allow_unmatched_globs = ["docs/METADATA*.md"]
 
 [[checks]]
 id = "catalog-contract"

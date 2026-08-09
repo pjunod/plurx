@@ -255,6 +255,39 @@ checks = ["baseline"]
             errors,
         )
 
+    def test_lint_rejects_a_glob_that_matches_no_tracked_file(self):
+        catalog = self.load(
+            CATALOG.replace('paths = ["web/**/*.js"]', 'paths = ["renamed/**/*.js"]')
+        )
+        errors = lint_catalog(
+            catalog,
+            audit=False,
+            tracked_paths=("src/lib.rs", "web/app.js"),
+        )
+
+        self.assertIn(
+            "point web path glob matches no tracked file: 'renamed/**/*.js'",
+            errors,
+        )
+
+    def test_forward_looking_glob_needs_an_exact_allowlist_entry(self):
+        catalog = self.load(
+            CATALOG.replace(
+                'always_checks = ["baseline"]',
+                'always_checks = ["baseline"]\nallow_unmatched_globs = ["future/**/*.md"]',
+            ).replace('paths = ["web/**/*.js"]', 'paths = ["future/**/*.md"]')
+        )
+        errors = lint_catalog(
+            catalog,
+            audit=False,
+            tracked_paths=("src/lib.rs",),
+        )
+
+        self.assertNotIn(
+            "point web path glob matches no tracked file: 'future/**/*.md'",
+            errors,
+        )
+
     def test_missing_optional_prerequisite_is_visible_and_strict_can_fail_it(self):
         catalog = self.load()
         check = dataclasses.replace(
