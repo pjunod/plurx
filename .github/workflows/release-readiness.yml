@@ -1,0 +1,34 @@
+name: release readiness
+
+on:
+  schedule:
+    - cron: "41 16 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-check:
+    name: current version is ready to tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install media and browser prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Verify release readiness
+        run: make release-check
