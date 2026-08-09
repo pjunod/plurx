@@ -149,6 +149,7 @@ jobs:
     needs: [scope, preflight]
     if: needs.scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
