@@ -96,21 +96,46 @@ impl TraktStore for SqliteStore {
         .await
     }
 
+    async fn delete_trakt_auth_if_current(
+        &self,
+        user_id: i64,
+        expected_refresh_token: &str,
+    ) -> Result<bool, StoreError> {
+        let expected_refresh_token = expected_refresh_token.to_owned();
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM trakt_auth WHERE user_id = ?1 AND refresh_token = ?2",
+                params![user_id, expected_refresh_token],
+            )? > 0)
+        })
+        .await
+    }
+
     async fn update_trakt_tokens(
         &self,
         user_id: i64,
+        expected_refresh_token: &str,
         access_token: &str,
         refresh_token: &str,
         expires_at: i64,
-    ) -> Result<(), StoreError> {
-        let (access_token, refresh_token) = (access_token.to_owned(), refresh_token.to_owned());
+    ) -> Result<bool, StoreError> {
+        let (expected_refresh_token, access_token, refresh_token) = (
+            expected_refresh_token.to_owned(),
+            access_token.to_owned(),
+            refresh_token.to_owned(),
+        );
         self.with_conn(move |conn| {
-            conn.execute(
+            Ok(conn.execute(
                 "UPDATE trakt_auth SET access_token = ?2, refresh_token = ?3, expires_at = ?4
-                 WHERE user_id = ?1",
-                params![user_id, access_token, refresh_token, expires_at],
-            )?;
-            Ok(())
+                 WHERE user_id = ?1 AND refresh_token = ?5",
+                params![
+                    user_id,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    expected_refresh_token
+                ],
+            )? > 0)
         })
         .await
     }
@@ -254,10 +279,14 @@ mod tests {
         assert_eq!(store.list_trakt_auth().await.expect("list").len(), 1);
 
         // Token refresh path updates only the token triple + expiry.
-        store
-            .update_trakt_tokens(user.id, "acc3", "ref3", 2000)
+        assert!(store
+            .update_trakt_tokens(user.id, "ref", "acc3", "ref3", 2000)
             .await
-            .expect("tokens");
+            .expect("tokens"));
+        assert!(!store
+            .update_trakt_tokens(user.id, "ref", "loser", "loser-ref", 3000)
+            .await
+            .expect("stale tokens"));
         let got = store
             .get_trakt_auth(user.id)
             .await

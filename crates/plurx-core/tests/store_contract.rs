@@ -1,20 +1,48 @@
 //! Backend-neutral behavioral contract for the durable store boundary.
 //!
 //! Every scenario receives only `Arc<dyn Store>` and runs against both SQLite
-//! modes. Replicated backends join the same factory list in later milestones.
+//! modes. With `hiqlite-store`, the same scenarios also run through a remote
+//! client backed by three separate voter processes.
 
+#[cfg(feature = "hiqlite-store")]
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::future::Future;
+#[cfg(feature = "hiqlite-store")]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(feature = "hiqlite-store")]
+use std::net::TcpListener;
 use std::path::PathBuf;
+#[cfg(feature = "hiqlite-store")]
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
+#[cfg(feature = "hiqlite-store")]
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "hiqlite-store")]
+use hiqlite::tls::ServerTlsConfig;
+#[cfg(feature = "hiqlite-store")]
+use hiqlite::{Client, Node, NodeConfig};
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
     NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, ProbeResult,
     TraktAuth,
 };
+#[cfg(feature = "hiqlite-store")]
+use plurx_core::store::HiqliteAuthStore;
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
+#[cfg(feature = "hiqlite-store")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "hiqlite-store")]
+use tokio::io::AsyncReadExt;
+
+#[cfg(feature = "hiqlite-store")]
+const CONTRACT_RAFT_SECRET: &str = "plurx-store-contract-raft";
+#[cfg(feature = "hiqlite-store")]
+const CONTRACT_API_SECRET: &str = "plurx-store-contract-api";
+#[cfg(feature = "hiqlite-store")]
+const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
 
 const SETTINGS_METHODS: &[&str] = &["ping", "get_setting", "put_setting", "instance_id"];
 const USER_METHODS: &[&str] = &[
@@ -87,6 +115,7 @@ const WATCH_METHODS: &[&str] = &[
     "watch_state",
     "watch_map",
     "put_progress",
+    "put_progress_if_current",
     "put_progress_at",
     "set_watched",
     "set_watched_tree",
@@ -101,6 +130,7 @@ const TRAKT_METHODS: &[&str] = &[
     "list_trakt_auth",
     "put_trakt_auth",
     "delete_trakt_auth",
+    "delete_trakt_auth_if_current",
     "update_trakt_tokens",
     "set_trakt_sync",
     "trakt_sync_candidates",
@@ -174,7 +204,7 @@ fn sqlite_fixtures() -> Vec<StoreFixture> {
     ]
 }
 
-async fn for_each_sqlite_backend<F, Fut>(mut contract: F)
+async fn for_each_backend<F, Fut>(mut contract: F)
 where
     F: FnMut(Arc<dyn Store>, &'static str) -> Fut,
     Fut: Future<Output = ()>,
@@ -182,6 +212,200 @@ where
     for fixture in sqlite_fixtures() {
         contract(Arc::clone(&fixture.store), fixture.name).await;
     }
+
+    #[cfg(feature = "hiqlite-store")]
+    {
+        static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _case = HIQLITE_CASE.lock().await;
+        let cluster = contract_cluster();
+        let client = Client::remote(
+            cluster.addresses.clone(),
+            true,
+            true,
+            CONTRACT_API_SECRET.to_owned(),
+            true,
+            None,
+        )
+        .await
+        .expect("connect contract client to three voters");
+        let store = HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID)
+            .await
+            .expect("bootstrap contract store");
+        store
+            .validation_reset_contract_state()
+            .await
+            .expect("reset replicated contract state");
+        contract(Arc::new(store), "hiqlite-3-voter").await;
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContractNodeSpec {
+    id: u64,
+    raft: String,
+    api: String,
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContractNodeLaunch {
+    node_id: u64,
+    root: PathBuf,
+    nodes: Vec<ContractNodeSpec>,
+}
+
+#[cfg(feature = "hiqlite-store")]
+struct ContractNodeProcess {
+    _child: Child,
+    _input: ChildStdin,
+    _output: ChildStdout,
+}
+
+#[cfg(feature = "hiqlite-store")]
+struct ContractCluster {
+    addresses: Vec<String>,
+    _root: tempfile::TempDir,
+    _nodes: Vec<ContractNodeProcess>,
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn contract_cluster() -> &'static ContractCluster {
+    static CLUSTER: OnceLock<ContractCluster> = OnceLock::new();
+    CLUSTER.get_or_init(ContractCluster::start)
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ContractCluster {
+    fn start() -> Self {
+        install_contract_crypto_provider();
+        let root = tempfile::tempdir().expect("three-voter contract root");
+        let specs = (1..=3)
+            .map(|id| ContractNodeSpec {
+                id,
+                raft: format!("127.0.0.1:{}", contract_free_port()),
+                api: format!("127.0.0.1:{}", contract_free_port()),
+            })
+            .collect::<Vec<_>>();
+        let executable = std::env::current_exe().expect("contract test executable");
+        let mut starting = Vec::new();
+        for node_id in 1..=3 {
+            let launch = ContractNodeLaunch {
+                node_id,
+                root: root.path().to_path_buf(),
+                nodes: specs.clone(),
+            };
+            let mut child = Command::new(&executable)
+                .arg("hiqlite_contract_node_process")
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(
+                    "PLURX_CONTRACT_NODE_LAUNCH",
+                    serde_json::to_string(&launch).expect("serialize node launch"),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn contract voter");
+            let input = child.stdin.take().expect("contract voter stdin");
+            let output = child.stdout.take().expect("contract voter stdout");
+            starting.push((node_id, child, input, output));
+        }
+
+        let mut nodes = Vec::new();
+        for (node_id, child, input, mut output) in starting {
+            let mut reader = BufReader::new(output);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .expect("read contract voter startup");
+                assert!(bytes > 0, "contract voter {node_id} exited before ready");
+                if line.trim() == format!("PLURX_CONTRACT_NODE_READY {node_id}") {
+                    break;
+                }
+            }
+            output = reader.into_inner();
+            nodes.push(ContractNodeProcess {
+                _child: child,
+                _input: input,
+                _output: output,
+            });
+        }
+        Self {
+            addresses: specs.into_iter().map(|node| node.api).collect(),
+            _root: root,
+            _nodes: nodes,
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawned by the backend-neutral contract factory"]
+async fn hiqlite_contract_node_process() {
+    install_contract_crypto_provider();
+    let launch: ContractNodeLaunch = serde_json::from_str(
+        &std::env::var("PLURX_CONTRACT_NODE_LAUNCH").expect("contract node launch"),
+    )
+    .expect("decode contract node launch");
+    let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
+    let data_dir = launch.root.join(format!("node-{}", launch.node_id));
+    std::fs::create_dir_all(&data_dir).expect("contract node data directory");
+    let client = hiqlite::start_node(NodeConfig {
+        node_id: launch.node_id,
+        nodes: launch
+            .nodes
+            .iter()
+            .map(|node| Node {
+                id: node.id,
+                addr_raft: node.raft.clone(),
+                addr_api: node.api.clone(),
+            })
+            .collect(),
+        listen_addr_api: Cow::Borrowed("127.0.0.1"),
+        listen_addr_raft: Cow::Borrowed("127.0.0.1"),
+        data_dir: Cow::Owned(data_dir.to_string_lossy().into_owned()),
+        filename_db: Cow::Borrowed("contract.db"),
+        secret_raft: CONTRACT_RAFT_SECRET.to_owned(),
+        secret_api: CONTRACT_API_SECRET.to_owned(),
+        tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
+        tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
+        health_check_delay_secs: 0,
+        wal_size: 2 * 1024 * 1024,
+        raft_config: NodeConfig::default_raft_config(10_000),
+        ..Default::default()
+    })
+    .await
+    .expect("start contract voter");
+    tokio::time::timeout(Duration::from_secs(45), client.wait_until_healthy_db())
+        .await
+        .expect("contract voter health timeout");
+    println!("PLURX_CONTRACT_NODE_READY {}", launch.node_id);
+    std::io::stdout().flush().expect("flush contract readiness");
+    let mut sink = Vec::new();
+    tokio::io::stdin()
+        .read_to_end(&mut sink)
+        .await
+        .expect("wait for contract parent");
+    std::process::exit(0);
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn contract_free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind contract port")
+        .local_addr()
+        .expect("contract port address")
+        .port()
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn install_contract_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[test]
@@ -209,7 +433,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 118, "review the M1a method count");
+    assert_eq!(declared.len(), 120, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -218,7 +442,7 @@ fn contract_inventory_matches_every_store_method() {
 
 #[tokio::test]
 async fn settings_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         store.ping().await.expect("ping");
         assert_eq!(store.get_setting("contract.key").await.expect("get"), None);
         store
@@ -247,7 +471,7 @@ async fn settings_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn user_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         assert_eq!(store.count_users().await.expect("count"), 0);
         let admin = store
             .create_user("Admin", "hash-1", true)
@@ -318,7 +542,7 @@ async fn user_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn api_key_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let expected_scopes = vec![
             scopes::SCAN_TRIGGER.to_owned(),
             scopes::STATUS_READ.to_owned(),
@@ -364,7 +588,7 @@ async fn api_key_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn library_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let library = store
             .create_library(&NewLibrary {
                 name: "Contract Movies".into(),
@@ -430,7 +654,7 @@ async fn library_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn media_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let movies = store
             .create_library(&NewLibrary {
                 name: "Media Contract Movies".into(),
@@ -925,7 +1149,7 @@ async fn media_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn watch_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let user = store
             .create_user("watch-contract", "hash", false)
             .await
@@ -1039,10 +1263,29 @@ async fn watch_contract_runs_through_dyn_store() {
             .await
             .expect("watch map")
             .is_empty());
-        store
+        let leading = store
             .put_progress(user.id, movie, 4_000, Some(10_000))
             .await
             .expect("progress");
+        let trailing = store
+            .put_progress_if_current(user.id, movie, &leading, 5_000, Some(10_000))
+            .await
+            .expect("compare-and-set progress")
+            .expect("unchanged row accepts trailing progress");
+        assert_eq!(trailing.position_ms, 5_000);
+        store
+            .set_watched(user.id, movie, false)
+            .await
+            .expect("competing manual write");
+        assert!(store
+            .put_progress_if_current(user.id, movie, &trailing, 6_000, Some(10_000))
+            .await
+            .expect("stale compare-and-set")
+            .is_none());
+        store
+            .put_progress(user.id, movie, 4_000, Some(10_000))
+            .await
+            .expect("restore progress");
         store
             .put_progress_at(user.id, episodes[0], 200, Some(1_000), Some(1))
             .await
@@ -1110,7 +1353,7 @@ async fn watch_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn trakt_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let user = store
             .create_user("trakt-contract", "hash", false)
             .await
@@ -1178,10 +1421,18 @@ async fn trakt_contract_runs_through_dyn_store() {
         assert_eq!(linked.expires_at, 100);
         assert_eq!(linked.trakt_username.as_deref(), Some("contract"));
         assert_eq!(store.list_trakt_auth().await.expect("list").len(), 1);
-        store
-            .update_trakt_tokens(user.id, "access-2", "refresh-2", 200)
+        assert!(store
+            .update_trakt_tokens(user.id, "refresh-1", "access-2", "refresh-2", 200)
             .await
-            .expect("update tokens");
+            .expect("update tokens"));
+        assert!(!store
+            .update_trakt_tokens(user.id, "refresh-1", "loser", "loser-refresh", 300)
+            .await
+            .expect("reject stale refresh"));
+        assert!(!store
+            .delete_trakt_auth_if_current(user.id, "refresh-1")
+            .await
+            .expect("reject stale unlink"));
         let refreshed = store
             .get_trakt_auth(user.id)
             .await
@@ -1224,13 +1475,21 @@ async fn trakt_contract_runs_through_dyn_store() {
 
 #[tokio::test]
 async fn watched_outbox_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let id = store
             .enqueue_watched(r#"{"type":"movie","watched":true}"#)
             .await
             .expect("enqueue");
         let mut due = store.due_watched(10).await.expect("due");
         assert_eq!(due.len(), 1, "backend {backend}");
+        assert!(
+            store
+                .due_watched(10)
+                .await
+                .expect("claimed row is not due")
+                .is_empty(),
+            "backend {backend} returned one claim to two workers"
+        );
         let entry = due.pop().expect("entry");
         assert_eq!(entry.id, id);
         store
@@ -1310,7 +1569,7 @@ async fn wait_until_after(second: i64) {
 
 #[tokio::test]
 async fn transcode_cache_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let (_, file) = seed_file(&store, "cache-contract").await;
         let node = "cache-node";
         assert!(store
@@ -1438,7 +1697,7 @@ fn offline_request(id: &str, request_id: &str, user_id: i64, file_id: i64) -> Ne
 
 #[tokio::test]
 async fn offline_package_contract_runs_through_dyn_store() {
-    for_each_sqlite_backend(|store, backend| async move {
+    for_each_backend(|store, backend| async move {
         let (user_id, file_id) = seed_file(&store, "offline-contract").await;
         let first = offline_request("package-1", "request-1", user_id, file_id);
         assert!(matches!(
@@ -1454,6 +1713,69 @@ async fn offline_package_contract_runs_through_dyn_store() {
                 .await
                 .expect("idempotent create"),
             OfflineCreateOutcome::Existing(_)
+        ));
+        let mut changed_expiry = first.clone();
+        changed_expiry.expires_at += 1;
+        assert_eq!(
+            store
+                .create_offline_package(&changed_expiry, 10, 100_000, 100_000)
+                .await
+                .expect("expiry conflict"),
+            OfflineCreateOutcome::RequestConflict,
+            "backend {backend} accepted changed expiry under one request id"
+        );
+        let mut changed_estimate = first.clone();
+        changed_estimate.estimated_bytes += 1;
+        assert_eq!(
+            store
+                .create_offline_package(&changed_estimate, 10, 100_000, 100_000)
+                .await
+                .expect("estimate conflict"),
+            OfflineCreateOutcome::RequestConflict,
+            "backend {backend} accepted changed estimate under one request id"
+        );
+        let mut changed_reservation = first.clone();
+        changed_reservation.reserved_bytes += 1;
+        assert_eq!(
+            store
+                .create_offline_package(&changed_reservation, 10, 100_000, 100_000)
+                .await
+                .expect("reservation conflict"),
+            OfflineCreateOutcome::RequestConflict,
+            "backend {backend} accepted changed reservation under one request id"
+        );
+        let mut other_node =
+            offline_request("package-other-node", "request-other-node", user_id, file_id);
+        other_node.node_id = "other-offline-node".into();
+        assert!(
+            matches!(
+                store
+                    .create_offline_package(&other_node, 10, 100_000, 5_000)
+                    .await
+                    .expect("per-node admission"),
+                OfflineCreateOutcome::Created(_)
+            ),
+            "backend {backend} charged another node's bytes to the local budget"
+        );
+        let mut negative =
+            offline_request("package-negative", "request-negative", user_id, file_id);
+        negative.reserved_bytes = -1;
+        assert!(matches!(
+            store
+                .create_offline_package(&negative, 10, 100_000, 100_000)
+                .await
+                .expect("negative reservation refusal"),
+            OfflineCreateOutcome::ByteLimit { .. }
+        ));
+        let mut overflow =
+            offline_request("package-overflow", "request-overflow", user_id, file_id);
+        overflow.reserved_bytes = i64::MAX;
+        assert!(matches!(
+            store
+                .create_offline_package(&overflow, 10, i64::MAX, i64::MAX)
+                .await
+                .expect("overflow-safe reservation refusal"),
+            OfflineCreateOutcome::ByteLimit { .. }
         ));
         assert!(store
             .offline_package_for_user(&first.id, user_id)

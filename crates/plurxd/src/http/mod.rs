@@ -3998,7 +3998,6 @@ mod tests {
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let seeded = seed_content(&state).await;
-
         let (_, server) = call(&app, get("/api/v1/server", None)).await;
         assert_pointers(
             &contract["server"],
@@ -4426,6 +4425,94 @@ mod tests {
             .await
             .0,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn both_progress_routes_use_the_coalescer_and_dated_writes_win() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let user_id = state
+            .store
+            .list_users()
+            .await
+            .expect("users")
+            .into_iter()
+            .find(|user| user.is_admin)
+            .expect("admin user")
+            .id;
+
+        let api_progress = |position_ms: i64, recorded_at: Option<i64>| {
+            post(
+                &format!("/api/v1/items/{}/progress", seeded.movie),
+                Some(&admin),
+                json!({
+                    "position_ms": position_ms,
+                    "duration_ms": 9_000_000,
+                    "recorded_at": recorded_at,
+                }),
+            )
+        };
+        call(&app, api_progress(1_000, None)).await;
+        let (_, coalesced) = call(&app, api_progress(50_000, None)).await;
+        assert_eq!(
+            coalesced["position_ms"], 1_000,
+            "the HTTP body remains the coherent durable row while a beat is pending"
+        );
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.movie)
+                .await
+                .expect("watch state")
+                .expect("watch row")
+                .position_ms,
+            1_000,
+            "the second REST beat must take the coalescer path"
+        );
+
+        let imported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Unix clock")
+            .as_secs() as i64;
+        call(&app, api_progress(80_000, Some(imported_at))).await;
+        state.progress.drain().await.expect("drain stale beat");
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.movie)
+                .await
+                .expect("watch state")
+                .expect("watch row")
+                .position_ms,
+            80_000,
+            "the dated bypass must invalidate an older pending beat"
+        );
+
+        let plex = |position_ms: i64| {
+            Request::builder()
+                .uri(format!(
+                    "/:/timeline?ratingKey={}&time={position_ms}&duration=9000000",
+                    seeded.ep
+                ))
+                .header("x-plex-token", &admin)
+                .body(Body::empty())
+                .expect("Plex timeline request")
+        };
+        assert!(status_of(&app, plex(1_000)).await.is_success());
+        assert!(status_of(&app, plex(60_000)).await.is_success());
+        state.progress.drain().await.expect("drain Plex beat");
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.ep)
+                .await
+                .expect("Plex watch state")
+                .expect("Plex watch row")
+                .position_ms,
+            60_000,
+            "the Plex timeline must share the coalescer"
         );
     }
 
