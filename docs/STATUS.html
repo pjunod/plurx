@@ -203,16 +203,17 @@
 
   <!-- ══════════ Phase 4 ══════════ -->
   <section>
-    <h2>Phase 4 — HA for real <span class="chip next">next major phase</span> <span class="ev">spike done · hiqlite decided</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:0%"></div></div><div class="n">0 / 5 items</div></div>
+    <h2>Phase 4 — HA for real <span class="chip prog">🚧 backend transition</span> <span class="ev">M0–M1d complete · M2 activation next</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:45%"></div></div><div class="n">5 milestones complete · activation/failover remain</div></div>
     <p class="blurb">The demo that defines the project: pull the power on a node mid-movie; playback resumes within seconds; zero loss of settings or watch state; a 3-node cluster from the README in under 10 minutes.</p>
     <details><summary>Items</summary>
       <ul class="items">
-        <li><span class="m todo">○ todo</span><span class="t">Cluster membership: join tokens, node add/remove, health, single logical server identity</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Streaming failover: client node-list + retry (web first), session takeover; VIP/keepalived + k8s patterns documented</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Helm chart (3-replica StatefulSet, anti-affinity), rolling upgrades, cluster admin UI</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Failure drills as CI-able tests: kill leader mid-transcode, kill follower mid-scan, netsplit, disk-full node</span></li>
+        <li class="done-item"><span class="m done">✓ M0 + M1a</span><span class="t">Local node identity, rollback-tolerant config, Hiqlite decision/cost record, deterministic replicated-SQL policy, and the backend-neutral <code>Arc&lt;dyn Store&gt;</code> inventory merged 2026-08-07</span></li>
+        <li class="done-item"><span class="m done">✓ M1b</span><span class="t">Three-voter settings/auth/API-key backend with schema preflight, replica digests, and follower/leader/quorum-loss harness merged 2026-08-07</span></li>
+        <li class="done-item"><span class="m done">✓ M1c</span><span class="t">Libraries, media, watch state, node-local FTS, root identity, and atomic bounded reconciliation merged in PR #88 on 2026-08-08</span></li>
+        <li class="done-item"><span class="m done">✓ M1d</span><span class="t">The complete 120-method replicated store, shared three-voter contract suite, Trakt/outbox multi-writer safety, offline/cache identity checks, and bounded progress coalescing passed PR #90 review and CI; post-coalescer compacted growth remains an M2 activation measurement</span></li>
+        <li><span class="m todo">○ M2–M3</span><span class="t">Import and activate one-voter Hiqlite, envelope-encrypt replicated Trakt bearer credentials, then add join/remove/health, offline-work cleanup on removal, and singleton fencing</span></li>
+        <li><span class="m todo">○ M4–M7</span><span class="t">Session takeover, client node-list retry, VIP/Kubernetes patterns, rolling upgrades, cluster admin UI, and the physical netsplit/disk/node-loss corpus</span></li>
       </ul>
     </details>
   </section>
@@ -274,7 +275,7 @@
   </section>
 
   <footer>
-    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>origin/main</code> @ <code>5c6bfe5</code> plus the PR #91 review response · page refreshed 2026-08-08
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>origin/main</code> @ <code>e8a910f</code> plus the complete M1d PR #90 review sequence · page refreshed 2026-08-08
   </footer>
 </div>
 </body>

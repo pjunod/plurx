@@ -696,12 +696,13 @@ outcome, not a fake encoder error.
 Create an offline artifact budget separate from `cache.max_gb`. Operator
 settings are `offline.enabled`, `offline.max_gb`,
 `offline.max_gb_per_user`, and optional per-user enable/override. A default
-install reserves 25 GiB globally and 15 GiB per user; operators may set either
+install reserves 25 GiB per storage node and 15 GiB per user across the
+cluster; operators may set either
 to zero to disable admission. Offline sweeps protect preparing, ready, and
 actively leased recipes and never evict ordinary playback cache to make room.
 
 Version 1 admission compares the conservative estimate with the configured
-global and per-user offline ceilings. It does not measure filesystem free space
+per-node and per-user offline ceilings. It does not measure filesystem free space
 or evict ordinary playback cache to make room. A package may reuse a complete
 matching recipe for zero new bytes; unexpected filesystem exhaustion surfaces
 later as `encoder_failed`, so operators must provision the data directory for
