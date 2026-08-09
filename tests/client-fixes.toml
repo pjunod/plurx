@@ -84,3 +84,19 @@ source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineDow
 source_anchor = "setNetworkPolicy(template.network)"
 test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
 test_anchor = "restoredNetworkPolicyKeepsTheSavedTransportRequirement"
+
+[[fixes]]
+id = "apple.seek-window-routing"
+commits = ["3e08de6f"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "nonisolated static func seekRoute("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSeekRoutePrefersTheNativeClockInsideTheAdvertisedWindow"
+
+[[fixes]]
+id = "apple.seek-window-review-fixes"
+commits = ["c1fa1134"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "Snapping applies only at the live edge"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSeekRouteSeeksInsideALaterRangeInsteadOfSnappingToAnEarlierEdge"
