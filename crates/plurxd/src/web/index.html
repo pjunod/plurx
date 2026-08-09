@@ -7028,7 +7028,8 @@ function updateStats(){
           ?` · bytes release ≤${fmtBytes(h.resume_below_bytes)}`
         :h.hold_reason==='global' && h.resume_below_bytes!=null
           ?` · global release ≤${fmtBytes(h.resume_below_bytes)}`:'';
-      srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?` · held${release}`:''}</div>`;
+      const transitions=h.suspend_count?` · ${h.suspend_count} suspend${h.suspend_count===1?'':'s'}`:'';
+      srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?` · held${release}`:''}${transitions}</div>`;
     }
     if(h.out_time_ms!=null && h.ahead_seconds==null){
       // A progressive stream has no published-media frontier to report; what
@@ -7317,12 +7318,19 @@ async function renderActivityBody(){
   const dels=d.deliveries||d.sessions.map(se=>({method:"transcode",user:se.user_name,item_id:se.item_id,
     title:se.item_title,started_unix:se.started_unix,idle_seconds:se.idle_seconds,session_id:se.id,
     target_height:se.target_height,encoder:se.encoder}));
-  const rows=dels.map(de=>`<tr>
-    <td><b><a href="#/item/${de.item_id}">${esc(de.title)}</a></b></td>
-    <td>${esc(de.user)}</td>
-    <td>${esc(de.method)}${de.session_id&&de.target_height?` · ${de.target_height}p`:''}${de.session_id&&de.encoder?` · ${esc(de.encoder)}`:''}</td>
-    <td class="muted">${fmtAgo(de.started_unix)}${de.idle_seconds>30?` · idle ${Math.round(de.idle_seconds)}s`:''}</td>
-    <td style="text-align:right">${(ME&&ME.is_admin&&de.session_id)?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(de.session_id))})">Stop</button>`:''}</td></tr>`).join("");
+  const sessionsById=Object.fromEntries((d.sessions||[]).map(se=>[se.id,se]));
+  const rows=dels.map(de=>{
+    const se=de.session_id?sessionsById[de.session_id]:null;
+    const flow=!se?'':se.suspended
+      ?` · held (${esc(se.hold_reason||'limit')}) · ${se.suspend_count||1} suspend${(se.suspend_count||1)===1?'':'s'}`
+      :se.suspend_count?` · ${se.suspend_count} suspend${se.suspend_count===1?'':'s'} · running`:'';
+    return `<tr>
+      <td><b><a href="#/item/${de.item_id}">${esc(de.title)}</a></b></td>
+      <td>${esc(de.user)}</td>
+      <td>${esc(de.method)}${de.session_id&&de.target_height?` · ${de.target_height}p`:''}${de.session_id&&de.encoder?` · ${esc(de.encoder)}`:''}${flow}</td>
+      <td class="muted">${fmtAgo(de.started_unix)}${de.idle_seconds>30?` · idle ${Math.round(de.idle_seconds)}s`:''}</td>
+      <td style="text-align:right">${(ME&&ME.is_admin&&de.session_id)?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(de.session_id))})">Stop</button>`:''}</td></tr>`;
+  }).join("");
   const scans=d.scans.map(sc=>`<tr><td style="width:200px"><b>${esc(sc.library)}</b></td><td class="muted">${statusText(sc.status)}</td></tr>`).join("");
   const t=d.trakt||{};
   const trakt = t.configured
@@ -7724,6 +7732,7 @@ function playbackPanel(settings){
         <div><label>Then pace at</label><select id="phr" style="width:auto;min-width:200px">${presetOpts([["1.5","1.5× — gentlest"],["2","2× — recommended"],["4","4×"],["0","Unlimited"]], settings.hls_readrate, v=>`${v}×`)}</select></div>
         <div><label>Buffer limit</label><select id="pha" style="width:auto;min-width:200px">${presetOpts([["60","1 minute"],["180","3 minutes — recommended"],["600","10 minutes"],["0","No limit — needs disk"]], settings.hls_ahead_max_secs, v=>`${v} seconds`)}</select></div>
       </div>
+      <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="phs" ${settings.hls_typeless_sliding?'checked':''} style="width:auto;margin-right:9px"> Experimental typeless sliding HLS <span class="muted" style="font-size:12px;margin-left:6px">· applies to new sessions; use only for the iPad control comparison</span></label>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -7995,7 +8004,8 @@ async function savePlayback(){
       stream_readrate:document.getElementById("prr").value,
       hls_readrate:document.getElementById("phr").value,
       hls_burst_secs:document.getElementById("phb").value,
-      hls_ahead_max_secs:document.getElementById("pha").value}});
+      hls_ahead_max_secs:document.getElementById("pha").value,
+      hls_typeless_sliding:document.getElementById("phs").checked}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }

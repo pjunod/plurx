@@ -89,7 +89,7 @@ one.
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
 | `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
-| `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. After retention deletes a prefix, the served playlist omits those URIs, advances `MEDIA-SEQUENCE`, and becomes a sliding media playlist. Completed cached VOD stays whole. | Rust retention/serving integration |
+| `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. The default served view becomes sliding only after retention deletes a prefix. The default-off iPad experiment instead serves a typeless playlist plus `EXT-X-START:TIME-OFFSET=0` from the first response, preserving one envelope across that boundary. Completed cached VOD stays whole. | Rust retention/serving integration + typeless shape-stability unit; physical-iPad comparison pending |
 | `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
 | `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
 | `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
@@ -473,8 +473,11 @@ Three details, each load-bearing:
   segment the client fetched, the request-side flow controller SIGSTOPs its
   ffmpeg. A later media fetch that brings the reserve to 150 s or less
   SIGCONTs it; the 30-second gap prevents a fast encoder from toggling once per
-  segment near the ceiling. Byte and global disk limits release at half because
-  those are hard capacity bounds. The 15-second reaper is a repair pass for a
+  segment near the ceiling. The per-session byte limit releases at half. The
+  global limit enters on total live scratch, but releases when the drainable
+  sum of bytes ahead reaches half; retained history behind every client is
+  still real disk usage but cannot make release structurally unreachable. The
+  15-second reaper is a repair pass for a
   producer nobody is requesting from, not the normal trigger. Session status
   reports the active hold as `time`, per-session `bytes`, or `global`, plus the
   matching release value; the web and Apple overlays show both beside a held
@@ -491,6 +494,17 @@ Three details, each load-bearing:
   stop therefore remains open pending a device capture of `loadedTimeRanges`,
   access-log segment counts, and the playlist header across the internal
   EVENT-to-sliding-window transition.
+
+**Playlist-envelope decision (2026-08-09): experiment, not yet adopted.** The
+default remains the established EVENT-then-sliding behavior until the batched
+physical-iPad run compares a long control playback with the gated variant.
+Enable **Settings → Playback → Experimental typeless sliding HLS** for the
+variant; it is snapshotted when a new session opens, strips EVENT before the
+first client response, adds `EXT-X-START:TIME-OFFSET=0`, and retains that same
+header shape when `MEDIA-SEQUENCE` begins advancing. The server logs the first
+slide once with the session id, first retained index, and seconds since start;
+compare that timestamp with client stall evidence. Keep the setting off if the
+variant does not materially reduce stalls or changes AVPlayer seek behavior.
 
 **Seek and audio-switch stay on this path.** A copy-HLS session sets
 `PLAYER.method = 'remux'` (honest — no video re-encode) and `PLAYER.copyHls =
@@ -708,9 +722,10 @@ covering the other.
   suspend window bounds the other end, so a session's directory holds roughly
   `hls_ahead_max_secs + 180 s` of content whatever the encoder's speed. At
   the default 180 s ahead limit this is about 360 s, up from the previous
-  300 s span (+20%). The 8 GiB global scratch cap is unchanged, continues to
-  release at half, and can therefore bind roughly one 4K session sooner; it
-  may keep a producer held until client frontiers advance. Session status
+  300 s span (+20%). The 8 GiB global scratch cap is unchanged. It enters on
+  total scratch and releases at half based on bytes ahead across live
+  sessions, so unprunable retention floors cannot deadlock every producer.
+  Session status
   exposes the active `hold_reason` plus `resume_below_seconds` or
   `resume_below_bytes`, and the web and Apple overlays show the matching value
   while a session is held so that state is distinguishable from an encoder

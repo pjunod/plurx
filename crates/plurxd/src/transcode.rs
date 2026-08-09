@@ -100,6 +100,10 @@ pub(crate) const HLS_SCRATCH_MAX_BYTES_DEFAULT: i64 = 8 * 1024 * 1024 * 1024;
 /// before the settings are consulted again. The bound on how stale an
 /// admin's change can look, and the whole cost of caching it.
 const AHEAD_LIMITS_TTL: Duration = Duration::from_secs(2);
+/// Repair cadence when no client request triggers flow control first. At the
+/// default 2× pace this permits at most 30 seconds of additional production
+/// between observations; keep the arithmetic pinned below.
+const FLOW_CONTROL_REPAIR_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Live encode telemetry for one session, fed by ffmpeg's `-progress` stream.
 ///
@@ -509,13 +513,20 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
 /// for one of those stale URIs during a playlist reload or decoder reset and
 /// stall even though the current encoder is healthy.
 ///
-/// Once pruning begins, the served view drops the deleted prefix, advances
-/// `MEDIA-SEQUENCE`, and removes the EVENT declaration (EVENT playlists are
-/// append-only by contract). The raw file and in-memory index stay complete.
-fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
-    let Some(first_retained) = first_retained.filter(|index| *index > 0) else {
+/// The settings-gated experiment serves a typeless sliding shape from the
+/// first response, with an explicit zero start offset, so the same URL never
+/// mutates from EVENT to live semantics under AVPlayer. Otherwise the legacy
+/// shape changes only once pruning makes EVENT impossible to serve honestly.
+/// The raw file and in-memory index stay complete in both cases.
+fn served_live_playlist(
+    raw: Vec<u8>,
+    first_retained: Option<i64>,
+    typeless_sliding: bool,
+) -> Vec<u8> {
+    let first_retained = first_retained.filter(|index| *index > 0).unwrap_or(0);
+    if first_retained == 0 && !typeless_sliding {
         return raw;
-    };
+    }
     let Ok(text) = std::str::from_utf8(&raw) else {
         return raw;
     };
@@ -527,37 +538,46 @@ fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
         return raw;
     };
 
-    // Start immediately after the prior segment URI. This retains any tags
-    // attached to the first surviving segment rather than assuming EXTINF is
-    // always the first line in its block.
-    let mut next_block = header_end;
-    let mut body_start = None;
-    for (position, line) in lines.iter().enumerate().skip(header_end) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let body_start = if first_retained == 0 {
+        header_end
+    } else {
+        // Start immediately after the prior segment URI. This retains any tags
+        // attached to the first surviving segment rather than assuming EXTINF
+        // is always the first line in its block.
+        let mut next_block = header_end;
+        let mut body_start = None;
+        for (position, line) in lines.iter().enumerate().skip(header_end) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if segment_index(line) == Some(first_retained) {
+                body_start = Some(next_block);
+                break;
+            }
+            if segment_index(line).is_some() {
+                next_block = position + 1;
+            }
         }
-        if segment_index(line) == Some(first_retained) {
-            body_start = Some(next_block);
-            break;
-        }
-        if segment_index(line).is_some() {
-            next_block = position + 1;
-        }
-    }
-    let Some(body_start) = body_start else {
-        // The index was derived from this playlist, so disagreement means a
-        // concurrent truncate/restart. Let the next reload observe the rebuilt
-        // index instead of manufacturing a playlist from mismatched states.
-        return raw;
+        let Some(body_start) = body_start else {
+            // The index was derived from this playlist, so disagreement means
+            // a concurrent truncate/restart. Let the next reload observe the
+            // rebuilt index instead of manufacturing mismatched state.
+            return raw;
+        };
+        body_start
     };
 
     let mut out = String::with_capacity(text.len());
     let mut wrote_media_sequence = false;
+    let mut wrote_start = false;
     for line in &lines[..header_end] {
         let trimmed = line.trim();
         if trimmed == "#EXT-X-PLAYLIST-TYPE:EVENT" {
             continue;
+        }
+        if trimmed.starts_with("#EXT-X-START:") {
+            wrote_start = true;
         }
         if trimmed.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
             out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
@@ -569,6 +589,9 @@ fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
     }
     if !wrote_media_sequence {
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
+    }
+    if typeless_sliding && !wrote_start {
+        out.push_str("#EXT-X-START:TIME-OFFSET=0\n");
     }
     for line in &lines[body_start..] {
         out.push_str(line);
@@ -623,7 +646,8 @@ fn time_release_threshold(limit: i64) -> Option<i64> {
 
 fn ahead_hold(
     ahead: Ahead,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
 ) -> Option<AheadHold> {
@@ -645,7 +669,17 @@ fn ahead_hold(
     // Capacity holds take precedence in telemetry because they cannot be
     // cleared merely by crossing the media-time release point.
     let global_limit = byte_limit(limits.global_max_bytes);
-    if over(global_bytes, global_limit) {
+    // Enter on total scratch so the configured cap remains a real disk
+    // bound. Release on the drainable reserve: retained bytes behind every
+    // client's frontier cannot be pruned inside RETENTION_SECS, so using
+    // total scratch for the half-cap release line can make that line
+    // structurally unreachable even after every client has caught up.
+    let global_value = if currently_suspended {
+        global_ahead_bytes
+    } else {
+        global_live_bytes
+    };
+    if over(global_value, global_limit) {
         return Some(AheadHold {
             reason: AheadHoldReason::Global,
             release_value: global_limit,
@@ -667,11 +701,19 @@ fn ahead_hold(
 #[cfg(test)]
 fn should_suspend(
     ahead: Ahead,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
 ) -> bool {
-    ahead_hold(ahead, global_bytes, limits, currently_suspended).is_some()
+    ahead_hold(
+        ahead,
+        global_live_bytes,
+        global_ahead_bytes,
+        limits,
+        currently_suspended,
+    )
+    .is_some()
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -1034,6 +1076,20 @@ fn tone_map_pref() -> ToneMap {
     }
 }
 
+struct LastRequest {
+    at: Instant,
+    kind: &'static str,
+}
+
+impl LastRequest {
+    fn now(kind: &'static str) -> Self {
+        Self {
+            at: Instant::now(),
+            kind,
+        }
+    }
+}
+
 struct Session {
     dir: PathBuf,
     /// The ffmpeg producing this session's segments — `None` for a cache hit,
@@ -1053,7 +1109,10 @@ struct Session {
     /// session's full lifetime so the budget sweep cannot remove its playlist
     /// or segments while an HTTP response can still reach them.
     _cache_reader: Option<crate::cachekeep::CacheReadGuard>,
-    last_access: Mutex<Instant>,
+    /// The request that keeps this session alive. Keeping the kind beside the
+    /// clock makes an idle reap explain whether the last sign of life was a
+    /// playlist reload, a media segment, or only a subtitle/context lookup.
+    last_request: Mutex<LastRequest>,
     // -- metadata for the activity page --
     file_id: i64,
     item_id: i64,
@@ -1157,6 +1216,17 @@ struct Session {
     /// playhead. Everything that judges a session's health has to know: a
     /// suspended encoder makes no progress *on purpose*.
     suspended: AtomicBool,
+    /// Successful running→held transitions during this session. A counter,
+    /// rather than only the current boolean, exposes flapping after it has
+    /// already resumed.
+    suspend_count: AtomicU64,
+    /// Snapshot of the EVENT-to-typeless experiment at session creation. A
+    /// settings edit must never mutate one URL's playlist type mid-play.
+    typeless_sliding: bool,
+    /// The first retained-prefix advance gets one operational log line. A
+    /// playlist reload may observe that state hundreds of times; only the
+    /// transition is evidence about the EVENT/sliding experiment.
+    first_slide_logged: AtomicBool,
 }
 
 /// How far a session's published media runs ahead of the client's download
@@ -1300,12 +1370,15 @@ async fn session_info(
     id: &str,
     s: &Session,
     limits: AheadLimits,
-    global_bytes: i64,
+    global_live_bytes: i64,
+    global_ahead_bytes: i64,
 ) -> SessionInfo {
     let ahead = s.ahead().await;
     let suspended = s.suspended.load(Relaxed);
     let hold = if suspended {
-        ahead.and_then(|ahead| ahead_hold(ahead, global_bytes, limits, true))
+        ahead.and_then(|ahead| {
+            ahead_hold(ahead, global_live_bytes, global_ahead_bytes, limits, true)
+        })
     } else {
         None
     };
@@ -1318,7 +1391,7 @@ async fn session_info(
         target_height: s.target_height,
         encoder: *s.encoder_label.lock().await,
         started_unix: s.started_unix,
-        idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
+        idle_seconds: s.last_request.lock().await.at.elapsed().as_secs(),
         speed: s.progress.speed(),
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
@@ -1335,6 +1408,7 @@ async fn session_info(
         delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
         delivered_idle_ms: s.delivery.idle_for_ms(),
         suspended,
+        suspend_count: s.suspend_count.load(Relaxed),
     }
 }
 
@@ -1651,6 +1725,10 @@ pub struct SessionInfo {
     /// measurement from a memory.
     pub delivered_idle_ms: i64,
     pub suspended: bool,
+    /// Number of times this producer entered a held state. This stays visible
+    /// after resume so a flapping session cannot look healthy merely because
+    /// the activity poll landed between transitions.
+    pub suspend_count: u64,
 }
 
 /// What a client asked for, normalised. Two requests with the same
@@ -2480,7 +2558,7 @@ impl TranscodeManager {
             child: Mutex::new(None),
             cached: true,
             _cache_reader: Some(cache_reader),
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id: file.id,
             item_id: file.item_id,
             item_title: item_title.to_owned(),
@@ -2513,6 +2591,9 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -3308,6 +3389,18 @@ impl TranscodeManager {
         }
     }
 
+    /// A feature switch stored in the ordinary settings table. Only the
+    /// literal value `1` enables an experiment; absent, malformed, and every
+    /// other value stay on the established path.
+    async fn bool_setting(&self, key: &str) -> bool {
+        self.store
+            .get_setting(key)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|value| value.trim() == "1")
+    }
+
     /// How an HLS session's input should be paced, given the admin settings
     /// and what this ffmpeg build supports. `for_copy` picks the pre-5.1
     /// degradation (see [`crate::ffmpeg::PacingCaps::resolve`]).
@@ -3681,6 +3774,7 @@ impl TranscodeManager {
             sw_permit.as_ref().map(|p| p.threads() as u32),
         );
         let pacing = self.pacing(false).await;
+        let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
         // Log the exact command — the single most useful diagnostic. It reveals
         // the decode/filter/encode pipeline actually used (e.g. whether heavy
@@ -3725,7 +3819,7 @@ impl TranscodeManager {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id,
             item_id: file.item_id,
             item_title,
@@ -3760,6 +3854,9 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(sw_permit),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            typeless_sliding,
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -3980,7 +4077,7 @@ impl TranscodeManager {
         ) {
             Ok(child) => {
                 *session.child.lock().await = Some(child);
-                *session.last_access.lock().await = Instant::now();
+                *session.last_request.lock().await = LastRequest::now("fallback-start");
                 // The activity page must stop naming the hardware
                 // encoder the moment it is no longer the one running.
                 *session.encoder_label.lock().await = retry_encoder.label();
@@ -4086,6 +4183,7 @@ impl TranscodeManager {
         // stream Safari played fine.
         let have_dovi = self.dv_strippable();
         let pacing = self.pacing(true).await;
+        let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let legacy_args = || {
             transcode::hls_copy_args_with_dolby_vision(
                 &file,
@@ -4180,7 +4278,7 @@ impl TranscodeManager {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id,
             item_id: file.item_id,
             item_title,
@@ -4209,6 +4307,9 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            typeless_sliding,
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -4299,7 +4400,8 @@ impl TranscodeManager {
                         ) {
                             Ok(child) => {
                                 *session.child.lock().await = Some(child);
-                                *session.last_access.lock().await = Instant::now();
+                                *session.last_request.lock().await =
+                                    LastRequest::now("fallback-start");
                                 tracing::info!(session = %sid, "fallback copy started");
                             }
                             Err(e) => {
@@ -4349,25 +4451,37 @@ impl TranscodeManager {
     /// is created and never moves.
     pub async fn list_deliveries(&self) -> Vec<(SessionInfo, crate::delivery::Method)> {
         let limits = self.ahead_limits().await;
-        let global_bytes = self.global_live_bytes().await;
+        let (global_live_bytes, global_ahead_bytes) = self.global_flow_bytes().await;
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push((session_info(id, s, limits, global_bytes).await, s.method));
+            out.push((
+                session_info(id, s, limits, global_live_bytes, global_ahead_bytes).await,
+                s.method,
+            ));
         }
         out.sort_by_key(|(s, _)| s.started_unix);
         out
     }
 
     /// One session's live telemetry, for the player's stats overlay. Does not
-    /// touch `last_access`: asking how a stream is doing is not the same as
+    /// touch the last-request clock: asking how a stream is doing is not the same as
     /// fetching from it, and a status poll must not keep an abandoned session
     /// alive past the idle reaper.
     pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
         let limits = self.ahead_limits().await;
-        let global_bytes = self.global_live_bytes().await;
-        Some(session_info(session_id, &session, limits, global_bytes).await)
+        let (global_live_bytes, global_ahead_bytes) = self.global_flow_bytes().await;
+        Some(
+            session_info(
+                session_id,
+                &session,
+                limits,
+                global_live_bytes,
+                global_ahead_bytes,
+            )
+            .await,
+        )
     }
 
     /// End one session now. True if it existed.
@@ -4388,15 +4502,15 @@ impl TranscodeManager {
         true
     }
 
-    async fn touch(&self, session_id: &str) -> Option<Arc<Session>> {
+    async fn touch(&self, session_id: &str, kind: &'static str) -> Option<Arc<Session>> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
-        *session.last_access.lock().await = Instant::now();
+        *session.last_request.lock().await = LastRequest::now(kind);
         Some(session)
     }
 
     /// Resolve the source and resume base attached to a live HLS capability.
     pub async fn hls_context(&self, session_id: &str) -> Option<HlsContext> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "hls-context").await?;
         Some(HlsContext {
             file_id: session.file_id,
             start_seconds: session.start_seconds,
@@ -4409,7 +4523,7 @@ impl TranscodeManager {
 
     /// Read the current media playlist for a session.
     pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "playlist").await?;
         let path = session.dir.join("index.m3u8");
         // Hold the request until the playlist exists. On the transcode path
         // that is a beat after ffmpeg starts; on the copy path it is the
@@ -4436,7 +4550,26 @@ impl TranscodeManager {
                         return Some(bytes);
                     }
                     let first_retained = session.segments.lock().await.first_retained_index();
-                    return Some(served_live_playlist(bytes, first_retained));
+                    if let Some(first_retained_index) = first_retained.filter(|index| *index > 0) {
+                        if !session.first_slide_logged.swap(true, Relaxed) {
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_secs() as i64)
+                                .unwrap_or(session.started_unix);
+                            tracing::info!(
+                                session = %session_id,
+                                first_retained_index,
+                                wall_seconds_since_start =
+                                    now_unix.saturating_sub(session.started_unix),
+                                "served HLS playlist began sliding"
+                            );
+                        }
+                    }
+                    return Some(served_live_playlist(
+                        bytes,
+                        first_retained,
+                        session.typeless_sliding,
+                    ));
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4452,7 +4585,7 @@ impl TranscodeManager {
     /// their files are gone, so callers never reconstruct time from a segment
     /// number or the shortened playlist.
     pub async fn segment_window(&self, session_id: &str, segment_index: i64) -> Option<(f64, f64)> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "segment-window").await?;
         self.flow_control(&session, session_id).await;
         let (start_ms, end_ms) = session.segments.lock().await.window_ms_of(segment_index)?;
         Some((start_ms as f64 / 1000.0, end_ms as f64 / 1000.0))
@@ -4474,7 +4607,7 @@ impl TranscodeManager {
         if !is_safe_segment(name) {
             return None;
         }
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "segment").await?;
         let path = session.dir.join(name);
         let idx = segment_index(name);
 
@@ -4587,13 +4720,20 @@ impl TranscodeManager {
         session: &Session,
         session_id: &str,
         limits: AheadLimits,
-        global_bytes: i64,
+        global_live_bytes: i64,
+        global_ahead_bytes: i64,
     ) {
         let Some(ahead) = session.ahead().await else {
             return; // nothing published yet — nothing to hold
         };
         let suspended = session.suspended.load(Relaxed);
-        let hold = ahead_hold(ahead, global_bytes, limits, suspended);
+        let hold = ahead_hold(
+            ahead,
+            global_live_bytes,
+            global_ahead_bytes,
+            limits,
+            suspended,
+        );
         let want_suspend = hold.is_some();
         if want_suspend == suspended {
             return;
@@ -4625,17 +4765,21 @@ impl TranscodeManager {
         }
         session.suspended.store(want_suspend, Relaxed);
         if want_suspend {
-            tracing::debug!(
+            let suspend_count = session.suspend_count.fetch_add(1, Relaxed) + 1;
+            tracing::info!(
                 session = %session_id,
+                suspend_count,
                 hold_reason = ?hold.map(|hold| hold.reason),
                 release_value = hold.map(|hold| hold.release_value),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
-                global_bytes, max_secs = limits.max_secs, max_bytes = limits.max_bytes,
+                global_live_bytes, global_ahead_bytes,
+                max_secs = limits.max_secs, max_bytes = limits.max_bytes,
                 "suspending transcode: far enough ahead of the client"
             );
         } else {
-            tracing::debug!(
+            tracing::info!(
                 session = %session_id,
+                suspend_count = session.suspend_count.load(Relaxed),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
                 "resuming transcode: the client caught up"
             );
@@ -4675,23 +4819,26 @@ impl TranscodeManager {
         *self.cached_limits.write().expect("limits lock") = None;
     }
 
-    /// Scratch in use across every live session, from each one's cached
-    /// figure — summing this must not cost a directory walk per session, or
-    /// the flow controller could not run on every segment fetch.
+    /// Both byte views across every live session, from their cached figures —
+    /// summing these must not cost a directory walk per session, or the flow
+    /// controller could not run on every segment fetch.
     ///
-    /// TOTAL bytes, not bytes-ahead. The cap this feeds is the documented
-    /// disk ceiling ([`keys::HLS_SCRATCH_MAX_BYTES`]), and a session's disk
-    /// is its whole retention window, not just its reserve: summing the
-    /// ahead figure let several healthy sessions exceed the "cap" by
-    /// [`RETENTION_SECS`] of media each (review §2.7). Pacing keeps using
-    /// each session's own ahead figure — that one is really about reserve.
-    async fn global_live_bytes(&self) -> i64 {
+    /// TOTAL bytes enforce the documented disk ceiling
+    /// ([`keys::HLS_SCRATCH_MAX_BYTES`]); drainable AHEAD bytes decide when a
+    /// global hold may release. The distinction is load-bearing: each
+    /// session's retained history is real scratch but cannot fall until its
+    /// client frontier moves beyond [`RETENTION_SECS`].
+    async fn global_flow_bytes(&self) -> (i64, i64) {
         self.sessions
             .lock()
             .await
             .values()
-            .map(|s| s.live_bytes.load(Relaxed))
-            .sum()
+            .fold((0, 0), |(live, ahead), session| {
+                (
+                    live + session.live_bytes.load(Relaxed),
+                    ahead + session.ahead_bytes.load(Relaxed),
+                )
+            })
     }
 
     /// Re-evaluate one session after a client request refreshes the published
@@ -4704,15 +4851,15 @@ impl TranscodeManager {
     async fn flow_control(&self, session: &Session, session_id: &str) {
         session.refresh_segments().await;
         let limits = self.ahead_limits().await;
-        let global = self.global_live_bytes().await;
-        self.apply_ahead_window(session, session_id, limits, global)
+        let (global_live, global_ahead) = self.global_flow_bytes().await;
+        self.apply_ahead_window(session, session_id, limits, global_live, global_ahead)
             .await;
     }
 
     /// Background loop: kill and remove sessions idle beyond the timeout,
     /// prune played-past segments, and hold sessions that have run ahead.
     pub async fn reap_loop(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        let mut ticker = tokio::time::interval(FLOW_CONTROL_REPAIR_INTERVAL);
         loop {
             ticker.tick().await;
             let idle = Duration::from_secs(SESSION_IDLE_SECS);
@@ -4722,14 +4869,16 @@ impl TranscodeManager {
             {
                 let sessions = self.sessions.lock().await;
                 for (id, s) in sessions.iter() {
-                    if s.last_access.lock().await.elapsed() > idle {
-                        expired.push((id.clone(), Arc::clone(s)));
+                    let last = s.last_request.lock().await;
+                    let idle_age = last.at.elapsed();
+                    if idle_age > idle {
+                        expired.push((id.clone(), Arc::clone(s), idle_age.as_secs(), last.kind));
                     } else {
                         live.push((id.clone(), Arc::clone(s)));
                     }
                 }
             }
-            for (id, session) in expired {
+            for (id, session, idle_seconds, last_request) in expired {
                 self.sessions.lock().await.remove(&id);
                 session.release_hardware();
                 session.release_software();
@@ -4737,7 +4886,12 @@ impl TranscodeManager {
                 // does not need the process scheduled to take effect.
                 session.kill_child().await;
                 session.discard_dir().await;
-                tracing::info!(session_id = %id, "reaped idle transcode session");
+                tracing::info!(
+                    session_id = %id,
+                    idle_seconds,
+                    last_request,
+                    "reaped idle transcode session"
+                );
             }
             // What this box actually achieves, remembered per class of work.
             // Admission asks it the next time hardware is full, so the answer
@@ -4761,9 +4915,10 @@ impl TranscodeManager {
                 session.refresh_segments().await;
                 gc_expired_segments(session).await;
             }
-            let global = self.global_live_bytes().await;
+            let (global_live, global_ahead) = self.global_flow_bytes().await;
             for (id, session) in &live {
-                self.apply_ahead_window(session, id, limits, global).await;
+                self.apply_ahead_window(session, id, limits, global_live, global_ahead)
+                    .await;
             }
         }
     }
@@ -5301,7 +5456,7 @@ mod tests {
         // (`touch` is the shared front half of the playlist and segment
         // readers; calling those here would long-poll for output this fixture
         // can never produce.)
-        assert!(mgr.touch(&info.session_id).await.is_some());
+        assert!(mgr.touch(&info.session_id, "test-fetch").await.is_some());
         assert_eq!(
             mgr.session_status(&info.session_id)
                 .await
@@ -5381,13 +5536,17 @@ mod tests {
                    #EXT-X-ENDLIST\n";
 
         assert_eq!(
-            served_live_playlist(raw.as_bytes().to_vec(), Some(0)),
+            served_live_playlist(raw.as_bytes().to_vec(), Some(0), false),
             raw.as_bytes(),
             "before pruning the client sees the writer's EVENT playlist unchanged"
         );
 
-        let served = String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(2)))
-            .expect("playlist utf8");
+        let served = String::from_utf8(served_live_playlist(
+            raw.as_bytes().to_vec(),
+            Some(2),
+            false,
+        ))
+        .expect("playlist utf8");
         assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{served}");
         assert!(!served.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{served}");
         assert!(!served.contains("seg00000.m4s"), "{served}");
@@ -5397,6 +5556,56 @@ mod tests {
             "tags attached to the first retained segment survive: {served}"
         );
         assert!(served.ends_with("seg00002.m4s\n#EXT-X-ENDLIST\n"));
+    }
+
+    /// The experiment's promise is not merely that EVENT disappears after a
+    /// prune; it is that one session URL presents the same typeless envelope
+    /// before and after that boundary. Only MEDIA-SEQUENCE and the retained
+    /// body are allowed to advance.
+    #[test]
+    fn typeless_sliding_playlist_keeps_one_shape_across_pruning() {
+        let raw = "#EXTM3U\n\
+                   #EXT-X-VERSION:7\n\
+                   #EXT-X-TARGETDURATION:10\n\
+                   #EXT-X-MEDIA-SEQUENCE:0\n\
+                   #EXT-X-PLAYLIST-TYPE:EVENT\n\
+                   #EXT-X-MAP:URI=\"init.mp4\"\n\
+                   #EXTINF:4.000,\n\
+                   seg00000.m4s\n\
+                   #EXTINF:4.000,\n\
+                   seg00001.m4s\n\
+                   #EXTINF:4.000,\n\
+                   seg00002.m4s\n";
+        let before =
+            String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(0), true))
+                .expect("before utf8");
+        let after = String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(2), true))
+            .expect("after utf8");
+
+        for playlist in [&before, &after] {
+            assert!(
+                !playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+                "{playlist}"
+            );
+            assert!(
+                playlist.contains("#EXT-X-START:TIME-OFFSET=0"),
+                "{playlist}"
+            );
+        }
+        let stable_headers = |playlist: &str| {
+            playlist
+                .lines()
+                .take_while(|line| !line.starts_with("#EXTINF:"))
+                .filter(|line| !line.starts_with("#EXT-X-MEDIA-SEQUENCE:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stable_headers(&before), stable_headers(&after));
+        assert!(before.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{before}");
+        assert!(after.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{after}");
+        assert!(before.contains("seg00000.m4s"), "{before}");
+        assert!(!after.contains("seg00000.m4s"), "{after}");
+        assert!(after.contains("seg00002.m4s"), "{after}");
     }
 
     // ---- the append-oriented index (review §2.6) ----------------------------
@@ -5633,31 +5842,34 @@ mod tests {
         assert_eq!(time_release_threshold(1), Some(1));
         assert_eq!(time_release_threshold(0), None);
         // Running: hold once past any single window.
-        assert!(!should_suspend(secs(179), 0, limits, false));
-        assert!(should_suspend(secs(181), 0, limits, false));
-        assert!(should_suspend(bytes(2_001), 0, limits, false));
+        assert!(!should_suspend(secs(179), 0, 0, limits, false));
+        assert!(should_suspend(secs(181), 0, 0, limits, false));
+        assert!(should_suspend(bytes(2_001), 0, 0, limits, false));
         // The global budget holds a session that is individually well behaved
         // — several healthy 4K streams fill a disk between them.
-        assert!(should_suspend(secs(10), 8_001, limits, false));
+        assert!(should_suspend(secs(10), 8_001, 0, limits, false));
 
         // Held: time keeps its 30-second release gap so a fast encoder does
         // not toggle once per client segment near the ceiling.
-        assert!(should_suspend(secs(151), 0, limits, true));
-        assert!(!should_suspend(secs(150), 0, limits, true));
-        assert!(!should_suspend(secs(138), 0, limits, true));
+        assert!(should_suspend(secs(151), 0, 0, limits, true));
+        assert!(!should_suspend(secs(150), 0, 0, limits, true));
+        assert!(!should_suspend(secs(138), 0, 0, limits, true));
         assert!(
-            should_suspend(secs(186), 0, limits, true),
+            should_suspend(secs(186), 0, 0, limits, true),
             "without a client fetch, the producer can remain held"
         );
-        // Byte budgets remain hard disk bounds and release only at half.
-        assert!(should_suspend(secs(10), 4_001, limits, true));
-        assert!(!should_suspend(secs(10), 4_000, limits, true));
+        // The global byte cap enters on total scratch but releases on the
+        // drainable reserve across all sessions. Retention behind the client
+        // is intentionally absent from this half-cap comparison.
+        assert!(should_suspend(secs(10), 8_001, 4_001, limits, true));
+        assert!(!should_suspend(secs(10), 8_001, 4_000, limits, true));
         // Time is fine but bytes are not: still held.
         assert!(should_suspend(
             Ahead {
                 seconds: 10,
                 bytes: 1_001
             },
+            0,
             0,
             limits,
             true
@@ -5669,29 +5881,82 @@ mod tests {
             max_bytes: 0,
             global_max_bytes: 0,
         };
-        assert!(!should_suspend(secs(10_000), 1 << 40, off, false));
-        assert!(!should_suspend(secs(10_000), 1 << 40, off, true));
+        assert!(!should_suspend(secs(10_000), 1 << 40, 1 << 40, off, false));
+        assert!(!should_suspend(secs(10_000), 1 << 40, 1 << 40, off, true));
 
         assert_eq!(
-            ahead_hold(secs(151), 0, limits, true),
+            ahead_hold(secs(151), 0, 0, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Time,
                 release_value: 150,
             })
         );
         assert_eq!(
-            ahead_hold(bytes(1_001), 0, limits, true),
+            ahead_hold(bytes(1_001), 0, 0, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Bytes,
                 release_value: 1_000,
             })
         );
         assert_eq!(
-            ahead_hold(secs(10), 4_001, limits, true),
+            ahead_hold(secs(10), 8_001, 4_001, limits, true),
             Some(AheadHold {
                 reason: AheadHoldReason::Global,
                 release_value: 4_000,
             })
+        );
+    }
+
+    /// A producer with no request-side evaluation can run until the repair
+    /// tick. Pin that gap at the shipped pace so a future cadence or pacing
+    /// change cannot quietly restore the observed +120-second overshoot.
+    #[test]
+    fn default_repair_cadence_bounds_time_overshoot() {
+        let overshoot =
+            (FLOW_CONTROL_REPAIR_INTERVAL.as_secs_f64() * HLS_READRATE_DEFAULT).ceil() as i64;
+        assert_eq!(FLOW_CONTROL_REPAIR_INTERVAL, Duration::from_secs(15));
+        assert_eq!(HLS_READRATE_DEFAULT, 2.0);
+        assert_eq!(overshoot, 30, "default worst-case overshoot in seconds");
+    }
+
+    /// Four retention floors can sit above the old half-cap release line even
+    /// after every client has fetched through the published frontier. Those
+    /// bytes are real disk usage, so they still trigger the cap while running;
+    /// they are not drainable reserve, so they cannot keep a held producer
+    /// stopped forever.
+    #[test]
+    fn retained_floors_cannot_make_global_release_unreachable() {
+        let indexes: Vec<SegmentIndex> = (0..4)
+            .map(|session| SegmentIndex {
+                segs: (0..3)
+                    .map(|segment| SegmentMeta {
+                        index: segment,
+                        name: format!("s{session}-seg{segment}.m4s"),
+                        start_ms: segment * 4_000,
+                        end_ms: (segment + 1) * 4_000,
+                        bytes: 500,
+                        pruned: false,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let global_live: i64 = indexes.iter().map(SegmentIndex::total_bytes).sum();
+        let global_ahead: i64 = indexes
+            .iter()
+            .map(|index| ahead_of(index, 12_000).expect("published").bytes)
+            .sum();
+        assert_eq!(global_live, 6_000, "retention floors remain on disk");
+        assert_eq!(global_ahead, 0, "every client drained its reserve");
+
+        let limits = AheadLimits {
+            max_secs: 180,
+            max_bytes: 2_000,
+            global_max_bytes: 8_000,
+        };
+        assert_eq!(
+            ahead_hold(Ahead::default(), global_live, global_ahead, limits, true),
+            None,
+            "retained floors above the 4,000-byte release line are not a permanent hold"
         );
     }
 
@@ -5790,7 +6055,7 @@ mod tests {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("test-start")),
             file_id: 1,
             item_id: 1,
             item_title: "T".into(),
@@ -5816,6 +6081,9 @@ mod tests {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
+            first_slide_logged: AtomicBool::new(false),
         }
     }
 
@@ -5866,6 +6134,7 @@ mod tests {
                 max_bytes: 2_000_000_000,
                 global_max_bytes: 8_000_000_000,
             },
+            0,
             0,
         )
         .await;
@@ -6153,6 +6422,7 @@ mod tests {
         assert_eq!(status.hold_reason, Some(AheadHoldReason::Time));
         assert_eq!(status.resume_below_seconds, Some(1));
         assert_eq!(status.resume_below_bytes, None);
+        assert_eq!(status.suspend_count, 1, "the first transition is visible");
         let frozen = session.progress.out_time_ms();
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(
@@ -6175,6 +6445,14 @@ mod tests {
             .clone();
         assert!(mgr.segment(&info.session_id, &newest).await.is_some());
         assert!(!session.suspended.load(Relaxed), "session was released");
+        assert_eq!(
+            mgr.session_status(&info.session_id)
+                .await
+                .expect("status after release")
+                .suspend_count,
+            1,
+            "resume preserves the transition history"
+        );
         let moved = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if session.progress.out_time_ms() > frozen {
@@ -6210,9 +6488,18 @@ mod tests {
                 global_max_bytes: 0,
             },
             0,
+            0,
         )
         .await;
         assert!(session.suspended.load(Relaxed), "held again");
+        assert_eq!(
+            mgr.session_status(&info.session_id)
+                .await
+                .expect("status after second hold")
+                .suspend_count,
+            2,
+            "a second transition cannot hide between activity polls"
+        );
         assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
     }
@@ -6565,7 +6852,7 @@ mod tests {
             child: Mutex::new(child),
             cached,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("test-start")),
             file_id: 1,
             item_id: 1,
             item_title: "Watchdog Fixture".into(),
@@ -6591,6 +6878,9 @@ mod tests {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
+            first_slide_logged: AtomicBool::new(false),
         })
     }
 
