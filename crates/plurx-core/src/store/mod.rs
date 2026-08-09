@@ -9,7 +9,10 @@
 //! The trait is split by domain area purely for readability; consumers hold
 //! one `Arc<dyn Store>`. Contract notes for future backends:
 //! - Operations are linearizable from the caller's perspective.
-//! - A write acknowledged ⇒ durable (on a cluster: quorum-acked).
+//! - A successful write method is durable (on a cluster: quorum-acked).
+//!   The HTTP progress coalescer sits above this boundary: an intermediate
+//!   active-playback beat may receive a soft acknowledgement while its newest
+//!   value is pending, and the response exposes only the durable state.
 //! - Implementations are shared via `Arc`, never cloned per-request.
 
 mod sqlite;
@@ -18,6 +21,8 @@ mod sqlite;
 mod hiqlite;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_catalog;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_durable;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
 
@@ -594,6 +599,21 @@ pub trait WatchStore: Send + Sync + 'static {
         self.put_progress_at(user_id, item_id, position_ms, duration_ms, None)
             .await
     }
+    /// Commit a coalesced playback beat only if the durable row still matches
+    /// the state observed by the coalescer's leading write.
+    ///
+    /// A manual watched/unwatched action, an offline replay, or a Trakt merge
+    /// may update the same row while a trailing beat is waiting. Returning
+    /// `None` tells the coalescer that another writer won; it must discard the
+    /// stale beat rather than overwrite that newer intent.
+    async fn put_progress_if_current(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        expected: &WatchState,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+    ) -> Result<Option<WatchState>, StoreError>;
     /// Record playback progress with an optional client observation time.
     ///
     /// `recorded_at` is used by offline clients replaying their durable final
@@ -682,14 +702,22 @@ pub trait TraktStore: Send + Sync + 'static {
     async fn list_trakt_auth(&self) -> Result<Vec<TraktAuth>, StoreError>;
     async fn put_trakt_auth(&self, auth: &TraktAuth) -> Result<(), StoreError>;
     async fn delete_trakt_auth(&self, user_id: i64) -> Result<(), StoreError>;
+    /// Delete a rejected OAuth link only if no other voter has already
+    /// rotated the refresh token.
+    async fn delete_trakt_auth_if_current(
+        &self,
+        user_id: i64,
+        expected_refresh_token: &str,
+    ) -> Result<bool, StoreError>;
     /// Refresh bookkeeping after a token rotation.
     async fn update_trakt_tokens(
         &self,
         user_id: i64,
+        expected_refresh_token: &str,
         access_token: &str,
         refresh_token: &str,
         expires_at: i64,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
     /// Stamp a completed sync run (and the last_activities gate JSON).
     async fn set_trakt_sync(
         &self,
@@ -740,6 +768,9 @@ pub struct OutboxEntry {
     /// pending | ok | failed
     pub status: String,
     pub next_at: i64,
+    /// Lease deadline for the worker that fetched this row. A stale worker's
+    /// settlement is ignored after another voter reclaims the delivery.
+    pub claim_until: i64,
 }
 
 /// The outbox for watched notifications (master plan §11.1).
@@ -1001,4 +1032,12 @@ impl<T> Store for T where
         + Sync
         + 'static
 {
+}
+
+// Compile-time proof that the composed trait remains object-safe and that the
+// production ownership shape can be constructed. If a future method makes
+// `Store` non-object-safe, this function stops compiling before runtime tests.
+#[allow(dead_code)]
+fn assert_arc_dyn_store(store: std::sync::Arc<SqliteStore>) -> std::sync::Arc<dyn Store> {
+    store
 }

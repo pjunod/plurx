@@ -15,7 +15,7 @@ internet, read [Non-goals](#non-goals--what-plurx-does-not-defend-against)
 first: several protections you'd expect at that boundary are the proxy's job,
 not plurx's, by design.
 
-Audited 2026-08-05. Where a claim below is exhaustive, the test that keeps it
+Audited 2026-08-08. Where a claim below is exhaustive, the test that keeps it
 honest is named inline.
 
 ## Authentication — one token bar, no anonymous back doors
@@ -90,6 +90,23 @@ ordinary cloud backups, and is not exported to shared storage. Revoking a
 user or login token prevents new server access but cannot erase bytes already
 downloaded to a device. Uninstalling the app removes those local downloads;
 a rooted or jailbroken device can read them.
+
+## Cluster voter disks — Trakt needs encryption before activation
+
+Passwords, login tokens, API keys, and offline lease capabilities are stored
+as hashes. Trakt is different: plurx must recover the upstream OAuth access
+and refresh tokens to make outbound calls, so the current SQLite schema stores
+live bearer credentials. The M1d replicated backend is not production-selected,
+but its schema would copy those plaintext values into every voter database,
+raft WAL, snapshot, and backup. Deleting the current row cannot erase the
+historical log entries.
+
+M2 therefore may not activate Hiqlite until Trakt bearer columns use envelope
+encryption under the node-local `enc_keys` described in
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md) §3.2. Raft may replicate ciphertext,
+key version, expiry, username, and sync metadata; a copied voter disk must not
+be enough to use a household's Trakt account. This is an activation gate, not
+a protection the under-review backend already claims.
 
 ## API keys — a credential for machines, not a token for robots
 

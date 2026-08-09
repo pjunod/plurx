@@ -456,7 +456,7 @@ pub mod scopes {
 // Watch state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct WatchState {
     pub position_ms: i64,
     pub duration_ms: Option<i64>,

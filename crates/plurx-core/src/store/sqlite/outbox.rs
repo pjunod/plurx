@@ -7,6 +7,8 @@ use super::SqliteStore;
 use crate::error::StoreError;
 use crate::store::{OutboxEntry, WatchedOutboxStore};
 
+const CLAIM_SECS: i64 = 60;
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -31,15 +33,19 @@ impl WatchedOutboxStore for SqliteStore {
 
     async fn due_watched(&self, limit: i64) -> Result<Vec<OutboxEntry>, StoreError> {
         self.with_conn(move |conn| {
+            let claimed_at = now();
+            let claim_until = claimed_at.saturating_add(CLAIM_SECS);
             let mut stmt = conn.prepare(
-                "SELECT id, payload, attempts, last_error, status, next_at
-                   FROM watched_outbox
-                  WHERE status = 'pending' AND next_at <= ?1
-                  ORDER BY next_at, id
-                  LIMIT ?2",
+                "UPDATE watched_outbox SET claim_until = ?3
+                   WHERE id IN (
+                     SELECT id FROM watched_outbox
+                      WHERE status = 'pending' AND next_at <= ?1 AND claim_until <= ?1
+                      ORDER BY next_at, id LIMIT ?2
+                   )
+                   RETURNING id, payload, attempts, last_error, status, next_at, claim_until",
             )?;
             let rows = stmt
-                .query_map(params![now(), limit], |row| {
+                .query_map(params![claimed_at, limit, claim_until], |row| {
                     Ok(OutboxEntry {
                         id: row.get(0)?,
                         payload: row.get(1)?,
@@ -47,6 +53,7 @@ impl WatchedOutboxStore for SqliteStore {
                         last_error: row.get(3)?,
                         status: row.get(4)?,
                         next_at: row.get(5)?,
+                        claim_until: row.get(6)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -61,15 +68,16 @@ impl WatchedOutboxStore for SqliteStore {
             conn.execute(
                 "UPDATE watched_outbox
                     SET attempts = ?2, last_error = ?3, status = ?4, next_at = ?5,
-                        updated_at = ?6
-                  WHERE id = ?1",
+                        updated_at = ?6, claim_until = 0
+                  WHERE id = ?1 AND claim_until = ?7",
                 params![
                     entry.id,
                     entry.attempts,
                     entry.last_error,
                     entry.status,
                     entry.next_at,
-                    now()
+                    now(),
+                    entry.claim_until
                 ],
             )?;
             Ok(())

@@ -76,6 +76,13 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.subtitle_index == requested.subtitle_index
         && existing.subtitle_language == requested.subtitle_language
         && existing.subtitle_mode == requested.subtitle_mode
+        && existing.estimated_bytes == requested.estimated_bytes
+        && existing.reserved_bytes == requested.reserved_bytes
+        && existing.expires_at == requested.expires_at
+}
+
+fn exceeds_byte_limit(used: i64, reserved: i64, limit: i64) -> bool {
+    limit <= 0 || reserved < 0 || used > limit || reserved > limit - used
 }
 
 #[async_trait]
@@ -129,9 +136,7 @@ impl OfflinePackageStore for SqliteStore {
                 [requested.user_id],
                 |row| row.get(0),
             )?;
-            if max_bytes_per_user <= 0
-                || used.saturating_add(requested.reserved_bytes) > max_bytes_per_user
-            {
+            if exceeds_byte_limit(used, requested.reserved_bytes, max_bytes_per_user) {
                 tx.commit()?;
                 return Ok(OfflineCreateOutcome::ByteLimit {
                     used,
@@ -141,13 +146,12 @@ impl OfflinePackageStore for SqliteStore {
 
             let global_used: i64 = tx.query_row(
                 "SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
-                 FROM offline_packages WHERE state IN ('queued', 'preparing', 'ready')",
-                [],
+                 FROM offline_packages WHERE node_id = ?1 \
+                   AND state IN ('queued', 'preparing', 'ready')",
+                [&requested.node_id],
                 |row| row.get(0),
             )?;
-            if max_bytes_global <= 0
-                || global_used.saturating_add(requested.reserved_bytes) > max_bytes_global
-            {
+            if exceeds_byte_limit(global_used, requested.reserved_bytes, max_bytes_global) {
                 tx.commit()?;
                 return Ok(OfflineCreateOutcome::GlobalByteLimit {
                     used: global_used,

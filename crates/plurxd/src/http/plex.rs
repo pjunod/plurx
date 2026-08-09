@@ -324,8 +324,8 @@ pub async fn timeline(
     {
         if state.store.get_item(rating_key).await?.is_some() {
             state
-                .store
-                .put_progress(user.id, rating_key, q.time.unwrap_or(0).max(0), q.duration)
+                .progress
+                .put(user.id, rating_key, q.time.unwrap_or(0).max(0), q.duration)
                 .await?;
         }
     }
