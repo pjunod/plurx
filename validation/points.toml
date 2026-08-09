@@ -501,7 +501,9 @@ paths = [
   "scripts/pre-commit",
   "scripts/ci-flake-report",
   "scripts/history-audit",
+  "scripts/prove-fix",
   "scripts/validate",
+  "tests/client-fixes.toml",
   "tests/validation/**",
   "validation/**",
 ]

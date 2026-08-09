@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tests/playback/routing-decisions.toml"
+CLIENT_FIXES = ROOT / "tests/client-fixes.toml"
 PLAYBACK_DOC = ROOT / "docs/PLAYBACK.md"
 START = "<!-- playback-routing-inventory:start -->"
 END = "<!-- playback-routing-inventory:end -->"
@@ -59,6 +60,43 @@ class PlaybackRoutingInventoryTest(unittest.TestCase):
                     self.assertIn(
                         entry[anchor_key],
                         contents,
+                        f"{entry['id']} lost {anchor_key} in {entry[path_key]}",
+                    )
+
+    def test_client_fix_anchors_are_unique_live_and_commit_bound(self) -> None:
+        catalog = tomllib.loads(CLIENT_FIXES.read_text(encoding="utf-8"))
+        self.assertEqual(catalog.get("version"), 1)
+        self.assertRegex(catalog.get("enforce_after", ""), r"^[0-9a-f]{7,40}$")
+        fixes = catalog["fixes"]
+        ids = [entry["id"] for entry in fixes]
+        self.assertEqual(len(ids), len(set(ids)), "client fix ids must be unique")
+        self.assertGreaterEqual(len(fixes), 3)
+        required = {
+            "id",
+            "commits",
+            "source",
+            "source_anchor",
+            "test",
+            "test_anchor",
+        }
+        commit_claims: set[str] = set()
+        for entry in fixes:
+            with self.subTest(client_fix=entry.get("id", "(missing id)")):
+                self.assertEqual(required, set(entry))
+                self.assertTrue(entry["commits"])
+                for commit in entry["commits"]:
+                    self.assertRegex(commit, r"^[0-9a-f]{7,40}$")
+                    self.assertNotIn(commit, commit_claims, "commit has two client fix rows")
+                    commit_claims.add(commit)
+                for path_key, anchor_key in (
+                    ("source", "source_anchor"),
+                    ("test", "test_anchor"),
+                ):
+                    path = ROOT / entry[path_key]
+                    self.assertTrue(path.is_file(), f"missing {path_key}: {path}")
+                    self.assertIn(
+                        entry[anchor_key],
+                        path.read_text(encoding="utf-8"),
                         f"{entry['id']} lost {anchor_key} in {entry[path_key]}",
                     )
 
