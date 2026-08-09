@@ -55,10 +55,9 @@ Nothing here blocks a work order. Section 1 needs Paul, not GPT. Section 2 is P2
 
 **CI / ops bookkeeping**
 
-- **Mismatch — branch protection.** Main requires `rustfmt + clippy` and
-  `functionality points (CI profile)` directly; `PR validation gate` is not a
-  required context. Correcting this repository security boundary needs an
-  explicit owner-approved protection change.
+- **Pass — branch protection.** With explicit owner approval, main now uses
+  strict up-to-date-branch enforcement and requires only the aggregate
+  `PR validation gate`. PR #115 passed that gate before merge.
 - **Pass — Actions history.** The 100 completed CI runs from 2026-08-08
   00:21 UTC through 2026-08-09 14:23 UTC put fast-preflight p95 at 15 seconds
   against the 60-second budget. The three-voter contract job recorded 27
