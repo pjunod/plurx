@@ -1,7 +1,8 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 through M1d are complete; post-coalescer growth
-measurement, import, and daemon activation remain pending
+**Status:** executing — M0 through M1d and M2's source backup plus table-import
+parity slices are complete; import orchestration, post-coalescer growth
+measurement, and daemon activation remain pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
 2026-08-09
@@ -55,8 +56,10 @@ M0 now provides tolerated cluster configuration and local node identity; M1a
 provides the full backend-neutral parity inventory; M1b provides the first
 hiqlite auth/settings backend; M1c adds libraries, media, watch state,
 node-local FTS, and bounded root-aware reconciliation; and M1d completes the
-120-method store plus the progress write-rate gate. The daemon still opens the
-complete SQLite store. Import, membership/join, full-store activation,
+120-method store plus the progress write-rate gate. M2 now provides the
+content-addressed source backup and the inert fresh-target row importer with
+per-table parity evidence. The daemon still opens the complete SQLite store.
+Import orchestration, membership/join, full-store activation,
 lease-fenced publication, replicated session ownership, serving self-fencing,
 and client failover do not exist yet.
 
@@ -518,6 +521,37 @@ content hashes and full parity behavior; kill each import step and prove the
 next boot either resumes from the completed atomic target or deletes incoming
 state and starts SQLite unchanged.
 
+**Source preparation and row import delivered 2026-08-09; activation remains
+open.** `prepare_sqlite_import` refuses a future schema before mutation,
+removes an abandoned incoming directory, and publishes a fsynced,
+content-addressed SQLite online backup with committed WAL pages included. The
+backup uses canonical delete journaling, so later verification never creates
+an untracked WAL sidecar beside immutable source material.
+
+`HiqliteAuthStore::import_sqlite_backup` accepts only a fresh bootstrapped
+target whose `instance.id` matches the source. It imports all 17 shared durable
+tables in foreign-key order and 64-row Raft transactions, preserving explicit
+ids, timestamps, nullable values, and binary values. Items load parent-first
+through a recursive source query, so numeric id order cannot violate their
+self-reference. A v14 source contributes empty scan-reconciliation tables and
+zero outbox claim deadlines; v15–v17 preserve their newer durable facts.
+`playback_events`, `items_fts`, and `offline_lease_guards` never cross the
+boundary: telemetry is node-local, FTS is rebuilt, and the lease guard is an
+internal transaction scratch table.
+
+The importer runs source and target foreign-key checks, rebuilds FTS, compares
+the exact ordered JSON rows for every imported table, and returns the row count
+and SHA-256 for each table only after parity. The three-voter contract imports
+populated v14 and current fixtures. It covers a child id that sorts before its
+parent, nonzero current outbox claims, current scan state, checksum refusal,
+merge-style retry refusal, and source playback telemetry exclusion.
+
+This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
+and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
+fsynced completion marker, atomic activation, failure injection at each step,
+and fallback to unchanged SQLite. Trakt credential encryption and the
+post-coalescer growth record also remain activation blockers.
+
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
 Add single-use join, add/remove, health, server-name replication, node-specific
@@ -611,19 +645,22 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M1d completes the backend, not daemon activation
+## 8. Handoff checkpoint — M2 can copy rows, not activate them
 
-M0 through M1d are on `main`. Every trait now has one replicated
-implementation, but keep SQLite as the daemon's selected store
-until the import, credential-encryption, node-removal, and post-coalescer
-growth gates are ready. The next implementation boundary is M2: resumable v14
-import, content-hash comparison, failure-injected recovery, envelope-encrypted
-Trakt credentials, and the one-voter Hiqlite startup switch.
+M0 through M1d and M2's source-backup slice are on `main`; this row-import
+slice adds populated v14/current parity without selecting it in `plurxd`.
+Every trait has one replicated implementation, and the importer can now prove
+the 17 shared durable tables, but keep SQLite as the daemon's selected store
+until incoming-cluster orchestration, credential encryption, node removal,
+and the post-coalescer growth gates are ready. The next implementation boundary
+is the fsynced completion marker plus failure-injected one-voter activation;
+that coordinator must delete partial incoming state and keep SQLite active on
+every failure.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
-make cluster-check            # M1b/M1c/M1d durable state, FTS, and loss gate
+make cluster-check            # M1b-M2 durable state, import, FTS, and loss gate
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```
