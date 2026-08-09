@@ -70,7 +70,7 @@ hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
 	  single_voter_cost_stays_inside_the_m0_budget -- --ignored --exact --nocapture
 
 .PHONY: cluster-check
-cluster-check: ## Run the M1b/M1c/M1d three-voter durable-state and failure contract
+cluster-check: ## Run the M1b-M2 three-voter durable-state, import, and failure contract
 	$(CARGO) test --locked -p plurx-core --features hiqlite-store \
 	  --test store_contract -- --test-threads=1
 	$(CARGO) run --locked -p plurx-cluster-check -- check

@@ -24,13 +24,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::{Client, Node, NodeConfig};
+#[cfg(feature = "hiqlite-store")]
+use plurx_core::cluster::migration::prepare_sqlite_import;
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
     NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
     PlaybackEventQuery, ProbeResult, TraktAuth,
 };
 #[cfg(feature = "hiqlite-store")]
-use plurx_core::store::HiqliteAuthStore;
+use plurx_core::store::{
+    HiqliteAuthStore, MediaStore, PlaybackTelemetryStore, UserStore, WatchStore,
+};
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
 use serde::{Deserialize, Serialize};
@@ -43,6 +47,9 @@ const CONTRACT_RAFT_SECRET: &str = "plurx-store-contract-raft";
 const CONTRACT_API_SECRET: &str = "plurx-store-contract-api";
 #[cfg(feature = "hiqlite-store")]
 const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
+
+#[cfg(feature = "hiqlite-store")]
+static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const SETTINGS_METHODS: &[&str] = &["ping", "get_setting", "put_setting", "instance_id"];
 const USER_METHODS: &[&str] = &[
@@ -220,29 +227,33 @@ where
 
     #[cfg(feature = "hiqlite-store")]
     {
-        static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _case = HIQLITE_CASE.lock().await;
-        let cluster = contract_cluster();
-        let client = Client::remote(
-            cluster.addresses.clone(),
-            true,
-            true,
-            CONTRACT_API_SECRET.to_owned(),
-            true,
-            None,
-        )
-        .await
-        .expect("connect contract client to three voters");
-        let telemetry_path = cluster._root.path().join("contract-client-telemetry.db");
-        let store = HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID, &telemetry_path)
-            .await
-            .expect("bootstrap contract store");
+        let store = open_contract_hiqlite_store().await;
         store
             .validation_reset_contract_state()
             .await
             .expect("reset replicated contract state");
         contract(Arc::new(store), "hiqlite-3-voter").await;
     }
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect contract client to three voters");
+    let telemetry_path = cluster._root.path().join("contract-client-telemetry.db");
+    HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID, &telemetry_path)
+        .await
+        .expect("bootstrap contract store")
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -412,6 +423,369 @@ fn contract_free_port() -> u16 {
 #[cfg(feature = "hiqlite-store")]
 fn install_contract_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
+    let path = data_dir.join("plurx.db");
+    drop(SqliteStore::open(&path).expect("create current SQLite fixture"));
+
+    let connection = rusqlite::Connection::open(&path).expect("open SQLite import fixture");
+    connection
+        .execute(
+            "UPDATE settings SET value = ?1, updated_at = 101 WHERE key = 'instance.id'",
+            [CONTRACT_INSTANCE_ID],
+        )
+        .expect("set import fixture identity");
+    connection
+        .execute_batch(
+            "INSERT INTO settings (key, value, updated_at)
+                 VALUES ('migration.fixture', 'v14', 102);
+             INSERT INTO users (id, username, password_hash, is_admin, created_at)
+                 VALUES (7, 'Import Admin', 'fixture-password-hash', 1, 103);
+             INSERT INTO tokens (token_hash, user_id, device, created_at, last_seen_at)
+                 VALUES ('fixture-token-hash', 7, 'fixture-device', 104, 105);
+             INSERT INTO api_keys
+                 (id, name, key_hash, scopes, created_at, last_used_at, disabled)
+                 VALUES (8, 'fixture key', 'fixture-key-hash', '[\"status:read\"]',
+                         106, 107, 0);
+             INSERT INTO libraries
+                 (id, name, kind, paths, anime, created_at, scan_interval_mins,
+                  refresh_interval_mins, last_scan_at, last_refresh_at)
+                 VALUES (9, 'Imported Shows', 'shows', '[\"/fixture/shows\"]', 0,
+                         108, 30, 60, 109, 110);
+             INSERT INTO items
+                 (id, library_id, kind, parent_id, title, sort_title, year, overview,
+                  added_at, updated_at, tags, genres)
+                 VALUES (20, 9, 'show', NULL, 'Imported Show', 'Imported Show', 2024,
+                         'fixture parent', 111, 112, '[\"fixture\"]', '[\"Drama\"]');
+             INSERT INTO items
+                 (id, library_id, kind, parent_id, title, sort_title, season_number,
+                  added_at, updated_at, tags, genres)
+                 VALUES (10, 9, 'season', 20, 'Season 1', 'Season 1', 1,
+                         113, 114, '[]', '[]');
+             INSERT INTO files
+                 (id, item_id, path, size, mtime, duration_ms, container, video_codec,
+                  audio_streams, subtitle_streams, scanned_at, audio_offset_ms)
+                 VALUES (30, 10, '/fixture/shows/season-1.mkv', 4096, 115, 3600000,
+                         'matroska', 'h264', '[]', '[]', 116, 25);
+             INSERT INTO watch_state
+                 (user_id, item_id, position_ms, duration_ms, watched, updated_at)
+                 VALUES (7, 10, 120000, 3600000, 0, 117);
+             INSERT INTO trakt_auth
+                 (user_id, access_token, refresh_token, expires_at, trakt_username,
+                  connected_at, last_sync_at, last_activities)
+                 VALUES (7, 'fixture-access', 'fixture-refresh', 999999,
+                         'fixture-user', 118, 119, '{\"movies\":1}');
+             INSERT INTO watched_outbox
+                 (id, payload, attempts, last_error, status, next_at, created_at,
+                  updated_at, claim_until)
+                 VALUES (40, '{\"fixture\":true}', 1, '', 'pending', 120, 121, 122, 130);
+             INSERT INTO transcode_cache_recipes
+                 (recipe_hash, file_id, recipe_version, created_at)
+                 VALUES ('fixture-recipe', 30, 1, 123);
+             INSERT INTO transcode_cache_locations
+                 (recipe_hash, node_id, storage_class, relative_dir, bytes, complete,
+                  last_used_at, last_seen_at)
+                 VALUES ('fixture-recipe', 'fixture-node', 'local', 'fixture-recipe',
+                         2048, 1, 124, 125);
+             INSERT INTO offline_packages
+                 (id, request_id, user_id, file_id, node_id, source_path, source_size,
+                  source_mtime, target_height, subtitle_mode, state, phase, expires_at)
+                 VALUES ('fixture-package', 'fixture-request', 7, 30, 'fixture-node',
+                         '/fixture/shows/season-1.mkv', 4096, 115, 720, 'none',
+                         'ready', 'complete', 999999);
+             INSERT INTO offline_package_leases
+                 (token_hash, package_id, created_at, last_access_at, expires_at)
+                 VALUES ('fixture-lease-hash', 'fixture-package', 126, 127, 999999);
+             INSERT INTO library_roots (library_id, fingerprint)
+                 VALUES (9, 'fixture-root-fingerprint');
+             INSERT INTO scan_reconcile_guards (library_id) VALUES (9);
+             INSERT INTO scan_reconcile_items (library_id, item_id) VALUES (9, 10);
+             INSERT INTO playback_events
+                 (at_unix_ms, user_id, file_id, event, detail)
+                 VALUES (131000, 7, 30, 'fixture-local-only', 'must not replicate');",
+        )
+        .expect("populate SQLite import fixture");
+    drop(connection);
+    path
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
+    let path = populated_current_import_fixture(data_dir);
+    let connection = rusqlite::Connection::open(&path).expect("open current SQLite fixture");
+    // Recreate the exact two schema differences between v14 and current.
+    // The v15 tables and v17 node-local telemetry did not exist; v16 had not
+    // added the recoverable outbox claim deadline yet.
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER library_roots_paths_au;
+             DROP TABLE scan_reconcile_items;
+             DROP TABLE scan_reconcile_guards;
+             DROP TABLE library_roots;
+             DROP TABLE playback_events;
+             DROP INDEX watched_outbox_due;
+             ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
+             CREATE TABLE watched_outbox (
+                 id INTEGER PRIMARY KEY,
+                 payload TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT NOT NULL DEFAULT '',
+                 status TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'ok', 'failed')),
+                 next_at INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+             ) STRICT;
+             INSERT INTO watched_outbox
+                 (id, payload, attempts, last_error, status, next_at, created_at, updated_at)
+                 SELECT id, payload, attempts, last_error, status, next_at, created_at, updated_at
+                 FROM watched_outbox_current;
+             DROP TABLE watched_outbox_current;
+             CREATE INDEX watched_outbox_due ON watched_outbox(status, next_at);
+             PRAGMA user_version = 14;
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("downgrade fixture shape to v14");
+    drop(connection);
+    path
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated import target");
+
+    let source = tempfile::tempdir().expect("SQLite import fixture directory");
+    populated_v14_import_fixture(source.path());
+    let prepared = prepare_sqlite_import(source.path()).expect("prepare v14 import backup");
+    assert_eq!(prepared.schema_version, 14);
+
+    let report = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect("import populated v14 backup");
+    assert_eq!(report.source_schema_version, 14);
+    assert_eq!(report.backup_sha256, prepared.backup_sha256);
+    assert_eq!(report.tables.len(), 17);
+    assert_eq!(report.search_rows, 2);
+    assert!(report.imported_rows >= 16);
+    for table in [
+        "library_roots",
+        "scan_reconcile_guards",
+        "scan_reconcile_items",
+    ] {
+        assert_eq!(
+            report
+                .tables
+                .iter()
+                .find(|digest| digest.table == table)
+                .expect("v14 compatibility table digest")
+                .row_count,
+            0,
+            "{table} must be empty for a v14 source"
+        );
+    }
+    assert_eq!(store.count_users().await.expect("imported user count"), 1);
+    assert_eq!(
+        store
+            .get_file(30)
+            .await
+            .expect("read imported file")
+            .expect("imported file")
+            .audio_offset_ms,
+        25
+    );
+    assert_eq!(
+        store
+            .watch_state(7, 10)
+            .await
+            .expect("read imported watch state")
+            .expect("imported watch state")
+            .position_ms,
+        120_000
+    );
+    assert!(
+        store
+            .playback_events(&PlaybackEventQuery::default())
+            .await
+            .expect("read node-local telemetry")
+            .is_empty(),
+        "SQLite playback telemetry must never enter replicated state"
+    );
+
+    let retry = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect_err("a populated target must refuse a merge-style retry");
+    assert!(retry.to_string().contains("target is not fresh"));
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated current-schema import target");
+
+    let source = tempfile::tempdir().expect("current SQLite import fixture directory");
+    populated_current_import_fixture(source.path());
+    let prepared = prepare_sqlite_import(source.path()).expect("prepare current import backup");
+    assert_eq!(
+        prepared.schema_version,
+        plurx_core::store::SQLITE_SCHEMA_VERSION
+    );
+
+    let checksum_error = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &"0".repeat(64),
+            prepared.schema_version,
+        )
+        .await
+        .expect_err("wrong content hash must fail before import");
+    assert!(checksum_error.to_string().contains("checksum changed"));
+
+    let report = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect("import populated current backup");
+    assert_eq!(report.search_rows, 2);
+    for table in [
+        "library_roots",
+        "scan_reconcile_guards",
+        "scan_reconcile_items",
+    ] {
+        assert_eq!(
+            report
+                .tables
+                .iter()
+                .find(|digest| digest.table == table)
+                .expect("current compatibility table digest")
+                .row_count,
+            1,
+            "{table} must survive a current-schema import"
+        );
+    }
+    assert!(
+        store
+            .playback_events(&PlaybackEventQuery::default())
+            .await
+            .expect("read node-local telemetry")
+            .is_empty(),
+        "source playback telemetry must never enter the Hiqlite sidecar"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_import_verification_refusals_have_teeth() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated verification target");
+
+    let mismatch = tempfile::tempdir().expect("identity mismatch fixture directory");
+    let mismatch_path = populated_current_import_fixture(mismatch.path());
+    rusqlite::Connection::open(&mismatch_path)
+        .expect("open identity mismatch fixture")
+        .execute(
+            "UPDATE settings SET value = 'different-cluster' WHERE key = 'instance.id'",
+            [],
+        )
+        .expect("change source identity");
+    let mismatch = prepare_sqlite_import(mismatch.path()).expect("prepare identity mismatch");
+    let identity_error = store
+        .import_sqlite_backup(
+            &mismatch.backup_path,
+            &mismatch.backup_sha256,
+            mismatch.schema_version,
+        )
+        .await
+        .expect_err("identity mismatch must refuse import");
+    assert!(matches!(
+        identity_error,
+        plurx_core::error::StoreError::Identity(_)
+    ));
+
+    let too_old = tempfile::tempdir().expect("old-schema fixture directory");
+    let too_old_path = populated_current_import_fixture(too_old.path());
+    rusqlite::Connection::open(&too_old_path)
+        .expect("open old-schema fixture")
+        .pragma_update(None, "user_version", 13)
+        .expect("mark fixture as schema v13");
+    let too_old = prepare_sqlite_import(too_old.path()).expect("prepare old-schema backup");
+    let schema_error = store
+        .import_sqlite_backup(
+            &too_old.backup_path,
+            &too_old.backup_sha256,
+            too_old.schema_version,
+        )
+        .await
+        .expect_err("schema v13 must refuse clustering import");
+    assert!(schema_error
+        .to_string()
+        .contains("supports SQLite schemas v14"));
+
+    let cycle = tempfile::tempdir().expect("item-cycle fixture directory");
+    let cycle_path = populated_current_import_fixture(cycle.path());
+    rusqlite::Connection::open(&cycle_path)
+        .expect("open item-cycle fixture")
+        .execute("UPDATE items SET parent_id = 10 WHERE id = 20", [])
+        .expect("create an FK-clean item cycle");
+    let cycle = prepare_sqlite_import(cycle.path()).expect("prepare item-cycle backup");
+    let cycle_error = store
+        .import_sqlite_backup(
+            &cycle.backup_path,
+            &cycle.backup_sha256,
+            cycle.schema_version,
+        )
+        .await
+        .expect_err("an item cycle must refuse import");
+    assert!(cycle_error.to_string().contains("parent_id cycle"));
+
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("discard partial cycle import");
+    let parity = tempfile::tempdir().expect("parity-fault fixture directory");
+    populated_current_import_fixture(parity.path());
+    let parity = prepare_sqlite_import(parity.path()).expect("prepare parity-fault backup");
+    let parity_error = store
+        .validation_import_sqlite_backup_with_parity_fault(
+            &parity.backup_path,
+            &parity.backup_sha256,
+            parity.schema_version,
+        )
+        .await
+        .expect_err("target corruption must fail parity");
+    assert!(parity_error
+        .to_string()
+        .contains("table settings failed SQLite-to-Hiqlite parity"));
 }
 
 #[test]
