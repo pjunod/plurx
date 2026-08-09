@@ -18,6 +18,8 @@ use crate::config::Config;
 use crate::error::StoreError;
 use crate::store::{SettingsStore, SqliteStore, Store};
 
+pub mod migration;
+
 pub const NODE_ID_FILENAME: &str = "node.id";
 /// M0 runs the existing local store as the first and only voter.
 pub const SINGLE_VOTER_RAFT_ID: u64 = 1;
