@@ -277,6 +277,23 @@ pub(super) async fn local_catalog_digest(client: &TimedClient) -> Result<String,
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
+mod query_helper_tests {
+    use super::*;
+    use crate::store::hiqlite::disconnected_test_client;
+
+    #[tokio::test]
+    async fn rows_helper_rejects_misordered_placeholders() {
+        let error = rows(
+            &disconnected_test_client(),
+            "SELECT $2 AS value WHERE $1 = 1",
+        )
+        .await
+        .expect_err("catalogue rows helper must validate SQL");
+        assert!(error.to_string().contains("expected $1, found $2"));
+    }
+}
+
 const LIB_COLS: &str = "id, name, kind, paths, anime, created_at, scan_interval_mins, \
      refresh_interval_mins, last_scan_at, last_refresh_at";
 

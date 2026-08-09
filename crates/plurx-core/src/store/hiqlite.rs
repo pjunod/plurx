@@ -91,11 +91,28 @@ pub struct HiqliteAuthStore {
 /// boundary prevents new catalogue or durable-store calls from accidentally
 /// waiting forever on a wedged leader.
 #[derive(Clone)]
-pub(super) struct TimedClient(Client);
+pub(super) struct TimedClient(TimedClientInner);
+
+#[derive(Clone)]
+enum TimedClientInner {
+    Connected(Client),
+    #[cfg(test)]
+    Disconnected,
+}
 
 impl TimedClient {
     fn new(client: Client) -> Self {
-        Self(client)
+        Self(TimedClientInner::Connected(client))
+    }
+
+    fn inner(&self) -> &Client {
+        match &self.0 {
+            TimedClientInner::Connected(client) => client,
+            #[cfg(test)]
+            TimedClientInner::Disconnected => {
+                panic!("validation test attempted hiqlite I/O")
+            }
+        }
     }
 
     pub(super) async fn query_consistent_map<T, S>(
@@ -107,7 +124,9 @@ impl TimedClient {
         T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
         S: Into<Cow<'static, str>>,
     {
-        timeout_store(self.0.query_consistent_map(sql, params)).await
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().query_consistent_map(sql, params)).await
     }
 
     pub(super) async fn query_map<T, S>(
@@ -119,7 +138,9 @@ impl TimedClient {
         T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
         S: Into<Cow<'static, str>>,
     {
-        timeout_store(self.0.query_map(sql, params)).await
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().query_map(sql, params)).await
     }
 
     pub(super) async fn execute<S>(
@@ -130,7 +151,9 @@ impl TimedClient {
     where
         S: Into<Cow<'static, str>>,
     {
-        timeout_store(self.0.execute(sql, params)).await
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute(sql, params)).await
     }
 
     pub(super) async fn execute_returning_map<S, T>(
@@ -142,7 +165,9 @@ impl TimedClient {
         S: Into<Cow<'static, str>>,
         T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
     {
-        timeout_store(self.0.execute_returning_map(sql, params)).await
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute_returning_map(sql, params)).await
     }
 
     pub(super) async fn execute_returning_map_one<S, T>(
@@ -154,7 +179,9 @@ impl TimedClient {
         S: Into<Cow<'static, str>>,
         T: for<'a, 'r> From<&'a mut hiqlite::Row<'r>> + Send + 'static,
     {
-        timeout_store(self.0.execute_returning_map_one(sql, params)).await
+        let sql = sql.into();
+        validate_sql(&sql)?;
+        timeout_store(self.inner().execute_returning_map_one(sql, params)).await
     }
 
     pub(super) async fn txn<C, Q>(
@@ -165,12 +192,24 @@ impl TimedClient {
         Q: IntoIterator<Item = (C, hiqlite::Params)>,
         C: Into<Cow<'static, str>>,
     {
-        timeout_store(self.0.txn(statements)).await
+        let statements = statements
+            .into_iter()
+            .map(|(sql, params)| (sql.into(), params))
+            .collect::<Vec<_>>();
+        for (sql, _) in &statements {
+            validate_sql(sql)?;
+        }
+        timeout_store(self.inner().txn(statements)).await
     }
 
     pub(super) async fn is_healthy_db(&self) -> Result<(), StoreError> {
-        timeout_store(self.0.is_healthy_db()).await
+        timeout_store(self.inner().is_healthy_db()).await
     }
+}
+
+#[cfg(test)]
+pub(super) fn disconnected_test_client() -> TimedClient {
+    TimedClient(TimedClientInner::Disconnected)
 }
 
 impl HiqliteAuthStore {
@@ -1111,6 +1150,28 @@ mod tests {
                 !compact.contains("self.client."),
                 "{name} store bypasses HiqliteAuthStore::client(), which enforces the 3s timeout"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_read_accessors_reject_misordered_placeholders_before_io() {
+        let client = disconnected_test_client();
+        for error in [
+            client
+                .query_consistent_map::<CountRow, _>(
+                    "SELECT $2 AS count WHERE $1 = 1",
+                    params!(1, 2),
+                )
+                .await
+                .err()
+                .expect("consistent helper must validate SQL"),
+            client
+                .query_map::<CountRow, _>("SELECT $2 AS count WHERE $1 = 1", params!(1, 2))
+                .await
+                .err()
+                .expect("local helper must validate SQL"),
+        ] {
+            assert!(error.to_string().contains("expected $1, found $2"));
         }
     }
 
