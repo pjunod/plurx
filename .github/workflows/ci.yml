@@ -28,6 +28,8 @@ jobs:
       release_build: ${{ steps.scope.outputs.release_build }}
       container: ${{ steps.scope.outputs.container }}
       mobile_version: ${{ steps.scope.outputs.mobile_version }}
+      hiqlite_spike: ${{ steps.scope.outputs.hiqlite_spike }}
+      cluster_auth: ${{ steps.scope.outputs.cluster_auth }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
@@ -145,7 +147,7 @@ jobs:
   hiqlite_spike:
     name: hiqlite M0 semantic proof
     needs: [scope, preflight]
-    if: needs.scope.outputs.docs_only != 'true'
+    if: needs.scope.outputs.hiqlite_spike == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -162,9 +164,9 @@ jobs:
         run: make hiqlite-spike
 
   cluster_auth:
-    name: hiqlite M1b auth failover
+    name: three-voter replicated store contracts
     needs: [scope, preflight]
-    if: needs.scope.outputs.docs_only != 'true'
+    if: needs.scope.outputs.cluster_auth == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

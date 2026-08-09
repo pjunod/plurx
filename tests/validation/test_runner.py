@@ -132,6 +132,31 @@ class CatalogCase(unittest.TestCase):
         self.assertTrue(server["release_build"])
         self.assertTrue(server["container"])
         self.assertFalse(server["android_device"])
+        self.assertFalse(server["hiqlite_spike"])
+        self.assertFalse(server["cluster_auth"])
+
+        web = scope_for_paths(catalog, ("crates/plurxd/src/web/app.js",))
+        self.assertFalse(web["hiqlite_spike"])
+        self.assertFalse(web["cluster_auth"])
+
+        cluster = scope_for_paths(
+            catalog, ("crates/plurx-core/src/store/hiqlite.rs",)
+        )
+        self.assertFalse(cluster["hiqlite_spike"])
+        self.assertTrue(cluster["cluster_auth"])
+
+        core = scope_for_paths(catalog, ("crates/plurx-core/src/domain.rs",))
+        self.assertTrue(core["hiqlite_spike"])
+        self.assertTrue(core["cluster_auth"])
+
+        cluster_selection = select_points(
+            catalog, ("crates/plurx-core/src/store/hiqlite.rs",)
+        )
+        cluster_ci_checks = {
+            check.id
+            for check in selected_checks(catalog, cluster_selection, profile="ci")
+        }
+        self.assertNotIn("cluster-auth", cluster_ci_checks)
 
         fallback = all_scope()
         executable_scope = (

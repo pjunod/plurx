@@ -25,6 +25,8 @@ SCOPE_KEYS = (
     "release_build",
     "container",
     "mobile_version",
+    "hiqlite_spike",
+    "cluster_auth",
     "docs_only",
 )
 
@@ -120,6 +122,7 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
     check_ids = {
         check.id for check in selected_checks(catalog, selection, profile="ci")
     }
+    point_ids = set(selection.point_ids)
     return {
         "apple": "apple-simulators" in check_ids,
         "android_jvm": "android-jvm" in check_ids,
@@ -128,6 +131,8 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
         "release_build": any(matches(path, RELEASE_BUILD_PATHS) for path in paths),
         "container": any(matches(path, CONTAINER_PATHS) for path in paths),
         "mobile_version": "mobile-version" in check_ids,
+        "hiqlite_spike": "core.media" in point_ids,
+        "cluster_auth": "cluster.auth" in point_ids,
         "docs_only": False,
     }
 
