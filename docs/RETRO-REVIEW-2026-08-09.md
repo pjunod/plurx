@@ -7,6 +7,10 @@
 
 Companion work orders (one per subject, sized for a GPT agent) live in `docs/retro-2026-08-09/WO-01 … WO-11`. Each is self-contained: context, file:line evidence at the pinned sha, exact tasks, acceptance checks.
 
+Execution results, the five approved decisions, adversarial corrections, and
+the remaining hardware-only gates are consolidated in
+[`docs/retro-2026-08-09/EXTERNAL-REVIEW-HANDOFF.md`](retro-2026-08-09/EXTERNAL-REVIEW-HANDOFF.md).
+
 ---
 
 ## 1. Baseline health at the pinned sha (executed here, Linux, rustc 1.97.1)
