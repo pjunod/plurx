@@ -249,6 +249,10 @@ def passing_measurement(mode, encoder="qsv-h264"):
         "speed_p50": 2.0,
         "vmaf": 95.0,
         "peak_window_kbps": 100.0,
+        "peak_window_seconds": 10.0,
+        "peak_window_role": "configured_complete_served_segment_window_diagnostic",
+        "bufsize_window_peak_kbps": 125.0,
+        "bufsize_window_peak_role": "perf2_v2_candidate_diagnostic",
         "limits": {
             "requested_height": 1080,
             "advertised_height": 1080,
@@ -257,10 +261,12 @@ def passing_measurement(mode, encoder="qsv-h264"):
             "derived_audio_kbps": 160.0,
             "video_maxrate_kbps": 12000.0,
             "video_bufsize_kbits": 16000.0,
+            "bufsize_window_seconds": 4 / 3,
             "theoretical_vbv_allowance_kbps": 90.0,
-            "theoretical_vbv_role": "nonbinding_diagnostic_only",
+            "theoretical_vbv_role": "diagnostic_pending_owner_ratification",
             "advertised_peak_kbps": 12160.0,
-            "binding_gate": "advertised_peak_kbps",
+            "advertised_peak_role": "diagnostic_pending_owner_ratification",
+            "peak_contract_status": "unratified_owner_decision_required",
         },
     }
 
@@ -470,6 +476,7 @@ class RateControlBenchCase(unittest.TestCase):
             server_manifest = write_server_manifest(root, references)
             cases = (
                 ("vmaf_model", "other-model", "vmaf_v0.6.1 exactly"),
+                ("vmaf_subsample", 100, "vmaf-subsample 1 exactly"),
                 ("rate_window", 12.0, "rate-window 10.0 exactly"),
                 ("poll", 1.0, "poll 0.25 exactly"),
                 ("settings_settle", 0.0, "settings-settle 3.0 exactly"),
@@ -647,7 +654,11 @@ class RateControlBenchCase(unittest.TestCase):
                     api=FullApi(references, selected_encoder=None),
                 )
             self.assertFalse(report["passed"])
-            self.assertIn("selected production encoder", report["failures"][0]["detail"])
+            self.assertTrue(any(
+                failure["code"] == "harness_error"
+                and "selected production encoder" in failure["detail"]
+                for failure in report["failures"]
+            ))
 
     def test_full_comparison_records_provenance_settings_and_separate_scorer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -659,9 +670,22 @@ class RateControlBenchCase(unittest.TestCase):
             with mock.patch.dict(G, patched_harness()):
                 report = BENCH["rate_control_report"](args, api=api)
 
-            self.assertTrue(report["passed"], report)
-            self.assertTrue(report["acceptance"]["eligible"])
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["acceptance"]["eligible"])
+            self.assertEqual(
+                report["acceptance"]["scope"],
+                "diagnostic_unratified_peak_contract",
+            )
+            self.assertEqual(
+                report["acceptance"]["peak_contract_status"],
+                "unratified_owner_decision_required",
+            )
+            self.assertEqual(
+                [failure["code"] for failure in report["failures"]],
+                ["peak_contract_unratified"],
+            )
             self.assertEqual(report["acceptance"]["required_vmaf_model"], "vmaf_v0.6.1")
+            self.assertEqual(report["acceptance"]["required_vmaf_subsample"], 1)
             self.assertEqual(report["acceptance"]["required_rate_window_seconds"], 10.0)
             self.assertEqual(report["acceptance"]["required_poll_seconds"], 0.25)
             self.assertEqual(report["acceptance"]["required_settings_settle_seconds"], 3.0)
@@ -692,6 +716,13 @@ class RateControlBenchCase(unittest.TestCase):
                 fixture["server_file_identity"]["probed"] is True
                 and fixture["server_file_identity"]["available"] is True
                 for fixture in report["fixtures"]
+            ))
+            self.assertTrue(all(
+                measured["limits"]["peak_contract_status"]
+                == "unratified_owner_decision_required"
+                and "binding_gate" not in measured["limits"]
+                for fixture in report["fixtures"]
+                for measured in fixture["modes"].values()
             ))
             self.assertIn("does not prove", report["mode_settings"]["qvbr"]["evidence_scope"])
             rendered = json.dumps(report, sort_keys=True)
@@ -745,7 +776,11 @@ class RateControlBenchCase(unittest.TestCase):
                 report = BENCH["rate_control_report"](
                     harness_args(root, corpus, server_manifest), api=api
                 )
-            self.assertTrue(report["passed"], report)
+            self.assertFalse(report["passed"])
+            self.assertEqual(
+                [failure["code"] for failure in report["failures"]],
+                ["peak_contract_unratified"],
+            )
             self.assertEqual(api.puts[-1], {
                 "transcode_rate_mode": "bitrate",
                 "transcode_quality": None,
@@ -782,6 +817,30 @@ class RateControlBenchCase(unittest.TestCase):
             ])
             self.assertEqual(api.settings["transcode_rate_mode"], "quality")
 
+    def test_restore_failure_redacts_token_and_base_url_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            patches = patched_harness()
+            patches["restore_rate_settings"] = mock.Mock(side_effect=BENCH["BenchError"](
+                "restore rejected top-secret-token for admin:password"
+            ))
+            with mock.patch.dict(G, patches):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest),
+                    api=FullApi(references),
+                )
+            failure = next(
+                failure for failure in report["failures"]
+                if failure["code"] == "setting_restore_failed"
+            )
+            self.assertNotIn("top-secret-token", failure["detail"])
+            self.assertNotIn("admin", failure["detail"])
+            self.assertNotIn("password", failure["detail"])
+            self.assertIn("<redacted-token>", failure["detail"])
+            self.assertIn("<redacted-credential>", failure["detail"])
+
     def test_capture_failure_still_restores_original_rate_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -797,13 +856,17 @@ class RateControlBenchCase(unittest.TestCase):
                     harness_args(root, corpus, server_manifest), api=api
                 )
             self.assertFalse(report["passed"])
-            self.assertIn("capture failed", report["failures"][0]["detail"])
+            self.assertTrue(any(
+                failure["code"] == "harness_error"
+                and "capture failed" in failure["detail"]
+                for failure in report["failures"]
+            ))
             self.assertEqual(api.puts, [
                 {"transcode_rate_mode": "bitrate"},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
 
-    def test_gates_use_advertised_peak_only_and_check_encoder_identity(self):
+    def test_unratified_peak_is_diagnostic_while_resolved_gates_still_fail(self):
         fixture = {
             "identity": "easy",
             "class": "easy",
@@ -821,16 +884,116 @@ class RateControlBenchCase(unittest.TestCase):
         failures = BENCH["evaluate_rate_control"]([fixture])
         codes = {failure["code"] for failure in failures}
         self.assertEqual(codes, {
-            "advertised_peak_exceeded", "encoder_identity_mismatch", "vmaf_regression",
-            "easy_bytes_regression", "speed_regression",
+            "encoder_identity_mismatch", "vmaf_regression", "easy_bytes_regression",
+            "speed_regression",
         })
-        self.assertNotIn("vbv_peak_exceeded", codes)
-        # VBR is over its lower theoretical diagnostic but under advertised;
-        # it must not receive any peak failure.
-        self.assertFalse(any(
-            failure["code"] == "advertised_peak_exceeded" and failure["mode"] == "vbr"
-            for failure in failures
-        ))
+        self.assertFalse(any("peak" in code for code in codes))
+
+    def test_duration_mismatch_and_rate_limit_derivation_are_pinned(self):
+        fixture = {
+            "identity": "easy",
+            "class": "easy",
+            "modes": {
+                "vbr": passing_measurement("vbr"),
+                "qvbr": passing_measurement("qvbr"),
+            },
+        }
+        fixture["modes"]["qvbr"]["captured_media_seconds"] = 6.051
+        failures = BENCH["evaluate_rate_control"]([fixture])
+        self.assertEqual(
+            [failure["code"] for failure in failures],
+            ["duration_mismatch"],
+        )
+
+        limits = BENCH["rate_limits"](
+            {"total_kbps": 4160, "peak_kbps": 6160},
+            10.0,
+        )
+        self.assertEqual(limits["derived_nominal_video_kbps"], 4000)
+        self.assertEqual(limits["derived_audio_kbps"], 160)
+        self.assertEqual(limits["video_maxrate_kbps"], 6000)
+        self.assertEqual(limits["video_bufsize_kbits"], 8000)
+        self.assertAlmostEqual(limits["bufsize_window_seconds"], 4 / 3)
+        self.assertEqual(
+            limits["peak_contract_status"],
+            "unratified_owner_decision_required",
+        )
+        self.assertEqual(
+            limits["advertised_peak_role"],
+            "diagnostic_pending_owner_ratification",
+        )
+        self.assertEqual(
+            limits["theoretical_vbv_role"],
+            "diagnostic_pending_owner_ratification",
+        )
+        with self.assertRaisesRegex(
+            BENCH["BenchError"], "internally inconsistent ladder rung"
+        ):
+            BENCH["rate_limits"](
+                {"total_kbps": 4160, "peak_kbps": 4000},
+                10.0,
+            )
+
+    def test_measured_capture_records_both_disputed_peak_windows(self):
+        segments = [
+            {"duration_seconds": 2.0, "bytes": 3_000_000},
+            *[
+                {"duration_seconds": 2.0, "bytes": 250_000}
+                for _ in range(5)
+            ],
+        ]
+        capture = {
+            "encoder": "qsv-h264",
+            "status_encoder": "qsv-h264",
+            "delivered_dynamic_range": "sdr",
+            "media_origin_ms": 0,
+            "media_origin_source": "start_response.media_origin_ms",
+            "captured_media_seconds": 12.0,
+            "capture_wall_seconds": 5.0,
+            "segments": segments,
+            "bytes": sum(segment["bytes"] for segment in segments),
+            "speed_samples": [2.0, 2.1],
+            "ladder_rung": {"height": 1080, "total_kbps": 4160, "peak_kbps": 6160},
+            "playlist_path": Path("capture.m3u8"),
+        }
+        fixture = {
+            "rung": 1080,
+            "reference_path": Path("reference.mkv"),
+        }
+        with mock.patch.dict(G, {"score_vmaf": lambda *_args: 95.0}):
+            measured = BENCH["measured_capture"](
+                capture,
+                fixture,
+                "scorer-ffmpeg",
+                "vmaf_v0.6.1",
+                1,
+                10.0,
+            )
+        self.assertEqual(measured["peak_window_kbps"], 3200.0)
+        self.assertEqual(measured["peak_window_seconds"], 10.0)
+        self.assertEqual(
+            measured["peak_window_role"],
+            "configured_complete_served_segment_window_diagnostic",
+        )
+        self.assertEqual(measured["bufsize_window_peak_kbps"], 12000.0)
+        self.assertEqual(
+            measured["bufsize_window_peak_role"],
+            "perf2_v2_candidate_diagnostic",
+        )
+        self.assertAlmostEqual(measured["limits"]["bufsize_window_seconds"], 4 / 3)
+
+        with mock.patch.dict(G, {"score_vmaf": lambda *_args: 95.0}):
+            smoke_measurement = BENCH["measured_capture"](
+                capture,
+                fixture,
+                "scorer-ffmpeg",
+                "vmaf_v0.6.1",
+                1,
+                12.0,
+            )
+        self.assertEqual(smoke_measurement["peak_window_seconds"], 12.0)
+        self.assertEqual(smoke_measurement["peak_window_kbps"], 2833.333)
+        self.assertNotIn("10_second", smoke_measurement["peak_window_role"])
 
     def test_zero_speed_cannot_pass_full_comparison(self):
         for baseline, candidate, expected_modes in (

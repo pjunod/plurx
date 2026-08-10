@@ -27,7 +27,7 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
-- **Performance II N1 gains its measurement gate before its encoder flags.**
+- **Performance II N1 gains its measurement harness before its encoder flags.**
   `scripts/bench rate-control` now opens uncached HLS sessions on the deployed
   plurxd, captures the segments that its production Jellyfin FFmpeg actually
   served, and only after each encode ends scores those bytes offline with an
@@ -36,14 +36,17 @@ bump may break compatibility and a **patch** bump never does.
   `PLURX_FFMPEG`, joins the compose service, or enters the live path. The stable
   JSON distinguishes server/build/encoder identity from scorer
   path/build/hash/model; binds the local corpus and operator-captured nynuc
-  `sha256sum` manifests; rejects duplicate filename/path/hash fixtures; proves
-  pinned, balanced SDR fixture identity; and
-  reports bytes, VMAF, server speed, and the binding advertised peak over
-  complete served-segment windows. For the full comparison, missing,
+  `sha256sum` manifests; rejects duplicate filename/path/hash fixtures in an
+  `n1_acceptance` corpus; proves pinned, balanced SDR fixture identity; and
+  reports bytes, VMAF, server speed, the 10-second complete-segment observed
+  peak, the separately observed derived-bufsize-window peak, and the inferred
+  10-second VBV allowance. The two peak interpretations are diagnostics pending
+  owner ratification after PR #131 review; a full run
+  emits `peak_contract_unratified` and cannot report `passed: true`. For the
+  eventual full comparison, missing,
   non-finite, or zero speed fails explicitly rather than allowing a zero/zero
-  comparison. The theoretical VBV allowance remains a labeled, nonbinding
-  diagnostic. Full VBR/QVBR runs
-  require maintenance-node exclusivity, exact model/window/poll/settle
+  comparison. Full VBR/QVBR runs
+  require maintenance-node exclusivity, exact model/subsample/window/poll/settle
   parameters, recorded measurement timing, probed/available SDR source facts,
   identical cross-mode ladder facts, settings acknowledgements, and a stable
   session encoder equal to the server-selected target. Restoration caps sleeps
