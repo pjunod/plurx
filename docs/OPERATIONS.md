@@ -499,8 +499,10 @@ diff -u out/laptop-perf2.sha256 out/nynuc-perf2.sha256
 An empty `diff` is the preflight. The harness then parses the nynuc file
 fail-closed, records its own SHA-256, and requires every server filename digest
 to equal the pinned local-reference digest. It also records the corpus
-manifest's SHA-256 and requires the server browse facts and every session to
-prove SDR. Missing/unknown HDR facts and any non-SDR delivery fail.
+manifest's SHA-256 and requires every server file to be probed, available, and
+backed by usable duration/video facts before a null HDR field can prove SDR.
+Missing or false scan state, unusable video facts, unknown HDR facts, and any
+non-SDR delivery fail.
 
 ```bash
 scripts/bench rate-control \
@@ -512,14 +514,50 @@ scripts/bench rate-control \
   --quality 22 \
   --vmaf-ffmpeg /opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg \
   --vmaf-model vmaf_v0.6.1 \
+  --rate-window 10.0 \
   --json out/rate-control-full.json
 ```
 
+Full comparison accepts exactly model `vmaf_v0.6.1` and a `10.0`-second served
+segment window. A different value can support a VBR diagnostic, but cannot
+produce a full acceptance pass; a longer window can dilute a 10-second burst.
+
 The harness sends partial settings updates only and records the requested mode
-plus only the verified rate/quality fields from the settings response. It
-restores both original values in a `finally` path, after proving the node idle;
-if a viewer appears, it refuses the next mutation. It never writes the token,
-the full settings response, or another setting/secret to the artifact.
+plus only the verified rate/quality fields from the settings response. Its
+`finally` path waits up to `--idle-timeout` for zero active transcodes before
+restoring both original values. It never mutates settings while playback is
+active. If the wait expires, the run fails with `setting_restore_failed` and
+may leave the last requested mode active. The failure's
+`required_manual_restore` object contains only the original rate and quality.
+It never writes the token, the full settings response, or another
+setting/secret to the artifact.
+
+After stopping playback, apply a reported manual rollback exactly once. The
+first request must return `true`; the second must return a settings response
+whose two fields equal the rollback body:
+
+```bash
+rollback_body="$(jq -c \
+  '.failures[] | select(.code == "setting_restore_failed") | .required_manual_restore' \
+  out/rate-control-full.json)"
+
+curl -fsS \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  http://nynuc:32400/api/v1/system \
+  | jq -e '.active_transcodes == 0'
+
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data "$rollback_body" \
+  http://nynuc:32400/api/v1/settings \
+  | jq --argjson expected "$rollback_body" -e \
+      '.transcode_rate_mode == $expected.transcode_rate_mode and
+       .transcode_quality == $expected.transcode_quality'
+```
+
+Do not retry the PUT until the system check is true. An active viewer is the
+reason automatic restoration stopped.
 
 The manifest is fixture identity, not an encoder recipe:
 
@@ -544,18 +582,22 @@ look good. A retained fixture/mode directory is never overwritten.
 The JSON keeps the evidence roles distinct: controller/scorer host, production
 server/build/Jellyfin-FFmpeg/encoder identity, and scoring-only FFmpeg
 path/build/configuration/hash/model/filter fingerprint. Each capture requires a
-stable status encoder matching StartResponse, and the two modes must use the
-same encoder per fixture. Peak rate uses the same complete-served-segment
+stable status encoder matching StartResponse and `/system.encoder_selected`;
+the two modes must also use the same encoder per fixture. This prevents a
+stable software fallback from masquerading as nynuc QSV evidence. Peak rate
+uses the same complete-served-segment
 rolling windows as `scripts/perf-report`; incomplete tail windows are ignored.
 The server-advertised rung peak is the plan's sole binding peak gate. The
 theoretical `maxrate + bufsize/window` value remains in JSON as a labeled,
 nonbinding diagnostic with its inferred 2× nominal-video bufsize assumption.
 
-`passed: true` on the full comparison means QVBR did not lower VMAF, grow bytes
-on easy content, or lose more than 10% server encode speed, and neither mode
-crossed the advertised peak. Failures are explicit
+`passed: true` on the full comparison means the requested quality-mode capture
+did not lower VMAF, grow bytes on easy content, or lose more than 10% server
+encode speed, and neither requested-mode capture crossed the advertised peak.
+It does not prove QVBR flags executed. Failures are explicit
 `vmaf_regression`, `easy_bytes_regression`, `speed_regression`,
-`encoder_identity_mismatch`, `advertised_peak_exceeded`, or `harness_error`.
+`encoder_identity_mismatch`, `advertised_peak_exceeded`, `harness_error`, or
+`setting_restore_failed`.
 Missing `libvmaf` fails; it never skips quality scoring. A quantitative harness
 pass proves settings acknowledgement and measured output, not that the intended
 encoder flags or forced fallback executed. N1's production tests and boot

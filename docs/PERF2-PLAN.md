@@ -329,8 +329,9 @@ scores captured bytes on the controller only after the production session
 ends; it never encodes playback or becomes a live-path dependency. No scorer is
 installed or needed on nynuc or in compose: nynuc performs production encoding
 and the accepted laptop controller scorer runs afterward. No N1 encoder flags
-or settings are implemented by this slice. Only the named-machine capture/full
-comparison remains unclaimed until it is actually run.
+or settings are implemented by this slice. The named-machine quantitative
+capture/full comparison remains unclaimed, as do N1 boot/production evidence
+and the separate forced-fallback run that prove the requested mode executed.
 
 **Objective:** stop paying fixed bitrates for content that doesn't need
 them. Same encoders, same ladder heights, same caps — but the target
@@ -423,18 +424,20 @@ explicit separate scorer decodes them for VMAF offline. Shape:
 `scripts/bench rate-control --base http://nynuc:32400 --token <admin-token>
 --corpus <fixtures> --modes vbr,qvbr --vmaf-ffmpeg <scoring-only-ffmpeg>
 --server-sha256-manifest <nynuc.sha256>
---vmaf-model vmaf_v0.6.1 --json out/rate-control.json`, failing nonzero when
+--vmaf-model vmaf_v0.6.1 --rate-window 10.0
+--json out/rate-control.json`, failing nonzero when
 quality mode regresses VMAF or exceeds the advertised peak over any complete
 served-segment window. The theoretical VBV allowance is a nonbinding diagnostic,
 not a second contract. Full acceptance requires pinned local and server hashes,
 equal nonempty easy/hard SDR halves, full-corpus scope, maintenance-node
-exclusivity, and stable StartResponse/status encoder identity. The settings DTO
-acknowledgement is not proof that effective flags or fallback executed; N1 boot
-validation/production tests and a separate forced-fallback run supply that
-evidence. The scorer never encodes production playback, becomes
-`PLURX_FFMPEG`, joins the compose service, or enters the live path. On that harness: quality
-mode produces ≤ the bytes of bitrate mode on the easy half of the
-corpus at equal-or-better VMAF (VMAF offline only, `n_subsample` as
+exclusivity, exact model/window parameters, probed and available server video
+facts, and stable StartResponse/status identity equal to the server-selected
+encoder. The settings DTO acknowledgement is not proof that effective flags or
+fallback executed; N1 boot validation/production tests and a separate
+forced-fallback run supply that evidence. The scorer never encodes production
+playback, becomes `PLURX_FFMPEG`, joins the compose service, or enters the live
+path. On that harness: quality mode produces ≤ the bytes of bitrate mode on the
+easy half of the corpus at equal-or-better VMAF (VMAF offline only, `n_subsample` as
 needed — never in the live path, principle 7); encode speed within 10%
 of bitrate mode; a session on a family whose driver refuses the mode
 starts and logs the fallback. Identity: golden-hash fixtures hold the

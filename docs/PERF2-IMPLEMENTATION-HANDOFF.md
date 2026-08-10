@@ -374,10 +374,13 @@ captured bytes offline after each encode, but never encodes production
 playback; no scorer is installed or needed on nynuc or in compose) and the
 golden-hash fixtures land **before** any flag changes. Full comparison uses a
 pinned, balanced SDR corpus plus an operator-captured nynuc `sha256sum`
-manifest, with the node reserved for maintenance. Harness settings-DTO and
-stable-encoder evidence does **not** prove effective flags or fallback: N1's
-boot/production tests and the separate forced-fallback acceptance run must do
-that. Then:
+manifest, with the node reserved for maintenance. Full acceptance also requires
+the exact VMAF model and 10-second window, probed/available server video facts,
+and session/status identity equal to the server-selected encoder. Restoration
+waits a bounded interval for idle and otherwise reports the safe two-field
+manual rollback body. Harness settings-DTO and stable-encoder evidence does
+**not** prove effective flags or fallback: N1's boot/production tests and the
+separate forced-fallback acceptance run must do that. Then:
 `EffectiveRateControl` resolved post-validation; the single
 `effective_recipe()` builder replacing the four constructor sites
 (`transcode.rs:2430,2607,2694` + the test helper); the per-family flag

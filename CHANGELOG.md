@@ -40,8 +40,11 @@ bump may break compatibility and a **patch** bump never does.
   reports bytes, VMAF, server speed, and the binding advertised peak over
   complete served-segment windows. The theoretical VBV allowance remains a
   labeled, nonbinding diagnostic. Full VBR/QVBR runs require maintenance-node
-  exclusivity, verify settings acknowledgements and stable session encoder
-  identity, and restore original values only after the node returns idle.
+  exclusivity, exact acceptance parameters, probed/available SDR source facts,
+  settings acknowledgements, and a stable session encoder equal to the
+  server-selected target. Restoration waits a bounded interval for the node to
+  return idle; a timeout fails loudly with the safe two-field manual rollback
+  body because the requested mode may remain active.
   Current main supports a visibly non-acceptance VBR smoke. A literal golden
   fixture still pins the current VBR recipe hash. No scorer is installed or
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer

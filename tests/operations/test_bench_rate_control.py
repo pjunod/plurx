@@ -77,6 +77,7 @@ class SessionApi:
         dynamic_range="sdr",
         start_encoder="qsv-h264",
         status_encoder="qsv-h264",
+        recent_speed=2.0,
         delete_error=False,
         stuck_after_delete=False,
         initially_active=0,
@@ -87,6 +88,7 @@ class SessionApi:
         self.dynamic_range = dynamic_range
         self.start_encoder = start_encoder
         self.status_encoder = status_encoder
+        self.recent_speed = recent_speed
         self.delete_error = delete_error
         self.stuck_after_delete = stuck_after_delete
         self.active = initially_active
@@ -109,7 +111,7 @@ class SessionApi:
                 "ladder": [{"height": 1080, "total_kbps": 8160, "peak_kbps": 12160}],
             }
         if path.endswith("/status"):
-            return {"recent_speed": 2.0, "encoder": self.status_encoder}
+            return {"recent_speed": self.recent_speed, "encoder": self.status_encoder}
         if method == "DELETE":
             if self.delete_error:
                 raise RuntimeError("DELETE failed")
@@ -132,10 +134,26 @@ class SessionApi:
 
 
 class FullApi:
-    def __init__(self, references, *, hdr=None, active_counts=None):
+    def __init__(
+        self,
+        references,
+        *,
+        hdr=None,
+        probed=True,
+        available=True,
+        fact_overrides=None,
+        active_counts=None,
+        default_active=0,
+        selected_encoder="qsv-h264",
+    ):
         self.references = references
         self.hdr = hdr
+        self.probed = probed
+        self.available = available
+        self.fact_overrides = fact_overrides or {}
         self.active_counts = list(active_counts or [])
+        self.default_active = default_active
+        self.selected_encoder = selected_encoder
         self.settings = {
             "transcode_rate_mode": "bitrate",
             "transcode_quality": None,
@@ -145,7 +163,7 @@ class FullApi:
 
     def call(self, path, method="GET", body=None):
         if path == "/system":
-            active = self.active_counts.pop(0) if self.active_counts else 0
+            active = self.active_counts.pop(0) if self.active_counts else self.default_active
             return {
                 "name": "nynuc",
                 "instance_id": "server-id",
@@ -154,7 +172,7 @@ class FullApi:
                 "built_at": "2026-08-09",
                 "ffmpeg": "/usr/lib/jellyfin-ffmpeg/ffmpeg",
                 "ffmpeg_version": "jellyfin-ffmpeg version production",
-                "encoder_selected": "qsv-h264",
+                "encoder_selected": self.selected_encoder,
                 "active_transcodes": active,
             }
         if path == "/libraries":
@@ -168,6 +186,8 @@ class FullApi:
                     "id": index,
                     "filename": filename,
                     "size": reference.stat().st_size,
+                    "probed": self.probed,
+                    "available": self.available,
                     "duration_ms": 60_000,
                     "container": "matroska",
                     "video_codec": "h264",
@@ -177,6 +197,11 @@ class FullApi:
                 }
                 if self.hdr is not MISSING:
                     facts["hdr"] = self.hdr
+                for key, value in self.fact_overrides.items():
+                    if value is MISSING:
+                        facts.pop(key, None)
+                    else:
+                        facts[key] = value
                 files.append(facts)
             return {"files": files}
         if path == "/settings" and method == "GET":
@@ -193,7 +218,7 @@ def harness_args(root, corpus, server_manifest=None, *, modes="vbr,qvbr", only=N
         modes=modes,
         vmaf_model="vmaf_v0.6.1",
         vmaf_subsample=1,
-        rate_window=4.0,
+        rate_window=10.0,
         poll=0.001,
         capture_timeout=1.0,
         idle_timeout=0.005,
@@ -300,6 +325,22 @@ class RateControlBenchCase(unittest.TestCase):
             with self.assertRaisesRegex(BENCH["BenchError"], "mismatch"):
                 BENCH["load_rate_control_corpus"](path)
 
+    def test_manifest_rejects_nonfinite_trim_numbers(self):
+        for field, value, message in (
+            ("start_seconds", float("nan"), "start_seconds"),
+            ("start_seconds", float("inf"), "start_seconds"),
+            ("duration_seconds", float("nan"), "positive number"),
+            ("duration_seconds", float("inf"), "positive number"),
+        ):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path, _ = write_corpus(root)
+                document = json.loads(path.read_text())
+                document["fixtures"][0]["trim"][field] = value
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(BENCH["BenchError"], message):
+                    BENCH["load_rate_control_corpus"](path)
+
     def test_checked_in_manifest_is_explicitly_smoke_only(self):
         path = ROOT / "scripts/perf2-rate-control-smoke-corpus.json"
         document = json.loads(path.read_text())
@@ -387,11 +428,53 @@ class RateControlBenchCase(unittest.TestCase):
             self.assertFalse(report["passed"])
             api.call.assert_not_called()
 
+    def test_full_acceptance_requires_canonical_model_and_ten_second_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            cases = (
+                ("vmaf_model", "other-model", "vmaf_v0.6.1 exactly"),
+                ("rate_window", 12.0, "rate-window 10.0 exactly"),
+            )
+            for field, value, message in cases:
+                with self.subTest(field=field):
+                    args = harness_args(root, corpus, server_manifest)
+                    setattr(args, field, value)
+                    api = mock.Mock()
+                    report = BENCH["rate_control_report"](args, api=api)
+                    self.assertFalse(report["passed"])
+                    self.assertIn(message, report["failures"][0]["detail"])
+                    api.call.assert_not_called()
+
+    def test_cli_float_arguments_reject_nonfinite_and_wrong_signs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, _ = write_corpus(root, purpose="vbr_smoke", pinned=False)
+            cases = (
+                ("rate_window", float("nan")),
+                ("poll", float("inf")),
+                ("capture_timeout", float("nan")),
+                ("idle_timeout", 0.0),
+                ("settings_settle", float("inf")),
+                ("settings_settle", -1.0),
+            )
+            for field, value in cases:
+                with self.subTest(field=field, value=value):
+                    args = harness_args(root, corpus, modes="vbr")
+                    setattr(args, field, value)
+                    api = mock.Mock()
+                    report = BENCH["rate_control_report"](args, api=api)
+                    self.assertFalse(report["passed"])
+                    self.assertIn("finite", report["failures"][0]["detail"])
+                    api.call.assert_not_called()
+
     def test_capture_uses_real_session_bytes_safe_names_sdr_and_stable_encoder(self):
         with tempfile.TemporaryDirectory() as directory:
             api = SessionApi()
             capture = BENCH["capture_live_session"](
                 api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                "qsv-h264",
             )
             self.assertNotIn("copy", api.start_body)
             self.assertTrue(api.deleted)
@@ -415,8 +498,38 @@ class RateControlBenchCase(unittest.TestCase):
                 with self.assertRaisesRegex(BENCH["BenchError"], message):
                     BENCH["capture_live_session"](
                         api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                        "qsv-h264",
                     )
                 self.assertTrue(api.deleted)
+
+    def test_capture_rejects_nonfinite_playlist_duration_and_status_speed(self):
+        for api, message in (
+            (SessionApi(recent_speed=float("nan")), "recent_speed"),
+            (SessionApi(recent_speed=float("inf")), "recent_speed"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(BENCH["BenchError"], message):
+                    BENCH["capture_live_session"](
+                        api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                        "qsv-h264",
+                    )
+                self.assertTrue(api.deleted)
+        for duration in ("nan", "inf", "0", "-1"):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(BENCH["BenchError"], "duration"):
+                    BENCH["parse_playlist"](
+                        f"#EXTM3U\n#EXTINF:{duration},\nsegment.ts\n"
+                    )
+
+    def test_capture_must_use_system_selected_encoder(self):
+        api = SessionApi(start_encoder="software-h264", status_encoder="software-h264")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(BENCH["BenchError"], "/system selected"):
+                BENCH["capture_live_session"](
+                    api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
+                )
+        self.assertTrue(api.deleted)
 
     def test_capture_surfaces_failed_delete_and_idle_timeout(self):
         for api, message in (
@@ -427,6 +540,7 @@ class RateControlBenchCase(unittest.TestCase):
                 with self.assertRaisesRegex((RuntimeError, BENCH["BenchError"]), message):
                     BENCH["capture_live_session"](
                         api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.002,
+                        "qsv-h264",
                     )
 
     def test_capture_rejects_reference_origin_misalignment(self):
@@ -435,6 +549,7 @@ class RateControlBenchCase(unittest.TestCase):
             with self.assertRaisesRegex(BENCH["BenchError"], "media_origin_ms"):
                 BENCH["capture_live_session"](
                     api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
                 )
         self.assertTrue(api.deleted)
 
@@ -444,6 +559,7 @@ class RateControlBenchCase(unittest.TestCase):
             with self.assertRaisesRegex(BENCH["BenchError"], "exclusivity was lost"):
                 BENCH["capture_live_session"](
                     api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
                 )
         self.assertFalse(api.posted)
 
@@ -459,6 +575,42 @@ class RateControlBenchCase(unittest.TestCase):
                             FullApi(references, hdr=hdr), fixtures, None
                         )
 
+    def test_server_source_requires_real_probed_available_video_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            fixtures = BENCH["load_rate_control_corpus"](corpus)["fixtures"]
+            cases = (
+                (FullApi(references, probed=False), "definitively probed"),
+                (FullApi(references, probed=None), "definitively probed"),
+                (FullApi(references, probed=MISSING), "definitively probed"),
+                (FullApi(references, available=False), "definitively available"),
+                (FullApi(references, available=MISSING), "definitively available"),
+                (FullApi(references, fact_overrides={"video_codec": None}), "video_codec"),
+                (FullApi(references, fact_overrides={"width": MISSING}), "width"),
+                (FullApi(references, fact_overrides={"height": 0}), "height"),
+                (FullApi(references, fact_overrides={"bit_depth": None}), "bit_depth"),
+                (FullApi(references, fact_overrides={"duration_ms": None}), "duration_ms"),
+                (FullApi(references, fact_overrides={"duration_ms": 1_000}), "trim ends"),
+            )
+            for api, message in cases:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(BENCH["BenchError"], message):
+                        BENCH["resolve_fixture_file_ids"](api, fixtures, None)
+
+    def test_report_refuses_missing_selected_production_encoder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            with mock.patch.dict(G, patched_harness()):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest),
+                    api=FullApi(references, selected_encoder=None),
+                )
+            self.assertFalse(report["passed"])
+            self.assertIn("selected production encoder", report["failures"][0]["detail"])
+
     def test_full_comparison_records_provenance_settings_and_separate_scorer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -471,6 +623,8 @@ class RateControlBenchCase(unittest.TestCase):
 
             self.assertTrue(report["passed"], report)
             self.assertTrue(report["acceptance"]["eligible"])
+            self.assertEqual(report["acceptance"]["required_vmaf_model"], "vmaf_v0.6.1")
+            self.assertEqual(report["acceptance"]["required_rate_window_seconds"], 10.0)
             self.assertEqual(report["corpus"]["manifest_sha256"], file_sha(corpus))
             self.assertEqual(
                 report["corpus"]["server_sha256_manifest"]["manifest_sha256"],
@@ -485,6 +639,11 @@ class RateControlBenchCase(unittest.TestCase):
                 report["mode_settings"]["qvbr"]["verified_settings_response"],
                 {"transcode_rate_mode": "quality", "transcode_quality": 22},
             )
+            self.assertTrue(all(
+                fixture["server_file_identity"]["probed"] is True
+                and fixture["server_file_identity"]["available"] is True
+                for fixture in report["fixtures"]
+            ))
             self.assertIn("does not prove", report["mode_settings"]["qvbr"]["evidence_scope"])
             rendered = json.dumps(report, sort_keys=True)
             self.assertNotIn(args.token, rendered)
@@ -525,6 +684,54 @@ class RateControlBenchCase(unittest.TestCase):
                 {"transcode_rate_mode": "bitrate"},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
+
+    def test_restore_waits_for_viewer_to_finish_then_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            # Initial check, VBR update, quality update, restore sees viewer then idle.
+            api = FullApi(references, active_counts=[0, 0, 0, 1, 0])
+            with mock.patch.dict(G, patched_harness()):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest), api=api
+                )
+            self.assertTrue(report["passed"], report)
+            self.assertEqual(api.puts[-1], {
+                "transcode_rate_mode": "bitrate",
+                "transcode_quality": None,
+            })
+
+    def test_restore_timeout_emits_manual_body_without_claiming_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            api = FullApi(
+                references,
+                active_counts=[0, 0, 0],
+                default_active=1,
+            )
+            with mock.patch.dict(G, patched_harness()):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest), api=api
+                )
+            failure = next(
+                failure for failure in report["failures"]
+                if failure["code"] == "setting_restore_failed"
+            )
+            self.assertFalse(report["passed"])
+            self.assertIn("idle timeout", failure["detail"])
+            self.assertEqual(failure["required_manual_restore"], {
+                "transcode_rate_mode": "bitrate",
+                "transcode_quality": None,
+            })
+            self.assertNotIn("must-not-leak", json.dumps(failure, sort_keys=True))
+            self.assertEqual(api.puts, [
+                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "quality", "transcode_quality": 22},
+            ])
+            self.assertEqual(api.settings["transcode_rate_mode"], "quality")
 
     def test_capture_failure_still_restores_original_rate_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -585,6 +792,17 @@ class RateControlBenchCase(unittest.TestCase):
         ]
         self.assertEqual(BENCH["rolling_segment_peak"](segments, 6.0), (20.0, 3.0))
 
+    def test_twelve_second_window_can_mask_a_failing_ten_second_peak(self):
+        segments = [
+            {"duration_seconds": 5.0, "bytes": 5000},
+            {"duration_seconds": 5.0, "bytes": 5000},
+            {"duration_seconds": 2.0, "bytes": 1},
+        ]
+        peak_10, _ = BENCH["rolling_segment_peak"](segments, 10.0)
+        peak_12, _ = BENCH["rolling_segment_peak"](segments, 12.0)
+        self.assertGreater(peak_10, 7.5)
+        self.assertLess(peak_12, 7.0)
+
     def test_stable_json_artifact_is_sorted_and_nonzero(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first.json"
@@ -594,6 +812,8 @@ class RateControlBenchCase(unittest.TestCase):
             BENCH["write_json"](second, document)
             self.assertGreater(first.stat().st_size, 0)
             self.assertEqual(first.read_bytes(), second.read_bytes())
+            with self.assertRaises(ValueError):
+                BENCH["write_json"](Path(directory) / "nan.json", {"value": float("nan")})
 
 
 if __name__ == "__main__":

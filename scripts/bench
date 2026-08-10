@@ -178,7 +178,12 @@ def last_error(result, lines=12):
 
 
 def positive_number(value, field_name):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise BenchError(f"{field_name} must be a positive number")
     return float(value)
 
@@ -232,7 +237,12 @@ def load_rate_control_corpus(path):
         if not isinstance(trim, dict):
             raise BenchError(f"{where}.trim must be an object")
         start = trim.get("start_seconds")
-        if isinstance(start, bool) or not isinstance(start, (int, float)) or start < 0:
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(start)
+            or start < 0
+        ):
             raise BenchError(f"{where}.trim.start_seconds must be zero or positive")
         duration = positive_number(trim.get("duration_seconds"), f"{where}.trim.duration_seconds")
         rung = fixture.get("rung")
@@ -503,21 +513,41 @@ def resolve_fixture_file_ids(api, fixtures, library_id, server_hashes=None):
         if filename not in by_filename:
             raise BenchError(f"fixture is not in library {library_id}: {filename}")
         server_file = by_filename[filename]
+        if server_file.get("probed") is not True:
+            raise BenchError(f"server fixture is not definitively probed: {filename}")
+        if server_file.get("available") is not True:
+            raise BenchError(f"server fixture is not definitively available: {filename}")
         if "hdr" not in server_file:
             raise BenchError(f"server dynamic-range fact is unknown for {filename}")
         server_hdr = server_file["hdr"]
         if server_hdr is not None and str(server_hdr).lower() != "sdr":
             raise BenchError(f"server fixture is not SDR: {filename} hdr={server_hdr!r}")
-        if int(server_file.get("size", -1)) != fixture["reference_size"]:
+        size = server_file.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise BenchError(f"server fixture has no usable size fact: {filename}")
+        if size != fixture["reference_size"]:
             raise BenchError(
                 f"fixture {filename} differs between controller and server: "
                 f"local {fixture['reference_size']} bytes, server {server_file.get('size')} bytes"
             )
+        video_codec = server_file.get("video_codec")
+        if not isinstance(video_codec, str) or not video_codec.strip():
+            raise BenchError(f"server fixture has no usable video_codec fact: {filename}")
+        for field in ("width", "height", "bit_depth"):
+            value = server_file.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise BenchError(f"server fixture has no usable {field} fact: {filename}")
         server_duration_ms = server_file.get("duration_ms")
+        if (
+            isinstance(server_duration_ms, bool)
+            or not isinstance(server_duration_ms, int)
+            or server_duration_ms <= 0
+        ):
+            raise BenchError(f"server fixture has no usable duration_ms fact: {filename}")
         required_end_ms = round(
             (fixture["start_seconds"] + fixture["duration_seconds"]) * 1000
         )
-        if server_duration_ms is not None and int(server_duration_ms) < required_end_ms:
+        if server_duration_ms < required_end_ms:
             raise BenchError(
                 f"fixture trim ends at {required_end_ms}ms but server file {filename} "
                 f"ends at {server_duration_ms}ms"
@@ -538,7 +568,7 @@ def resolve_fixture_file_ids(api, fixtures, library_id, server_hashes=None):
         fixture["server_file_identity"] = {
             key: server_file.get(key)
             for key in (
-                "id", "filename", "size", "duration_ms", "container",
+                "id", "filename", "size", "probed", "available", "duration_ms", "container",
                 "video_codec", "width", "height", "bit_depth", "hdr",
             )
         }
@@ -627,6 +657,7 @@ def capture_live_session(
     poll_seconds,
     timeout_seconds,
     idle_timeout_seconds,
+    expected_encoder,
 ):
     """Capture only bytes served by one uncached production HLS session."""
     require_server_idle(api, f"capturing {fixture['identity']}/{mode}")
@@ -648,6 +679,11 @@ def capture_live_session(
             )
         if encoder == "copy":
             raise BenchError(f"{fixture['identity']}/{mode} copied video instead of transcoding")
+        if encoder != expected_encoder:
+            raise BenchError(
+                f"{fixture['identity']}/{mode} used encoder {encoder!r}; "
+                f"/system selected {expected_encoder!r}"
+            )
         delivered_dynamic_range = info.get("delivered_dynamic_range")
         if delivered_dynamic_range != "sdr":
             raise BenchError(
@@ -735,6 +771,15 @@ def capture_live_session(
                 )
             speed = status.get("recent_speed")
             if speed is not None:
+                if (
+                    isinstance(speed, bool)
+                    or not isinstance(speed, (int, float))
+                    or not math.isfinite(speed)
+                    or speed < 0
+                ):
+                    raise BenchError(
+                        f"{fixture['identity']}/{mode} status reported invalid recent_speed"
+                    )
                 speed_samples.append(float(speed))
             if media_seconds + 1e-6 < fixture["duration_seconds"]:
                 time.sleep(poll_seconds)
@@ -829,8 +874,13 @@ def update_rate_setting(api, contract, mode, quality=None, include_quality=False
     }
 
 
-def restore_rate_settings(api, contract):
-    require_server_idle(api, "restoring original rate-control settings")
+def restore_rate_settings(api, contract, poll_seconds, idle_timeout_seconds):
+    wait_for_server_idle(
+        api,
+        "waiting to restore original rate-control settings",
+        poll_seconds,
+        idle_timeout_seconds,
+    )
     body = {
         contract["rate_field"]: contract["original_rate"],
         contract["quality_field"]: contract["original_quality"],
@@ -840,6 +890,7 @@ def restore_rate_settings(api, contract):
         raise BenchError("server did not restore original rate mode")
     if returned.get(contract["quality_field"]) != contract["original_quality"]:
         raise BenchError("server did not restore original quality override")
+    return body
 
 
 def evaluate_rate_control(fixture_rows):
@@ -985,23 +1036,48 @@ def rate_control_report(args, api=None):
     if args.vmaf_subsample < 1:
         report["failures"].append({"code": "harness_error", "detail": "--vmaf-subsample must be at least 1"})
         return report
-    if args.rate_window <= 0:
-        report["failures"].append({"code": "harness_error", "detail": "--rate-window must be positive"})
-        return report
-    if (
-        args.poll <= 0
-        or args.capture_timeout <= 0
-        or args.idle_timeout <= 0
+    positive_cli = (
+        ("--rate-window", args.rate_window),
+        ("--poll", args.poll),
+        ("--capture-timeout", args.capture_timeout),
+        ("--idle-timeout", args.idle_timeout),
+    )
+    invalid_positive = next((
+        name for name, value in positive_cli
+        if isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ), None)
+    invalid_settle = (
+        isinstance(args.settings_settle, bool)
+        or not isinstance(args.settings_settle, (int, float))
+        or not math.isfinite(args.settings_settle)
         or args.settings_settle < 0
-    ):
+    )
+    if invalid_positive is not None or invalid_settle:
         report["failures"].append({
             "code": "harness_error",
             "detail": (
-                "--poll/--capture-timeout/--idle-timeout must be positive and "
-                "--settings-settle nonnegative"
+                f"{invalid_positive} must be a finite positive number"
+                if invalid_positive is not None
+                else "--settings-settle must be a finite nonnegative number"
             ),
         })
         return report
+    if selected_modes == RATE_CONTROL_FULL_MODES:
+        if args.vmaf_model != "vmaf_v0.6.1":
+            report["failures"].append({
+                "code": "harness_error",
+                "detail": "vbr,qvbr acceptance requires --vmaf-model vmaf_v0.6.1 exactly",
+            })
+            return report
+        if args.rate_window != 10.0:
+            report["failures"].append({
+                "code": "harness_error",
+                "detail": "vbr,qvbr acceptance requires --rate-window 10.0 exactly",
+            })
+            return report
 
     contract = None
     try:
@@ -1062,6 +1138,8 @@ def rate_control_report(args, api=None):
                 "settings DTO acknowledgement plus stable encoder identity only; "
                 "N1 boot/production flag validation and forced-fallback evidence are separate"
             ),
+            "required_vmaf_model": "vmaf_v0.6.1",
+            "required_rate_window_seconds": 10.0,
         }
         if args.only:
             fixtures = [fixture for fixture in fixtures if fixture["identity"] == args.only]
@@ -1083,6 +1161,9 @@ def rate_control_report(args, api=None):
         })
         api = api or Api(args.base, args.token)
         system = api.call("/system")
+        target_encoder = system.get("encoder_selected")
+        if not isinstance(target_encoder, str) or not target_encoder:
+            raise BenchError("server did not report a selected production encoder")
         report["production"] = {
             "role": "production_hls_encoding_by_plurxd_only",
             "encoder_execution_host": system.get("name"),
@@ -1094,7 +1175,7 @@ def rate_control_report(args, api=None):
             "plurx_built_at": system.get("built_at"),
             "production_ffmpeg_path": system.get("ffmpeg"),
             "production_ffmpeg_build": system.get("ffmpeg_version"),
-            "selected_encoder": system.get("encoder_selected"),
+            "selected_encoder": target_encoder,
             "vmaf_scorer_used_for_encoding": False,
         }
         system_active = system.get("active_transcodes")
@@ -1172,6 +1253,7 @@ def rate_control_report(args, api=None):
                     args.poll,
                     args.capture_timeout,
                     args.idle_timeout,
+                    target_encoder,
                 )
                 try:
                     measured = measured_capture(
@@ -1202,7 +1284,7 @@ def rate_control_report(args, api=None):
     finally:
         if contract is not None and api is not None:
             try:
-                restore_rate_settings(api, contract)
+                restore_rate_settings(api, contract, args.poll, args.idle_timeout)
             except Exception as error:
                 detail = str(error)
                 if getattr(args, "token", None):
@@ -1210,6 +1292,10 @@ def rate_control_report(args, api=None):
                 report["failures"].append({
                     "code": "setting_restore_failed",
                     "detail": detail,
+                    "required_manual_restore": {
+                        contract["rate_field"]: contract["original_rate"],
+                        contract["quality_field"]: contract["original_quality"],
+                    },
                 })
     if report["fixtures"] and not any(failure["code"] == "harness_error" for failure in report["failures"]):
         report["failures"].extend(evaluate_rate_control(report["fixtures"]))
@@ -1220,7 +1306,10 @@ def rate_control_report(args, api=None):
 def write_json(path, document):
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def print_rate_control(report):
@@ -1359,8 +1448,10 @@ def parse_playlist(text):
         if line.startswith("#EXTINF:"):
             try:
                 pending = float(line[8:].split(",")[0])
-            except ValueError:
-                pending = None
+            except ValueError as error:
+                raise BenchError("server playlist contained a nonnumeric EXTINF duration") from error
+            if not math.isfinite(pending) or pending <= 0:
+                raise BenchError("server playlist contained a non-finite or nonpositive duration")
         elif line and not line.startswith("#") and pending is not None:
             out.append((line, pending))
             pending = None
@@ -1450,7 +1541,11 @@ def main():
             "never used for production playback encoding"
         ),
     )
-    rc.add_argument("--vmaf-model", default="vmaf_v0.6.1")
+    rc.add_argument(
+        "--vmaf-model",
+        default="vmaf_v0.6.1",
+        help="scoring model; full vbr,qvbr requires vmaf_v0.6.1 exactly",
+    )
     rc.add_argument(
         "--vmaf-subsample",
         type=int,
@@ -1461,14 +1556,22 @@ def main():
     rc.add_argument("--work-dir", default=None, help="controller-side capture scratch directory")
     rc.add_argument("--keep-artifacts", action="store_true", help="retain captured HLS after scoring")
     rc.add_argument("--quality", type=int, default=None, help="full-mode QVBR quality override")
-    rc.add_argument("--rate-window", type=float, default=10.0, help="served-segment peak window")
+    rc.add_argument(
+        "--rate-window",
+        type=float,
+        default=10.0,
+        help="served-segment peak window; full vbr,qvbr requires 10.0 seconds exactly",
+    )
     rc.add_argument("--poll", type=float, default=0.25, help="playlist/status polling interval")
     rc.add_argument("--capture-timeout", type=float, default=180.0, help="per-session wall timeout")
     rc.add_argument(
         "--idle-timeout",
         type=float,
         default=30.0,
-        help="seconds to prove the production server returned to zero active transcodes",
+        help=(
+            "seconds to prove the server returned idle after DELETE or before safe settings "
+            "restoration"
+        ),
     )
     rc.add_argument(
         "--settings-settle",
