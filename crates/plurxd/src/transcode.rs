@@ -41,6 +41,24 @@ pub const MAX_HEIGHT: i64 = 2160;
 /// How long a segment request waits for ffmpeg to produce a not-yet-written
 /// segment before giving up.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
+/// Hold the first live transcode playlist until it has both two complete
+/// segments and this much published media. The first playlist used to expose
+/// one ~2 s segment while ffmpeg was already writing the rest; hls.js reached
+/// that edge at the same instant it scheduled its first EVENT reload and
+/// visibly stalled even when the encoder had finished the entire title.
+///
+/// Two nominal segments are the smallest useful head start. Media duration is
+/// the actual contract rather than `TARGETDURATION` (a ceiling, not inventory),
+/// and requiring two entries prevents one unusually long opening segment from
+/// recreating the same live-edge race. Finished short titles escape through
+/// `ENDLIST` rather than waiting for media that can never exist.
+const TRANSCODE_START_CUSHION_MS: i64 = transcode::SEGMENT_SECONDS as i64 * 2 * 1_000;
+/// The initial playlist request was already bounded to 30 seconds. Naming the
+/// cadence keeps the new cushion inside that same failure/cancellation surface:
+/// no detached task survives a dropped HTTP request and a failed session still
+/// exits immediately.
+const PLAYLIST_WAIT_POLLS: usize = 300;
+const PLAYLIST_WAIT_POLL: Duration = Duration::from_millis(100);
 /// Grace period for a hardware transcode to list its first segment before we
 /// assume it stalled (GPU contention, or a decode the GPU can't do) and fall
 /// back to software. Longer than a healthy hardware start (~1–3 s), with slack
@@ -503,6 +521,26 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
         cursor_ms += duration_ms;
     }
     out
+}
+
+/// Whether the first HTTP response for a live transcode can safely expose this
+/// EVENT playlist. Later reloads never pass through this verdict: the session
+/// remembers that publication opened.
+fn transcode_first_playlist_ready(raw: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        // Preserve the old fail-fast behavior for malformed ffmpeg output. A
+        // media player can report the parse error; hiding it behind a 30-second
+        // wait would turn a useful failure into a gray screen.
+        return true;
+    };
+    if text.lines().any(|line| line.trim() == "#EXT-X-ENDLIST") {
+        return true;
+    }
+    let segments = parse_playlist(text);
+    segments.len() >= 2
+        && segments
+            .last()
+            .is_some_and(|segment| segment.end_ms >= TRANSCODE_START_CUSHION_MS)
 }
 
 /// Turn the append-only writer playlist into the sliding view clients see.
@@ -1158,6 +1196,11 @@ struct Session {
     /// both failed to emit a first segment). Playlist/segment reads then fail
     /// fast so the player shows an error instead of waiting on a gray screen.
     failed: AtomicBool,
+    /// True once the first playlist response is allowed out. Cached assets and
+    /// copy sessions start true: VOD is already complete, and the copy
+    /// segmenter owns its separate 12-second publication gate. A live
+    /// transcode flips this exactly once when its small startup cushion exists.
+    playlist_published: AtomicBool,
     /// Highest segment index the client has fetched (-1 before the first).
     /// Kept for logs and for resolving the frontier against the index; the
     /// accounting itself works in media time.
@@ -2596,6 +2639,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            playlist_published: AtomicBool::new(true),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
@@ -3877,6 +3921,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
@@ -4348,6 +4393,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            playlist_published: AtomicBool::new(true),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
@@ -4675,12 +4721,27 @@ impl TranscodeManager {
         // error retry. A failed session still returns None immediately → 404
         // → the player reports an error rather than polling a segment-less
         // playlist on a gray screen forever.
-        for _ in 0..300 {
+        for _ in 0..PLAYLIST_WAIT_POLLS {
             if session.failed.load(Relaxed) {
                 return None;
             }
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 if !bytes.is_empty() {
+                    // ffmpeg rewrites an EVENT playlist after each segment. Do
+                    // not let hls.js race away with the first one-segment
+                    // version: its first reload is scheduled at the exact edge
+                    // of that segment, which leaves no time for request + append
+                    // and creates a deterministic startup stall. This is only a
+                    // first-response gate; cached VOD and copy have already
+                    // opened it in their constructors, and every reload after
+                    // the publication store below stays on the old fast path.
+                    if !session.playlist_published.load(Relaxed) {
+                        if !transcode_first_playlist_ready(&bytes) {
+                            tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
+                            continue;
+                        }
+                        session.playlist_published.store(true, Relaxed);
+                    }
                     // The playlist just told us what is published — the one
                     // moment the segment index can be refreshed for free.
                     self.flow_control(&session, session_id).await;
@@ -4725,7 +4786,7 @@ impl TranscodeManager {
                     ));
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
         }
         None
     }
@@ -5710,6 +5771,32 @@ mod tests {
         assert!(parse_playlist("").is_empty());
     }
 
+    /// A live EVENT playlist needs both more than one segment and enough media
+    /// runway before its first response. A long first segment alone still
+    /// leaves hls.js at the writer edge, while a completed short title must not
+    /// be held until the request timeout.
+    #[test]
+    fn live_transcode_publication_requires_real_cushion_or_endlist() {
+        let one_short = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+                          #EXTINF:2.000,\nseg00000.ts\n";
+        let one_long = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+                         #EXTINF:8.000,\nseg00000.ts\n";
+        let two_short = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+                          #EXTINF:1.000,\nseg00000.ts\n\
+                          #EXTINF:1.000,\nseg00001.ts\n";
+        let two_ready = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+                          #EXTINF:2.000,\nseg00000.ts\n\
+                          #EXTINF:2.000,\nseg00001.ts\n";
+        let completed_short = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+                                #EXTINF:1.000,\nseg00000.ts\n#EXT-X-ENDLIST\n";
+
+        assert!(!transcode_first_playlist_ready(one_short));
+        assert!(!transcode_first_playlist_ready(one_long));
+        assert!(!transcode_first_playlist_ready(two_short));
+        assert!(transcode_first_playlist_ready(two_ready));
+        assert!(transcode_first_playlist_ready(completed_short));
+    }
+
     /// The writer keeps an append-only EVENT history, but a client must never
     /// be offered names retention already unlinked. This pure pin also covers
     /// the HLS shape: a playlist that removes old entries is a sliding media
@@ -6266,6 +6353,7 @@ mod tests {
             encoder_label: Mutex::new("test"),
             started_unix: 0,
             failed: AtomicBool::new(false),
+            playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
@@ -6302,6 +6390,48 @@ mod tests {
         tokio::fs::write(dir.join("index.m3u8"), playlist)
             .await
             .expect("write playlist");
+    }
+
+    /// The manager must hold the first live response while ffmpeg has only a
+    /// one-segment EVENT playlist, then release it as soon as a second segment
+    /// provides the startup cushion. This pins both the asynchronous polling
+    /// behavior and the per-session one-way publication state.
+    #[tokio::test]
+    async fn first_live_transcode_playlist_waits_for_two_segments() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        seeded_session_dir(dir.path(), 1, 2.0).await;
+        let session = Arc::new(test_session(dir.path().to_path_buf()));
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.sessions
+            .lock()
+            .await
+            .insert("startup-gate".into(), Arc::clone(&session));
+
+        let held =
+            tokio::time::timeout(Duration::from_millis(250), mgr.playlist("startup-gate")).await;
+        assert!(
+            held.is_err(),
+            "one segment must not escape the startup gate"
+        );
+        assert!(!session.playlist_published.load(Relaxed));
+
+        seeded_session_dir(dir.path(), 2, 2.0).await;
+        let playlist = tokio::time::timeout(Duration::from_secs(2), mgr.playlist("startup-gate"))
+            .await
+            .expect("two-segment playlist should be released")
+            .expect("playlist");
+        let text = String::from_utf8(playlist).expect("utf8 playlist");
+        assert!(text.contains("seg00000.ts"));
+        assert!(text.contains("seg00001.ts"));
+        assert!(session.playlist_published.load(Relaxed));
     }
 
     /// Re-evaluating an unchanged running session must be a no-op. Without the
@@ -7106,6 +7236,7 @@ mod tests {
             encoder_label: Mutex::new("test"),
             started_unix: 0,
             failed: AtomicBool::new(false),
+            playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
