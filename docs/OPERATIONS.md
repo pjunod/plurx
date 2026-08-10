@@ -456,14 +456,25 @@ on nynuc or in compose. Nynuc performs production encoding; the accepted laptop
 controller scorer runs only after DELETE succeeds and `/system` confirms the
 node returned to zero active transcodes.
 
-Build and scan the standard fixtures first, make the same files available as
-local controller references, stop all playback, and run the current-main VBR
-smoke:
+Build the standard fixtures first, scan that directory as a plurx library, make
+the same files available as local controller references, stop all playback,
+and run the current-main VBR smoke:
+
+```bash
+scripts/bench fixtures --dir bench-media  # builds the standard fixture matrix
+```
+
+Pass `--library <id>` when the server has more than one library; omission is
+accepted only when `/libraries` returns exactly one entry. The library must be
+the one that scanned the fixture bytes whose local copies are used as VMAF
+references. Set `PLURX_FIXTURE_LIBRARY_ID` to that numeric ID for the commands
+below.
 
 ```bash
 scripts/bench rate-control \
   --base http://nynuc:32400 \
   --token "$PLURX_ADMIN_TOKEN" \
+  --library "$PLURX_FIXTURE_LIBRARY_ID" \
   --corpus scripts/perf2-rate-control-smoke-corpus.json \
   --modes vbr \
   --vmaf-ffmpeg /opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg \
@@ -511,6 +522,7 @@ non-SDR delivery fail.
 scripts/bench rate-control \
   --base http://nynuc:32400 \
   --token "$PLURX_ADMIN_TOKEN" \
+  --library "$PLURX_FIXTURE_LIBRARY_ID" \
   --corpus /path/to/perf2-n1-acceptance.json \
   --server-sha256-manifest out/nynuc-perf2.sha256 \
   --modes vbr,qvbr \
@@ -526,14 +538,15 @@ scripts/bench rate-control \
   --json out/rate-control-full.json
 ```
 
-Full comparison accepts exactly model `vmaf_v0.6.1`, a `10.0`-second served
-segment window, `--poll 0.25`, and `--settings-settle 3.0`. A different poll
-can miss a slow speed sample, and a different settle delay can change which
-post-update state gets measured; either is VBR-diagnostic-only. A longer rate
-window can dilute a 10-second burst. The VMAF subsample and the capture/idle
-timeouts may vary under the plan, but the artifact records them. Capture and
-idle timeouts can only refuse an incomplete or unsafe run; they do not shorten
-the fixed source-timeline trim that is scored.
+Full comparison accepts exactly model `vmaf_v0.6.1`, `--vmaf-subsample 1`, a
+`10.0`-second served-segment window, `--poll 0.25`, and
+`--settings-settle 3.0`. Subsampling can conceal a short quality regression; a
+different poll can miss a slow speed sample; and a different settle delay can
+change which post-update state gets measured. Any deviation is
+VBR-diagnostic-only. A longer rate window can dilute a 10-second burst. The
+capture/idle timeouts may vary under the plan, but the artifact records them.
+They can only refuse an incomplete or unsafe run; they do not shorten the fixed
+source-timeline trim that is scored.
 
 The harness sends partial settings updates only and records the requested mode
 plus only the verified rate/quality fields from the settings response. Its
@@ -588,7 +601,7 @@ The manifest is fixture identity, not an encoder recipe:
 | `dynamic_range` | Must be literal `sdr`; the server file fact and delivered session must agree |
 | `filename` / `reference` | Server-visible filename and the controller-local identical source; relative references resolve beside the manifest; full acceptance requires each filename and resolved path to be unique |
 | `reference_sha256` | Optional pinned lowercase SHA-256; every run records the actual local SHA; full acceptance requires unique pins and matching local/server bytes |
-| `trim` | Source-timeline start and capture duration; `StartResponse.media_origin_ms` is authoritative and must agree within 50 ms |
+| `trim` | Source-timeline start and capture duration; `StartResponse.media_origin_ms` is authoritative and must agree within 50 ms. A legacy transcode response without that field falls back to the manifest start and records `media_origin_source: manifest_start_legacy_transcode`; copy and cached sessions are already refused before that fallback |
 | `rung` | Requested production output height |
 
 The controller preflights free disk and removes each capture immediately after
@@ -596,9 +609,20 @@ scoring. `--keep-artifacts` retains generated playlists/segments for diagnosis;
 `--work-dir` chooses scratch. `--only` is diagnostic: the JSON marks it as a
 subset, forces `passed: false`, and exits nonzero even when its measurements
 look good. A retained fixture/mode directory is never overwritten.
-`--vmaf-subsample N` scores every Nth frame. Stable JSON records the VMAF model,
-subsample, rate window, poll interval, capture timeout, idle timeout, and
-settings-settle delay, so measurement timing cannot disappear from review.
+`--vmaf-subsample N` scores every Nth frame for diagnostics; full comparison
+requires `N = 1`. Stable JSON records the VMAF model, subsample, rate window,
+poll interval, capture timeout, idle timeout, and settings-settle delay, so
+measurement timing cannot disappear from review.
+
+VMAF is comparative at one delivered rung in this harness. The filter graph
+uses `scale2ref` to scale the source reference down to the captured stream's
+distorted resolution, then scores both there. That is a no-op for the checked-in
+1080p-to-1080p smoke and is valid for VBR/QVBR comparisons forced onto the same
+rung. It is not an industry-style absolute score at source/viewing resolution,
+and scores from different rungs are not comparable. Do not calibrate D5 from a
+sub-source-rung absolute score until the plan explicitly chooses whether to
+upscale the distorted stream to the source/viewing resolution; this harness PR
+defers that normalization decision rather than silently baking in an offset.
 
 The JSON keeps the evidence roles distinct: controller/scorer host, production
 server/build/Jellyfin-FFmpeg/encoder identity, and scoring-only FFmpeg
@@ -611,28 +635,41 @@ height, total, peak, and derived nominal/audio/max/buffer facts. An inflated
 quality-mode cap is not an equal comparison. Peak rate uses the same
 complete-served-segment rolling windows as `scripts/perf-report`; incomplete
 tail windows are ignored.
-The server-advertised rung peak is the plan's sole binding peak gate. The
-theoretical `maxrate + bufsize/window` value remains in JSON as a labeled,
-nonbinding diagnostic with its inferred 2× nominal-video bufsize assumption.
 
-`passed: true` on the full comparison means both modes supplied finite,
-strictly positive server-speed p10 measurements, the requested quality-mode
-capture did not lower VMAF, grow bytes on easy content, or lose more than 10%
-server encode speed, and neither requested-mode capture crossed the advertised
-peak.
-It does not prove QVBR flags executed. Failures are explicit
+Peak acceptance is stop-flagged after PR #131 review. PERF2-PLAN v2 named the
+advertised peak over a bufsize window; PR #131 implemented the advertised peak
+over 10-second complete served-segment windows and retained the inferred
+`maxrate + bufsize/window` value as a diagnostic. The harness now records the
+observed peak over both candidate windows: exactly `10.0` seconds for PR #131,
+and `video_bufsize_kbits / video_maxrate_kbps` seconds for v2. Because served
+segments are the measurement quantum, the latter is the rate of the shortest
+complete-segment span meeting that derived duration. The JSON also keeps the
+10-second theoretical VBV allowance separate from both observed peaks.
+
+The owner has not ratified either peak gate. The JSON labels both observed
+peaks diagnostic, sets
+`acceptance.eligible: false`, emits `peak_contract_unratified`, and cannot
+report `passed: true` for `vbr,qvbr`. Do not present that artifact as N1
+acceptance until the plan records the owner's chosen peak contract.
+
+Apart from that deliberate stop, the diagnostic comparison still checks that
+both modes supplied finite, strictly positive server-speed p10 measurements
+and that the requested quality-mode capture did not lower VMAF, grow bytes on
+easy content, or lose more than 10% server encode speed. It does not prove QVBR
+flags executed. Failures are explicit
 `vmaf_regression`, `easy_bytes_regression`, `speed_invalid`,
 `speed_nonpositive`, `speed_regression`, `encoder_identity_mismatch`,
-`ladder_identity_mismatch`, `duration_mismatch`, `advertised_peak_exceeded`,
+`ladder_identity_mismatch`, `duration_mismatch`, `peak_contract_unratified`,
 `diagnostic_subset_not_acceptance`, `harness_error`, or
 `setting_restore_failed`.
 Missing `libvmaf` fails; it never skips quality scoring. A quantitative harness
-pass proves settings acknowledgement and measured output, not that the intended
-encoder flags or forced fallback executed. N1's production tests and boot
-validation must prove settings-to-flags behavior, and the plan's separate
-forced-fallback run must supply that evidence. TTFS is not N1 evidence. Keep
-the JSON as the PR artifact, and do not claim the named-machine full comparison
-without running it.
+run proves settings acknowledgement and measured output only after every stop
+condition has been resolved; it does not prove that the intended encoder flags
+or forced fallback executed. N1's production tests and boot validation must
+prove settings-to-flags behavior, and the plan's separate forced-fallback run
+must supply that evidence. TTFS is not N1 evidence. Keep the JSON as the PR
+artifact, and do not claim the named-machine full comparison without both peak
+ratification and the actual run.
 
 ### Where the transcode scratch lives
 

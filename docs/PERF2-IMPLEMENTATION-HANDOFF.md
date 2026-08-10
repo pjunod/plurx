@@ -375,10 +375,11 @@ playback; no scorer is installed or needed on nynuc or in compose) and the
 golden-hash fixtures land **before** any flag changes. Full comparison uses a
 pinned, balanced SDR corpus with unique filename/path/hash identities plus an
 operator-captured nynuc `sha256sum` manifest, with the node reserved for
-maintenance. Full acceptance also requires the exact VMAF model, 10-second
-window, 0.25-second poll, 3-second settle delay, recorded timing, usable server
-video facts, identical cross-mode ladder facts, and session/status identity
-equal to the server-selected encoder. Idle checks are immediate observations,
+maintenance. Full acceptance also requires the exact VMAF model,
+`n_subsample=1`, 10-second window, 0.25-second poll, 3-second settle delay,
+recorded timing, usable server video facts, identical cross-mode ladder facts,
+and session/status identity equal to the server-selected encoder. Idle checks
+are immediate observations,
 not GET-to-PUT locks; bounded polling may still include one in-flight 30-second
 HTTP timeout and otherwise reports the safe two-field manual rollback body.
 Harness settings-DTO and stable-encoder evidence does **not** prove effective
@@ -394,7 +395,11 @@ at creation.
 *Stop-and-flag if:* the legacy VBR digest bytes cannot be preserved
 exactly; or a driver family needs flags that `validation_args`'s
 15-frame probe cannot exercise; or offline snapshot storage wants a
-schema change beyond a column (that is v18+ territory — say so).
+schema change beyond a column (that is v18+ territory — say so); or the owner
+has not ratified whether peak acceptance uses v2's bufsize window or PR #131's
+10-second complete-served-segment window. Until that choice is recorded, both
+candidate-window observed peaks and the 10-second VBV allowance remain
+diagnostic, and a full artifact must stay ineligible and non-passing.
 *Acceptance:* plan §4's block, on nynuc, numbers in the PR.
 
 ### N2 — per-title analysis (plan §5)
