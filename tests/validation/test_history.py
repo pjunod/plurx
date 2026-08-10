@@ -6,7 +6,7 @@ import tempfile
 import textwrap
 import unittest
 
-from validation.history import audit_history
+from validation.history import ISSUE_RE, HistoryError, audit_history
 from validation.runner import load_catalog
 
 
@@ -130,6 +130,102 @@ class HistoryAuditCase(unittest.TestCase):
 
         self.assertEqual(report.errors, ())
         self.assertEqual(report.mapped_count, 1)
+
+    def test_client_anchor_survives_a_non_corrective_squash_title(self):
+        root, catalog, coverage = self.repository()
+        (root / "clients").mkdir()
+        (root / "clients/app.swift").write_text(
+            "func restoredPolicy() {}\n", encoding="utf-8"
+        )
+        (root / "tests/client.swift").write_text(
+            "func testRestoredPolicy() {}\n", encoding="utf-8"
+        )
+        subject = "Persist saved client policy (#120)"
+        self.assertIsNone(ISSUE_RE.search(subject))
+        sha = self.commit(root, subject)
+        (root / "tests/client-fixes.toml").write_text(
+            textwrap.dedent(
+                f"""
+                version = 1
+
+                [[fixes]]
+                id = "client.restored-policy"
+                commits = ["{sha[:8]}"]
+                source = "clients/app.swift"
+                source_anchor = "restoredPolicy"
+                test = "tests/client.swift"
+                test_anchor = "testRestoredPolicy"
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        report = audit_history(root, catalog, coverage)
+
+        self.assertEqual(report.errors, ())
+        self.assertEqual(report.anchored_count, 1)
+
+    def test_commit_prefixes_must_be_stable_lowercase_shas(self):
+        root, catalog, coverage = self.repository()
+        (root / "src/app.rs").write_text(
+            "pub fn answer() -> u8 { 1 }\n", encoding="utf-8"
+        )
+        self.commit(root, "feat: seed")
+        for prefix in ("", "a", "123456", "ABCDEF0", "123456g", "a" * 41):
+            with self.subTest(prefix=prefix):
+                coverage.write_text(
+                    textwrap.dedent(
+                        f"""
+                        version = 1
+
+                        [[coverage]]
+                        commits = ["{prefix}"]
+                        points = ["app"]
+                        checks = ["baseline"]
+                        reason = "Invalid prefixes must fail before history inspection."
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(HistoryError) as raised:
+                    audit_history(root, catalog, coverage)
+                self.assertEqual(
+                    str(raised.exception),
+                    "coverage[0].commits must contain Git SHA prefixes",
+                )
+
+    def test_one_commit_cannot_use_two_client_anchor_prefixes(self):
+        root, catalog, coverage = self.repository()
+        (root / "clients").mkdir()
+        (root / "clients/app.swift").write_text(
+            "func restoredPolicy() {}\n", encoding="utf-8"
+        )
+        (root / "tests/client.swift").write_text(
+            "func testRestoredPolicy() {}\n", encoding="utf-8"
+        )
+        sha = self.commit(root, "fix(client): restore saved policy")
+        rows = []
+        for identifier, prefix in (("short", sha[:8]), ("long", sha[:12])):
+            rows.append(
+                textwrap.dedent(
+                    f"""
+                    [[fixes]]
+                    id = "client.{identifier}"
+                    commits = ["{prefix}"]
+                    source = "clients/app.swift"
+                    source_anchor = "restoredPolicy"
+                    test = "tests/client.swift"
+                    test_anchor = "testRestoredPolicy"
+                    """
+                )
+            )
+        (root / "tests/client-fixes.toml").write_text(
+            "version = 1\n" + "".join(rows), encoding="utf-8"
+        )
+
+        report = audit_history(root, catalog, coverage)
+
+        self.assertTrue(any("anchored more than once" in error for error in report.errors))
 
     def test_unknown_checks_and_duplicate_commit_coverage_fail_loudly(self):
         root, catalog, coverage = self.repository()

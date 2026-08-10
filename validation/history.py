@@ -109,6 +109,13 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _commit_prefixes(value: object, field: str) -> tuple[str, ...]:
+    prefixes = _strings(value, field)
+    if not all(re.fullmatch(r"[0-9a-f]{7,40}", prefix) for prefix in prefixes):
+        raise HistoryError(f"{field} must contain Git SHA prefixes")
+    return prefixes
+
+
 def load_coverage(path: Path = DEFAULT_COVERAGE) -> tuple[CoverageEntry, ...]:
     try:
         with path.open("rb") as handle:
@@ -125,7 +132,7 @@ def load_coverage(path: Path = DEFAULT_COVERAGE) -> tuple[CoverageEntry, ...]:
             raise HistoryError(f"{where} must be a table")
         entries.append(
             CoverageEntry(
-                commits=_strings(item.get("commits"), f"{where}.commits"),
+                commits=_commit_prefixes(item.get("commits"), f"{where}.commits"),
                 points=_strings(item.get("points"), f"{where}.points"),
                 checks=_strings(item.get("checks"), f"{where}.checks"),
                 reason=str(item.get("reason", "")).strip(),
@@ -172,7 +179,7 @@ def load_client_fixes(path: Path) -> ClientFixLedger:
         entries.append(
             ClientFixEntry(
                 id=str(item["id"]),
-                commits=_strings(item["commits"], f"{where}.commits"),
+                commits=_commit_prefixes(item["commits"], f"{where}.commits"),
                 source=str(item["source"]),
                 source_anchor=str(item["source_anchor"]),
                 test=str(item["test"]),
@@ -263,14 +270,15 @@ def audit_history(
     client_fixes_path: Path | None = None,
 ) -> HistoryReport:
     entries = load_coverage(coverage_path)
+    client_fixes = load_client_fixes(
+        client_fixes_path or root / "tests" / "client-fixes.toml"
+    )
     catalog = catalog or load_catalog()
     issues = discover_issues(
         root,
         catalog,
-        tuple(prefix for entry in entries for prefix in entry.commits),
-    )
-    client_fixes = load_client_fixes(
-        client_fixes_path or root / "tests" / "client-fixes.toml"
+        tuple(prefix for entry in entries for prefix in entry.commits)
+        + tuple(prefix for entry in client_fixes.fixes for prefix in entry.commits),
     )
     errors: list[str] = []
     by_sha = {issue.sha: issue for issue in issues}
@@ -357,6 +365,9 @@ def audit_history(
             sha = matches_sha[0]
             if sha in resolved:
                 errors.append(f"corrective commit {prefix} has both ledger and anchor evidence")
+                continue
+            if sha in anchored:
+                errors.append(f"corrective commit {prefix} is anchored more than once")
                 continue
             anchored.add(sha)
 

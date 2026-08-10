@@ -368,9 +368,22 @@ facts and the per-milestone stop-and-flag list. Do them in this order
 ### N1 — quality-bounded rate control (plan §4; review R4)
 
 *Order inside the milestone:* the `scripts/bench rate-control` harness
-(VMAF via the ffmpeg `libvmaf` filter — behavioral probe for its
-presence first; the jellyfin-ffmpeg build is the default engine) and the
-golden-hash fixtures land **before** any flag changes. Then:
+(production Jellyfin FFmpeg creates real, uncached plurxd HLS sessions; an
+explicit separate FFmpeg with a behavior-probed `libvmaf` filter may score the
+captured bytes offline after each encode, but never encodes production
+playback; no scorer is installed or needed on nynuc or in compose) and the
+golden-hash fixtures land **before** any flag changes. Full comparison uses a
+pinned, balanced SDR corpus with unique filename/path/hash identities plus an
+operator-captured nynuc `sha256sum` manifest, with the node reserved for
+maintenance. Full acceptance also requires the exact VMAF model, 10-second
+window, 0.25-second poll, 3-second settle delay, recorded timing, usable server
+video facts, identical cross-mode ladder facts, and session/status identity
+equal to the server-selected encoder. Idle checks are immediate observations,
+not GET-to-PUT locks; bounded polling may still include one in-flight 30-second
+HTTP timeout and otherwise reports the safe two-field manual rollback body.
+Harness settings-DTO and stable-encoder evidence does **not** prove effective
+flags or fallback: N1's boot/production tests and the separate forced-fallback
+acceptance run must do that. Then:
 `EffectiveRateControl` resolved post-validation; the single
 `effective_recipe()` builder replacing the four constructor sites
 (`transcode.rs:2430,2607,2694` + the test helper); the per-family flag
