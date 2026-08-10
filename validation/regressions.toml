@@ -225,3 +225,9 @@ commits = ["344ab5bf"]
 points = ["persistence.upgrades", "cluster.auth"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The SQLite import integration suite pins identity and schema refusals, parent-cycle detection, and exact target parity after an injected mutation; the three-voter contract exercises the reviewed bounded parent-order import path."
+
+[[coverage]]
+commits = ["d9f0ca47"]
+points = ["playback.pipeline"]
+checks = ["rust-gate", "playback-exhaustive"]
+reason = "The manager regressions hold a live transcode's first one-segment EVENT playlist until real media cushion exists, and the exhaustive shipped-player matrix rejects startup stalls."

@@ -2,8 +2,8 @@
 
 **Assessment baseline:** `origin/main` @ `e8a910f` · Companion to
 `docs/RETRO-REVIEW-2026-08-09.md` and WO-01…WO-11. The outcomes below record
-the post-assessment execution state through PR #123 and the physical-device
-session on 2026-08-09.
+the post-assessment execution state through PR #128, plus the adversarial audit
+and physical-device session on 2026-08-09.
 
 Nothing here reopens a work order's “Don't” section. Those entries remain
 verified fixes or refuted claims, not a second backlog.
@@ -12,10 +12,13 @@ verified fixes or refuted claims, not a second backlog.
 
 Paul approved all five recommendations on 2026-08-09.
 
-1. **Yes — cut a real release.** `v0.2.7` is tagged, the changelog carries the
-   release heading, and the tag-driven publication contract has an executed
-   release to describe. `docs/RELEASING.md` remains the canonical release
-   procedure; continuous main did not replace it.
+1. **Yes — cut a real release; publication recovery is still required.**
+   `v0.2.7` is tagged and the changelog carries the release heading, but the
+   first GHCR publication timed out after 60 minutes while Rust was compiling
+   under arm64 emulation. No release image was published. The repaired workflow
+   must publish and verify `0.2.7`, `0.2`, and `latest` before this decision is
+   complete. `docs/RELEASING.md` remains the canonical procedure; continuous
+   main did not replace it.
 2. **Yes — choose the guard-only PGS policy.** The server independently refuses
    an explicit subtitle burn for probed DV, HDR10, or HLG sources. There is
    deliberately no “burn to SDR anyway” override: an old or context-poor client
@@ -143,15 +146,23 @@ simulator tests are not substitutes:
   00:21 UTC through 2026-08-09 14:23 UTC put fast-preflight p95 at 15 seconds
   against the 60-second budget. The three-voter contract job recorded 27
   successes, zero failures, and 14 intentional path-based skips.
-- **Pass — history audit headroom.** The final local `make check` covered 293
+- **Pass — history audit headroom.** The final local `make check` covered 308
   corrective commits; the combined CI preflight p95 remains 15 seconds.
-- **Pass — fleet contract.** nynuc and nuc4 report stamped
-  `v0.2.7-15-g83403ef`, schema 15. Every media bind is read-only, both
-  containers have `/dev/dri`, and nuc4 retains TCP 32402 plus GDM UDP 32415.
-  The private deploy play invokes `make docker-up`, and its contract test pins
-  that call. No `backups/` directory exists yet because neither node has
-  performed a post-automation redeploy; the earlier scratch rollback drill
-  remains the executed recovery proof.
+- **Pass after repair — live backup invariant.** An adversarial check found
+  nynuc and nuc4 on `v0.2.7-66-g3603923` without `/srv/plurx/backups`, proving
+  the earlier deployment bypassed or predated current automation. The clean
+  private-Ansible `4c74d27` path then ran serially with rebuild disabled: it
+  stopped each stack, copied the closed database, restarted the unchanged
+  image, and passed both health probes. nynuc's
+  `plurx.db.predeploy-20260810T004048Z-3603923cce64.bak` is 69,574,656 bytes
+  with SHA-256 `56f80771de22ca17ee8fd7d077ba52b902162cabd496a8cbcbbe755ddf521090`;
+  nuc4's `plurx.db.predeploy-20260810T004143Z-3603923cce64.bak` is 81,661,952
+  bytes with SHA-256
+  `9fef22305d92507a8396e3937405f1a62e128348a470e2332bf13456d8da61ee`.
+  Both read-only snapshots return `PRAGMA quick_check = ok`; both services
+  still report the unchanged running build and healthy endpoints. The scratch
+  rollback drill remains the restore proof, while this run closes the missing
+  live-snapshot gap.
 
 ## 3. Explicitly not action items
 
