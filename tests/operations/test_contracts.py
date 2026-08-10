@@ -207,10 +207,12 @@ class OperationsContractCase(unittest.TestCase):
 
     def test_release_registry_and_weekly_readiness_match_ci(self):
         ci = read(".github/workflows/ci.yml")
+        publisher = read(".github/workflows/publish-release.yml")
         unraid = read("deploy/unraid-plurx.xml")
         readiness = read(".github/workflows/release-readiness.yml")
 
-        self.assertIn("images: ghcr.io/${{ github.repository }}", ci)
+        self.assertIn("uses: ./.github/workflows/publish-release.yml", ci)
+        self.assertIn("REGISTRY_IMAGE: ghcr.io/${{ github.repository }}", publisher)
         self.assertIn("<Repository>ghcr.io/pjunod/plurx:latest</Repository>", unraid)
         self.assertIn(
             "<Registry>https://github.com/pjunod/plurx/pkgs/container/plurx</Registry>",
@@ -224,6 +226,7 @@ class OperationsContractCase(unittest.TestCase):
         for path in (
             ".github/workflows/ci.yml",
             ".github/workflows/lint.yml",
+            ".github/workflows/publish-release.yml",
             ".github/workflows/release-readiness.yml",
             ".github/workflows/rust-audit.yml",
         ):
@@ -233,6 +236,7 @@ class OperationsContractCase(unittest.TestCase):
                 missing = [
                     name for name, block in jobs.items()
                     if "\n    timeout-minutes:" not in block
+                    and "\n    uses:" not in block
                 ]
                 self.assertEqual([], missing, f"jobs without timeouts in {path}")
 
