@@ -47,6 +47,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sleep = time.sleep
+
 # --- the corpus -------------------------------------------------------------
 # Each entry is a shape that has bitten this pipeline, not a resolution ladder.
 # The comment on each says which failure it is here to catch.
@@ -102,6 +104,20 @@ DURATION = 45
 RATE_CONTROL_SCHEMA_VERSION = 1
 RATE_CONTROL_SMOKE_MODES = ("vbr",)
 RATE_CONTROL_FULL_MODES = ("vbr", "qvbr")
+RATE_CONTROL_ACCEPTANCE_MODEL = "vmaf_v0.6.1"
+RATE_CONTROL_ACCEPTANCE_RATE_WINDOW = 10.0
+RATE_CONTROL_ACCEPTANCE_POLL = 0.25
+RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE = 3.0
+LADDER_IDENTITY_FIELDS = (
+    "requested_height",
+    "advertised_height",
+    "advertised_total_kbps",
+    "advertised_peak_kbps",
+    "derived_nominal_video_kbps",
+    "derived_audio_kbps",
+    "video_maxrate_kbps",
+    "video_bufsize_kbits",
+)
 VMAF_SCORE = re.compile(r"VMAF score:\s*([^\s]+)")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -287,6 +303,22 @@ def load_rate_control_corpus(path):
                 "n1_acceptance requires pinned reference_sha256 for every fixture: "
                 + ", ".join(unpinned)
             )
+        unique_contracts = (
+            ("server filename", lambda fixture: fixture["filename"]),
+            ("resolved reference path", lambda fixture: str(fixture["reference_path"])),
+            ("pinned reference SHA-256", lambda fixture: fixture["reference_sha256"]),
+        )
+        for label, value_for in unique_contracts:
+            owners = {}
+            for fixture in normalized_fixtures:
+                value = value_for(fixture)
+                previous = owners.get(value)
+                if previous is not None:
+                    raise BenchError(
+                        f"n1_acceptance requires a unique {label} per fixture: "
+                        f"{previous!r} and {fixture['identity']!r} duplicate {value!r}"
+                    )
+                owners[value] = fixture["identity"]
         easy = sum(fixture["class"] == "easy" for fixture in normalized_fixtures)
         hard = sum(fixture["class"] == "hard" for fixture in normalized_fixtures)
         if easy < 1 or hard < 1 or easy != hard:
@@ -594,15 +626,22 @@ def require_server_idle(api, action):
 
 def wait_for_server_idle(api, action, poll_seconds, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
+    last_count = None
     while True:
+        if last_count is not None and time.monotonic() >= deadline:
+            raise BenchError(
+                f"server still has {last_count} active transcode(s) after {action}; idle timeout"
+            )
         count = active_transcodes(api)
         if count == 0:
             return
-        if time.monotonic() >= deadline:
+        last_count = count
+        now = time.monotonic()
+        if now >= deadline:
             raise BenchError(
                 f"server still has {count} active transcode(s) after {action}; idle timeout"
             )
-        time.sleep(poll_seconds)
+        sleep(min(poll_seconds, max(0, deadline - now)))
 
 
 def capture_disk_preflight(path, fixture):
@@ -782,7 +821,7 @@ def capture_live_session(
                     )
                 speed_samples.append(float(speed))
             if media_seconds + 1e-6 < fixture["duration_seconds"]:
-                time.sleep(poll_seconds)
+                sleep(poll_seconds)
 
         if len(ordered) < 3:
             raise BenchError(f"{fixture['identity']}/{mode} produced fewer than three segments")
@@ -898,6 +937,27 @@ def evaluate_rate_control(fixture_rows):
     failures = []
     for fixture in fixture_rows:
         name = fixture["identity"]
+        if set(fixture["modes"]) == set(RATE_CONTROL_FULL_MODES):
+            vbr, qvbr = fixture["modes"]["vbr"], fixture["modes"]["qvbr"]
+            baseline_ladder = {
+                field: vbr.get("limits", {}).get(field)
+                for field in LADDER_IDENTITY_FIELDS
+            }
+            candidate_ladder = {
+                field: qvbr.get("limits", {}).get(field)
+                for field in LADDER_IDENTITY_FIELDS
+            }
+            if (
+                any(value is None for value in baseline_ladder.values())
+                or any(value is None for value in candidate_ladder.values())
+                or baseline_ladder != candidate_ladder
+            ):
+                failures.append({
+                    "code": "ladder_identity_mismatch",
+                    "fixture": name,
+                    "baseline": baseline_ladder,
+                    "candidate": candidate_ladder,
+                })
         for mode, measured in fixture["modes"].items():
             if measured["peak_window_kbps"] > measured["limits"]["advertised_peak_kbps"]:
                 failures.append({
@@ -954,6 +1014,8 @@ def evaluate_rate_control(fixture_rows):
 def measured_capture(capture, fixture, scorer, model, n_subsample, rate_window):
     peak, peak_at = rolling_segment_peak(capture["segments"], rate_window)
     limits = rate_limits(capture["ladder_rung"], rate_window)
+    limits["requested_height"] = fixture["rung"]
+    limits["advertised_height"] = capture["ladder_rung"].get("height")
     vmaf = score_vmaf(
         scorer,
         capture["playlist_path"],
@@ -992,6 +1054,7 @@ def empty_rate_control_report(modes, model, n_subsample):
         "modes": list(modes),
         "corpus": None,
         "acceptance": None,
+        "measurement_parameters": None,
         "mode_settings": {},
         "controller": {
             "host": socket.gethostname(),
@@ -1065,17 +1128,54 @@ def rate_control_report(args, api=None):
             ),
         })
         return report
+    report["measurement_parameters"] = {
+        "vmaf_model": args.vmaf_model,
+        "vmaf_subsample": args.vmaf_subsample,
+        "rate_window_seconds": float(args.rate_window),
+        "poll_seconds": float(args.poll),
+        "capture_timeout_seconds": float(args.capture_timeout),
+        "idle_timeout_seconds": float(args.idle_timeout),
+        "settings_settle_seconds": float(args.settings_settle),
+    }
     if selected_modes == RATE_CONTROL_FULL_MODES:
-        if args.vmaf_model != "vmaf_v0.6.1":
+        # Poll cadence affects the speed-sample percentile, and settling delay can
+        # change the state observed after a global settings update. Pin both for
+        # comparable full runs. Capture/idle timeouts only reject incomplete or
+        # unsafe fixed-trim runs, so they remain configurable and are recorded.
+        if args.vmaf_model != RATE_CONTROL_ACCEPTANCE_MODEL:
             report["failures"].append({
                 "code": "harness_error",
-                "detail": "vbr,qvbr acceptance requires --vmaf-model vmaf_v0.6.1 exactly",
+                "detail": (
+                    "vbr,qvbr acceptance requires "
+                    f"--vmaf-model {RATE_CONTROL_ACCEPTANCE_MODEL} exactly"
+                ),
             })
             return report
-        if args.rate_window != 10.0:
+        if args.rate_window != RATE_CONTROL_ACCEPTANCE_RATE_WINDOW:
             report["failures"].append({
                 "code": "harness_error",
-                "detail": "vbr,qvbr acceptance requires --rate-window 10.0 exactly",
+                "detail": (
+                    "vbr,qvbr acceptance requires "
+                    f"--rate-window {RATE_CONTROL_ACCEPTANCE_RATE_WINDOW:.1f} exactly"
+                ),
+            })
+            return report
+        if args.poll != RATE_CONTROL_ACCEPTANCE_POLL:
+            report["failures"].append({
+                "code": "harness_error",
+                "detail": (
+                    "vbr,qvbr acceptance requires "
+                    f"--poll {RATE_CONTROL_ACCEPTANCE_POLL:.2f} exactly"
+                ),
+            })
+            return report
+        if args.settings_settle != RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE:
+            report["failures"].append({
+                "code": "harness_error",
+                "detail": (
+                    "vbr,qvbr acceptance requires "
+                    f"--settings-settle {RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE:.1f} exactly"
+                ),
             })
             return report
 
@@ -1138,8 +1238,10 @@ def rate_control_report(args, api=None):
                 "settings DTO acknowledgement plus stable encoder identity only; "
                 "N1 boot/production flag validation and forced-fallback evidence are separate"
             ),
-            "required_vmaf_model": "vmaf_v0.6.1",
-            "required_rate_window_seconds": 10.0,
+            "required_vmaf_model": RATE_CONTROL_ACCEPTANCE_MODEL,
+            "required_rate_window_seconds": RATE_CONTROL_ACCEPTANCE_RATE_WINDOW,
+            "required_poll_seconds": RATE_CONTROL_ACCEPTANCE_POLL,
+            "required_settings_settle_seconds": RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE,
         }
         if args.only:
             fixtures = [fixture for fixture in fixtures if fixture["identity"] == args.only]
@@ -1241,7 +1343,7 @@ def rate_control_report(args, api=None):
                     quality=args.quality,
                     include_quality=mode == "qvbr" and args.quality is not None,
                 )
-                time.sleep(args.settings_settle)
+                sleep(args.settings_settle)
             for fixture, report_fixture in zip(fixtures, report["fixtures"]):
                 print(f"rate-control {fixture['identity']} / {mode}…", flush=True)
                 disk_preflight = capture_disk_preflight(work_dir, fixture)
@@ -1562,22 +1664,29 @@ def main():
         default=10.0,
         help="served-segment peak window; full vbr,qvbr requires 10.0 seconds exactly",
     )
-    rc.add_argument("--poll", type=float, default=0.25, help="playlist/status polling interval")
+    rc.add_argument(
+        "--poll",
+        type=float,
+        default=0.25,
+        help="playlist/status polling interval; full vbr,qvbr requires 0.25 exactly",
+    )
     rc.add_argument("--capture-timeout", type=float, default=180.0, help="per-session wall timeout")
     rc.add_argument(
         "--idle-timeout",
         type=float,
         default=30.0,
         help=(
-            "seconds to prove the server returned idle after DELETE or before safe settings "
-            "restoration"
+            "local deadline between completed idle responses after DELETE or before a settings "
+            "update; one in-flight API request may add its timeout"
         ),
     )
     rc.add_argument(
         "--settings-settle",
         type=float,
         default=3.0,
-        help="seconds between a full-mode settings update and capture",
+        help=(
+            "seconds between a settings update and capture; full vbr,qvbr requires 3.0 exactly"
+        ),
     )
     rc.add_argument("--only", default=None, help="one fixture name")
 

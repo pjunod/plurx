@@ -36,15 +36,19 @@ bump may break compatibility and a **patch** bump never does.
   `PLURX_FFMPEG`, joins the compose service, or enters the live path. The stable
   JSON distinguishes server/build/encoder identity from scorer
   path/build/hash/model; binds the local corpus and operator-captured nynuc
-  `sha256sum` manifests; proves pinned, balanced SDR fixture identity; and
+  `sha256sum` manifests; rejects duplicate filename/path/hash fixtures; proves
+  pinned, balanced SDR fixture identity; and
   reports bytes, VMAF, server speed, and the binding advertised peak over
   complete served-segment windows. The theoretical VBV allowance remains a
   labeled, nonbinding diagnostic. Full VBR/QVBR runs require maintenance-node
-  exclusivity, exact acceptance parameters, probed/available SDR source facts,
+  exclusivity, exact model/window/poll/settle parameters, recorded measurement
+  timing, probed/available SDR source facts, identical cross-mode ladder facts,
   settings acknowledgements, and a stable session encoder equal to the
-  server-selected target. Restoration waits a bounded interval for the node to
-  return idle; a timeout fails loudly with the safe two-field manual rollback
-  body because the requested mode may remain active.
+  server-selected target. Restoration caps sleeps at the local deadline between
+  completed responses; an in-flight HTTP request may add its 30-second timeout,
+  and neither automatic nor manual GET-to-PUT checks are atomic. A timeout fails
+  loudly with the safe two-field manual rollback body because the requested
+  mode may remain active.
   Current main supports a visibly non-acceptance VBR smoke. A literal golden
   fixture still pins the current VBR recipe hash. No scorer is installed or
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer

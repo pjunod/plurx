@@ -219,10 +219,10 @@ def harness_args(root, corpus, server_manifest=None, *, modes="vbr,qvbr", only=N
         vmaf_model="vmaf_v0.6.1",
         vmaf_subsample=1,
         rate_window=10.0,
-        poll=0.001,
+        poll=0.25,
         capture_timeout=1.0,
         idle_timeout=0.005,
-        settings_settle=0,
+        settings_settle=3.0,
         corpus=str(corpus),
         server_sha256_manifest=str(server_manifest) if server_manifest else None,
         only=only,
@@ -250,6 +250,13 @@ def passing_measurement(mode, encoder="qsv-h264"):
         "vmaf": 95.0,
         "peak_window_kbps": 100.0,
         "limits": {
+            "requested_height": 1080,
+            "advertised_height": 1080,
+            "advertised_total_kbps": 8160.0,
+            "derived_nominal_video_kbps": 8000.0,
+            "derived_audio_kbps": 160.0,
+            "video_maxrate_kbps": 12000.0,
+            "video_bufsize_kbits": 16000.0,
             "theoretical_vbv_allowance_kbps": 90.0,
             "theoretical_vbv_role": "nonbinding_diagnostic_only",
             "advertised_peak_kbps": 12160.0,
@@ -277,6 +284,7 @@ def patched_harness(measure=passing_measurement):
         "capture_disk_preflight": lambda *_args: {"free_bytes_before": 1_000_000_000},
         "capture_live_session": capture,
         "measured_capture": measured,
+        "sleep": lambda _seconds: None,
     }
 
 
@@ -309,6 +317,33 @@ class RateControlBenchCase(unittest.TestCase):
             unpinned, _ = write_corpus(root, pinned=False)
             with self.assertRaisesRegex(BENCH["BenchError"], "pinned reference_sha256"):
                 BENCH["load_rate_control_corpus"](unpinned)
+
+    def test_full_manifest_rejects_duplicate_filename_path_and_clip_hash(self):
+        cases = (
+            ("filename", "unique server filename"),
+            ("reference", "unique resolved reference path"),
+            ("hash", "unique pinned reference SHA-256"),
+        )
+        for duplicate, message in cases:
+            with self.subTest(duplicate=duplicate), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path, references = write_corpus(root)
+                document = json.loads(path.read_text())
+                if duplicate == "filename":
+                    document["fixtures"][1]["filename"] = document["fixtures"][0]["filename"]
+                elif duplicate == "reference":
+                    document["fixtures"][1]["reference"] = document["fixtures"][0]["reference"]
+                    document["fixtures"][1]["reference_sha256"] = (
+                        document["fixtures"][0]["reference_sha256"]
+                    )
+                else:
+                    easy = references[document["fixtures"][0]["filename"]]
+                    hard = references[document["fixtures"][1]["filename"]]
+                    hard.write_bytes(easy.read_bytes())
+                    document["fixtures"][1]["reference_sha256"] = file_sha(hard)
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(BENCH["BenchError"], message):
+                    BENCH["load_rate_control_corpus"](path)
 
     def test_manifest_rejects_unknown_dynamic_range_and_wrong_reference_sha(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -428,7 +463,7 @@ class RateControlBenchCase(unittest.TestCase):
             self.assertFalse(report["passed"])
             api.call.assert_not_called()
 
-    def test_full_acceptance_requires_canonical_model_and_ten_second_window(self):
+    def test_full_acceptance_requires_canonical_measurement_parameters(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             corpus, references = write_corpus(root)
@@ -436,6 +471,8 @@ class RateControlBenchCase(unittest.TestCase):
             cases = (
                 ("vmaf_model", "other-model", "vmaf_v0.6.1 exactly"),
                 ("rate_window", 12.0, "rate-window 10.0 exactly"),
+                ("poll", 1.0, "poll 0.25 exactly"),
+                ("settings_settle", 0.0, "settings-settle 3.0 exactly"),
             )
             for field, value, message in cases:
                 with self.subTest(field=field):
@@ -625,6 +662,17 @@ class RateControlBenchCase(unittest.TestCase):
             self.assertTrue(report["acceptance"]["eligible"])
             self.assertEqual(report["acceptance"]["required_vmaf_model"], "vmaf_v0.6.1")
             self.assertEqual(report["acceptance"]["required_rate_window_seconds"], 10.0)
+            self.assertEqual(report["acceptance"]["required_poll_seconds"], 0.25)
+            self.assertEqual(report["acceptance"]["required_settings_settle_seconds"], 3.0)
+            self.assertEqual(report["measurement_parameters"], {
+                "vmaf_model": "vmaf_v0.6.1",
+                "vmaf_subsample": 1,
+                "rate_window_seconds": 10.0,
+                "poll_seconds": 0.25,
+                "capture_timeout_seconds": 1.0,
+                "idle_timeout_seconds": 0.005,
+                "settings_settle_seconds": 3.0,
+            })
             self.assertEqual(report["corpus"]["manifest_sha256"], file_sha(corpus))
             self.assertEqual(
                 report["corpus"]["server_sha256_manifest"]["manifest_sha256"],
@@ -783,6 +831,32 @@ class RateControlBenchCase(unittest.TestCase):
             for failure in failures
         ))
 
+    def test_inflated_quality_ladder_cannot_pass_as_the_same_comparison(self):
+        fixture = {
+            "identity": "easy",
+            "class": "easy",
+            "modes": {
+                "vbr": passing_measurement("vbr"),
+                "qvbr": passing_measurement("qvbr"),
+            },
+        }
+        fixture["modes"]["qvbr"]["limits"].update({
+            "advertised_total_kbps": 12_160.0,
+            "advertised_peak_kbps": 18_160.0,
+            "derived_nominal_video_kbps": 12_000.0,
+            "derived_audio_kbps": 160.0,
+            "video_maxrate_kbps": 18_000.0,
+            "video_bufsize_kbits": 24_000.0,
+            "theoretical_vbv_allowance_kbps": 20_400.0,
+        })
+        failures = BENCH["evaluate_rate_control"]([fixture])
+        self.assertIn("ladder_identity_mismatch", {
+            failure["code"] for failure in failures
+        })
+        self.assertNotIn("advertised_peak_exceeded", {
+            failure["code"] for failure in failures
+        })
+
     def test_rolling_rate_matches_complete_served_segment_windows(self):
         segments = [
             {"duration_seconds": 3.0, "bytes": 3000},
@@ -802,6 +876,36 @@ class RateControlBenchCase(unittest.TestCase):
         peak_12, _ = BENCH["rolling_segment_peak"](segments, 12.0)
         self.assertGreater(peak_10, 7.5)
         self.assertLess(peak_12, 7.0)
+
+    def test_sparse_poll_can_hide_a_slow_speed_sample_but_full_mode_refuses_it(self):
+        self.assertLess(
+            BENCH["percentile"]([0.5, 2.0, 2.0, 2.0], 10),
+            BENCH["percentile"]([2.0], 10),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            args = harness_args(root, corpus, write_server_manifest(root, references))
+            args.poll = 1.0
+            api = mock.Mock()
+            report = BENCH["rate_control_report"](args, api=api)
+            self.assertFalse(report["passed"])
+            self.assertIn("--poll 0.25 exactly", report["failures"][0]["detail"])
+            api.call.assert_not_called()
+
+    def test_idle_wait_caps_sleep_at_remaining_deadline(self):
+        api = mock.Mock()
+        api.call.return_value = {"active_transcodes": 1}
+        monotonic = mock.Mock(side_effect=[0.0, 0.1, 1.0])
+        sleeper = mock.Mock()
+        with mock.patch.object(G["time"], "monotonic", monotonic), mock.patch.dict(
+            G, {"sleep": sleeper}
+        ):
+            with self.assertRaisesRegex(BENCH["BenchError"], "idle timeout"):
+                BENCH["wait_for_server_idle"](api, "test wait", 10.0, 1.0)
+        api.call.assert_called_once_with("/system")
+        sleeper.assert_called_once()
+        self.assertAlmostEqual(sleeper.call_args.args[0], 0.9)
 
     def test_stable_json_artifact_is_sorted_and_nonzero(self):
         with tempfile.TemporaryDirectory() as directory:

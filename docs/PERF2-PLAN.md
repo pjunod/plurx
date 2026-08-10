@@ -424,21 +424,26 @@ explicit separate scorer decodes them for VMAF offline. Shape:
 `scripts/bench rate-control --base http://nynuc:32400 --token <admin-token>
 --corpus <fixtures> --modes vbr,qvbr --vmaf-ffmpeg <scoring-only-ffmpeg>
 --server-sha256-manifest <nynuc.sha256>
---vmaf-model vmaf_v0.6.1 --rate-window 10.0
+--vmaf-model vmaf_v0.6.1 --rate-window 10.0 --poll 0.25
+--settings-settle 3.0
 --json out/rate-control.json`, failing nonzero when
 quality mode regresses VMAF or exceeds the advertised peak over any complete
 served-segment window. The theoretical VBV allowance is a nonbinding diagnostic,
-not a second contract. Full acceptance requires pinned local and server hashes,
-equal nonempty easy/hard SDR halves, full-corpus scope, maintenance-node
-exclusivity, exact model/window parameters, probed and available server video
-facts, and stable StartResponse/status identity equal to the server-selected
-encoder. The settings DTO acknowledgement is not proof that effective flags or
-fallback executed; N1 boot validation/production tests and a separate
+not a second contract. Full acceptance requires unique filenames, resolved
+reference paths, and pinned hashes across equal nonempty easy/hard SDR halves;
+full-corpus scope; maintenance-node exclusivity; exact model, window, poll, and
+settle parameters; recorded measurement timing; probed and available server
+video facts; stable StartResponse/status identity equal to the server-selected
+encoder; and identical advertised/derived ladder facts across modes. The
+pre-PUT idle observation is not an atomic lock. Its deadline bounds polling
+between completed responses, while one in-flight HTTP request may add its
+30-second timeout. The settings DTO acknowledgement is not proof that effective
+flags or fallback executed; N1 boot validation/production tests and a separate
 forced-fallback run supply that evidence. The scorer never encodes production
 playback, becomes `PLURX_FFMPEG`, joins the compose service, or enters the live
 path. On that harness: quality mode produces ≤ the bytes of bitrate mode on the
-easy half of the corpus at equal-or-better VMAF (VMAF offline only, `n_subsample` as
-needed — never in the live path, principle 7); encode speed within 10%
+easy half of the corpus at equal-or-better VMAF (VMAF offline only,
+`n_subsample` as needed — never in the live path, principle 7); encode speed within 10%
 of bitrate mode; a session on a family whose driver refuses the mode
 starts and logs the fallback. Identity: golden-hash fixtures hold the
 legacy VBR digest constant; cross-path fixtures prove
