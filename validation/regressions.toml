@@ -219,7 +219,6 @@ commits = ["b11b9d9e", "9161a4e3"]
 points = ["persistence.upgrades"]
 checks = ["database-upgrades"]
 reason = "The clustering migration tests pin WAL-inclusive backup, refusal-before-mutation, abandoned staging cleanup, canonical journal mode, content-addressed reuse, and corruption rejection."
-
 [[coverage]]
 commits = ["344ab5bf"]
 points = ["persistence.upgrades", "cluster.auth"]
