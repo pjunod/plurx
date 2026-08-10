@@ -375,4 +375,16 @@ mod tests {
         assert_eq!(first.len(), 64, "hex sha-256");
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    /// N1 will move rate control into the effective per-recipe identity. This
+    /// literal pins the pre-N1 VBR bytes first, so that refactor cannot turn a
+    /// cache-preserving contract into a fleet-wide miss by accident.
+    #[test]
+    fn legacy_vbr_recipe_hash_is_a_golden_fixture() {
+        let (d, f, o) = (digest(), media(), TranscodeOptions::default());
+        assert_eq!(
+            hash_of(&d, &f, &o, false),
+            "2551a15c49c71a80c92c629c8ab42e004d86d9bfffc1de5e76f72e2225961855"
+        );
+    }
 }

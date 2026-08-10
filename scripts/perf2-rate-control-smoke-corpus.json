@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "purpose": "vbr_smoke",
+  "fixtures": [
+    {
+      "identity": "easy-1080p-h264",
+      "class": "easy",
+      "dynamic_range": "sdr",
+      "filename": "1080p-h264.mkv",
+      "reference": "../bench-media/1080p-h264.mkv",
+      "reference_sha256": null,
+      "trim": {
+        "start_seconds": 0,
+        "duration_seconds": 30
+      },
+      "rung": 1080
+    },
+    {
+      "identity": "hard-1080p-grain",
+      "class": "hard",
+      "dynamic_range": "sdr",
+      "filename": "grainy.mkv",
+      "reference": "../bench-media/grainy.mkv",
+      "reference_sha256": null,
+      "trim": {
+        "start_seconds": 0,
+        "duration_seconds": 30
+      },
+      "rung": 1080
+    }
+  ]
+}
