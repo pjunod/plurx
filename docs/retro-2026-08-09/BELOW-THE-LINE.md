@@ -2,8 +2,9 @@
 
 **Assessment baseline:** `origin/main` @ `e8a910f` · Companion to
 `docs/RETRO-REVIEW-2026-08-09.md` and WO-01…WO-11. The outcomes below record
-the post-assessment execution state through PR #128, plus the adversarial audit
-and physical-device session on 2026-08-09.
+the post-assessment execution state through PR #135, plus the adversarial audit
+and physical-device session on 2026-08-09. The consolidated review packet is
+[EXTERNAL-REVIEW-HANDOFF.md](EXTERNAL-REVIEW-HANDOFF.md).
 
 Nothing here reopens a work order's “Don't” section. Those entries remain
 verified fixes or refuted claims, not a second backlog.
@@ -12,13 +13,15 @@ verified fixes or refuted claims, not a second backlog.
 
 Paul approved all five recommendations on 2026-08-09.
 
-1. **Yes — cut a real release; publication recovery is still required.**
-   `v0.2.7` is tagged and the changelog carries the release heading, but the
-   first GHCR publication timed out after 60 minutes while Rust was compiling
-   under arm64 emulation. No release image was published. The repaired workflow
-   must publish and verify `0.2.7`, `0.2`, and `latest` before this decision is
-   complete. `docs/RELEASING.md` remains the canonical procedure; continuous
-   main did not replace it.
+1. **Yes — cut and publish release 0.2.7.** The first GHCR publication timed
+   out after 60 minutes while Rust was compiling under arm64 emulation. PR
+   [#129](https://github.com/pjunod/plurx/pull/129) repaired the publication
+   path, and run
+   [31346745768](https://github.com/pjunod/plurx/actions/runs/31346745768)
+   published `0.2.7`, `0.2`, and `latest` as the same two-platform index,
+   `sha256:8e90b4f05d6d750a1546df1a6d44ae786fde9c63caa1aa48a8cb1e5cac73a374`.
+   `docs/RELEASING.md` remains the canonical procedure; continuous main did
+   not replace it.
 2. **Yes — choose the guard-only PGS policy.** The server independently refuses
    an explicit subtitle burn for probed DV, HDR10, or HLG sources. There is
    deliberately no “burn to SDR anyway” override: an old or context-poor client
@@ -73,12 +76,20 @@ Paul approved all five recommendations on 2026-08-09.
   typeless session against a control session, so it does not establish whether
   the EVENT-to-sliding mutation causes the reported 2–5 minute cadence. The
   experimental setting remains default-off.
-- **Fail — cold production PGS demux.** Track 0 from a 25,016,940,779-byte
-  NAS-resident 4K HDR10 episode hit the production 600-second deadline at
-  600.08 seconds before producing a SUP file. The 256 MiB `-fs` bound held by
-  construction, but cue count and PNG bytes could not be measured because
-  parser admission never began. The production M0 ledger records the same
-  result.
+- **Fail, then bounded unchanged recovery — cold production PGS demux.** Track
+  0 from a 25,016,940,779-byte NAS-resident 4K HDR10 episode hit the production
+  600-second deadline at 600.08 seconds before producing a SUP file. The 256
+  MiB `-fs` bound held by construction, but cue count and PNG bytes could not
+  be measured because parser admission never began. Two later executions of
+  the same bounded command and track completed without a product-code change.
+  The timestamped recovery ran from 2026-08-10T01:31:52Z through 01:32:58Z,
+  wrote 13,230,798 SUP bytes through source timestamp `00:52:11.253`, and
+  produced SHA-256
+  `d48091d6960e0fd6831479c12c5190d7c78509b28d726549a12ba65ea651d9cc`.
+  A same-day QNAP NFS not-responding/recovered event makes transient storage or
+  cache state the leading inference, not a proved cause. The unchanged command
+  refutes a deterministic 600-second demux defect; it does not complete the
+  default-off production/device gate.
 - **Pass with bounded scope — Pixel Fold phone checks.** A Pixel 10 Pro Fold on
   Android 17 advertised H.264, HEVC, AV1, VP9, AAC, MP3, Opus, FLAC, AC-3,
   E-AC-3, MKV, MP4, WebM, MOV, TS, and HDR. It did not advertise Dolby Vision.
@@ -90,7 +101,7 @@ Paul approved all five recommendations on 2026-08-09.
   focus mode or exact emulator dimensions and are not recorded as Fold app
   regressions.
 - **Pass — iPhone source/device suite.** An iPhone 17 Pro Max on iOS 26.6 ran
-  the current Apple build-46 suite: 132 tests with zero failures. The tests
+  the then-current Apple build-46 suite: 132 tests with zero failures. The tests
   themselves completed in 3.225 seconds after the unlocked phone accepted the
   run. This supersedes the earlier 128-test build-45 pass.
 
@@ -129,13 +140,32 @@ simulator tests are not substitutes:
   package; `AVAssetCache.isPlayableOffline` accepting TS plus a one-segment-VTT
   subtitle rendition; completed background transfer; airplane-mode start and
   midpoint seek.
-- Android unattended `PlatformScheduler` launch after reboot on targetSdk 37;
+- Android build 25 now has the targetSdk-37 source path for unattended reboot:
+  a persisted UIDT job, synchronous intent/network state, granted-network
+  socket and DNS binding, and an explicit system-stop Resume state. A build-24
+  in-flight transfer needs one foreground Resume tap after upgrade because no
+  earlier UIDT registration exists. The actual unattended reboot remains a
+  physical-device check;
   real six-hour `onTimeout`; fully offline playback with a selected subtitle
   track; Android TV `uiMode` and D-pad behavior on actual TV hardware.
 - Post-expiry re-download on both platforms proving the server's `Cached`
   transfer-only fast path without a re-encode.
-- iPad Stage Manager/Split View, tvOS focus and swipe HUD, a physical PGS
-  overlay/PiP path, and real HDR/Dolby Vision output.
+- iPad Stage Manager/Split View; iPhone orientation, PiP return, autoplay, and
+  background-audio/Now Playing continuity; duration-less MKV natural end;
+  maximum-Dynamic-Type marker readability on a narrow iPhone; tvOS focus and
+  swipe HUD; and a physical PGS overlay/PiP path.
+- Repeated approximately eight-second throttled AVPlayer stalls with server
+  stall evidence and zero playback reopens.
+- AVPlayer paused for more than 60 seconds against a live non-ENDLIST playlist,
+  distinguishing its playlist-reload behavior from the server's 60-second idle
+  reaper plus 15-second sweep cadence.
+- Physical High-tier HEVC HDR playback with Main-tier and Dolby Vision titles
+  unaffected; Android TV tunneled playback/D-pad behavior; and ExoPlayer
+  acceptance of the cleared hvcC tier bit.
+- Android Media3 receiving `X-Plurx-Media-Origin-Ms` through
+  `onTransferStart`/`responseHeaders` before the first progress post.
+- A fade-heavy production PGS title: retain cue count and PNG bytes against the
+  256 MiB per-track cap, and judge whether a 422 refusal is acceptable UX.
 
 ### CI and operations bookkeeping
 
@@ -146,14 +176,36 @@ simulator tests are not substitutes:
   00:21 UTC through 2026-08-09 14:23 UTC put fast-preflight p95 at 15 seconds
   against the 60-second budget. The three-voter contract job recorded 27
   successes, zero failures, and 14 intentional path-based skips.
-- **Pass — history audit headroom.** The final local `make check` covered 308
-  corrective commits; the combined CI preflight p95 remains 15 seconds.
+- **Pass — history audit headroom.** The latest audit covers 316 corrective
+  commits, 239 direct test changes, 80 explicit current-check mappings, 14
+  client-fix anchors, and 11 non-runtime corrections. The combined CI
+  preflight p95 remains 15 seconds.
+- **Pass — hosted nightly isolation and seeded red path.** PR
+  [#130](https://github.com/pjunod/plurx/pull/130) split deep validation,
+  parser fuzz, and mutation into independent jobs. Normal run
+  [31347358863](https://github.com/pjunod/plurx/actions/runs/31347358863)
+  completed 3,605,409 fuzz executions without a crash; seeded run
+  [31347364590](https://github.com/pjunod/plurx/actions/runs/31347364590)
+  reproduced the deliberate crash and retained its evidence while making the
+  fuzz job red. The report-only mutation job executed 554 mutants and retained
+  its artifact. Playback-fix exact-head run
+  [31354801983](https://github.com/pjunod/plurx/actions/runs/31354801983)
+  passed deep validation and completed 5,893,665 independent fuzz executions.
+- **Pass — live-transcode startup publication.** PR
+  [#132](https://github.com/pjunod/plurx/pull/132) prevents the first
+  live-transcode playlist response from exposing only one unfinished EVENT
+  segment. Independent hostile review approved the bounded gate; the exact
+  Chrome case passed at 0.994× with zero hitches and zero measured stalls, and
+  the playback-fix exact-head hosted deep-validation job passed.
 - **Pass after repair — live backup invariant.** An adversarial check found
   nynuc and nuc4 on `v0.2.7-66-g3603923` without `/srv/plurx/backups`, proving
   the earlier deployment bypassed or predated current automation. The clean
-  private-Ansible `4c74d27` path then ran serially with rebuild disabled: it
-  stopped each stack, copied the closed database, restarted the unchanged
-  image, and passed both health probes. nynuc's
+  private-Ansible backup implementation from
+  [#2](https://github.com/pjunod/ansible/pull/2) (`be16fb71`) then ran through
+  the stamped deploy path corrected by
+  [#3](https://github.com/pjunod/ansible/pull/3) (`4c74d27`), serially with
+  rebuild disabled: it stopped each stack, copied the closed database,
+  restarted the unchanged image, and passed both health probes. nynuc's
   `plurx.db.predeploy-20260810T004048Z-3603923cce64.bak` is 69,574,656 bytes
   with SHA-256 `56f80771de22ca17ee8fd7d077ba52b902162cabd496a8cbcbbe755ddf521090`;
   nuc4's `plurx.db.predeploy-20260810T004143Z-3603923cce64.bak` is 81,661,952
@@ -163,6 +215,14 @@ simulator tests are not substitutes:
   still report the unchanged running build and healthy endpoints. The scratch
   rollback drill remains the restore proof, while this run closes the missing
   live-snapshot gap.
+- **Pass — live fleet contract.** The original direct inspection found both
+  nodes stamped at `e8a910f` on schema 15, every media bind read-only, both
+  containers exposing `/dev/dri`, and nuc4 retaining TCP 32402 plus GDM UDP
+  32415. The private deploy play invokes `make docker-up`, and its contract
+  test pins that call. The later backup repair ran with rebuild disabled and
+  left the then-running `v0.2.7-66-g3603923` image unchanged; these are retained
+  inspection results, not a claim that either historical SHA is today's fleet
+  tip.
 
 ## 3. Explicitly not action items
 

@@ -46,6 +46,7 @@ import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.OfflineQueueRequest
 import tv.plurx.app.data.offline.OfflineRecord
+import tv.plurx.app.data.offline.authoritativeOfflineNetwork
 import tv.plurx.app.player.decisionForce
 
 /** Top-level app state: which screen the shell should show. */
@@ -72,6 +73,11 @@ data class HomeState(
 data class PlaybackTarget(val itemId: Long, val fileId: Long, val startMs: Long = 0)
 
 data class EpisodePlaybackTarget(val episode: Item, val playback: PlaybackTarget)
+
+internal enum class OfflineResumeTrigger(val explicitUserAction: Boolean) {
+    Lifecycle(false),
+    UserControl(true),
+}
 
 /**
  * Single view-model for the whole app (manual DI — no Hilt). Owns the session
@@ -149,7 +155,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             serverInstanceId = saved.instanceId
             audioLang = saved.audioLang
             subLang = saved.subLang
-            _preferences.value = saved.preferences
+            _preferences.value = saved.preferences.copy(
+                offlineNetwork = authoritativeOfflineNetwork(
+                    OfflineDownloads.currentNetworkPolicy(),
+                    saved.preferences.offlineNetwork,
+                ),
+            )
+            if (_preferences.value.offlineNetwork != saved.preferences.offlineNetwork) {
+                settings.saveViewerPreferences(_preferences.value)
+            }
 
             if (
                 OfflineDownloads.catalog.profile(saved.instanceId, saved.userId).isNotEmpty()
@@ -396,10 +410,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setOfflineQuality(quality: OfflineQuality) =
         updatePreferences { copy(offlineQuality = quality) }
 
-    fun setOfflineNetwork(network: OfflineNetwork) =
-        updatePreferences { copy(offlineNetwork = network) }.also {
-            OfflineDownloads.setNetworkPolicy(network)
-        }
+    fun setOfflineNetwork(network: OfflineNetwork) = applyOfflineNetworkChange(
+        persistRecovery = { OfflineDownloads.setNetworkPolicy(network) },
+        publishPreferences = { updatePreferences { copy(offlineNetwork = network) } },
+    )
 
     fun queueOffline(item: Item, file: MediaFileDto): String? {
         val instance = serverInstanceId
@@ -433,7 +447,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return null
     }
 
-    fun resumeOffline(record: OfflineRecord) {
+    fun resumeOffline(record: OfflineRecord) =
+        resumeOffline(record, OfflineResumeTrigger.UserControl)
+
+    private fun resumeOffline(record: OfflineRecord, trigger: OfflineResumeTrigger) {
         val instance = serverInstanceId ?: return
         val user = currentUserId ?: return
         val preferences = _preferences.value
@@ -454,13 +471,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 maximumHeight = preferences.offlineQuality.maximumHeight,
                 network = preferences.offlineNetwork,
             ),
+            explicitResumeId = record.id.takeIf { trigger.explicitUserAction },
         )
     }
 
     fun resumeOfflineProfile() {
         val instance = serverInstanceId ?: return
         val user = currentUserId ?: return
-        OfflineDownloads.catalog.profile(instance, user).firstOrNull()?.let(::resumeOffline)
+        OfflineDownloads.catalog.profile(instance, user).firstOrNull()?.let { record ->
+            resumeOffline(record, OfflineResumeTrigger.Lifecycle)
+        }
     }
 
     fun onForeground() {
@@ -771,6 +791,14 @@ internal suspend fun <T> validateSavedSession(
 }
 
 /** Normalize the manual server field to the same origin contract as Apple. */
+internal fun applyOfflineNetworkChange(
+    persistRecovery: () -> Unit,
+    publishPreferences: () -> Unit,
+) {
+    persistRecovery()
+    publishPreferences()
+}
+
 internal fun normalizeOrigin(raw: String): String {
     val trimmed = raw.trim().trimEnd('/')
     if (trimmed.isEmpty()) return trimmed

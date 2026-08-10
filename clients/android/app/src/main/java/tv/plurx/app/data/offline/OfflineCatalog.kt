@@ -44,6 +44,8 @@ data class OfflineRecord(
     val progressRecordedAt: Long? = null,
     val pendingProgress: Boolean = false,
     val errorMessage: String? = null,
+    /** Orders Media3 callbacks that can finish catalog IO out of order. */
+    val transferSequence: Long = 0,
     val updatedAt: Long = System.currentTimeMillis(),
 ) {
     val isPlayable: Boolean get() = state == "completed"
