@@ -96,10 +96,60 @@ CI passes the tag name automatically when it publishes an image.
    with `Cargo.toml`, so a mismatch fails before anything reaches a registry
    rather than after.
 
-6. **CI does the rest.** A `v*` tag runs the full gate, builds x86-64 and
-   aarch64 binaries, and publishes a multi-arch image to GHCR tagged
-   `{version}`, `{major}.{minor}`, and `latest`. Pushes to `main` build but do
-   not publish, so releases are always deliberate.
+6. **CI does the rest.** A `v*` tag runs the full gate, then calls the same
+   publication workflow used for recovery. That workflow peels the annotated
+   tag once, builds x86-64 and aarch64 binaries inside the pinned Bookworm
+   toolchain, and stamps both with the validated tag. It packages and smoke
+   tests each platform by digest before assigning the GHCR tags `{version}`,
+   `{major}.{minor}`, and `latest`. Pushes to `main` build but do not publish,
+   so releases are always deliberate.
+
+### Recovering a cancelled publication without moving the tag
+
+A cancelled image build does not justify retagging a different commit. Run the
+manual workflow from current `main` and pass the existing annotated tag; the
+workflow resolves source and runtime files from that immutable tag rather than
+from the branch that supplied the repaired workflow.
+
+```bash
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # bound the run lookup to this command
+gh workflow run publish-release.yml --ref main \
+  -f release_tag=v0.2.7                 # rebuild and verify the existing tag
+run_id=$(gh run list --workflow publish-release.yml --branch main \
+  --event workflow_dispatch --created ">=$started" --user @me --limit 10 \
+  --json databaseId,displayTitle \
+  --jq 'map(select(.displayTitle == "publish v0.2.7"))[0].databaseId')
+                                           # capture this named dispatch only
+gh run watch "$run_id" --exit-status     # require that exact run to succeed
+image=ghcr.io/pjunod/plurx
+version_digest=$(docker buildx imagetools inspect "$image:0.2.7" \
+  | sed -n 's/^Digest:[[:space:]]*//p' | head -1)
+for alias in 0.2.7 0.2 latest; do
+  test "$(docker buildx imagetools inspect "$image:$alias" \
+    | sed -n 's/^Digest:[[:space:]]*//p' | head -1)" = "$version_digest"
+  test "$(docker buildx imagetools inspect --raw "$image:$alias" \
+    | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' | sort)" \
+    = "$(printf 'linux/amd64\nlinux/arm64')"
+done
+```
+
+The workflow refuses lightweight tags, version or changelog mismatches, and a
+remote tag that moves after source resolution. It pushes architecture images
+without human-facing tags, smoke tests them, then creates the immutable version
+index and its moving aliases. If the version index already exists, both of its
+architecture bindings must pass the same source-label, version, and container
+smoke checks before the workflow reuses it. `0.2` and `latest` move only when
+the recovered version is not older than their verified current target, so a
+late recovery cannot roll clients backward.
+
+The successful workflow is the acceptance record: both platform jobs must
+report `plurxd 0.2.7 (v0.2.7)`, both image configs must name the tag's peeled
+source commit, and container smoke must pass on both. For a first publication,
+`0.2.7`, `0.2`, and `latest` must resolve to the same two-platform index. For a
+recovery after a newer release, the immutable `0.2.7` index must pass while the
+newer moving aliases remain unchanged. Never delete or move the release tag to
+make recovery pass; a mismatch is an incident to investigate, not an alias to
+overwrite.
 
 The weekly release-readiness workflow runs `make release-check`. A red run
 means the current workspace version is already tagged or has no dated

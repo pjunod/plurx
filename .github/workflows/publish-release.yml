@@ -1,0 +1,579 @@
+name: publish release image
+run-name: publish ${{ inputs.release_tag }}
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated vX.Y.Z tag to publish without moving it
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  resolve:
+    name: resolve immutable release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
+      tag_object: ${{ steps.release.outputs.tag_object }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
+      release_minor: ${{ steps.release.outputs.release_minor }}
+      packaging_sha: ${{ steps.release.outputs.packaging_sha }}
+      version_exists: ${{ steps.registry.outputs.version_exists }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Validate and peel the annotated release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$EVENT_REF" != refs/heads/main ]; then
+            echo "::error::manual release recovery must run from refs/heads/main"
+            exit 1
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::release tag must be exactly vX.Y.Z"
+            exit 1
+          }
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag || {
+            echo "::error::$RELEASE_TAG must be an annotated tag"
+            exit 1
+          }
+          tag_object=$(git rev-parse "refs/tags/$RELEASE_TAG")
+          commit_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          release_version="${RELEASE_TAG#v}"
+          cargo_ver=$(git show "$commit_sha:Cargo.toml" \
+            | sed -n '/^\[workspace.package\]/,/^\[/p' \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          test "$cargo_ver" = "$release_version" || {
+            echo "::error::$RELEASE_TAG does not match workspace version $cargo_ver"
+            exit 1
+          }
+          git show "$commit_sha:CHANGELOG.md" | grep -Fq "## [$release_version]" || {
+            echo "::error::CHANGELOG.md has no $release_version release heading"
+            exit 1
+          }
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "release_minor=${release_version%.*}" >> "$GITHUB_OUTPUT"
+          echo "packaging_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Detect an existing immutable version index
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.release_version }}
+        run: |
+          is_missing_ref() {
+            local ref="$1" err="$2"
+            grep -Eqi 'manifest unknown|name unknown' "$err" ||
+              { grep -Fq "$ref" "$err" && grep -Eqi '(^|[[:space:]:])not found([[:space:].:]|$)' "$err"; }
+          }
+          version_ref="$REGISTRY_IMAGE:$RELEASE_VERSION"
+          if docker buildx imagetools inspect "$version_ref" \
+              > /dev/null 2> inspect.err; then
+            echo "version_exists=true" >> "$GITHUB_OUTPUT"
+          elif is_missing_ref "$version_ref" inspect.err; then
+            echo "version_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat inspect.err >&2
+            echo "::error::registry state is indeterminate; refusing to publish"
+            exit 1
+          fi
+
+  binary:
+    name: Bookworm binary (${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.version_exists != 'true'
+    runs-on: ubuntu-latest
+    container: rust:1.97.1-bookworm
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+      - name: Install the target and compatibility tools
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          rustup target add "$TARGET"
+          apt-get update
+          apt-get install -y --no-install-recommends binutils file
+          if [ "$ARCH" = arm64 ]; then
+            apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-bookworm-${{ matrix.target }}
+      - name: Build the exact tagged binary
+        env:
+          TARGET: ${{ matrix.target }}
+          PLURX_BUILD_REF: ${{ needs.resolve.outputs.release_tag }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --locked --release -p plurxd --target "$TARGET"
+      - name: Verify version, ABI ceiling, and checksum
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/plurxd"
+          test "$(file -b "$binary")" != ""
+          max_glibc=$(readelf --version-info "$binary" \
+            | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' \
+            | sort -V | tail -1)
+          test -n "$max_glibc"
+          test "$(printf '%s\n' "$max_glibc" 2.36 | sort -V | tail -1)" = 2.36 || {
+            echo "::error::$ARCH binary requires GLIBC_$max_glibc; Bookworm provides 2.36"
+            exit 1
+          }
+          if [ "$ARCH" = arm64 ]; then
+            reported=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" --version)
+          else
+            reported=$("$binary" --version)
+          fi
+          test "$reported" = "plurxd $RELEASE_VERSION ($RELEASE_TAG)" || {
+            echo "::error::unexpected version: $reported"
+            exit 1
+          }
+          mkdir -p release-binary
+          install -m 0755 "$binary" release-binary/plurxd
+          cd release-binary
+          sha256sum plurxd > plurxd.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.arch }}
+          path: release-binary
+          if-no-files-found: error
+          compression-level: 0
+
+  image:
+    name: package and smoke (${{ matrix.arch }})
+    needs: [resolve, binary]
+    if: >-
+      always() && needs.resolve.result == 'success' &&
+      needs.resolve.outputs.version_exists != 'true' &&
+      needs.binary.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Check out the trusted packaging tool
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.packaging_sha }}
+      - name: Check out the exact tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+          path: release-source
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binary-${{ matrix.arch }}
+          path: release-source/release-bin
+      - name: Derive a prebuilt-only Dockerfile from the tagged runtime
+        run: |
+          python3 -m validation.release_dockerfile \
+            release-source/Dockerfile release-source/Dockerfile.release
+          cd release-source/release-bin
+          sha256sum -c plurxd.sha256
+          chmod 0755 plurxd
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the untagged platform manifest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: release-source
+          file: release-source/Dockerfile.release
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.release_version }}
+            tv.plurx.packaging-revision=${{ github.sha }}
+      - name: Verify the pushed platform image before it can receive a tag
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.commit_sha }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image_ref="$REGISTRY_IMAGE@$DIGEST"
+          docker pull --platform "linux/$ARCH" "$image_ref"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image_ref")" = "linux/$ARCH"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_ref")" = "$SOURCE_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_ref")" = "$RELEASE_VERSION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image_ref")" = "$SOURCE_URL"
+          reported=$(docker run --rm --platform "linux/$ARCH" "$image_ref" --version)
+          test "$reported" = "plurxd $RELEASE_VERSION ($RELEASE_TAG)"
+          release-source/scripts/container-smoke "$image_ref"
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-image-digest-${{ matrix.arch }}
+          path: digests
+          if-no-files-found: error
+
+  reuse:
+    name: verify existing release (${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.version_exists == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify architecture binding, labels, version, and runtime
+        env:
+          ARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.commit_sha }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version_ref="$REGISTRY_IMAGE:$RELEASE_VERSION"
+          index_digest=$(docker buildx imagetools inspect "$version_ref" \
+            | sed -n 's/^Digest:[[:space:]]*//p' | head -1)
+          test -n "$index_digest"
+          verified_ref="$REGISTRY_IMAGE@$index_digest"
+          docker buildx imagetools inspect --raw "$verified_ref" > index.json
+          platforms=$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' index.json | sort)
+          test "$platforms" = "$(printf 'linux/amd64\nlinux/arm64')"
+          count=$(jq --arg arch "$ARCH" \
+            '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] | length' \
+            index.json)
+          test "$count" = 1
+          digest=$(jq -r --arg arch "$ARCH" \
+            '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+            index.json)
+          image_ref="$REGISTRY_IMAGE@$digest"
+          docker pull --platform "linux/$ARCH" "$image_ref"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image_ref")" = "linux/$ARCH"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_ref")" = "$SOURCE_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_ref")" = "$RELEASE_VERSION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image_ref")" = "$SOURCE_URL"
+          reported=$(docker run --rm --platform "linux/$ARCH" "$image_ref" --version)
+          test "$reported" = "plurxd $RELEASE_VERSION ($RELEASE_TAG)"
+          scripts/container-smoke "$image_ref"
+          current_digest=$(docker buildx imagetools inspect "$version_ref" \
+            | sed -n 's/^Digest:[[:space:]]*//p' | head -1)
+          test "$current_digest" = "$index_digest"
+          mkdir -p verified-index
+          printf '%s\n' "$index_digest" > "verified-index/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-index-${{ matrix.arch }}
+          path: verified-index
+          if-no-files-found: error
+
+  publish:
+    name: attach verified release aliases
+    needs: [resolve, image, reuse]
+    if: >-
+      always() && needs.resolve.result == 'success' &&
+      ((needs.resolve.outputs.version_exists == 'true' && needs.reuse.result == 'success') ||
+       (needs.resolve.outputs.version_exists != 'true' && needs.image.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: publish-release-aliases
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.packaging_sha }}
+      - uses: actions/download-artifact@v4
+        if: needs.resolve.outputs.version_exists != 'true'
+        with:
+          pattern: release-image-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        if: needs.resolve.outputs.version_exists == 'true'
+        with:
+          pattern: verified-release-index-*
+          path: verified-index
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reconfirm the remote tag has not moved
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
+          COMMIT_SHA: ${{ needs.resolve.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          refs=$(git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          remote_object=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1}')
+          remote_commit=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1}')
+          test "$remote_object" = "$TAG_OBJECT"
+          test "$remote_commit" = "$COMMIT_SHA"
+      - name: Create the immutable version index from the two smoked digests
+        if: needs.resolve.outputs.version_exists != 'true'
+        env:
+          AMD64_DIGEST_FILE: digests/amd64
+          ARM64_DIGEST_FILE: digests/arm64
+          RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          amd64=$(cat "$AMD64_DIGEST_FILE")
+          arm64=$(cat "$ARM64_DIGEST_FILE")
+          version_ref="$REGISTRY_IMAGE:$RELEASE_VERSION"
+          is_missing_ref() {
+            local ref="$1" err="$2"
+            grep -Eqi 'manifest unknown|name unknown' "$err" ||
+              { grep -Fq "$ref" "$err" && grep -Eqi '(^|[[:space:]:])not found([[:space:].:]|$)' "$err"; }
+          }
+          if docker buildx imagetools inspect "$version_ref" \
+              > /dev/null 2> inspect.err; then
+            echo "::error::$version_ref appeared after source resolution; rerun so it is verified before reuse"
+            exit 1
+          elif ! is_missing_ref "$version_ref" inspect.err; then
+            cat inspect.err >&2
+            echo "::error::registry state is indeterminate; refusing to create $version_ref"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "$version_ref" \
+            "$REGISTRY_IMAGE@$amd64" "$REGISTRY_IMAGE@$arm64"
+      - name: Advance aliases monotonically and verify their index digests
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+          RELEASE_MINOR: ${{ needs.resolve.outputs.release_minor }}
+          VERSION_EXISTS: ${{ needs.resolve.outputs.version_exists }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          version_ref="$REGISTRY_IMAGE:$RELEASE_VERSION"
+          minor_ref="$REGISTRY_IMAGE:$RELEASE_MINOR"
+          latest_ref="$REGISTRY_IMAGE:latest"
+
+          index_digest() {
+            local ref="$1"
+            docker buildx imagetools inspect "$ref" 2>/dev/null \
+              | sed -n 's/^Digest:[[:space:]]*//p' | head -1
+          }
+          is_missing_ref() {
+            local ref="$1" err="$2"
+            grep -Eqi 'manifest unknown|name unknown' "$err" ||
+              { grep -Fq "$ref" "$err" && grep -Eqi '(^|[[:space:]:])not found([[:space:].:]|$)' "$err"; }
+          }
+          assert_ref_snapshot() {
+            local ref="$1" expected="$2" file="$3" err="$3.err" current=""
+            if docker buildx imagetools inspect "$ref" > "$file" 2> "$err"; then
+              current=$(sed -n 's/^Digest:[[:space:]]*//p' "$file" | head -1)
+              test -n "$current"
+            elif ! is_missing_ref "$ref" "$err"; then
+              cat "$err" >&2
+              echo "::error::registry state for $ref is indeterminate"
+              return 1
+            fi
+            test "$current" = "$expected" || {
+              echo "::error::$ref changed while its release decision was being validated"
+              return 1
+            }
+          }
+          declare -A validated_alias_versions=()
+          alias_version() {
+            local ref="$1" file="$2" version_output="$3" digest_output="$4" err="$2.err"
+            local platforms alias_digest immutable_digest value="" revision=""
+            local arch digest image_ref arch_value arch_revision arch_source
+            local refs remote_object remote_commit tag_ref
+            printf -v "$version_output" '%s' ""
+            printf -v "$digest_output" '%s' ""
+            if ! docker buildx imagetools inspect "$ref" > "$file.inspect" 2> "$err"; then
+              if is_missing_ref "$ref" "$err"; then
+                return 0
+              fi
+              cat "$err" >&2
+              echo "::error::registry state for $ref is indeterminate"
+              return 1
+            fi
+            alias_digest=$(sed -n 's/^Digest:[[:space:]]*//p' "$file.inspect" | head -1)
+            test -n "$alias_digest"
+            printf -v "$digest_output" '%s' "$alias_digest"
+            if [[ -v "validated_alias_versions[$alias_digest]" ]]; then
+              printf -v "$version_output" '%s' "${validated_alias_versions[$alias_digest]}"
+              return 0
+            fi
+            docker buildx imagetools inspect --raw "$REGISTRY_IMAGE@$alias_digest" > "$file"
+            platforms=$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' "$file" | sort)
+            test "$platforms" = "$(printf 'linux/amd64\nlinux/arm64')"
+            for arch in amd64 arm64; do
+              digest=$(jq -r --arg arch "$arch" \
+                '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+                "$file")
+              image_ref="$REGISTRY_IMAGE@$digest"
+              docker pull --platform "linux/$arch" "$image_ref" >/dev/null
+              test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image_ref")" = "linux/$arch"
+              arch_value=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_ref")
+              arch_revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_ref")
+              arch_source=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image_ref")
+              [[ "$arch_value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+              [[ "$arch_revision" =~ ^[0-9a-f]{40}$ ]]
+              test "$arch_source" = "$SOURCE_URL"
+              test "$(docker run --rm --platform "linux/$arch" "$image_ref" --version)" = "plurxd $arch_value (v$arch_value)"
+              scripts/container-smoke "$image_ref" >&2
+              if [ -z "$value" ]; then
+                value="$arch_value"
+                revision="$arch_revision"
+              else
+                test "$arch_value" = "$value"
+                test "$arch_revision" = "$revision"
+              fi
+            done
+            tag_ref="refs/tags/v$value"
+            refs=$(git ls-remote origin "$tag_ref" "$tag_ref^{}")
+            remote_object=$(printf '%s\n' "$refs" | awk -v ref="$tag_ref" '$2 == ref {print $1}')
+            remote_commit=$(printf '%s\n' "$refs" | awk -v ref="$tag_ref^{}" '$2 == ref {print $1}')
+            test -n "$remote_object"
+            test "$remote_commit" = "$revision"
+            immutable_digest=$(index_digest "$REGISTRY_IMAGE:$value")
+            test -n "$immutable_digest"
+            test "$alias_digest" = "$immutable_digest"
+            validated_alias_versions[$alias_digest]="$value"
+            printf -v "$version_output" '%s' "$value"
+          }
+
+          candidate_digest=$(index_digest "$version_ref")
+          test -n "$candidate_digest"
+          docker buildx imagetools inspect --raw "$REGISTRY_IMAGE@$candidate_digest" > published.json
+          platforms=$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' published.json | sort)
+          test "$platforms" = "$(printf 'linux/amd64\nlinux/arm64')"
+          if [ "$VERSION_EXISTS" = true ]; then
+            verified_amd64=$(cat verified-index/amd64)
+            verified_arm64=$(cat verified-index/arm64)
+            test "$verified_amd64" = "$verified_arm64"
+            test "$candidate_digest" = "$verified_amd64"
+          else
+            published_amd64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' published.json)
+            published_arm64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' published.json)
+            test "$published_amd64" = "$(cat digests/amd64)"
+            test "$published_arm64" = "$(cat digests/arm64)"
+          fi
+          test "$(index_digest "$version_ref")" = "$candidate_digest"
+          source_ref="$REGISTRY_IMAGE@$candidate_digest"
+          minor_existing=""
+          minor_before=""
+          latest_existing=""
+          latest_before=""
+          alias_version "$minor_ref" minor.json minor_existing minor_before
+          alias_version "$latest_ref" latest.json latest_existing latest_before
+          minor_args=(--alias minor --candidate "$RELEASE_VERSION")
+          if [ -n "$minor_existing" ]; then minor_args+=(--existing "$minor_existing"); fi
+          latest_args=(--alias latest --candidate "$RELEASE_VERSION")
+          if [ -n "$latest_existing" ]; then latest_args+=(--existing "$latest_existing"); fi
+          minor_action=$(python3 -m validation.release_aliases "${minor_args[@]}")
+          latest_action=$(python3 -m validation.release_aliases "${latest_args[@]}")
+
+          assert_ref_snapshot "$minor_ref" "$minor_before" minor-before-create.inspect
+          assert_ref_snapshot "$latest_ref" "$latest_before" latest-before-create.inspect
+          tags=()
+          if [ "$minor_action" = advance ]; then tags+=(--tag "$minor_ref"); fi
+          if [ "$latest_action" = advance ]; then tags+=(--tag "$latest_ref"); fi
+          if [ "${#tags[@]}" -gt 0 ]; then
+            docker buildx imagetools create "${tags[@]}" "$source_ref"
+          fi
+
+          minor_expected="$candidate_digest"
+          if [ "$minor_action" = keep ]; then minor_expected="$minor_before"; fi
+          latest_expected="$candidate_digest"
+          if [ "$latest_action" = keep ]; then latest_expected="$latest_before"; fi
+          test "$(index_digest "$minor_ref")" = "$minor_expected"
+          test "$(index_digest "$latest_ref")" = "$latest_expected"
+          test "$(index_digest "$version_ref")" = "$candidate_digest"
