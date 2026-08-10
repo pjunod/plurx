@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      seed_pgs_crash:
+        description: Prove the fuzz failure gate with a disposable harness panic
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,16 +35,73 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: Run every scheduled validation
         run: make validate-nightly
+      - name: Upload deep-validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-deep-validation-evidence
+          path: |
+            target/validation
+            target/playback-lab
+            target/ui-baseline
+          if-no-files-found: warn
+          retention-days: 14
+
+  pgs-fuzz:
+    name: bounded PGS parser fuzz campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
       - name: Install the PGS fuzz runner
         run: |
           rustup toolchain install nightly-2026-08-01 --profile minimal
           cargo install cargo-fuzz --locked
         timeout-minutes: 20
+      - name: Prove the fuzz seed is opt-in
+        run: cargo +nightly-2026-08-01 test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz the bounded PGS parser
         id: pgs_fuzz
         continue-on-error: true
         timeout-minutes: 20
-        run: cargo +nightly-2026-08-01 fuzz run inspect_sup fuzz/corpus/inspect_sup -- -max_total_time=900
+        env:
+          PLURX_FUZZ_SEEDED_CRASH: ${{ inputs.seed_pgs_crash && '1' || '' }}
+        run: |
+          mkdir -p target/validation
+          set -o pipefail
+          cargo +nightly-2026-08-01 fuzz run inspect_sup fuzz/corpus/inspect_sup \
+            -- -max_total_time=900 2>&1 | tee target/validation/pgs-fuzz.log
+      - name: Upload PGS fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-pgs-fuzz-evidence
+          path: |
+            target/validation/pgs-fuzz.log
+            fuzz/artifacts
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Fail when the PGS fuzzer finds a crash
+        if: always() && steps.pgs_fuzz.outcome == 'failure'
+        run: |
+          echo "The bounded PGS fuzz campaign found a reproducible failure." \
+            >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+  mutation:
+    name: report-only weekly mutation spot-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-mutation
+      - name: Install media prerequisite
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install the mutation spot-checker
         run: cargo install cargo-mutants --locked
         timeout-minutes: 20
@@ -76,22 +139,11 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
-      - name: Upload validation evidence
+      - name: Upload mutation evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-validation-evidence
-          path: |
-            target/validation
-            target/playback-lab
-            target/ui-baseline
-            target/mutants
-            fuzz/artifacts
+          name: nightly-mutation-evidence
+          path: target/mutants
           if-no-files-found: warn
           retention-days: 14
-      - name: Fail when the PGS fuzzer finds a crash
-        if: always() && steps.pgs_fuzz.outcome == 'failure'
-        run: |
-          echo "The bounded PGS fuzz campaign found a reproducible failure." \
-            >> "$GITHUB_STEP_SUMMARY"
-          exit 1
