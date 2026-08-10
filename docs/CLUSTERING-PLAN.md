@@ -1,8 +1,8 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 through M1d and M2's source backup plus table-import
-parity slices are complete; import orchestration, post-coalescer growth
-measurement, and daemon activation remain pending
+**Status:** executing — M0 through M1d and M2's source backup, table import,
+and bounded parity verification slices are complete; import orchestration,
+post-coalescer growth measurement, and daemon activation remain pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
 2026-08-09
@@ -543,23 +543,33 @@ internal transaction scratch table.
 
 The importer runs source and target foreign-key checks, rebuilds FTS, compares
 the exact ordered JSON rows for every imported table, and returns the row count
-and SHA-256 for each table only after parity. The three-voter contract imports
-populated v14 and current fixtures. It covers a child id that sorts before its
-parent, nonzero current outbox claims, current scan state, checksum refusal,
+and SHA-256 for each table only after parity. Source validation, row loading,
+and digest scans share one blocking worker, so synchronous SQLite work never
+occupies an async runtime worker. Row data crosses that boundary in bounded
+chunks; one parent-first item-id ordering remains O(items) so the importer does
+not rebuild and re-sort the full item tree for every 64 rows. Target parity
+advances through 64-row primary-key pages and feeds an incremental digest
+instead of returning a whole table through the leader. Each page is a
+consistent read against the quiescent incoming target; activation does not
+start a concurrent writer before parity succeeds.
+
+The three-voter contract imports populated v14 and current fixtures, including
+single- and multi-column primary-key tables large enough to cross the import
+and parity page boundary. It covers a child id that sorts before its parent,
+nonzero current outbox claims, current scan state, checksum refusal,
 merge-style retry refusal, identity mismatch, the v14 schema floor, cyclic
-parent refusal, injected target corruption before parity, and source playback
-telemetry exclusion.
+parent refusal, injected target corruption before parity, source playback
+telemetry exclusion, and runtime multi-column keyset progress. Unit tests pin
+the keyset SQL shape and prove async-executor responsiveness while SQLite is
+blocked.
 
 This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
 and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
 fsynced completion marker, atomic activation, failure injection at each step,
 and fallback to unchanged SQLite. Trakt credential encryption and the
-post-coalescer growth record also remain activation blockers. Before activation,
-replace whole-table target parity responses with bounded keyset pages and an
-incremental digest, then move source backup scans onto a blocking worker. The
-current single consistent response can carry hundreds of MiB of `probe_json`
-through the leader, and synchronous source scans must not occupy an async
-runtime worker during a long migration.
+post-coalescer growth record also remain activation blockers. Bounded target
+parity and blocking-worker source reads are now in place; the next boundary is
+the activation coordinator, not another importer expansion.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -654,17 +664,17 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M2 can copy rows, not activate them
+## 8. Handoff checkpoint — M2 can verify rows, not activate them
 
-M0 through M1d and M2's source-backup slice are on `main`; this row-import
-slice adds populated v14/current parity without selecting it in `plurxd`.
-Every trait has one replicated implementation, and the importer can now prove
-the 17 shared durable tables, but keep SQLite as the daemon's selected store
-until incoming-cluster orchestration, credential encryption, node removal,
-and the post-coalescer growth gates are ready. The next implementation boundary
-is the fsynced completion marker plus failure-injected one-voter activation;
-that coordinator must delete partial incoming state and keep SQLite active on
-every failure.
+M0 through M1d and M2's source-backup plus row-import slices are on `main`;
+the importer can now prove the 17 shared durable tables without unbounded
+leader responses or blocking the async executor. It still does not select the
+target in `plurxd`. Keep SQLite as the daemon's selected store until
+incoming-cluster orchestration, credential encryption, node removal, and the
+post-coalescer growth gates are ready. The next implementation boundary is the
+fsynced completion marker plus failure-injected one-voter activation; that
+coordinator must delete partial incoming state and keep SQLite active on every
+failure.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline

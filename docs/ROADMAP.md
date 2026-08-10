@@ -125,10 +125,11 @@ The executable handoff is
 logical server first, then brings up the one-voter replicated store before
 membership, singleton jobs, session takeover, and failure drills.
 
-M0–M1d are merged: identity, the one-/three-voter Hiqlite proofs, replicated
-auth/catalogue/media/search contracts, and the complete 120-method Store
-backend are in-tree. M2 activation is next; SQLite remains the production
-default until import and daemon selection land.
+M0–M1d and M2's source-backup plus row-import slices are merged: identity, the
+one-/three-voter Hiqlite proofs, replicated auth/catalogue/media/search
+contracts, the complete 120-method Store backend, and bounded exact import
+parity are in-tree. M2 activation is next; SQLite remains the production
+default until daemon selection lands.
 
 - ✅ **M0 complete 2026-08-07:** local node identity, rollback-tolerant
   cluster configuration, Hiqlite decision/cost record, deterministic-SQL guard,
@@ -145,7 +146,11 @@ default until import and daemon selection land.
   guards, and the progress coalescer passed the full PR #90 review and CI
   sequence. Post-coalescer compacted growth remains an explicit activation
   measurement.
-- ○ **M2–M3 next:** import and select one-voter Hiqlite, envelope-encrypt Trakt
+- ✅ **M2 import complete 2026-08-09:** content-addressed backup and fresh-target
+  import preserve v14 through current durable rows, rebuild derived FTS, and
+  prove exact parity with bounded keyset pages, an incremental digest, and
+  source reads isolated on one blocking worker.
+- ○ **M2–M3 next:** activate one-voter Hiqlite, envelope-encrypt Trakt
   bearer credentials, then add join/remove/health and singleton job fencing.
   Removing a node must explicitly fail or safely re-home its offline work.
 - ○ **M4–M7 remain:** replicated session takeover, client node-list retry,
