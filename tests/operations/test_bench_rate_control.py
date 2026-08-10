@@ -539,8 +539,9 @@ class RateControlBenchCase(unittest.TestCase):
                     )
                 self.assertTrue(api.deleted)
 
-    def test_capture_rejects_nonfinite_playlist_duration_and_status_speed(self):
+    def test_capture_rejects_bad_status_speed_and_playlist_duration(self):
         for api, message in (
+            (SessionApi(recent_speed=0), "recent_speed"),
             (SessionApi(recent_speed=float("nan")), "recent_speed"),
             (SessionApi(recent_speed=float("inf")), "recent_speed"),
         ):
@@ -830,6 +831,56 @@ class RateControlBenchCase(unittest.TestCase):
             failure["code"] == "advertised_peak_exceeded" and failure["mode"] == "vbr"
             for failure in failures
         ))
+
+    def test_zero_speed_cannot_pass_full_comparison(self):
+        for baseline, candidate, expected_modes in (
+            (0.0, 0.0, {"vbr", "qvbr"}),
+            (2.0, 0.0, {"qvbr"}),
+            (0.0, 2.0, {"vbr"}),
+        ):
+            with self.subTest(baseline=baseline, candidate=candidate):
+                fixture = {
+                    "identity": "easy",
+                    "class": "easy",
+                    "modes": {
+                        "vbr": passing_measurement("vbr"),
+                        "qvbr": passing_measurement("qvbr"),
+                    },
+                }
+                fixture["modes"]["vbr"]["speed_p10"] = baseline
+                fixture["modes"]["qvbr"]["speed_p10"] = candidate
+                failures = BENCH["evaluate_rate_control"]([fixture])
+                speed_failures = [
+                    failure for failure in failures
+                    if failure["code"] == "speed_nonpositive"
+                ]
+                self.assertEqual(
+                    {failure["mode"] for failure in speed_failures},
+                    expected_modes,
+                )
+                self.assertNotIn("speed_regression", {
+                    failure["code"] for failure in failures
+                })
+
+    def test_missing_or_nonfinite_speed_is_explicitly_invalid(self):
+        for value in (None, float("nan"), float("inf"), "fast", True):
+            with self.subTest(value=value):
+                fixture = {
+                    "identity": "easy",
+                    "class": "easy",
+                    "modes": {
+                        "vbr": passing_measurement("vbr"),
+                        "qvbr": passing_measurement("qvbr"),
+                    },
+                }
+                fixture["modes"]["qvbr"]["speed_p10"] = value
+                failures = BENCH["evaluate_rate_control"]([fixture])
+                self.assertTrue(any(
+                    failure["code"] == "speed_invalid"
+                    and failure["mode"] == "qvbr"
+                    for failure in failures
+                ))
+                json.dumps(failures, allow_nan=False)
 
     def test_inflated_quality_ladder_cannot_pass_as_the_same_comparison(self):
         fixture = {

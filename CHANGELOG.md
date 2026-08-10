@@ -38,17 +38,18 @@ bump may break compatibility and a **patch** bump never does.
   path/build/hash/model; binds the local corpus and operator-captured nynuc
   `sha256sum` manifests; rejects duplicate filename/path/hash fixtures; proves
   pinned, balanced SDR fixture identity; and
-  reports bytes, VMAF, server speed, and the binding advertised peak over
-  complete served-segment windows. The theoretical VBV allowance remains a
-  labeled, nonbinding diagnostic. Full VBR/QVBR runs require maintenance-node
-  exclusivity, exact model/window/poll/settle parameters, recorded measurement
-  timing, probed/available SDR source facts, identical cross-mode ladder facts,
-  settings acknowledgements, and a stable session encoder equal to the
-  server-selected target. Restoration caps sleeps at the local deadline between
-  completed responses; an in-flight HTTP request may add its 30-second timeout,
-  and neither automatic nor manual GET-to-PUT checks are atomic. A timeout fails
-  loudly with the safe two-field manual rollback body because the requested
-  mode may remain active.
+  reports bytes, VMAF, finite positive server speed, and the binding advertised
+  peak over complete served-segment windows. Missing, non-finite, or zero speed
+  fails explicitly rather than allowing a zero/zero comparison. The theoretical
+  VBV allowance remains a labeled, nonbinding diagnostic. Full VBR/QVBR runs
+  require maintenance-node exclusivity, exact model/window/poll/settle
+  parameters, recorded measurement timing, probed/available SDR source facts,
+  identical cross-mode ladder facts, settings acknowledgements, and a stable
+  session encoder equal to the server-selected target. Restoration caps sleeps
+  at the local deadline between completed responses; an in-flight HTTP request
+  may add its 30-second timeout, and neither automatic nor manual GET-to-PUT
+  checks are atomic. A timeout fails loudly with the safe two-field manual
+  rollback body because the requested mode may remain active.
   Current main supports a visibly non-acceptance VBR smoke. A literal golden
   fixture still pins the current VBR recipe hash. No scorer is installed or
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer

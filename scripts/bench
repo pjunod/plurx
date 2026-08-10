@@ -814,7 +814,7 @@ def capture_live_session(
                     isinstance(speed, bool)
                     or not isinstance(speed, (int, float))
                     or not math.isfinite(speed)
-                    or speed < 0
+                    or speed <= 0
                 ):
                     raise BenchError(
                         f"{fixture['identity']}/{mode} status reported invalid recent_speed"
@@ -998,9 +998,35 @@ def evaluate_rate_control(fixture_rows):
                 "baseline": vbr["bytes"],
                 "candidate": qvbr["bytes"],
             })
-        if qvbr["speed_p10"] is None or vbr["speed_p10"] is None:
-            failures.append({"code": "speed_missing", "fixture": name})
-        elif qvbr["speed_p10"] + 1e-9 < vbr["speed_p10"] * 0.90:
+        speed_values = {
+            "vbr": vbr.get("speed_p10"),
+            "qvbr": qvbr.get("speed_p10"),
+        }
+        speed_unusable = False
+        for mode, value in speed_values.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                failures.append({
+                    "code": "speed_invalid",
+                    "fixture": name,
+                    "mode": mode,
+                    "observed": repr(value),
+                })
+                speed_unusable = True
+            elif value <= 0:
+                failures.append({
+                    "code": "speed_nonpositive",
+                    "fixture": name,
+                    "mode": mode,
+                    "observed": value,
+                })
+                speed_unusable = True
+        if speed_unusable:
+            continue
+        if qvbr["speed_p10"] + 1e-9 < vbr["speed_p10"] * 0.90:
             failures.append({
                 "code": "speed_regression",
                 "fixture": name,

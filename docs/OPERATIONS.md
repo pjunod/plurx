@@ -615,13 +615,17 @@ The server-advertised rung peak is the plan's sole binding peak gate. The
 theoretical `maxrate + bufsize/window` value remains in JSON as a labeled,
 nonbinding diagnostic with its inferred 2× nominal-video bufsize assumption.
 
-`passed: true` on the full comparison means the requested quality-mode capture
-did not lower VMAF, grow bytes on easy content, or lose more than 10% server
-encode speed, and neither requested-mode capture crossed the advertised peak.
+`passed: true` on the full comparison means both modes supplied finite,
+strictly positive server-speed p10 measurements, the requested quality-mode
+capture did not lower VMAF, grow bytes on easy content, or lose more than 10%
+server encode speed, and neither requested-mode capture crossed the advertised
+peak.
 It does not prove QVBR flags executed. Failures are explicit
-`vmaf_regression`, `easy_bytes_regression`, `speed_regression`,
-`encoder_identity_mismatch`, `ladder_identity_mismatch`,
-`advertised_peak_exceeded`, `harness_error`, or `setting_restore_failed`.
+`vmaf_regression`, `easy_bytes_regression`, `speed_invalid`,
+`speed_nonpositive`, `speed_regression`, `encoder_identity_mismatch`,
+`ladder_identity_mismatch`, `duration_mismatch`, `advertised_peak_exceeded`,
+`diagnostic_subset_not_acceptance`, `harness_error`, or
+`setting_restore_failed`.
 Missing `libvmaf` fails; it never skips quality scoring. A quantitative harness
 pass proves settings acknowledgement and measured output, not that the intended
 encoder flags or forced fallback executed. N1's production tests and boot
