@@ -129,7 +129,12 @@ simulator tests are not substitutes:
   package; `AVAssetCache.isPlayableOffline` accepting TS plus a one-segment-VTT
   subtitle rendition; completed background transfer; airplane-mode start and
   midpoint seek.
-- Android unattended `PlatformScheduler` launch after reboot on targetSdk 37;
+- Android build 25 now has the targetSdk-37 source path for unattended reboot:
+  a persisted UIDT job, synchronous intent/network state, granted-network
+  socket and DNS binding, and an explicit system-stop Resume state. A build-24
+  in-flight transfer needs one foreground Resume tap after upgrade because no
+  earlier UIDT registration exists. The actual unattended reboot remains a
+  physical-device check;
   real six-hour `onTimeout`; fully offline playback with a selected subtitle
   track; Android TV `uiMode` and D-pad behavior on actual TV hardware.
 - Post-expiry re-download on both platforms proving the server's `Cached`

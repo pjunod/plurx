@@ -454,6 +454,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 maximumHeight = preferences.offlineQuality.maximumHeight,
                 network = preferences.offlineNetwork,
             ),
+            explicitUserResume = true,
         )
     }
 

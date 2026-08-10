@@ -911,13 +911,23 @@ the WorkManager artifact, whose merged foreground-service declaration would
 need additional type configuration at this target SDK.
 
 The manifest adds `FOREGROUND_SERVICE`,
-`FOREGROUND_SERVICE_DATA_SYNC`, the unexported service with
-`foregroundServiceType="dataSync"`, `RECEIVE_BOOT_COMPLETED`, and the
-`BIND_JOB_SERVICE` scheduler service. A boot receiver never starts the
-`dataSync` service directly. At target SDK 37, Android 15+ caps app-wide
-`dataSync` foreground work at six hours per 24 hours; `onTimeout()` persists
-state, stops cleanly, and leaves **Paused by system — tap Resume**. Version 1
-accepts this ceiling instead of building a custom UIDT scheduler.
+`FOREGROUND_SERVICE_DATA_SYNC`, `RUN_USER_INITIATED_JOBS`,
+`RECEIVE_BOOT_COMPLETED`, and the required `BIND_JOB_SERVICE` services. Android
+6–13 retain the Media3 `DownloadService` plus boot/RESTART fallback. Android
+14+ uses one persisted user-initiated data-transfer job per complete Media3
+request; no boot receiver launches a `dataSync` service on that path. The
+manager starts paused, and its HTTP source fails closed until `JobParameters`
+supplies the granted `Network`, which owns both the socket factory and DNS.
+Task Manager and timeout stops persist state, stop cleanly, and leave **Paused
+by system — tap Resume**; automatic foreground catch-up never clears a nonzero
+stop reason.
+
+The local intent and network policy use synchronous app-private commits before
+foreground preparation. The catalog still fsyncs its richer display record,
+and the Media3 index remains authoritative for transfer bytes. A UIDT job is
+registered only after a listener acknowledges the complete request in that
+index. A build-24 transfer has no persisted UIDT registration to migrate, so an
+upgrade requires one foreground Resume tap before unattended reboot recovery.
 
 Android 13+ asks for notification permission when the first background
 download needs it. Denial is benign: the service still runs and the transfer

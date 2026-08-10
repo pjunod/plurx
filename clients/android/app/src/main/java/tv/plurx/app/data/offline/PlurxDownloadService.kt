@@ -3,6 +3,7 @@
 package tv.plurx.app.data.offline
 
 import android.app.Notification
+import android.os.Build
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadNotificationHelper
@@ -22,7 +23,12 @@ class PlurxDownloadService : DownloadService(
 
     override fun getDownloadManager(): DownloadManager = OfflineDownloads.manager
 
-    override fun getScheduler(): Scheduler = PlatformScheduler(this, SCHEDULER_JOB_ID)
+    override fun getScheduler(): Scheduler? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            null
+        } else {
+            PlatformScheduler(this, SCHEDULER_JOB_ID)
+        }
 
     override fun getForegroundNotification(
         downloads: MutableList<Download>,
@@ -37,8 +43,8 @@ class PlurxDownloadService : DownloadService(
     )
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        OfflineDownloads.manager.currentDownloads.forEach {
-            OfflineDownloads.manager.setStopReason(it.request.id, OfflineDownloads.SYSTEM_TIMEOUT_REASON)
+        OfflineDownloads.manager.currentDownloads.toList().forEach {
+            OfflineDownloads.pauseForSystem(it.request.id, OfflineDownloads.SYSTEM_TIMEOUT_REASON)
         }
         stopSelf(startId)
     }

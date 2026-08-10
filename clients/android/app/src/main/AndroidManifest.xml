@@ -13,6 +13,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS" />
 
     <!-- This is a phone/tablet app that also runs on Android TV. Touchscreen is
          not required (TVs have none), and leanback is optional so the Play Store
@@ -59,7 +60,26 @@
         <service
             android:name=".data.offline.PlurxDownloadService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="androidx.media3.exoplayer.downloadService.action.RESTART" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".data.offline.OfflineTransferJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <receiver
+            android:name=".data.offline.OfflineBootReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="androidx.media3.exoplayer.downloadService.action.RESTART" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name="androidx.media3.exoplayer.scheduler.PlatformScheduler$PlatformSchedulerService"
