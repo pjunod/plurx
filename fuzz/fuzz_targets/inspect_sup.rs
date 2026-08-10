@@ -2,6 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use plurx_pgs::{inspect_sup, ParserLimits};
+use plurx_pgs_fuzz::seeded_crash_enabled;
 use std::cell::RefCell;
 use std::io::{Seek, SeekFrom, Write};
 
@@ -33,6 +34,12 @@ fn fuzz_limits() -> ParserLimits {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Manual nightly dispatches use this fuzz-only switch to prove that a
+    // reproducible harness crash makes the hosted fuzz job red and preserves
+    // its artifact. It is never set by scheduled runs or shipped binaries.
+    if seeded_crash_enabled(std::env::var_os("PLURX_FUZZ_SEEDED_CRASH").as_deref()) {
+        panic!("seeded PGS fuzz-gate crash");
+    }
     if data.len() > MAX_FUZZ_BYTES {
         return;
     }

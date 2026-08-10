@@ -28,6 +28,8 @@ class EvidenceWorkflowCase(unittest.TestCase):
         self.assertIn("continue-on-error: true", workflow)
         self.assertIn("target/mutants", workflow)
         self.assertIn("GITHUB_STEP_SUMMARY", workflow)
+        self.assertIn("name: report-only weekly mutation spot-check", workflow)
+        self.assertIn("name: nightly-mutation-evidence", workflow)
 
     def test_pgs_fuzzer_is_bounded_seeded_artifacted_and_gating(self) -> None:
         workflow = self.read(".github/workflows/validation-nightly.yml")
@@ -38,8 +40,36 @@ class EvidenceWorkflowCase(unittest.TestCase):
         self.assertIn("-max_total_time=900", workflow)
         self.assertIn("fuzz/artifacts", workflow)
         self.assertIn("steps.pgs_fuzz.outcome == 'failure'", workflow)
+        self.assertIn("name: bounded PGS parser fuzz campaign", workflow)
+        self.assertIn("name: nightly-pgs-fuzz-evidence", workflow)
+        self.assertIn("target/validation/pgs-fuzz.log", workflow)
+        self.assertIn("seed_pgs_crash:", workflow)
+        self.assertIn("PLURX_FUZZ_SEEDED_CRASH", workflow)
+        self.assertIn(
+            'seeded_crash_enabled(std::env::var_os("PLURX_FUZZ_SEEDED_CRASH").as_deref())',
+            self.read("fuzz/fuzz_targets/inspect_sup.rs"),
+        )
+        self.assertIn(
+            "only_the_explicit_seed_enables_the_crash_proof",
+            self.read("fuzz/src/lib.rs"),
+        )
+        self.assertIn("test --manifest-path fuzz/Cargo.toml --lib", workflow)
         self.assertIn("exit 1", workflow)
         self.assertTrue((ROOT / "fuzz/corpus/inspect_sup/minimal-header").is_file())
+
+    def test_nightly_deep_fuzz_and_mutation_jobs_are_independent(self) -> None:
+        workflow = self.read(".github/workflows/validation-nightly.yml")
+        deep = workflow.split("\n  deep-validation:\n", 1)[1].split("\n  pgs-fuzz:\n", 1)[0]
+        fuzz = workflow.split("\n  pgs-fuzz:\n", 1)[1].split("\n  mutation:\n", 1)[0]
+        mutation = workflow.split("\n  mutation:\n", 1)[1]
+
+        self.assertIn("run: make validate-nightly", deep)
+        self.assertNotIn("cargo-fuzz", deep)
+        self.assertNotIn("cargo-mutants", deep)
+        self.assertIn("cargo-fuzz", fuzz)
+        self.assertNotIn("needs:", fuzz)
+        self.assertIn("cargo-mutants", mutation)
+        self.assertNotIn("needs:", mutation)
 
     def test_pgs_periodic_refresh_and_completion_prune_remain_wired(self) -> None:
         apple = self.read("clients/apple/Sources/PlayerController.swift")
