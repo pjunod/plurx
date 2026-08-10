@@ -332,6 +332,12 @@ and the accepted laptop controller scorer runs afterward. No N1 encoder flags
 or settings are implemented by this slice. The named-machine quantitative
 capture/full comparison remains unclaimed, as do N1 boot/production evidence
 and the separate forced-fallback run that prove the requested mode executed.
+PR #131 review also stop-flagged the peak contract: v2 named an advertised-peak
+gate over a bufsize window, while the merged harness implemented a 10-second
+complete-served-segment advertised-peak gate. The harness records observed
+served-byte peaks over both candidate windows plus the 10-second theoretical
+VBV allowance. Neither interpretation is binding until the owner ratifies one;
+full artifacts remain explicitly ineligible and non-passing meanwhile.
 
 **Objective:** stop paying fixed bitrates for content that doesn't need
 them. Same encoders, same ladder heights, same caps — but the target
@@ -424,27 +430,33 @@ explicit separate scorer decodes them for VMAF offline. Shape:
 `scripts/bench rate-control --base http://nynuc:32400 --token <admin-token>
 --corpus <fixtures> --modes vbr,qvbr --vmaf-ffmpeg <scoring-only-ffmpeg>
 --server-sha256-manifest <nynuc.sha256>
---vmaf-model vmaf_v0.6.1 --rate-window 10.0 --poll 0.25
+--vmaf-model vmaf_v0.6.1 --vmaf-subsample 1
+--rate-window 10.0 --poll 0.25
 --settings-settle 3.0
---json out/rate-control.json`, failing nonzero when
-quality mode regresses VMAF or exceeds the advertised peak over any complete
-served-segment window. The theoretical VBV allowance is a nonbinding diagnostic,
-not a second contract. Full acceptance requires unique filenames, resolved
-reference paths, and pinned hashes across equal nonempty easy/hard SDR halves;
-full-corpus scope; maintenance-node exclusivity; exact model, window, poll, and
-settle parameters; recorded measurement timing; probed and available server
-video facts; stable StartResponse/status identity equal to the server-selected
-encoder; and identical advertised/derived ladder facts across modes. The
-pre-PUT idle observation is not an atomic lock. Its deadline bounds polling
+--json out/rate-control.json`. **Peak-contract stop:** the harness records the
+observed complete-segment peak over both the 10-second PR #131 window and v2's
+derived `bufsize / maxrate` window, plus the inferred 10-second
+`maxrate + bufsize/window` allowance, as diagnostics. It sets
+`acceptance.eligible: false`, emits `peak_contract_unratified`, and fails
+nonzero. Owner ratification must choose the binding peak definition before N1
+acceptance can proceed. The remaining full-comparison contract requires unique
+filenames, resolved reference paths, and pinned hashes across equal nonempty
+easy/hard SDR halves;
+full-corpus scope; maintenance-node exclusivity; exact model, subsample,
+window, poll, and settle parameters; recorded measurement timing; probed and
+available server video facts; stable StartResponse/status identity equal to the
+server-selected encoder; and identical advertised/derived ladder facts across
+modes. The pre-PUT idle observation is not an atomic lock. Its deadline bounds polling
 between completed responses, while one in-flight HTTP request may add its
 30-second timeout. The settings DTO acknowledgement is not proof that effective
 flags or fallback executed; N1 boot validation/production tests and a separate
 forced-fallback run supply that evidence. The scorer never encodes production
 playback, becomes `PLURX_FFMPEG`, joins the compose service, or enters the live
-path. On that harness: quality mode produces ≤ the bytes of bitrate mode on the
-easy half of the corpus at equal-or-better VMAF (VMAF offline only,
-`n_subsample` as needed — never in the live path, principle 7); encode speed within 10%
-of bitrate mode; a session on a family whose driver refuses the mode
+path. After peak-contract ratification, quality mode must produce ≤ the bytes
+of bitrate mode on the easy half of the corpus at equal-or-better VMAF (VMAF
+offline only,
+`n_subsample=1` — never in the live path, principle 7); encode speed within
+10% of bitrate mode; a session on a family whose driver refuses the mode
 starts and logs the fallback. Identity: golden-hash fixtures hold the
 legacy VBR digest constant; cross-path fixtures prove
 live/producer/offline hash agreement.
