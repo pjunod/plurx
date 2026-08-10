@@ -136,8 +136,30 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn('APPLE_IPAD_SIM=platform=iOS Simulator,id=$ipad_id', workflow)
         self.assertIn('APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id', workflow)
         self.assertIn('$${APPLE_IPAD_SIM:-}', makefile)
-        self.assertEqual(makefile.count("-scheme plurx-iOS"), 2)
         self.assertLess(workflow.index("xcrun simctl create"), workflow.index("run: make apple-test"))
+
+        # Each platform compiles once and every destination replays those
+        # products: one iOS build-for-testing feeds the iPhone AND iPad
+        # test-without-building runs, one tvOS build feeds Apple TV. A third
+        # `test` (with building) invocation sneaking back in is the regression
+        # this pins out.
+        apple_target = makefile.split(".PHONY: apple-test", 1)[1].split(".PHONY:", 1)[0]
+        self.assertEqual(apple_target.count("build-for-testing"), 2)
+        self.assertEqual(apple_target.count("test-without-building"), 3)
+        self.assertEqual(apple_target.count("-scheme plurx-iOS"), 3)
+        self.assertEqual(apple_target.count("-scheme plurx-tvOS"), 2)
+        self.assertNotRegex(
+            apple_target, r"CODE_SIGNING_ALLOWED=NO test(?!-without-building)"
+        )
+        self.assertLess(
+            apple_target.index("build-for-testing"),
+            apple_target.index("test-without-building"),
+        )
+        self.assertEqual(apple_target.count('-derivedDataPath "$(APPLE_DERIVED_DATA)"'), 5)
+        # The DerivedData cache in ci.yml must point at the same directory the
+        # Makefile builds into, or it silently caches nothing.
+        self.assertIn("APPLE_DERIVED_DATA := build/DerivedData", makefile)
+        self.assertIn("path: clients/apple/build/DerivedData", workflow)
 
     def test_pr_ci_selects_expensive_surfaces_and_has_one_aggregate_gate(self):
         workflow = read(".github/workflows/ci.yml")
@@ -160,7 +182,7 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.hiqlite_spike == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.cluster_auth == 'true'", workflow)
         self.assertIn("name: three-voter replicated store contracts", workflow)
-        self.assertIn("if: needs.scope.outputs.docs_only != 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.rust == 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
         self.assertIn(
@@ -204,6 +226,68 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release --workspace --target ${{ matrix.target }}",
             workflow,
         )
+
+    def test_the_merge_queue_is_the_full_fan_out_and_prs_are_the_fast_lane(self):
+        workflow = read(".github/workflows/ci.yml")
+        lint = read(".github/workflows/lint.yml")
+        makefile = read("Makefile")
+
+        # Both required workflows must fire on merge_group, or enabling the
+        # queue deadlocks every merge on a check that never reports.
+        self.assertIn("\n  merge_group:\n", workflow)
+        self.assertIn("\n  merge_group:\n", lint)
+        self.assertIn(
+            "if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')",
+            workflow,
+        )
+        # Queue runs must never be cancelled by a later PR push.
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            workflow,
+        )
+
+        # The CI Rust gate splits, not shrinks: clippy stays in lint.yml, and
+        # the excluded cluster member keeps its own dedicated job in ci.yml.
+        gate = makefile.split(".PHONY: ci-rust-gate", 1)[1].split(".PHONY:", 1)[0]
+        self.assertIn("--workspace --locked --exclude plurx-cluster-check", gate)
+        self.assertIn("ci-rust-gate: fmt-check", gate)
+        self.assertIn("make fmt-check lint", lint)
+        self.assertIn("run: make cluster-check", workflow)
+
+    def test_ci_caches_are_keyed_to_what_they_cache(self):
+        workflow = read(".github/workflows/ci.yml")
+
+        # The Playwright pip pin and the browser-bundle cache key must move
+        # together, or a version bump silently reuses the wrong browsers.
+        pip_pin = re.search(r"playwright==(\d+\.\d+\.\d+)", workflow)
+        cache_pin = re.search(r"playwright-\$\{\{ runner\.os \}\}-(\d+\.\d+\.\d+)", workflow)
+        self.assertIsNotNone(pip_pin)
+        self.assertIsNotNone(cache_pin)
+        self.assertEqual(pip_pin.group(1), cache_pin.group(1))
+
+        # Both Android jobs reuse the GHCR toolchain image keyed on the
+        # Dockerfile hash, and the Makefile honors the pre-pull instead of
+        # rebuilding the SDK image from scratch.
+        self.assertEqual(
+            workflow.count("sha256sum clients/android/Dockerfile"), 2
+        )
+        self.assertEqual(workflow.count("PLURX_ANDROID_IMAGE_READY=1"), 4)
+        makefile = read("Makefile")
+        self.assertIn('if [ "$${PLURX_ANDROID_IMAGE_READY:-}" = "1" ]', makefile)
+
+        # The emulator restores a cached AVD snapshot and never saves over it.
+        self.assertIn("key: avd-35-google_apis-pixel_7_pro", workflow)
+        self.assertIn("-no-snapshot-save", workflow)
+
+        # The spike workspace's target dir must be inside its cache mapping,
+        # or its 400-crate build runs cold every time.
+        self.assertIn("spikes/hiqlite-m0 -> spikes/hiqlite-m0/target", workflow)
+
+        # The docker smoke build keeps the GHA layer cache wired so the
+        # ffmpeg runtime layers stop re-downloading on every run.
+        docker = workflow.split("  docker:", 1)[1].split("\n  pr_gate:", 1)[0]
+        self.assertIn("cache-from: type=gha", docker)
+        self.assertIn("cache-to: type=gha,mode=min", docker)
 
     def test_release_registry_and_weekly_readiness_match_ci(self):
         ci = read(".github/workflows/ci.yml")

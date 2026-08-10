@@ -47,6 +47,16 @@ lint: ## Clippy across the workspace, warnings are errors
 .PHONY: rust-check
 rust-check: fmt-check lint test ## Rust format, lint, and workspace tests
 
+# The CI split of `rust-check`: lint.yml already runs the identical clippy
+# gate in a parallel workflow, and the cluster_auth job owns the replicated
+# store member — excluding it here keeps cargo's feature unification from
+# compiling the whole hiqlite/openraft stack into the PR gate, so this suite
+# also exercises plurx-core with the features the shipped plurxd resolves.
+# Local development keeps `make rust-check`; this target exists for ci.yml.
+.PHONY: ci-rust-gate
+ci-rust-gate: fmt-check ## CI Rust gate: format + workspace tests minus the cluster member
+	$(CARGO) test --workspace --locked --exclude plurx-cluster-check
+
 .PHONY: history-check
 history-check: ## Verify every corrective commit has current regression evidence
 	@scripts/history-audit --report target/validation/history.json
@@ -279,25 +289,52 @@ hooks: ## Install the functionality-point pre-commit validator
 
 ## ---- apple clients -----------------------------------------------------
 
+# iPhone and iPad run the exact same build products, so iOS compiles ONCE with
+# `build-for-testing` and both destinations replay it with
+# `test-without-building` — the third full Swift compile per run was pure
+# waste. The shared DerivedData lives at clients/apple/build/DerivedData so CI
+# can cache it between runs; a stale or absent cache only costs a rebuild.
+APPLE_DERIVED_DATA := build/DerivedData
+
 .PHONY: apple-test
-apple-test: ## Generate the Xcode project and test the shared suite on iOS + tvOS
+apple-test: ## Generate the Xcode project, build each platform once, test every destination
 	cd clients/apple && xcodegen generate
 	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
 	  -destination "$${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}" \
-	  CODE_SIGNING_ALLOWED=NO test
+	  -derivedDataPath "$(APPLE_DERIVED_DATA)" \
+	  CODE_SIGNING_ALLOWED=NO build-for-testing
+	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+	  -destination "$${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}" \
+	  -derivedDataPath "$(APPLE_DERIVED_DATA)" \
+	  CODE_SIGNING_ALLOWED=NO test-without-building
 	@if [ -n "$${APPLE_IPAD_SIM:-}" ]; then \
 	  cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
-	    -destination "$${APPLE_IPAD_SIM}" CODE_SIGNING_ALLOWED=NO test; \
+	    -destination "$${APPLE_IPAD_SIM}" \
+	    -derivedDataPath "$(APPLE_DERIVED_DATA)" \
+	    CODE_SIGNING_ALLOWED=NO test-without-building; \
 	fi
 	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
 	  -destination "$${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}" \
-	  CODE_SIGNING_ALLOWED=NO test
+	  -derivedDataPath "$(APPLE_DERIVED_DATA)" \
+	  CODE_SIGNING_ALLOWED=NO build-for-testing
+	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
+	  -destination "$${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}" \
+	  -derivedDataPath "$(APPLE_DERIVED_DATA)" \
+	  CODE_SIGNING_ALLOWED=NO test-without-building
 
 ## ---- android client ----------------------------------------------------
 
+# CI pre-pulls the image from GHCR keyed on the Dockerfile's hash and sets
+# PLURX_ANDROID_IMAGE_READY=1, so two jobs per run stop re-downloading the SDK
+# from Google. Anything else — a local build, a cache miss, a fork without
+# registry access — falls through to the same docker build as always.
 .PHONY: android-image
 android-image: ## Build the pinned Android build-env image (JDK 25 + SDK)
-	docker build --platform $(ANDROID_PLATFORM) -t $(ANDROID_IMAGE) clients/android
+	@if [ "$${PLURX_ANDROID_IMAGE_READY:-}" = "1" ]; then \
+	  echo "android-image: reusing pre-pulled $(ANDROID_IMAGE)"; \
+	else \
+	  docker build --platform $(ANDROID_PLATFORM) -t $(ANDROID_IMAGE) clients/android; \
+	fi
 
 .PHONY: android-test
 android-test: android-image ## Run Android JVM unit tests + lint in the pinned image

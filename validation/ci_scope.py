@@ -18,6 +18,7 @@ from validation.runner import (
 
 
 SCOPE_KEYS = (
+    "rust",
     "apple",
     "android_jvm",
     "android_device",
@@ -32,11 +33,13 @@ SCOPE_KEYS = (
 
 # A selector or aggregate-workflow edit can change which evidence appears at
 # all. It must exercise every routed surface instead of trusting the routing it
-# is in the middle of changing.
+# is in the middle of changing. `runner.py` owns diff resolution, glob
+# matching, and point selection, so it is selector code exactly like this file.
 FULL_CI_PATHS = (
     ".github/workflows/ci.yml",
     "validation/ci_scope.py",
     "validation/points.toml",
+    "validation/runner.py",
 )
 
 # Documentation can still be executable evidence: validation unit tests pin
@@ -63,6 +66,42 @@ SHIPPED_SOURCE_PATHS = (
     "clients/**",
     "crates/**",
 )
+
+# The pull-request lane is the iteration loop, so client suites run only when
+# a diff can reach their compiled sources; the impact graph's server→client
+# fan-out still runs where it belongs — on every merge_group and push event,
+# which resolve through all_scope() before a commit can land on main. The one
+# cross-surface file that compiles into BOTH native clients is the shared wire
+# fixture: editing it re-runs both client suites on the PR itself.
+APPLE_PATHS = (
+    "clients/apple/**",
+    "tests/contracts/native-api.json",
+)
+
+ANDROID_JVM_PATHS = (
+    "clients/android/**",
+    "tests/contracts/native-api.json",
+)
+
+# The layout golden is exercised by booting the real server, so its inputs are
+# the embedded web sources and the tooling that drives or grades the sweep —
+# the `web.experience` point's compiled surface, minus prose.
+WEB_LAYOUT_PATHS = (
+    "brand/tokens.css",
+    "crates/plurxd/src/http/web.rs",
+    "crates/plurxd/src/web/**",
+    "scripts/contrast-*",
+    "scripts/js-check",
+    "scripts/themes-proposed.json",
+    "scripts/ui-baseline",
+    "tests/ui-structure.golden",
+)
+
+# The cargo gate cannot be affected by native-client sources: a Kotlin or
+# Swift diff compiles nothing under crates/. Everything else — scripts,
+# deploy, validation, vendor — keeps the Rust lane, because those trees feed
+# build, packaging, or selection behavior the workspace suite pins.
+RUST_EXEMPT_PATHS = ("clients/**",)
 
 # Device tests prove Android UI, focus, and packaging behavior. Server-only
 # changes can select the Android consumer through the impact graph, but they do
@@ -121,6 +160,21 @@ def is_docs_only(paths: tuple[str, ...]) -> bool:
     )
 
 
+def needs_rust_gate(paths: tuple[str, ...]) -> bool:
+    """Fail open unless every changed path provably skips the cargo suite."""
+
+    if not paths:
+        return True
+    return not all(
+        matches(path, RUST_EXEMPT_PATHS)
+        or (
+            matches(path, DOCS_ONLY_PATHS)
+            and not matches(path, SHIPPED_SOURCE_PATHS)
+        )
+        for path in paths
+    )
+
+
 def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]:
     """Map changed paths to independently runnable CI surfaces."""
 
@@ -135,10 +189,11 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
     }
     point_ids = set(selection.point_ids)
     return {
-        "apple": "apple-simulators" in check_ids,
-        "android_jvm": "android-jvm" in check_ids,
+        "rust": needs_rust_gate(paths),
+        "apple": any(matches(path, APPLE_PATHS) for path in paths),
+        "android_jvm": any(matches(path, ANDROID_JVM_PATHS) for path in paths),
         "android_device": any(matches(path, ANDROID_DEVICE_PATHS) for path in paths),
-        "web_layout": "web-layout" in check_ids,
+        "web_layout": any(matches(path, WEB_LAYOUT_PATHS) for path in paths),
         "release_build": any(matches(path, RELEASE_BUILD_PATHS) for path in paths),
         "container": any(matches(path, CONTAINER_PATHS) for path in paths),
         "mobile_version": "mobile-version" in check_ids,
@@ -149,7 +204,12 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
 
 
 def resolve_scope(event: str, base: str | None) -> dict[str, bool]:
-    """Use impact selection for PRs and exhaustive jobs after merge or on tags."""
+    """Scope pull requests; run everything for merge_group, push, and tags.
+
+    The merge queue is the enforcement point: a `merge_group` event lands here
+    with a non-PR event name and fails open into `all_scope()`, so the full
+    cross-surface fan-out always runs between a green PR and main.
+    """
 
     if event != "pull_request":
         return all_scope()

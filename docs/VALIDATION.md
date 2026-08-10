@@ -71,18 +71,32 @@ selected points ask for the same gate.
         deduplicate ──▶ execute ──▶ JSON + JUnit + logs
 ```
 
-Path selection never suppresses the baseline. `catalog-contract` and
-`history-regressions`, and `rust-gate` are `always_checks`, so every
+Path selection never suppresses the baseline. `catalog-contract`,
+`history-regressions`, and the Rust gate are `always_checks`, so every
 commit-profile or CI-profile run still validates the catalog and history and
-executes `make rust-check`. Impact selection only adds checks; a bad path
+executes the workspace suite. Impact selection only adds checks; a bad path
 mapping cannot quietly make ordinary tests disappear.
+
+The Rust gate has two forms that must never drift apart in coverage, only in
+packaging. Local profiles (`commit`, `full`, `nightly`) run `rust-gate` —
+`make rust-check`, the one-command fmt + clippy + full-workspace suite. The
+`ci` profile runs `rust-gate-ci` — `make ci-rust-gate` — which drops exactly
+the two pieces that already run as their own CI jobs on the same commit:
+clippy is lint.yml's entire job, and the replicated-store member is the
+`cluster_auth` job's entire job. Excluding `plurx-cluster-check` also keeps
+cargo's feature unification from compiling the hiqlite stack into the PR
+gate, which makes the CI suite test `plurx-core` with the features the
+shipped `plurxd` actually resolves. The subset re-runs (`api-wire`,
+`security-boundaries`, `user-journey`) stay out of the `ci` profile for the
+same reason: there they would re-execute binaries the workspace run already
+executed with identical feature resolution.
 
 ## Profiles — fast by default, deep when the environment can prove more
 
 | Profile | Intended use | Additional evidence |
 |---|---|---|
 | `commit` | Pre-commit and ordinary local work | Mandatory Rust/catalog baseline; shared API wire check; web syntax, contrast, golden, and accessibility when affected |
-| `ci` | Pull requests and `main` | Impact-selected Linux contracts plus parallel browser, Apple, Android, build, and container jobs when their surfaces can change |
+| `ci` | Pull requests, the merge queue, and `main` | PR runs scope to the diff — client suites run only when a diff can reach their compiled sources; `merge_group` and push events enable every surface, so the full cross-surface fan-out always sits between a green PR and `main` |
 | `full` | Before a risky merge or release | Browser playback; both native-client suites; Android device tests when an explicit disposable device is selected; container startup/restart |
 | `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks; a gating 15-minute PGS parser fuzz campaign; report-only mutation sampling over Rust files changed in the last seven days |
 

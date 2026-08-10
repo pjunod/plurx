@@ -264,6 +264,17 @@
     </details>
   </section>
 
+  <!-- ══════════ Delivery pipeline ══════════ -->
+  <section>
+    <h2>Delivery pipeline — two-tier CI <span class="chip prog">🚧 queue flip pending</span> <span class="ev">VALIDATION.md · ci.yml + lint.yml · 2026-08-09</span></h2>
+    <p class="blurb">PR pushes now run a diff-scoped fast lane; every merge-queue run fails open into the full cross-surface fan-out, so the impact graph's server→client net moved from every push to the last gate before <code>main</code>. Measured before the change: a server PR's lane was ~10.5 min end to end (Apple sims 8m20 · Android emulator 8m29 · web layout 6m45 · cargo check 4m50), paid again on every push.</p>
+    <ul class="items">
+      <li class="done-item"><span class="m done">✓ shipped</span><span class="t">Client-only diffs skip the cargo lane and server diffs defer client suites to the queue; iOS compiles once and iPhone+iPad replay the products; the Android SDK image pulls from GHCR by Dockerfile hash; Gradle, AVD-snapshot, Playwright, spike-target, DerivedData, and docker-layer caches are wired; Argon2 test hashing is optimized; the coalescer trailing-flush assert is deterministic under load</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Flip the repo settings: enable the merge queue on <code>main</code> with <b>PR validation gate</b> as the required check (it reports on both <code>pull_request</code> and <code>merge_group</code>) and turn on auto-merge — the workflows are already queue-ready, and enabling the queue before this change merges would deadlock nothing since the gate now fires on merge_group</span></li>
+      <li><span class="m todo">○ measure</span><span class="t">After the flip, pull two or three PR-lane and queue runs through <code>scripts/ci-flake-report</code> and record the new per-job baselines here</span></li>
+    </ul>
+  </section>
+
   <!-- ══════════ Operator ══════════ -->
   <section>
     <h2>Operator checklist (Paul) <span class="ev">hardware evidence that source tests cannot supply</span></h2>
