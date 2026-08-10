@@ -92,7 +92,7 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · Apple in-window seek routing (build 47) + retrospective work orders + tagged v0.2.7 + Android build 24; physical acceptance is partially executed</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · bounded M2 import verification + Apple in-window seek routing (build 47) + retrospective work orders + tagged v0.2.7 + Android build 24; physical acceptance is partially executed</div>
   </header>
 
   <div class="tiles">
@@ -214,7 +214,7 @@
         <li class="done-item"><span class="m done">✓ M1b</span><span class="t">Three-voter settings/auth/API-key backend with schema preflight, replica digests, and follower/leader/quorum-loss harness merged 2026-08-07</span></li>
         <li class="done-item"><span class="m done">✓ M1c</span><span class="t">Libraries, media, watch state, node-local FTS, root identity, and atomic bounded reconciliation merged in PR #88 on 2026-08-08</span></li>
         <li class="done-item"><span class="m done">✓ M1d</span><span class="t">The complete 120-method replicated store, shared three-voter contract suite, Trakt/outbox multi-writer safety, offline/cache identity checks, and bounded progress coalescing passed PR #90 review and CI; post-coalescer compacted growth remains an M2 activation measurement</span></li>
-        <li class="done-item"><span class="m done">✓ M2 import</span><span class="t">Content-addressed SQLite backup, fresh-target row import, and exact parity now use bounded chunks, 64-row target keyset pages, an incremental digest, and one blocking SQLite worker; the target remains inert</span></li>
+        <li class="done-item"><span class="m done">✓ M2 import</span><span class="t">Content-addressed SQLite backup, fresh-target row import, and exact parity now use 64-row import chunks and target keyset pages, an incremental digest, one parent-first item-id ordering, and one blocking SQLite worker; the target remains inert</span></li>
         <li><span class="m todo">○ M2–M3</span><span class="t">Activate one-voter Hiqlite with failure-safe incoming-state orchestration, envelope-encrypt replicated Trakt bearer credentials, then add join/remove/health, offline-work cleanup on removal, and singleton fencing</span></li>
         <li><span class="m todo">○ M4–M7</span><span class="t">Session takeover, client node-list retry, VIP/Kubernetes patterns, rolling upgrades, cluster admin UI, and the physical netsplit/disk/node-loss corpus</span></li>
       </ul>

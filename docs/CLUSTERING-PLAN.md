@@ -545,19 +545,23 @@ The importer runs source and target foreign-key checks, rebuilds FTS, compares
 the exact ordered JSON rows for every imported table, and returns the row count
 and SHA-256 for each table only after parity. Source validation, row loading,
 and digest scans share one blocking worker, so synchronous SQLite work never
-occupies an async runtime worker and only bounded chunks cross that boundary.
-Target parity advances through 64-row primary-key pages and feeds an
-incremental digest instead of returning a whole table through the leader. Each
-page is a consistent read against the quiescent incoming target; activation
-does not start a concurrent writer before parity succeeds.
+occupies an async runtime worker. Row data crosses that boundary in bounded
+chunks; one parent-first item-id ordering remains O(items) so the importer does
+not rebuild and re-sort the full item tree for every 64 rows. Target parity
+advances through 64-row primary-key pages and feeds an incremental digest
+instead of returning a whole table through the leader. Each page is a
+consistent read against the quiescent incoming target; activation does not
+start a concurrent writer before parity succeeds.
 
 The three-voter contract imports populated v14 and current fixtures, including
-tables large enough to cross the import and parity page boundary. It covers a
-child id that sorts before its parent, nonzero current outbox claims, current
-scan state, checksum refusal, merge-style retry refusal, identity mismatch,
-the v14 schema floor, cyclic parent refusal, injected target corruption before
-parity, source playback telemetry exclusion, multi-column keyset progress, and
-async-executor responsiveness while SQLite is blocked.
+single- and multi-column primary-key tables large enough to cross the import
+and parity page boundary. It covers a child id that sorts before its parent,
+nonzero current outbox claims, current scan state, checksum refusal,
+merge-style retry refusal, identity mismatch, the v14 schema floor, cyclic
+parent refusal, injected target corruption before parity, source playback
+telemetry exclusion, and runtime multi-column keyset progress. Unit tests pin
+the keyset SQL shape and prove async-executor responsiveness while SQLite is
+blocked.
 
 This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
 and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the

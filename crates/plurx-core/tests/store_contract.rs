@@ -518,6 +518,24 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
                 ],
             )
             .expect("populate paged parity settings");
+        for storage_class in ["local", "shared"] {
+            connection
+                .execute(
+                    "INSERT INTO transcode_cache_locations
+                         (recipe_hash, node_id, storage_class, relative_dir, bytes, complete,
+                          last_used_at, last_seen_at)
+                     VALUES ('fixture-recipe', ?1, ?2, ?3, ?4, 1, ?5, ?6)",
+                    rusqlite::params![
+                        format!("fixture-page-node-{ordinal:03}"),
+                        storage_class,
+                        format!("fixture-page-location-{ordinal:03}-{storage_class}"),
+                        3_000 + ordinal,
+                        300 + ordinal,
+                        400 + ordinal,
+                    ],
+                )
+                .expect("populate composite-key paged parity locations");
+        }
     }
     drop(connection);
     path
@@ -601,6 +619,17 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
             .row_count
             > 64,
         "settings parity must cross the 64-row keyset page boundary"
+    );
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "transcode_cache_locations")
+            .expect("transcode cache locations digest")
+            .row_count,
+        141,
+        "the leading fixture row plus two storage classes per node must split a \
+         three-column key between parity pages"
     );
     assert!(report.imported_rows >= 16);
     for table in [

@@ -145,8 +145,9 @@ enum SourceRequest {
 ///
 /// Reopening the backup for every 64-row chunk would avoid blocking Tokio but
 /// turn a large catalogue into thousands of connection setups. This actor
-/// keeps one read-only connection and sends only bounded owned results back to
-/// the async coordinator.
+/// keeps one read-only connection and sends row data back in bounded chunks.
+/// The one deliberate O(items) reply is the parent-first id ordering used to
+/// avoid rebuilding and sorting the full item tree for every chunk.
 struct SourceReader {
     requests: mpsc::Sender<SourceRequest>,
 }
@@ -1347,7 +1348,7 @@ mod tests {
         .await
         .expect("source reader");
 
-        let pause = reader.pause(std::time::Duration::from_millis(100));
+        let pause = reader.pause(std::time::Duration::from_millis(500));
         tokio::pin!(pause);
         tokio::select! {
             result = &mut pause => panic!("blocking source work returned early: {result:?}"),
