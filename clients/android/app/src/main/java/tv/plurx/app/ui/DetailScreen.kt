@@ -82,6 +82,7 @@ import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Outline
 import tv.plurx.app.ui.theme.SurfaceHi
 import tv.plurx.app.data.offline.OfflineDownloads
+import tv.plurx.app.data.offline.needsExplicitResume
 
 private data class DetailLoad(
     val detail: ItemDetail? = null,
@@ -519,7 +520,7 @@ private fun Actions(
                                 offline == null || offline.state in setOf("failed", "missing") -> {
                                     downloadError = vm.queueOffline(item, playable)
                                 }
-                                offline.state == "paused" -> {
+                                offline.needsExplicitResume -> {
                                     downloadError = null
                                     vm.resumeOffline(offline)
                                 }
@@ -535,7 +536,7 @@ private fun Actions(
                             when {
                                 offline == null -> "  Download"
                                 offline.isPlayable -> "  Downloaded"
-                                offline.state == "paused" -> "  Resume download"
+                                offline.needsExplicitResume -> "  Resume download"
                                 offline.state in setOf("failed", "missing") -> "  Download again"
                                 else -> "  Cancel download"
                             },

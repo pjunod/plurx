@@ -11,6 +11,22 @@ import retrofit2.Response
 
 class AppViewModelTest {
     @Test
+    fun onlyTheResumeControlAuthorizesAStoppedOfflineTransfer() {
+        assertEquals(false, OfflineResumeTrigger.Lifecycle.explicitUserAction)
+        assertEquals(true, OfflineResumeTrigger.UserControl.explicitUserAction)
+    }
+
+    @Test
+    fun offlineNetworkRecoveryCommitsBeforeAsyncPreferencesPublish() {
+        val order = mutableListOf<String>()
+        applyOfflineNetworkChange(
+            persistRecovery = { order += "recovery" },
+            publishPreferences = { order += "preferences" },
+        )
+        assertEquals(listOf("recovery", "preferences"), order)
+    }
+
+    @Test
     fun manualOriginsUseThePlurxPortWhenHttpHasNone() {
         assertEquals("http://192.168.1.20:32400", normalizeOrigin("192.168.1.20"))
         assertEquals("http://media-box:32400", normalizeOrigin("media-box"))

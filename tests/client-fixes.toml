@@ -81,9 +81,25 @@ test_anchor = "testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock"
 id = "android.offline-network-policy-restore"
 commits = ["335b22a4"]
 source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineDownloads.kt"
-source_anchor = "setNetworkPolicy(template.network)"
+source_anchor = "fun setNetworkPolicy(policy: OfflineNetwork)"
 test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
 test_anchor = "restoredNetworkPolicyKeepsTheSavedTransportRequirement"
+
+[[fixes]]
+id = "android.unattended-offline-recovery"
+commits = ["e0b7e6e"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineDownloads.kt"
+source_anchor = "internal fun coldStartStopReason("
+test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
+test_anchor = "coldStartOnlyAddsUidtOwnershipToAnUnstoppedTransfer"
+
+[[fixes]]
+id = "android.uidt-ownership-boundaries"
+commits = ["37f2684"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineTransferJobService.kt"
+source_anchor = "private data class RunningTransfer"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
+test_anchor = "rebindingCancelsOldCallsAndStaleOwnerCannotClearReplacement"
 
 [[fixes]]
 id = "apple.seek-window-routing"

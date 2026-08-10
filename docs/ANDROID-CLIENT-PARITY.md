@@ -27,7 +27,7 @@ for that viewer and keeps server administration out of the comparison.
 > (needs a TV emulator or device) and the badge's on-screen behaviour on an HDR
 > panel.
 >
-> Performance II N0 source parity is Android build 24: the Media3 controller
+> Performance II N0 source parity is included in Android build 25: the Media3 controller
 > posts authenticated `ttff`, passive six-second `stall`, and
 > `playback_error` events through the shared client, with attempt and live HLS
 > session identity. TTFF starts before the detail/decision requests. A stall is
@@ -36,6 +36,15 @@ for that viewer and keeps server administration out of the comparison.
 > and lint prove the wire, controller wiring, reason, and timing contracts; a
 > physical Android play producing a joined `ttff` row remains an explicit,
 > unclaimed acceptance run.
+>
+> Build 25 also replaces Android 14+ boot-time `dataSync` service recovery with
+> a persisted user-initiated data-transfer job. The local intent and selected
+> network constraint are committed synchronously; Media3 stays paused and its
+> HTTP source fails closed until the job supplies a network for both socket and
+> DNS resolution. Android 6–13 retain the boot/Media3-restart service path.
+> Task Manager and timeout stops persist as an explicit Resume state. An active
+> build-24 transfer cannot be retroactively given a persisted UIDT registration
+> after upgrade without a foreground user action, so it needs one Resume tap.
 
 ## Viewer surface
 
