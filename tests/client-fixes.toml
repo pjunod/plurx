@@ -86,6 +86,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownl
 test_anchor = "restoredNetworkPolicyKeepsTheSavedTransportRequirement"
 
 [[fixes]]
+id = "android.unattended-offline-recovery"
+commits = ["e0b7e6e"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/offline/OfflineDownloads.kt"
+source_anchor = "internal fun coldStartStopReason("
+test = "clients/android/app/src/test/java/tv/plurx/app/data/offline/OfflineDownloadsTest.kt"
+test_anchor = "coldStartOnlyAddsUidtOwnershipToAnUnstoppedTransfer"
+
+[[fixes]]
 id = "apple.seek-window-routing"
 commits = ["3e08de6f"]
 source = "clients/apple/Sources/PlayerController.swift"
