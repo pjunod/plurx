@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.OfflineRecord
+import tv.plurx.app.data.offline.needsExplicitResume
 import tv.plurx.app.ui.components.SafeTopRow
 import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Accent
@@ -133,7 +134,7 @@ fun DownloadsScreen(
                         onOpen = {
                             when {
                                 record.isPlayable -> onPlay(record.id)
-                                record.state == "paused" -> vm.resumeOffline(record)
+                                record.needsExplicitResume -> vm.resumeOffline(record)
                             }
                         },
                         onRemove = { vm.removeOffline(record) },

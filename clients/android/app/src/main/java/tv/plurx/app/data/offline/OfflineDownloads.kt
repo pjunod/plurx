@@ -5,7 +5,9 @@ package tv.plurx.app.data.offline
 
 import android.content.Context
 import android.content.res.Configuration
+import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Looper
@@ -26,6 +28,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -76,13 +79,21 @@ data class OfflineQueueRequest(
 
 /** Process-wide owner of the one non-evicting Media3 cache and DownloadManager. */
 object OfflineDownloads {
+    private data class StopReasonAcknowledgement(
+        val expected: Int,
+        val completion: CompletableDeferred<Unit>,
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val secureRandom = SecureRandom()
     private val preparationJobs = mutableMapOf<String, Job>()
     private val activeApis = ConcurrentHashMap<String, PlurxApi>()
     private val addAcknowledgements = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private val stopReasonAcknowledgements =
+        ConcurrentHashMap<String, StopReasonAcknowledgement>()
     private val transferSequence = AtomicLong(1)
+    private val networkPolicyGeneration = AtomicLong(0)
     private lateinit var appContext: Context
     private lateinit var database: StandaloneDatabaseProvider
     private lateinit var recovery: OfflineRecoveryStore
@@ -177,6 +188,17 @@ object OfflineDownloads {
                 ) {
                     check(Looper.myLooper() == Looper.getMainLooper())
                     addAcknowledgements.remove(download.request.id)?.complete(Unit)
+                    stopReasonAcknowledgements[download.request.id]
+                        ?.takeIf { it.expected == download.stopReason }
+                        ?.let { acknowledgement ->
+                            if (stopReasonAcknowledgements.remove(
+                                    download.request.id,
+                                    acknowledgement,
+                                )
+                            ) {
+                                acknowledgement.completion.complete(Unit)
+                            }
+                        }
                     val snapshot = DownloadSnapshot.from(
                         download,
                         finalException?.message,
@@ -239,14 +261,14 @@ object OfflineDownloads {
         }
     }
 
-    fun resumePending(template: OfflineQueueRequest, explicitUserResume: Boolean = false) {
+    fun resumePending(template: OfflineQueueRequest, explicitResumeId: String? = null) {
         // DownloadManager is process-local and starts with the conservative
         // Wi-Fi-only requirement below. Reapply the persisted viewer policy
         // before restoring rows, otherwise an "Any network" transfer that was
         // active before process death comes back queued and never resumes.
-        setNetworkPolicy(template.network)
         val profile = catalog.profile(template.serverInstanceId, template.userId)
         profile.forEach { record ->
+            val explicitUserResume = isExplicitResumeTarget(record.id, explicitResumeId)
             // Media3 owns transfer progress across process death, but the API
             // object that releases the server package is process-local. Bind
             // every restored row to the now-authenticated profile before
@@ -275,9 +297,67 @@ object OfflineDownloads {
     }
 
     fun setNetworkPolicy(policy: OfflineNetwork) {
+        val changed = recovery.networkPolicy() != policy
         recovery.setNetworkPolicy(policy)
         runOnManager { requirements = offlineRequirements(policy) }
+        if (changed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            reconfigureUidtTransfers(policy, networkPolicyGeneration.incrementAndGet())
+        }
     }
+
+    @androidx.annotation.RequiresApi(34)
+    private fun reconfigureUidtTransfers(policy: OfflineNetwork, policyGeneration: Long) {
+        val transfers = catalog.records.value.filter { record ->
+            recovery.existingJobId(record.id) != null &&
+                recovery.transferState(record.id) in setOf(
+                    TransferRecoveryState.Active,
+                    TransferRecoveryState.WaitingForJob,
+                )
+        }
+        runOnManager {
+            transfers.forEach { record ->
+                transferDataSource.revokeCurrent(record.id)
+                recovery.setTransferState(record.id, TransferRecoveryState.WaitingForJob)
+                // Start undispatched while still on the app looper so the
+                // fail-closed binding revocation is immediately followed by
+                // Media3's queued stop transition. Job replacement waits for
+                // the listener acknowledgement that the stop is durable.
+                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    if (!awaitStopReason(record.id, UIDT_WAITING_REASON)) {
+                        catalog.update(record.id) {
+                            it.copy(
+                                state = "ready",
+                                phase = "waiting_for_foreground",
+                                errorMessage = "Tap Resume to start this download",
+                            )
+                        }
+                        return@launch
+                    }
+                    if (networkPolicyGeneration.get() != policyGeneration) return@launch
+                    val scheduled = runCatching {
+                        OfflineTransferJobService.schedule(
+                            appContext,
+                            checkNotNull(recovery.existingJobId(record.id)),
+                            record.id,
+                            policy,
+                            record.bytesTotal,
+                        )
+                    }.getOrDefault(false)
+                    if (!scheduled) {
+                        catalog.update(record.id) {
+                            it.copy(
+                                state = "ready",
+                                phase = "waiting_for_foreground",
+                                errorMessage = "Tap Resume to start this download",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun currentNetworkPolicy(): OfflineNetwork = recovery.networkPolicy()
 
     fun remove(record: OfflineRecord, api: PlurxApi? = null) {
         synchronized(preparationJobs) { preparationJobs.remove(record.id) }?.cancel()
@@ -310,6 +390,12 @@ object OfflineDownloads {
         return ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(cacheOnly))
             .build()
+    }
+
+    suspend fun completedDownloadRequest(id: String): DownloadRequest? = withManager {
+        downloadIndex.getDownload(id)
+            ?.takeIf { it.state == Download.STATE_COMPLETED }
+            ?.request
     }
 
     private suspend fun prepare(
@@ -482,6 +568,23 @@ object OfflineDownloads {
                 return
             }
             recovery.setTransferState(record.id, TransferRecoveryState.WaitingForJob)
+            val currentStopReason = withManager {
+                downloadIndex.getDownload(record.id)?.stopReason ?: UIDT_WAITING_REASON
+            }
+            val waitingReason = explicitResumeStopReason(
+                currentStopReason,
+                isTappedRow = true,
+            )
+            if (!awaitStopReason(record.id, waitingReason)) {
+                catalog.update(record.id) {
+                    it.copy(
+                        state = "ready",
+                        phase = "waiting_for_foreground",
+                        errorMessage = "Tap Resume to start this download",
+                    )
+                }
+                return
+            }
             catalog.update(record.id) {
                 it.copy(
                     state = "ready",
@@ -537,6 +640,7 @@ object OfflineDownloads {
     private suspend fun removeNow(record: OfflineRecord, api: PlurxApi?) {
         synchronized(preparationJobs) { preparationJobs.remove(record.id) }?.cancel()
         addAcknowledgements.remove(record.id)?.cancel()
+        stopReasonAcknowledgements.remove(record.id)?.completion?.cancel()
         activeApis.remove(record.id)
         val latest = catalog.record(record.id) ?: record
         recovery.existingJobId(record.id)?.let { jobId ->
@@ -647,17 +751,23 @@ object OfflineDownloads {
         }
     }
 
-    internal fun bindUidtNetwork(id: String, network: Network) {
+    internal fun bindUidtNetwork(id: String, network: Network, owner: Long): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
-        val manifest = catalog.record(id)?.manifestUrl ?: return
-        transferDataSource.bind(id, manifest, network)
+        if (!uidtNetworkSatisfiesCurrentPolicy(network)) return false
+        val manifest = catalog.record(id)?.manifestUrl ?: return false
+        transferDataSource.bind(id, owner, manifest, network)
+        return true
     }
 
-    internal suspend fun runUserInitiatedTransfer(id: String, network: Network): Boolean {
+    internal suspend fun runUserInitiatedTransfer(
+        id: String,
+        network: Network,
+        owner: Long,
+    ): Boolean {
         try {
             while (!withManager { isInitialized }) delay(25)
             val started = withManager {
-                bindUidtNetwork(id, network)
+                if (!bindUidtNetwork(id, network, owner)) return@withManager false
                 val current = downloadIndex.getDownload(id) ?: return@withManager false
                 if (
                     current.stopReason != UIDT_WAITING_REASON &&
@@ -686,17 +796,35 @@ object OfflineDownloads {
             }
         } finally {
             withContext(NonCancellable + Dispatchers.Main.immediate) {
-                transferDataSource.clear(id)
+                transferDataSource.revoke(id, owner)
             }
         }
     }
 
-    internal fun replaceUidtNetwork(id: String, network: Network) {
+    internal fun replaceUidtNetwork(id: String, network: Network, owner: Long) {
         check(Looper.myLooper() == Looper.getMainLooper())
         manager.setStopReason(id, UIDT_WAITING_REASON)
-        bindUidtNetwork(id, network)
+        transferDataSource.revoke(id, owner)
+        if (!bindUidtNetwork(id, network, owner)) {
+            pauseForJobRetry(id)
+            return
+        }
         manager.setStopReason(id, Download.STOP_REASON_NONE)
         manager.resumeDownloads()
+    }
+
+    internal fun revokeUidtNetwork(id: String, owner: Long) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        transferDataSource.revoke(id, owner)
+    }
+
+    internal fun uidtNetworkSatisfiesCurrentPolicy(network: Network): Boolean {
+        val capabilities = appContext.getSystemService(ConnectivityManager::class.java)
+            .getNetworkCapabilities(network) ?: return false
+        return networkSatisfiesPolicy(
+            recovery.networkPolicy(),
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+        )
     }
 
     internal fun pauseForSystem(id: String, reason: Int) {
@@ -739,6 +867,33 @@ object OfflineDownloads {
             manager.block()
         }
 
+    /** Wait until Media3's internal thread has persisted the ownership stop reason. */
+    private suspend fun awaitStopReason(id: String, expected: Int): Boolean {
+        if (withManager { downloadIndex.getDownload(id)?.stopReason } == expected) return true
+        val completion = CompletableDeferred<Unit>()
+        val acknowledgement = StopReasonAcknowledgement(expected, completion)
+        stopReasonAcknowledgements.put(id, acknowledgement)
+            ?.completion
+            ?.cancel()
+        withManager {
+            setStopReason(id, expected)
+            if (
+                downloadIndex.getDownload(id)?.stopReason == expected &&
+                stopReasonAcknowledgements.remove(id, acknowledgement)
+            ) {
+                completion.complete(Unit)
+            }
+        }
+        return try {
+            withTimeoutOrNull(STOP_REASON_ACK_TIMEOUT_MS) {
+                completion.await()
+                true
+            } ?: false
+        } finally {
+            stopReasonAcknowledgements.remove(id, acknowledgement)
+        }
+    }
+
     private fun runOnManager(block: DownloadManagerAction<Unit>) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             manager.block()
@@ -755,6 +910,7 @@ object OfflineDownloads {
     const val UIDT_WAITING_REASON = 10_003
 
     private const val ADD_ACK_TIMEOUT_MS = 5_000L
+    private const val STOP_REASON_ACK_TIMEOUT_MS = 5_000L
     private const val TRANSFER_POLL_MS = 1_000L
 }
 
@@ -824,8 +980,30 @@ internal fun offlineRequirements(policy: OfflineNetwork): Requirements {
     return Requirements(network or Requirements.DEVICE_STORAGE_NOT_LOW)
 }
 
+internal fun authoritativeOfflineNetwork(
+    recovery: OfflineNetwork,
+    @Suppress("UNUSED_PARAMETER") legacyDataStore: OfflineNetwork,
+): OfflineNetwork = recovery
+
+internal fun networkSatisfiesPolicy(policy: OfflineNetwork, isUnmetered: Boolean): Boolean =
+    policy == OfflineNetwork.Any || isUnmetered
+
 internal val OfflineRecord.needsServerCompletion: Boolean
     get() = state == "completed" && packageId != null
+
+internal val OfflineRecord.needsExplicitResume: Boolean
+    get() = state == "paused" ||
+        (state == "ready" && phase in setOf("waiting_for_foreground", "waiting_for_transfer_job"))
+
+internal fun isExplicitResumeTarget(recordId: String, explicitResumeId: String?): Boolean =
+    explicitResumeId != null && recordId == explicitResumeId
+
+internal fun explicitResumeStopReason(current: Int, isTappedRow: Boolean): Int =
+    if (isTappedRow) {
+        OfflineDownloads.UIDT_WAITING_REASON
+    } else {
+        current
+    }
 
 internal fun offlineStreamKeys(hasSubtitle: Boolean): List<StreamKey> = buildList {
     add(StreamKey(HlsMultivariantPlaylist.GROUP_INDEX_VARIANT, 0))

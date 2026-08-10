@@ -13,6 +13,8 @@ import android.content.Context
 import android.os.PersistableBundle
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -20,17 +22,26 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import tv.plurx.app.R
 import tv.plurx.app.data.OfflineNetwork
+import java.util.concurrent.atomic.AtomicLong
 
 /** Android 14+ owner for user-requested, persisted offline transfers. */
 class OfflineTransferJobService : JobService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val running = mutableMapOf<Int, Job>()
+    private data class RunningTransfer(val downloadId: String, val owner: Long, val job: Job)
+
+    // Non-immediate Main is intentional: a fast missing/stopped row must not
+    // call jobFinished before onStartJob has returned true to the framework.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val running = mutableMapOf<Int, RunningTransfer>()
 
     override fun onStartJob(parameters: JobParameters): Boolean {
         val id = parameters.extras.getString(EXTRA_DOWNLOAD_ID) ?: return false
         val network = parameters.network
         if (network == null) {
             OfflineDownloads.pauseForSystem(id, OfflineDownloads.SYSTEM_INTERRUPTED_REASON)
+            return false
+        }
+        if (!OfflineDownloads.uidtNetworkSatisfiesCurrentPolicy(network)) {
+            OfflineDownloads.pauseForJobRetry(id)
             return false
         }
         ensureChannel()
@@ -46,24 +57,58 @@ class OfflineTransferJobService : JobService() {
                 .build(),
             JOB_END_NOTIFICATION_POLICY_REMOVE,
         )
-        running[parameters.jobId] = scope.launch {
-            OfflineDownloads.runUserInitiatedTransfer(id, network)
-            running.remove(parameters.jobId)
-            // A constraint loss arrives through onStopJob. Missing, failed,
-            // completed, and explicitly stopped rows must not self-reschedule.
-            jobFinished(parameters, false)
+        val owner = NEXT_OWNER.getAndIncrement()
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            var finishNormally = false
+            try {
+                OfflineDownloads.runUserInitiatedTransfer(id, network, owner)
+                finishNormally = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Fail closed. A corrupt index, persistence failure, or other
+                // unexpected owner error must not leave a scheduler wakelock
+                // and notification alive until timeout.
+                runCatching {
+                    OfflineDownloads.pauseForSystem(
+                        id,
+                        OfflineDownloads.SYSTEM_INTERRUPTED_REASON,
+                    )
+                }
+                finishNormally = true
+            } finally {
+                val current = running[parameters.jobId]
+                if (current?.owner == owner) {
+                    running.remove(parameters.jobId)
+                    if (finishNormally) {
+                        // Constraint loss reaches onStopJob instead. Terminal,
+                        // missing, failed, and explicit-pause rows do not retry.
+                        jobFinished(parameters, false)
+                    }
+                }
+            }
         }
+        running[parameters.jobId] = RunningTransfer(id, owner, job)
+        job.start()
         return true
     }
 
     override fun onNetworkChanged(parameters: JobParameters) {
         val id = parameters.extras.getString(EXTRA_DOWNLOAD_ID) ?: return
-        parameters.network?.let { network -> OfflineDownloads.replaceUidtNetwork(id, network) }
+        val active = running[parameters.jobId] ?: return
+        parameters.network?.let { network ->
+            OfflineDownloads.replaceUidtNetwork(id, network, active.owner)
+        }
     }
 
     override fun onStopJob(parameters: JobParameters): Boolean {
-        running.remove(parameters.jobId)?.cancel()
         val id = parameters.extras.getString(EXTRA_DOWNLOAD_ID) ?: return false
+        val active = running.remove(parameters.jobId)
+        // Revoke sockets synchronously before returning UIDT ownership to the
+        // system. Generation matching prevents an old job from touching a
+        // replacement that already owns the same download id.
+        active?.let { OfflineDownloads.revokeUidtNetwork(id, it.owner) }
+        active?.job?.cancel()
         if (parameters.stopReason == JobParameters.STOP_REASON_CANCELLED_BY_APP) return false
         if (jobStopRequiresExplicitResume(parameters.stopReason)) {
             val reason = if (
@@ -85,6 +130,10 @@ class OfflineTransferJobService : JobService() {
     }
 
     override fun onDestroy() {
+        running.values.forEach { transfer ->
+            OfflineDownloads.revokeUidtNetwork(transfer.downloadId, transfer.owner)
+        }
+        running.clear()
         scope.cancel()
         super.onDestroy()
     }
@@ -102,6 +151,7 @@ class OfflineTransferJobService : JobService() {
     companion object {
         private const val EXTRA_DOWNLOAD_ID = "download_id"
         private const val CHANNEL_ID = "offline-downloads"
+        private val NEXT_OWNER = AtomicLong(1)
         fun schedule(
             context: Context,
             jobId: Int,
@@ -117,13 +167,7 @@ class OfflineTransferJobService : JobService() {
                 .setUserInitiated(true)
                 .setPersisted(true)
                 .setRequiresStorageNotLow(true)
-                .setRequiredNetworkType(
-                    if (policy == OfflineNetwork.WifiOnly) {
-                        JobInfo.NETWORK_TYPE_UNMETERED
-                    } else {
-                        JobInfo.NETWORK_TYPE_ANY
-                    },
-                )
+                .setRequiredNetworkType(uidtNetworkType(policy))
                 .setExtras(extras)
             if (estimatedBytes != null && estimatedBytes > 0) {
                 builder.setEstimatedNetworkBytes(estimatedBytes, 0)
@@ -137,3 +181,10 @@ class OfflineTransferJobService : JobService() {
         }
     }
 }
+
+internal fun uidtNetworkType(policy: OfflineNetwork): Int =
+    if (policy == OfflineNetwork.WifiOnly) {
+        JobInfo.NETWORK_TYPE_UNMETERED
+    } else {
+        JobInfo.NETWORK_TYPE_ANY
+    }

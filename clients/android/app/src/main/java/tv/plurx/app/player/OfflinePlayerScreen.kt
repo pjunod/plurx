@@ -28,7 +28,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.ui.components.TvButton
 
@@ -44,14 +43,12 @@ fun OfflinePlayerScreen(downloadId: String, onExit: () -> Unit) {
     BackHandler(onBack = onExit)
 
     LaunchedEffect(downloadId) {
-        val download = withContext(Dispatchers.IO) {
-            runCatching { OfflineDownloads.manager.downloadIndex.getDownload(downloadId) }.getOrNull()
-        }
-        if (download == null || download.state != androidx.media3.exoplayer.offline.Download.STATE_COMPLETED) {
+        val request = runCatching { OfflineDownloads.completedDownloadRequest(downloadId) }.getOrNull()
+        if (request == null) {
             failure = "Download incomplete"
             return@LaunchedEffect
         }
-        player.setMediaItem(download.request.toMediaItem(), record?.positionMs ?: 0)
+        player.setMediaItem(request.toMediaItem(), record?.positionMs ?: 0)
         player.prepare()
         player.playWhenReady = true
     }
