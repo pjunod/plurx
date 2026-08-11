@@ -13,7 +13,9 @@ import android.os.Build
 import android.os.Looper
 import androidx.media3.common.StreamKey
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException
 import androidx.media3.datasource.PlaceholderDataSource
+import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
@@ -42,7 +44,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import tv.plurx.app.data.ConnectionFailure
 import tv.plurx.app.data.CreateOfflinePackageReq
+import tv.plurx.app.data.classifyNamedTransport
+import tv.plurx.app.data.copyFor
+import tv.plurx.app.data.hasValidatedNetwork
+import tv.plurx.app.data.isCancellation
 import tv.plurx.app.data.OfflineLeaseReq
 import tv.plurx.app.data.OfflineNetwork
 import tv.plurx.app.data.Net
@@ -201,7 +208,9 @@ object OfflineDownloads {
                         }
                     val snapshot = DownloadSnapshot.from(
                         download,
-                        finalException?.message,
+                        finalException?.let { failed ->
+                            transferFailureMessage(failed, hasValidatedNetwork(appContext))
+                        },
                         transferSequence.getAndIncrement(),
                     )
                     scope.launch { reflect(snapshot) }
@@ -480,9 +489,7 @@ object OfflineDownloads {
                 request.origin.trimEnd('/') + lease.manifest_url
             }
             val required = (lease.bytes * 1.10).toLong() + 256L * 1024 * 1024
-            check(appContext.filesDir.usableSpace >= required) {
-                "Not enough device storage for this download"
-            }
+            check(appContext.filesDir.usableSpace >= required) { NOT_ENOUGH_STORAGE }
             record = (catalog.record(id) ?: return).copy(
                 packageId = status.id,
                 manifestUrl = manifest,
@@ -513,8 +520,18 @@ object OfflineDownloads {
                 )
             }
         } catch (error: Exception) {
+            // `DownloadsScreen` renders this string, so it may not be a native
+            // one. Two failures reaching here are ours and already say
+            // something the viewer can act on — NOT_ENOUGH_STORAGE and the
+            // server's own preparation error — so an IllegalStateException
+            // keeps its message. Everything else goes through the same
+            // preparation/transfer rule as the Media3 listener, so the two
+            // paths cannot say different things on the same line.
+            val message = (error as? IllegalStateException)?.message
+                ?: transferFailureMessage(error, hasValidatedNetwork(appContext))
+                ?: return
             catalog.update(id) {
-                it.copy(state = "failed", phase = "failed", errorMessage = error.message)
+                it.copy(state = "failed", phase = "failed", errorMessage = message)
             }
         }
     }
@@ -913,6 +930,70 @@ object OfflineDownloads {
     private const val STOP_REASON_ACK_TIMEOUT_MS = 5_000L
     private const val TRANSFER_POLL_MS = 1_000L
 }
+
+/**
+ * The one sentence in this file the contract does not own, because a full disk
+ * is not a connectivity failure. Shared by the pre-flight space check and by
+ * [transferFailureMessage] so the viewer sees the same words either way.
+ */
+internal const val NOT_ENOUGH_STORAGE = "Not enough device storage for this download"
+
+/**
+ * What `DownloadsScreen` says when an offline download fails.
+ *
+ * **Not everything that fails a download is a transport failure**, and this is
+ * the whole point of the function. Media3 reports a cache write that ran out of
+ * disk, a response the server genuinely sent, and a dropped connection as
+ * `IOException`s alike — so handing them all to [classify] answers "Can't reach
+ * {server}." for a 12 GB download that filled the device, and the viewer goes
+ * off to power-cycle a router that was working perfectly.
+ *
+ * The order is therefore: not-a-failure, then disk, then what the server
+ * actually answered, then — only for a chain that *names* a transport failure —
+ * the contract class. Anything left keeps the message it had before the
+ * taxonomy existed, because inventing a class for it would be a guess.
+ *
+ * Returns `null` when there is nothing to say (the transfer was cancelled).
+ */
+internal fun transferFailureMessage(error: Throwable, hasNetwork: Boolean): String? {
+    if (isCancellation(error)) return null
+
+    val chain = generateSequence(error, Throwable::cause).take(16).toList()
+
+    // Media3 writes into the app's own cache directory; a commit failure there
+    // is a disk problem wearing an IOException.
+    if (chain.any { it is Cache.CacheException || it.looksLikeNoSpaceLeft }) return NOT_ENOUGH_STORAGE
+
+    // The server answered. 5xx is the taxonomy's `server_error`; a 401, 403 or
+    // 404 is something specific the server said, and the taxonomy has no class
+    // for it, so its own message stands rather than a guess.
+    chain.filterIsInstance<InvalidResponseCodeException>().firstOrNull()?.let { answered ->
+        return if (answered.responseCode in 500..599) {
+            copyFor(ConnectionFailure.SERVER_ERROR, OFFLINE_SERVER_LABEL).short
+        } else {
+            error.message
+        }
+    }
+
+    return classifyNamedTransport(error, hasNetwork)
+        ?.let { copyFor(it, OFFLINE_SERVER_LABEL).short }
+        ?: error.message
+}
+
+/**
+ * `{server}` on the Downloads list resolves to the contract's fallback.
+ *
+ * A download outlives the session that queued it: `OfflineRecord` keeps no
+ * origin, and Media3's transfer callbacks carry none, so the preparation path
+ * (which does have `request.origin`) and the transfer path would otherwise put
+ * "Can't reach http://192.168.1.10:32400." and "Can't reach the server." on the
+ * same line of the same screen. One label, deliberately the vaguer one.
+ */
+private val OFFLINE_SERVER_LABEL: String? = null
+
+private val Throwable.looksLikeNoSpaceLeft: Boolean
+    get() = message?.contains("ENOSPC", ignoreCase = true) == true ||
+        message?.contains("No space left on device", ignoreCase = true) == true
 
 internal data class DownloadSnapshot(
     val id: String,

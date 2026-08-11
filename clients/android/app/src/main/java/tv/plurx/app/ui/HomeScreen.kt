@@ -42,11 +42,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import tv.plurx.app.data.ConnectionSurface
+import tv.plurx.app.data.connectionSurfaceFor
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.Library
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
+import tv.plurx.app.ui.components.ConnectionErrorBanner
+import tv.plurx.app.ui.components.ConnectionErrorState
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.MediaRow
@@ -101,9 +105,16 @@ fun HomeScreen(
             // dashboard the viewer is already reading, and neither must a
             // refresh that fails.
             !state.hasContent && state.loading -> LoadingBox()
-            !state.hasContent && state.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(state.error!!, color = Muted)
-            }
+            // Nothing to protect: the full surface, with the class's own
+            // actions. It used to be a bare line of raw `Throwable.message`
+            // with no way to try again from inside the box.
+            connectionSurfaceFor(state.failure, state.hasContent) == ConnectionSurface.Full ->
+                ConnectionErrorState(
+                    failure = state.failure!!,
+                    server = vm.serverLabel,
+                    onRetry = vm::loadHome,
+                    onChangeServer = vm::changeServer,
+                )
             else -> {
                 val collections = homeCollections(state.libraries, state.libraryItems, preferences.homeGrouping)
                 val continueShelfItems = continueWatchingShelfItems(
@@ -168,6 +179,16 @@ fun HomeScreen(
                         .verticalScroll(rememberScrollState())
                         .padding(bottom = 32.dp)
                 ) {
+                    // `cached_content_wins`: a refresh that failed over a
+                    // dashboard the viewer is already reading says so in one
+                    // line and leaves the shelves alone.
+                    if (connectionSurfaceFor(state.failure, state.hasContent) == ConnectionSurface.Banner) {
+                        ConnectionErrorBanner(
+                            failure = state.failure!!,
+                            server = vm.serverLabel,
+                            onRetry = vm::loadHome,
+                        )
+                    }
                     if (formFactor == FormFactor.Compact) {
                         state.hubs.continue_watching.firstOrNull()?.let { featured ->
                             CompactContinueHero(

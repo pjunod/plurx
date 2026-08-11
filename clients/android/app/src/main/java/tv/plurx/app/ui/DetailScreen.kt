@@ -59,9 +59,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import tv.plurx.app.data.ConnectionFailure
+import tv.plurx.app.data.ConnectionSurface
+import tv.plurx.app.data.connectionSurfaceFor
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
 import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.ui.components.ConnectionErrorBanner
+import tv.plurx.app.ui.components.ConnectionErrorState
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.NetworkImage
@@ -86,7 +91,7 @@ import tv.plurx.app.data.offline.needsExplicitResume
 
 private data class DetailLoad(
     val detail: ItemDetail? = null,
-    val error: String? = null,
+    val failure: ConnectionFailure? = null,
 )
 
 @Composable
@@ -105,7 +110,12 @@ fun DetailScreen(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            DetailLoad(error = e.message ?: "Couldn't load this item")
+            // `refresh` re-runs this after a watched-state toggle, so this is
+            // also the "a refresh failed over content already on screen" case.
+            // Carrying the previous detail forward is what lets
+            // `connectionSurfaceFor` answer Banner instead of blanking a page
+            // the viewer is reading (`cached_content_wins`).
+            DetailLoad(detail = value?.detail, failure = vm.connectionFailure(e))
         }
     }
     // Resolving "which episode does Play mean" walks seasons and episodes
@@ -124,25 +134,42 @@ fun DetailScreen(
         }
     }
 
+    val surface = connectionSurfaceFor(load?.failure, detail != null)
+
     when {
         load == null -> Box(Modifier.fillMaxSize()) {
             LoadingBox()
             DetailBackButton(onBack)
         }
-        load?.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        surface == ConnectionSurface.Full -> Box(Modifier.fillMaxSize()) {
             DetailBackButton(onBack)
-            Text(load?.error.orEmpty(), color = MaterialTheme.colorScheme.error)
+            ConnectionErrorState(
+                failure = load!!.failure!!,
+                server = vm.serverLabel,
+                // The detail page reloads itself; `refresh` is the same key
+                // the watched-state toggle already turns.
+                onRetry = { refresh++ },
+            )
         }
-        else -> DetailContent(
-            vm = vm,
-            detail = load!!.detail!!,
-            seriesPlayback = seriesPlayback,
-            onPlay = onPlay,
-            onOpenItem = onOpenItem,
-            onViewPhoto = onViewPhoto,
-            onWatchedChanged = { refresh++ },
-            onBack = onBack,
-        )
+        else -> Column(Modifier.fillMaxSize()) {
+            if (surface == ConnectionSurface.Banner) {
+                ConnectionErrorBanner(
+                    failure = load!!.failure!!,
+                    server = vm.serverLabel,
+                    onRetry = { refresh++ },
+                )
+            }
+            DetailContent(
+                vm = vm,
+                detail = load!!.detail!!,
+                seriesPlayback = seriesPlayback,
+                onPlay = onPlay,
+                onOpenItem = onOpenItem,
+                onViewPhoto = onViewPhoto,
+                onWatchedChanged = { refresh++ },
+                onBack = onBack,
+            )
+        }
     }
 }
 

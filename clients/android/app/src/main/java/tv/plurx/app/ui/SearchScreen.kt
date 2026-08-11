@@ -17,12 +17,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -35,7 +35,12 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import tv.plurx.app.data.ConnectionFailure
+import tv.plurx.app.data.ConnectionSurface
+import tv.plurx.app.data.connectionSurfaceFor
 import tv.plurx.app.data.Item
+import tv.plurx.app.ui.components.ConnectionErrorBanner
+import tv.plurx.app.ui.components.ConnectionErrorState
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeTopRow
@@ -57,18 +62,20 @@ fun SearchScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf<List<Item>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
+    var failure by remember { mutableStateOf<ConnectionFailure?>(null) }
+    // Retry re-runs the effect without the viewer retyping the query.
+    var retry by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(query) {
+    LaunchedEffect(query, retry) {
         if (query.isBlank()) {
             results = emptyList()
             loading = false
-            error = null
+            failure = null
             return@LaunchedEffect
         }
         delay(300)
         loading = true
-        error = null
+        failure = null
         try {
             results = vm.search(query)
         } catch (cancelled: CancellationException) {
@@ -77,11 +84,15 @@ fun SearchScreen(
             // the field for the length of the debounce on every fast typist.
             throw cancelled
         } catch (e: Exception) {
-            error = e.message ?: "Search failed"
+            // `results` is deliberately left alone — a failed re-search must
+            // not sweep away what the viewer is still reading.
+            failure = vm.connectionFailure(e)
         } finally {
             loading = false
         }
     }
+
+    val surface = connectionSurfaceFor(failure, results.isNotEmpty())
 
     Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
         SafeTopRow(
@@ -104,11 +115,24 @@ fun SearchScreen(
             )
         }
 
+        // A search that failed over results already on screen keeps them and
+        // says so in one line (`cached_content_wins`) — the viewer was probably
+        // still reading them.
+        if (surface == ConnectionSurface.Banner) {
+            ConnectionErrorBanner(
+                failure = failure!!,
+                server = vm.serverLabel,
+                onRetry = { retry++ },
+            )
+        }
+
         when {
             loading -> LoadingBox()
-            error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(error.orEmpty(), color = MaterialTheme.colorScheme.error)
-            }
+            surface == ConnectionSurface.Full -> ConnectionErrorState(
+                failure = failure!!,
+                server = vm.serverLabel,
+                onRetry = { retry++ },
+            )
             query.isBlank() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Search your library", color = Muted)
             }

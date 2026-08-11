@@ -18,6 +18,11 @@ import retrofit2.HttpException
 import java.net.URI
 import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
+import tv.plurx.app.data.ConnectionFailure
+import tv.plurx.app.data.classify
+import tv.plurx.app.data.copyFor
+import tv.plurx.app.data.hasValidatedNetwork
+import tv.plurx.app.data.isCancellation
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.PlaybackQuality
 import tv.plurx.app.data.OfflineNetwork
@@ -62,7 +67,10 @@ data class HomeState(
     val libraries: List<Library> = emptyList(),
     val libraryItems: Map<Long, List<Item>> = emptyMap(),
     val loading: Boolean = true,
-    val error: String? = null,
+    // The failure *class*, not a rendered sentence: the composable decides
+    // whether this surface gets a title/detail/actions or a one-line banner,
+    // and both readings come from the same contract entry.
+    val failure: ConnectionFailure? = null,
 ) {
     /** Anything worth painting. A spinner over real content is a regression. */
     val hasContent: Boolean
@@ -128,6 +136,32 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private var api: PlurxApi? = null
     fun api(): PlurxApi = api ?: error("not connected")
+
+    /** What `{server}` interpolates to: display name, then origin, then null. */
+    val serverLabel: String?
+        get() = serverName?.takeIf { it.isNotBlank() } ?: origin.takeIf { it.isNotBlank() }
+
+    /**
+     * Classify a failure against this device's current network state.
+     *
+     * `null` means **draw nothing**: the request was cancelled, which is a
+     * screen leaving composition or a keystroke superseding a search, not a
+     * failure to report. `catch (e: Exception)` catches `CancellationException`
+     * in Kotlin, so every call site is a place that could otherwise have
+     * painted "Something went wrong" over a navigation.
+     *
+     * A 401/403 has no connectivity class either, but a screen still has to
+     * draw something, so it takes the fallback class — which exists precisely
+     * so nothing falls through to a native string. (Mid-session 401 handling
+     * itself is a gap; see the note on [signInFailureMessage].)
+     */
+    fun connectionFailure(error: Throwable): ConnectionFailure? =
+        if (isCancellation(error)) null
+        else classify(error, hasValidatedNetwork(getApplication())) ?: ConnectionFailure.UNKNOWN
+
+    /** The inline one-liner for a form or a banner. `null` for a cancellation. */
+    fun connectionMessage(error: Throwable, server: String? = null): String? =
+        connectionFailure(error)?.let { copyFor(it, server ?: serverLabel).short }
 
     /** One dashboard load at a time — a refresh replaces the one in flight. */
     private var homeJob: Job? = null
@@ -247,8 +281,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 connectToOrigin(normalized)
-            } catch (_: Exception) {
-                _authError.value = "Couldn't reach a Cinema server at $normalized"
+            } catch (e: Exception) {
+                // This screen is exactly where the distinction earns its keep:
+                // a typo'd address (`unknown_host`), a server that is off
+                // (`unreachable`) and a bad certificate (`insecure`) all used
+                // to read as one flat "Couldn't reach a Cinema server at …".
+                _authError.value = connectionMessage(e, normalized)
             } finally {
                 _busy.value = false
             }
@@ -262,8 +300,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 connectToOrigin(serverBrowser.resolve(server))
             } catch (e: Exception) {
-                _authError.value = e.message
-                    ?: "The discovered server stopped responding. Try scanning again."
+                _authError.value = connectionMessage(e, server.name)
             } finally {
                 _busy.value = false
             }
@@ -298,8 +335,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 loadHome()
                 resumeOfflineProfile()
                 syncOfflineProgress()
-            } catch (_: Exception) {
-                _authError.value = "Wrong username or password"
+            } catch (e: Exception) {
+                // docs §4. Only the server saying 401/403 means the password
+                // was wrong. Everything else is a transport failure, and
+                // telling a viewer whose server is simply off to retype a
+                // correct password was the single most damaging thing this
+                // client did.
+                _authError.value = signInFailureMessage(
+                    error = e,
+                    hasNetwork = hasValidatedNetwork(getApplication()),
+                    server = serverLabel,
+                )
             } finally {
                 _busy.value = false
             }
@@ -319,7 +365,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun loadHome() {
         homeJob?.cancel()
-        _home.value = _home.value.copy(loading = true, error = null)
+        _home.value = _home.value.copy(loading = true, failure = null)
         homeJob = viewModelScope.launch {
             try {
                 coroutineScope {
@@ -347,7 +393,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                _home.value = _home.value.copy(loading = false, error = e.message ?: "Failed to load")
+                _home.value = _home.value.copy(loading = false, failure = connectionFailure(e))
             }
         }
     }
@@ -732,6 +778,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
  * over. Home can retry and say why; the splash can only spin.
  */
 private const val LAUNCH_VALIDATION_TIMEOUT_MS = 12_000L
+
+/**
+ * The only sentence in this app that may accuse the viewer of a typo.
+ *
+ * Its exact words are the contract's `credentials_message`, not a local
+ * choice: it is the sentence a client says *instead of* a class, so a client
+ * that words it differently has quietly reintroduced the split docs §4 exists
+ * to close. `ConnectivityCopyTest` compares this constant to the JSON.
+ */
+internal const val CREDENTIALS_REJECTED = "Wrong username or password"
+
+/**
+ * The sign-in rule from docs §4, as a pure function so it can be tested
+ * without an `Application`:
+ *
+ * ```
+ *  sign-in failed
+ *    ├── HTTP 401 / 403 ──────▶ credentials_message, verbatim
+ *    └── anything else ───────▶ classify() and render that class
+ * ```
+ *
+ * Returns `null` when there is nothing to say — the sign-in was cancelled, and
+ * accusing a viewer of a bad password because they navigated away would be the
+ * same bug in a smaller costume.
+ *
+ * **Known gap, deliberately not fixed here:** this covers sign-in. A 401 that
+ * arrives *mid-session* (a server restart with a new signing secret) has no
+ * runtime handler outside `validateSavedSession`, so it takes the `unknown`
+ * class and offers a Retry that can never succeed. Fixing it needs a re-auth
+ * path this change does not have.
+ */
+internal fun signInFailureMessage(
+    error: Throwable,
+    hasNetwork: Boolean,
+    server: String?,
+): String? {
+    if (isCancellation(error)) return null
+    val failure = classify(error, hasNetwork) ?: return CREDENTIALS_REJECTED
+    return copyFor(failure, server).short
+}
 
 private data class RecoveredServer(val origin: String, val info: Server)
 

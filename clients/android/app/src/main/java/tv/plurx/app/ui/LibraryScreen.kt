@@ -19,6 +19,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -29,8 +30,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CancellationException
+import tv.plurx.app.data.ConnectionFailure
+import tv.plurx.app.data.ConnectionSurface
+import tv.plurx.app.data.connectionSurfaceFor
 import tv.plurx.app.data.Item
 import tv.plurx.app.ui.components.ChoicePicker
+import tv.plurx.app.ui.components.ConnectionErrorBanner
+import tv.plurx.app.ui.components.ConnectionErrorState
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeTopRow
@@ -41,7 +47,10 @@ internal enum class WatchFilter(val label: String) {
     Everything("Everything"), Unwatched("Unwatched"), InProgress("In progress"), Watched("Watched")
 }
 
-private data class LibraryLoad(val items: List<Item> = emptyList(), val error: String? = null)
+private data class LibraryLoad(
+    val items: List<Item> = emptyList(),
+    val failure: ConnectionFailure? = null,
+)
 
 @Composable
 fun LibraryScreen(
@@ -64,7 +73,8 @@ fun LibraryScreen(
     // Keyed on the libraries alone. Sorting is client-side (`sortMerged`), so
     // keying it on `sort` too meant every sort change re-fetched the whole
     // collection behind a spinner to receive the same items back.
-    val load by produceState<LibraryLoad?>(initialValue = null, libraryIds) {
+    var reload by remember(libraryIds) { mutableIntStateOf(0) }
+    val load by produceState<LibraryLoad?>(initialValue = null, libraryIds, reload) {
         val loaded = mutableListOf<Item>()
         try {
             libraryIds.forEach { id ->
@@ -78,18 +88,20 @@ fun LibraryScreen(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            value = if (loaded.isEmpty()) {
-                LibraryLoad(error = e.message ?: "Couldn't load this library")
-            } else {
-                // Some of it arrived; a later page failing is not a reason to
-                // replace what the viewer is already looking at.
-                LibraryLoad(loaded.toList())
-            }
+            // Some of it arrived? Then the failure rides *beside* the items —
+            // `connectionSurfaceFor` turns that into a banner rather than an
+            // error state, and the viewer keeps the grid. Dropping the failure
+            // here (which is what this did) meant a page-2 failure over a
+            // populated grid said nothing at all.
+            value = LibraryLoad(loaded.toList(), failure = vm.connectionFailure(e))
         }
     }
     val shown = remember(load, sort, filter) {
         sortMerged(load?.items.orEmpty(), sort).filter { matchesFilter(it, filter) }
     }
+    // Items already on screen outrank the failure: a page that fails after the
+    // first one landed gets a banner, not an error state (`cached_content_wins`).
+    val surface = connectionSurfaceFor(load?.failure, load?.items.orEmpty().isNotEmpty())
     val posterWidth = (preferences.posterSize.widthDp * formFactor.posterScale()).dp
 
     Column(Modifier.fillMaxSize().navigationBarsPadding()) {
@@ -101,7 +113,7 @@ fun LibraryScreen(
             }
             Column(Modifier.weight(1f)) {
                 Text(title, style = MaterialTheme.typography.titleLarge)
-                if (load != null && load?.error == null) {
+                if (load != null && load?.failure == null) {
                     Text("${shown.size} of ${load?.items?.size ?: 0}", color = Muted, style = MaterialTheme.typography.labelMedium)
                 }
             }
@@ -137,11 +149,21 @@ fun LibraryScreen(
             )
         }
 
+        if (surface == ConnectionSurface.Banner) {
+            ConnectionErrorBanner(
+                failure = load!!.failure!!,
+                server = vm.serverLabel,
+                onRetry = { reload++ },
+            )
+        }
+
         when {
             load == null -> LoadingBox()
-            load?.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(load?.error.orEmpty(), color = MaterialTheme.colorScheme.error)
-            }
+            surface == ConnectionSurface.Full -> ConnectionErrorState(
+                failure = load!!.failure!!,
+                server = vm.serverLabel,
+                onRetry = { reload++ },
+            )
             shown.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(if (filter == WatchFilter.Everything) "This library is empty." else "No titles match this filter.", color = Muted)
             }
