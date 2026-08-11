@@ -79,6 +79,7 @@ const LIBRARY_METHODS: &[&str] = &[
 const MEDIA_METHODS: &[&str] = &[
     "item_by_external_id",
     "find_movie",
+    "find_book",
     "find_show",
     "find_season",
     "find_episode",
@@ -865,7 +866,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 123, "review the Store method count");
+    assert_eq!(declared.len(), 124, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -1186,6 +1187,15 @@ async fn media_contract_runs_through_dyn_store() {
             })
             .await
             .expect("home library");
+        let books = store
+            .create_library(&NewLibrary {
+                name: "Media Contract Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/contract/books")],
+                anime: false,
+            })
+            .await
+            .expect("books library");
 
         let movie = store
             .insert_item(&NewItem {
@@ -1259,6 +1269,30 @@ async fn media_contract_runs_through_dyn_store() {
             })
             .await
             .expect("home folder");
+        let ebook = store
+            .insert_item(&NewItem {
+                library_id: books.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "Shared Contract Title".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("ebook");
+        let audiobook = store
+            .insert_item(&NewItem {
+                library_id: books.id,
+                kind: ItemKind::Audiobook,
+                parent_id: None,
+                title: "Shared Contract Title".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("audiobook");
 
         assert_eq!(
             store
@@ -1277,6 +1311,24 @@ async fn media_contract_runs_through_dyn_store() {
                 .expect("show")
                 .id,
             show
+        );
+        assert_eq!(
+            store
+                .find_book(books.id, ItemKind::Book, "Shared Contract Title", None)
+                .await
+                .expect("find ebook")
+                .expect("ebook")
+                .id,
+            ebook
+        );
+        assert_eq!(
+            store
+                .find_book(books.id, ItemKind::Audiobook, "Shared Contract Title", None,)
+                .await
+                .expect("find audiobook")
+                .expect("audiobook")
+                .id,
+            audiobook
         );
         assert_eq!(
             store

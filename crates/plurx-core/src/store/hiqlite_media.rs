@@ -668,6 +668,28 @@ impl MediaStore for HiqliteAuthStore {
         )
     }
 
+    async fn find_book(
+        &self,
+        library_id: i64,
+        kind: ItemKind,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Option<Item>, StoreError> {
+        debug_assert!(matches!(kind, ItemKind::Book | ItemKind::Audiobook));
+        one_item(
+            self.client()
+                .query_consistent_map::<ItemRow, _>(
+                    format!(
+                        "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
+                         AND kind = $2 AND title = $3 COLLATE NOCASE AND year IS $4"
+                    ),
+                    params!(library_id, kind.as_str(), title, year),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
     async fn find_show(
         &self,
         library_id: i64,
@@ -827,7 +849,7 @@ impl MediaStore for HiqliteAuthStore {
             }
             ItemSort::Recorded => "(recorded_at IS NULL), recorded_at DESC, sort_title ASC",
         };
-        const TOP: &str = "(kind IN ('movie','show') OR \
+        const TOP: &str = "(kind IN ('movie','show','book','audiobook') OR \
              (kind IN ('folder','video','photo') AND parent_id IS NULL))";
         const GENRE: &str = "($2 IS NULL OR EXISTS (SELECT 1 FROM json_each(items.genres) \
              WHERE value = $2 COLLATE NOCASE))";
@@ -880,7 +902,7 @@ impl MediaStore for HiqliteAuthStore {
                  FROM items i \
                  LEFT JOIN items season ON season.id = i.parent_id AND i.kind = 'episode' \
                  LEFT JOIN items show ON show.id = season.parent_id \
-                 WHERE i.kind IN ('movie','episode','video','folder') \
+                 WHERE i.kind IN ('movie','episode','video','folder','book','audiobook') \
                    AND ($1 IS NULL OR i.library_id = $1) \
              ) \
              SELECT {r}, r.rail_show_title, r.rail_season_poster \
@@ -908,7 +930,7 @@ impl MediaStore for HiqliteAuthStore {
              LEFT JOIN items season ON season.id = i.parent_id AND i.kind = 'episode' \
              LEFT JOIN items show ON show.id = season.parent_id \
              WHERE items_fts MATCH $1 \
-               AND i.kind IN ('movie','show','episode','folder','video','photo') \
+               AND i.kind IN ('movie','show','episode','folder','video','photo','book','audiobook') \
              ORDER BY rank LIMIT $2",
             i = item_cols("i")
         );
@@ -1595,7 +1617,7 @@ impl MediaStore for HiqliteAuthStore {
             (
                 "DELETE FROM items WHERE library_id = $1 \
                  AND EXISTS (SELECT 1 FROM scan_reconcile_guards WHERE library_id = $1) \
-                 AND kind IN ('movie','episode','video','photo') \
+                 AND kind IN ('movie','episode','video','photo','book','audiobook') \
                  AND id NOT IN (SELECT item_id FROM files)"
                     .to_owned(),
                 params!(library_id),
@@ -1754,7 +1776,7 @@ impl MediaStore for HiqliteAuthStore {
         let statements = [
             "DELETE FROM scan_reconcile_items WHERE library_id = $1",
             "DELETE FROM items WHERE library_id = $1 \
-             AND kind IN ('movie','episode','video','photo') \
+             AND kind IN ('movie','episode','video','photo','book','audiobook') \
              AND id NOT IN (SELECT item_id FROM files)",
             "DELETE FROM items WHERE library_id = $1 AND kind = 'season' \
              AND id NOT IN (SELECT parent_id FROM items \
@@ -1798,7 +1820,7 @@ impl MediaStore for HiqliteAuthStore {
     }
 }
 
-const PLAYABLE_KINDS: &str = "'movie','episode','video'";
+const PLAYABLE_KINDS: &str = "'movie','episode','video','audiobook'";
 
 #[async_trait]
 impl WatchStore for HiqliteAuthStore {
@@ -2129,7 +2151,7 @@ impl WatchStore for HiqliteAuthStore {
              LEFT JOIN items season ON season.id = i.parent_id AND i.kind = 'episode' \
              LEFT JOIN items show ON show.id = season.parent_id \
              WHERE w.user_id = $1 AND w.watched = 0 AND w.position_ms > 0 \
-               AND i.kind IN ('movie','episode','video') \
+               AND i.kind IN ('movie','episode','video','audiobook') \
              ORDER BY w.updated_at DESC LIMIT $2",
             i = item_cols("i")
         );

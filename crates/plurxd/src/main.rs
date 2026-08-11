@@ -147,8 +147,8 @@ async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::R
         .filter(|library| library_id.is_none_or(|id| library.id == id))
     {
         match library.kind {
-            LibraryKind::Home => {
-                println!("{}: skipped local artwork", library.name);
+            LibraryKind::Books | LibraryKind::Home => {
+                println!("{}: skipped provider artwork", library.name);
             }
             LibraryKind::Shows if library.anime => {
                 let report = metadata::enrich_anime_library(

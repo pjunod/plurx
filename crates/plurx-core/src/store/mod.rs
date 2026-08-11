@@ -324,6 +324,13 @@ pub trait MediaStore: Send + Sync + 'static {
         title: &str,
         year: Option<i32>,
     ) -> Result<Option<Item>, StoreError>;
+    async fn find_book(
+        &self,
+        library_id: i64,
+        kind: ItemKind,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Option<Item>, StoreError>;
     async fn find_show(
         &self,
         library_id: i64,

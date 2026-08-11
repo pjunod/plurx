@@ -301,6 +301,8 @@
   .player{width:100vw;height:100dvh;position:relative;background:#000;display:flex;align-items:center;justify-content:center;cursor:default}
   .player.idle{cursor:none}
   .player video{width:100%;height:100%;max-height:100dvh;background:#000;object-fit:contain}
+  .player.audio{background-color:#090a0d;background-position:center;background-repeat:no-repeat;background-size:min(54vh,54vw);}
+  .player.audio video{opacity:0}
   .pbar{position:absolute;left:0;right:0;top:0;z-index:4;display:flex;justify-content:space-between;align-items:center;gap:10px;
     padding:16px 20px;background:linear-gradient(to bottom,rgba(0,0,0,.74),rgba(0,0,0,0));transition:opacity .2s ease-out;
     pointer-events:none}   /* the bar itself is tap-transparent — only its buttons catch touches, so the browser's native video controls underneath stay reachable */
@@ -2751,6 +2753,8 @@ function artHtml(it, cls){
   if(src) return `<img class="art ${cls||''}" loading="lazy" src="${esc(tok(src))}" alt="">`;
   if(it.kind==='season' && it.season_number!=null)
     return `<div class="art ph season ${cls||''}"><div class="snum">${it.season_number}</div><div class="sl">Season</div></div>`;
+  if(it.kind==='audiobook') return `<div class="art ph ${cls||''}" aria-label="Audiobook">♫</div>`;
+  if(it.kind==='book') return `<div class="art ph ${cls||''}" aria-label="Ebook">Aa</div>`;
   const label=(it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?";
   return `<div class="art ph ${cls||''}">${esc(label)}</div>`;
 }
@@ -3071,8 +3075,12 @@ function card(it, watchCtx){
       ? esc(it.show_title ? (it.title ? `${ep} · ${it.title}` : ep) : ep)
       : it.kind==='video'
         ? esc(fmtDate(it.recorded_at))
+        : it.kind==='audiobook'
+          ? esc(['Audiobook',it.runtime_ms?fmtDur(it.runtime_ms):''].filter(Boolean).join(' · '))
+        : it.kind==='book'
+          ? 'Ebook'
         : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
-  const dur = it.kind==='video'&&it.runtime_ms? `<span class="durbadge">${esc(fmtDur(it.runtime_ms))}</span>`:"";
+  const dur = (it.kind==='video'||it.kind==='audiobook')&&it.runtime_ms? `<span class="durbadge">${esc(fmtDur(it.runtime_ms))}</span>`:"";
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
@@ -3261,11 +3269,12 @@ function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catc
 function libCategory(lib){
   if(lib.kind==="movie"||lib.kind==="movies") return {key:"movie", name:"Movies"};
   if(lib.kind==="show"||lib.kind==="shows")   return {key:"show",  name:"TV Shows"};
+  if(lib.kind==="book"||lib.kind==="books")   return {key:"book",  name:"Books"};
   if(lib.kind==="home")  return {key:"home",  name:"Home videos"};
   const k=lib.kind||"other";
   return {key:k, name:k.charAt(0).toUpperCase()+k.slice(1)};
 }
-function catOrder(key){ return key==="movie"?0:key==="show"?1:key==="home"?2:3; }
+function catOrder(key){ return key==="movie"?0:key==="show"?1:key==="book"?2:key==="home"?3:4; }
 function groupToggleHtml(group){
   return `<div class="libbar" style="margin-top:22px"><div class="row">
     <span class="lbl">Group by</span>
@@ -3915,7 +3924,8 @@ function specBadges(f){
   const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${mediaIcon('video')}${esc(c)}</span>`);
   if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
   const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${mediaIcon('dynamic')}${esc(h.text)}</span>`);
-  const au=premiumAudio(f); if(au) b.push(`<span class="vbadge audio">${mediaIcon('audio')}${esc(au)}</span>`);
+  const au=premiumAudio(f)||((f.audio_streams||[])[0]&&codecLabel(f.audio_streams[0].codec));
+  if(au) b.push(`<span class="vbadge audio">${mediaIcon('audio')}${esc(au)}</span>`);
   return b.join("");
 }
 function playbackAudioChip(a){
@@ -3953,8 +3963,13 @@ function specBlock(f){
   const aud=(f.audio_streams||[]).map(audioLabel).filter(Boolean).join("  /  ")||"—";
   const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size),fmtDur(f.duration_ms)].filter(Boolean).join(" · ");
   return `<dl class="specs">
-    <dt>Video</dt><dd>${esc(vid||"—")}</dd>
+    ${vid?`<dt>Video</dt><dd>${esc(vid)}</dd>`:''}
     <dt>Audio</dt><dd>${esc(aud)}</dd>
+    <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
+}
+function bookSpecBlock(f){
+  const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size)].filter(Boolean).join(" · ");
+  return `<dl class="specs"><dt>Format</dt><dd>${esc((f.container||"book").toUpperCase())}</dd>
     <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
 }
 // A file whose probe never succeeded shows "Video —  Audio —" and no reason.
@@ -4052,21 +4067,67 @@ async function loadItem(id){
   // re-deriving the same cascade of length checks. `folder` covers both the
   // empty folder and the mirrored one, distinguished by children.length.
   const shape = it.kind==='photo' ? "photo"
+    : it.kind==='book' && files.length ? "book"
+    : it.kind==='audiobook' && files.length ? "audiobook"
     : files.length ? "versions"
     : (children.length && children[0].kind==='episode') ? "episodes"
     : children.length ? "children"
     : it.kind==='folder' ? "folder" : "empty";
+  const available=files.filter(f=>f.available);
+  // A multipart audiobook owns one global timeline. Pick the part containing
+  // the saved item position and hand the player a local offset inside it.
+  let playable=available[0]||null, playStart=resume;
+  if(it.kind==='audiobook' && available.length){
+    playable=available[0];
+    for(const f of available){
+      const off=f.part_offset_ms||0, end=off+(f.duration_ms||0);
+      if(resume>=off && (!end||resume<end)) { playable=f; break; }
+      if(resume>=off) playable=f;
+    }
+    playStart=Math.max(0,resume-(playable.part_offset_ms||0));
+  }
   return {kind:"item", id:Number(id), item:it, files, ancestors, children, lib,
     best, multi, runtime, resume, years, shape,
     // The one file a Play button should reach for, and the label for the
     // children grid — both were computed identically in two bodies.
-    playable: files.find(f=>f.available)||null,
+    playable, playStart,
     childLabel: it.kind==='folder' ? 'Contents'
       : (children[0]&&children[0].kind==='season') ? 'Seasons' : 'Episodes',
     meta: playerMeta(it, ancestors),
     // Metadata editing is a home-library affair: elsewhere the provider agent
     // owns the fields and would overwrite a hand edit on the next refresh.
     editable: !!(ME&&ME.is_admin&&lib&&lib.kind==="home")};
+}
+
+// Player metadata for an audiobook carries the complete ordered part list.
+// That lets the existing player keep one resume/progress timeline while it
+// changes source files at part boundaries or when the scrubber crosses one.
+function playbackMetaFor(p,file){
+  const m=Object.assign({},p.meta||{});
+  if(p.item.kind!=='audiobook') return m;
+  m.audiobook=true;
+  m.part_offset_ms=file.part_offset_ms||0;
+  m.book_duration_ms=p.runtime||0;
+  m.poster=p.item.poster||p.item.backdrop||null;
+  m.book_parts=p.files.filter(f=>f.available).map((f,i)=>({
+    id:f.id, title:f.filename||`Part ${i+1}`, duration_ms:f.duration_ms||0,
+    part_offset_ms:f.part_offset_ms||0
+  }));
+  return m;
+}
+function playCall(p,file,startMs){
+  return `play(${file.id},${esc(JSON.stringify(p.item.title))},${Math.max(0,startMs||0)},${file.duration_ms||0},${esc(JSON.stringify(playbackMetaFor(p,file)))})`;
+}
+function bookContentUrl(file){ return tok(`/api/v1/files/${file.id}/content`); }
+function chapterList(p){
+  const rows=[];
+  for(const f of p.files){
+    for(const c of (f.chapters||[])){
+      const at=(f.part_offset_ms||0)+(c.start_ms||0);
+      rows.push(`<button class="ghost sm" onclick='${playCall(p,f,c.start_ms||0)}'>${esc(c.title||`Chapter ${c.index+1}`)} <span class="muted">${esc(fmtDur(at))}</span></button>`);
+    }
+  }
+  return rows.length?`<div class="chapters"><h2 class="section">Chapters</h2><div class="row" style="align-items:flex-start">${rows.join('')}</div></div>`:'';
 }
 async function viewItem(id){
   layoutChrome("home",`<div class="empty">Loading…</div>`);
@@ -4079,7 +4140,7 @@ async function viewItem(id){
     // Same file, same resume point, same metadata the buttons would have used:
     // the autoplay path is a third caller of the model, not a third derivation.
     const it=page.item, pf=page.playable;
-    if(pf) play(pf.id, it.title, page.resume, pf.duration_ms||0, page.meta);
+    if(pf) play(pf.id, it.title, page.playStart, pf.duration_ms||0, playbackMetaFor(page,pf));
   }
 }
 // Classic's item body — byte-for-byte what this app has always emitted.
@@ -4126,6 +4187,32 @@ function classicItemBody(p){
     body+=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>
       <img class="art" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
            src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
+  } else if(p.shape==="book"){
+    const playable=p.playable;
+    if(playable){
+      body+=`<div class="actions"><a class="btnplay" href="${esc(bookContentUrl(playable))}" target="_blank" rel="noopener">Open book</a>
+        <a class="ghost" href="${esc(bookContentUrl(playable))}" download="${esc(playable.filename||it.title)}">Download</a></div>`;
+    }
+    body+=d.files.map(v=>`<div class="version">${bookSpecBlock(v)}${!v.available&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`).join("");
+  } else if(p.shape==="audiobook"){
+    const playable=p.playable, resume=p.resume, start=p.playStart;
+    const watchBtn=watchControls(it);
+    if(playable){
+      body+=`<div class="actions">
+        <button class="btnplay" onclick='${playCall(p,playable,start)}'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play audiobook'}</button>
+        ${resume?`<button class="ghost" onclick='${playCall(p,p.files.find(f=>f.available),0)}'>Start over</button>`:''}
+        ${watchBtn}</div>`;
+      const rem=resume?Math.max(0,runtime-resume):runtime, pend=endsAt(rem);
+      if(rem) body+=`<div class="playinfo">${resume?fmtDur(rem)+" left":fmtDur(rem)}${pend?" · ends ~"+pend:""}</div>`;
+    } else {
+      body+=`<div class="filemissing">⚠ No audiobook part is currently available on the server.</div><div class="actions">${watchBtn}</div>`;
+    }
+    body+=d.files.map((v,i)=>{
+      const miss=!v.available, part=d.files.length>1?`Part ${i+1}`:'Audiobook';
+      const head=`<div class="vh"><span class="vbadges"><span class="vt">${esc(part)}</span>${specBadges(v)}${miss?'<span class="missbadge">missing</span>':''}</span>${!miss?`<button class="ghost sm" onclick='${playCall(p,v,0)}'>▶ Play</button>`:''}</div>`;
+      return `<div class="version">${head}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
+    }).join("");
+    body+=chapterList(p);
   } else if(p.shape==="versions"){
     // Movie / episode: play the best *available* version + labeled specs.
     // The player's info panel is fed from here — the detail response is the only
@@ -4135,8 +4222,8 @@ function classicItemBody(p){
     const playable=p.playable;
     if(playable){
       body+=`<div class="actions">
-        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
-        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>Start over</button>`:''}
+        <button class="btnplay" onclick='${playCall(p,playable,resume)}'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='${playCall(p,playable,0)}'>Start over</button>`:''}
         ${watchBtn}</div>`;
       const pdur=playable.duration_ms||runtime||0, prem=resume?Math.max(0,pdur-resume):pdur, pend=endsAt(prem);
       if(prem) body+=`<div class="playinfo">${resume?fmtDur(prem)+" left":fmtDur(prem)}${pend?" · ends ~"+pend:""}</div>`;
@@ -4150,7 +4237,7 @@ function classicItemBody(p){
       // to tell apart, or when a file is missing. A single version is already
       // badged in the hero, so its block is just the spec detail.
       const header=(multi||miss)
-        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ Play</button>`:''}</div>`
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='${playCall(p,v,resume)}'>▶ Play</button>`:''}</div>`
         : '';
       return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
     }).join("");
@@ -4288,7 +4375,7 @@ async function setWatched(id, watched){
 //  direct_play → native <video>, client-side seek/resume
 //  remux       → progressive fMP4 from ffmpeg, server fast-seek for resume
 //  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
-let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false,deliveredRange:null};
+let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false,deliveredRange:null,bookOffset:0,bookDuration:0,bookParts:null};
 let PLAYER_WIRED=false;
 // Native HLS (`video.src = playlist.m3u8`) is for real Safari ONLY — it's what
 // makes AirPlay work (an MSE stream can't be flung to an Apple TV). The trap:
@@ -4704,7 +4791,11 @@ const PLAY_CAPS=(function(){
   if(dvCan("08.07")) dvProfiles.push(8);
   // `hdrDisplay` is exposed (it is not part of CAPS_Q) so the badge layer can
   // see what the server was told, separately from what is true right now.
-  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0,
+  const containers=["mp4","webm","mov","m4a","m4b","mp3","aac"];
+  if(can('audio/flac')) containers.push("flac");
+  if(can('audio/ogg')) containers.push("ogg","opus");
+  if(can('audio/wav')) containers.push("wav");
+  return {vcodec:vc.join(","), acodec:ac.join(","), container:containers.join(","), hdr:hdr?1:0,
     dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay};
 })();
 const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}&dvprofile=${PLAY_CAPS.dvprofile}`;
@@ -4847,6 +4938,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   teardownHls();
   clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
+  const book=meta&&meta.audiobook;
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
     decodeRetest:retestDecodeLimit,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
@@ -4861,6 +4953,9 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     refusedOriginal:false,
     aoffset:sessionAudioOffset, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
+    bookOffset:book?(meta.part_offset_ms||0):0,
+    bookDuration:book?(meta.book_duration_ms||0):0,
+    bookParts:book?(meta.book_parts||[]):null,
     transcodeAudio:!!decision.transcode_audio,
     preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
     // What grade the DECISION plans to put on the wire. A session overrides it
@@ -4876,11 +4971,16 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   const initialAudio=selectedAudioIndex(PLAYER);
   setupAirplay(video);
+  const player=document.getElementById("player");
+  if(player){
+    player.classList.toggle("audio",!!book);
+    player.style.backgroundImage=book&&meta.poster?`linear-gradient(rgba(0,0,0,.28),rgba(0,0,0,.72)),url(${JSON.stringify(tok(meta.poster)).slice(1,-1)})`:"";
+  }
   setupTrackMenus();
   renderPlayerInfo();
   renderSkip(null);
-  const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
-  const ab=document.getElementById("autonextbtn"); if(ab) ab.classList.toggle("on", autoNextOn());
+  const sb=document.getElementById("skipbtn"); if(sb){ sb.classList.toggle("on", PLAYER.autoskip); sb.style.display=book?"none":""; }
+  const ab=document.getElementById("autonextbtn"); if(ab){ ab.classList.toggle("on", autoNextOn()); ab.style.display=book?"none":""; }
   // Server-chosen default subtitle (Settings → Playback defaults / anime rule).
   // Native <track> subs ride direct/remux only; transcode burns them instead.
   const defSub=PLAYER.subs.find(s=>s.default);
@@ -6045,6 +6145,7 @@ function playerMeta(it, ancestors){
 // — the values the native <video> bar gets wrong on a growing remux / offset HLS
 // stream. Seeking routes through the method-aware seekTo().
 function pbTotalSec(){ const v=document.getElementById("video");
+  if(PLAYER&&PLAYER.bookDuration) return PLAYER.bookDuration/1000;
   if(PLAYER&&PLAYER.durMs) return PLAYER.durMs/1000;
   if(PLAYER&&PLAYER.knownDur) return PLAYER.knownDur/1000;
   // A remux/transcode stream's `duration` is only what has arrived so far — it
@@ -6054,7 +6155,7 @@ function pbTotalSec(){ const v=document.getElementById("video");
   // none: pbTick draws an indeterminate bar and seekTo refuses fraction seeks.
   if(PLAYER&&PLAYER.method&&PLAYER.method!=='direct_play') return 0;
   return (v&&isFinite(v.duration)&&v.duration>0)?((PLAYER&&PLAYER.offset)||0)+v.duration:0; }
-function pbPosSec(){ const v=document.getElementById("video"); return ((PLAYER&&PLAYER.offset)||0)+((v&&v.currentTime)||0); }
+function pbPosSec(){ const v=document.getElementById("video"); return ((PLAYER&&PLAYER.bookOffset)||0)/1000+((PLAYER&&PLAYER.offset)||0)+((v&&v.currentTime)||0); }
 // Same number, clamped to the runtime, for anything the viewer reads. A remux
 // seek to N starts ffmpeg at the keyframe *at or before* N while we count from
 // N, so the sum drifts a second or two long and the clock ends up reading past
@@ -6072,7 +6173,7 @@ function pbTick(){
   if(thumb) thumb.style.left=(f*100)+"%";
   const cur=document.getElementById("ptcur"); if(cur) cur.textContent=clockFromSec(pos);
   const dur=document.getElementById("ptdur"); if(dur) dur.textContent=tot>0?clockFromSec(tot):"--:--";
-  if(buf){ let bf=0; try{ if(v&&v.buffered&&v.buffered.length){ const be=((PLAYER.offset)||0)+v.buffered.end(v.buffered.length-1); bf=tot>0?Math.min(1,be/tot):0; } }catch(e){} buf.style.width=(bf*100)+"%"; }
+  if(buf){ let bf=0; try{ if(v&&v.buffered&&v.buffered.length){ const be=((PLAYER.bookOffset)||0)/1000+((PLAYER.offset)||0)+v.buffered.end(v.buffered.length-1); bf=tot>0?Math.min(1,be/tot):0; } }catch(e){} buf.style.width=(bf*100)+"%"; }
   const sk=document.getElementById("pseek");
   if(sk){ sk.setAttribute("aria-valuenow", Math.round(f*100)); sk.setAttribute("aria-valuetext", clockFromSec(pos)+(tot>0?" of "+clockFromSec(tot):"")); }
   // Seeking a transcode restarts the session at a new offset, which moves the
@@ -6280,6 +6381,23 @@ async function seekTo(targetSec){
   // packets, so it would "buffer" forever with nothing wrong on either side.
   const total=pbTotalSec();
   if(total>0) targetSec=Math.min(targetSec, Math.max(0,total-2));
+  // The scrubber is global for multipart audiobooks. Crossing a part boundary
+  // changes files through the same play() path; staying in this part converts
+  // the global target back to the local timeline the media element owns.
+  if(PLAYER.bookParts&&PLAYER.bookParts.length){
+    let part=PLAYER.bookParts[0];
+    for(const p of PLAYER.bookParts){
+      const off=(p.part_offset_ms||0)/1000, end=off+(p.duration_ms||0)/1000;
+      if(targetSec>=off && (!end||targetSec<end)){ part=p; break; }
+      if(targetSec>=off) part=p;
+    }
+    const local=Math.max(0,targetSec-(part.part_offset_ms||0)/1000);
+    if(part.id!==PLAYER.fileId){
+      const m=Object.assign({},PLAYER.meta||{},{part_offset_ms:part.part_offset_ms||0});
+      return play(part.id,PLAYER.title,Math.round(local*1000),part.duration_ms||0,m);
+    }
+    targetSec=local;
+  }
   // Two kinds of stream seek without touching the server: direct play, and a
   // cache hit. A cached transcode is a finished asset — every segment already
   // exists — so seeking into it is a seek, in the same fraction of a second
@@ -6375,9 +6493,19 @@ async function playNextEpisode(){
   location.hash="#/item/"+next.id;
   return true;
 }
+async function playNextAudiobookPart(){
+  if(!PLAYER||!PLAYER.bookParts||PLAYER.bookParts.length<2) return false;
+  const i=PLAYER.bookParts.findIndex(p=>p.id===PLAYER.fileId), next=PLAYER.bookParts[i+1];
+  if(i<0||!next) return false;
+  const m=Object.assign({},PLAYER.meta||{},{part_offset_ms:next.part_offset_ms||0});
+  toast(`▶ Continuing ${next.title||`part ${i+2}`}`);
+  await play(next.id,PLAYER.title,0,next.duration_ms||0,m);
+  return true;
+}
 // Video reached its natural end (or auto-skipped credits hit the end): play the
 // next episode if autoplay is on, otherwise fall back to prior behavior.
 async function finishPlayback(closeIfNoNext){
+  if(PLAYER&&PLAYER.bookParts){ closePlayer(); return; }
   if(autoNextOn()){
     setLoading(true,"Up next…","finding the next episode");
     if(await playNextEpisode()) return;                      // navigation + play take over
@@ -6401,6 +6529,13 @@ const ENDED_SLACK_SEC=15;
 // stream marked a film watched permanently and told Trakt so.
 async function handleEnded(fileId){
   const total=pbTotalSec(), pos=pbPosSec();
+  if(PLAYER&&PLAYER.bookParts&&PLAYER.bookParts.length){
+    const i=PLAYER.bookParts.findIndex(p=>p.id===PLAYER.fileId);
+    if(i>=0&&PLAYER.bookParts[i+1]){
+      await reportProgress(fileId,false);
+      if(await playNextAudiobookPart()) return;
+    }
+  }
   // total===0 means no runtime is known for this file (nothing probed, and a
   // growing stream's own duration is not a substitute). There is nothing
   // better to judge by, so `ended` stands.
@@ -7229,14 +7364,14 @@ async function pollSessionHealth(){
 setInterval(()=>{ pollSessionHealth().catch(()=>{}); }, 2000);
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
-  const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
+  const posMs=Math.round((PLAYER.bookOffset||0)+((PLAYER.offset||0)+ (video.currentTime||0))*1000);
   // The file's probed duration is the truth. Only direct play's own
   // video.duration is the whole file: a progressive remux's grows as ffmpeg
   // writes, and an offset HLS stream's covers the tail alone. Reporting either
   // as the runtime marked films watched minutes in. With nothing trustworthy,
   // send none — the server then keeps the duration it probed at scan time, and
   // declines to auto-mark if it has none either.
-  const durMs = PLAYER.knownDur
+  const durMs = PLAYER.bookDuration || PLAYER.knownDur
     || ((PLAYER.method==='direct_play' && video.duration && isFinite(video.duration))
         ? Math.round(video.duration*1000) : null);
   if(!ITEM_FOR_FILE[fileId]) return;
@@ -7244,6 +7379,8 @@ async function reportProgress(fileId, ended){
 }
 function closePlayer(){
   const video=document.getElementById("video");
+  const player=document.getElementById("player");
+  if(player){ player.classList.remove("audio"); player.style.backgroundImage=""; }
   // First, before anything is torn down: give the screen back. Hiding `#modal`
   // sets `display:none` on an ancestor, which draws nothing but does not end
   // the browser's fullscreen — `#player` stays the fullscreen element, so the
@@ -7646,7 +7783,7 @@ function librariesPanel(libs,status,settings){
         <span class="muted" style="font-size:12px">${libs.length} librar${libs.length===1?'y':'ies'}</span></div>`:"";
   // Movies/TV need a TMDB key for artwork; without one the scan finds files but
   // downloads nothing. Surface that right here, where libraries are managed.
-  // Home libraries have no provider at all, so they don't want a key either.
+  // Home and Books libraries have no provider, so they don't want a key either.
   // Two different moments, and the useful thing to say differs between them.
   //
   // Before any library exists this is *advice*: set the key first and the very
@@ -7657,13 +7794,13 @@ function librariesPanel(libs,status,settings){
   // The old version only ever showed the second, which meant the one person
   // who could still act on the advice — someone setting the server up, on an
   // empty Libraries tab — was the only one who never saw it.
-  const wantsProvider = l => !l.anime && l.kind!=="home";
+  const wantsProvider = l => !l.anime && l.kind!=="home" && l.kind!=="books";
   const noKey = settings && !settings.tmdb_configured;
   let warn = "";
   if(noKey && libs.some(wantsProvider)){
-    warn = `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then come back and use <b>Refresh all art</b> — adding the key does not backfill what the earlier scans missed. (Anime libraries use AniList, and home libraries use no provider at all — neither needs a key.)</div>`;
+    warn = `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then come back and use <b>Refresh all art</b> — adding the key does not backfill what the earlier scans missed. (Anime uses AniList; Books and home-video libraries use no provider.)</div>`;
   } else if(noKey && !libs.some(wantsProvider)){
-    warn = `<div class="setwarn">⚠ <b>Set up a metadata key before you add a Movies or TV library.</b> Without one the scan finds every file and downloads no posters, overviews or episode data — and adding the key afterwards doesn't backfill it, so you'd have to re-run a full refresh over the whole library. <a onclick="setSettingsTab('metadata')">Add a free TMDB key in Metadata</a> first; it takes a minute. (Anime and home-video libraries need no key.)</div>`;
+    warn = `<div class="setwarn">⚠ <b>Set up a metadata key before you add a Movies or TV library.</b> Without one the scan finds every file and downloads no posters, overviews or episode data — and adding the key afterwards doesn't backfill it, so you'd have to re-run a full refresh over the whole library. <a onclick="setSettingsTab('metadata')">Add a free TMDB key in Metadata</a> first; it takes a minute. (Anime, Books, and home-video libraries need no TMDB key.)</div>`;
   }
   return `<div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
       ${warn}${bulk}
@@ -7671,7 +7808,7 @@ function librariesPanel(libs,status,settings){
       <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" aria-label="Library name" style="max-width:180px">
-        <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>
+        <select id="lk" style="max-width:190px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="books">Books &amp; audiobooks</option><option value="home">Home videos &amp; photos</option></select>
         <input id="lp" placeholder="/path/to/media (comma-separated)" aria-label="Media paths"></div>
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
@@ -7942,6 +8079,7 @@ function editLib(id){
         <option value="movies"${sel==="movies"?" selected":""}>Movies</option>
         <option value="shows"${sel==="shows"?" selected":""}>TV Shows</option>
         <option value="anime"${sel==="anime"?" selected":""}>Anime</option>
+        <option value="books"${sel==="books"?" selected":""}>Books &amp; audiobooks</option>
         <option value="home"${sel==="home"?" selected":""}>Home videos &amp; photos</option></select>
       <input id="elp-${id}" value="${esc((l.paths||[]).join(", "))}" placeholder="/path (comma-separated)" style="flex:1;min-width:240px">
       <button class="sm" onclick="saveLib(${id})">Save</button>
@@ -8239,6 +8377,7 @@ const CATALOG_GLYPHS={
   tv:'<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/>',
   cam:'<rect x="2" y="7" width="13" height="10" rx="2"/><path d="M15 10l7-3v10l-7-3z"/>',
   anime:'<path d="M12 3l2.4 5.2 5.6.6-4.2 3.8 1.2 5.6-5-2.9-5 2.9 1.2-5.6L4 8.8l5.6-.6z"/>',
+  book:'<path d="M4 5.5A3.5 3.5 0 0 1 7.5 2H11v17H7.5A3.5 3.5 0 0 0 4 22zM20 5.5A3.5 3.5 0 0 0 16.5 2H13v17h3.5A3.5 3.5 0 0 1 20 22z"/>',
   folder:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   stack:'<rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="6" rx="1.5"/><rect x="14" y="14" width="7" height="6" rx="1.5"/>',
   search:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.4-3.4"/>',
@@ -8261,6 +8400,7 @@ function catalogLibGlyph(kind, anime){
   if(anime) return "anime";
   if(kind==="movie"||kind==="movies") return "film";
   if(kind==="show"||kind==="shows") return "tv";
+  if(kind==="book"||kind==="books") return "book";
   if(kind==="home") return "cam";
   return "folder";
 }

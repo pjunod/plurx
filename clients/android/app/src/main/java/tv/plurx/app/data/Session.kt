@@ -1,5 +1,8 @@
 package tv.plurx.app.data
 
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+
 /**
  * Live connection state, read by the OkHttp auth interceptor (and the image /
  * player data sources) on every request. Set once at connect and after login;
@@ -18,4 +21,12 @@ object Session {
     /** Absolute URL for a server-relative path (`/api/v1/images/…`). */
     fun url(path: String): String =
         if (path.startsWith("http")) path else origin + path
+
+    /** URL for media consumers that cannot attach the bearer header. */
+    fun mediaUrl(path: String): String {
+        val base = url(path)
+        val credential = token ?: return base
+        val joiner = if ('?' in base) '&' else '?'
+        return base + joiner + "token=" + URLEncoder.encode(credential, StandardCharsets.UTF_8.toString())
+    }
 }

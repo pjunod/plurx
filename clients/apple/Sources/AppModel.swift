@@ -493,7 +493,7 @@ final class AppModel: ObservableObject {
             }
         }
 
-        let orderedKinds = ["movie", "show", "home"]
+        let orderedKinds = ["movie", "show", "book", "home"]
         let grouped = Dictionary(grouping: libraries) { Self.canonicalLibraryKind($0.kind) }
         let kinds = orderedKinds + grouped.keys.filter { !orderedKinds.contains($0) }.sorted()
         return kinds.compactMap { kind in
@@ -502,6 +502,7 @@ final class AppModel: ObservableObject {
             switch kind {
             case "movie": title = "Movies"
             case "show": title = "TV Shows"
+            case "book": title = "Books"
             case "home": title = "Home Videos"
             default: title = kind.prefix(1).uppercased() + kind.dropFirst()
             }
@@ -729,6 +730,27 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Continue the next physical file of one logical audiobook timeline.
+    func nextAudiobookPart(itemId: Int, after fileId: Int) async -> PlayContext? {
+        guard let detail = try? await itemDetail(itemId), detail.item.isAudiobook else { return nil }
+        let files = (detail.files ?? []).filter { $0.available != false }
+        guard let index = files.firstIndex(where: { $0.id == fileId }), files.indices.contains(index + 1) else {
+            return nil
+        }
+        let next = files[index + 1]
+        return PlayContext(
+            itemId: itemId,
+            fileId: next.id,
+            startMs: 0,
+            durationMs: next.durationMs ?? 0,
+            progressOffsetMs: next.partOffsetMs ?? 0,
+            itemDurationMs: detail.item.runtimeMs,
+            title: detail.item.title,
+            year: detail.item.year,
+            overview: detail.item.overview
+        )
+    }
+
     private func nextEpisodeSubtitle(_ item: Item) -> String? {
         var parts: [String] = []
         if let show = item.showTitle, !show.isEmpty { parts.append(show) }
@@ -830,6 +852,7 @@ final class AppModel: ObservableObject {
         switch raw.lowercased() {
         case "movie", "movies": return "movie"
         case "show", "shows", "tv": return "show"
+        case "book", "books": return "book"
         case "home", "home_video", "home_videos": return "home"
         default: return raw.lowercased()
         }

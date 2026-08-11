@@ -7,9 +7,11 @@
 A self-hosted media server and player in the spirit of **old-school Plex** —
 before the streaming tiles, live TV, ads, and cloud accounts. Your media, your
 hardware, your network: one lean Rust binary, a web app that doubles as the admin
-UI, a Plex-compatible API so existing clients just work, and the thing no media
-server has ever shipped — **real high-availability clustering**. Music, photos,
-and live TV are out of scope on purpose (see [non-goals](#non-goals)).
+UI, first-class ebook and audiobook libraries, a Plex-compatible API so existing
+clients just work, and the thing no media server has ever shipped — **real
+high-availability clustering**. Music, photos, and live TV are out of scope on
+purpose (see [non-goals](#non-goals)); books are not — text books and audiobooks
+are both supported.
 
 > **Self-hosted and pre-1.0.** plurx runs on your LAN with no cloud dependency and
 > never phones home. It mounts your media **read-only** and never writes, renames,
@@ -143,15 +145,15 @@ cd .. && make docker-up                    # builds, starts, and stamps the comm
 open http://<host>:32400                # :32400 is the default port
 
 # 4. Add a library: Settings → Libraries → Add & scan
-#    Kind: Movies | TV Shows | Anime | Home videos & photos
+#    Kind: Movies | TV Shows | Anime | Books | Home videos & photos
 #    Path: what the SERVER sees (the container mount)
 
 # 5. Press play. Open ⓘ Stats (or press i) to see how it's being served.
 ```
 
 Movies and TV want a free TMDB key for posters and metadata (Settings →
-Metadata); anime enriches from AniList with no key, and home videos use no
-provider at all — their thumbnails are frame grabs. Everything runtime — users,
+Metadata); anime enriches from AniList with no key, while books and home videos
+use no provider at all. Home-video thumbnails are frame grabs. Everything runtime — users,
 libraries, keys — is edited in Settings, never a config file. A scan that finds
 nothing almost always means the path isn't what the server sees; the fix is in
 [docs/OPERATIONS.md](docs/OPERATIONS.md#reading-library-scan-status).
@@ -224,9 +226,13 @@ so a UI change only shows up after a rebuild. How the pieces fit and *why* is
 ## Usage
 
 **Add a library.** Settings → Libraries → *Add & scan*. Pick Movies, TV Shows,
-Anime, or Home videos & photos; give it one or more paths. The scanner
+Anime, Books, or Home videos & photos; give it one or more paths. The scanner
 identifies files, probes them with `ffprobe`, and enriches from TMDB
-(movies/TV, optional key) or AniList (anime, no key). A home library is
+(movies/TV, optional key) or AniList (anime, no key). A Books library detects
+ebooks separately from audio, groups numbered audio files into one multipart
+audiobook, and preserves embedded duration, codec/container, and chapter facts.
+Ebooks open through the authenticated original-file route; audiobooks use the
+ordinary playback, resume, progress, and delivery-decision path. A home library is
 different by design: its folder tree *is* the organization, its titles are your
 filenames untouched, and its metadata comes from the disk — an optional Kodi
 `.nfo` read exactly once, plus capture dates and frame-grab thumbnails. See
@@ -280,6 +286,10 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [x] **Home video & photos.** A `home` library kind: mirrored folder trees,
   filename-verbatim titles, capture dates, seed-once `.nfo` sidecars, photo
   lightbox, local frame-grab artwork, and in-UI metadata editing.
+- [x] **Books.** A `books` library kind with separate ebook and audiobook
+  items, multipart audiobook grouping, chapter/codec/container/duration facts,
+  authenticated ebook opening, and cross-client audio playback with one global
+  resume/progress timeline.
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.
@@ -301,8 +311,8 @@ and [docs/FEATURES.md](docs/FEATURES.md#11-what-plurx-does-not-do):
   deleting.
 - **Not a streaming aggregator.** No ads, no live TV, no rentals, no "discover"
   feeds.
-- **No music** in v1 (the data model won't preclude it later). Photos are
-  supported, in home libraries.
+- **No general music library** in v1 (the data model won't preclude it later).
+  Audiobooks are supported in Books libraries; photos are supported in Home.
 - **No transcode-by-default.** On demand only, when a device forces it.
 
 ## License

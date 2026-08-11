@@ -68,7 +68,9 @@ struct Item: Codable, Identifiable, Hashable {
     var rollup: WatchRollup?
 
     var isMovieOrEpisode: Bool { kind == "movie" || kind == "episode" }
-    var isPlayable: Bool { isMovieOrEpisode || kind == "video" }
+    var isPlayable: Bool { isMovieOrEpisode || kind == "video" || kind == "audiobook" }
+    var isBook: Bool { kind == "book" }
+    var isAudiobook: Bool { kind == "audiobook" }
 }
 
 struct Hubs: Codable {
@@ -294,6 +296,17 @@ struct MediaFile: Codable, Identifiable {
     /// always been on `FileDto`; the detail screen now shows them.
     var hdr: String?
     var hdrFormat: String?
+    var audioStreams: [AudioTrack]? = nil
+    var partOffsetMs: Int? = nil
+    var chapters: [BookChapter]? = nil
+    var available: Bool? = true
+}
+
+struct BookChapter: Codable, Hashable {
+    let index: Int
+    let title: String
+    let startMs: Int
+    let endMs: Int
 }
 
 struct ItemDetail: Codable {

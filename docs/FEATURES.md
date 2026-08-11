@@ -7,7 +7,7 @@ last section lists what it deliberately does *not* do, so an absence is never
 ambiguous.
 
 Everything below is implemented and shipping as of Phase 2 (movies, TV, anime,
-playback, Plex-compat), plus the home video & photos slice, with the Phase 3
+playback, Plex-compat), plus the home video, photos, and books slices, with the Phase 3
 cluster spike complete. Anything still
 on the roadmap is called out inline as *planned* with its phase, or lives in the
 [not-yet](#12-what-plurx-does-not-do) section — it is never listed as if it
@@ -18,11 +18,11 @@ works. Scope and phase gates live in [REQUIREMENTS.md](REQUIREMENTS.md) and
 
 ## 1. Libraries & scanning — "find my media and keep up with it"
 
-**What it does:** turns folders of files into browsable movies, shows, and
-anime.
+**What it does:** turns folders of files into browsable movies, shows, anime,
+books, and home media.
 
-- Four library kinds: **Movies**, **TV Shows**, **Anime** (a shows library
-  flagged for anime rules), and **Home videos & photos** (§1a). One library
+- Five library kinds: **Movies**, **TV Shows**, **Anime** (a shows library
+  flagged for anime rules), **Books** (§1b), and **Home videos & photos** (§1a). One library
   spans multiple root paths (comma-separated).
 - **Identification** from filename and folder structure: Plex/Jellyfin layouts
   and scene naming for movies and `S01E02` episodes; anime **absolute
@@ -152,6 +152,44 @@ was copied, which resets it. Fix it with ✎ Edit; nothing will overwrite it.
 
 ---
 
+## 1b. Books — "read it or listen to it"
+
+**What it does:** treats ebooks and audiobooks as two first-class media types
+inside one Books library while keeping their actions and metadata honest.
+
+- **Ebooks** are detected by extension: EPUB, PDF, MOBI, AZW/AZW3, FB2, CBZ,
+  and CBR. They remain `book` items, are never sent through `ffprobe`, and open
+  or download through an authenticated, range-capable original-file endpoint.
+- **Audiobooks** are detected as `audiobook` items for M4B, M4A, MP3, AAC,
+  FLAC, OGG, Opus, WAV, and WMA. They use the existing probe and playback
+  decision infrastructure, so supported sources direct-play and incompatible
+  sources use the same remux/transcode fallback as other playable media.
+- **Multipart grouping** understands numbered tracks/discs under a title
+  directory. All parts become one audiobook item, ordered by path, with a
+  cumulative duration and one item-level progress timeline.
+- **Useful audio facts** appear on detail screens: total and per-part duration,
+  container, bitrate, audio codec/channels/language, and embedded chapters when
+  the container exposes them to `ffprobe`.
+- **Resume and progress are global to the book.** Resume selects the physical
+  part containing the saved position; progress adds that part's cumulative
+  offset; natural completion moves to the next available part. Start over
+  always returns to the first available part.
+- **Web, iOS/tvOS, and Android/Google TV** distinguish Ebook from Audiobook in
+  library cards and details. The web player also provides one cross-part
+  scrubber; native scrubbers seek within the current physical part and advance
+  automatically at its end.
+- **No book metadata provider or built-in ebook renderer.** Titles/authors come
+  from the file/folder layout and audio facts from the container. The client
+  hands an ebook to the browser/platform viewer. DRM-protected books are not
+  decrypted, and cover extraction is not yet implemented.
+
+**How to read it:** a numbered set of audio tracks inside one title directory
+is one audiobook, not several editions. Chapter rows only appear when chapters
+are embedded in a file; loose parts still appear as ordered Parts even without
+authored chapter markers.
+
+---
+
 ## 2. Metadata & artwork — "make it look like a library, then work offline"
 
 **What it does:** matches items to real metadata and caches everything.
@@ -161,6 +199,8 @@ was copied, which resets it. Fix it with ✎ Edit; nothing will overwrite it.
   shows filenames and no posters.
 - **AniList** agent for anime, **no key required**: absolute-numbering ordering,
   title variants, artwork.
+- **Books are local-only:** no provider lookup or guessed artwork. Audiobook
+  technical metadata and chapters come from the stored scan-time probe.
 - **Artwork cached locally** (posters, backdrops, season posters); provider JSON
   cached too. Once enriched, a library works **offline forever** — no provider
   is contacted to browse or play.
@@ -183,6 +223,8 @@ was copied, which resets it. Fix it with ✎ Edit; nothing will overwrite it.
 - **Item detail:** hero backdrop, poster, breadcrumb trail (Home / Show / Season,
   every level clickable), title, spec chips (year, runtime, kind, resolution,
   HDR), overview, and a labeled spec block per version (Video / Audio / File).
+  Book details instead label Ebook versus Audiobook, show audio parts and
+  chapters where applicable, and expose the correct Open or Play action.
 - **Search** across the library (SQLite FTS5), debounced from the header on every
   page.
 - **Progress + watched indicators** on posters: a glowing progress bar for
@@ -225,7 +267,8 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   the error-path rescuing an undecodable pick), or a forced *1080p / 720p / 480p*
   transcode. Persists per browser; switching restarts at the current position.
 - **Resume everywhere:** client-seek for direct play, server fast-seek for remux,
-  offset-based session for transcode.
+  offset-based session for transcode. Multipart audiobooks map every physical
+  part onto one item-level resume/progress timeline and continue at part ends.
 - **Multi-track audio:** pick any audio track from the player; a non-default pick
   forces a remux so the chosen track is the one delivered. Anime dual-audio
   defaults to original audio + subtitles.
@@ -565,11 +608,14 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   monarr for its calendar if you paired one. plurx never tells another
   application to do something. Pushing watch state back to monarr is on the
   roadmap and is not built.
-- **Does not do music** (v1 scope). The data model won't preclude it; it is not
-  bolted on speculatively. Photos *are* supported, in home libraries (§1a).
+- **Does not do a general music library** (v1 scope). The data model won't
+  preclude it; it is not bolted on speculatively. Audiobooks *are* supported in
+  Books libraries (§1b), and photos in Home libraries (§1a).
 - **Does not expose home libraries through the Plex façade.** Plex has no
   honest section type for a folder tree of camera files, and a half-mapped
   section breaks Kodi clients harder than an absent one.
+- **Does not expose Books libraries through the Plex façade.** Their ebook and
+  multipart-audio semantics do not have an honest Tier-1 Plex mapping.
 - **Does not write, export, or re-read `.nfo` sidecars.** One read, at first
   ingest, and never again (§1a).
 - **Does not edit photos** — no rotation, cropping, favorites, or face/object

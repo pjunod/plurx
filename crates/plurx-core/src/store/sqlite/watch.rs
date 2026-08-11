@@ -14,7 +14,7 @@ const WATCHED_THRESHOLD: f64 = 0.95;
 /// Kinds that carry watch state. Photos are excluded deliberately: a home
 /// library full of stills would otherwise make every folder permanently
 /// unwatched, since nothing ever marks a picture seen.
-const PLAYABLE_KINDS: &str = "'movie','episode','video'";
+const PLAYABLE_KINDS: &str = "'movie','episode','video','audiobook'";
 
 /// Every playable item at or under `item_id`, depth-first through whatever
 /// container chain sits above it — season → episode, show → season → episode,
@@ -452,7 +452,7 @@ impl WatchStore for SqliteStore {
                         ON season.id = i.parent_id AND i.kind = 'episode'
                  LEFT JOIN items show ON show.id = season.parent_id
                  WHERE w.user_id = ?1 AND w.watched = 0 AND w.position_ms > 0
-                   AND i.kind IN ('movie','episode','video')
+                   AND i.kind IN ('movie','episode','video','audiobook')
                  ORDER BY w.updated_at DESC LIMIT ?2",
                 i = item_cols("i")
             ))?;

@@ -728,6 +728,8 @@ final class PlayerController: ObservableObject {
     private var baseMs = 0
     private var itemId = 0
     private var fileId = 0
+    private var progressOffsetMs = 0
+    private var itemDurationMs: Int?
     private var title = ""
     #if os(iOS)
     private var offlineId: String?
@@ -884,6 +886,8 @@ final class PlayerController: ObservableObject {
         fileId: Int,
         startMs: Int,
         durationMs: Int,
+        progressOffsetMs: Int = 0,
+        itemDurationMs: Int? = nil,
         title: String
     ) {
         guard !started else { return }
@@ -895,6 +899,8 @@ final class PlayerController: ObservableObject {
         self.model = model
         self.itemId = itemId
         self.fileId = fileId
+        self.progressOffsetMs = max(0, progressOffsetMs)
+        self.itemDurationMs = itemDurationMs
         self.knownDurationMs = durationMs
         self.currentMs = max(0, startMs)
         self.title = title
@@ -2658,13 +2664,14 @@ final class PlayerController: ObservableObject {
 
     private func report(_ position: Int) {
         guard position > 0 else { return }
-        let duration = knownDurationMs > 0 ? knownDurationMs : nil
+        let globalPosition = progressOffsetMs + position
+        let duration = itemDurationMs ?? (knownDurationMs > 0 ? knownDurationMs : nil)
         #if os(iOS)
         if let offlineId {
             Task {
                 await OfflineDownloadManager.shared.recordProgress(
                     id: offlineId,
-                    positionMs: position,
+                    positionMs: globalPosition,
                     durationMs: duration
                 )
             }
@@ -2673,7 +2680,7 @@ final class PlayerController: ObservableObject {
         #endif
         let itemId = itemId
         let model = model
-        Task { await model?.reportProgress(itemId: itemId, positionMs: position, durationMs: duration) }
+        Task { await model?.reportProgress(itemId: itemId, positionMs: globalPosition, durationMs: duration) }
     }
 
     private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {

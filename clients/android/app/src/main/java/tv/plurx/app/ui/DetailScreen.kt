@@ -1,6 +1,8 @@
 package tv.plurx.app.ui
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,6 +64,7 @@ import kotlinx.coroutines.launch
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
 import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.data.Session
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.NetworkImage
@@ -162,9 +165,9 @@ private fun DetailContent(
     val item = detail.item
     val scope = rememberCoroutineScope()
     var startingEpisodeId by remember(item.id) { mutableStateOf<Long?>(null) }
-    val best = detail.files.firstOrNull()
-    val durationMs = best?.duration_ms ?: item.runtime_ms
     val resumeMs = item.watch?.position_ms ?: 0L
+    val best = playbackFile(item, detail.files, resumeMs)
+    val durationMs = if (item.isAudiobook) item.runtime_ms ?: best?.duration_ms else best?.duration_ms ?: item.runtime_ms
     val nearlyDone = durationMs != null && durationMs > 0 && resumeMs > durationMs * 0.95
     val canResume = resumeMs > 3_000 && !nearlyDone
     val heroHeight = when (formFactor) {
@@ -264,13 +267,27 @@ private fun DetailContent(
         if (detail.files.isNotEmpty()) {
             item {
                 Column(Modifier.padding(horizontal = side, vertical = 22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(if (detail.files.size > 1) "Versions" else "Media", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        when {
+                            item.isAudiobook -> "Parts & chapters"
+                            detail.files.size > 1 -> "Versions"
+                            else -> "Media"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                    )
                     detail.files.forEachIndexed { index, file ->
                         VersionCard(
                             file = file,
                             showPlay = detail.files.size > 1 && file.available,
-                            onPlay = { onPlay(item.id, file.id, if (canResume) resumeMs else 0L) },
-                            label = if (detail.files.size > 1) "Version ${index + 1}" else null,
+                            onPlay = { startMs ->
+                                onPlay(
+                                    item.id,
+                                    file.id,
+                                    if (item.isAudiobook) startMs else if (canResume) resumeMs else 0L,
+                                )
+                            },
+                            label = if (detail.files.size > 1) (if (item.isAudiobook) "Part ${index + 1}" else "Version ${index + 1}") else null,
+                            showChapters = item.isAudiobook,
                         )
                     }
                 }
@@ -457,7 +474,9 @@ private fun Actions(
     ) { /* denial is benign; Android still exposes foreground work */ }
     var changingWatch by remember { mutableStateOf(false) }
     var downloadError by remember(item.id) { mutableStateOf<String?>(null) }
-    val playable = files.firstOrNull { it.available }
+    val playable = playbackFile(item, files, resumeMs)
+    val startOverFile = if (item.isAudiobook) files.firstOrNull { it.available } ?: playable else playable
+    val localResume = if (item.isAudiobook) (resumeMs - (playable?.part_offset_ms ?: 0)).coerceAtLeast(0) else resumeMs
     val offline = playable?.let { file -> offlineRecords.firstOrNull {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
             it.fileId == file.id
@@ -477,6 +496,16 @@ private fun Actions(
                     Text("  View full size")
                 }
             }
+        } else if (item.isBook && playable != null) {
+            item {
+                DetailPrimaryActionButton(
+                    onClick = {
+                        val url = Session.mediaUrl("/api/v1/files/${playable.id}/content")
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                    },
+                    requestInitialFocus = requestInitialFocus,
+                ) { Text("Open book", fontWeight = FontWeight.SemiBold) }
+            }
         } else if (seriesPlayback != null) {
             item {
                 DetailPrimaryActionButton(
@@ -490,10 +519,10 @@ private fun Actions(
                     Text("  ${seriesPlayLabel(seriesPlayback)}", fontWeight = FontWeight.SemiBold)
                 }
             }
-        } else if (playable != null && item.isPlayableVideo) {
+        } else if (playable != null && item.isPlayable) {
             item {
                 DetailPrimaryActionButton(
-                    onClick = { onPlay(item.id, playable.id, if (canResume) resumeMs else 0L) },
+                    onClick = { onPlay(item.id, playable.id, if (canResume) localResume else 0L) },
                     requestInitialFocus = requestInitialFocus,
                 ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
@@ -502,7 +531,7 @@ private fun Actions(
             }
             if (canResume) {
                 item {
-                    TvOutlinedButton(onClick = { onPlay(item.id, playable.id, 0L) }) {
+                    TvOutlinedButton(onClick = { onPlay(item.id, startOverFile?.id ?: playable.id, 0L) }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  Start over")
                     }
@@ -580,7 +609,7 @@ private fun Actions(
                     }
                 }
             }
-        } else if (item.kind != "photo") {
+        } else if (item.kind != "photo" && !item.isBook) {
             item {
                 TvTextButton(enabled = !changingWatch, onClick = {
                     changingWatch = true
@@ -615,7 +644,13 @@ internal fun DetailPrimaryActionButton(
 }
 
 @Composable
-private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Unit, label: String?) {
+private fun VersionCard(
+    file: MediaFileDto,
+    showPlay: Boolean,
+    onPlay: (Long) -> Unit,
+    label: String?,
+    showChapters: Boolean,
+) {
     Column(
         Modifier.fillMaxWidth().background(SurfaceHi, MaterialTheme.shapes.medium)
             .border(1.dp, Outline, MaterialTheme.shapes.medium).padding(16.dp),
@@ -624,7 +659,7 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label ?: file.filename, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
             if (!file.available) SpecChip("Missing", MaterialTheme.colorScheme.error)
-            if (showPlay) TvOutlinedButton(onClick = onPlay) { Text("Play") }
+            if (showPlay) TvOutlinedButton(onClick = { onPlay(0L) }) { Text("Play") }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(detailMediaFacts(file), key = { it.kind }) { fact ->
@@ -641,6 +676,19 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
             )
         } else if (!file.probed) {
             Text("Media details have not been read yet; re-analyze it from the web admin.", color = MaterialTheme.colorScheme.error)
+        }
+        if (showChapters && file.chapters.isNotEmpty()) {
+            Text("Chapters", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
+            file.chapters.forEach { chapter ->
+                TvTextButton(
+                    onClick = { onPlay(chapter.start_ms) },
+                    enabled = file.available,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(chapter.title, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(formatTime(file.part_offset_ms + chapter.start_ms), color = Muted)
+                }
+            }
         }
     }
 }
@@ -703,12 +751,19 @@ private fun fileSpecLine(file: MediaFileDto): String {
         listOfNotNull(stream.codec?.uppercase(), stream.channels?.let { "${it}ch" }, stream.language).joinToString("  ")
     }
     val bits = listOfNotNull(
+        file.duration_ms?.takeIf { it > 0 }?.let(::formatTime),
         file.container?.uppercase(),
         file.bitrate?.let { "%.1f Mbps".format(it / 1_000_000.0) },
         file.size.takeIf { it > 0 }?.let { "%.1f GB".format(it / 1_073_741_824.0) },
         audio.takeIf { it.isNotBlank() },
     )
     return bits.joinToString("   ")
+}
+
+private fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
+    val available = files.filter { it.available }
+    if (!item.isAudiobook) return available.firstOrNull()
+    return available.lastOrNull { positionMs >= it.part_offset_ms } ?: available.firstOrNull()
 }
 
 private fun metaLine(item: Item, durationMs: Long?): String = buildList {

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::domain::{Item, ItemKind, Library, LibraryKind, NewItem};
+use crate::domain::{Item, ItemKind, Library, LibraryKind, MetadataPatch, NewItem, ProbeResult};
 use crate::error::StoreError;
 use crate::store::{ReconcileOutcome, RootFingerprintStatus, Store};
 
@@ -28,6 +28,18 @@ const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "mov", "ts", "m2ts", "webm", "wmv", "flv", "mpg", "mpeg", "vob",
     "ogv", "3gp",
 ];
+
+/// Audio containers accepted in a Books library. These are formats ffmpeg's
+/// existing probe/direct-play stack understands on the project's supported
+/// platforms; M4B is listed separately even though it is an MP4-family
+/// container because the extension is the strongest audiobook signal.
+pub const AUDIOBOOK_EXTS: &[&str] = &[
+    "m4b", "m4a", "mp3", "aac", "flac", "ogg", "opus", "wav", "wma",
+];
+
+/// Readable text/illustrated book formats. They are indexed and served as the
+/// original bytes, never sent through ffprobe or the audio/video transcoder.
+pub const TEXT_BOOK_EXTS: &[&str] = &["epub", "pdf", "mobi", "azw", "azw3", "fb2", "cbz", "cbr"];
 
 /// What a scan did, in two orthogonal dimensions — mixing them is what made the
 /// old status line read as four events when only two files were involved.
@@ -253,7 +265,7 @@ const SKIP_SAMPLES: usize = 3;
 /// "processing 412 of 3801" is the difference between progress and a hang.
 #[derive(Debug, Default)]
 pub struct ScanProgress {
-    /// Candidate video files discovered by the directory walk.
+    /// Candidate media files discovered by the directory walk.
     pub found: AtomicUsize,
     /// Files handled so far (unchanged, added, updated, skipped, or errored).
     pub processed: AtomicUsize,
@@ -266,6 +278,59 @@ fn is_video(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn extension_in(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| extensions.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// The first-class book media type implied by a file extension.
+pub fn book_kind_for_path(path: &Path) -> Option<ItemKind> {
+    if extension_in(path, AUDIOBOOK_EXTS) {
+        Some(ItemKind::Audiobook)
+    } else if extension_in(path, TEXT_BOOK_EXTS) {
+        Some(ItemKind::Book)
+    } else {
+        None
+    }
+}
+
+fn text_book_probe(path: &Path) -> ProbeResult {
+    let container = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    // `raw_json` is also the durable "analysis succeeded" bit. Text books do
+    // not belong in ffprobe, but leaving this null would make every retry pass
+    // treat a healthy EPUB/PDF as a failed media probe forever.
+    let raw_json = container.as_ref().map(|kind| {
+        serde_json::json!({
+            "book": { "format": kind },
+            "streams": [],
+            "chapters": []
+        })
+        .to_string()
+    });
+    ProbeResult {
+        container,
+        raw_json,
+        ..ProbeResult::default()
+    }
+}
+
+fn recognized_extensions(library: &Library) -> String {
+    match library.kind {
+        LibraryKind::Home => format!("{}, {}", VIDEO_EXTS.join(", "), home::PHOTO_EXTS.join(", ")),
+        LibraryKind::Books => format!(
+            "{}, {}",
+            AUDIOBOOK_EXTS.join(", "),
+            TEXT_BOOK_EXTS.join(", ")
+        ),
+        _ => VIDEO_EXTS.join(", "),
+    }
 }
 
 /// File size and mtime (unix seconds). The `io::Error` is kept rather than
@@ -396,10 +461,8 @@ pub async fn scan_library_with_progress_and_prune_limit(
 
     if candidates.is_empty() && walk_errors == 0 {
         let (what, exts) = match library.kind {
-            LibraryKind::Home => (
-                "video or photo files",
-                format!("{}, {}", VIDEO_EXTS.join(", "), home::PHOTO_EXTS.join(", ")),
-            ),
+            LibraryKind::Home => ("video or photo files", recognized_extensions(library)),
+            LibraryKind::Books => ("book or audiobook files", recognized_extensions(library)),
             _ => ("video files", VIDEO_EXTS.join(", ")),
         };
         report.note(format!(
@@ -532,6 +595,11 @@ pub async fn scan_library_with_progress_and_prune_limit(
                 .to_owned(),
         );
     }
+
+    // Reconcile may have removed one physical part from a multipart book.
+    // Derive the item duration from the surviving file rows after that change,
+    // including for otherwise-unchanged files and repaired probes.
+    refresh_audiobook_runtimes(store, library, &placed).await?;
 
     // Worst first: the folder costing the most files is the one to rename.
     let mut groups: Vec<SkipGroup> = skips.into_values().collect();
@@ -726,7 +794,7 @@ pub async fn scan_path(
             "no media files found under `{}` — the path exists but holds nothing \
              recognized ({})",
             canonical.display(),
-            VIDEO_EXTS.join(", ")
+            recognized_extensions(library)
         ));
     }
 
@@ -742,6 +810,7 @@ pub async fn scan_path(
         Some(&mut items),
     )
     .await?;
+    refresh_audiobook_runtimes(store, library, &items).await?;
     report.skip_groups = skips.into_values().collect();
     report.seal_problems();
 
@@ -765,10 +834,13 @@ pub async fn scan_path(
 /// libraries, and a poster JPEG beside a movie stays as invisible as it is
 /// today.
 fn wanted_file(library: &Library, path: &Path) -> bool {
-    is_video(path)
-        || (library.kind == LibraryKind::Home
-            && home::is_photo(path)
-            && !home::is_artwork_sidecar(path))
+    match library.kind {
+        LibraryKind::Books => book_kind_for_path(path).is_some(),
+        LibraryKind::Home => {
+            is_video(path) || (home::is_photo(path) && !home::is_artwork_sidecar(path))
+        }
+        _ => is_video(path),
+    }
 }
 
 /// Records one batch of candidate files into the library.
@@ -922,17 +994,23 @@ async fn record_candidates(
 
         // Probe is best-effort — a weird file still records with null media
         // details rather than failing the whole scan.
-        let probe = match probe::probe(&path).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(path = %path_str, error = %e, "probe failed; recording without media detail");
-                report.errors += 1;
-                report.degraded += 1;
-                report.note(format!(
-                    "could not read media details for `{path_str}`: {e} — it was added without \
-                     codec, duration, or track info, so playback decisions for it are guesses"
-                ));
-                Default::default()
+        let probe = if library.kind == LibraryKind::Books
+            && book_kind_for_path(&path) == Some(ItemKind::Book)
+        {
+            text_book_probe(&path)
+        } else {
+            match probe::probe(&path).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(path = %path_str, error = %e, "probe failed; recording without media detail");
+                    report.errors += 1;
+                    report.degraded += 1;
+                    report.note(format!(
+                        "could not read media details for `{path_str}`: {e} — it was added without \
+                         codec, duration, or track info, so playback decisions for it are guesses"
+                    ));
+                    Default::default()
+                }
             }
         };
 
@@ -972,6 +1050,44 @@ async fn record_candidates(
     Ok(skips)
 }
 
+async fn refresh_audiobook_runtimes(
+    store: &dyn Store,
+    library: &Library,
+    placed: &[PlacedFile],
+) -> Result<(), StoreError> {
+    if library.kind != LibraryKind::Books {
+        return Ok(());
+    }
+    let item_ids = placed
+        .iter()
+        .map(|placed| placed.item_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for item_id in item_ids {
+        let Some(item) = store.get_item(item_id).await? else {
+            continue;
+        };
+        if item.kind != ItemKind::Audiobook {
+            continue;
+        }
+        let duration_ms = store
+            .files_for_item(item_id)
+            .await?
+            .into_iter()
+            .filter_map(|file| file.duration_ms)
+            .sum::<i64>();
+        store
+            .apply_metadata(
+                item_id,
+                &MetadataPatch {
+                    runtime_ms: Some(duration_ms),
+                    ..MetadataPatch::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// The outcome of trying to identify a file. A skip carries the sentence the
 /// scan report will print, written where the decision is actually made — a
 /// reason reconstructed later by the caller drifts from the code that skipped.
@@ -1002,6 +1118,35 @@ async fn place_item(
                 .insert_item(&NewItem {
                     library_id: library.id,
                     kind: ItemKind::Movie,
+                    parent_id: None,
+                    title: parsed.title,
+                    year: parsed.year,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await?;
+            Ok(Placement::Placed(home::Placed { id, created: true }))
+        }
+        LibraryKind::Books => {
+            let Some(kind) = book_kind_for_path(path) else {
+                return Ok(Placement::Skipped(
+                    "it is not a recognized text-book or audiobook format",
+                ));
+            };
+            let parsed = parse::parse_book(path, &library.paths);
+            if let Some(existing) = store
+                .find_book(library.id, kind, &parsed.title, parsed.year)
+                .await?
+            {
+                return Ok(Placement::Placed(home::Placed {
+                    id: existing.id,
+                    created: false,
+                }));
+            }
+            let id = store
+                .insert_item(&NewItem {
+                    library_id: library.id,
+                    kind,
                     parent_id: None,
                     title: parsed.title,
                     year: parsed.year,
@@ -1196,6 +1341,151 @@ mod tests {
             })
             .await
             .expect("lib")
+    }
+
+    #[tokio::test]
+    async fn books_library_keeps_text_and_multi_file_audio_as_first_class_items() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Ursula K. Le Guin/The Dispossessed (1974).epub").await;
+        write_fake_video(dir.path(), "Andy Weir/Project Hail Mary/01.mp3").await;
+        write_fake_video(
+            dir.path(),
+            "Andy Weir/Project Hail Mary/Disc 1/Chapter 02.m4a",
+        )
+        .await;
+        // A video in the same tree is not a book by accident.
+        write_fake_video(dir.path(), "Andy Weir/interview.mp4").await;
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let report = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(report.added, 3, "the EPUB and two audio parts were indexed");
+
+        let page = store
+            .list_top_items(lib.id, ItemSort::Title, 0, 20)
+            .await
+            .expect("items");
+        assert_eq!(page.total, 2, "audio parts collapse into one work");
+        let text = page
+            .items
+            .iter()
+            .find(|item| item.kind == ItemKind::Book)
+            .expect("text book");
+        assert_eq!(text.title, "The Dispossessed");
+        assert_eq!(text.year, Some(1974));
+        let text_file = store.files_for_item(text.id).await.expect("text file");
+        assert_eq!(text_file[0].container.as_deref(), Some("epub"));
+        assert!(
+            text_file[0].probed,
+            "a valid text book must not enter the failed-ffprobe retry queue"
+        );
+
+        let audio = page
+            .items
+            .iter()
+            .find(|item| item.kind == ItemKind::Audiobook)
+            .expect("audiobook");
+        assert_eq!(audio.title, "Project Hail Mary");
+        assert_eq!(
+            store
+                .files_for_item(audio.id)
+                .await
+                .expect("audio files")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn audiobook_runtime_reconciles_from_the_surviving_parts() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/contract/books")],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item_id = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Audiobook,
+                parent_id: None,
+                title: "Two Parts".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("audiobook");
+        let first = store
+            .upsert_file(
+                item_id,
+                "/contract/books/01.m4b",
+                10,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(60_000),
+                    ..ProbeResult::default()
+                },
+            )
+            .await
+            .expect("first part");
+        let second = store
+            .upsert_file(
+                item_id,
+                "/contract/books/02.m4b",
+                10,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(90_000),
+                    ..ProbeResult::default()
+                },
+            )
+            .await
+            .expect("second part");
+        let placed = [PlacedFile {
+            item_id,
+            file_id: first,
+            path: "/contract/books/01.m4b".into(),
+        }];
+
+        refresh_audiobook_runtimes(&store, &library, &placed)
+            .await
+            .expect("aggregate runtime");
+        assert_eq!(
+            store
+                .get_item(item_id)
+                .await
+                .expect("item")
+                .expect("audiobook item disappeared")
+                .runtime_ms,
+            Some(150_000)
+        );
+
+        store.delete_files(&[second]).await.expect("delete part");
+        refresh_audiobook_runtimes(&store, &library, &placed)
+            .await
+            .expect("reconcile runtime");
+        assert_eq!(
+            store
+                .get_item(item_id)
+                .await
+                .expect("item")
+                .expect("audiobook item disappeared")
+                .runtime_ms,
+            Some(60_000)
+        );
     }
 
     /// THE property. A targeted scan sees one subtree by construction, so if

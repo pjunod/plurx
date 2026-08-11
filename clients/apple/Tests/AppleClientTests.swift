@@ -4339,11 +4339,35 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(finalWaiters, 0)
     }
 
-    func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {
+    func testPluralServerLibraryKindsMapToNativeCollections() {
         XCTAssertEqual(AppModel.canonicalLibraryKind("movies"), "movie")
         XCTAssertEqual(AppModel.canonicalLibraryKind("shows"), "show")
+        XCTAssertEqual(AppModel.canonicalLibraryKind("books"), "book")
         XCTAssertEqual(AppModel.canonicalLibraryKind("home"), "home")
         XCTAssertEqual(AppModel.canonicalLibraryKind("MOVIES"), "movie")
+    }
+
+    func testAudiobookDetailDecodesPartsChaptersAndSelectsTheResumePart() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let detail = try decoder.decode(ItemDetail.self, from: Data(#"""
+        {
+          "item":{"id":44,"kind":"audiobook","title":"The Long Book","runtime_ms":300000},
+          "files":[
+            {"id":440,"filename":"01.m4b","duration_ms":120000,"part_offset_ms":0,
+             "container":"mov,mp4,m4a,3gp,3g2,mj2","audio_streams":[{"index":0,"codec":"aac","default":true}],
+             "chapters":[{"index":0,"title":"Opening","start_ms":0,"end_ms":60000}]},
+            {"id":441,"filename":"02.m4b","duration_ms":180000,"part_offset_ms":120000}
+          ]
+        }
+        """#.utf8))
+
+        XCTAssertTrue(detail.item.isAudiobook)
+        XCTAssertTrue(detail.item.isPlayable)
+        XCTAssertEqual(detail.files?.first?.audioStreams?.first?.codec, "aac")
+        XCTAssertEqual(detail.files?.first?.chapters?.first?.title, "Opening")
+        XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 119_999)?.id, 440)
+        XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 120_000)?.id, 441)
     }
 
     func testPosterSizesAreOrderedAndMatchTheWebChoices() {

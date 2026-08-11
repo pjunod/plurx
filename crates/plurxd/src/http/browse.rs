@@ -8,7 +8,7 @@ use axum::Json;
 use plurx_core::domain::{Item, ItemKind, ItemSort, WatchState};
 use serde::{Deserialize, Serialize};
 
-use super::dto::{in_progress_dto, recent_dto, FileDto, ItemDto};
+use super::dto::{chapters_from_probe_json, in_progress_dto, recent_dto, FileDto, ItemDto};
 use super::error::ApiError;
 use super::extract::AuthUser;
 use crate::state::AppState;
@@ -116,8 +116,19 @@ pub async fn list_items(
     // page's playable ids, so this is a second constant-cost lookup, not a
     // fan-out. Photos and folders are not in `badged` — a photo has no codec
     // to name and a folder has no files of its own.
+    let file_backed: Vec<i64> = page
+        .items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.kind,
+                ItemKind::Movie | ItemKind::Video | ItemKind::Book | ItemKind::Audiobook
+            )
+        })
+        .map(|i| i.id)
+        .collect();
     let mut facts = if q.facts == Some(1) {
-        state.store.item_media_facts(&badged).await?
+        state.store.item_media_facts(&file_backed).await?
     } else {
         HashMap::new()
     };
@@ -220,14 +231,23 @@ pub async fn item_detail(
                 .collect::<Vec<_>>(),
         )
         .await?;
-    let files = match item.kind {
+    let mut files = match item.kind {
         // Home videos and photos have files exactly like movies do; folders
         // (and shows/seasons) have children instead.
-        ItemKind::Movie | ItemKind::Episode | ItemKind::Video | ItemKind::Photo => {
-            state.store.files_for_item(id).await?
-        }
+        ItemKind::Movie
+        | ItemKind::Episode
+        | ItemKind::Book
+        | ItemKind::Audiobook
+        | ItemKind::Video
+        | ItemKind::Photo => state.store.files_for_item(id).await?,
         _ => Vec::new(),
     };
+    if item.kind == ItemKind::Audiobook {
+        // Generic media versions sort best-quality first. Audiobook files are
+        // sequential parts, not alternate versions, so their path order is
+        // the playback order.
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
 
     // Check each file actually resolves on disk right now, so the client can
     // refuse to "play" a file that's missing (unmounted share, moved file,
@@ -235,11 +255,19 @@ pub async fn item_detail(
     // file — cheap for the handful a movie/episode has. Admins also get the
     // full path back so they can see what to fix.
     let mut file_dtos: Vec<FileDto> = Vec::with_capacity(files.len());
+    let mut part_offset_ms = 0_i64;
     for f in files {
         let path = f.path.clone();
         let available = tokio::fs::metadata(&path).await.is_ok();
+        let raw_probe = state.store.get_file_probe_json(f.id).await?;
+        let duration_ms = f.duration_ms.unwrap_or(0).max(0);
         let mut dto = FileDto::from(f);
         dto.available = available;
+        dto.part_offset_ms = part_offset_ms;
+        dto.chapters = chapters_from_probe_json(raw_probe.as_deref());
+        if item.kind == ItemKind::Audiobook {
+            part_offset_ms = part_offset_ms.saturating_add(duration_ms);
+        }
         if !available && user.is_admin {
             dto.missing_path = Some(path.to_string_lossy().into_owned());
         }

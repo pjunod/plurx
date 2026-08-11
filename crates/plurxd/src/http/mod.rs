@@ -149,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/offline/media/{token}/{segment}", get(offline::segment))
         .route("/files/{id}/direct", get(stream::direct))
+        .route("/files/{id}/content", get(stream::book_content))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route(
             "/files/{id}/subs/{index}/overlay.json",

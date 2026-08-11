@@ -82,6 +82,27 @@ class ModelContractTest {
     }
 
     @Test
+    fun audiobookDetailCarriesPlaybackAndChapterMetadata() {
+        val detail = json.decodeFromString<ItemDetail>(
+            """{
+              "item": {"id": 44, "kind": "audiobook", "title": "The Long Book", "runtime_ms": 300000},
+              "files": [{
+                "id": 440, "filename": "01.m4b", "duration_ms": 120000,
+                "container": "mov,mp4,m4a,3gp,3g2,mj2", "part_offset_ms": 120000,
+                "audio_streams": [{"index": 0, "codec": "aac", "channels": 2}],
+                "chapters": [{"index": 0, "title": "Opening", "start_ms": 0, "end_ms": 60000}]
+              }]
+            }""".trimIndent(),
+        )
+
+        assertTrue(detail.item.isAudiobook)
+        assertTrue(detail.item.isPlayable)
+        assertEquals(120_000L, detail.files.single().part_offset_ms)
+        assertEquals("aac", detail.files.single().audio_streams.single().codec)
+        assertEquals("Opening", detail.files.single().chapters.single().title)
+    }
+
+    @Test
     fun decisionCarriesTheExecutableDeliveryAndPlaybackControls() {
         val decision = json.decodeFromString<Decision>(
             """{

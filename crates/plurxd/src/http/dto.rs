@@ -266,6 +266,15 @@ pub struct FileDto {
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
+    /// Start of this file within a multi-file audiobook. Zero for ordinary
+    /// media and for the first part. Clients add this to local player time
+    /// before posting item progress, so resume remains one continuous book.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub part_offset_ms: i64,
+    /// Chapter table embedded in the container, captured by ffprobe at scan
+    /// time. Empty for containers with no authored chapters.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<ChapterDto>,
     /// Whether the file is actually readable on the server right now. `false`
     /// means the path no longer resolves (unmounted share, moved/deleted file,
     /// wrong container mount) — the client shows this and refuses to "play"
@@ -305,10 +314,101 @@ impl From<MediaFile> for FileDto {
             bitrate: f.bitrate,
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,
+            part_offset_ms: 0,
+            chapters: Vec::new(),
             available: true,
             probed: f.probed,
             missing_path: None,
         }
+    }
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChapterDto {
+    pub index: i64,
+    pub title: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Read the general chapter table out of stored ffprobe JSON. Playback's
+/// marker classifier consumes the same source but intentionally returns only
+/// intro/credits; audiobook detail needs every authored chapter.
+pub fn chapters_from_probe_json(raw: Option<&str>) -> Vec<ChapterDto> {
+    let Some(probe) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(chapters) = probe.get("chapters").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ChapterDto> = chapters
+        .iter()
+        .enumerate()
+        .filter_map(|(position, chapter)| {
+            let seconds = |key: &str| {
+                chapter
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .map(|value| (value * 1000.0).round() as i64)
+            };
+            let start_ms = seconds("start_time")?;
+            let end_ms = seconds("end_time")?;
+            if end_ms <= start_ms {
+                return None;
+            }
+            let index = chapter
+                .get("id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(position as i64);
+            let title = chapter
+                .get("tags")
+                .and_then(|tags| tags.get("title"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Chapter {}", position + 1));
+            Some(ChapterDto {
+                index,
+                title,
+                start_ms,
+                end_ms,
+            })
+        })
+        .collect();
+    out.sort_by_key(|chapter| chapter.start_ms);
+    out
+}
+
+#[cfg(test)]
+mod audiobook_tests {
+    use super::*;
+
+    #[test]
+    fn chapter_table_is_named_sorted_and_converted_to_milliseconds() {
+        let raw = r#"{"chapters":[
+            {"id":8,"start_time":"12.500","end_time":"20.000","tags":{"title":"Second"}},
+            {"id":7,"start_time":"0.000","end_time":"12.500","tags":{}},
+            {"id":9,"start_time":"30.000","end_time":"29.000","tags":{"title":"invalid"}}
+        ]}"#;
+        let chapters = chapters_from_probe_json(Some(raw));
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "Chapter 2");
+        assert_eq!((chapters[0].start_ms, chapters[0].end_ms), (0, 12_500));
+        assert_eq!(chapters[1].title, "Second");
+        assert_eq!(chapters[1].index, 8);
+    }
+
+    #[test]
+    fn malformed_probe_has_no_chapters() {
+        assert!(chapters_from_probe_json(Some("not json")).is_empty());
+        assert!(chapters_from_probe_json(None).is_empty());
     }
 }
 

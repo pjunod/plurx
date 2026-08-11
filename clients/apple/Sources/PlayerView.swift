@@ -587,6 +587,8 @@ struct PlayerView: View {
     let startMs: Int
     let durationMs: Int
     let title: String
+    var progressOffsetMs: Int = 0
+    var itemDurationMs: Int? = nil
     var subtitle: String? = nil
     var year: Int? = nil
     var airDate: String? = nil
@@ -745,6 +747,8 @@ struct PlayerView: View {
                     fileId: fileId,
                     startMs: startMs,
                     durationMs: durationMs,
+                    progressOffsetMs: progressOffsetMs,
+                    itemDurationMs: itemDurationMs,
                     title: title
                 )
             }
@@ -755,6 +759,8 @@ struct PlayerView: View {
                 fileId: fileId,
                 startMs: startMs,
                 durationMs: durationMs,
+                progressOffsetMs: progressOffsetMs,
+                itemDurationMs: itemDurationMs,
                 title: title
             )
             #endif
@@ -791,11 +797,14 @@ struct PlayerView: View {
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
         .onChange(of: optionMenuOpen) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
-            guard let action = Self.naturalEndAction(
-                finished: finished,
-                autoplay: model.autoplay,
-                offline: offlineItem != nil
-            ) else { return }
+            let action = itemDurationMs != nil && offlineItem == nil
+                ? PlayerNaturalEndAction.findNext
+                : Self.naturalEndAction(
+                    finished: finished,
+                    autoplay: model.autoplay,
+                    offline: offlineItem != nil
+                )
+            guard let action else { return }
             // Leave the SwiftUI update transaction before publishing teardown
             // state and replacing the AVPlayer item.
             Task { @MainActor in
@@ -832,7 +841,12 @@ struct PlayerView: View {
                 findingNext = true
                 nextEpisodeTask?.cancel()
                 nextEpisodeTask = Task {
-                    let next = await model.nextEpisode(after: itemId)
+                    let next: PlayContext?
+                    if itemDurationMs != nil {
+                        next = await model.nextAudiobookPart(itemId: itemId, after: fileId)
+                    } else {
+                        next = await model.nextEpisode(after: itemId)
+                    }
                     guard !Task.isCancelled, !lifecycle.isTearingDown else { return }
                     findingNext = false
                     guard let next, let onPlayNext else {
