@@ -305,9 +305,70 @@ struct EpisodeCard: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(Palette.muted)
                 .lineLimit(1)
+
+            EpisodeMediaSummary(badges: episodeMediaSummaryBadges(item))
         }
         .frame(width: width, alignment: .leading)
     }
+}
+
+struct EpisodeMediaSummary: View {
+    let badges: [ItemMetadataBadge]
+
+    @ViewBuilder
+    var body: some View {
+        if badges.isEmpty {
+            Color.clear
+                .frame(height: 20)
+                .accessibilityHidden(true)
+        } else {
+            #if os(iOS)
+            HStack(spacing: 5) {
+                ForEach(badges) { badge in
+                    IOSWebMediaBadge(badge: badge)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
+            .clipped()
+            #else
+            Text(badges.map { $0.mark ?? $0.accessibilityLabel }.joined(separator: " · "))
+                .font(.system(.caption2, design: .monospaced).weight(.bold))
+                .foregroundStyle(Palette.muted)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
+                .accessibilityLabel(badges.map(\.accessibilityLabel).joined(separator: ", "))
+            #endif
+        }
+    }
+}
+
+/// Season rows intentionally stop at the two facts that distinguish picture
+/// quality at a glance. Codec, audio and file details belong on the episode
+/// page; repeating them here would turn a compact shelf into a spec table.
+func episodeMediaSummaryBadges(_ item: Item) -> [ItemMetadataBadge] {
+    var badges: [ItemMetadataBadge] = []
+    if let resolution = resolutionLabel(item.media?.height ?? item.resolution) {
+        badges.append(ItemMetadataBadge(
+            kind: .resolution,
+            symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
+            mark: resolution == "4K" ? nil : resolution.uppercased(),
+            accessibilityLabel: resolution
+        ))
+    }
+    if let range = PlayerView.dynamicRangeBadge(
+        hdr: item.media?.hdr,
+        hdrFormat: item.media?.hdrFormat,
+        delivered: nil,
+        displayHDR: true
+    ) {
+        badges.append(ItemMetadataBadge(
+            kind: .dynamicRange,
+            symbol: range.symbol,
+            mark: range.mark,
+            accessibilityLabel: range.accessibilityLabel
+        ))
+    }
+    return badges
 }
 
 struct MediaRow: View {

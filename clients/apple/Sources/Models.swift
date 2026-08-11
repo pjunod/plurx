@@ -61,6 +61,7 @@ struct Item: Codable, Identifiable, Hashable {
     var recordedAt: String?
     var tags: [String]?
     var resolution: Int?
+    var media: ItemMedia?
     var childCount: Int?
     var addedAt: Int?
     var updatedAt: Int?
@@ -69,6 +70,20 @@ struct Item: Codable, Identifiable, Hashable {
 
     var isMovieOrEpisode: Bool { kind == "movie" || kind == "episode" }
     var isPlayable: Bool { isMovieOrEpisode || kind == "video" }
+}
+
+/// A list-safe summary of the best file behind an item. Season detail uses
+/// this block for episode cards so the client does not fan out into one detail
+/// request per episode just to learn resolution and dynamic range.
+struct ItemMedia: Codable, Hashable {
+    var files: Int?
+    var bytes: Int?
+    var video: String?
+    var height: Int?
+    var hdr: String?
+    var hdrFormat: String?
+    var audio: String?
+    var container: String?
 }
 
 struct Hubs: Codable {
@@ -284,16 +299,21 @@ struct LibraryCollection: Identifiable, Hashable {
 struct MediaFile: Codable, Identifiable {
     let id: Int
     var filename: String?
+    var size: Int?
     var durationMs: Int?
     var container: String?
     var videoCodec: String?
+    var videoProfile: String?
     var width: Int?
     var height: Int?
+    var bitDepth: Int?
     /// Coarse source grade — `"dolby_vision" | "hdr10" | "hlg"` — and the rich
     /// display label ("Dolby Vision · Profile 7 (HDR10-compatible)"). Both have
     /// always been on `FileDto`; the detail screen now shows them.
     var hdr: String?
     var hdrFormat: String?
+    var bitrate: Int?
+    var audioStreams: [AudioTrack]?
 }
 
 struct ItemDetail: Codable {

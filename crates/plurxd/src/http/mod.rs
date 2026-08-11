@@ -4133,6 +4133,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn season_detail_children_include_batched_resolution_and_hdr_facts() {
+        use plurx_core::domain::{AudioStream, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let path =
+            std::env::temp_dir().join(format!("plurx-season-facts-{}.mkv", uuid::Uuid::new_v4()));
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &path.to_string_lossy(),
+                80_000_000_000,
+                2,
+                &ProbeResult {
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(3840),
+                    height: Some(2160),
+                    bit_depth: Some(10),
+                    hdr: Some("dolby_vision".into()),
+                    hdr_format: Some("Dolby Vision · Profile 7 (HDR10-compatible)".into()),
+                    bitrate: Some(48_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "truehd".into(),
+                        channels: Some(8),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("4K episode file");
+
+        let (status, season) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", seeded.season), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{season}");
+        let episode = season["children"]
+            .as_array()
+            .and_then(|children| children.first())
+            .expect("season episode");
+        assert_eq!(episode["id"], seeded.ep);
+        assert_eq!(episode["resolution"], 2160);
+        assert_eq!(
+            episode["media"],
+            json!({
+                "files": 2,
+                "bytes": 80_000_000_042_i64,
+                "video": "HEVC",
+                "height": 2160,
+                "hdr": "dolby_vision",
+                "hdr_format": "Dolby Vision · Profile 7 (HDR10-compatible)",
+                "audio": "TrueHD 7.1",
+                "container": "MKV"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn shared_native_api_fixture_uses_the_servers_live_wire_keys() {
         const FIXTURE: &str = include_str!("../../../../tests/contracts/native-api.json");
 

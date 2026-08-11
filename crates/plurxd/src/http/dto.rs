@@ -70,10 +70,10 @@ pub struct ItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<i64>,
     /// Aggregated facts about the files behind this item — codec, dynamic
-    /// range, audio, size on disk. Only populated on the library list, and
-    /// only when the caller asked (`?facts=1`). Absent otherwise, so a client
-    /// that never heard of this field gets the byte-for-byte response it got
-    /// before the field existed.
+    /// range, audio, size on disk. Populated on the library list when the
+    /// caller asks (`?facts=1`) and on playable children in item detail, where
+    /// a season needs to describe its episode rows without an N+1 of episode
+    /// detail requests. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaDto>,
     /// How many items a folder holds — the "12 items" line on a folder card.
@@ -216,8 +216,8 @@ impl ItemDto {
         self
     }
 
-    /// Opt-in decoration, like `with_resolution`: nothing calls this unless a
-    /// request asked for facts, so the default response shape is untouched.
+    /// List decoration, like `with_resolution`: callers opt into the one
+    /// page-wide query when they are rendering playable rows or cards.
     pub fn with_media(mut self, facts: Option<MediaFacts>) -> Self {
         self.media = facts.map(Into::into);
         self
