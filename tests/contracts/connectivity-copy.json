@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "The single source of truth for what every Cinema client says when it cannot",
+    "reach the server. Consumed by four test suites so the copy cannot drift:",
+    "  crates/plurxd/src/http/web.rs        (the shipped classifier carries every class)",
+    "  tests/connectivity/web-copy.test.js  (web, under node)",
+    "  clients/android/.../ConnectivityCopyTest.kt",
+    "  clients/apple/Tests/AppleClientTests.swift",
+    "Adding a class here fails all four until every client implements it. That is",
+    "the point: a taxonomy one client silently lacks is not a taxonomy.",
+    "See docs/CLIENT-CONNECTIVITY.md for how each platform maps its native errors",
+    "onto these classes."
+  ],
+  "version": 1,
+  "server_fallback": "the server",
+  "credentials_message": "Wrong username or password",
+  "actions": {
+    "retry": "Try again",
+    "change_server": "Change server"
+  },
+  "classes": {
+    "offline": {
+      "meaning": "This device has no network at all. Nothing was sent.",
+      "title": "You're offline",
+      "detail": "This device isn't connected to a network.",
+      "short": "You're offline.",
+      "actions": ["retry"]
+    },
+    "unreachable": {
+      "meaning": "The network is up but the server did not accept the connection: refused, host down, or no route.",
+      "title": "Can't reach {server}",
+      "detail": "The network is working, but the server didn't answer. It may be powered off, restarting, or on another network.",
+      "short": "Can't reach {server}.",
+      "actions": ["retry", "change_server"]
+    },
+    "unknown_host": {
+      "meaning": "The address does not resolve. DNS failure, or a name that no longer exists on this network.",
+      "title": "Can't find {server}",
+      "detail": "Nothing on this network answers to that address. If the server moved, point Cinema at its new one.",
+      "short": "Can't find {server}.",
+      "actions": ["retry", "change_server"]
+    },
+    "timeout": {
+      "meaning": "The connection was made or attempted, but no answer arrived before the deadline.",
+      "title": "No answer from {server}",
+      "detail": "The server accepted the connection but didn't answer in time. It may be busy or still starting up.",
+      "short": "No answer from {server}.",
+      "actions": ["retry"]
+    },
+    "insecure": {
+      "meaning": "TLS failed: certificate untrusted, expired, or hostname mismatch. Never retried silently.",
+      "title": "Couldn't connect securely to {server}",
+      "detail": "The secure connection failed. The server's certificate may have changed or expired.",
+      "short": "Couldn't connect securely to {server}.",
+      "actions": ["retry", "change_server"]
+    },
+    "server_error": {
+      "meaning": "The server was reached and answered, but with 5xx or a body the client cannot use.",
+      "title": "Error from {server}",
+      "detail": "The server answered with an error. Nothing is wrong with this device or your network.",
+      "short": "Error from {server}.",
+      "actions": ["retry"]
+    },
+    "unknown": {
+      "meaning": "The fallback. Anything the classifier cannot place lands here rather than leaking a native error string.",
+      "title": "Something went wrong",
+      "detail": "Cinema couldn't complete that request.",
+      "short": "Something went wrong.",
+      "actions": ["retry"]
+    }
+  },
+  "rules": {
+    "no_raw_transport_text": "No class may render a platform error string (URLError.localizedDescription, Throwable.message, TypeError.message) to the user. Native text goes to diagnostics only.",
+    "signin_is_not_credentials": "A transport failure during sign-in must render its connectivity class, never a credentials message. Only HTTP 401/403 means the password was wrong, and then every client says credentials_message verbatim.",
+    "every_error_offers_retry": "Every class carries at least the retry action, and every surface that renders a class must expose it.",
+    "cached_content_wins": "A failed refresh over content already on screen shows a transient short-form notice; it must not replace the content with an error state."
+  }
+}
