@@ -823,6 +823,7 @@ catalog|item@1280x860|dom|div.px-pop > div#profilemenu.amenu|1
 catalog|item@1280x860|dom|div.px-pop > div#sizemenu.amenu|1
 catalog|item@1280x860|dom|div.px-pop > div#thememenu.amenu|1
 catalog|item@1280x860|dom|div.px-user > div.px-pop|1
+catalog|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|item@1280x860|dom|div.version > dl.specs|1
@@ -837,9 +838,10 @@ catalog|item@1280x860|dom|nav.px-nav[aria-label=*] > a|3
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
+catalog|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-catalog|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
+catalog|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -935,6 +937,7 @@ catalog|item@390x780|dom|div.px-pop > div#profilemenu.amenu|1
 catalog|item@390x780|dom|div.px-pop > div#sizemenu.amenu|1
 catalog|item@390x780|dom|div.px-pop > div#thememenu.amenu|1
 catalog|item@390x780|dom|div.px-user > div.px-pop|1
+catalog|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|item@390x780|dom|div.version > dl.specs|1
@@ -949,9 +952,10 @@ catalog|item@390x780|dom|nav.px-nav[aria-label=*] > a|3
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
+catalog|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-catalog|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
+catalog|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -1351,6 +1355,7 @@ catalog|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@1280x860|dom|div.row > button.pbtn[text]|1
 catalog|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
 catalog|player@1280x860|dom|div.statshd > span[text]|1
+catalog|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|player@1280x860|dom|div.version > dl.specs|1
@@ -1365,10 +1370,10 @@ catalog|player@1280x860|dom|nav.px-nav[aria-label=*] > a|3
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+catalog|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 catalog|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-catalog|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
+catalog|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -1509,6 +1514,7 @@ catalog|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@390x780|dom|div.row > button.pbtn[text]|1
 catalog|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
 catalog|player@390x780|dom|div.statshd > span[text]|1
+catalog|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|player@390x780|dom|div.version > dl.specs|1
@@ -1523,10 +1529,10 @@ catalog|player@390x780|dom|nav.px-nav[aria-label=*] > a|3
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+catalog|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 catalog|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-catalog|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
+catalog|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -1815,7 +1821,7 @@ catalog|settings@1280x860|dom|select#cache-produce > option[text]|4
 catalog|settings@1280x860|dom|select#job-art > option[text]|5
 catalog|settings@1280x860|dom|select#job-clean > option[text]|4
 catalog|settings@1280x860|dom|select#job-probe > option[text]|5
-catalog|settings@1280x860|dom|select#lk > option[text]|4
+catalog|settings@1280x860|dom|select#lk > option[text]|5
 catalog|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 catalog|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 catalog|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -1909,7 +1915,7 @@ catalog|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 catalog|settings@1280x860|focus|035|button.ghost.sm "Edit"
 catalog|settings@1280x860|focus|036|button.ghost.sm "Delete"
 catalog|settings@1280x860|focus|037|input#ln "Library name"
-catalog|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+catalog|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 catalog|settings@1280x860|focus|039|input#lp "Media paths"
 catalog|settings@1280x860|focus|040|button "Add & scan"
 catalog|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -2015,7 +2021,7 @@ catalog|settings@390x780|dom|select#cache-produce > option[text]|4
 catalog|settings@390x780|dom|select#job-art > option[text]|5
 catalog|settings@390x780|dom|select#job-clean > option[text]|4
 catalog|settings@390x780|dom|select#job-probe > option[text]|5
-catalog|settings@390x780|dom|select#lk > option[text]|4
+catalog|settings@390x780|dom|select#lk > option[text]|5
 catalog|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 catalog|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 catalog|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -2106,7 +2112,7 @@ catalog|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artw
 catalog|settings@390x780|focus|032|button.ghost.sm "Edit"
 catalog|settings@390x780|focus|033|button.ghost.sm "Delete"
 catalog|settings@390x780|focus|034|input#ln "Library name"
-catalog|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
+catalog|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 catalog|settings@390x780|focus|036|input#lp "Media paths"
 catalog|settings@390x780|focus|037|button "Add & scan"
 catalog|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
@@ -2658,6 +2664,7 @@ classic|item@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
 classic|item@1280x860|dom|div.phnav > div.crumbs|1
 classic|item@1280x860|dom|div.poster > div.art.ph[text]|1
 classic|item@1280x860|dom|div.topctl > div|4
+classic|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 classic|item@1280x860|dom|div.version > dl.specs|1
@@ -2674,9 +2681,10 @@ classic|item@1280x860|dom|header.top > span.spacer|1
 classic|item@1280x860|dom|main#main > div.hero|1
 classic|item@1280x860|dom|nav > a.active[text]|1
 classic|item@1280x860|dom|nav > a[text]|2
+classic|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-classic|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
+classic|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
 classic|item@1280x860|dom|svg[aria-hidden=true] > rect|4
 classic|item@1280x860|focus|000|a.logo "cinema"
 classic|item@1280x860|focus|001|a.active "home"
@@ -2738,6 +2746,7 @@ classic|item@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
 classic|item@390x780|dom|div.phnav > div.crumbs|1
 classic|item@390x780|dom|div.poster > div.art.ph[text]|1
 classic|item@390x780|dom|div.topctl > div|4
+classic|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 classic|item@390x780|dom|div.version > dl.specs|1
@@ -2754,9 +2763,10 @@ classic|item@390x780|dom|header.top > span.spacer|1
 classic|item@390x780|dom|main#main > div.hero|1
 classic|item@390x780|dom|nav > a.active[text]|1
 classic|item@390x780|dom|nav > a[text]|2
+classic|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-classic|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
+classic|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
 classic|item@390x780|dom|svg[aria-hidden=true] > rect|4
 classic|item@390x780|focus|000|a.logo "cinema"
 classic|item@390x780|focus|001|a.active "home"
@@ -3032,6 +3042,7 @@ classic|player@1280x860|dom|div.row > button.pbtn[text]|1
 classic|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
 classic|player@1280x860|dom|div.statshd > span[text]|1
 classic|player@1280x860|dom|div.topctl > div|4
+classic|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 classic|player@1280x860|dom|div.version > dl.specs|1
@@ -3048,10 +3059,10 @@ classic|player@1280x860|dom|header.top > span.spacer|1
 classic|player@1280x860|dom|main#main > div.hero|1
 classic|player@1280x860|dom|nav > a.active[text]|1
 classic|player@1280x860|dom|nav > a[text]|2
-classic|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+classic|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 classic|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-classic|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
+classic|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
 classic|player@1280x860|dom|svg[aria-hidden=true] > rect|4
 classic|player@1280x860|focus|000|button.ghost.sm "Mark watched"
 classic|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -3161,6 +3172,7 @@ classic|player@390x780|dom|div.row > button.pbtn[text]|1
 classic|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
 classic|player@390x780|dom|div.statshd > span[text]|1
 classic|player@390x780|dom|div.topctl > div|4
+classic|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 classic|player@390x780|dom|div.version > dl.specs|1
@@ -3177,10 +3189,10 @@ classic|player@390x780|dom|header.top > span.spacer|1
 classic|player@390x780|dom|main#main > div.hero|1
 classic|player@390x780|dom|nav > a.active[text]|1
 classic|player@390x780|dom|nav > a[text]|2
-classic|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+classic|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 classic|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-classic|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
+classic|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
 classic|player@390x780|dom|svg[aria-hidden=true] > rect|4
 classic|player@390x780|focus|000|button.ghost.sm "Mark watched"
 classic|player@390x780|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -3386,7 +3398,7 @@ classic|settings@1280x860|dom|select#cache-produce > option[text]|4
 classic|settings@1280x860|dom|select#job-art > option[text]|5
 classic|settings@1280x860|dom|select#job-clean > option[text]|4
 classic|settings@1280x860|dom|select#job-probe > option[text]|5
-classic|settings@1280x860|dom|select#lk > option[text]|4
+classic|settings@1280x860|dom|select#lk > option[text]|5
 classic|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 classic|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 classic|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -3477,7 +3489,7 @@ classic|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 classic|settings@1280x860|focus|035|button.ghost.sm "Edit"
 classic|settings@1280x860|focus|036|button.ghost.sm "Delete"
 classic|settings@1280x860|focus|037|input#ln "Library name"
-classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 classic|settings@1280x860|focus|039|input#lp "Media paths"
 classic|settings@1280x860|focus|040|button "Add & scan"
 classic|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -3560,7 +3572,7 @@ classic|settings@390x780|dom|select#cache-produce > option[text]|4
 classic|settings@390x780|dom|select#job-art > option[text]|5
 classic|settings@390x780|dom|select#job-clean > option[text]|4
 classic|settings@390x780|dom|select#job-probe > option[text]|5
-classic|settings@390x780|dom|select#lk > option[text]|4
+classic|settings@390x780|dom|select#lk > option[text]|5
 classic|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 classic|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 classic|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -3651,7 +3663,7 @@ classic|settings@390x780|focus|034|button.ghost.sm "Re-fetch all metadata & artw
 classic|settings@390x780|focus|035|button.ghost.sm "Edit"
 classic|settings@390x780|focus|036|button.ghost.sm "Delete"
 classic|settings@390x780|focus|037|input#ln "Library name"
-classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 classic|settings@390x780|focus|039|input#lp "Media paths"
 classic|settings@390x780|focus|040|button "Add & scan"
 classic|settings@390x780|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -4275,6 +4287,7 @@ theater|item@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
 theater|item@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
 theater|item@1280x860|dom|div.th-pop > div#thememenu.amenu|1
 theater|item@1280x860|dom|div.th-rest > div.version|1
+theater|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 theater|item@1280x860|dom|div.version > dl.specs|1
@@ -4292,9 +4305,10 @@ theater|item@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|item@1280x860|dom|main#main > div.th-rest|1
 theater|item@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|item@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
+theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
 theater|item@1280x860|dom|svg[aria-hidden=true] > rect|4
 theater|item@1280x860|focus|000|a.logo "cinema"
 theater|item@1280x860|focus|001|a "Home"
@@ -4359,6 +4373,7 @@ theater|item@390x780|dom|div.th-pop > div#profilemenu.amenu|1
 theater|item@390x780|dom|div.th-pop > div#sizemenu.amenu|1
 theater|item@390x780|dom|div.th-pop > div#thememenu.amenu|1
 theater|item@390x780|dom|div.th-rest > div.version|1
+theater|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 theater|item@390x780|dom|div.version > dl.specs|1
@@ -4376,9 +4391,10 @@ theater|item@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|item@390x780|dom|main#main > div.th-rest|1
 theater|item@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|item@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
+theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
 theater|item@390x780|dom|svg[aria-hidden=true] > rect|4
 theater|item@390x780|focus|000|a.logo "cinema"
 theater|item@390x780|focus|001|input#q.search "Search cinema"
@@ -4665,6 +4681,7 @@ theater|player@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
 theater|player@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
 theater|player@1280x860|dom|div.th-pop > div#thememenu.amenu|1
 theater|player@1280x860|dom|div.th-rest > div.version|1
+theater|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 theater|player@1280x860|dom|div.version > dl.specs|1
@@ -4682,10 +4699,10 @@ theater|player@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|player@1280x860|dom|main#main > div.th-rest|1
 theater|player@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|player@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 theater|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-theater|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
+theater|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
 theater|player@1280x860|dom|svg[aria-hidden=true] > rect|4
 theater|player@1280x860|focus|000|button.ghost.sm "Mark watched"
 theater|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -4798,6 +4815,7 @@ theater|player@390x780|dom|div.th-pop > div#profilemenu.amenu|1
 theater|player@390x780|dom|div.th-pop > div#sizemenu.amenu|1
 theater|player@390x780|dom|div.th-pop > div#thememenu.amenu|1
 theater|player@390x780|dom|div.th-rest > div.version|1
+theater|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 theater|player@390x780|dom|div.version > dl.specs|1
@@ -4815,10 +4833,10 @@ theater|player@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|player@390x780|dom|main#main > div.th-rest|1
 theater|player@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|player@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
 theater|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-theater|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
+theater|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
 theater|player@390x780|dom|svg[aria-hidden=true] > rect|4
 theater|player@390x780|focus|000|button.ghost.sm "Mark watched"
 theater|player@390x780|focus|001|a "Home"
@@ -5038,7 +5056,7 @@ theater|settings@1280x860|dom|select#cache-produce > option[text]|4
 theater|settings@1280x860|dom|select#job-art > option[text]|5
 theater|settings@1280x860|dom|select#job-clean > option[text]|4
 theater|settings@1280x860|dom|select#job-probe > option[text]|5
-theater|settings@1280x860|dom|select#lk > option[text]|4
+theater|settings@1280x860|dom|select#lk > option[text]|5
 theater|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 theater|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 theater|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -5129,7 +5147,7 @@ theater|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 theater|settings@1280x860|focus|035|button.ghost.sm "Edit"
 theater|settings@1280x860|focus|036|button.ghost.sm "Delete"
 theater|settings@1280x860|focus|037|input#ln "Library name"
-theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 theater|settings@1280x860|focus|039|input#lp "Media paths"
 theater|settings@1280x860|focus|040|button "Add & scan"
 theater|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -5215,7 +5233,7 @@ theater|settings@390x780|dom|select#cache-produce > option[text]|4
 theater|settings@390x780|dom|select#job-art > option[text]|5
 theater|settings@390x780|dom|select#job-clean > option[text]|4
 theater|settings@390x780|dom|select#job-probe > option[text]|5
-theater|settings@390x780|dom|select#lk > option[text]|4
+theater|settings@390x780|dom|select#lk > option[text]|5
 theater|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 theater|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 theater|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -5303,7 +5321,7 @@ theater|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artw
 theater|settings@390x780|focus|032|button.ghost.sm "Edit"
 theater|settings@390x780|focus|033|button.ghost.sm "Delete"
 theater|settings@390x780|focus|034|input#ln "Library name"
-theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 theater|settings@390x780|focus|036|input#lp "Media paths"
 theater|settings@390x780|focus|037|button "Add & scan"
 theater|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
