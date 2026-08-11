@@ -568,7 +568,9 @@ struct DetailView: View {
     let itemId: Int
     @State private var detail: ItemDetail?
     @State private var play: PlayContext?
-    @State private var loadError: String?
+    @State private var loadFailure: ConnectionFailure?
+    /// Bumped by the error state's Retry so `.task(id:)` reloads this item.
+    @State private var reloadNonce = 0
     @State private var watchBusy = false
     @State private var actionError: String?
     #if os(iOS)
@@ -585,13 +587,14 @@ struct DetailView: View {
                 Group {
                     if let detail {
                         content(detail)
-                    } else if let loadError {
-                        ContentUnavailableView(
-                            "Couldn't load this title",
-                            systemImage: "exclamationmark.triangle",
-                            description: Text(loadError)
+                    } else if let loadFailure {
+                        ConnectionErrorView(
+                            failure: loadFailure,
+                            server: model.serverLabel,
+                            retry: { reloadNonce += 1 },
+                            changeServer: { model.changeServer() }
                         )
-                        .frame(maxWidth: .infinity).padding(.top, 80)
+                        .padding(.top, 80)
                     } else {
                         ProgressView().tint(Palette.accent)
                             .frame(maxWidth: .infinity).padding(.top, 80)
@@ -626,11 +629,16 @@ struct DetailView: View {
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         #endif
-        .task(id: itemId) {
+        .task(id: "\(itemId):\(reloadNonce)") {
+            // Clear the failure *before* the request, not after it succeeds:
+            // without this, tapping Try again against a still-unreachable
+            // server left the screen byte-identical for the length of the
+            // deadline, and the button looked dead. Dropping it puts the
+            // spinner back, which is the acknowledgement the tap deserves.
+            loadFailure = nil
             do {
                 let loaded = try await model.itemDetail(itemId)
                 detail = loaded
-                loadError = nil
                 #if os(tvOS)
                 tvFocusedAction = nil
                 if loaded.item.kind == "show" || loaded.item.kind == "season" {
@@ -643,8 +651,10 @@ struct DetailView: View {
                     tvFocusedAction = .primaryAction
                 }
                 #endif
+            } catch is CancellationError {
+                return
             } catch {
-                loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                loadFailure = AppModel.connectionFailure(for: error)
             }
         }
         .fullScreenCover(item: $play, onDismiss: {
@@ -1482,7 +1492,7 @@ struct DetailView: View {
             detail = try await model.itemDetail(item.id)
             await model.loadHome()
         } catch {
-            actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            actionError = Connectivity.message(for: error, server: model.serverLabel)
         }
         watchBusy = false
     }
@@ -1629,7 +1639,7 @@ struct DetailView: View {
                         markers: markers
                     )
                 } catch {
-                    actionError = error.localizedDescription
+                    actionError = Connectivity.message(for: error, server: model.serverLabel)
                 }
                 downloadBusy = false
             }

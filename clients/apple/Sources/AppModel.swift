@@ -24,7 +24,12 @@ final class AppModel: ObservableObject {
     @Published var libraries: [Library] = []
     @Published var libraryPreviews: [Int: [Item]] = [:]
     @Published var homeLoading = true
-    @Published var homeError: String?
+    /// The failure *class*, not a rendered sentence. The dashboards hand it to
+    /// `Connectivity.surface(for:hasCachedContent:)` and get either the full
+    /// error state or a one-line notice above the shelves they already have
+    /// (docs/CLIENT-CONNECTIVITY.md §5). Deciding it here would mean the model
+    /// had to know what is on screen.
+    @Published var homeFailure: ConnectionFailure?
     @Published var libraryGrouping: LibraryGrouping
 
     @Published var audioLang: String
@@ -47,6 +52,14 @@ final class AppModel: ObservableObject {
     private(set) var username: String?
     private(set) var userId: Int?
     private(set) var serverName: String?
+
+    /// What `{server}` becomes in connectivity copy: the server's advertised
+    /// name, else the origin it was reached at, else nil so
+    /// `Connectivity.copy(for:server:)` uses the contract's fallback.
+    var serverLabel: String? {
+        if let serverName, !serverName.isEmpty { return serverName }
+        return origin.isEmpty ? nil : origin
+    }
 
     private let settings = SettingsStore()
     private var api: PlurxAPI?
@@ -119,7 +132,7 @@ final class AppModel: ObservableObject {
             ) {
                 await retrySavedSession(at: recovered, token: savedToken)
             } else {
-                showReconnectFailure()
+                showReconnectFailure(error)
             }
         }
     }
@@ -156,7 +169,9 @@ final class AppModel: ObservableObject {
             settings.setServer(origin: normalized, instanceId: info.instanceId, token: nil)
             phase = .needLogin
         } catch {
-            authError = "Couldn't reach a Cinema server at \(normalized)"
+            // The address the viewer just typed is the most useful `{server}`
+            // there is — there is no name yet.
+            authError = Connectivity.message(for: error, server: normalized)
         }
     }
 
@@ -177,11 +192,34 @@ final class AppModel: ObservableObject {
             phase = .ready
             discovery.stop()
             await loadHome()
-        } catch APIError.http(let code) where code == 401 || code == 403 {
-            authError = "Wrong username or password"
         } catch {
-            authError = "Couldn't reach \(serverName ?? origin). Check Local Network access and the server."
+            authError = Self.signInFailureMessage(for: error, server: serverLabel)
         }
+    }
+
+    /// docs/CLIENT-CONNECTIVITY.md §4, as a pure function so the rule is
+    /// pinned by test rather than by reading a `catch` clause:
+    ///
+    /// ```
+    ///  sign-in failed
+    ///    ├── HTTP 401 / 403 ──────▶ credentials_message, verbatim
+    ///    └── anything else ───────▶ classify() and render that class
+    /// ```
+    ///
+    /// `classify` returns nil for exactly 401/403 and for cancellation, which
+    /// is what makes this one `guard` rather than a second copy of the
+    /// status-code check. Telling a viewer whose server is simply off to
+    /// retype a correct password was the single most damaging thing this
+    /// client did, and the shape of this function is what stops it recurring.
+    nonisolated static func signInFailureMessage(
+        for error: Error,
+        server: String?
+    ) -> String? {
+        if Connectivity.isCancellation(error) { return nil }
+        guard let failure = Connectivity.classify(error) else {
+            return Connectivity.credentialsMessage
+        }
+        return Connectivity.copy(for: failure, server: server).short
     }
 
     func loadHome() async {
@@ -210,7 +248,7 @@ final class AppModel: ObservableObject {
         // populated screen for the length of a round trip. Both dashboards key
         // their `ProgressView` off this flag, so the policy lives here once.
         homeLoading = !hasHomeContent
-        homeError = nil
+        homeFailure = nil
         do {
             // Three independent requests, one round trip. Coming Soon is
             // started with the other two rather than after them: it is never
@@ -249,12 +287,15 @@ final class AppModel: ObservableObject {
             for id in removed { libraryPreviews.removeValue(forKey: id) }
         } catch {
             noteAuthFailure(error)
-            homeError = Self.homeErrorMessage(for: error, hasCachedContent: hasHomeContent)
+            homeFailure = Self.connectionFailure(for: error)
             homeLoading = false
         }
     }
 
-    private var hasHomeContent: Bool {
+    /// Whether the dashboards have anything worth protecting from an error
+    /// state. Internal because the views need the same answer this method
+    /// gives — `cached_content_wins` is decided where the content is.
+    var hasHomeContent: Bool {
         !libraries.isEmpty
             || !(hubs.continueWatching ?? []).isEmpty
             || !(hubs.nextUp ?? []).isEmpty
@@ -262,15 +303,19 @@ final class AppModel: ObservableObject {
             || !comingSoon.isEmpty
     }
 
-    /// A cancelled refresh should leave the last good Home screen in place.
-    /// The same applies to a transient refresh failure when cached content is
-    /// available; a fatal empty-state message is reserved for initial loads
-    /// that have never produced anything useful.
-    nonisolated static func homeErrorMessage(for error: Error, hasCachedContent: Bool) -> String? {
-        if error is CancellationError { return nil }
-        if let urlError = error as? URLError, urlError.code == .cancelled { return nil }
-        guard !hasCachedContent else { return nil }
-        return (error as? LocalizedError)?.errorDescription ?? "Failed to load"
+    /// The class a failed load leaves behind, or nil when there is nothing to
+    /// say. A cancelled refresh — SwiftUI replacing a view's task — must leave
+    /// the last good screen exactly as it was.
+    ///
+    /// Whether that class becomes a full state or a one-line notice is
+    /// `Connectivity.surface(for:hasCachedContent:)`'s decision, taken where
+    /// the content is.
+    nonisolated static func connectionFailure(for error: Error) -> ConnectionFailure? {
+        if Connectivity.isCancellation(error) { return nil }
+        // `classify` declines 401/403, which `noteAuthFailure` is already
+        // turning into a sign-out; `unknown` is what a surface shows in the
+        // instant before the login screen replaces it.
+        return Connectivity.classify(error) ?? .unknown
     }
 
     /// Is this the answer a server gives to a bearer it no longer honors?
@@ -312,7 +357,7 @@ final class AppModel: ObservableObject {
         libraries = []
         libraryPreviews = [:]
         homeLoading = true
-        homeError = nil
+        homeFailure = nil
         phase = .needLogin
     }
 
@@ -363,7 +408,7 @@ final class AppModel: ObservableObject {
             settings.clearToken()
             phase = .needLogin
         } catch {
-            showReconnectFailure()
+            showReconnectFailure(error)
         }
     }
 
@@ -396,8 +441,12 @@ final class AppModel: ObservableObject {
         serverName = info.name
     }
 
-    private func showReconnectFailure() {
-        authError = "Couldn't reach \(serverName ?? origin). I also searched this network for the saved server."
+    /// docs/CLIENT-CONNECTIVITY.md §4: a saved session that fails for transport
+    /// reasons keeps its credentials and shows the connectivity class, rather
+    /// than dropping the viewer at a login form that implies it expired.
+    /// `ReconnectView`'s own "Try again" is the class's `retry` action.
+    private func showReconnectFailure(_ error: Error) {
+        authError = Connectivity.message(for: error, server: serverLabel)
         phase = .reconnectFailed
     }
 

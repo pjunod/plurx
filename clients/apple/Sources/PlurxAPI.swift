@@ -3,12 +3,25 @@ import Foundation
 enum APIError: Error, LocalizedError {
     case badURL
     case http(Int)
+    /// A transport failure already placed in the shared taxonomy
+    /// (docs/CLIENT-CONNECTIVITY.md §1). Every user-facing transport error is
+    /// this case; the raw `URLError` never travels further than
+    /// `transportError(from:)`.
+    case connection(ConnectionFailure)
+    /// Cinema's own sentence for a condition outside the taxonomy — "Not
+    /// enough device storage for this download" and friends. It has never
+    /// carried a Foundation string since the classifier landed, and must not
+    /// start again.
     case transport(String)
 
     var errorDescription: String? {
         switch self {
         case .badURL: return "Invalid server address"
         case .http(let code): return "Server returned \(code)"
+        // No server is in scope here, so `{server}` resolves to the contract's
+        // fallback. Screens that know which server they were talking to call
+        // `Connectivity.copy(for:server:)` directly and get its name.
+        case .connection(let failure): return Connectivity.copy(for: failure, server: nil).short
         case .transport(let message): return message
         }
     }
@@ -21,17 +34,32 @@ struct PlurxAPI {
     let origin: String
     /// A cold embedded-subtitle extraction can require one full sequential
     /// read of a large MKV before the HLS session exists. Keep ordinary API
-    /// calls brisk, but let this explicit playback-preparation action finish.
+    /// calls brisk, but let an explicit playback-preparation action finish.
     static let playbackPreparationTimeout: TimeInterval = 180
-    /// A local-network request may be the operation that causes iOS to show
-    /// its permission sheet. The first request must wait for that choice,
-    /// rather than failing underneath the sheet and making login work only on
-    /// the second attempt.
-    private static let waitingSession: URLSession = {
+    /// docs/CLIENT-CONNECTIVITY.md §3. Named rather than written inline so the
+    /// deadlines are assertable: an error state nobody ever reaches is worse
+    /// than a bad error message, and a deadline quietly widened again is how
+    /// that comes back.
+    static let apiRequestTimeout: TimeInterval = 15
+    static let apiResourceTimeout: TimeInterval = 30
+    /// docs/CLIENT-CONNECTIVITY.md §2.3 — read that section before changing
+    /// this. `waitsForConnectivity` is what covers the local-network
+    /// permission sheet: on a fresh install the first request is made while
+    /// iOS is still asking, and a session that does not wait fails underneath
+    /// the sheet, so connecting works only on the second tap. The Bonjour
+    /// preflight in `AppModel.bootstrap()` predates this flag and was judged
+    /// insufficient — the flag is the fix, not redundant with it.
+    ///
+    /// The price, named in §2.3: `.notConnectedToInternet` never surfaces, so
+    /// a fully offline device classifies as `timeout` rather than `offline`.
+    /// `apiResourceTimeout` is what keeps that honest instead of endless —
+    /// *No answer from the server* after 30 seconds, not a spinner forever.
+    static let apiWaitsForConnectivity = true
+    private static let apiSession: URLSession = {
         let configuration = URLSessionConfiguration.default
-        configuration.waitsForConnectivity = true
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 30
+        configuration.waitsForConnectivity = apiWaitsForConnectivity
+        configuration.timeoutIntervalForRequest = apiRequestTimeout
+        configuration.timeoutIntervalForResource = apiResourceTimeout
         return URLSession(configuration: configuration)
     }()
     private static let playbackPreparationSession: URLSession = {
@@ -41,7 +69,32 @@ struct PlurxAPI {
         configuration.timeoutIntervalForResource = playbackPreparationTimeout
         return URLSession(configuration: configuration)
     }()
-    private var session: URLSession { Self.waitingSession }
+    private var session: URLSession { Self.apiSession }
+
+    /// docs/CLIENT-CONNECTIVITY.md §3. Two endpoints look like ordinary JSON
+    /// calls and are not, so they take the playback deadline rather than the
+    /// API one:
+    ///
+    /// - `/decision` reaches `markers_for` server-side, which can fall through
+    ///   to a live `ffprobe -show_chapters` subprocess with no timeout of its
+    ///   own, behind an availability stat that may be sitting on a spun-down
+    ///   NAS. A 15-second deadline there turns a slow first play of a large
+    ///   file into *No answer from the server* — an error state for something
+    ///   that was merely working. The web client gives it 120 s for the same
+    ///   reason.
+    /// - Session open spawns an encoder process and kills its predecessor.
+    ///
+    /// Applied by `get`/`post`/`put` from the path itself, not passed in by the
+    /// endpoint methods: an opt-in `using:` argument is a deadline one deleted
+    /// line reverts, and the suite would stay green because a predicate is not
+    /// its own wiring.
+    nonisolated static func usesPlaybackDeadline(path: String) -> Bool {
+        path.hasSuffix("/decision") || path.hasSuffix("/hls/sessions")
+    }
+
+    private static func deadlineSession(forPath path: String) -> URLSession {
+        usesPlaybackDeadline(path: path) ? playbackPreparationSession : apiSession
+    }
 
     private static let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -60,21 +113,29 @@ struct PlurxAPI {
         return comps.url
     }
 
-    private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+    // Every path-taking request builder below resolves its own deadline from
+    // `deadlineSession(forPath:)`. There is deliberately no `using:` parameter
+    // for an endpoint method to forget: when the long deadline was opt-in per
+    // call site, deleting one argument put `/decision` back on 15 seconds with
+    // every test still green, because a predicate is not its own wiring.
+
+    private func get<T: Decodable>(
+        _ path: String,
+        query: [URLQueryItem] = []
+    ) async throws -> T {
         guard let url = makeURL(path, query: query) else { throw APIError.badURL }
         var req = URLRequest(url: url)
         Session.shared.authorize(&req)
-        return try await run(req)
+        return try await run(req, using: Self.deadlineSession(forPath: path))
     }
 
     private func post<B: Encodable, T: Decodable>(
         _ path: String,
-        body: B,
-        using session: URLSession? = nil
+        body: B
     ) async throws -> T {
         var req = try jsonRequest(path, body: body)
         Session.shared.authorize(&req)
-        return try await run(req, using: session)
+        return try await run(req, using: Self.deadlineSession(forPath: path))
     }
 
     private func post<T: Decodable>(_ path: String) async throws -> T {
@@ -82,14 +143,14 @@ struct PlurxAPI {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         Session.shared.authorize(&req)
-        return try await run(req)
+        return try await run(req, using: Self.deadlineSession(forPath: path))
     }
 
     private func put<B: Encodable, T: Decodable>(_ path: String, body: B) async throws -> T {
         var req = try jsonRequest(path, body: body)
         req.httpMethod = "PUT"
         Session.shared.authorize(&req)
-        return try await run(req)
+        return try await run(req, using: Self.deadlineSession(forPath: path))
     }
 
     private func deleteNoContent(_ path: String) async throws {
@@ -97,7 +158,7 @@ struct PlurxAPI {
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         Session.shared.authorize(&req)
-        let (_, resp) = try await session.data(for: req)
+        let (_, resp) = try await send(req, using: Self.deadlineSession(forPath: path))
         try Self.check(resp)
     }
 
@@ -106,14 +167,14 @@ struct PlurxAPI {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         Session.shared.authorize(&req)
-        let (_, resp) = try await session.data(for: req)
+        let (_, resp) = try await send(req, using: Self.deadlineSession(forPath: path))
         try Self.check(resp)
     }
 
     private func postNoContent<B: Encodable>(_ path: String, body: B) async throws {
         var req = try jsonRequest(path, body: body)
         Session.shared.authorize(&req)
-        let (_, resp) = try await session.data(for: req)
+        let (_, resp) = try await send(req, using: Self.deadlineSession(forPath: path))
         try Self.check(resp)
     }
 
@@ -126,14 +187,24 @@ struct PlurxAPI {
         return req
     }
 
+    /// Every request whose failure can reach a screen leaves this type here.
+    /// Calling `session.data(for:)` directly is what let a raw `URLError` — and
+    /// with it a Foundation sentence — escape from the no-content routes
+    /// untyped. The one remaining direct call is `endHlsSession`, which is
+    /// best-effort and discards its result and its error entirely.
+    private func send(
+        _ req: URLRequest,
+        using session: URLSession? = nil
+    ) async throws -> (Data, URLResponse) {
+        do { return try await (session ?? self.session).data(for: req) }
+        catch { throw Self.transportError(from: error) }
+    }
+
     private func run<T: Decodable>(
         _ req: URLRequest,
         using session: URLSession? = nil
     ) async throws -> T {
-        let data: Data
-        let resp: URLResponse
-        do { (data, resp) = try await (session ?? self.session).data(for: req) }
-        catch { throw Self.transportError(from: error) }
+        let (data, resp) = try await send(req, using: session)
         try Self.check(resp)
         return try Self.decoder.decode(T.self, from: data)
     }
@@ -143,12 +214,19 @@ struct PlurxAPI {
     /// actually becoming unreachable. URLSession reports cancellation as
     /// either Swift's CancellationError or NSURLErrorCancelled depending on
     /// which layer observes it first.
+    ///
+    /// Everything else is placed in the shared taxonomy here, once, so no
+    /// screen has to look at a `URLError` and none can render Foundation's
+    /// wording (docs/CLIENT-CONNECTIVITY.md §2.3).
     static func transportError(from error: Error) -> Error {
         if error is CancellationError { return CancellationError() }
         if let urlError = error as? URLError, urlError.code == .cancelled {
             return CancellationError()
         }
-        return APIError.transport(error.localizedDescription)
+        // `classify` only declines cancellation — handled above — and HTTP
+        // 401/403, which a transport failure is not, so this is total in
+        // practice; `.unknown` is the contract's floor rather than a guess.
+        return APIError.connection(Connectivity.classify(error) ?? .unknown)
     }
 
     private static func check(_ resp: URLResponse) throws {
@@ -198,6 +276,8 @@ struct PlurxAPI {
     }
 
     func decision(fileId: Int, caps: [URLQueryItem]) async throws -> Decision {
+        // The 180 s deadline comes from `deadlineSession(forPath:)` inside
+        // `get`, not from anything this call site remembers to pass.
         try await get("files/\(fileId)/decision", query: caps)
     }
 
@@ -210,10 +290,7 @@ struct PlurxAPI {
         }
         var request = URLRequest(url: url)
         Session.shared.authorize(&request)
-        let data: Data
-        let response: URLResponse
-        do { (data, response) = try await session.data(for: request) }
-        catch { throw Self.transportError(from: error) }
+        let (data, response) = try await send(request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError.transport("The PGS overlay response was not HTTP.")
         }
@@ -244,10 +321,7 @@ struct PlurxAPI {
         else { throw PGSOverlayError.invalidManifest }
         var request = URLRequest(url: url)
         Session.shared.authorize(&request)
-        let data: Data
-        let response: URLResponse
-        do { (data, response) = try await session.data(for: request) }
-        catch { throw Self.transportError(from: error) }
+        let (data, response) = try await send(request)
         try Self.check(response)
         guard let http = response as? HTTPURLResponse,
               http.value(forHTTPHeaderField: "Content-Type")?
@@ -262,11 +336,7 @@ struct PlurxAPI {
     /// `playback_id` and a per-attempt `request_id` so a replay recovers the
     /// same session instead.
     func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
-        try await post(
-            "files/\(fileId)/hls/sessions",
-            body: body,
-            using: Self.playbackPreparationSession
-        )
+        try await post("files/\(fileId)/hls/sessions", body: body)
     }
 
     func hlsStatus(sessionId: String) async throws -> PlaybackSessionStatus {

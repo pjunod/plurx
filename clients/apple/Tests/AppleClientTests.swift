@@ -30,6 +30,32 @@ private struct NativeAPIContractFixture: Decodable {
     let decision: Decision
 }
 
+/// `tests/contracts/connectivity-copy.json`, the copy table the web, Android
+/// and Apple clients all answer to. Decoded with a plain `JSONDecoder` on
+/// purpose: `convertFromSnakeCase` rewrites dictionary keys too, which would
+/// silently turn the `unknown_host` class id into `unknownHost` and let this
+/// fixture agree with a client that had drifted.
+private struct ConnectivityContractFixture: Decodable {
+    struct FailureClass: Decodable {
+        let title: String
+        let detail: String
+        let short: String
+        let actions: [String]
+    }
+
+    let serverFallback: String
+    let credentialsMessage: String
+    let actions: [String: String]
+    let classes: [String: FailureClass]
+
+    enum CodingKeys: String, CodingKey {
+        case serverFallback = "server_fallback"
+        case credentialsMessage = "credentials_message"
+        case actions
+        case classes
+    }
+}
+
 private actor ArtworkDownloadProbe {
     private var starts = 0
     private var cancellations = 0
@@ -4357,17 +4383,519 @@ final class AppleClientTests: XCTestCase {
         let mapped = PlurxAPI.transportError(from: URLError(.cancelled))
 
         XCTAssertTrue(mapped is CancellationError)
-        XCTAssertNil(AppModel.homeErrorMessage(for: mapped, hasCachedContent: false))
+        XCTAssertNil(AppModel.connectionFailure(for: mapped))
+        XCTAssertNil(Connectivity.message(for: mapped, server: "Attic"))
+        XCTAssertNil(AppModel.signInFailureMessage(for: mapped, server: "Attic"))
     }
 
+    /// `cached_content_wins`, as the decision itself rather than as its
+    /// absence.
+    ///
+    /// This test used to assert that `APIError.transport("The request timed
+    /// out.")` reached the screen verbatim — the *old* contract, and exactly
+    /// what docs/CLIENT-CONNECTIVITY.md replaced: that sentence is
+    /// Foundation's, not Cinema's. It then briefly asserted that a failed
+    /// refresh over cached content produced nil, which was true and useless,
+    /// because nothing rendered anything for the notice case. Both shapes are
+    /// pinned now.
     func testTransientRefreshFailureKeepsCachedHomeContentVisible() {
-        let failure = APIError.transport("The request timed out.")
+        let failure = APIError.connection(.timeout)
+        let classified = AppModel.connectionFailure(for: failure)
 
-        XCTAssertNil(AppModel.homeErrorMessage(for: failure, hasCachedContent: true))
+        XCTAssertEqual(classified, .timeout)
         XCTAssertEqual(
-            AppModel.homeErrorMessage(for: failure, hasCachedContent: false),
-            "The request timed out."
+            Connectivity.surface(for: classified, hasCachedContent: true),
+            .notice(.timeout)
         )
+        XCTAssertEqual(
+            Connectivity.surface(for: classified, hasCachedContent: false),
+            .full(.timeout)
+        )
+        // Spelled out: with a bare `.none` the compiler could read this as
+        // `Optional.none` and the assertion would quietly mean something else.
+        XCTAssertEqual(
+            Connectivity.surface(for: nil, hasCachedContent: false),
+            ConnectionSurface.none
+        )
+        XCTAssertEqual(
+            Connectivity.surface(for: nil, hasCachedContent: true),
+            ConnectionSurface.none
+        )
+        XCTAssertNotEqual(
+            Connectivity.surface(for: classified, hasCachedContent: true),
+            ConnectionSurface.none
+        )
+
+        // The notice shape renders `short`, and that is the whole of it.
+        XCTAssertEqual(
+            Connectivity.copy(for: .timeout, server: "Attic").short,
+            "No answer from Attic."
+        )
+        XCTAssertEqual(
+            Connectivity.copy(for: .timeout, server: nil).short,
+            "No answer from the server."
+        )
+        // The legacy `.transport` payload is a Cinema sentence, not a class,
+        // and the full-surface path never renders one.
+        XCTAssertEqual(
+            AppModel.connectionFailure(for: APIError.transport("The request timed out.")),
+            .unknown
+        )
+    }
+
+    // MARK: - Connectivity taxonomy (docs/CLIENT-CONNECTIVITY.md)
+
+    private func connectivityContract() throws -> ConnectivityContractFixture {
+        let url = try XCTUnwrap(
+            Bundle(for: AppleClientTests.self).url(
+                forResource: "connectivity-copy",
+                withExtension: "json"
+            )
+        )
+        return try JSONDecoder().decode(
+            ConnectivityContractFixture.self,
+            from: Data(contentsOf: url)
+        )
+    }
+
+    /// The taxonomy is only shared if both clients hold *every* class. A class
+    /// added to the contract must fail here until this client implements it.
+    func testEveryContractClassMapsToAConnectionFailure() throws {
+        let contract = try connectivityContract()
+
+        XCTAssertEqual(
+            Set(contract.classes.keys),
+            Set(ConnectionFailure.allCases.map(\.rawValue))
+        )
+        XCTAssertEqual(
+            Set(contract.actions.keys),
+            Set(ConnectionAction.allCases.map(\.rawValue))
+        )
+        XCTAssertEqual(contract.serverFallback, Connectivity.serverFallback)
+        XCTAssertEqual(contract.credentialsMessage, Connectivity.credentialsMessage)
+        for (id, label) in contract.actions {
+            let action = try XCTUnwrap(ConnectionAction(rawValue: id))
+            XCTAssertEqual(action.label, label)
+        }
+    }
+
+    /// Byte-identical, for a display name, for a bare origin, and for the
+    /// `server_fallback` — the three things `{server}` can become.
+    func testConnectionCopyIsByteIdenticalToTheSharedContract() throws {
+        let contract = try connectivityContract()
+        let servers: [String?] = ["Attic", "http://192.168.1.10:32400", nil]
+
+        for (id, expected) in contract.classes {
+            let failure = try XCTUnwrap(
+                ConnectionFailure(rawValue: id),
+                "the contract names a class this client does not have: \(id)"
+            )
+            for server in servers {
+                let name = server ?? contract.serverFallback
+                let copy = Connectivity.copy(for: failure, server: server)
+
+                XCTAssertEqual(
+                    copy.title,
+                    expected.title.replacingOccurrences(of: "{server}", with: name),
+                    "title drift for \(id) with server \(name)"
+                )
+                XCTAssertEqual(
+                    copy.detail,
+                    expected.detail.replacingOccurrences(of: "{server}", with: name),
+                    "detail drift for \(id) with server \(name)"
+                )
+                XCTAssertEqual(
+                    copy.short,
+                    expected.short.replacingOccurrences(of: "{server}", with: name),
+                    "short drift for \(id) with server \(name)"
+                )
+                XCTAssertEqual(
+                    copy.actions.map(\.rawValue),
+                    expected.actions,
+                    "action drift for \(id)"
+                )
+            }
+            // `every_error_offers_retry`: no surface may render a dead end.
+            XCTAssertTrue(
+                Connectivity.copy(for: failure, server: nil).actions.contains(.retry),
+                "\(id) offers no retry"
+            )
+        }
+
+        // A blank name is not a name, and must not render "Can't reach ."
+        XCTAssertEqual(
+            Connectivity.copy(for: .unreachable, server: "   ").short,
+            "Can't reach the server."
+        )
+    }
+
+    /// `Connectivity.message` is the function `AppModel.connect`,
+    /// `showReconnectFailure`, the detail actions, the offline downloader and
+    /// `PlayerController.fail` all render. Byte-asserting its output for every
+    /// class is what stops it becoming a constant, or a class's `short` being
+    /// swapped for another's.
+    func testConnectivityMessageRendersTheClassShortLineForEveryClass() throws {
+        let contract = try connectivityContract()
+
+        for (id, expected) in contract.classes {
+            let failure = try XCTUnwrap(ConnectionFailure(rawValue: id))
+            let short = expected.short.replacingOccurrences(of: "{server}", with: "Attic")
+
+            XCTAssertEqual(
+                Connectivity.message(for: APIError.connection(failure), server: "Attic"),
+                short,
+                "message drift for \(id)"
+            )
+            if failure != .unknown {
+                XCTAssertEqual(
+                    Connectivity.classifiedMessage(
+                        for: APIError.connection(failure),
+                        server: "Attic"
+                    ),
+                    short,
+                    "classifiedMessage drift for \(id)"
+                )
+            }
+        }
+
+        // Straight from a URLError, the way every real call site arrives.
+        XCTAssertEqual(
+            Connectivity.message(for: URLError(.cannotConnectToHost), server: "Attic"),
+            "Can't reach Attic."
+        )
+        XCTAssertEqual(
+            Connectivity.message(for: URLError(.timedOut), server: nil),
+            "No answer from the server."
+        )
+        // Cinema's own sentence for a condition outside the taxonomy survives;
+        // it is the reason `ownCopy` exists at all.
+        XCTAssertEqual(
+            Connectivity.message(
+                for: APIError.transport("Not enough device storage for this download"),
+                server: "Attic"
+            ),
+            "Not enough device storage for this download"
+        )
+        // `classifiedMessage` declines what it cannot place, so a caller with
+        // better copy of its own keeps it.
+        XCTAssertNil(
+            Connectivity.classifiedMessage(
+                for: APIError.transport("Not enough device storage for this download"),
+                server: "Attic"
+            )
+        )
+        // Debug shorthand is not user copy: an HTTP status the taxonomy has no
+        // class for reads the same everywhere rather than leaking a code.
+        XCTAssertEqual(
+            Connectivity.message(for: APIError.http(404), server: "Attic"),
+            "Something went wrong."
+        )
+        XCTAssertEqual(
+            AppModel.connectionFailure(for: APIError.http(404)),
+            .unknown
+        )
+        XCTAssertEqual(
+            Connectivity.message(for: APIError.badURL, server: "Attic"),
+            "Something went wrong."
+        )
+    }
+
+    /// docs §4, the rule that cost the most before it existed: a viewer whose
+    /// server is off must not be told to retype a correct password.
+    func testSignInRendersCredentialsOnlyForAnHTTPRejection() throws {
+        let contract = try connectivityContract()
+
+        for code in [401, 403] {
+            XCTAssertEqual(
+                AppModel.signInFailureMessage(for: APIError.http(code), server: "Attic"),
+                contract.credentialsMessage,
+                "HTTP \(code) should be the credentials message"
+            )
+        }
+
+        for (id, expected) in contract.classes {
+            let failure = try XCTUnwrap(ConnectionFailure(rawValue: id))
+            let short = expected.short.replacingOccurrences(of: "{server}", with: "Attic")
+            let message = AppModel.signInFailureMessage(
+                for: APIError.connection(failure),
+                server: "Attic"
+            )
+
+            XCTAssertEqual(message, short, "sign-in copy drift for \(id)")
+            XCTAssertNotEqual(
+                message,
+                contract.credentialsMessage,
+                "\(id) during sign-in must not read as a wrong password"
+            )
+        }
+
+        // The failures a viewer actually hits with the server switched off.
+        XCTAssertEqual(
+            AppModel.signInFailureMessage(for: URLError(.cannotConnectToHost), server: "Attic"),
+            "Can't reach Attic."
+        )
+        XCTAssertEqual(
+            AppModel.signInFailureMessage(for: URLError(.timedOut), server: "Attic"),
+            "No answer from Attic."
+        )
+        XCTAssertEqual(
+            AppModel.signInFailureMessage(for: URLError(.cannotFindHost), server: nil),
+            "Can't find the server."
+        )
+        // A 500 is the server answering, not the password being wrong.
+        XCTAssertEqual(
+            AppModel.signInFailureMessage(for: APIError.http(500), server: "Attic"),
+            "Error from Attic."
+        )
+    }
+
+    /// `every_error_offers_retry` for the surface that renders it. The view
+    /// body itself is not reachable from a unit test, so the decision it draws
+    /// from is a pure function and this asserts that instead.
+    func testEveryConnectionErrorSurfaceOffersRetry() throws {
+        let contract = try connectivityContract()
+
+        for (id, expected) in contract.classes {
+            let failure = try XCTUnwrap(ConnectionFailure(rawValue: id))
+
+            // A surface that can do both draws exactly the contract's actions.
+            XCTAssertEqual(
+                ConnectionErrorView.renderedActions(
+                    for: failure,
+                    canRetry: true,
+                    canChangeServer: true
+                ).map(\.rawValue),
+                expected.actions,
+                "rendered actions drift for \(id)"
+            )
+            // A surface with nowhere to send the viewer drops that button and
+            // keeps the one every class carries.
+            XCTAssertEqual(
+                ConnectionErrorView.renderedActions(
+                    for: failure,
+                    canRetry: true,
+                    canChangeServer: false
+                ),
+                [.retry],
+                "\(id) lost its retry when change-server was unavailable"
+            )
+            XCTAssertTrue(
+                ConnectionErrorView.renderedActions(
+                    for: failure,
+                    canRetry: true,
+                    canChangeServer: true
+                ).contains(.retry),
+                "\(id) renders no retry"
+            )
+        }
+    }
+
+    /// docs §3. The deadlines are the difference between an error state and a
+    /// spinner nobody escapes, and `/decision` is the one endpoint that must
+    /// *not* get the short one.
+    func testAPIDeadlinesMatchTheDocumentedBudgets() {
+        XCTAssertEqual(PlurxAPI.apiRequestTimeout, 15)
+        XCTAssertEqual(PlurxAPI.apiResourceTimeout, 30)
+        XCTAssertEqual(PlurxAPI.playbackPreparationTimeout, 180)
+        // §2.3: the flag stays on, and the resource deadline is what keeps
+        // waiting for connectivity from becoming waiting forever.
+        XCTAssertTrue(PlurxAPI.apiWaitsForConnectivity)
+
+        XCTAssertTrue(PlurxAPI.usesPlaybackDeadline(path: "files/42/decision"))
+        XCTAssertTrue(PlurxAPI.usesPlaybackDeadline(path: "files/42/hls/sessions"))
+        XCTAssertFalse(PlurxAPI.usesPlaybackDeadline(path: "hubs"))
+        XCTAssertFalse(PlurxAPI.usesPlaybackDeadline(path: "libraries"))
+        XCTAssertFalse(PlurxAPI.usesPlaybackDeadline(path: "me"))
+        XCTAssertFalse(PlurxAPI.usesPlaybackDeadline(path: "search"))
+        XCTAssertFalse(PlurxAPI.usesPlaybackDeadline(path: "hls/abc123/status"))
+    }
+
+    /// Every `URLError.Code` docs §2.3 names, constructed as a real `URLError`.
+    func testClassifyMapsEveryURLErrorCodeInTheTable() {
+        let table: [(URLError.Code, ConnectionFailure)] = [
+            (.notConnectedToInternet, .offline),
+            (.internationalRoamingOff, .offline),
+            (.callIsActive, .offline),
+            (.cannotFindHost, .unknownHost),
+            (.dnsLookupFailed, .unknownHost),
+            (.timedOut, .timeout),
+            (.secureConnectionFailed, .insecure),
+            (.serverCertificateHasBadDate, .insecure),
+            (.serverCertificateUntrusted, .insecure),
+            (.serverCertificateHasUnknownRoot, .insecure),
+            (.serverCertificateNotYetValid, .insecure),
+            (.clientCertificateRejected, .insecure),
+            (.clientCertificateRequired, .insecure),
+            (.appTransportSecurityRequiresSecureConnection, .insecure),
+            (.cannotConnectToHost, .unreachable),
+            (.networkConnectionLost, .unreachable),
+            (.cannotLoadFromNetwork, .unreachable),
+            (.resourceUnavailable, .unreachable),
+            (.badServerResponse, .unreachable),
+        ]
+
+        for (code, expected) in table {
+            XCTAssertEqual(
+                Connectivity.classify(URLError(code)),
+                expected,
+                "\(code) should classify as \(expected.rawValue)"
+            )
+        }
+
+        // "any other URLError ⇒ unreachable"
+        XCTAssertEqual(Connectivity.classify(URLError(.unsupportedURL)), .unreachable)
+        XCTAssertEqual(Connectivity.classify(URLError(.dataNotAllowed)), .unreachable)
+    }
+
+    /// Cancellation stays control flow at every layer, which is what
+    /// `testCancelledURLRequestRemainsCancellationInsteadOfConnectionFailure`
+    /// depends on.
+    func testCancellationIsNotAConnectivityClass() {
+        XCTAssertNil(Connectivity.classify(CancellationError()))
+        XCTAssertNil(Connectivity.classify(URLError(.cancelled)))
+        XCTAssertNil(
+            Connectivity.classifiedMessage(for: URLError(.cancelled), server: "Attic")
+        )
+    }
+
+    func testServerAnswersAndAuthFailuresClassifyPerTheContract() {
+        XCTAssertEqual(Connectivity.classify(APIError.http(500)), .serverError)
+        XCTAssertEqual(Connectivity.classify(APIError.http(502)), .serverError)
+        XCTAssertEqual(Connectivity.classify(APIError.http(503)), .serverError)
+        XCTAssertEqual(
+            Connectivity.copy(for: .serverError, server: "Attic").short,
+            "Error from Attic."
+        )
+
+        // 401/403 is the auth path's, not the taxonomy's (docs §4). Returning
+        // nil is what leaves `noteAuthFailure`'s sign-out in charge.
+        XCTAssertNil(Connectivity.classify(APIError.http(401)))
+        XCTAssertNil(Connectivity.classify(APIError.http(403)))
+
+        // A body the client cannot use is the server answering wrongly.
+        let decodingFailure = DecodingError.dataCorrupted(
+            DecodingError.Context(codingPath: [], debugDescription: "not json")
+        )
+        XCTAssertEqual(Connectivity.classify(decodingFailure), .serverError)
+
+        // Anything else lands on the floor rather than leaking.
+        XCTAssertEqual(Connectivity.classify(APIError.http(404)), .unknown)
+        XCTAssertEqual(Connectivity.classify(APIError.badURL), .unknown)
+
+        // Re-classifying an already-classified failure is the identity, or a
+        // second screen asking would flatten the class it was given.
+        for failure in ConnectionFailure.allCases {
+            XCTAssertEqual(Connectivity.classify(APIError.connection(failure)), failure)
+        }
+    }
+
+    /// `PlurxAPI` is where a `URLError` stops being a `URLError`.
+    func testTransportErrorsLeaveThePlurxAPISeamAlreadyClassified() throws {
+        let mapped = try XCTUnwrap(
+            PlurxAPI.transportError(from: URLError(.cannotFindHost)) as? APIError
+        )
+
+        guard case .connection(let failure) = mapped else {
+            return XCTFail("expected a classified connection failure, got \(mapped)")
+        }
+        XCTAssertEqual(failure, .unknownHost)
+        XCTAssertEqual(mapped.errorDescription, "Can't find the server.")
+    }
+
+    /// The negative (docs §7). A suite that only checked the happy strings
+    /// would pass a client that appended "(Could not connect to the server.)"
+    /// to every one of them.
+    func testNoConnectivityCopyContainsANativeErrorString() throws {
+        let contract = try connectivityContract()
+        let nativeErrors: [Error] = [
+            URLError(.notConnectedToInternet),
+            URLError(.cannotConnectToHost),
+            URLError(.cannotFindHost),
+            URLError(.timedOut),
+            URLError(.secureConnectionFailed),
+            URLError(.badServerResponse),
+        ]
+        // Foundation's own sentences, which this taxonomy exists to replace.
+        let nativeFragments = [
+            "Could not connect to the server",
+            "The request timed out",
+            "A server with the specified hostname could not be found",
+            "The Internet connection appears to be offline",
+            "The operation couldn",
+            "NSURLErrorDomain",
+            "Error Domain",
+        ]
+
+        var rendered: [String] = []
+        for error in nativeErrors {
+            let failure = try XCTUnwrap(Connectivity.classify(error))
+            let copy = Connectivity.copy(for: failure, server: "Attic")
+            rendered.append(contentsOf: [copy.title, copy.detail, copy.short])
+            rendered.append(Connectivity.message(for: error, server: "Attic") ?? "")
+            rendered.append(AppModel.signInFailureMessage(for: error, server: "Attic") ?? "")
+            let mapped = PlurxAPI.transportError(from: error)
+            rendered.append((mapped as? LocalizedError)?.errorDescription ?? "")
+            rendered.append(Connectivity.message(for: mapped, server: "Attic") ?? "")
+        }
+        // Every class and every one of its four strings, not only the classes
+        // the errors above happen to reach.
+        for failure in ConnectionFailure.allCases {
+            for server in ["Attic", "http://192.168.1.10:32400"] {
+                let copy = Connectivity.copy(for: failure, server: server)
+                rendered.append(contentsOf: [copy.title, copy.detail, copy.short])
+                rendered.append(contentsOf: copy.actions.map(\.label))
+            }
+        }
+        rendered.append(Connectivity.credentialsMessage)
+
+        for text in rendered where !text.isEmpty {
+            for fragment in nativeFragments {
+                XCTAssertFalse(
+                    text.contains(fragment),
+                    "\"\(text)\" leaks the native fragment \"\(fragment)\""
+                )
+            }
+            for error in nativeErrors {
+                let native = error.localizedDescription
+                guard !native.isEmpty else { continue }
+                XCTAssertFalse(
+                    text.contains(native),
+                    "\"\(text)\" leaks a platform error string"
+                )
+            }
+        }
+
+        // And the contract itself carries no native text to transcribe — every
+        // string of it, not only `detail`.
+        for (id, failureClass) in contract.classes {
+            let contractStrings = [
+                "title": failureClass.title,
+                "detail": failureClass.detail,
+                "short": failureClass.short,
+            ]
+            for (field, text) in contractStrings {
+                for fragment in nativeFragments {
+                    XCTAssertFalse(
+                        text.contains(fragment),
+                        "the contract's \(id) \(field) carries native text"
+                    )
+                }
+            }
+        }
+        for (id, label) in contract.actions {
+            for fragment in nativeFragments {
+                XCTAssertFalse(
+                    label.contains(fragment),
+                    "the contract's \(id) action label carries native text"
+                )
+            }
+        }
+        for fragment in nativeFragments {
+            XCTAssertFalse(
+                contract.credentialsMessage.contains(fragment),
+                "the contract's credentials_message carries native text"
+            )
+        }
     }
 
     func testPGSOverlayManifestDecodesAndRejectsIdentityOrTraversalDrift() throws {

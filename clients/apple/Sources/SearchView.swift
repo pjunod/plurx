@@ -6,7 +6,10 @@ struct SearchView: View {
     @State private var results: [Item] = []
     @State private var searching = false
     @State private var hasSearched = false
-    @State private var error: String?
+    @State private var failure: ConnectionFailure?
+    /// Bumped by the error state's Retry so `.task(id:)` re-runs the same
+    /// query instead of requiring the viewer to retype it.
+    @State private var reloadNonce = 0
 
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: model.posterSize.posterWidth), spacing: 18, alignment: .top)]
@@ -32,7 +35,7 @@ struct SearchView: View {
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $query, prompt: "Movies, shows, and episodes")
         #endif
-        .task(id: query) { await performSearch() }
+        .task(id: "\(query)|\(reloadNonce)") { await performSearch() }
     }
 
     @ViewBuilder
@@ -40,13 +43,13 @@ struct SearchView: View {
         if searching {
             ProgressView().tint(Palette.accent)
                 .frame(maxWidth: .infinity).padding(.top, 70)
-        } else if let error {
-            ContentUnavailableView(
-                "Search unavailable",
-                systemImage: "exclamationmark.triangle",
-                description: Text(error)
+        } else if let failure {
+            ConnectionErrorView(
+                failure: failure,
+                server: model.serverLabel,
+                retry: { reloadNonce += 1 },
+                changeServer: { model.changeServer() }
             )
-            .frame(maxWidth: .infinity)
         } else if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             ContentUnavailableView(
                 "Find something to watch",
@@ -84,22 +87,29 @@ struct SearchView: View {
         guard !trimmed.isEmpty else {
             results = []
             hasSearched = false
-            error = nil
+            failure = nil
             searching = false
             return
         }
 
+        // Cleared before the debounce, not after it: leaving the previous
+        // failure painted for 300 ms is long enough for Try again to look
+        // dead. `searching` deliberately stays behind the sleep — raising the
+        // spinner on every keystroke is what the debounce exists to avoid.
+        failure = nil
         do {
             try await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             searching = true
-            error = nil
             results = try await model.search(trimmed)
             hasSearched = true
         } catch is CancellationError {
             return
         } catch {
-            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            // A search has no cached content to protect: the previous query's
+            // results are not an answer to this one, so this surface is always
+            // the full state.
+            failure = AppModel.connectionFailure(for: error)
             hasSearched = true
         }
         searching = false

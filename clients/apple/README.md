@@ -12,10 +12,15 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `47` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `48` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 46 adds a one-shot, session-joined TTFF beacon
+> same regression suite. Build 48 replaces Foundation's own failure
+> sentences with the shared connectivity taxonomy in
+> [CLIENT-CONNECTIVITY.md](../../docs/CLIENT-CONNECTIVITY.md): a Retry on
+> every error surface, a credentials message only for a real 401/403, and
+> the playback deadline on `/decision` and the session open.
+> Build 46 adds a one-shot, session-joined TTFF beacon
 > when the online player first advances, with separate cold-start and resume
 > reasons; passing physical-device evidence remains pending. Build 29 added
 > app-managed offline viewing on iPhone and iPad; the

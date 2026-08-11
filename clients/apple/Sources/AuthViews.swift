@@ -230,7 +230,11 @@ struct ConnectView: View {
                 await model.connect(origin)
             } catch {
                 resolving = nil
-                model.authError = error.localizedDescription
+                // docs/CLIENT-CONNECTIVITY.md §5: the inline field shape. A
+                // Bonjour resolution failure keeps `ServerDiscoveryError`'s own
+                // sentence; anything the classifier can place renders its
+                // class. Neither is Foundation's wording.
+                model.authError = Connectivity.message(for: error, server: server.name)
             }
         }
     }

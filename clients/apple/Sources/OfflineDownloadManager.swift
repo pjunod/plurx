@@ -183,7 +183,10 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         } catch {
             if var failed = await catalog.item(id: local.id) {
                 failed.state = .failed
-                failed.errorMessage = error.localizedDescription
+                failed.errorMessage = Connectivity.message(
+                    for: error,
+                    server: settings.origin
+                )
                 failed.updatedAt = Date()
                 try? await catalog.replace(failed)
                 await refresh()
@@ -601,12 +604,15 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                 if let path {
                     try? FileManager.default.removeItem(at: OfflineCatalog.localURL(for: path))
                 }
+                // Classified before the catalog closure so the message it
+                // stores is a plain string, not a captured error.
+                let message: String? = (error as NSError).code == NSURLErrorCancelled
+                    ? "Paused — tap Resume"
+                    : Connectivity.message(for: error, server: settings.origin)
                 _ = try? await catalog.update(id: id) { item in
                     item.state = .paused
                     item.phase = "paused"
-                    item.errorMessage = (error as NSError).code == NSURLErrorCancelled
-                        ? "Paused — tap Resume"
-                        : error.localizedDescription
+                    item.errorMessage = message
                     item.localAssetRelativePath = nil
                     return true
                 }

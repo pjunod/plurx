@@ -2103,7 +2103,12 @@ final class PlayerController: ObservableObject {
     private func fail(_ error: Error) {
         isChangingStream = false
         failed = player.currentItem == nil || error is PlaybackPreparationError
-        playbackError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        // A preparation failure already carries Cinema's own sentence and keeps
+        // it; anything else renders its connectivity class
+        // (docs/CLIENT-CONNECTIVITY.md §2.3). Foundation's wording reaches the
+        // client log, never the screen.
+        playbackError = (error as? PlaybackPreparationError)?.errorDescription
+            ?? Connectivity.message(for: error, server: Session.shared.origin)
     }
 
     private func needsAAC(audioIndex: Int?, decision: Decision) -> Bool {
@@ -2265,8 +2270,13 @@ final class PlayerController: ObservableObject {
         wantsPlayback = false
         isChangingStream = false
         failed = true
-        playbackError = item.error?.localizedDescription
-            ?? PlaybackPreparationError.failed.localizedDescription
+        // `item.error` is AVFoundation's NSError. `reportPlaybackFailure` above
+        // has already sent its text to the server log, which is where a native
+        // string belongs; the screen gets the connectivity class when there is
+        // one and the existing preparation sentence when there is not.
+        playbackError = item.error.flatMap {
+            Connectivity.classifiedMessage(for: $0, server: Session.shared.origin)
+        } ?? PlaybackPreparationError.failed.localizedDescription
     }
 
     private func reportPlaybackFailure(_ item: AVPlayerItem) {

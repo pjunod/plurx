@@ -114,7 +114,13 @@ final class PictureInPictureController: NSObject, ObservableObject,
         failedToStartPictureInPictureWithError error: Error
     ) {
         isActive = false
-        errorMessage = "Picture in Picture couldn't start: \(error.localizedDescription)"
+        // A stream that died under PiP renders its connectivity class; AVKit's
+        // own reasons keep the sentence this surface already had, minus the
+        // native tail it used to append.
+        errorMessage = Connectivity.classifiedMessage(
+            for: error,
+            server: Session.shared.origin
+        ) ?? "Picture in Picture couldn't start."
     }
 
     func pictureInPictureController(

@@ -129,14 +129,33 @@ private struct HomeDashboard: View {
                 if model.homeLoading {
                     ProgressView().tint(Palette.accent)
                         .frame(maxWidth: .infinity).padding(.top, 80)
-                } else if let error = model.homeError {
-                    ContentUnavailableView(
-                        "Server unavailable",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(error)
-                    )
                 } else {
-                    homeContent
+                    // `cached_content_wins`: a refresh that failed over shelves
+                    // the viewer is already reading says so in one line and
+                    // leaves them up. Only a dashboard with nothing on it is
+                    // replaced by the error state.
+                    switch Connectivity.surface(
+                        for: model.homeFailure,
+                        hasCachedContent: model.hasHomeContent
+                    ) {
+                    case .none:
+                        homeContent
+                    case .notice(let failure):
+                        ConnectionNoticeView(
+                            failure: failure,
+                            server: model.serverLabel,
+                            retry: { Task { await model.loadHome() } }
+                        )
+                        .padding(.horizontal, screenHPad)
+                        homeContent
+                    case .full(let failure):
+                        ConnectionErrorView(
+                            failure: failure,
+                            server: model.serverLabel,
+                            retry: { Task { await model.loadHome() } },
+                            changeServer: { model.changeServer() }
+                        )
+                    }
                 }
             }
             .padding(.bottom, 36)
@@ -247,29 +266,30 @@ private struct LibrariesDashboard: View {
                         .tint(Palette.accent)
                         .frame(maxWidth: .infinity)
                         .padding(.top, 80)
-                } else if let error = model.homeError {
-                    ContentUnavailableView(
-                        "Server unavailable",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(error)
-                    )
-                } else if model.libraries.isEmpty {
-                    ContentUnavailableView(
-                        "Your library is empty",
-                        systemImage: "rectangle.stack",
-                        description: Text("Add a library in the Cinema web app, then pull to refresh.")
-                    )
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 80)
                 } else {
-                    libraryHeading
-                    ForEach(model.libraryCollections()) { collection in
-                        MediaRow(
-                            title: collection.title,
-                            items: model.previewItems(for: collection),
-                            collection: collection,
-                            destination: collection
+                    // Same two shapes as the home dashboard; `hasHomeContent`
+                    // is the one definition of "there is something to protect".
+                    switch Connectivity.surface(
+                        for: model.homeFailure,
+                        hasCachedContent: model.hasHomeContent
+                    ) {
+                    case .full(let failure):
+                        ConnectionErrorView(
+                            failure: failure,
+                            server: model.serverLabel,
+                            retry: { Task { await model.loadHome() } },
+                            changeServer: { model.changeServer() }
                         )
+                    case .notice(let failure):
+                        ConnectionNoticeView(
+                            failure: failure,
+                            server: model.serverLabel,
+                            retry: { Task { await model.loadHome() } }
+                        )
+                        .padding(.horizontal, screenHPad)
+                        librariesContent
+                    case .none:
+                        librariesContent
                     }
                 }
             }
@@ -280,6 +300,31 @@ private struct LibrariesDashboard: View {
         .toolbar(.hidden, for: .navigationBar)
         .refreshable { await model.loadHome() }
         #endif
+    }
+
+    /// Extracted so both the clean case and the notice case draw exactly the
+    /// same shelves — the banner is added above them, never instead of them.
+    @ViewBuilder
+    private var librariesContent: some View {
+        if model.libraries.isEmpty {
+            ContentUnavailableView(
+                "Your library is empty",
+                systemImage: "rectangle.stack",
+                description: Text("Add a library in the Cinema web app, then pull to refresh.")
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.top, 80)
+        } else {
+            libraryHeading
+            ForEach(model.libraryCollections()) { collection in
+                MediaRow(
+                    title: collection.title,
+                    items: model.previewItems(for: collection),
+                    collection: collection,
+                    destination: collection
+                )
+            }
+        }
     }
 
     private var libraryHeading: some View {

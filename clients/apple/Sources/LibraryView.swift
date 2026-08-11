@@ -8,7 +8,10 @@ struct LibraryView: View {
     @State private var sort: LibrarySort = .title
     @State private var filter: WatchFilter = .all
     @State private var loading = true
-    @State private var error: String?
+    @State private var failure: ConnectionFailure?
+    /// Bumped by the error state's Retry so `.task(id:)` runs `load()` again
+    /// without touching the sort or collection that key it.
+    @State private var reloadNonce = 0
 
     private var visibleItems: [Item] {
         items.filter { AppModel.matches($0, filter: filter) }
@@ -22,7 +25,7 @@ struct LibraryView: View {
         [GridItem(.adaptive(minimum: model.posterSize.posterWidth), spacing: 18, alignment: .top)]
     }
 
-    private var loadKey: String { "\(collection.id):\(sort.rawValue)" }
+    private var loadKey: String { "\(collection.id):\(sort.rawValue):\(reloadNonce)" }
 
     var body: some View {
         ScrollView {
@@ -66,14 +69,33 @@ struct LibraryView: View {
         if loading && items.isEmpty {
             ProgressView().tint(Palette.accent)
                 .frame(maxWidth: .infinity).padding(.top, 80)
-        } else if let error, items.isEmpty {
-            ContentUnavailableView(
-                "Couldn't load \(collection.title)",
-                systemImage: "exclamationmark.triangle",
-                description: Text(error)
-            )
-            .frame(maxWidth: .infinity)
-        } else if visibleItems.isEmpty {
+        } else {
+            // A page that failed after some of the library was already on
+            // screen gets the one-line notice; only an empty grid is replaced.
+            switch Connectivity.surface(for: failure, hasCachedContent: !items.isEmpty) {
+            case .full(let failure):
+                ConnectionErrorView(
+                    failure: failure,
+                    server: model.serverLabel,
+                    retry: { reloadNonce += 1 },
+                    changeServer: { model.changeServer() }
+                )
+            case .notice(let failure):
+                ConnectionNoticeView(
+                    failure: failure,
+                    server: model.serverLabel,
+                    retry: { reloadNonce += 1 }
+                )
+                itemsContent
+            case .none:
+                itemsContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var itemsContent: some View {
+        if visibleItems.isEmpty {
             ContentUnavailableView(
                 filter == .all ? "This library is empty" : "No matching titles",
                 systemImage: "rectangle.stack",
@@ -126,7 +148,7 @@ struct LibraryView: View {
     @MainActor
     private func load() async {
         loading = true
-        error = nil
+        failure = nil
         do {
             // Each page paints as it arrives rather than after the last one, so
             // a thousand-item library shows its first screenful in one round
@@ -138,12 +160,9 @@ struct LibraryView: View {
             }
         } catch {
             // Same policy as Home: SwiftUI cancelling this view's task is not a
-            // failure, and a transient one over content already on screen is
-            // not worth an empty state.
-            self.error = AppModel.homeErrorMessage(
-                for: error,
-                hasCachedContent: !items.isEmpty
-            )
+            // failure. Whether the class becomes a full state or a notice is
+            // `stateContent`'s call, made from what is on screen.
+            failure = AppModel.connectionFailure(for: error)
         }
         loading = false
     }
