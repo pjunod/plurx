@@ -3095,12 +3095,15 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(item.media?.height, 2160)
         XCTAssertEqual(item.media?.hdrFormat, "Dolby Vision · Profile 7 (HDR10-compatible)")
-        let badges = episodeMediaSummaryBadges(item)
+        let badges = try XCTUnwrap(posterCardEpisodeSummaryBadges(item))
         XCTAssertEqual(badges.map(\.kind), [.resolution, .dynamicRange])
         XCTAssertEqual(badges.map(\.mark), [nil, "DV P7"])
         XCTAssertEqual(badges.map(\.accessibilityLabel), [
             "4K", "Dolby Vision · Profile 7 (HDR10-compatible)",
         ])
+        XCTAssertNil(posterCardEpisodeSummaryBadges(
+            Item(id: 73, kind: "movie", title: "Not a season child")
+        ))
     }
 
     func testEpisodeDetailMediaInfoUsesExistingFileAndAudioFields() throws {
@@ -3116,7 +3119,7 @@ final class AppleClientTests: XCTestCase {
          "video_profile":"Main 10","width":3840,"height":2160,"bit_depth":10,
          "hdr":"dolby_vision",
          "hdr_format":"Dolby Vision · Profile 7 (HDR10-compatible)",
-         "bitrate":48000000,
+         "bitrate":48200000,
          "audio_streams":[
            {"index":0,"codec":"truehd","channels":8,"language":"eng",
             "title":"Dolby Atmos","default":true},
@@ -3129,7 +3132,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(rows, [
             EpisodeMediaInfoRow(
                 label: "Video",
-                value: "HEVC · Main 10 · 3840 × 2160 · Dolby Vision · Profile 7 (HDR10-compatible) · 10-bit · 48 Mbps"
+                value: "HEVC · Main 10 · 3840×2160 · Dolby Vision · Profile 7 (HDR10-compatible) · 10-bit · 48 Mb/s"
             ),
             EpisodeMediaInfoRow(
                 label: "Audio",
@@ -3168,6 +3171,47 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(badges.last?.mark, "ATMOS 7.1")
         XCTAssertEqual(badges.last?.accessibilityLabel, "Dolby Atmos 7.1")
     }
+
+    #if os(iOS)
+    @MainActor
+    func testEpisodeMediaInfoLabelsGrowAtAccessibilityTextSizes() {
+        func measuredLabelWidth(_ sizeCategory: ContentSizeCategory) -> CGFloat {
+            let controller = UIHostingController(rootView:
+                EpisodeMediaInfoLabel(text: "Audio")
+                    .environment(\.sizeCategory, sizeCategory)
+            )
+            return controller.sizeThatFits(
+                in: CGSize(width: 320, height: 1_000)
+            ).width
+        }
+
+        let standardWidth = measuredLabelWidth(.large)
+        let accessibilityWidth = measuredLabelWidth(.accessibilityExtraExtraExtraLarge)
+        XCTAssertEqual(
+            standardWidth,
+            EpisodeMediaInfoMetrics.minimumLabelWidth,
+            accuracy: 0.5
+        )
+        XCTAssertGreaterThan(
+            accessibilityWidth,
+            EpisodeMediaInfoMetrics.minimumLabelWidth,
+            "large Dynamic Type labels must grow instead of truncating inside a fixed column"
+        )
+
+        let controller = UIHostingController(rootView:
+            EpisodeMediaInfoSection(rows: [
+                EpisodeMediaInfoRow(label: "Video", value: "3840×2160 · Dolby Vision"),
+                EpisodeMediaInfoRow(label: "Audio", value: "Dolby Atmos 7.1 · ENG"),
+                EpisodeMediaInfoRow(label: "File", value: "Episode.mkv · 74.5 GB"),
+            ])
+            .environment(\.sizeCategory, .accessibilityExtraExtraExtraLarge)
+        )
+        let measured = controller.sizeThatFits(
+            in: CGSize(width: 320, height: 10_000)
+        )
+        XCTAssertLessThanOrEqual(measured.width, 320.5)
+    }
+    #endif
 
     func testPlayerOverlayAutoHidesWheneverItIsIdle() {
         XCTAssertFalse(PlayerView.shouldAutoHideControls(

@@ -71,26 +71,26 @@ struct PosterCard: View {
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
             let metadata = cardShelfMetadata(item)
-            let trailingResolution = resolutionLabel(item.resolution)
-            if !metadata.isEmpty || trailingResolution != nil {
+            if let episodeBadges = posterCardEpisodeSummaryBadges(item) {
+                if !metadata.isEmpty {
+                    Text(metadata)
+                        .font(.system(.caption2, design: .rounded).weight(.medium))
+                        .foregroundColor(Palette.muted)
+                        .lineLimit(1)
+                }
+                EpisodeMediaSummary(badges: episodeBadges)
+            } else if !metadata.isEmpty || resolutionBadge(resolutionLabel(item.resolution)) != nil {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if !metadata.isEmpty {
                         Text(metadata)
                             .font(.system(.caption2, design: .rounded).weight(.medium))
                     }
                     Spacer(minLength: 4)
-                    if let trailingResolution {
+                    if let trailingResolution = resolutionBadge(resolutionLabel(item.resolution)) {
                         #if os(iOS)
-                        IOSWebMediaBadge(
-                            badge: ItemMetadataBadge(
-                                kind: .resolution,
-                                symbol: "",
-                                mark: trailingResolution,
-                                accessibilityLabel: trailingResolution
-                            )
-                        )
+                        IOSWebMediaBadge(badge: trailingResolution)
                         #else
-                        Text(trailingResolution)
+                        Text(trailingResolution.accessibilityLabel)
                             .font(.system(.caption2, design: .monospaced).weight(.bold))
                         #endif
                     }
@@ -347,13 +347,8 @@ struct EpisodeMediaSummary: View {
 /// page; repeating them here would turn a compact shelf into a spec table.
 func episodeMediaSummaryBadges(_ item: Item) -> [ItemMetadataBadge] {
     var badges: [ItemMetadataBadge] = []
-    if let resolution = resolutionLabel(item.media?.height ?? item.resolution) {
-        badges.append(ItemMetadataBadge(
-            kind: .resolution,
-            symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
-            mark: resolution == "4K" ? nil : resolution.uppercased(),
-            accessibilityLabel: resolution
-        ))
+    if let badge = resolutionBadge(resolutionLabel(item.media?.height ?? item.resolution)) {
+        badges.append(badge)
     }
     if let range = PlayerView.dynamicRangeBadge(
         hdr: item.media?.hdr,
@@ -369,6 +364,15 @@ func episodeMediaSummaryBadges(_ item: Item) -> [ItemMetadataBadge] {
         ))
     }
     return badges
+}
+
+/// Poster season shelves stay visually compact on iPhone and iPad, but their
+/// episode cards still receive the same resolution/HDR pair as tvOS's
+/// landscape cards. Returning `nil` for every other kind keeps ordinary
+/// poster shelves on their existing one-line metadata layout.
+func posterCardEpisodeSummaryBadges(_ item: Item) -> [ItemMetadataBadge]? {
+    guard item.kind == "episode" else { return nil }
+    return episodeMediaSummaryBadges(item)
 }
 
 struct MediaRow: View {
@@ -594,6 +598,19 @@ func resolutionLabel(width: Int?, height: Int?) -> String? {
     if longEdge >= 1_100 || shortEdge >= 650 { return "720p" }
     if longEdge >= 700 || shortEdge >= 400 { return "480p" }
     return "\(shortEdge)p"
+}
+
+/// One resolution label produces one badge everywhere: detail metadata,
+/// tvOS episode cards, and compact iOS/iPadOS poster cards cannot drift in
+/// symbol, casing, or accessibility text.
+func resolutionBadge(_ resolution: String?) -> ItemMetadataBadge? {
+    guard let resolution else { return nil }
+    return ItemMetadataBadge(
+        kind: .resolution,
+        symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
+        mark: resolution == "4K" ? nil : resolution.uppercased(),
+        accessibilityLabel: resolution
+    )
 }
 
 private func timeRemaining(_ item: Item) -> String? {

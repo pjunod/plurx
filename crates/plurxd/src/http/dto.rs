@@ -64,9 +64,9 @@ pub struct ItemDto {
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
     pub backdrop: Option<String>,
-    /// Best (max) file height for the item, e.g. 2160 / 1080 / 720. Only
-    /// populated on the library grid so cards can show a resolution badge and
-    /// group into resolution sections. `None` for shows and where unknown.
+    /// Best (max) file height for the item, e.g. 2160 / 1080 / 720. Populated
+    /// on library grids and playable season children so compact cards can show
+    /// a resolution badge. `None` for shows and where unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<i64>,
     /// Aggregated facts about the files behind this item — codec, dynamic

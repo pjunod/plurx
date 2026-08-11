@@ -258,7 +258,19 @@ enum EpisodeMediaInfoMetrics {
     /// A technical value line should wrap before it turns into an iPad-wide
     /// ruler. Phones naturally use less than this through DetailBodyFrame.
     static let maximumWidth: CGFloat = 620
-    static let labelWidth: CGFloat = 48
+    static let minimumLabelWidth: CGFloat = 48
+}
+
+struct EpisodeMediaInfoLabel: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(.caption, design: .rounded).weight(.semibold))
+            .foregroundStyle(Palette.muted)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: EpisodeMediaInfoMetrics.minimumLabelWidth, alignment: .leading)
+    }
 }
 
 struct EpisodeMediaInfoSection: View {
@@ -277,10 +289,7 @@ struct EpisodeMediaInfoSection: View {
                         Divider().overlay(Palette.outline.opacity(0.5))
                     }
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(row.label)
-                            .font(.system(.caption, design: .rounded).weight(.semibold))
-                            .foregroundStyle(Palette.muted)
-                            .frame(width: EpisodeMediaInfoMetrics.labelWidth, alignment: .leading)
+                        EpisodeMediaInfoLabel(text: row.label)
                         Text(row.value)
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(Palette.onBg.opacity(0.82))
@@ -1442,7 +1451,7 @@ struct DetailView: View {
             video.append(profile)
         }
         if let width = file.width, width > 0, let height = file.height, height > 0 {
-            video.append("\(width) × \(height)")
+            video.append("\(width)×\(height)")
         } else if let resolution = resolutionLabel(width: file.width, height: file.height) {
             video.append(resolution)
         }
@@ -1508,11 +1517,13 @@ struct DetailView: View {
 
     private static func mediaBitrateLabel(_ bitsPerSecond: Int?) -> String? {
         guard let bitsPerSecond, bitsPerSecond > 0 else { return nil }
-        let megabits = Double(bitsPerSecond) / 1_000_000
-        if megabits >= 10, megabits.rounded() == megabits {
-            return "\(Int(megabits)) Mbps"
+        if bitsPerSecond >= 1_000_000 {
+            let megabits = Double(bitsPerSecond) / 1_000_000
+            return bitsPerSecond >= 10_000_000
+                ? String(format: "%.0f Mb/s", megabits)
+                : String(format: "%.1f Mb/s", megabits)
         }
-        return String(format: "%.1f Mbps", megabits)
+        return "\(Int((Double(bitsPerSecond) / 1_000).rounded())) kb/s"
     }
 
     private static func mediaFileSizeLabel(_ bytes: Int?) -> String? {
@@ -1569,15 +1580,10 @@ struct DetailView: View {
                 accessibilityLabel: runtime
             ))
         }
-        if let resolution = file.flatMap({
+        if let badge = resolutionBadge(file.flatMap({
             resolutionLabel(width: $0.width, height: $0.height)
-        }) ?? resolutionLabel(item.resolution) {
-            badges.append(ItemMetadataBadge(
-                kind: .resolution,
-                symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
-                mark: resolution == "4K" ? nil : resolution.uppercased(),
-                accessibilityLabel: resolution
-            ))
+        }) ?? resolutionLabel(item.resolution)) {
+            badges.append(badge)
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
             let label = tvCodecLabel(codec)

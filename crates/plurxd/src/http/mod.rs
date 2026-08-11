@@ -4134,7 +4134,7 @@ mod tests {
 
     #[tokio::test]
     async fn season_detail_children_include_batched_resolution_and_hdr_facts() {
-        use plurx_core::domain::{AudioStream, ProbeResult};
+        use plurx_core::domain::{AudioStream, ItemKind, NewItem, ProbeResult};
 
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
@@ -4171,16 +4171,62 @@ mod tests {
             .await
             .expect("4K episode file");
 
+        let second_episode = state
+            .store
+            .insert_item(&NewItem {
+                library_id: seeded.lib,
+                kind: ItemKind::Episode,
+                parent_id: Some(seeded.season),
+                title: "The Detail".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(2),
+            })
+            .await
+            .expect("second episode");
+        let second_path = std::env::temp_dir().join(format!(
+            "plurx-season-facts-second-{}.mp4",
+            uuid::Uuid::new_v4()
+        ));
+        state
+            .store
+            .upsert_file(
+                second_episode,
+                &second_path.to_string_lossy(),
+                7_000_000_000,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1280),
+                    height: Some(720),
+                    bit_depth: Some(8),
+                    hdr: Some("hdr10".into()),
+                    hdr_format: Some("HDR10".into()),
+                    bitrate: Some(5_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        channels: Some(2),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("720p episode file");
+
         let (status, season) = call(
             &app,
             get(&format!("/api/v1/items/{}", seeded.season), Some(&admin)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{season}");
-        let episode = season["children"]
-            .as_array()
-            .and_then(|children| children.first())
-            .expect("season episode");
+        let episodes = season["children"].as_array().expect("season episodes");
+        assert_eq!(episodes.len(), 2, "{season}");
+        let episode = &episodes[0];
         assert_eq!(episode["id"], seeded.ep);
         assert_eq!(episode["resolution"], 2160);
         assert_eq!(
@@ -4194,6 +4240,22 @@ mod tests {
                 "hdr_format": "Dolby Vision · Profile 7 (HDR10-compatible)",
                 "audio": "TrueHD 7.1",
                 "container": "MKV"
+            })
+        );
+        let second = &episodes[1];
+        assert_eq!(second["id"], second_episode);
+        assert_eq!(second["resolution"], 720);
+        assert_eq!(
+            second["media"],
+            json!({
+                "files": 1,
+                "bytes": 7_000_000_000_i64,
+                "video": "H.264",
+                "height": 720,
+                "hdr": "hdr10",
+                "hdr_format": "HDR10",
+                "audio": "AAC 2.0",
+                "container": "MP4"
             })
         );
     }
