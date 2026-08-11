@@ -368,7 +368,8 @@ fn bounded_playback_query(query: PlaybackEventsQuery) -> PlaybackEventQuery {
 pub struct ClientLog {
     /// "error" | "warn" — anything but "error" logs at WARN.
     pub level: String,
-    /// Short machine tag: "playback_failed" | "stream_rejected" | "hls_fatal" | "stall".
+    /// Short machine tag: "playback_failed" | "stream_rejected" | "hls_fatal" |
+    /// "stall" | "stall_recovery".
     pub event: String,
     /// Human-readable summary (e.g. "format not supported by this browser").
     pub message: String,

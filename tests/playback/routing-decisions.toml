@@ -61,7 +61,7 @@ id = "server.segmented-remux"
 source = "crates/plurx-core/src/playback/mod.rs"
 source_anchor = "pub fn prefer_segmented("
 test = "crates/plurx-core/src/playback/mod.rs"
-test_anchor = "a_modest_file_on_slow_storage_still_wants_segments"
+test_anchor = "every_probed_remux_has_a_stable_segmented_reason"
 
 [[decisions]]
 id = "server.track-selection"
