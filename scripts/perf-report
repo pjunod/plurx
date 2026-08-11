@@ -602,8 +602,8 @@ def shape_section(out, shape):
     over = shape.get("over_segmented_floor", 0)
     mx = shape.get("max_bitrate")
     out("")
-    out(f"  {over} file(s) at or above 40 Mb/s — these take the segmented remux "
-        "path (§4.3bis)")
+    out(f"  {over} file(s) at or above the historic 40 Mb/s remux floor — "
+        "high-bitrate stress population (§4.3bis)")
     if mx:
         out(f"  biggest file on disk: {mx/1e6:.0f} Mb/s")
 

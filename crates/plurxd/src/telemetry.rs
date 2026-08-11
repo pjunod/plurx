@@ -9,6 +9,7 @@ use plurx_core::store::{keys, Store};
 const TTFF_BUCKETS: [i64; 8] = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
 const METHODS: [&str; 4] = ["direct_play", "remux", "transcode", "unknown"];
 const STALL_KINDS: [&str; 4] = ["supply", "decode", "network", "other"];
+const STALL_RECOVERY_OUTCOMES: [&str; 4] = ["attempt", "recovered", "failed", "other"];
 const HOLD_REASONS: [&str; 4] = ["time", "bytes", "global", "unknown"];
 const CACHE_RESULTS: [&str; 3] = ["hit", "miss", "prefix_later"];
 const ENCODERS: [&str; 7] = [
@@ -26,6 +27,7 @@ struct PlaybackMetrics {
     ttff_count: [AtomicU64; METHODS.len()],
     ttff_sum: [AtomicU64; METHODS.len()],
     stalls: [AtomicU64; STALL_KINDS.len()],
+    stall_recoveries: [AtomicU64; STALL_RECOVERY_OUTCOMES.len()],
     suspends: [AtomicU64; HOLD_REASONS.len()],
     suspended_ms: AtomicU64,
     cache_serves: [AtomicU64; CACHE_RESULTS.len()],
@@ -40,6 +42,7 @@ impl PlaybackMetrics {
             ttff_count: [const { AtomicU64::new(0) }; METHODS.len()],
             ttff_sum: [const { AtomicU64::new(0) }; METHODS.len()],
             stalls: [const { AtomicU64::new(0) }; STALL_KINDS.len()],
+            stall_recoveries: [const { AtomicU64::new(0) }; STALL_RECOVERY_OUTCOMES.len()],
             suspends: [const { AtomicU64::new(0) }; HOLD_REASONS.len()],
             suspended_ms: AtomicU64::new(0),
             cache_serves: [const { AtomicU64::new(0) }; CACHE_RESULTS.len()],
@@ -74,6 +77,16 @@ impl PlaybackMetrics {
                     "other"
                 };
                 self.stalls[label_index(Some(kind), &STALL_KINDS)].fetch_add(1, Ordering::Relaxed);
+            }
+            "stall_recovery" => {
+                let outcome = event
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(':')
+                    .next();
+                self.stall_recoveries[label_index(outcome, &STALL_RECOVERY_OUTCOMES)]
+                    .fetch_add(1, Ordering::Relaxed);
             }
             "suspend" => {
                 self.suspends[label_index(event.hold_reason.as_deref(), &HOLD_REASONS)]
@@ -137,6 +150,14 @@ impl PlaybackMetrics {
             "kind",
             &STALL_KINDS,
             &self.stalls,
+        );
+        render_counters(
+            &mut out,
+            "plurx_stall_recoveries_total",
+            "Persistent-stall recovery events reported by clients.",
+            "outcome",
+            &STALL_RECOVERY_OUTCOMES,
+            &self.stall_recoveries,
         );
         render_counters(
             &mut out,
@@ -256,6 +277,16 @@ mod tests {
             ..PlaybackEvent::default()
         });
         metrics.record(&PlaybackEvent {
+            event: "stall_recovery".into(),
+            detail: Some("attempt:transcode".into()),
+            ..PlaybackEvent::default()
+        });
+        metrics.record(&PlaybackEvent {
+            event: "stall_recovery".into(),
+            detail: Some("recovered".into()),
+            ..PlaybackEvent::default()
+        });
+        metrics.record(&PlaybackEvent {
             event: "suspend".into(),
             hold_reason: Some("time".into()),
             ..PlaybackEvent::default()
@@ -269,6 +300,8 @@ mod tests {
         assert!(text.contains("plurx_ttff_ms_count{method=\"remux\"} 1"));
         assert!(text.contains("plurx_ttff_ms_bucket{method=\"remux\",le=\"1000\"} 1"));
         assert!(text.contains("plurx_stalls_total{kind=\"supply\"} 1"));
+        assert!(text.contains("plurx_stall_recoveries_total{outcome=\"attempt\"} 1"));
+        assert!(text.contains("plurx_stall_recoveries_total{outcome=\"recovered\"} 1"));
         assert!(text.contains("plurx_suspends_total{reason=\"time\"} 1"));
         assert!(text.contains("plurx_suspended_seconds_total 1.500"));
         assert!(!text.contains("title="));

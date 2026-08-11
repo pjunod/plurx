@@ -230,3 +230,9 @@ commits = ["d9f0ca47"]
 points = ["playback.pipeline"]
 checks = ["rust-gate", "playback-exhaustive"]
 reason = "The manager regressions hold a live transcode's first one-segment EVENT playlist until real media cushion exists, and the exhaustive shipped-player matrix rejects startup stalls."
+
+[[coverage]]
+commits = ["617356c9", "ec7777dd"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static", "playback-exhaustive"]
+reason = "Playback routing units, browser policy tests, and the deterministic playback matrix pin segmented-remux eligibility, bounded persistent-stall recovery, true reconnects, per-track audio compatibility, and recovery telemetry."
