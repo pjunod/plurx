@@ -593,20 +593,21 @@ The fix is therefore not a header and not a pacing value. Every other path
 plurx has already gets a real buffer: direct play is a range-served file
 (10.8 s measured), transcode and cache hits go through hls.js where the buffer
 is ours to set (§4.3). Only the progressive remux is stuck, and the way out is
-to stop using it for high-bitrate sources — route them to the copy-video HLS
-session that already exists for Safari, where hls.js manages the buffer in
-seconds.
+to stop using it by default — route remuxes to the copy-video HLS session that
+already exists for Safari, where hls.js manages the buffer in seconds.
 
-**Shipped 2026-07-29, as a hint plus a veto.** The split matters. The server
-decides *whether* a remux wants segments (`playback::prefer_segmented`): above
-40 Mb/s outright, or below 8× headroom against what `storeprobe` measured for
-the mount holding the file — so a modest file on slow storage is caught too,
-and a big one on fast storage is left alone. The client decides *whether it
-can* (`segmentedRemuxOk`), because only the browser knows its own
-MediaSource, and `<video src>` and MSE are different code paths with different
-answers: Chrome decodes plenty progressively that MediaSource refuses. A no
-from either side keeps today's behaviour — which is stuttery on a big file,
-and stuttery is recoverable where black is not.
+**Shipped 2026-07-29 and widened 2026-08-10, as a hint plus a veto.** The split
+matters. The server now says every probed remux wants segments
+(`playback::prefer_segmented`). The original ≥40 Mb/s or <8× storage-headroom
+gate missed 36 persisted progressive stalls in seven days, including 249.2 s
+on a 10.3 Mb/s file whose mount averaged roughly 20× headroom. Those averages
+cannot predict a network, scheduler, or filesystem gap, and the 2.2 s browser
+buffer does not grow merely because the source is modest. The client still
+decides *whether it can* (`segmentedRemuxOk`), because only the browser knows
+its own MediaSource, and `<video src>` and MSE are different code paths with
+different answers: Chrome decodes plenty progressively that MediaSource
+refuses. A client veto keeps progressive delivery—stuttery remains preferable
+to black—and **Original · one stream** remains the explicit diagnostic escape.
 
 The codec question is asked the way hls.js will ask it: video and audio in one
 `isTypeSupported` string, since checking them apart passes pairs the browser
@@ -1137,8 +1138,9 @@ three-quarters false. **The pre-transcode cache (M3) is the lever for the other
 instead of every time somebody presses play.
 
 Two more numbers worth keeping from the same run: 186 files sit at or above the
-40 Mb/s segmented-remux floor (§4.3bis), the largest at 98 Mb/s; and the codec
-split is 58% H.264, 37% HEVC, with 96 AV1 files already on disk. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
+former 40 Mb/s segmented-remux floor (§4.3bis), the largest at 98 Mb/s; and the
+codec split is 58% H.264, 37% HEVC, with 96 AV1 files already on disk.
+`vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
 above the ≥3× objective. Every node reports its own verdicts on Settings →
 System and in `/api/v1/system`.
 

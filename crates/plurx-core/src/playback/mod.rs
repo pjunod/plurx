@@ -544,51 +544,41 @@ pub fn decide_forced(
     }
 }
 
-/// Above this, a remux wants a segmented transport even on storage nobody has
-/// measured. Set to sit above 4K web-DLs (25–35 Mb/s) and below disc remuxes,
-/// so the change reaches the files that are actually failing and leaves the
-/// ones that work alone.
-const SEGMENTED_FLOOR_BPS: f64 = 40e6;
-/// ...and below this much headroom over the storage that holds it, whatever
-/// the absolute bitrate. On a slow mount even a modest file needs the deeper
-/// buffer, and on a fast one a big file may not.
-const SEGMENTED_MIN_HEADROOM: f64 = 8.0;
-
 /// Should a remux be delivered as HLS segments rather than progressively?
 ///
 /// Chrome's progressive read-ahead is a hard ~2.2 seconds and no response
 /// header can raise it (PERF-PLAN §4.3bis, measured). That is a fine margin
-/// for ordinary web video and a fatal one for a 69 Mb/s remux, where any
-/// supply gap longer than two seconds is a visible stall. The same bytes sent
-/// as HLS go through MSE instead, where the buffer is the player's to set.
+/// for ordinary web video and a fatal one for a remux, where any transient
+/// supply gap longer than two seconds is a visible stall. That is true at
+/// 10 Mb/s as well as 69 Mb/s: persisted production events included a
+/// four-minute progressive stall on the former while average storage
+/// headroom still measured 20x. Average bitrate and average storage speed
+/// cannot predict a short path gap. The same bytes sent as HLS go through MSE
+/// instead, where the buffer is the player's to set.
 ///
 /// Video quality is identical either way — this chooses a *transport*, not a
 /// ladder rung. Which is why the rule can afford to be generous: the cost of
 /// a false positive is a playlist round-trip at startup, and the cost of a
 /// false negative is the stall this exists to remove.
 ///
-/// `storage_bps` is what the mount holding the file measured
-/// (`storeprobe`); `None` means nobody has measured it, which falls back to
-/// the absolute floor rather than assuming either way.
+/// `storage_bps` is what the mount holding the file measured (`storeprobe`).
+/// It is diagnostic context, not a gate: the browser's progressive buffer is
+/// the same size on fast storage, and link/scheduler gaps do not appear in a
+/// mount's average read rate.
 ///
 /// Returns the reason, so the player and the log can say why.
 pub fn prefer_segmented(bitrate_bps: Option<i64>, storage_bps: Option<f64>) -> Option<String> {
     // An unprobed file has no bitrate, and guessing one from resolution would
     // route half a library on an inference. Leave it on the path it has.
     let bitrate = bitrate_bps.filter(|b| *b > 0)? as f64;
-    if bitrate >= SEGMENTED_FLOOR_BPS {
-        return Some(format!(
-            "{:.0} Mb/s source — too fast for the browser's 2.2 s progressive buffer",
-            bitrate / 1e6
-        ));
-    }
-    let headroom = storage_bps.filter(|s| *s > 0.0)? / bitrate;
-    (headroom < SEGMENTED_MIN_HEADROOM).then(|| {
-        format!(
-            "storage reads only {headroom:.1}× this file's bitrate — too little \
-             margin for the browser's 2.2 s progressive buffer"
-        )
-    })
+    let measured = storage_bps
+        .filter(|speed| *speed > 0.0)
+        .map(|speed| format!("; storage averages {:.1}x its bitrate", speed / bitrate))
+        .unwrap_or_default();
+    Some(format!(
+        "{:.0} Mb/s remux{measured} — the browser's 2.2 s progressive buffer cannot absorb supply gaps",
+        bitrate / 1e6
+    ))
 }
 
 #[cfg(test)]
@@ -1203,24 +1193,25 @@ mod tests {
 
     #[test]
     fn a_disc_remux_wants_segments_even_on_storage_nobody_measured() {
-        let why = prefer_segmented(Some(69_000_000), None).expect("above the floor");
+        let why = prefer_segmented(Some(69_000_000), None).expect("probed remux");
         assert!(why.contains("69 Mb/s"), "{why}");
     }
 
     #[test]
-    fn an_ordinary_file_on_ample_storage_stays_progressive() {
-        // 25 Mb/s off a mount reading 335 Mb/s: 13x headroom. Changing this
-        // file's transport buys nothing and costs a playlist round-trip.
-        assert_eq!(prefer_segmented(Some(25_000_000), Some(335e6)), None);
+    fn an_ordinary_remux_on_ample_storage_still_wants_segments() {
+        // Average mount speed does not include a Wi-Fi, scheduler, or network
+        // filesystem gap. Those are exactly what a buffer must absorb.
+        let why = prefer_segmented(Some(25_000_000), Some(335e6)).expect("probed remux");
+        assert!(why.contains("13.4x"), "{why}");
     }
 
     #[test]
     fn a_modest_file_on_slow_storage_still_wants_segments() {
-        // The rule that the absolute floor alone would miss: 20 Mb/s is not a
-        // big file, but off a 100 Mb/s mount it has 5x headroom, and 2.2 s of
-        // buffer is thin at 5x whatever the bitrate says.
+        // Storage speed still belongs in the reason: 20 Mb/s off a 100 Mb/s
+        // mount has 5x average headroom, but the routing no longer mistakes an
+        // average for proof that every two-second window will be healthy.
         let why = prefer_segmented(Some(20_000_000), Some(100e6)).expect("thin headroom");
-        assert!(why.contains("5.0×"), "{why}");
+        assert!(why.contains("5.0x"), "{why}");
     }
 
     #[test]
@@ -1229,9 +1220,8 @@ mod tests {
         // resolution would reroute a library on an inference.
         assert_eq!(prefer_segmented(None, Some(100e6)), None);
         assert_eq!(prefer_segmented(Some(0), Some(100e6)), None);
-        // And an unmeasured mount falls back to the floor rather than to a
-        // headroom computed from a number that does not exist.
-        assert_eq!(prefer_segmented(Some(20_000_000), None), None);
+        // Mount measurement is context, not a routing gate.
+        assert!(prefer_segmented(Some(20_000_000), None).is_some());
         assert!(prefer_segmented(Some(69_000_000), None).is_some());
     }
 }

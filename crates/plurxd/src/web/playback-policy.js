@@ -57,6 +57,21 @@
     return nativeHls && hevcCopy ? "native" : "mse";
   }
 
+  function copyAudioNeedsTranscode({
+    codec,
+    clientAudioCodecs = [],
+    msePairSupported = false,
+    nativeHls = false,
+  }) {
+    const normalized = String(codec || "").toLowerCase();
+    if (!normalized) return true;
+    return nativeHls
+      ? !clientAudioCodecs.some(
+          (candidate) => String(candidate).toLowerCase() === normalized,
+        )
+      : !msePairSupported;
+  }
+
   function initialRoute({
     method,
     selectedAudioIndex = 0,
@@ -85,6 +100,25 @@
       (method === "direct_play" || method === "remux")
       ? "transcode"
       : "fail";
+  }
+
+  // A wait that persists has already outlived hls.js/browser nudges. Auto may
+  // trade an original remux for a compatible transcode; an explicit quality
+  // choice is respected and merely reconnected. One automatic attempt is the
+  // hard bound that prevents a bad file or dead network from restart-looping.
+  function stallRecoveryAction({
+    method,
+    quality = "auto",
+    alreadyRecovered = false,
+    active = true,
+  }) {
+    if (!active || alreadyRecovered) return "prompt";
+    if (method === "remux" && qualityForce(quality) === "auto") {
+      return "transcode";
+    }
+    return ["direct_play", "remux", "transcode"].includes(method)
+      ? "restart"
+      : "prompt";
   }
 
   function subtitleBurnAction({ requiresBurn, deliveredRange = null }) {
@@ -146,8 +180,10 @@
     sessionHeight,
     nativeHlsAvailable,
     hlsTransport,
+    copyAudioNeedsTranscode,
     initialRoute,
     fallbackAction,
+    stallRecoveryAction,
     subtitleBurnAction,
     seekDeltaSeconds,
     lostFrameRate,

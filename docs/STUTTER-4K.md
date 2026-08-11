@@ -53,35 +53,38 @@ plurx picks one of four ways to get a file to a browser
  container or audio in the way?  ──── no ───▶ TRANSCODE
         │ yes                                 re-encode, HLS, mpegts segments
         ▼
-      REMUX  ── bitrate ≥ 40 Mb/s, or storage
-        │       headroom < 8× ── yes ──▶ SEGMENTED REMUX  ← the bug is here
+      REMUX  ── probed bitrate ─────────▶ SEGMENTED REMUX  ← the bug is here
         │                                copy video, HLS, fmp4 segments, MSE
-        └── no ──────────────────────▶ PROGRESSIVE REMUX
+        └── client MSE veto / explicit
+            "Original · one stream" ───▶ PROGRESSIVE REMUX
                                          copy video, one continuous fMP4
 ```
 
 The routing rule is `prefer_segmented` in
-[playback/mod.rs](../crates/plurx-core/src/playback/mod.rs):
-
-```rust
-const SEGMENTED_FLOOR_BPS: f64 = 40e6;      // absolute floor
-const SEGMENTED_MIN_HEADROOM: f64 = 8.0;    // × the file's bitrate, off storage
-```
-
-It is a *hint*. The server offers it; the client verifies the browser will
-actually take the codec through MediaSource (`segmentedRemuxOk`) and falls
-back to progressive if not. That split matters for testing: the client can
-decline, which is what §4's new menu entry exploits.
+[playback/mod.rs](../crates/plurx-core/src/playback/mod.rs). Every probed remux
+now receives the hint. It remains a *hint*: the client verifies the browser
+will actually take the exact codec pair through MediaSource
+(`segmentedRemuxOk`) and falls back to progressive if not. That split matters
+for testing: the client can decline, which is what §4's menu entry exploits.
 
 **Why the segmented path exists at all.** Chrome will only read ahead ~2.2 s
 on a progressive stream unless the response carries *both* `Content-Length`
 and `Accept-Ranges` (PERF-PLAN §4.3). At 69 Mb/s that is not enough runway,
-so big remuxes were routed to HLS + MSE, where the buffer target is set
-explicitly. **Re-verify this premise before building on it** — the
-`Content-Length` + `Accept-Ranges` fix landed separately and took the
-progressive path from 2.2 s to 10.8 s of read-ahead, which may have made
-this whole routing decision obsolete. Nobody has re-measured progressive at
-69 Mb/s *after* that fix.
+so remuxes use HLS + MSE, where the buffer target is set explicitly. The later
+`Content-Length` + `Accept-Ranges` fix took the **direct-file control** to
+10.8 s. It cannot apply to a live progressive remux whose final byte count does
+not exist yet; current Chrome still holds about 2.2 s on `/stream.mp4`.
+
+**Re-verified 2026-08-10 with production evidence.** Seven days of durable
+events held 36 progressive-remux stalls averaging 23.2 s, including a 249.2 s
+stall on a 10.3 Mb/s H.264 episode. The storage mount averaged roughly 20 times
+that file's bitrate, so neither the former 40 Mb/s floor nor the former 8×
+headroom threshold selected the safer transport. A separate 54 Mb/s copy-HLS
+session showed the inverse case: the server remained 97 s ahead at 2.1× while
+the client estimated only 35 Mb/s and ran to 0.1 s of runway. Average storage
+and source bitrate do not predict transient delivery gaps or the client link;
+the buffer must absorb them. That is why every probed remux now prefers HLS,
+with the browser's MSE capability check still the safety veto.
 
 ---
 
@@ -1214,11 +1217,12 @@ rejected for a reason.
    handles HEVC — `case 36` sets `segmentVideoCodec="hevc"` and an `hvc1()`
    box builder consumes the parsed VPS. See §5.1 for the constraints the
    test still carries (per-session container choice; Apple requires fMP4).
-2. Is the `prefer_segmented` routing still needed at all, now that
-   progressive reads ahead 10.8 s instead of 2.2 s? Nobody re-measured
-   progressive at 69 Mb/s after the `Content-Length` + `Accept-Ranges` fix.
-   If it holds, the whole segmented copy path — and this bug with it — can be
-   deleted rather than debugged.
+2. **Answered (2026-08-10): yes.** The 10.8 s result belongs to range-served
+   direct files. A live progressive remux cannot advertise its final
+   `Content-Length`, remains near 2.2 s in Chrome, and produced 36 durable
+   stalls in seven days. The old bitrate/storage thresholds also missed long
+   10 Mb/s stalls, so all probed remuxes now prefer segmented delivery while
+   the client keeps its exact-codec MSE veto.
 3. Should `-tag:v hvc1` be `dvh1`/`dvhe` for Dolby Vision, and does Chrome
    care? Every DV file in the library currently ships as plain HEVC — and
    since §5.0 it ships without RPUs at all, which makes `hvc1` the honest
