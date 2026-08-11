@@ -1969,6 +1969,152 @@ mod tests {
         );
     }
 
+    /// N1's two settings move as one complete replicated pair. JSON null
+    /// clears the optional quality override. The response shows the requested
+    /// values; the manager carries the separately validated effective answer
+    /// used by sessions.
+    #[tokio::test]
+    async fn rate_control_settings_validate_publish_and_restore() {
+        use plurx_core::transcode::{EffectiveRateControl, Encoder};
+
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+        let (status, initial) = call(&app, get("/api/v1/settings", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(initial["transcode_rate_mode"], "bitrate");
+        assert!(initial["transcode_quality"].is_null(), "{initial}");
+
+        let (status, bad) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({
+                    "transcode_rate_mode": "cq",
+                    "transcode_quality": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+
+        let (status, partial) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "transcode_rate_mode": "quality" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{partial}");
+        assert!(
+            partial["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("provided together")),
+            "{partial}"
+        );
+
+        let (status, quality) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({
+                    "transcode_rate_mode": "quality",
+                    "transcode_quality": 22
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{quality}");
+        assert_eq!(quality["transcode_rate_mode"], "quality");
+        assert_eq!(quality["transcode_quality"], 22);
+        assert_eq!(
+            state.transcode.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Qvbr { quality: 22 },
+            "the production software args were behavior-probed before publication"
+        );
+
+        let (status, restored) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({
+                    "transcode_rate_mode": "bitrate",
+                    "transcode_quality": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{restored}");
+        assert_eq!(restored["transcode_rate_mode"], "bitrate");
+        assert!(restored["transcode_quality"].is_null(), "{restored}");
+        assert_eq!(
+            state.transcode.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Vbr
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_control_settings_return_conflict_without_mutating_while_a_viewer_waits() {
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+        let _viewer = state.transcode.test_mark_live_waiting();
+
+        let (status, body) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({
+                    "transcode_rate_mode": "quality",
+                    "transcode_quality": 22
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("validation deferred")),
+            "{body}"
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting_pair(
+                    plurx_core::store::keys::TRANSCODE_RATE_MODE,
+                    plurx_core::store::keys::TRANSCODE_QUALITY,
+                )
+                .await
+                .expect("settings pair"),
+            (None, None),
+            "the rejected PUT must not write either requested field"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_report_a_corrupt_quality_pair_as_fail_closed_bitrate() {
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+        state
+            .store
+            .put_settings(&[
+                (plurx_core::store::keys::TRANSCODE_RATE_MODE, "quality"),
+                (plurx_core::store::keys::TRANSCODE_QUALITY, "256"),
+            ])
+            .await
+            .expect("corrupt durable pair");
+
+        let (status, settings) = call(&app, get("/api/v1/settings", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        assert_eq!(settings["transcode_rate_mode"], "bitrate");
+        assert!(settings["transcode_quality"].is_null(), "{settings}");
+    }
+
     #[tokio::test]
     async fn an_unknown_request_id_is_a_404() {
         let app = test_app();
@@ -2203,6 +2349,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["version"].is_string());
         assert!(body["encoders"].is_object());
+        assert!(
+            body["encoders"]["quality_rc"].is_object(),
+            "the fleet census must expose each family's behavioral quality-mode verdict: {body}"
+        );
         assert_eq!(body["users"], 1);
     }
 

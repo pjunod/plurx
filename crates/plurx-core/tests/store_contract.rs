@@ -51,7 +51,14 @@ const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
 #[cfg(feature = "hiqlite-store")]
 static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const SETTINGS_METHODS: &[&str] = &["ping", "get_setting", "put_setting", "instance_id"];
+const SETTINGS_METHODS: &[&str] = &[
+    "ping",
+    "get_setting",
+    "get_setting_pair",
+    "put_setting",
+    "put_settings",
+    "instance_id",
+];
 const USER_METHODS: &[&str] = &[
     "count_users",
     "create_user",
@@ -865,7 +872,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 123, "review the Store method count");
+    assert_eq!(declared.len(), 125, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -960,6 +967,28 @@ async fn settings_contract_runs_through_dyn_store() {
         assert_eq!(
             store.get_setting("contract.key").await.expect("get"),
             Some("second".to_owned()),
+            "backend {backend}"
+        );
+        store
+            .put_settings(&[("contract.left", "L"), ("contract.right", "R")])
+            .await
+            .expect("publish related settings");
+        assert_eq!(
+            store.get_setting("contract.left").await.expect("left"),
+            Some("L".to_owned()),
+            "backend {backend}"
+        );
+        assert_eq!(
+            store.get_setting("contract.right").await.expect("right"),
+            Some("R".to_owned()),
+            "backend {backend}"
+        );
+        assert_eq!(
+            store
+                .get_setting_pair("contract.left", "contract.right")
+                .await
+                .expect("pair"),
+            (Some("L".to_owned()), Some("R".to_owned())),
             "backend {backend}"
         );
         let instance_id = store.instance_id().await.expect("instance id");

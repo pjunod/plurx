@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "purpose": "n1_acceptance",
+  "fixtures": [
+    {
+      "identity": "easy-1080p-h264",
+      "class": "easy",
+      "dynamic_range": "sdr",
+      "filename": "1080p-h264.mkv",
+      "reference": "../bench-media/1080p-h264.mkv",
+      "reference_sha256": "6a3539090d77f8e465178c8c66b190f6aade705cf42b4c512ae7bdd7c22341a9",
+      "trim": {
+        "start_seconds": 0,
+        "duration_seconds": 30
+      },
+      "rung": 1080
+    },
+    {
+      "identity": "hard-1080p-grain",
+      "class": "hard",
+      "dynamic_range": "sdr",
+      "filename": "grainy.mkv",
+      "reference": "../bench-media/grainy.mkv",
+      "reference_sha256": "2c6924d0fa6f5ebcc230e9020e209831aa08adbcfc8584517d71de539332cd54",
+      "trim": {
+        "start_seconds": 0,
+        "duration_seconds": 30
+      },
+      "rung": 1080
+    }
+  ]
+}

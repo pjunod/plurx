@@ -560,6 +560,30 @@ impl SettingsStore for HiqliteAuthStore {
         Ok(rows.into_iter().next().map(|row| row.value))
     }
 
+    async fn get_setting_pair(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError> {
+        let sql = "SELECT key, value FROM settings WHERE key = $1 OR key = $2 ORDER BY key";
+        validate_sql(sql)?;
+        let rows = timeout_store(
+            self.client()
+                .query_consistent_map::<SettingEntryRow, _>(sql, params!(first, second)),
+        )
+        .await?;
+        let mut pair = (None, None);
+        for row in rows {
+            if row.key == first {
+                pair.0 = Some(row.value.clone());
+            }
+            if row.key == second {
+                pair.1 = Some(row.value);
+            }
+        }
+        Ok(pair)
+    }
+
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = self.now()?;
         self.execute(
@@ -569,6 +593,26 @@ impl SettingsStore for HiqliteAuthStore {
             params!(key, value, now),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn put_settings(&self, values: &[(&str, &str)]) -> Result<(), StoreError> {
+        let now = self.now()?;
+        let sql = "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                   ON CONFLICT(key) DO UPDATE SET \
+                   value = excluded.value, updated_at = excluded.updated_at";
+        validate_sql(sql)?;
+        self.client()
+            .txn(
+                values
+                    .iter()
+                    .map(|(key, value)| (sql.to_owned(), params!(*key, *value, now))),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1041,6 +1085,20 @@ struct SettingValueRow {
 impl From<&mut Row<'_>> for SettingValueRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
+            value: row.get("value"),
+        }
+    }
+}
+
+struct SettingEntryRow {
+    key: String,
+    value: String,
+}
+
+impl From<&mut Row<'_>> for SettingEntryRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            key: row.get("key"),
             value: row.get("value"),
         }
     }

@@ -922,6 +922,35 @@ impl SettingsStore for SqliteStore {
         .await
     }
 
+    async fn get_setting_pair(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError> {
+        let first = first.to_owned();
+        let second = second.to_owned();
+        self.with_read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT key, value FROM settings WHERE key = ?1 OR key = ?2 ORDER BY key",
+            )?;
+            let rows = stmt.query_map(params![first, second], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut pair = (None, None);
+            for row in rows {
+                let (key, value) = row?;
+                if key == first {
+                    pair.0 = Some(value.clone());
+                }
+                if key == second {
+                    pair.1 = Some(value);
+                }
+            }
+            Ok(pair)
+        })
+        .await
+    }
+
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let key = key.to_owned();
         let value = value.to_owned();
@@ -933,6 +962,28 @@ impl SettingsStore for SqliteStore {
                     SET value = excluded.value, updated_at = unixepoch()",
                 params![key, value],
             )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn put_settings(&self, values: &[(&str, &str)]) -> Result<(), StoreError> {
+        let values = values
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (key, value) in values {
+                tx.execute(
+                    "INSERT INTO settings (key, value, updated_at)
+                     VALUES (?1, ?2, unixepoch())
+                     ON CONFLICT(key) DO UPDATE
+                        SET value = excluded.value, updated_at = unixepoch()",
+                    params![key, value],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1010,6 +1061,33 @@ mod tests {
         assert_eq!(
             store.get_setting("k").await.expect("get"),
             Some("v2".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn related_settings_publish_as_one_group() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        store
+            .put_settings(&[
+                ("transcode.quality", "22"),
+                ("transcode.rate_mode", "quality"),
+            ])
+            .await
+            .expect("put group");
+        assert_eq!(
+            store.get_setting("transcode.quality").await.expect("get"),
+            Some("22".to_owned())
+        );
+        assert_eq!(
+            store.get_setting("transcode.rate_mode").await.expect("get"),
+            Some("quality".to_owned())
+        );
+        assert_eq!(
+            store
+                .get_setting_pair("transcode.rate_mode", "transcode.quality")
+                .await
+                .expect("get pair"),
+            (Some("quality".to_owned()), Some("22".to_owned()))
         );
     }
 

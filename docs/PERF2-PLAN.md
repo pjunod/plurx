@@ -321,17 +321,33 @@ each stall instant, joined in one record. An Android play produces a
 
 ## 4. N1 — Quality-bounded rate control
 
-**Implementation status (2026-08-09):** the live-session capture/offline-score
-rate-control harness and the legacy-VBR golden recipe fixture are implemented
-in source. Production encoding remains the deployed server's unchanged
-Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is behavior-probed and
-scores captured bytes on the controller only after the production session
-ends; it never encodes playback or becomes a live-path dependency. No scorer is
-installed or needed on nynuc or in compose: nynuc performs production encoding
-and the accepted laptop controller scorer runs afterward. No N1 encoder flags
-or settings are implemented by this slice. The named-machine quantitative
-capture/full comparison remains unclaimed, as do N1 boot/production evidence
-and the separate forced-fallback run that prove the requested mode executed.
+**Implementation status (2026-08-10):** the harness, runtime settings,
+per-family quality arguments, behavioral validation/fallback, atomically
+published effective mode, single recipe builder, legacy-VBR golden identity,
+and pinned full SDR corpus are implemented in source. A two-second background
+refresh on each server reads the replicated requested pair and validates
+changes against that node's encoder. Those runtime probes share the existing
+offline/speculative encoder lane, reserve background admission, defer behind
+viewer/offline work, and kill/defer the probe if a viewer or offline job
+arrives. A three-second per-family deadline kills/reaps a wedged probe and
+defers the change; timeout or contention does not become a false capability
+refusal. Session
+creation remains an in-memory snapshot read, and one live session keeps one
+captured generation through fallback. Live sessions and the speculative
+producer can use the validated effective quality mode. Resumable offline
+packages deliberately remain on
+legacy VBR: persisting their effective rate-control snapshot requires the
+still-unratified storage-schema decision, so reading the mutable global mode on
+resume is forbidden. The required effective-QVBR live/producer/offline identity
+fixture follows that decision. Production encoding still uses the deployed
+server's Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is
+behavior-probed and scores captured bytes on the controller only after the
+production session ends; it never encodes playback or becomes a live-path
+dependency. No scorer is installed or needed on nynuc or in compose: nynuc
+performs production encoding and the accepted laptop controller scorer runs
+afterward. The named-machine quantitative capture/full comparison remains
+unclaimed, as do N1 boot/production evidence and the separate forced-fallback
+run that prove the requested mode executed.
 PR #131 review also stop-flagged the peak contract: v2 named an advertised-peak
 gate over a bufsize window, while the merged harness implemented a 10-second
 complete-served-segment advertised-peak gate. The harness records observed
@@ -377,6 +393,21 @@ the failure mode is therefore *a boot log line and a per-family
 fallback to today's VBR*, never a viewer-facing error. A family whose
 quality mode fails validation records that in the new `EncoderCaps`
 fields (§3.5) and keeps bitrate mode.
+
+Missing or empty durable quality is the valid family-default request. A
+present nonempty value that cannot parse as the bounded integer is corruption,
+not an alias for that default: boot, refresh, and settings reporting fail the
+whole pair closed to bitrate with no quality override.
+
+Runtime revalidation is lower priority than playback. It shares the serialized
+offline/speculative encoder lane, reserves the same background
+hardware/software admission used by speculative work, refuses to start while
+viewer or offline work is waiting, and terminates its probe if either arrives.
+A three-second per-family deadline also terminates and reaps a wedged child. A
+yielded or timed-out probe retains the last validated snapshot and is retried;
+it is never recorded as a driver refusal. A direct admin quality
+change that cannot acquire that safe probe window returns conflict before
+either requested setting is written.
 
 ### 4.3 Contract changes — one effective identity, everywhere (review R4)
 

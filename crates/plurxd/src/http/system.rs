@@ -811,6 +811,12 @@ pub struct SettingsDto {
     /// How fast a remux may be delivered, as a multiple of real time. "0" means
     /// unpaced — which lets a single stream take the whole link.
     pub stream_readrate: String,
+    /// Requested N1 rate control. The production-effective value may be VBR
+    /// when a family refuses quality mode; `/system` capabilities and boot
+    /// logs carry that validation result.
+    pub transcode_rate_mode: String,
+    /// `None` means use the validated family-tuned default.
+    pub transcode_quality: Option<u8>,
     /// How an HLS session (transcode or copy-video) is paced: the multiple of
     /// real time it settles at, how many seconds it may deliver flat-out first
     /// (that burst IS the viewer's opening buffer), and how far ahead of the
@@ -909,6 +915,16 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::STREAM_READRATE)
         .await?
         .unwrap_or_else(|| crate::http::stream::READRATE_DEFAULT.to_string());
+    let (transcode_rate_mode, transcode_quality) = state
+        .store
+        .get_setting_pair(keys::TRANSCODE_RATE_MODE, keys::TRANSCODE_QUALITY)
+        .await?;
+    let (transcode_rate_mode, transcode_quality, _) =
+        crate::transcode::normalize_rate_control_request(
+            transcode_rate_mode.as_deref(),
+            transcode_quality.as_deref(),
+        );
+    let transcode_rate_mode = transcode_rate_mode.as_str().to_owned();
     let text = |v: Option<String>, default: &str| -> String {
         v.map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
@@ -1043,6 +1059,8 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         default_sub_lang: prefs.sub_lang,
         sub_mode: prefs.sub_mode.as_str().to_owned(),
         stream_readrate,
+        transcode_rate_mode,
+        transcode_quality,
         hls_readrate,
         hls_burst_secs,
         hls_ahead_max_secs,
@@ -1098,6 +1116,14 @@ pub struct UpdateSettings {
     pub sub_mode: Option<String>,
     /// Remux delivery pace, a multiple of real time; "0" disables the limit.
     pub stream_readrate: Option<String>,
+    /// N1 requested rate-control family. Whenever either rate-control field is
+    /// sent, both are required so a replicated update is one complete pair.
+    /// A quality request is behavior-probed before the effective snapshot
+    /// changes; a refused driver remains VBR.
+    pub transcode_rate_mode: Option<String>,
+    /// JSON null clears the override back to the family-tuned default.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub transcode_quality: Option<Option<u8>>,
     /// HLS session pacing: rate (x real time, "0" unpaced), opening burst in
     /// seconds, and the ahead-of-playhead window in seconds ("0" unbounded).
     pub hls_readrate: Option<String>,
@@ -1122,12 +1148,51 @@ pub struct UpdateSettings {
     pub genre_backfill: Option<bool>,
 }
 
+/// Preserve the distinction between an absent PATCH-style field and an
+/// explicit JSON null. Serde's ordinary `Option<Option<T>>` collapses both;
+/// the harness needs null to restore an originally-unset quality override.
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// PUT /api/v1/settings (admin)
 pub async fn update_settings(
     _admin: AdminUser,
     State(state): State<AppState>,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsDto>, ApiError> {
+    match (&req.transcode_rate_mode, req.transcode_quality) {
+        (None, None) => {}
+        (Some(requested_mode), Some(quality)) => {
+            let mode = plurx_core::transcode::RateMode::parse(requested_mode).ok_or_else(|| {
+                ApiError::BadRequest("transcode_rate_mode must be bitrate or quality".into())
+            })?;
+            match state
+                .transcode
+                .apply_rate_control_settings(mode, quality)
+                .await
+            {
+                Ok(()) => {}
+                Err(crate::transcode::ApplyRateControlError::Store(error)) => {
+                    return Err(error.into())
+                }
+                Err(crate::transcode::ApplyRateControlError::Busy) => {
+                    return Err(ApiError::Conflict(
+                        "rate-control validation deferred while playback, offline/speculative encoding, or encoder capacity is active; retry after the node is idle".into(),
+                    ))
+                }
+            }
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "transcode_rate_mode and transcode_quality must be provided together".into(),
+            ));
+        }
+    }
     let pairs: [(&str, &Option<String>); 8] = [
         (keys::TMDB_API_KEY, &req.tmdb_api_key),
         (keys::OMDB_API_KEY, &req.omdb_api_key),

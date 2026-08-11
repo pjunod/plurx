@@ -908,16 +908,17 @@ def setting_contract(settings):
     }
 
 
-def update_rate_setting(api, contract, mode, quality=None, include_quality=False):
+def update_rate_setting(api, contract, mode, quality=None):
     require_server_idle(api, f"setting rate-control mode to {mode}")
     expected_rate = "bitrate" if mode == "vbr" else "quality"
-    body = {contract["rate_field"]: expected_rate}
-    if include_quality:
-        body[contract["quality_field"]] = quality
+    body = {
+        contract["rate_field"]: expected_rate,
+        contract["quality_field"]: quality,
+    }
     returned = api.call("/settings", "PUT", body)
     if returned.get(contract["rate_field"]) != expected_rate:
         raise BenchError(f"server did not apply requested {expected_rate} rate mode")
-    if include_quality and returned.get(contract["quality_field"]) != quality:
+    if returned.get(contract["quality_field"]) != quality:
         raise BenchError("server did not apply requested quality override")
     return {
         "requested_mode": mode,
@@ -1407,7 +1408,6 @@ def rate_control_report(args, api=None):
                     contract,
                     mode,
                     quality=args.quality,
-                    include_quality=mode == "qvbr" and args.quality is not None,
                 )
                 sleep(args.settings_settle)
             for fixture, report_fixture in zip(fixtures, report["fixtures"]):

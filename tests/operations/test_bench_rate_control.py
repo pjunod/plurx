@@ -390,6 +390,28 @@ class RateControlBenchCase(unittest.TestCase):
         self.assertTrue(all(fixture["dynamic_range"] == "sdr" for fixture in document["fixtures"]))
         self.assertNotIn("ffmpeg_args", path.read_text())
 
+    def test_checked_in_n1_manifest_pins_the_verified_easy_and_hard_bytes(self):
+        path = ROOT / "scripts/perf2-rate-control-n1-corpus.json"
+        document = json.loads(path.read_text())
+        self.assertEqual(document["purpose"], "n1_acceptance")
+        self.assertEqual(
+            [fixture["class"] for fixture in document["fixtures"]],
+            ["easy", "hard"],
+        )
+        self.assertEqual(
+            [fixture["reference_sha256"] for fixture in document["fixtures"]],
+            [
+                "6a3539090d77f8e465178c8c66b190f6aade705cf42b4c512ae7bdd7c22341a9",
+                "2c6924d0fa6f5ebcc230e9020e209831aa08adbcfc8584517d71de539332cd54",
+            ],
+        )
+        self.assertEqual(
+            len({fixture["filename"] for fixture in document["fixtures"]}),
+            len(document["fixtures"]),
+        )
+        self.assertTrue(all(fixture["dynamic_range"] == "sdr" for fixture in document["fixtures"]))
+        self.assertNotIn("ffmpeg_args", path.read_text())
+
     def test_server_sha256_manifest_is_fail_closed_and_self_identifying(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -704,7 +726,7 @@ class RateControlBenchCase(unittest.TestCase):
                 file_sha(server_manifest),
             )
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "quality", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
@@ -717,6 +739,7 @@ class RateControlBenchCase(unittest.TestCase):
                 and fixture["server_file_identity"]["available"] is True
                 for fixture in report["fixtures"]
             ))
+
             self.assertTrue(all(
                 measured["limits"]["peak_contract_status"]
                 == "unratified_owner_decision_required"
@@ -730,6 +753,25 @@ class RateControlBenchCase(unittest.TestCase):
             self.assertNotIn("must-not-leak", rendered)
             self.assertFalse(report["production"]["vmaf_scorer_used_for_encoding"])
             self.assertEqual(report["vmaf_scorer"]["role"], "scoring_only_never_production_encoding")
+
+    def test_omitting_quality_explicitly_clears_a_preexisting_override(self):
+        api = FullApi({})
+        api.settings["transcode_quality"] = 19
+        contract = BENCH["setting_contract"](api.call("/settings"))
+        evidence = BENCH["update_rate_setting"](
+            api,
+            contract,
+            "qvbr",
+            quality=None,
+        )
+        self.assertEqual(api.puts, [{
+            "transcode_rate_mode": "quality",
+            "transcode_quality": None,
+        }])
+        self.assertEqual(evidence["verified_settings_response"], {
+            "transcode_rate_mode": "quality",
+            "transcode_quality": None,
+        })
 
     def test_full_subset_is_diagnostic_nonzero_even_when_measurements_pass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -761,7 +803,7 @@ class RateControlBenchCase(unittest.TestCase):
                 )
             self.assertFalse(report["passed"])
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
 
@@ -812,7 +854,7 @@ class RateControlBenchCase(unittest.TestCase):
             })
             self.assertNotIn("must-not-leak", json.dumps(failure, sort_keys=True))
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "quality", "transcode_quality": 22},
             ])
             self.assertEqual(api.settings["transcode_rate_mode"], "quality")
@@ -862,7 +904,7 @@ class RateControlBenchCase(unittest.TestCase):
                 for failure in report["failures"]
             ))
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
 

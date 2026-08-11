@@ -327,7 +327,12 @@ async fn run(
     // No forced IDR here: this probe asks whether a tone-map graph produces the
     // right *picture* fast enough, and it writes one short clip rather than a
     // segmented playlist. Where the key frames land does not enter into it.
-    args.extend(encoder.encode_args(4_000, false, None));
+    args.extend(encoder.encode_args(
+        4_000,
+        plurx_core::transcode::EffectiveRateControl::Vbr,
+        false,
+        None,
+    ));
     args.push(out.to_string_lossy().into_owned());
 
     let started = Instant::now();

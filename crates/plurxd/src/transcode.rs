@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use plurx_core::domain::PlaybackEvent;
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::{
-    self, Encoder, EncoderCaps, Pacing, Pipeline, PipelineDigest, Recipe, ToneMap, TranscodeOptions,
+    self, EffectiveRateControl, Encoder, EncoderCaps, Pacing, Pipeline, PipelineDigest,
+    QualityRateControlValidation, QualityRc, RateMode, Recipe, ToneMap, TranscodeOptions,
 };
 use tokio::process::Child;
 use tokio::sync::Mutex;
@@ -2173,6 +2174,86 @@ struct CacheConfig {
     node_id: String,
 }
 
+/// One atomically published answer to the operator's requested rate control.
+///
+/// `quality_rc` is for the exact requested override (or each family's
+/// candidate default), not a version-derived guess. A session reads this once
+/// while its normalized options are built and keeps that effective value for
+/// its lifetime.
+#[derive(Debug, Clone, Copy)]
+struct RateControlSnapshot {
+    requested_mode: RateMode,
+    requested_quality: Option<u8>,
+    quality_rc: QualityRc,
+}
+
+const RATE_CONTROL_REFRESH: Duration = Duration::from_secs(2);
+
+/// Normalize the complete durable request pair. Missing/empty quality is the
+/// valid "use this family's default" value; a present nonempty value that does
+/// not fit `u8` is corruption and fails the entire pair back to legacy VBR.
+pub(crate) fn normalize_rate_control_request(
+    raw_mode: Option<&str>,
+    raw_quality: Option<&str>,
+) -> (RateMode, Option<u8>, bool) {
+    let mode_text = raw_mode.map(str::trim).filter(|value| !value.is_empty());
+    let mode = mode_text.and_then(RateMode::parse);
+    let quality_text = raw_quality.map(str::trim).filter(|value| !value.is_empty());
+    let quality = quality_text.and_then(|value| value.parse::<u8>().ok());
+    let corrupt =
+        mode_text.is_some() && mode.is_none() || quality_text.is_some() && quality.is_none();
+    if corrupt {
+        (RateMode::Bitrate, None, true)
+    } else {
+        (mode.unwrap_or_default(), quality, false)
+    }
+}
+
+enum RateControlValidation {
+    Complete(RateControlSnapshot),
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+enum RateControlProbePolicy {
+    Boot,
+    YieldingBackground,
+}
+
+#[derive(Debug)]
+pub enum ApplyRateControlError {
+    Store(plurx_core::error::StoreError),
+    Busy,
+}
+
+impl From<plurx_core::error::StoreError> for ApplyRateControlError {
+    fn from(error: plurx_core::error::StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl RateControlSnapshot {
+    fn bitrate(boot_caps: QualityRc) -> Self {
+        Self {
+            requested_mode: RateMode::Bitrate,
+            requested_quality: None,
+            quality_rc: boot_caps,
+        }
+    }
+
+    fn effective_for(self, encoder: Encoder) -> EffectiveRateControl {
+        if self.requested_mode == RateMode::Quality && self.quality_rc.supported_by(encoder) {
+            EffectiveRateControl::Qvbr {
+                quality: self
+                    .requested_quality
+                    .unwrap_or_else(|| encoder.default_quality()),
+            }
+        } else {
+            EffectiveRateControl::Vbr
+        }
+    }
+}
+
 pub struct TranscodeManager {
     store: Arc<dyn Store>,
     work_dir: PathBuf,
@@ -2181,6 +2262,13 @@ pub struct TranscodeManager {
     /// Extracted text subtitles shared with the WebVTT endpoint.
     subtitle_cache: PathBuf,
     caps: EncoderCaps,
+    /// Validated hot rate-control state. Published only after every usable
+    /// family has completed its production-argument probe.
+    rate_control: std::sync::RwLock<RateControlSnapshot>,
+    /// Serializes probe → durable settings → publication. Without this, two
+    /// concurrent admin PUTs can leave the store describing one request and
+    /// the in-memory effective snapshot describing the other.
+    rate_control_update: Mutex<()>,
     /// The tone-map graph this node proved it can run, or [`Pipeline::Cpu`]
     /// when nothing did. A per-session decision still filters it — see
     /// [`Pipeline::for_session`] — because a proven graph is a claim about the
@@ -2265,6 +2353,8 @@ impl TranscodeManager {
             work_dir,
             runtime_cache,
             subtitle_cache,
+            rate_control: std::sync::RwLock::new(RateControlSnapshot::bitrate(caps.quality_rc)),
+            rate_control_update: Mutex::new(()),
             caps,
             pipeline,
             admissions: Admissions::new(),
@@ -2368,6 +2458,31 @@ impl TranscodeManager {
             encoder: Encoder::Software, // replaced per lookup
             pipeline: self.pipeline,
         })
+    }
+
+    /// The only constructor for a content-addressed transcode recipe.
+    ///
+    /// `opts` is already normalized and contains only validated effective rate
+    /// control. Setting the encoder here prevents live lookup, speculative
+    /// production, and offline production from drifting into different names
+    /// for the same output. The manager-level pipeline remains byte-for-byte
+    /// where the legacy recipe put it; changing that is a separate cache
+    /// contract, not part of N1.
+    fn effective_recipe<'a>(
+        &self,
+        digest: &'a mut PipelineDigest,
+        file: &'a plurx_core::domain::MediaFile,
+        opts: &'a TranscodeOptions,
+        encoder: Encoder,
+        audio_copied: bool,
+    ) -> Recipe<'a> {
+        digest.encoder = encoder;
+        Recipe {
+            digest,
+            file,
+            opts,
+            audio_copied,
+        }
     }
 
     /// Which audio track a session carries, and which subtitle it burns.
@@ -2477,6 +2592,7 @@ impl TranscodeManager {
             target_height,
             software_threads,
             video_bitrate_kbps: bitrate_for_height(target_height),
+            effective_rate_control: self.effective_rate_control(encoder),
             audio_index,
             start_seconds,
             tone_map,
@@ -2505,6 +2621,17 @@ impl TranscodeManager {
             force_idr: self.caps.forced_idr.wanted_by(encoder),
             ..Default::default()
         }
+    }
+
+    /// Keep resumable offline packages on the immutable pre-N1 identity until
+    /// their effective rate control can be persisted with the package row.
+    ///
+    /// A package may yield and resume after the global setting changes. Using
+    /// that mutable setting would rebuild a different recipe and strand the
+    /// package behind its already-pinned hash. The durable snapshot needs a
+    /// ratified storage migration, so the safe interim behavior is legacy VBR.
+    fn pin_offline_rate_control(opts: &mut TranscodeOptions) {
+        opts.effective_rate_control = EffectiveRateControl::Vbr;
     }
 
     /// A lossless-enough sidecar for simple text codecs. ASS/SSA remains
@@ -2563,14 +2690,9 @@ impl TranscodeManager {
     ) -> Option<StartInfo> {
         let cache = self.cache.as_ref()?;
         let mut digest = self.digest()?;
-        digest.encoder = encoder;
-        let hash = Recipe {
-            digest: &digest,
-            file,
-            opts,
-            audio_copied: false,
-        }
-        .hash();
+        let hash = self
+            .effective_recipe(&mut digest, file, opts, encoder, false)
+            .hash();
 
         // Claim before looking at either the row or the filesystem. An
         // eviction already in progress turns this into an ordinary miss; a
@@ -2730,6 +2852,7 @@ impl TranscodeManager {
             Ok(permit) => permit,
             Err(_) => return Ok(None),
         };
+        let rate_control = self.rate_control_snapshot();
         // A background artifact is the zero-offset default shared by future
         // plays. Never bake a historical, file-persisted correction into it.
         let mut playback_file = file.clone();
@@ -2744,7 +2867,7 @@ impl TranscodeManager {
             audio_index,
             subtitle_burn,
         } = self.select_tracks(file, None, None).await;
-        let opts = self.options_for(
+        let mut opts = self.options_for(
             encoder,
             file,
             target_height,
@@ -2755,15 +2878,11 @@ impl TranscodeManager {
             // under (produce_into) — and the recipe hash excludes it anyway.
             None,
         );
+        opts.effective_rate_control = rate_control.effective_for(encoder);
         let mut digest = self.digest().ok_or("no cache digest")?;
-        digest.encoder = encoder;
-        let hash = Recipe {
-            digest: &digest,
-            file,
-            opts: &opts,
-            audio_copied: false,
-        }
-        .hash();
+        let hash = self
+            .effective_recipe(&mut digest, file, &opts, encoder, false)
+            .hash();
 
         Ok(
             match self
@@ -2832,7 +2951,7 @@ impl TranscodeManager {
             }
             OfflineSubtitle::None | OfflineSubtitle::Native(_) => None,
         };
-        let opts = self.options_for_tone_map(
+        let mut opts = self.options_for_tone_map(
             encoder,
             file,
             spec.target_height,
@@ -2842,15 +2961,11 @@ impl TranscodeManager {
             None,
             ToneMap::Zscale,
         );
+        Self::pin_offline_rate_control(&mut opts);
         let mut digest = self.digest().ok_or("no cache digest")?;
-        digest.encoder = encoder;
-        let hash = Recipe {
-            digest: &digest,
-            file,
-            opts: &opts,
-            audio_copied: false,
-        }
-        .hash();
+        let hash = self
+            .effective_recipe(&mut digest, file, &opts, encoder, false)
+            .hash();
         if !self
             .store
             .set_offline_package_recipe(package_id, &hash)
@@ -3522,6 +3637,304 @@ impl TranscodeManager {
         self.caps.choose(&prefer)
     }
 
+    fn rate_control_snapshot(&self) -> RateControlSnapshot {
+        *self
+            .rate_control
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The effective value a newly normalized session on `encoder` receives.
+    pub fn effective_rate_control(&self, encoder: Encoder) -> EffectiveRateControl {
+        self.rate_control_snapshot().effective_for(encoder)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_live_waiting(&self) -> crate::admission::LiveWait {
+        self.admissions.wait_for_slot()
+    }
+
+    async fn validate_rate_control_snapshot(
+        &self,
+        mode: RateMode,
+        quality: Option<u8>,
+        policy: RateControlProbePolicy,
+    ) -> RateControlValidation {
+        if mode == RateMode::Bitrate {
+            return RateControlValidation::Complete(RateControlSnapshot {
+                requested_mode: mode,
+                requested_quality: quality,
+                quality_rc: self.caps.quality_rc,
+            });
+        }
+
+        // Runtime validation is background encoder work, not an exception to
+        // the background-work contract. Sharing this gate means it cannot run
+        // beside an active speculative or offline encode. If an offline job
+        // queues after the probe wins the gate, `offline_waiting` below is its
+        // cancellation signal and the probe gives the lane back promptly.
+        let _background_lane = match policy {
+            RateControlProbePolicy::Boot => None,
+            RateControlProbePolicy::YieldingBackground => {
+                let Ok(guard) = self.background_producer.try_lock() else {
+                    return RateControlValidation::Deferred;
+                };
+                Some(guard)
+            }
+        };
+
+        let mut quality_rc = QualityRc::default();
+        for encoder in [
+            Encoder::Software,
+            Encoder::Nvenc,
+            Encoder::Qsv,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            if !self.caps.available(encoder) {
+                continue;
+            }
+            let q = quality.unwrap_or_else(|| encoder.default_quality());
+            if matches!(policy, RateControlProbePolicy::Boot) {
+                quality_rc.set_supported(
+                    encoder,
+                    transcode::validate_quality_rate_control(
+                        &ffmpeg_bin(),
+                        encoder,
+                        q,
+                        self.caps.forced_idr.wanted_by(encoder),
+                    )
+                    .await,
+                );
+                continue;
+            }
+            let should_yield = || {
+                self.admissions.live_is_waiting()
+                    || self
+                        .offline_waiting
+                        .load(std::sync::atomic::Ordering::Acquire)
+            };
+            if should_yield() {
+                return RateControlValidation::Deferred;
+            }
+            let validation = if encoder == Encoder::Software {
+                let budget = self.software_budget().await;
+                // Even a misconfigured zero-thread budget must account for
+                // the process. The software pool's empty-pool exception lets
+                // one oversized job run, and a positive weight makes the next
+                // live waiter visible so this probe can yield to it.
+                let probe_weight = budget.max(1);
+                let Some(_permit) =
+                    self.admissions
+                        .try_admit_software(budget, probe_weight, Priority::Background)
+                else {
+                    return RateControlValidation::Deferred;
+                };
+                transcode::validate_quality_rate_control_yielding(
+                    &ffmpeg_bin(),
+                    encoder,
+                    q,
+                    self.caps.forced_idr.wanted_by(encoder),
+                    should_yield,
+                )
+                .await
+            } else {
+                let Some(_slot) = self
+                    .admissions
+                    .try_acquire(self.max_hw_sessions().await, Priority::Background)
+                else {
+                    return RateControlValidation::Deferred;
+                };
+                transcode::validate_quality_rate_control_yielding(
+                    &ffmpeg_bin(),
+                    encoder,
+                    q,
+                    self.caps.forced_idr.wanted_by(encoder),
+                    should_yield,
+                )
+                .await
+            };
+            match validation {
+                QualityRateControlValidation::Supported => quality_rc.set_supported(encoder, true),
+                QualityRateControlValidation::Refused => quality_rc.set_supported(encoder, false),
+                QualityRateControlValidation::Deferred => return RateControlValidation::Deferred,
+            }
+        }
+        RateControlValidation::Complete(RateControlSnapshot {
+            requested_mode: mode,
+            requested_quality: quality,
+            quality_rc,
+        })
+    }
+
+    fn publish_rate_control(&self, snapshot: RateControlSnapshot, selected: Encoder) {
+        let effective = snapshot.effective_for(selected);
+        *self
+            .rate_control
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+        tracing::info!(
+            requested_mode = snapshot.requested_mode.as_str(),
+            requested_quality = snapshot.requested_quality,
+            encoder = selected.label(),
+            effective = %effective.snapshot_value(),
+            "published validated rate-control snapshot"
+        );
+    }
+
+    async fn requested_rate_control(
+        &self,
+    ) -> Result<(RateMode, Option<u8>), plurx_core::error::StoreError> {
+        let (raw_mode, raw_quality) = self
+            .store
+            .get_setting_pair(keys::TRANSCODE_RATE_MODE, keys::TRANSCODE_QUALITY)
+            .await?;
+        let (mode, quality, corrupt) =
+            normalize_rate_control_request(raw_mode.as_deref(), raw_quality.as_deref());
+        if corrupt {
+            tracing::warn!(
+                rate_mode = raw_mode.as_deref().unwrap_or_default(),
+                quality = raw_quality.as_deref().unwrap_or_default(),
+                "invalid durable rate-control pair — using bitrate"
+            );
+        }
+        Ok((mode, quality))
+    }
+
+    async fn refresh_rate_control_locked(
+        &self,
+    ) -> Result<Option<RateControlSnapshot>, plurx_core::error::StoreError> {
+        loop {
+            let (mode, quality) = self.requested_rate_control().await?;
+            let current = self.rate_control_snapshot();
+            if current.requested_mode == mode && current.requested_quality == quality {
+                return Ok(Some(current));
+            }
+            let candidate = match self
+                .validate_rate_control_snapshot(
+                    mode,
+                    quality,
+                    RateControlProbePolicy::YieldingBackground,
+                )
+                .await
+            {
+                RateControlValidation::Complete(snapshot) => snapshot,
+                RateControlValidation::Deferred => return Ok(None),
+            };
+            // A different node may have committed another complete pair while
+            // this node exercised its driver. Publish only a still-current
+            // request; otherwise validate the newer pair instead.
+            if self.requested_rate_control().await? != (mode, quality) {
+                continue;
+            }
+            let selected = self.encoder().await;
+            self.publish_rate_control(candidate, selected);
+            return Ok(Some(candidate));
+        }
+    }
+
+    /// Refresh this node's validated effective state from the replicated
+    /// requested pair. Each voter owns different hardware, so requested values
+    /// replicate while validation remains deliberately node-local.
+    async fn refresh_rate_control(
+        &self,
+    ) -> Result<Option<RateControlSnapshot>, plurx_core::error::StoreError> {
+        let _serial = self.rate_control_update.lock().await;
+        self.refresh_rate_control_locked().await
+    }
+
+    /// Keep the in-memory hot-path snapshot within the plan's two-second TTL.
+    /// Store reads and behavioral probes stay entirely off session creation;
+    /// live/producer paths only copy the already-published snapshot.
+    pub async fn rate_control_refresh_loop(self: Arc<Self>) {
+        let start = tokio::time::Instant::now() + RATE_CONTROL_REFRESH;
+        let mut interval = tokio::time::interval_at(start, RATE_CONTROL_REFRESH);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.refresh_rate_control().await {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::debug!(
+                    "rate-control refresh deferred for live/offline work or occupied encoder capacity"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not refresh replicated rate-control settings")
+                }
+            }
+        }
+    }
+
+    /// Load the durable request at boot, exercise the real production args,
+    /// and publish only the effective result. Invalid legacy/corrupt values
+    /// fall back to bitrate rather than preventing the server from starting.
+    pub async fn initialize_rate_control(&self) -> Result<(), plurx_core::error::StoreError> {
+        let _serial = self.rate_control_update.lock().await;
+        let (mode, quality) = self.requested_rate_control().await?;
+        let RateControlValidation::Complete(snapshot) = self
+            .validate_rate_control_snapshot(mode, quality, RateControlProbePolicy::Boot)
+            .await
+        else {
+            unreachable!("boot rate-control validation never defers")
+        };
+        if self.requested_rate_control().await? == (mode, quality) {
+            let selected = self.encoder().await;
+            self.publish_rate_control(snapshot, selected);
+        } else {
+            // Startup settings changed during the probe. The runtime refresher
+            // will validate the new complete pair under background admission.
+            tracing::info!(
+                "rate-control settings changed during boot validation; deferring refresh"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate and durably apply one complete requested setting pair.
+    /// Sessions keep the old effective snapshot until every probe and both
+    /// writes succeed, then all new sessions see the new one at once.
+    pub async fn apply_rate_control_settings(
+        &self,
+        mode: RateMode,
+        quality: Option<u8>,
+    ) -> Result<(), ApplyRateControlError> {
+        let _serial = self.rate_control_update.lock().await;
+        let snapshot = match self
+            .validate_rate_control_snapshot(
+                mode,
+                quality,
+                RateControlProbePolicy::YieldingBackground,
+            )
+            .await
+        {
+            RateControlValidation::Complete(snapshot) => snapshot,
+            RateControlValidation::Deferred => return Err(ApplyRateControlError::Busy),
+        };
+        let stored_quality = quality.map(|value| value.to_string()).unwrap_or_default();
+        self.store
+            .put_settings(&[
+                (keys::TRANSCODE_QUALITY, stored_quality.as_str()),
+                (keys::TRANSCODE_RATE_MODE, mode.as_str()),
+            ])
+            .await?;
+        if self.requested_rate_control().await? == (mode, quality) {
+            let selected = self.encoder().await;
+            self.publish_rate_control(snapshot, selected);
+        } else {
+            // A concurrent writer on another voter won after our transaction.
+            // Bring this process to the replicated winner before returning
+            // when a safe probe window exists. If it does not, the write has
+            // already completed and must not be mislabeled as the pre-write
+            // Busy/409 case; the background loop will retry while the HTTP
+            // response reports the replicated winner's requested pair.
+            if self.refresh_rate_control_locked().await?.is_none() {
+                tracing::info!(
+                    "concurrent rate-control winner will be validated by the background refresher"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The rung "Auto" means, given what this server can actually encode with.
     ///
     /// Auto was 720p for everything, which was the right answer when every
@@ -3672,6 +4085,7 @@ impl TranscodeManager {
         user_name: &str,
         playback_id: &str,
     ) -> Result<StartInfo, String> {
+        let rate_control = self.rate_control_snapshot();
         // Before spawning, not after: the point is to never have two encoders
         // for one player running at once, and reaping first also frees the
         // hardware slot the new session is about to want.
@@ -3713,7 +4127,7 @@ impl TranscodeManager {
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
         let mut encoder = self.encoder().await;
-        let opts = self.options_for(
+        let mut opts = self.options_for(
             encoder,
             &file,
             target_height,
@@ -3722,6 +4136,7 @@ impl TranscodeManager {
             subtitle_burn.clone(),
             None,
         );
+        opts.effective_rate_control = rate_control.effective_for(encoder);
         if let Some(info) = self
             .serve_cached(&file, &opts, encoder, &item_title, user_name, playback_id)
             .await
@@ -3846,7 +4261,7 @@ impl TranscodeManager {
         // patched. Same builder, so the two cannot describe different sessions.
         // The software permit's thread budget rides in the same rebuild: what
         // admission reserved is exactly what x264 is told to spend.
-        let opts = self.options_for(
+        let mut opts = self.options_for(
             encoder,
             &file,
             target_height,
@@ -3855,6 +4270,7 @@ impl TranscodeManager {
             subtitle_burn,
             sw_permit.as_ref().map(|p| p.threads() as u32),
         );
+        opts.effective_rate_control = rate_control.effective_for(encoder);
         let pacing = self.pacing(false).await;
         let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
@@ -3977,6 +4393,7 @@ impl TranscodeManager {
             let started_on_hardware = encoder != Encoder::Software;
             let sw_pool = self.admissions.software_pool();
             let runtime_cache = self.runtime_cache.clone();
+            let software_rate_control = rate_control.effective_for(Encoder::Software);
             tokio::spawn(async move {
                 if started_on_hardware {
                     tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
@@ -4054,6 +4471,7 @@ impl TranscodeManager {
                             &file,
                             &opts,
                             encoder,
+                            software_rate_control,
                             pacing,
                             &sw_pool,
                             &dir,
@@ -4104,12 +4522,13 @@ impl TranscodeManager {
         file: &plurx_core::domain::MediaFile,
         opts: &TranscodeOptions,
         encoder: Encoder,
+        software_rate_control: EffectiveRateControl,
         pacing: Pacing,
         sw_pool: &crate::admission::SwPool,
         dir: &std::path::Path,
         sid: &str,
         runtime_cache: &std::path::Path,
-    ) {
+    ) -> EffectiveRateControl {
         let downgrade_pipeline = opts.pipeline.on_gpu();
         let retry_encoder = if downgrade_pipeline {
             encoder
@@ -4119,6 +4538,11 @@ impl TranscodeManager {
         let mut retry_opts = opts.clone();
         if downgrade_pipeline {
             retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+        } else {
+            // A family-tuned default is part of the effective identity. A
+            // VideoToolbox value, for example, is not a valid x264 CRF merely
+            // because both are integers.
+            retry_opts.effective_rate_control = software_rate_control;
         }
         tracing::warn!(
             session = %sid,
@@ -4190,6 +4614,7 @@ impl TranscodeManager {
                 session.failed.store(true, Relaxed);
             }
         }
+        retry_opts.effective_rate_control
     }
 
     /// Start a **copy-video** HLS session: the source video is repackaged into
@@ -5390,6 +5815,414 @@ mod tests {
         assert_eq!(bitrate_for_height(1080), 8_000);
         assert_eq!(bitrate_for_height(720), 4_000);
         assert_eq!(bitrate_for_height(240), 1_200);
+    }
+
+    #[test]
+    fn durable_quality_distinguishes_unset_default_from_corruption() {
+        assert_eq!(
+            normalize_rate_control_request(Some("quality"), None),
+            (RateMode::Quality, None, false)
+        );
+        assert_eq!(
+            normalize_rate_control_request(Some("quality"), Some("  ")),
+            (RateMode::Quality, None, false)
+        );
+        assert_eq!(
+            normalize_rate_control_request(Some("quality"), Some("22")),
+            (RateMode::Quality, Some(22), false)
+        );
+        for corrupt in ["256", "garbage", "-1"] {
+            assert_eq!(
+                normalize_rate_control_request(Some("quality"), Some(corrupt)),
+                (RateMode::Bitrate, None, true),
+                "{corrupt} must fail the pair closed rather than aliasing the family default"
+            );
+        }
+        assert_eq!(
+            normalize_rate_control_request(Some("cq"), Some("22")),
+            (RateMode::Bitrate, None, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_fails_a_corrupt_quality_pair_closed_to_legacy_vbr() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        store
+            .put_settings(&[
+                (keys::TRANSCODE_RATE_MODE, "quality"),
+                (keys::TRANSCODE_QUALITY, "256"),
+            ])
+            .await
+            .expect("corrupt durable pair");
+        let (mgr, _work, _cache) = cached_manager(&store);
+
+        mgr.initialize_rate_control().await.expect("boot fallback");
+        assert_eq!(
+            mgr.rate_control_snapshot().requested_mode,
+            RateMode::Bitrate
+        );
+        assert_eq!(
+            mgr.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Vbr
+        );
+    }
+
+    #[test]
+    fn requested_quality_resolves_per_family_and_fails_closed() {
+        let mut supported = QualityRc::default();
+        supported.set_supported(Encoder::Qsv, true);
+        let snapshot = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: Some(21),
+            quality_rc: supported,
+        };
+        assert_eq!(
+            snapshot.effective_for(Encoder::Qsv),
+            EffectiveRateControl::Qvbr { quality: 21 }
+        );
+        assert_eq!(
+            snapshot.effective_for(Encoder::Software),
+            EffectiveRateControl::Vbr,
+            "a requested value cannot outrun this family's probe verdict"
+        );
+
+        let defaults = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: None,
+            quality_rc: supported,
+        };
+        assert_eq!(
+            defaults.effective_for(Encoder::Qsv),
+            EffectiveRateControl::Qvbr {
+                quality: Encoder::Qsv.default_quality()
+            }
+        );
+
+        let mut cross_family = supported;
+        cross_family.set_supported(Encoder::Software, true);
+        cross_family.set_supported(Encoder::VideoToolbox, true);
+        let defaults = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: None,
+            quality_rc: cross_family,
+        };
+        assert_eq!(
+            defaults.effective_for(Encoder::VideoToolbox),
+            EffectiveRateControl::Qvbr { quality: 65 }
+        );
+        assert_eq!(
+            defaults.effective_for(Encoder::Software),
+            EffectiveRateControl::Qvbr { quality: 23 },
+            "a runtime hardware fallback must re-resolve the destination family's default"
+        );
+        assert_eq!(
+            RateControlSnapshot::bitrate(supported).effective_for(Encoder::Qsv),
+            EffectiveRateControl::Vbr
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_identity_stays_vbr_until_its_snapshot_is_durable() {
+        use plurx_core::domain::{NewOfflinePackage, OfflineCreateOutcome};
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store.create_user("paul", "hash", true).await.expect("user");
+        let file_id = seed_file(&store).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let mut supported = QualityRc::default();
+        supported.set_supported(Encoder::Software, true);
+        let package_id = "offline-vbr-snapshot";
+        let requested = NewOfflinePackage {
+            id: package_id.to_owned(),
+            request_id: "offline-vbr-snapshot-request".to_owned(),
+            user_id: user.id,
+            file_id,
+            node_id: NODE.to_owned(),
+            source_path: file.path.to_string_lossy().into_owned(),
+            source_size: file.size,
+            source_mtime: file.mtime,
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".to_owned(),
+            estimated_bytes: 1_000_000,
+            reserved_bytes: 1_100_000,
+            expires_at: i64::MAX,
+        };
+        assert!(matches!(
+            store
+                .create_offline_package(&requested, 10, 10_000_000, 20_000_000)
+                .await
+                .expect("create package"),
+            OfflineCreateOutcome::Created(_)
+        ));
+        store
+            .claim_next_offline_package(NODE)
+            .await
+            .expect("claim")
+            .expect("queued package");
+
+        let set_quality = |quality| {
+            *mgr.rate_control
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = RateControlSnapshot {
+                requested_mode: RateMode::Quality,
+                requested_quality: Some(quality),
+                quality_rc: supported,
+            };
+        };
+        let spec = OfflineSpec {
+            target_height: 720,
+            audio_index: None,
+            subtitle: OfflineSubtitle::None,
+        };
+        set_quality(21);
+        assert!(matches!(
+            mgr.ensure_offline(
+                package_id,
+                &file,
+                &spec,
+                Instant::now(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("first offline pass"),
+            OfflineProduceOutcome::Yielded
+        ));
+        let first_hash = store
+            .offline_package_for_user(package_id, user.id)
+            .await
+            .expect("read package")
+            .expect("package")
+            .recipe_hash
+            .expect("pinned recipe");
+
+        assert!(store
+            .requeue_offline_package(package_id)
+            .await
+            .expect("requeue"));
+        store
+            .claim_next_offline_package(NODE)
+            .await
+            .expect("claim again")
+            .expect("queued package");
+        set_quality(29);
+        assert!(matches!(
+            mgr.ensure_offline(
+                package_id,
+                &file,
+                &spec,
+                Instant::now(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("resumed offline pass after hot setting change"),
+            OfflineProduceOutcome::Yielded
+        ));
+        assert_eq!(
+            store
+                .offline_package_for_user(package_id, user.id)
+                .await
+                .expect("read resumed package")
+                .expect("package")
+                .recipe_hash
+                .as_deref(),
+            Some(first_hash.as_str()),
+            "ensure_offline must keep the package's legacy identity across a hot quality change"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_refresh_loop_updates_the_hot_path_snapshot() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let (writer, _writer_work, _writer_cache) = cached_manager(&store);
+        let (peer, _peer_work, _peer_cache) = cached_manager(&store);
+        let peer = Arc::new(peer);
+        let mut supported = QualityRc::default();
+        supported.set_supported(Encoder::Software, true);
+        peer.publish_rate_control(
+            RateControlSnapshot {
+                requested_mode: RateMode::Quality,
+                requested_quality: Some(21),
+                quality_rc: supported,
+            },
+            Encoder::Software,
+        );
+        assert_eq!(
+            peer.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Qvbr { quality: 21 }
+        );
+
+        writer
+            .apply_rate_control_settings(RateMode::Bitrate, None)
+            .await
+            .expect("replicated write");
+        let refresh = tokio::spawn(Arc::clone(&peer).rate_control_refresh_loop());
+        tokio::task::yield_now().await;
+        tokio::time::advance(RATE_CONTROL_REFRESH).await;
+        for _ in 0..100 {
+            if peer.effective_rate_control(Encoder::Software) == EffectiveRateControl::Vbr {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            peer.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Vbr,
+            "the two-second refresher must replace the peer's stale snapshot"
+        );
+        refresh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_peer_refresh_defers_quality_validation_while_a_viewer_waits() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let (peer, _work, _cache) = cached_manager(&store);
+        store
+            .put_settings(&[
+                (keys::TRANSCODE_RATE_MODE, "quality"),
+                (keys::TRANSCODE_QUALITY, "22"),
+            ])
+            .await
+            .expect("replicated quality request");
+        let _viewer = peer.admissions.wait_for_slot();
+
+        assert!(
+            peer.refresh_rate_control()
+                .await
+                .expect("refresh")
+                .is_none(),
+            "the runtime probe must be deferred, not treated as a driver refusal"
+        );
+        assert_eq!(
+            peer.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Vbr,
+            "the last validated snapshot remains published while the viewer has priority"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_quality_change_does_not_mutate_settings_while_a_viewer_waits() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let _viewer = mgr.admissions.wait_for_slot();
+
+        assert!(matches!(
+            mgr.apply_rate_control_settings(RateMode::Quality, Some(22))
+                .await,
+            Err(ApplyRateControlError::Busy)
+        ));
+        assert_eq!(
+            mgr.requested_rate_control().await.expect("requested pair"),
+            (RateMode::Bitrate, None),
+            "a deferred validation must not durably publish an unvalidated request"
+        );
+        assert_eq!(
+            mgr.effective_rate_control(Encoder::Software),
+            EffectiveRateControl::Vbr
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_quality_validation_never_overlaps_the_background_encoder_lane() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let _producer = mgr.background_producer.lock().await;
+
+        assert!(matches!(
+            mgr.apply_rate_control_settings(RateMode::Quality, Some(22))
+                .await,
+            Err(ApplyRateControlError::Busy)
+        ));
+        assert_eq!(
+            mgr.requested_rate_control().await.expect("requested pair"),
+            (RateMode::Bitrate, None),
+            "validation must defer before writing while offline/speculative encoding owns the lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_uses_the_session_generation_not_the_latest_setting() {
+        use plurx_core::store::SqliteStore;
+
+        super::require_ffmpeg();
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let mut supported = QualityRc::default();
+        supported.set_supported(Encoder::VideoToolbox, true);
+        supported.set_supported(Encoder::Software, true);
+        let captured = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: None,
+            quality_rc: supported,
+        };
+        let later = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: Some(31),
+            quality_rc: supported,
+        };
+        *mgr.rate_control
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = later;
+
+        let dir = tempfile::tempdir().expect("session dir");
+        let session = test_session(dir.path().to_path_buf());
+        let mut opts = mgr.options_for_tone_map(
+            Encoder::VideoToolbox,
+            &file,
+            720,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+        );
+        opts.pipeline = Pipeline::Cpu;
+        opts.effective_rate_control = captured.effective_for(Encoder::VideoToolbox);
+        let sw_pool = mgr.admissions.software_pool();
+        let fallback = TranscodeManager::downgrade_one_step(
+            &session,
+            &file,
+            &opts,
+            Encoder::VideoToolbox,
+            captured.effective_for(Encoder::Software),
+            Pacing::unpaced(),
+            &sw_pool,
+            dir.path(),
+            "generation-test",
+            &mgr.runtime_cache,
+        )
+        .await;
+        session.kill_child().await;
+
+        assert_eq!(
+            fallback,
+            EffectiveRateControl::Qvbr { quality: 23 },
+            "the production downgrade seam must use the session's captured generation"
+        );
+        assert_ne!(
+            fallback,
+            mgr.effective_rate_control(Encoder::Software),
+            "the global q31 setting is reserved for a later session"
+        );
     }
 
     /// The snap normalises menu strays onto the ladder — nearest rung, ties
@@ -7462,14 +8295,8 @@ mod tests {
         let encoder = mgr.encoder().await;
         let opts = mgr.options_for(encoder, file, height, 0.0, None, None, None);
         let mut digest = mgr.digest().expect("cache configured");
-        digest.encoder = encoder;
-        Recipe {
-            digest: &digest,
-            file,
-            opts: &opts,
-            audio_copied: false,
-        }
-        .hash()
+        mgr.effective_recipe(&mut digest, file, &opts, encoder, false)
+            .hash()
     }
 
     /// Write what a finished transcode looks like on disk.

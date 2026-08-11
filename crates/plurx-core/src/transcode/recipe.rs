@@ -69,7 +69,6 @@ impl PipelineDigest {
         field(h, "colour", b"bt709/bt709/bt709/tv");
         field(h, "muxer", b"hls/mpegts");
         field(h, "segment_policy", SEGMENT_SECONDS.to_string().as_bytes());
-        field(h, "rate_control", b"vbr:maxrate1.5x:bufsize2x");
     }
 }
 
@@ -94,6 +93,15 @@ impl Recipe<'_> {
         let mut h = Sha256::new();
         field(&mut h, "v", CACHE_FORMAT_VERSION.to_string().as_bytes());
         self.digest.feed(&mut h);
+        // This occupied the same position with the same literal in the
+        // manager-level digest before N1. Moving it here lets a per-title
+        // effective quality value participate without changing one byte of a
+        // legacy VBR recipe.
+        field(
+            &mut h,
+            "rate_control",
+            self.opts.effective_rate_control.recipe_value().as_bytes(),
+        );
 
         // The source. Size and mtime are what make invalidation automatic: a
         // re-encoded or replaced file cannot match its old entry, whether or
@@ -189,6 +197,7 @@ fn burn_key(burn: Option<&SubtitleBurn>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcode::EffectiveRateControl;
     use std::path::PathBuf;
 
     fn digest() -> PipelineDigest {
@@ -269,6 +278,9 @@ mod tests {
             // What was asked for.
             ("height", |_, _, o, _| o.target_height = 720),
             ("video bitrate", |_, _, o, _| o.video_bitrate_kbps += 1),
+            ("effective rate control", |_, _, o, _| {
+                o.effective_rate_control = EffectiveRateControl::Qvbr { quality: 23 }
+            }),
             ("audio bitrate", |_, _, o, _| o.audio_bitrate_kbps += 1),
             ("audio channels", |_, _, o, _| o.audio_channels = 6),
             ("audio index", |_, _, o, _| o.audio_index = Some(1)),
@@ -386,5 +398,21 @@ mod tests {
             hash_of(&d, &f, &o, false),
             "2551a15c49c71a80c92c629c8ab42e004d86d9bfffc1de5e76f72e2225961855"
         );
+    }
+
+    #[test]
+    fn every_effective_quality_value_has_a_distinct_identity() {
+        let (d, f) = (digest(), media());
+        let hash = |quality| {
+            let o = TranscodeOptions {
+                effective_rate_control: EffectiveRateControl::Qvbr { quality },
+                ..Default::default()
+            };
+            hash_of(&d, &f, &o, false)
+        };
+        let vbr = hash_of(&d, &f, &TranscodeOptions::default(), false);
+        assert_ne!(hash(22), vbr);
+        assert_ne!(hash(23), vbr);
+        assert_ne!(hash(22), hash(23));
     }
 }

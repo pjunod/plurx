@@ -69,6 +69,13 @@ pub mod keys {
     /// Hardware-encoder preference for transcoding: "nvenc" | "qsv" | "vaapi"
     /// | "videotoolbox" | "software" | "" (automatic).
     pub const HWACCEL: &str = "transcode.hwaccel";
+    /// Requested rate-control family. Missing/`bitrate` preserves the legacy
+    /// VBR path exactly; `quality` is validated against every usable encoder
+    /// before an effective snapshot is published.
+    pub const TRANSCODE_RATE_MODE: &str = "transcode.rate_mode";
+    /// Optional integer quality override. Empty/absent means the calibrated
+    /// per-family default; the value matters only when rate mode is quality.
+    pub const TRANSCODE_QUALITY: &str = "transcode.quality";
     /// Trakt API application credentials (the admin creates the app at
     /// trakt.tv/oauth/applications; empty/absent disables the integration).
     pub const TRAKT_CLIENT_ID: &str = "trakt.client_id";
@@ -234,7 +241,19 @@ pub trait SettingsStore: Send + Sync + 'static {
     /// Cheap liveness probe of the backing storage (drives `/readyz`).
     async fn ping(&self) -> Result<(), StoreError>;
     async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError>;
+    /// Read two related settings from one database snapshot.
+    async fn get_setting_pair(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError>;
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), StoreError>;
+    /// Atomically publish a related group of settings.
+    ///
+    /// Callers use this when one key activates the meaning of another. A
+    /// partial write must never leave a durable configuration that no request
+    /// actually submitted.
+    async fn put_settings(&self, values: &[(&str, &str)]) -> Result<(), StoreError>;
     /// The stable unique id of this logical server.
     async fn instance_id(&self) -> Result<String, StoreError>;
 }

@@ -432,6 +432,84 @@ the limit is capped at 2,000. Settings → System shows a small seven-day TTFF,
 stall, and suspended-time summary. `scripts/perf-report` uses the same endpoint
 and falls back to the log ring when pointed at an older server.
 
+### Quality-bounded transcodes
+
+N1 adds two admin runtime settings. `transcode.rate_mode` is `bitrate` by
+default and preserves the pre-N1 encoder arguments and cache identity.
+`quality` requests the family-specific quality mode below. An optional
+`transcode.quality` integer overrides the family default; JSON `null` clears
+that override. The server validates the complete production argument list on
+the real driver before atomically storing the pair and publishing it to new
+sessions.
+
+| Encoder family | Effective quality arguments |
+|---|---|
+| Software | `-crf q`, with the existing max-rate and buffer caps |
+| Intel QSV | `-global_quality q`, with target bitrate and caps |
+| VA-API | `-rc_mode QVBR -global_quality q`, with target bitrate and caps |
+| NVIDIA NVENC | `-rc vbr -cq q`, with target bitrate and caps |
+| Apple VideoToolbox | `-q:v q`, with target bitrate and caps |
+
+The request and the effective result are deliberately different facts. A
+driver that refuses its quality arguments remains usable for bitrate mode; new
+sessions on that family fall back to VBR and the boot/runtime log names the
+refusal. `GET /api/v1/system` exposes the boot-probed per-family verdicts under
+`encoders.quality_rc`. `GET /api/v1/settings` returns the requested mode and
+override, not proof that a particular session executed quality mode. Confirm
+that from the behavioral-probe log plus a production session's ffmpeg
+arguments during the named-machine acceptance run.
+
+```bash
+# Request one explicit calibration candidate.
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"transcode_rate_mode":"quality","transcode_quality":22}' \
+  http://nynuc:32400/api/v1/settings
+
+# Return to the byte-for-byte legacy path and clear the override.
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"transcode_rate_mode":"bitrate","transcode_quality":null}' \
+  http://nynuc:32400/api/v1/settings
+```
+
+The built-in quality numbers are calibration candidates until N1's nynuc run
+accepts one value per encoder family. Do not treat source defaults or a
+successful 15-frame validation probe as D5 evidence. Effective VBR retains the
+literal legacy recipe bytes; each effective quality value has a distinct
+recipe identity, so a requested mode that falls back cannot poison the cache.
+
+Both rate-control fields are required whenever either is updated; the server
+stores them as one pair. In a cluster the requested pair replicates, while a
+two-second background loop on each node validates changes against that node's
+encoder. Runtime probes share the serialized offline/speculative encoder lane,
+reserve background admission, and yield to the existing viewer/offline priority
+signals: they do not start while higher-priority work is waiting, and an
+in-flight probe is killed and retried if a viewer or offline job arrives. Each
+family probe also has a three-second deadline; a wedged child is killed and
+reaped instead of retaining the lane or request indefinitely. The previous
+validated snapshot stays active; timeout or temporary contention is never
+recorded as an unsupported driver. A direct quality-mode PUT that cannot obtain
+a safe probe window returns HTTP 409 and writes neither field, so retry it after
+the node is idle. Session creation does no store read or probe: it copies the
+latest in-memory snapshot. A live session keeps that captured setting
+generation even if it later falls back to software.
+
+An absent or empty stored quality means the valid per-family default. A
+nonempty value that cannot parse as the bounded integer marks the durable pair
+corrupt; boot, refresh, and `GET /settings` all report/use legacy bitrate with
+no override rather than silently turning corruption into default-quality mode.
+
+Live sessions and speculative production may use the validated quality
+identity. Resumable offline packages are temporarily pinned to legacy VBR
+instead: a package must persist its effective rate-control snapshot to survive
+a yield and later resume, and that storage migration remains an explicit owner
+decision. Do not describe offline packages as quality-mode output until the
+snapshot schema and the effective-QVBR live/producer/offline identity test land
+together.
+
 ### Rate-control acceptance captures production, then scores offline
 
 Performance II N1 is judged on bytes created by the deployed server, not by a
@@ -482,13 +560,16 @@ scripts/bench rate-control \
   --json out/rate-control-vbr.json
 ```
 
-After N1 adds the exact `transcode_rate_mode` and `transcode_quality` settings,
-build a full acceptance manifest. Every local reference must carry its actual
+N1's full comparison uses
+`scripts/perf2-rate-control-n1-corpus.json`. It pins the standard
+`1080p-h264.mkv` easy fixture and `grainy.mkv` hard fixture by SHA-256; the
+relative controller references resolve to `bench-media/` created by the
+fixture command above. Every full manifest reference must carry its actual
 SHA-256, `dynamic_range: sdr`, and one of equal, nonempty `easy` and `hard`
 halves. Every fixture must have a unique server filename, resolved controller
 path, and pinned SHA-256. Relabeling the same clip as both easy and hard is not
-a corpus. The checked-in two-fixture manifest is a VBR smoke only; it is not D5
-calibration or full acceptance.
+a corpus. `scripts/perf2-rate-control-smoke-corpus.json` remains VBR-smoke-only
+and is not D5 calibration or full acceptance.
 
 Capture server hashes from the exact files in nynuc's fixture library, then
 produce the same ordered list locally and compare it before running. Replace
@@ -499,12 +580,12 @@ copy merely because it has the same filename:
 mkdir -p out
 
 ssh nynuc \
-  'cd /path/to/nynuc/bench-media && sha256sum -- easy-a.mkv easy-b.mkv hard-a.mkv hard-b.mkv' \
+  'cd /mnt/qnap/media/plurx-perf2/bench-media && sha256sum -- 1080p-h264.mkv grainy.mkv' \
   > out/nynuc-perf2.sha256
 
 (
   cd bench-media
-  shasum -a 256 easy-a.mkv easy-b.mkv hard-a.mkv hard-b.mkv
+  shasum -a 256 1080p-h264.mkv grainy.mkv
 ) > out/laptop-perf2.sha256
 
 diff -u out/laptop-perf2.sha256 out/nynuc-perf2.sha256
@@ -523,7 +604,7 @@ scripts/bench rate-control \
   --base http://nynuc:32400 \
   --token "$PLURX_ADMIN_TOKEN" \
   --library "$PLURX_FIXTURE_LIBRARY_ID" \
-  --corpus /path/to/perf2-n1-acceptance.json \
+  --corpus scripts/perf2-rate-control-n1-corpus.json \
   --server-sha256-manifest out/nynuc-perf2.sha256 \
   --modes vbr,qvbr \
   --quality 22 \
@@ -538,6 +619,17 @@ scripts/bench rate-control \
   --json out/rate-control-full.json
 ```
 
+The command above measures the explicit `q=22` calibration candidate only; it
+cannot ratify the currently provisional unset/default value. D5 requires a
+nynuc sweep, updating the selected family default to the winning measured
+value, and rerunning that exact default without `--quality`. Until the peak
+contract is also ratified, every full artifact remains ineligible and exits
+nonzero even when its other diagnostics are green.
+
+Omitting `--quality` explicitly sends and verifies
+`transcode_quality: null` for both captures; it does not preserve a preexisting
+override. The original pair is still restored in the final cleanup path.
+
 Full comparison accepts exactly model `vmaf_v0.6.1`, `--vmaf-subsample 1`, a
 `10.0`-second served-segment window, `--poll 0.25`, and
 `--settings-settle 3.0`. Subsampling can conceal a short quality regression; a
@@ -548,8 +640,8 @@ capture/idle timeouts may vary under the plan, but the artifact records them.
 They can only refuse an incomplete or unsafe run; they do not shorten the fixed
 source-timeline trim that is scored.
 
-The harness sends partial settings updates only and records the requested mode
-plus only the verified rate/quality fields from the settings response. Its
+The harness sends the complete rate/quality pair on every update and records
+only those verified fields from the settings response. Its
 `finally` path stops starting new `/system` polls when the local
 `--idle-timeout` deadline is reached and restores only after a completed
 response reports zero. Each sleep is capped at the deadline's remaining time.
