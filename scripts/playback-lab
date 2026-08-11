@@ -890,10 +890,12 @@ function playerSnapshotExpression() {
       offset:Number(p.offset||0),
       ttff_ms:p.ttffMs==null?null:p.ttffMs, stalls:p.stalls||0,
       stalls_by_kind:p.stallsByKind||{supply:0,decode:0}, buffer_limits:p.bufferLimits||{},
+      stall_recoveries:p.stallRecoveries||0, recovering_stall:p.recoveringStall||null,
       hitches:{back:h.back||0,held:h.held||0,late:h.late||0,drop:h.drop||0,gap:h.gap||0,slow:h.slow||0,rate:h.rate==null?null:h.rate},
       decode:p.decodeInfo||null, health:p.health||null,
       source:p.source||null, audio_count:(p.audio||[]).length, subtitle_count:(p.subs||[]).length,
       current_audio:p.curAudio==null?null:p.curAudio, current_subtitle:p.curSub==null?null:p.curSub,
+      media_events:(globalThis.__plurxLabMediaEvents||[]).slice(-30),
       video:{current_time:v?Number((v.currentTime||0).toFixed(3)):0,
         absolute_time:v?Number(((p.offset||0)+(v.currentTime||0)).toFixed(3)):Number(p.offset||0),
         duration:v&&isFinite(v.duration)?v.duration:null,
@@ -922,6 +924,20 @@ async function prepareBrowser(driver, token) {
 async function setCasePreferences(driver, quality) {
   await driver.exec(`
     try{closePlayer()}catch(e){}
+    globalThis.__plurxLabMediaEvents=[];
+    { const v=document.getElementById('video');
+      if(v&&!v.__plurxLabEvents){
+        v.__plurxLabEvents=true;
+        for(const event of ['play','playing','pause','waiting','stalled','suspend','ended','abort','emptied'])
+          v.addEventListener(event,()=>{
+            const p=(typeof PLAYER!=='undefined'&&PLAYER)||{};
+            globalThis.__plurxLabMediaEvents.push({event,at_ms:Math.round(performance.now()),
+              attempt:p.attemptReason||null,current_time:Number((v.currentTime||0).toFixed(3)),
+              paused:!!v.paused,ended:!!v.ended,seeking:!!v.seeking,
+              ready_state:v.readyState,network_state:v.networkState});
+          });
+      }
+    }
     localStorage.setItem('plurx_quality', ${JSON.stringify(quality)});
     localStorage.setItem('plurx_autonext', '0');
     localStorage.setItem('plurx_autoskip', '0');

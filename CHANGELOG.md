@@ -10,6 +10,27 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Web playback no longer waits forever on a starved remux.** Every probed
+  remux now prefers copy-video HLS when the browser proves it can accept the
+  exact video/audio pair through MediaSource; explicit **Original · one
+  stream** and unsupported MSE combinations keep the progressive escape
+  hatch. This removes the browser's roughly 2.2-second progressive-buffer
+  ceiling from ordinary remuxes too—the former 40 Mb/s/storage-headroom gate
+  missed persisted 10 Mb/s stalls lasting minutes. A `waiting` state that
+  survives eight seconds is now recorded immediately and gets one bounded,
+  position-preserving recovery: Auto remuxes switch to a transcode, while
+  direct play, explicit Original, cached VOD, and existing transcodes truly
+  reconnect. Recovery attempts, successes, and failures enter durable
+  playback telemetry and bounded Prometheus counters; startup diagnosis now
+  covers direct play and mid-playback fallback streams as well. Copy-HLS audio
+  switches also re-check the newly selected codec and convert only that track
+  to AAC when the active browser transport cannot accept it, including
+  ManagedMediaSource on iOS. Fallible decode/manual fallback creation keeps a
+  working picture until the replacement exists, native-HLS restarts detach the
+  old playlist before recovery accounting begins, recovery buttons survive
+  subsequent browser `waiting` events, and audio/subtitle changes cancel a
+  pending stall deadline for the stream they replace.
+
 - **Apple seeking works like a progress bar again.** Scrubbing, skip presses,
   and lock-screen position commands on iPhone, iPad, and Apple TV now seek the
   current item's own clock whenever the target sits inside the growing HLS

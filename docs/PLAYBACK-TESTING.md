@@ -92,12 +92,12 @@ branch; do not multiply the suite merely because another axis exists.
 | `remux-h264-multitrack-1080.mkv` | Container remux with two audio codecs and a text subtitle; owns seek/audio/subtitle restarts. |
 | `transcode-mpeg4-mp3-720.avi` | Unsupported video codec forces a real video transcode. |
 | `direct-vp9-opus-720.webm` | Non-MP4 direct path where this browser reports VP9 + Opus. |
-| `hevc-hdr-open-gop-2160.mkv` | 3840×2160 · 10-bit PQ/BT.2020 · open GOP · approximately 48 Mb/s, above the 40 Mb/s segmented-remux floor. |
+| `hevc-hdr-open-gop-2160.mkv` | 3840×2160 · 10-bit PQ/BT.2020 · open GOP · approximately 48 Mb/s, preserving the high-bitrate copy/segmenter stress case. |
 
 Generation is cached. Every invocation still runs `ffprobe` and rejects a file
 whose codec, streams, dimensions, HDR tags, duration, or critical bitrate no
 longer match. That guard prevents a fast-compressing synthetic 4K clip from
-quietly falling below the routing threshold and "passing" the wrong path.
+quietly turning a high-bitrate buffer/segmenter case into an ordinary one.
 
 The 4K file is about 108 MB; the whole corpus is about 195 MB under
 `target/playback-lab/fixtures/`, which Git ignores. `--rebuild` regenerates it.

@@ -69,6 +69,42 @@ test("native HLS is Safari-only unless MSE is unavailable", () => {
   );
   assert.equal(policy.hlsTransport({ nativeHls: true, hevcCopy: true }), "native");
   assert.equal(policy.hlsTransport({ nativeHls: true, hevcCopy: false }), "mse");
+  assert.equal(
+    policy.hlsTransport({
+      nativeHls: true,
+      hevcCopy: false,
+      hlsJsSupported: false,
+    }),
+    "native",
+  );
+});
+
+test("copy-HLS audio compatibility follows the newly selected track", () => {
+  assert.equal(
+    policy.copyAudioNeedsTranscode({ codec: "aac", msePairSupported: true }),
+    false,
+  );
+  assert.equal(
+    policy.copyAudioNeedsTranscode({ codec: "ac3", msePairSupported: false }),
+    true,
+  );
+  assert.equal(
+    policy.copyAudioNeedsTranscode({
+      codec: "ac3",
+      clientAudioCodecs: ["aac", "ac3"],
+      nativeHls: true,
+    }),
+    false,
+  );
+  assert.equal(
+    policy.copyAudioNeedsTranscode({
+      codec: "truehd",
+      clientAudioCodecs: ["aac", "ac3"],
+      nativeHls: true,
+    }),
+    true,
+  );
+  assert.equal(policy.copyAudioNeedsTranscode({ codec: null }), true);
 });
 
 test("manual quality and rescue height preserve the viewer's promise", () => {
@@ -141,6 +177,69 @@ test("a rejected cheap stream gets one compatibility transcode", () => {
   assert.equal(
     policy.fallbackAction({ method: "remux", mediaFailure: false }),
     "fail",
+  );
+});
+
+test("a persistent stall gets one bounded method-aware recovery", () => {
+  assert.equal(
+    policy.stallRecoveryAction({ method: "remux", quality: "auto" }),
+    "transcode",
+  );
+  for (const quality of ["original", "nomse", "1080"]) {
+    assert.equal(
+      policy.stallRecoveryAction({ method: "remux", quality }),
+      "restart",
+      quality,
+    );
+  }
+  for (const method of ["direct_play", "transcode"]) {
+    assert.equal(
+      policy.stallRecoveryAction({ method, quality: "auto" }),
+      "restart",
+      method,
+    );
+  }
+  assert.equal(
+    policy.stallRecoveryAction({
+      method: "remux",
+      quality: "auto",
+      alreadyRecovered: true,
+    }),
+    "prompt",
+  );
+  assert.equal(policy.stallRecoveryAction({ method: "unknown" }), "prompt");
+});
+
+test("fallback swaps preserve healthy playback until the replacement exists", () => {
+  assert.equal(
+    policy.fallbackResetBeforeOpen({ reason: "stall-recovery" }),
+    true,
+  );
+  assert.equal(
+    policy.fallbackResetBeforeOpen({ reason: "stall-manual" }),
+    true,
+  );
+  for (const reason of ["decode-rescue", "stream-rejected", null]) {
+    assert.equal(
+      policy.fallbackResetBeforeOpen({ reason }),
+      false,
+      String(reason),
+    );
+  }
+});
+
+test("a persistent-stall prompt survives later waiting events", () => {
+  assert.equal(
+    policy.waitingOverlayAction({ started: false, stallPrompt: false }),
+    "ignore",
+  );
+  assert.equal(
+    policy.waitingOverlayAction({ started: true, stallPrompt: false }),
+    "buffer",
+  );
+  assert.equal(
+    policy.waitingOverlayAction({ started: true, stallPrompt: true }),
+    "preserve_prompt",
   );
 });
 

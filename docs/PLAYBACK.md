@@ -84,7 +84,7 @@ one.
 | `server.selected-audio-compatibility` | Selected track to remux audio recipe | Audio compatibility follows the track selected by language policy or the viewer, not the container's scan-time default. An unsupported preferred TrueHD track is converted to AAC while the HDR video remains copied. | Mixed E-AC-3/TrueHD Dolby Vision Rust regression |
 | `server.apple-high-tier-master` | High-tier Apple HLS playlist envelope | HDR HEVC High-tier sessions without native text renditions serve their media playlist directly, avoiding AVPlayer's multivariant eligibility rejection without changing video samples. | High/Main-tier, HDR/SDR, and subtitle-gate Rust matrix |
 | `server.apple-high-tier-init` | High-tier Apple HLS initialization record | The generated initialization segment clears only its HEVC High-tier declaration for the same narrowly gated HDR sessions, allowing VideoToolbox to inspect otherwise decodable picture data. | Synthetic High-tier `hvcC` Rust regression |
-| `server.segmented-remux` | Progressive vs segmented remux hint | Only remuxes are eligible. Prefer segments at source bitrate ≥40 Mb/s or storage headroom <8×; missing measurements preserve the old route. The browser must still prove MSE accepts the codecs. | Boundary units in `playback/mod.rs` |
+| `server.segmented-remux` | Progressive vs segmented remux hint | Every probed remux prefers segments. Average bitrate and storage speed cannot predict a transient path gap, while progressive fMP4 has only about 2.2 s of browser runway. The browser must still prove MSE accepts the exact codec pair; **Original · one stream** remains an explicit veto. | Eligibility units in `playback/mod.rs`; browser policy matrix |
 | `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
 | `server.hdr-subtitle-burn-guard` | Old-client burn request on HDR | Session creation independently refuses `subtitle_burn` for a probed DV, HDR10, or HLG source with a machine-readable 422 before playback accounting or encoder creation. SDR and unprobed sources retain burn support. There is deliberately no override: missing client-plan context is not permission to replace HDR with SDR. | Rust HTTP refusal contract plus helper matrix |
@@ -517,15 +517,49 @@ session (`startCopyHls`) instead of falling back to the progressive
 re-break it.
 
 **Wiring:** `GET /files/{id}/hls/start?copy=1&aac=<0|1>` — `copy=1` selects the
-copy session; `aac=1` says the audio needs transcoding (the client already
-learned that from `decision.transcode_audio`). Everything else — playlist and
-segment serving, the idle reaper, the fail-fast watchdog — is the shared HLS
-session machinery. The start response includes additive `media_origin_ms`, the
-source timestamp represented by player-local time zero. Copy sessions report
-the preceding keyframe actually selected by the demuxer; accurate transcodes
-report the requested start, and cached whole-title sessions report zero. New
-clients use this integer origin for timeline mapping and old clients continue
-to fall back to `start_seconds`.
+copy session; `aac=1` says the selected audio needs transcoding. A cold start
+gets that answer from `decision.transcode_audio`. An audio switch re-evaluates
+the newly selected track against the transport that will actually attach:
+native HLS uses the browser's audio capability list, while hls.js uses the
+exact video/audio MediaSource pair. Without the second check, an AAC-default
+file switching to AC-3 fed unsupported AC-3 into Chrome MSE and failed at
+`bufferAddCodecError`. Everything else — playlist and segment serving, the
+idle reaper, the fail-fast watchdog — is the shared HLS session machinery. The
+start response includes additive `media_origin_ms`, the source timestamp
+represented by player-local time zero. Copy sessions report the preceding
+keyframe actually selected by the demuxer; accurate transcodes report the
+requested start, and cached whole-title sessions report zero. New clients use
+this integer origin for timeline mapping and old clients continue to fall back
+to `start_seconds`.
+
+## Persistent stalls — one bounded recovery, with an outcome
+
+The startup watchdog diagnoses a stream that never starts. Mid-playback was
+different: `waiting` began a timer only so `playing` could calculate the
+finished gap. If `playing` never arrived, no stall beacon was emitted and no
+deadline existed. The overlay could say **Buffering…** forever even after the
+server's own transcode watchdog had correctly failed a stuck producer.
+
+Now an uninterrupted wait has an eight-second deadline. The deadline records
+the stall immediately, including runway and the active session id, then asks
+the pure `stallRecoveryAction` policy for one action:
+
+- An Auto remux switches at the current film position to H.264/AAC transcode.
+  This covers both a source faster than the client link and a copy stream the
+  browser cannot present reliably.
+- Direct play, explicit Original, cached VOD, and an existing transcode
+  reconnect the same route. This is a real source/session replacement; the old
+  **Try again** path only assigned `currentTime` to the already-stalled element
+  for direct and VOD playback.
+- A second persistent stall never loops automatically. The viewer gets **Try
+  again**, **Force transcode** where meaningful, and **Close**.
+
+The attempt and its terminal `recovered` or `failed` outcome are separate
+`stall_recovery` playback events. They join the same live session truth as
+other client beacons and project to
+`plurx_stall_recoveries_total{outcome=...}`. A stall that never resumes is
+therefore visible both as the original supply/decode failure and as whether
+the player repaired it.
 
 ## The error fallback — and the stale-reason trap
 
