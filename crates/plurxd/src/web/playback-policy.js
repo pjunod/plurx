@@ -53,8 +53,8 @@
     return !hlsJsSupported;
   }
 
-  function hlsTransport({ nativeHls, hevcCopy }) {
-    return nativeHls && hevcCopy ? "native" : "mse";
+  function hlsTransport({ nativeHls, hevcCopy, hlsJsSupported = true }) {
+    return nativeHls && (hevcCopy || !hlsJsSupported) ? "native" : "mse";
   }
 
   function copyAudioNeedsTranscode({
@@ -110,15 +110,23 @@
     method,
     quality = "auto",
     alreadyRecovered = false,
-    active = true,
   }) {
-    if (!active || alreadyRecovered) return "prompt";
+    if (alreadyRecovered) return "prompt";
     if (method === "remux" && qualityForce(quality) === "auto") {
       return "transcode";
     }
     return ["direct_play", "remux", "transcode"].includes(method)
       ? "restart"
       : "prompt";
+  }
+
+  function fallbackResetBeforeOpen({ reason }) {
+    return reason === "stall-recovery" || reason === "stall-manual";
+  }
+
+  function waitingOverlayAction({ started = false, stallPrompt = false }) {
+    if (!started) return "ignore";
+    return stallPrompt ? "preserve_prompt" : "buffer";
   }
 
   function subtitleBurnAction({ requiresBurn, deliveredRange = null }) {
@@ -184,6 +192,8 @@
     initialRoute,
     fallbackAction,
     stallRecoveryAction,
+    fallbackResetBeforeOpen,
+    waitingOverlayAction,
     subtitleBurnAction,
     seekDeltaSeconds,
     lostFrameRate,

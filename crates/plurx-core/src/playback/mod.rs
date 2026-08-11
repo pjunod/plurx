@@ -561,22 +561,13 @@ pub fn decide_forced(
 /// a false positive is a playlist round-trip at startup, and the cost of a
 /// false negative is the stall this exists to remove.
 ///
-/// `storage_bps` is what the mount holding the file measured (`storeprobe`).
-/// It is diagnostic context, not a gate: the browser's progressive buffer is
-/// the same size on fast storage, and link/scheduler gaps do not appear in a
-/// mount's average read rate.
-///
-/// Returns the reason, so the player and the log can say why.
-pub fn prefer_segmented(bitrate_bps: Option<i64>, storage_bps: Option<f64>) -> Option<String> {
+/// Returns the viewer-facing reason for the transport hint.
+pub fn prefer_segmented(bitrate_bps: Option<i64>) -> Option<String> {
     // An unprobed file has no bitrate, and guessing one from resolution would
     // route half a library on an inference. Leave it on the path it has.
     let bitrate = bitrate_bps.filter(|b| *b > 0)? as f64;
-    let measured = storage_bps
-        .filter(|speed| *speed > 0.0)
-        .map(|speed| format!("; storage averages {:.1}x its bitrate", speed / bitrate))
-        .unwrap_or_default();
     Some(format!(
-        "{:.0} Mb/s remux{measured} — the browser's 2.2 s progressive buffer cannot absorb supply gaps",
+        "{:.0} Mb/s remux — progressive fMP4 buffers about 2.2 s; HLS allows deeper read-ahead",
         bitrate / 1e6
     ))
 }
@@ -1192,36 +1183,32 @@ mod tests {
     }
 
     #[test]
-    fn a_disc_remux_wants_segments_even_on_storage_nobody_measured() {
-        let why = prefer_segmented(Some(69_000_000), None).expect("probed remux");
+    fn a_disc_remux_wants_segments_without_any_storage_measurement() {
+        let why = prefer_segmented(Some(69_000_000)).expect("probed remux");
         assert!(why.contains("69 Mb/s"), "{why}");
     }
 
     #[test]
-    fn an_ordinary_remux_on_ample_storage_still_wants_segments() {
-        // Average mount speed does not include a Wi-Fi, scheduler, or network
-        // filesystem gap. Those are exactly what a buffer must absorb.
-        let why = prefer_segmented(Some(25_000_000), Some(335e6)).expect("probed remux");
-        assert!(why.contains("13.4x"), "{why}");
-    }
-
-    #[test]
-    fn a_modest_file_on_slow_storage_still_wants_segments() {
-        // Storage speed still belongs in the reason: 20 Mb/s off a 100 Mb/s
-        // mount has 5x average headroom, but the routing no longer mistakes an
-        // average for proof that every two-second window will be healthy.
-        let why = prefer_segmented(Some(20_000_000), Some(100e6)).expect("thin headroom");
-        assert!(why.contains("5.0x"), "{why}");
+    fn every_probed_remux_has_a_stable_segmented_reason() {
+        // Average source rate cannot predict a Wi-Fi, scheduler, or network
+        // filesystem gap. Pin both the widened route and its viewer-facing
+        // explanation; a partial restoration of the old 40 Mb/s gate fails.
+        assert_eq!(
+            prefer_segmented(Some(25_000_000)).as_deref(),
+            Some(
+                "25 Mb/s remux — progressive fMP4 buffers about 2.2 s; HLS allows deeper read-ahead"
+            )
+        );
+        assert!(prefer_segmented(Some(10_000_000)).is_some());
     }
 
     #[test]
     fn nothing_is_claimed_about_a_file_that_was_never_probed() {
         // No bitrate means no measurement, not a small file. Guessing one from
         // resolution would reroute a library on an inference.
-        assert_eq!(prefer_segmented(None, Some(100e6)), None);
-        assert_eq!(prefer_segmented(Some(0), Some(100e6)), None);
-        // Mount measurement is context, not a routing gate.
-        assert!(prefer_segmented(Some(20_000_000), None).is_some());
-        assert!(prefer_segmented(Some(69_000_000), None).is_some());
+        assert_eq!(prefer_segmented(None), None);
+        assert_eq!(prefer_segmented(Some(0)), None);
+        assert!(prefer_segmented(Some(20_000_000)).is_some());
+        assert!(prefer_segmented(Some(69_000_000)).is_some());
     }
 }

@@ -757,9 +757,7 @@ pub async fn decision(
     // control in §4.3bis, at 10.8 s against the progressive path's 2.2 — and a
     // transcode is HLS already.
     let prefer_segmented = if decision.method == playback::PlaybackMethod::Remux {
-        let storage = state.storage.read().await;
-        let read_bps = storage.for_path(&file.path).and_then(|m| m.read_bps);
-        playback::prefer_segmented(file.bitrate, read_bps)
+        playback::prefer_segmented(file.bitrate)
     } else {
         None
     };

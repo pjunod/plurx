@@ -609,6 +609,15 @@ different answers: Chrome decodes plenty progressively that MediaSource
 refuses. A client veto keeps progressive delivery—stuttery remains preferable
 to black—and **Original · one stream** remains the explicit diagnostic escape.
 
+The 2026-07-29 library census bounds the widened population: 5,427 titles were
+probed, while only 186 met the former 40 Mb/s floor. That is an upper bound of
+5,241 additional candidates, not 5,241 new background jobs: only an active web
+playback whose server verdict is remux and whose browser accepts the exact MSE
+pair opens a copy-HLS session. Each such session uses the existing scratch
+retention and global-cap flow control; nothing is pre-segmented per library
+item. Operators should therefore judge the change by concurrent remux sessions
+and scratch-cap holds, not by catalog size alone.
+
 The codec question is asked the way hls.js will ask it: video and audio in one
 `isTypeSupported` string, since checking them apart passes pairs the browser
 rejects as a pair. The audio asked about is what will be *on the wire*, not

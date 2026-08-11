@@ -24,7 +24,12 @@ bump may break compatibility and a **patch** bump never does.
   playback telemetry and bounded Prometheus counters; startup diagnosis now
   covers direct play and mid-playback fallback streams as well. Copy-HLS audio
   switches also re-check the newly selected codec and convert only that track
-  to AAC when the active browser transport cannot accept it.
+  to AAC when the active browser transport cannot accept it, including
+  ManagedMediaSource on iOS. Fallible decode/manual fallback creation keeps a
+  working picture until the replacement exists, native-HLS restarts detach the
+  old playlist before recovery accounting begins, recovery buttons survive
+  subsequent browser `waiting` events, and audio/subtitle changes cancel a
+  pending stall deadline for the stream they replace.
 
 - **Apple seeking works like a progress bar again.** Scrubbing, skip presses,
   and lock-screen position commands on iPhone, iPad, and Apple TV now seek the

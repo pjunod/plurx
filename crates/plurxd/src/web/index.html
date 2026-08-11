@@ -2642,7 +2642,8 @@ function beginWait(v){
   p.waitRunway=bufferRunway(v);
   p.waitReported=false;
   const began=p.waitAt;
-  p.waitTimer=setTimeout(()=>persistentWait(v,p,began),PERSISTENT_STALL_MS);
+  const generation=p._seekToken||0;
+  p.waitTimer=setTimeout(()=>persistentWait(v,p,began,generation),PERSISTENT_STALL_MS);
 }
 function recordWaitStall(p, kind, ms, runway, detail){
   p.stalls=(p.stalls||0)+1;
@@ -2671,8 +2672,9 @@ function endWait(resumed){
 // only reporter and therefore never ran. Record it at a fixed deadline, then
 // make one method-aware attempt. Auto remuxes move to a smaller transcode;
 // explicit quality choices and already-compatible streams simply reconnect.
-function persistentWait(v,p,began){
-  if(PLAYER!==p || p.waitAt!==began || v.paused || v.seeking) return;
+function persistentWait(v,p,began,generation){
+  if(PLAYER!==p || p.waitAt!==began || !p.started ||
+     (p._seekToken||0)!==generation || v.paused || v.seeking) return;
   p.waitTimer=null;
   const ms=Math.round(performance.now()-began), runway=p.waitRunway;
   const kind=(runway!=null && runway<SUPPLY_RUNWAY_SECS)?"supply":"decode";
@@ -2681,14 +2683,14 @@ function persistentWait(v,p,began){
   p.stallFrom=pbPosSec();
   const action=PlaybackPolicy.stallRecoveryAction({
     method:p.method, quality:playQuality(),
-    alreadyRecovered:(p.stallRecoveries||0)>0,
-    active:!v.paused&&!v.seeking
+    alreadyRecovered:(p.stallRecoveries||0)>0
   });
   if(action==='prompt'){
+    p.stallPrompt=true;
     setLoading(true,"Playback is still stalled.",
       "One automatic recovery was already tried. Your place is saved.",
       `<button onclick="retryPlayback()">Try again</button>`+
-      (p.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+      (p.method!=='transcode'?`<button onclick="startTranscodeFallback('stall-manual')">Force transcode</button>`:``)+
       `<button onclick="closePlayer()">Close</button>`);
     return;
   }
@@ -2717,9 +2719,10 @@ function finishStallRecovery(outcome,note){
 }
 function showStallRecoveryFailure(note){
   const p=PLAYER; if(!p) return;
+  p.stallPrompt=true;
   setLoading(true,"Playback could not reconnect.",note||"Your place is saved.",
     `<button onclick="retryPlayback()">Try again</button>`+
-    (p.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+    (p.method!=='transcode'?`<button onclick="startTranscodeFallback('stall-manual')">Force transcode</button>`:``)+
     `<button onclick="closePlayer()">Close</button>`);
 }
 // The failure every per-frame counter forgives: hardware decode, a full
@@ -4385,9 +4388,13 @@ function streamIsHevc(){
   }
   return false;
 }
+function hlsJsSupported(){
+  return !!(window.Hls && Hls.isSupported());
+}
 function preferNativeHls(video){
   return PlaybackPolicy.hlsTransport({
-    nativeHls:useNativeHls(video), hevcCopy:streamIsHevc()
+    nativeHls:useNativeHls(video), hevcCopy:streamIsHevc(),
+    hlsJsSupported:hlsJsSupported()
   })==='native';
 }
 // One place that attaches an HLS playlist to the video element (used by start,
@@ -4931,7 +4938,6 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     refusedOriginal:false,
     aoffset:sessionAudioOffset, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
-    transcodeAudio:!!decision.transcode_audio,
     preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
     // What grade the DECISION plans to put on the wire. A session overrides it
     // the moment one attaches (a burn or a forced rung transcodes something the
@@ -4941,7 +4947,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
     waitAt:null, waitRunway:null, waitTimer:null, waitReported:false,
-    stallsByKind:null, stallRecoveries:0, recoveringStall:null,
+    stallsByKind:null, stallRecoveries:0, recoveringStall:null, stallPrompt:false,
     burnedSub:null, vod:false, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
@@ -5048,7 +5054,9 @@ async function startCopyHls(v, startSec, live){
   const src=PLAYER.source||{}, track=PLAYER.audio&&PLAYER.audio[PLAYER.curAudio];
   const codec=track&&track.codec;
   const hevcCopy=["hevc","h265","hevc10"].includes(String(src.video_codec||"").toLowerCase());
-  const native=PlaybackPolicy.hlsTransport({nativeHls:useNativeHls(v),hevcCopy})==='native';
+  const native=PlaybackPolicy.hlsTransport({
+    nativeHls:useNativeHls(v), hevcCopy, hlsJsSupported:hlsJsSupported()
+  })==='native';
   // `decision.transcode_audio` describes only the initially selected track.
   // Audio switches must ask again: widening copy-HLS to ordinary remuxes made
   // an AAC-default/AC-3-alternate file feed AC-3 into Chrome MSE and fail at
@@ -5143,19 +5151,20 @@ function mseCodecKey(srcCodec, bitDepth){
 // nothing here is ever told to the server. A no sends the remux down the
 // progressive path, which is where the `<video>` error handler's rescue lives.
 function mseCanTake(srcCodec, audioCodec, bitDepth){
-  if(!(window.MediaSource && MediaSource.isTypeSupported)) return false;
+  const mediaSource=window.ManagedMediaSource||window.MediaSource;
+  if(!(mediaSource && mediaSource.isTypeSupported)) return false;
   const v=MSE_VIDEO[mseCodecKey(srcCodec, bitDepth)];
   if(!v) return false;                       // unknown codec: do not gamble
   const a=MSE_AUDIO[String(audioCodec||"").toLowerCase()];
   if(!a) return false;
-  return v.some(c=>{ try{ return MediaSource.isTypeSupported(`video/mp4; codecs="${c},${a}"`); }catch(e){ return false; } });
+  return v.some(c=>{ try{ return mediaSource.isTypeSupported(`video/mp4; codecs="${c},${a}"`); }catch(e){ return false; } });
 }
 // Should this remux take the HLS path instead of progressive /stream.mp4?
 //
-// The server decides *whether* (it knows the bitrate and what the storage under
-// the file reads at); this decides *whether it can* (only the browser knows its
-// own MSE). Both must agree, and a no from either keeps today's behaviour —
-// which is stuttery on a big file, but stuttery is recoverable and black is not.
+// The server marks every probed remux because average bitrate cannot predict a
+// transient path gap. This function is the browser's veto: only it knows
+// whether hls.js and its MediaSource implementation accept the exact codec
+// pair. A veto keeps progressive playback — stuttery is preferable to black.
 function segmentedRemuxOk(decision, video){
   if(!decision || !decision.prefer_segmented) return false;
   if(noSegments()) return false;             // the viewer asked for one stream
@@ -5826,6 +5835,9 @@ function retuneBuffer(segSecs, force){
             `${Math.round(tgt.peakBytes/1e6)}MB against a ${Math.round(MSE_QUOTA_BYTES/1e6)}MB quota`});
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+function resetMediaSource(v){
+  try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
+}
 // Every timer hanging off PLAYER, stopped. Anything that replaces or discards
 // PLAYER must call this first: once the object is gone the handles are gone
 // with it and the callbacks run forever.
@@ -5894,30 +5906,41 @@ async function startTranscodeFallback(reason, note){
   // an identity check still passed and both streams attached.
   const {me, live}=streamGeneration();
   newAttempt(reason||"fallback");
-  // This is a fresh stream start even when the rejected/stalled predecessor
-  // had played for an hour. Leaving `started` true disarms armStall's entire
-  // startup diagnosis for this replacement.
-  me.started=false;
+  me.stallPrompt=false;
   // Before the session is opened, because `transcodeOpts` reads it: a stream
   // the browser refused is not a stream it lacked the pixels for, so the
   // replacement keeps the source's resolution (see sessionHeight). Set only
   // for that reason — the decode rescue and the manual Force-transcode button
   // both arrive here meaning something else entirely.
   if(reason==="stream-rejected") me.refusedOriginal=true;
-  teardownHls();
-  // Stop the predecessor before waiting for session creation. Otherwise a
-  // starved progressive stream can resume during this await, fire `playing`,
-  // and falsely mark the not-yet-attached recovery as successful.
-  try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
+  // A stalled predecessor must be detached before the await: if it refills,
+  // its late `playing` event would falsely report recovery for a replacement
+  // that does not exist yet. Decode rescue and stream rejection are different:
+  // keep any still-playing picture until session creation succeeds, so a 5xx
+  // cannot turn a marginal stream into a blank player with no way back.
+  const resetBeforeOpen=PlaybackPolicy.fallbackResetBeforeOpen({reason});
+  if(resetBeforeOpen){
+    me.started=false;
+    teardownHls();
+    resetMediaSource(v);
+    if(reason==="stall-manual")
+      setLoading(true,"Starting the transcoder…","your place is saved");
+  }
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec,selectedAudioIndex(me)));}catch(e){
     if(live()){
       if(finishStallRecovery("failed",e.message)) showStallRecoveryFailure(e.message);
+      else if(resetBeforeOpen) showStallRecoveryFailure(e.message);
       else setLoading(false);
       toast(e.message);
     }
     return;
   }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
+  // Session creation is the commit point for non-stall fallbacks. Until here,
+  // the old picture remains intact; after here no event from it may satisfy the
+  // replacement's watchdog or recovery accounting.
+  if(!resetBeforeOpen){ teardownHls(); resetMediaSource(v); }
+  me.started=false;
   me.method='transcode'; me.copyHls=false;
   // A silent switch is a lie of omission. Without this the overlay keeps the
   // decision's remux Reason over a transcode session picked mid-flight — and
@@ -6026,6 +6049,7 @@ function armStall(fromSec, graceMs){
 // were trying to reach, rather than making the user close and re-open the item.
 function retryPlayback(){
   if(!PLAYER) return;
+  PLAYER.stallPrompt=false;
   const t=(PLAYER.stallFrom!=null)?PLAYER.stallFrom:pbPosSec();
   setLoading(true,"Retrying…","");
   seekTo(t,true);
@@ -6068,8 +6092,9 @@ async function stallDiagnose(){
   clientLog({level:"warn",event:"stall",src:(url||"").split("?")[0],message:verdict,detail:detail});
   setLoading(true, verdict, detail,
     `<button onclick="retryPlayback()">Try again</button>`+
-    (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+    (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback('stall-manual')">Force transcode</button>`:``)+
     `<button onclick="closePlayer()">Close</button>`);
+  PLAYER.stallPrompt=true;
   toast(verdict);
 }
 
@@ -6273,7 +6298,7 @@ function wirePlayer(){
   const p=document.getElementById("player"), v=document.getElementById("video");
   if(!p||!v) return;
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
-  v.addEventListener("playing",()=>{ const first=!PLAYER.started; endWait(true); PLAYER.started=true; clearStall(); finishStallRecovery("recovered"); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); if(first) reportTtff(); });
+  v.addEventListener("playing",()=>{ const first=!PLAYER.started; endWait(true); PLAYER.started=true; PLAYER.stallPrompt=false; clearStall(); finishStallRecovery("recovered"); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); if(first) reportTtff(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   // Only a stream that HAS started can "buffer". Before that, the loading
   // overlay owns the message (and a watchdog owns the deadline), so a stalled
@@ -6284,7 +6309,11 @@ function wirePlayer(){
   // decided when playback resumes, because that is the first moment its
   // duration is known. See beginWait/endWait.
   v.addEventListener("waiting",()=>{
-    if(!PLAYER||!PLAYER.started) return;
+    if(!PLAYER) return;
+    const action=PlaybackPolicy.waitingOverlayAction({
+      started:PLAYER.started, stallPrompt:PLAYER.stallPrompt
+    });
+    if(action!=='buffer') return;
     setLoading(true,"Buffering…","");
     beginWait(v);
   });
@@ -6416,7 +6445,7 @@ async function seekTo(targetSec, forceReopen=false){
         showStallRecoveryFailure("The direct-play URL is unavailable. Your place is saved.");
       return;
     }
-    try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
+    resetMediaSource(v);
     if(!live()) return;
     v.onloadedmetadata=()=>{ v.onloadedmetadata=null;
       if(live()&&targetSec>0){ try{v.currentTime=targetSec}catch(e){} } };
@@ -6444,6 +6473,7 @@ async function seekTo(targetSec, forceReopen=false){
   setLoading(true, PLAYER.method==='transcode'?"Skipping ahead…":"Seeking…",
     PLAYER.method==='transcode'?"the transcoder is re-seeking":"");
   teardownHls();
+  if(forceReopen) resetMediaSource(v); // native HLS has no PLAYER.hls to destroy
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
     let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(targetSec,aidx));}catch(e){ return failed(e); }
@@ -6461,7 +6491,7 @@ async function seekTo(targetSec, forceReopen=false){
     // Hand the element a clean slate first. Assigning .src straight over a live
     // progressive stream leaves the aborted fetch and its buffered range
     // attached, and the replacement can then sit at readyState 0 forever.
-    try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
+    resetMediaSource(v);
     if(!live()) return;
     PLAYER.probeUrl=`/api/v1/files/${PLAYER.fileId}/stream.mp4`;
     v.src=url; armStall(targetSec,20000); v.play().catch(()=>{});
@@ -6560,7 +6590,7 @@ async function handleEnded(fileId){
     return setLoading(true,"The stream stopped before the end.",
       "It ended "+clockFromSec(total-pos)+" short of the runtime. Your place is saved, so resuming picks up here.",
       `<button onclick="retryPlayback()">Try again</button>`+
-      (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+      (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback('stall-manual')">Force transcode</button>`:``)+
       `<button onclick="closePlayer()">Close</button>`);
   }
   setLoading(true,"Reconnecting…","the stream ended early — resuming from "+clockFromSec(pos));
@@ -6834,6 +6864,7 @@ function vttParse(text){
 async function setSub(index){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   const me=PLAYER; if(!me) return;
+  endWait(false); // a viewer-directed track change supersedes stall recovery
   // A bitmap subtitle (PGS on a Blu-ray remux, VobSub on a DVD one) is a
   // picture, not text. There is nothing to hand a <track>, so the only way to
   // show it is to have the server draw it into the frames — which means a
@@ -6905,6 +6936,7 @@ async function setSub(index){
 // direct-playing happily — you cannot draw on a stream you are copying.
 async function burnSub(index){
   const v=document.getElementById("video"); if(!v||!PLAYER) return;
+  endWait(false);
   const me=PLAYER;
   const pos=(me.offset||0)+(v.currentTime||0);
   // Burning nothing is not a transcode wish. This used to open another
@@ -6965,6 +6997,7 @@ async function cycleSub(){
 async function switchAudio(idx){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   if(idx===PLAYER.curAudio) return;
+  endWait(false); // cancel a timer armed for the stream this switch replaces
   PLAYER.curAudio=idx;
   renderPlayerInfo();
   const v=document.getElementById("video");
