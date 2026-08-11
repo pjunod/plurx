@@ -31,6 +31,41 @@ bump may break compatibility and a **patch** bump never does.
   subsequent browser `waiting` events, and audio/subtitle changes cancel a
   pending stall deadline for the stream they replace.
 
+- **An unreachable server now says something a viewer can act on, in the same
+  words on every client.** The web app showed the browser's own `Failed to
+  fetch` on a dashed empty box; Android showed `Unable to resolve host "…": No
+  address associated with hostname`; Apple showed Foundation's *"Could not
+  connect to the server."* All three now classify the failure into one of seven
+  shared classes — offline, unreachable, unknown host, timeout, insecure,
+  server error, unknown — and render the copy for it with a Retry button, from
+  a single contract at `tests/contracts/connectivity-copy.json` that four test
+  suites read so the wording cannot drift apart again. A native error string is
+  diagnostics now, never user copy.
+
+  Signing in no longer lies. A network failure during sign-in reported *"Wrong
+  username or password"* on Android and painted the raw transport error in the
+  same red on web and Apple, so a viewer whose server was merely off would
+  retype a correct password until they gave up. Only an actual HTTP 401/403
+  blames the credentials, and every client says that sentence identically. On
+  web a genuinely wrong password used to flash the word `unauthorized` and then
+  rebuild the whole form empty, discarding what had been typed.
+
+  Nothing hangs any more either. The web client had no request deadline at all,
+  so a host that dropped packets instead of refusing them left `Loading…` on
+  screen forever with no failure to report; requests now have a 15-second
+  deadline, and the calls that legitimately take longer — playback preparation,
+  storage remeasurement, reanalyze, artwork refresh — are named and given 120.
+  Android's JSON calls gained a 30-second call deadline on a separate client so
+  media segments and offline package transfers keep none, with playback
+  preparation on its own 180-second budget; Apple routes `/decision` and the
+  session open to its 180-second session rather than the 15-second one. A
+  failed refresh over content already on screen now shows a transient notice
+  instead of replacing what you were reading — the web activity view used to
+  repaint its error every three seconds — and a request left behind by
+  navigation can no longer paint over the page that replaced it. Downloads keep
+  their own vocabulary too: a full disk says so instead of blaming the network.
+  See [docs/CLIENT-CONNECTIVITY.md](docs/CLIENT-CONNECTIVITY.md).
+
 - **Apple seeking works like a progress bar again.** Scrubbing, skip presses,
   and lock-screen position commands on iPhone, iPad, and Apple TV now seek the
   current item's own clock whenever the target sits inside the growing HLS
