@@ -9,6 +9,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
         case resolution
         case video
         case dynamicRange
+        case audio
     }
 
     let kind: Kind
@@ -77,7 +78,7 @@ struct ItemMetadataBadgeRow: View {
 
     static func usesStyledMediaBadge(_ badge: ItemMetadataBadge) -> Bool {
         switch badge.kind {
-        case .resolution, .video, .dynamicRange:
+        case .resolution, .video, .dynamicRange, .audio:
             return true
         case .series, .episode, .year, .runtime:
             return false
@@ -145,6 +146,8 @@ struct IOSWebMediaBadge: View {
             return badge.accessibilityLabel.localizedCaseInsensitiveContains("Dolby")
                 ? Color(red: 0.79, green: 0.60, blue: 0.17)
                 : Color(red: 0.07, green: 0.70, blue: 0.65)
+        case .audio:
+            return Color(red: 0.50, green: 0.56, blue: 0.88)
         default:
             return Palette.onBg
         }
@@ -203,6 +206,20 @@ private struct IOSWebMediaGlyph: View {
                 context.fill(Self.sparkle(center: CGPoint(x: 19, y: 5), outer: 4, inner: 1.3), with: .foreground)
                 context.fill(Self.sparkle(center: CGPoint(x: 19, y: 19), outer: 4, inner: 1.3), with: .foreground)
 
+            case .audio:
+                let bars: [(x: CGFloat, y: CGFloat, height: CGFloat)] = [
+                    (3.0, 10.0, 4.0),
+                    (7.0, 6.0, 12.0),
+                    (11.0, 2.0, 20.0),
+                    (15.0, 6.0, 12.0),
+                    (19.0, 10.0, 4.0),
+                ]
+                for (x, y, height) in bars {
+                    var bar = Path()
+                    bar.addRect(CGRect(x: x, y: y, width: 2, height: height))
+                    context.fill(bar, with: .foreground)
+                }
+
             default:
                 break
             }
@@ -229,6 +246,73 @@ private struct IOSWebMediaGlyph: View {
     }
 }
 #endif
+
+struct EpisodeMediaInfoRow: Equatable, Identifiable {
+    let label: String
+    let value: String
+
+    var id: String { label }
+}
+
+enum EpisodeMediaInfoMetrics {
+    /// A technical value line should wrap before it turns into an iPad-wide
+    /// ruler. Phones naturally use less than this through DetailBodyFrame.
+    static let maximumWidth: CGFloat = 620
+    static let minimumLabelWidth: CGFloat = 48
+}
+
+struct EpisodeMediaInfoLabel: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(.caption, design: .rounded).weight(.semibold))
+            .foregroundStyle(Palette.muted)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: EpisodeMediaInfoMetrics.minimumLabelWidth, alignment: .leading)
+    }
+}
+
+struct EpisodeMediaInfoSection: View {
+    let rows: [EpisodeMediaInfoRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("MEDIA INFO")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(1.5)
+                .foregroundStyle(Palette.accent.opacity(0.9))
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    if index > 0 {
+                        Divider().overlay(Palette.outline.opacity(0.5))
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        EpisodeMediaInfoLabel(text: row.label)
+                        Text(row.value)
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(Palette.onBg.opacity(0.82))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.vertical, 8)
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .padding(.horizontal, 11)
+            .background(
+                Palette.surfaceHi.opacity(0.66),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Palette.outline.opacity(0.72), lineWidth: 0.75)
+            }
+        }
+        .frame(maxWidth: EpisodeMediaInfoMetrics.maximumWidth, alignment: .leading)
+    }
+}
 
 /// Clickable ancestors for a detail page. The server returns these outermost
 /// first, so an episode naturally reads "Show / Season" and a season reads
@@ -823,6 +907,8 @@ struct DetailView: View {
                         }
                         .padding(.top, 3)
                     }
+
+                    episodeMediaInfo(item: item, file: file)
                 }
             }
             .padding(.top, 10)
@@ -977,6 +1063,8 @@ struct DetailView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.top, 6)
                     }
+
+                    episodeMediaInfo(item: item, file: file)
                 }
             }
             #if os(iOS)
@@ -1341,6 +1429,113 @@ struct DetailView: View {
     }
     #endif
 
+    @ViewBuilder
+    private func episodeMediaInfo(item: Item, file: MediaFile?) -> some View {
+        if item.kind == "episode", let file {
+            let rows = Self.episodeMediaInfoRows(file)
+            if !rows.isEmpty {
+                EpisodeMediaInfoSection(rows: rows)
+                    .padding(.top, 3)
+            }
+        }
+    }
+
+    static func episodeMediaInfoRows(_ file: MediaFile) -> [EpisodeMediaInfoRow] {
+        var rows: [EpisodeMediaInfoRow] = []
+        var video: [String] = []
+
+        if let codec = nonempty(file.videoCodec) {
+            video.append(tvCodecLabel(codec))
+        }
+        if let profile = nonempty(file.videoProfile) {
+            video.append(profile)
+        }
+        if let width = file.width, width > 0, let height = file.height, height > 0 {
+            video.append("\(width)×\(height)")
+        } else if let resolution = resolutionLabel(width: file.width, height: file.height) {
+            video.append(resolution)
+        }
+        if let format = nonempty(file.hdrFormat) {
+            video.append(format)
+        } else if let grade = DynamicRange.source(hdr: file.hdr, hdrFormat: nil) {
+            video.append(DynamicRange.longLabel(grade))
+        }
+        if let bitDepth = file.bitDepth, bitDepth > 0 {
+            video.append("\(bitDepth)-bit")
+        }
+        if let bitrate = mediaBitrateLabel(file.bitrate) {
+            video.append(bitrate)
+        }
+        if !video.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "Video", value: video.joined(separator: " · ")))
+        }
+
+        let audio = (file.audioStreams ?? []).compactMap(audioDescription(_:))
+        if !audio.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "Audio", value: audio.joined(separator: " / ")))
+        }
+
+        var storedFile: [String] = []
+        if let filename = nonempty(file.filename) {
+            storedFile.append(filename)
+        }
+        if let container = nonempty(file.container) {
+            storedFile.append(container.uppercased())
+        }
+        if let size = mediaFileSizeLabel(file.size) {
+            storedFile.append(size)
+        }
+        if !storedFile.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "File", value: storedFile.joined(separator: " · ")))
+        }
+
+        return rows
+    }
+
+    private static func nonempty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func preferredAudioTrack(_ file: MediaFile) -> AudioTrack? {
+        let tracks = file.audioStreams ?? []
+        return tracks.first(where: {
+            $0.title?.localizedCaseInsensitiveContains("atmos") == true
+        }) ?? tracks.first(where: { $0.default }) ?? tracks.first
+    }
+
+    private static func audioDescription(_ track: AudioTrack) -> String? {
+        guard let sound = PlayerView.soundLabel(track) else { return nil }
+        let languageCode = nonempty(track.language)
+        let language = languageCode?.lowercased() == "und"
+            ? nil
+            : languageCode?.uppercased()
+        return [sound.accessibilityLabel, language]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private static func mediaBitrateLabel(_ bitsPerSecond: Int?) -> String? {
+        guard let bitsPerSecond, bitsPerSecond > 0 else { return nil }
+        if bitsPerSecond >= 1_000_000 {
+            let megabits = Double(bitsPerSecond) / 1_000_000
+            return bitsPerSecond >= 10_000_000
+                ? String(format: "%.0f Mb/s", megabits)
+                : String(format: "%.1f Mb/s", megabits)
+        }
+        return "\(Int((Double(bitsPerSecond) / 1_000).rounded())) kb/s"
+    }
+
+    private static func mediaFileSizeLabel(_ bytes: Int?) -> String? {
+        guard let bytes, bytes > 0 else { return nil }
+        let gibibytes = Double(bytes) / 1_073_741_824
+        if gibibytes >= 1 {
+            return String(format: "%.1f GB", gibibytes)
+        }
+        let mebibytes = Double(bytes) / 1_048_576
+        return String(format: "%.1f MB", mebibytes)
+    }
+
     static func itemMetadataBadges(
         _ item: Item,
         file: MediaFile?,
@@ -1385,15 +1580,10 @@ struct DetailView: View {
                 accessibilityLabel: runtime
             ))
         }
-        if let resolution = file.flatMap({
+        if let badge = resolutionBadge(file.flatMap({
             resolutionLabel(width: $0.width, height: $0.height)
-        }) ?? resolutionLabel(item.resolution) {
-            badges.append(ItemMetadataBadge(
-                kind: .resolution,
-                symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
-                mark: resolution == "4K" ? nil : resolution.uppercased(),
-                accessibilityLabel: resolution
-            ))
+        }) ?? resolutionLabel(item.resolution)) {
+            badges.append(badge)
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
             let label = tvCodecLabel(codec)
@@ -1420,6 +1610,15 @@ struct DetailView: View {
                 symbol: range.symbol,
                 mark: range.mark,
                 accessibilityLabel: range.accessibilityLabel
+            ))
+        }
+        if let audio = file.flatMap({ preferredAudioTrack($0) }),
+           let sound = PlayerView.soundLabel(audio) {
+            badges.append(ItemMetadataBadge(
+                kind: .audio,
+                symbol: "waveform",
+                mark: sound.mark,
+                accessibilityLabel: sound.accessibilityLabel
             ))
         }
         return badges

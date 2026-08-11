@@ -48,6 +48,17 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **TV episode lists and details now name the media they will open.** Season
+  detail responses attach each episode's best-file resolution and HDR facts in
+  one batched query, so the Apple season shelf can show a compact resolution +
+  HDR pair without one request per episode. iPhone and iPad keep their compact
+  poster cards; Apple TV keeps its landscape episode cards. Episode detail now
+  adds a width-bounded Media Info panel for codec/profile, exact dimensions,
+  HDR format, bit depth, bitrate, audio tracks, container, filename, and size,
+  plus the preferred audio format in the existing badge row. The richer file
+  fields already existed on the detail response; this exposes them without
+  widening the season shelf into a spec table.
+
 - **Performance II N1 gains its measurement harness before its encoder flags.**
   `scripts/bench rate-control` now opens uncached HLS sessions on the deployed
   plurxd, captures the segments that its production Jellyfin FFmpeg actually

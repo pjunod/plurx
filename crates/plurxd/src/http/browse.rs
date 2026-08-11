@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use plurx_core::domain::{Item, ItemKind, ItemSort, WatchState};
+use plurx_core::mediafacts::MediaFacts;
 use serde::{Deserialize, Serialize};
 
 use super::dto::{in_progress_dto, recent_dto, FileDto, ItemDto};
@@ -37,13 +38,20 @@ fn annotate_with_counts(
     items: Vec<Item>,
     watch: &HashMap<i64, WatchState>,
     counts: &HashMap<i64, i64>,
+    media: &mut HashMap<i64, MediaFacts>,
 ) -> Vec<ItemDto> {
     items
         .into_iter()
         .map(|item| {
             let w = watch.get(&item.id).copied();
             let count = counts.get(&item.id).copied();
-            ItemDto::from(item).with_watch(w).with_child_count(count)
+            let facts = media.remove(&item.id);
+            let resolution = facts.as_ref().and_then(|f| f.height);
+            ItemDto::from(item)
+                .with_watch(w)
+                .with_resolution(resolution)
+                .with_media(facts)
+                .with_child_count(count)
         })
         .collect()
 }
@@ -220,6 +228,22 @@ pub async fn item_detail(
                 .collect::<Vec<_>>(),
         )
         .await?;
+    // A season page is a media listing just as surely as a library grid is.
+    // Fetch one best-file summary for all episode children in a single query;
+    // asking for every episode detail independently would turn a 24-episode
+    // season into 24 extra requests and queries. Keep other item-detail child
+    // responses unchanged: home folders, for example, did not previously
+    // attach list-style media badges.
+    let mut child_media = if item.kind == ItemKind::Season {
+        let episode_ids: Vec<i64> = children
+            .iter()
+            .filter(|child| child.kind == ItemKind::Episode)
+            .map(|child| child.id)
+            .collect();
+        state.store.item_media_facts(&episode_ids).await?
+    } else {
+        HashMap::new()
+    };
     let files = match item.kind {
         // Home videos and photos have files exactly like movies do; folders
         // (and shows/seasons) have children instead.
@@ -267,7 +291,7 @@ pub async fn item_detail(
     Ok(Json(ItemDetail {
         item: item_dto,
         ancestors: ancestors.into_iter().map(Into::into).collect(),
-        children: annotate_with_counts(children, &watch, &child_counts),
+        children: annotate_with_counts(children, &watch, &child_counts, &mut child_media),
         files: file_dtos,
     }))
 }
