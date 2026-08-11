@@ -221,6 +221,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root_dispatch))
         .route("/assets/hls.min.js", get(web::hls_js))
         .route("/assets/playback-policy.js", get(web::playback_policy_js))
+        .route("/assets/connectivity.js", get(web::connectivity_js))
         .route("/connect.svg", get(web::connect_qr))
         // PWA install assets + the sideloadable Android APK.
         .route("/manifest.webmanifest", get(web::manifest))

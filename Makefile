@@ -207,8 +207,9 @@ ui-golden: ## Rewrite tests/ui-structure.golden after an intended UI change
 # serves a blank page; and the theme tables are data, so a token pair that
 # fails contrast is not a type error anywhere. Run this on any web change.
 .PHONY: web-check
-web-check: ## Test playback policy, embedded JS, and every shipped theme
+web-check: ## Test playback + connectivity policy, embedded JS, and every theme
 	@node tests/playback/web-policy.test.js
+	@node tests/connectivity/web-copy.test.js
 	@scripts/js-check
 	@scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
 		--foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad' \

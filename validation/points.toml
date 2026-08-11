@@ -464,6 +464,24 @@ checks = ["rust-gate", "web-static", "web-layout", "playback-smoke", "playback-e
 depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
+id = "client.connectivity"
+title = "What every client says when the server is gone"
+contract = "A failed request reaches the viewer as one of the taxonomy's classes with a retry, never as a platform transport string, and a network failure during sign-in is never reported as a wrong password."
+# Literal paths, not `tests/connectivity/**`: the catalog lints a glob against
+# git's TRACKED files, so a directory that exists but is not yet committed
+# reads as a glob matching nothing. These become a glob when a second suite
+# lands beside the first. The Apple and Android classifiers are covered by
+# apple.client / android.client, which own their own evidence.
+paths = [
+  "crates/plurxd/src/web/connectivity.js",
+  "docs/CLIENT-CONNECTIVITY.md",
+  "tests/connectivity/web-copy.test.js",
+  "tests/contracts/connectivity-copy.json",
+]
+checks = ["rust-gate", "web-static"]
+depends_on = ["server.api", "identity.access", "web.experience"]
+
+[[points]]
 id = "mobile.versioning"
 title = "Mobile release versioning"
 contract = "Shipped Apple and Android changes advance their store build counters, and both marketing versions track the workspace release."

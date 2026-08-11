@@ -281,6 +281,27 @@
   /* theme-picker button shows the current accent as a live swatch */
   .tsw{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--accent);vertical-align:middle;box-shadow:0 0 0 2px var(--panel),0 0 7px var(--accent)}
   .empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
+  /* The connection-error surface. Deliberately NOT .empty: an empty shelf and
+     an unreachable server are different facts, and .empty is themed as a joke
+     about emptiness — terminal prefixes it with `$ ls`, noirr lowercases it
+     into a comment. "Can't reach Living Room" must not arrive as
+     `$ ls can't reach living room`, so this carries its own solid box, built
+     from the shared tokens both themes already restyle. */
+  .connerr{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:34px 26px;text-align:center;max-width:46ch;margin:40px auto}
+  .connerr h2{margin:0 0 8px;font-size:19px;line-height:1.3}
+  .connerr p{margin:0;color:var(--muted);font-size:13.5px;line-height:1.5}
+  /* Same shape as the player's recovery buttons (.ploadAct), in page ink
+     rather than over-video white: a diagnosed failure gets an action, not
+     just a verdict. */
+  .connerr .connact{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:18px}
+  .connerr .connact:empty{display:none}
+  .connerr .connact button{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+    border-radius:9px;padding:9px 16px;font-size:13.5px;font-weight:600;cursor:pointer}
+  .connerr .connact button:hover{background:var(--accent);border-color:var(--accent);color:var(--btn-ink)}
+  /* Boot failure paints into the same centred .card the login form uses, so
+     the card owns the frame and the inner block supplies only the words. */
+  .connerrcard>.connerr{background:none;border:0;padding:0;margin:0;max-width:none}
 
   .detail{display:grid;grid-template-columns:260px 1fr;gap:28px}
   .detail .poster{cursor:default}
@@ -2420,23 +2441,131 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 <div class="toast" id="toast"></div>
 
 <script src="/assets/playback-policy.js"></script>
+<script src="/assets/connectivity.js"></script>
 <script src="/assets/hls.min.js"></script>
 <script>
 "use strict";
+// Two separate <script src> tags, so both can be absent at runtime in a way
+// neither can be at build time: a proxy that strips an asset, a service worker
+// holding half a stale install. Without this the app runs anyway and dies with
+// a TypeError nowhere near the cause — inside a playback failure, or inside
+// the error handler that was supposed to explain a different failure.
+//
+// It fails at load instead, and deliberately does NOT shim: PlaybackPolicy has
+// eleven members and every one of them is called, so a stub covering only the
+// one you happened to think of is a lie that removes behavior silently — a
+// `fallbackAction: () => "fail"` stub disables the whole transcode-fallback
+// ladder without a word. Two lines of missing asset are worth one honest
+// sentence, and this one is not a connectivity class: nothing was attempted,
+// so there is nothing to classify and no retry that could help.
 const PlaybackPolicy = window.PlurxPlaybackPolicy;
+const Connectivity = window.PlurxConnectivity;
+if(!PlaybackPolicy || !Connectivity){
+  document.getElementById("app").innerHTML =
+    `<div class="center"><div class="card">Cinema didn't finish loading. Reload the page.</div></div>`;
+  throw new Error("plurx: missing "+(PlaybackPolicy?"connectivity.js":"playback-policy.js"));
+}
 const API = "/api/v1";
 let TOKEN = localStorage.getItem("plurx_token") || null;
 let ME = null;
 
 // ---- api helpers ----------------------------------------------------------
-async function api(path, {method="GET", body=null, raw=false}={}){
+// Every request gets a deadline. Without one a blackholing host — the wrong
+// subnet, a firewall that drops instead of refusing — leaves "Loading…" on
+// screen forever, with nothing to classify because nothing ever failed
+// (docs/CLIENT-CONNECTIVITY.md §3). WHICH deadline is not decided here: the
+// budget belongs to the endpoint, so `Connectivity.deadlineFor` states it once
+// under test and the sites that would otherwise each have to remember a
+// literal simply do not get a say.
+//
+// Returns a `release` alongside the signal. `AbortSignal.timeout` stops itself
+// when the request settles; the AbortController fallback does not, and a page
+// of finished requests each holding a live timer to its own deadline is a leak
+// the browser cannot see.
+function requestDeadline(ms){
+  if(!(ms>0)) return {signal:undefined, release:()=>{}};
+  if(typeof AbortSignal!=="undefined" && AbortSignal.timeout){
+    return {signal:AbortSignal.timeout(ms), release:()=>{}};
+  }
+  if(typeof AbortController==="undefined") return {signal:undefined, release:()=>{}};
+  const c=new AbortController();
+  const timer=setTimeout(()=>c.abort(new DOMException("deadline reached","TimeoutError")),ms);
+  return {signal:c.signal, release:()=>clearTimeout(timer)};
+}
+// What {server} interpolates to: the server's own name if it has told us one
+// yet, else the address the browser is already talking to.
+function serverContext(){ return {server:(SERVER&&SERVER.name)||null, origin:location.origin}; }
+function classifyFailure(what){
+  const online=(typeof navigator!=="undefined" && "onLine" in navigator) ? navigator.onLine : true;
+  return Connectivity.classify(Object.assign({online}, what));
+}
+// A failure carries its class with it. Every surface that renders one — the
+// router, the activity view, a toast, a form's error line — then reads the
+// copy off the error instead of re-deriving what went wrong from a string.
+// The native error is attached as `cause` for diagnostics and is never read
+// back out for display (docs §7).
+function connectivityError(classId, cause){
+  const d=Connectivity.describe(classId, serverContext());
+  const err=new Error(d.short);
+  err.connectivity=d.id; err.title=d.title; err.detail=d.detail;
+  err.short=d.short; err.actions=d.actions;
+  err.cause=cause;
+  return err;
+}
+// Signing in is not a session ending, so it does not take the session-ending
+// path. `logout()` clears the token and re-renders the whole shell, which
+// rebuilds the very form whose red line was about to be written — the message
+// and the typed username both vanish and a wrong password looks like nothing
+// happened at all. And 403 never reached that branch, so the server's raw 4xx
+// body was rendered as if it were copy. Both now end here, saying the one
+// sentence the contract holds for them (docs §4).
+function credentialsError(){
+  const err=new Error(Connectivity.CREDENTIALS_MESSAGE);
+  err.credentials=true;
+  return err;
+}
+async function api(path, {method="GET", body=null, raw=false, timeoutMs=null, signin=false}={}){
   const headers={};
   if(TOKEN) headers["authorization"]="Bearer "+TOKEN;
   if(body){ headers["content-type"]="application/json"; }
-  const res=await fetch(API+path,{method,headers,body:body?JSON.stringify(body):null});
-  if(res.status===401){ logout(); throw new Error("unauthorized"); }
-  if(!res.ok){ let m="request failed"; try{m=(await res.json()).error||m}catch(e){} throw new Error(m); }
-  return raw?res:res.json();
+  const deadline=requestDeadline(timeoutMs==null?Connectivity.deadlineFor(path):timeoutMs);
+  try{
+    let res;
+    try{
+      res=await fetch(API+path,{method,headers,body:body?JSON.stringify(body):null,
+        signal:deadline.signal});
+    }catch(e){
+      // The browser says "Failed to fetch" and nothing else — one opaque
+      // TypeError for refused, DNS, TLS and CORS alike. That string is
+      // diagnostics; the class is what the viewer reads (docs §2.1).
+      throw connectivityError(classifyFailure({error:e})||"unknown", e);
+    }
+    // Only the sign-in call treats 401/403 as an answer about credentials.
+    // Everywhere else 401 still means the saved session ended.
+    if(signin && (res.status===401 || res.status===403)) throw credentialsError();
+    if(res.status===401){ logout(); throw new Error("unauthorized"); }
+    if(!res.ok){
+      // A 4xx carries the server's own sentence and keeps it: a server that
+      // says "library not found" must go on saying that. Only 5xx is a class.
+      let m="request failed"; try{m=(await res.json()).error||m}catch(e){}
+      const cls=classifyFailure({response:res});
+      throw cls?connectivityError(cls,new Error(m)):new Error(m);
+    }
+    if(raw) return res;
+    // A body the client cannot use is the server answering wrongly, even at 200.
+    try{ return await res.json(); }
+    catch(e){ throw connectivityError(classifyFailure({response:res,error:e})||"server_error", e); }
+  }finally{ deadline.release(); }
+}
+// The one place any surface turns an error into a line of text. Credentials
+// first — that sentence is the contract's and outranks everything — then the
+// connectivity class's short form, and otherwise exactly the message that site
+// showed before, so a server-supplied "library not found" survives and only
+// transport failures change voice.
+function errText(e, fallback){
+  if(e&&e.credentials) return e.message;
+  if(e&&e.connectivity&&e.short) return e.short;
+  return (e&&e.message)||fallback||"Something went wrong.";
 }
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
 // The library list is small, changes only from Settings, and is needed on
@@ -2810,28 +2939,103 @@ function fmtDate(s){
   return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]))
     .toLocaleDateString([], {year:"numeric",month:"short",day:"numeric"});
 }
+function initials(title){
+  return (title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?";
+}
 // Artwork with a graceful fallback: initials on a tinted card when there's
 // no poster (so a seasons grid never shows blank rectangles).
 function artHtml(it, cls){
   // A photo whose thumbnail hasn't been generated yet still has itself to
   // show — the endpoint falls back to the original.
   const src=it.poster||it.backdrop||(it.kind==='photo'?`/api/v1/items/${it.id}/photo?size=thumb`:null);
-  if(src) return `<img class="art ${cls||''}" loading="lazy" src="${esc(tok(src))}" alt="">`;
+  const label=initials(it.title);
+  if(src) return `<img class="art ${cls||''}" loading="lazy" src="${esc(tok(src))}" alt="" data-ph="${esc(label)}" onerror="imgFailed(this)">`;
   if(it.kind==='season' && it.season_number!=null)
     return `<div class="art ph season ${cls||''}"><div class="snum">${it.season_number}</div><div class="sl">Season</div></div>`;
-  const label=(it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?";
   return `<div class="art ph ${cls||''}">${esc(label)}</div>`;
+}
+// An unreachable server does not only fail its API calls: every <img> already
+// on the page fails too, and a grid of broken-image glyphs is the browser
+// narrating the outage in its own voice. Swap in the tinted placeholder an
+// item with no artwork already gets. Elements the app looks up again by id —
+// the lightbox reuses one <img> for every photo — are emptied in place rather
+// than replaced, so a later `src` assignment still lands on an <img>.
+function imgFailed(img, label){
+  if(!img) return;
+  const text=label||img.getAttribute("data-ph")||"";
+  // A reused element keeps its failure until told otherwise — see imgRestore,
+  // which every repaint of one must call first.
+  if(img.id){ img.classList.add("ph"); img.alt=text; img.removeAttribute("src"); return; }
+  const ph=document.createElement("div");
+  ph.className=`${img.className||"art"} ph`.trim();
+  ph.style.cssText=img.style.cssText;
+  ph.textContent=text;
+  img.replaceWith(ph);
+}
+// The other half of imgFailed's in-place branch. Without it the lightbox's one
+// shared <img> stays marked after a single dead photo, so every later photo
+// that loaded perfectly well is still announced to a screen reader as the one
+// that didn't.
+function imgRestore(img){
+  if(!img) return;
+  img.classList.remove("ph");
+  img.alt="";
+}
+
+// ---- connectivity surfaces ------------------------------------------------
+// The full surface (docs §5): title, detail, and the class's actions, for a
+// view with no content to keep. `onRetry` re-runs whatever failed — it is
+// passed in because the router and the activity poller fail differently, and
+// "reload the page" is not a retry.
+//
+// Which buttons to draw is Connectivity.renderableActions' decision, not an
+// `if` in this loop: web passes canChangeServer:false because this app is
+// served BY the server it talks to, so there is no second address to point it
+// at and the button would sign the viewer out onto the same login form. Stating
+// it as a capability keeps the rule under test and keeps this function to the
+// one job of turning an answer into DOM.
+function renderConnectionError(container, err, onRetry){
+  if(!container) return;
+  const d=Connectivity.describe(err&&err.connectivity, serverContext());
+  container.innerHTML=`<div class="connerr" role="alert">
+    <h2>${esc(d.title)}</h2>
+    <p>${esc(d.detail)}</p>
+    <div class="connact"></div></div>`;
+  const acts=container.querySelector(".connact");
+  for(const a of Connectivity.renderableActions(d.id,{canChangeServer:false})){
+    const b=document.createElement("button");
+    b.type="button"; b.textContent=a.label;
+    b.addEventListener("click",()=>{ if(onRetry) onRetry(); });
+    acts.appendChild(b);
+  }
 }
 
 // ---- auth flows -----------------------------------------------------------
 function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working"); render(); }
 let SERVER=null;   // last /server response (name, version, android_app, …)
+// The whole app is downstream of one request, so there is no shell to preserve
+// when it fails: the full surface goes into #app. It replaces a bare "Server
+// unreachable." that said nothing about which failure this was and offered no
+// way back except the viewer thinking to reload the page themselves.
+function renderBootError(err){
+  document.getElementById("app").innerHTML=
+    `<div class="center"><div class="card connerrcard" id="booterr"></div></div>`;
+  renderConnectionError(document.getElementById("booterr"), err, boot);
+}
 async function boot(){
   let server;
-  try{ server=await api("/server"); SERVER=server; }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
+  try{ server=await api("/server"); SERVER=server; }catch(e){ return renderBootError(e); }
   if(server.setup_required){ return renderSetup(server); }
   if(!TOKEN){ return renderLogin(server); }
-  try{ ME=await api("/me"); }catch(e){ return renderLogin(server); }
+  try{ ME=await api("/me"); }catch(e){
+    // A transport failure is not an expired session. Falling through to the
+    // login form here told people their session had ended and discarded a
+    // token that was perfectly good — so hold the token, and say what actually
+    // happened (docs §4). A real 401 has already been handled inside api(),
+    // which clears the token and re-renders; only other failures arrive here.
+    if(e&&e.connectivity) return renderBootError(e);
+    return renderLogin(server);
+  }
   location.hash=location.hash||"#/";
   render();
 }
@@ -2844,7 +3048,11 @@ function authShell(title, sub, fields, btn, onsubmit){
     <div class="versionstamp">Version ${esc(buildLabel())}</div></form></div>`;
   document.getElementById("af").addEventListener("submit",async e=>{
     e.preventDefault(); const b=document.getElementById("ab"); b.disabled=true;
-    try{ await onsubmit(); }catch(err){ document.getElementById("aerr").textContent=err.message; b.disabled=false; }
+    // The inline-field surface (docs §5), and the rule that made it worth
+    // building: a server that is simply off must not be reported in the same
+    // red line as a wrong password. Only the server answering 401 means the
+    // credentials were wrong; everything else renders its class (docs §4).
+    try{ await onsubmit(); }catch(err){ document.getElementById("aerr").textContent=errText(err); b.disabled=false; }
   });
 }
 // The first account, and the one place a typo is unrecoverable from inside the
@@ -2873,12 +3081,16 @@ function renderLogin(){
     `<label for="u">Username</label><input id="u" autocomplete="username" required>
      <label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required>
      <details class="connectqr"><summary>Connect an app with a QR code</summary>
-       <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
+       <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}" onerror="imgFailed(this,'QR')">
        <p>Scan this from the ${APP_NAME} iPhone, iPad, or Android app to add this server.</p>
        <p>The code contains only the server address. Sign in inside the app with your usual account.</p>
      </details>`,
     "Sign in", async()=>{
-      const r=await api("/auth/login",{method:"POST",body:{username:u.value.trim(),password:p.value,device:"Web"}});
+      // `signin:true` is the whole of docs §4 on this side: a 401 or 403 here
+      // is the server answering about the password, not a session ending, so
+      // it must not run logout() and tear this form down underneath its own
+      // error line.
+      const r=await api("/auth/login",{method:"POST",signin:true,body:{username:u.value.trim(),password:p.value,device:"Web"}});
       TOKEN=r.token; localStorage.setItem("plurx_token",TOKEN); ME=r.user; location.hash="#/"; render();
     });
 }
@@ -3032,7 +3244,7 @@ function showConnectQr(){
     <button class="connectx" type="button" aria-label="Close server QR code" onclick="closeConnectQr()">✕</button>
     <h2 id="connecttitle">Connect mobile app</h2>
     <p>In the ${APP_NAME} mobile app, choose <b>Scan server QR code</b>.</p>
-    <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
+    <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}" onerror="imgFailed(this,'QR')">
     <p>This code contains only this server's address. You will sign in normally on the mobile app.</p>
   </div>`;
   dialog.addEventListener("click",e=>{ if(e.target===dialog) closeConnectQr(); });
@@ -3187,7 +3399,7 @@ function openLightbox(id){
   if(!box){
     box=document.createElement("div");
     box.id="lightbox"; box.className="lightbox";
-    box.innerHTML=`<img id="lbimg" alt="">
+    box.innerHTML=`<img id="lbimg" alt="" onerror="imgFailed(this,'Photo unavailable')">
       <button class="lbx" aria-label="Close (Esc)" title="Close (Esc)" onclick="closeLightbox()">✕</button>
       <button class="lbprev" aria-label="Previous photo" onclick="lbStep(-1)">‹</button>
       <button class="lbnext" aria-label="Next photo" onclick="lbStep(1)">›</button>
@@ -3206,7 +3418,7 @@ function openLightbox(id){
 let LB_TOUCH=0;
 function paintLightbox(){
   const p=PHOTO_SET[LB_AT]; if(!p) return closeLightbox();
-  const img=document.getElementById("lbimg"); if(img) img.src=photoUrl(p.id);
+  const img=document.getElementById("lbimg"); if(img){ imgRestore(img); img.src=photoUrl(p.id); }
   const cap=document.getElementById("lbcap");
   const many=PHOTO_SET.length>1? ` · ${LB_AT+1} of ${PHOTO_SET.length}`:"";
   if(cap) cap.innerHTML=`<b>${esc(p.title||"")}</b> ${esc(fmtDate(p.recorded_at))}${esc(many)}`;
@@ -3689,7 +3901,7 @@ async function eachItemPage(libIds, sort, gen, onBatch){
       try{
         page=await api(`/libraries/${id}/items?limit=${LIB_PAGE}&offset=${offset}&sort=${sort}`);
       }catch(e){
-        if(LIB_LOAD===gen) toast(e.message);
+        if(LIB_LOAD===gen) toast(errText(e));
         return false;
       }
       // Superseded, or the view is simply no longer on screen. Checking the
@@ -4045,7 +4257,7 @@ async function reanalyze(itemId,btn){
     if(r.repaired){ toast(`Read ${r.repaired} file${r.repaired>1?"s":""} — details updated`); render(); }
     else if(r.gone) toast("The file isn’t readable at that path any more");
     else toast((r.problems&&r.problems[0])||"ffprobe still can’t read it");
-  }catch(e){ toast(e.message||"Reanalyze failed"); }
+  }catch(e){ toast(errText(e,"Reanalyze failed")); }
   finally{ btn.disabled=false; btn.textContent=label; }
 }
 // Reanalyze's sibling, for pictures instead of media details. A poster that
@@ -4057,7 +4269,7 @@ async function refreshArtwork(itemId,btn){
     const r=await api(`/items/${itemId}/refresh-artwork`,{method:"POST"});
     if(r.poster){ toast("Artwork updated"); render(); }
     else toast(r.error?`Couldn’t fetch artwork — ${r.error}`:"The provider has no artwork for this");
-  }catch(e){ toast(e.message||"Artwork refresh failed"); }
+  }catch(e){ toast(errText(e,"Artwork refresh failed")); }
   finally{ btn.disabled=false; btn.textContent=label; }
 }
 function epThumb(ep){
@@ -4193,7 +4405,8 @@ function classicItemBody(p){
     PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
     body+=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>
       <img class="art" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
-           src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
+           src="${esc(photoUrl(it.id,'thumb'))}" alt="" data-ph="${esc(initials(it.title))}"
+           onerror="imgFailed(this)" onclick="openLightbox(${it.id})">`;
   } else if(p.shape==="versions"){
     // Movie / episode: play the best *available* version + labeled specs.
     // The player's info panel is fed from here — the detail response is the only
@@ -4314,7 +4527,7 @@ async function saveEdit(id){
   try{
     await api(`/items/${id}`,{method:"PATCH",body});
     closeEdit(); toast("Saved"); viewItem(id);
-  }catch(e){ if(err) err.textContent=e.message; }
+  }catch(e){ if(err) err.textContent=errText(e); }
 }
 
 // The mark-watched control(s) for a detail page. A movie or episode is binary,
@@ -4348,7 +4561,7 @@ async function setWatched(id, watched){
     toast(n>1 ? `${n} items marked ${watched?'watched':'unwatched'}`
               : (watched?"Marked watched":"Marked unwatched"));
     viewItem(id);
-  }catch(e){ toast(e.message); }
+  }catch(e){ toast(errText(e)); }
 }
 
 // ---- player ---------------------------------------------------------------
@@ -4691,6 +4904,10 @@ async function openSession(fileId, opts){
   // A null height is the *absence* of a request, not a request for nothing:
   // sending the key would have the server clamp null to its floor.
   if(body.height==null) delete body.height;
+  // Opening a session waits on ffmpeg actually starting an encode, so it runs
+  // on the long deadline — stated by Connectivity.deadlineFor against this
+  // path, not passed from here, so all six call sites get it whether or not
+  // they knew to ask (docs §3).
   return api(`/files/${fileId}/hls/sessions`,{method:"POST",body});
 }
 // Take on a newly-opened session's identity, and attach it.
@@ -4882,7 +5099,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
-  let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+  let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(errText(e)); return closePlayer(); }
   let retestDecodeLimit=false;
   // A device that measured itself out of decode headroom on this codec and
   // resolution (see maybeDecodeRescue) routes straight to a transcode on Auto
@@ -4973,7 +5190,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(initialRoute==='transcode_hls'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(errText(e)); return closePlayer(); }
     const from=attachSession(video, PLAYER, info, startSec);
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
       (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
@@ -4996,7 +5213,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
       why? `${why} — sending it as HLS so the player can buffer ahead`
          : "remuxing to HLS — keeping the original video");
     try{ await startCopyHls(video, startSec); }
-    catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    catch(e){ setLoading(false); toast(errText(e)); return closePlayer(); }
   } else {
     // Direct play, or remux for a browser that plays progressive fMP4 (Chrome).
     // A raw direct-play file gives the browser control of its mux defaults, not
@@ -5928,10 +6145,14 @@ async function startTranscodeFallback(reason, note){
   }
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec,selectedAudioIndex(me)));}catch(e){
     if(live()){
-      if(finishStallRecovery("failed",e.message)) showStallRecoveryFailure(e.message);
-      else if(resetBeforeOpen) showStallRecoveryFailure(e.message);
+      // The overlay and the toast are read by a person, so they take the
+      // classified sentence; the clientLog note is diagnostics, which is the
+      // one place the native text belongs (docs/CLIENT-CONNECTIVITY.md).
+      const shown=errText(e);
+      if(finishStallRecovery("failed",e.message)) showStallRecoveryFailure(shown);
+      else if(resetBeforeOpen) showStallRecoveryFailure(shown);
       else setLoading(false);
-      toast(e.message);
+      toast(shown);
     }
     return;
   }
@@ -6465,11 +6686,11 @@ async function seekTo(targetSec, forceReopen=false){
   // otherwise paint "Buffering…" over the overlay with no diagnosis and no way
   // out) and it gates the stall watchdog's own early-out.
   me.started=false;
-  const failed=e=>{ if(live()){
+  const failed=e=>{ const shown=errText(e); if(live()){
     me.started=true;
-    if(finishStallRecovery("failed",e.message)) showStallRecoveryFailure(e.message);
+    if(finishStallRecovery("failed",e.message)) showStallRecoveryFailure(shown);
     else setLoading(false);
-  } toast(e.message); };
+  } toast(shown); };
   setLoading(true, PLAYER.method==='transcode'?"Skipping ahead…":"Seeking…",
     PLAYER.method==='transcode'?"the transcoder is re-seeking":"");
   teardownHls();
@@ -6969,7 +7190,7 @@ async function burnSub(index){
   let info;
   try{
     info=await openSession(me.fileId,transcodeOpts(pos,aidx));
-  }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  }catch(e){ if(live()){ setLoading(false); toast(errText(e)); } return; }
   if(!live()) return;
   me.method='transcode'; me.copyHls=false;
   // The overlay's Reason row otherwise keeps quoting the /decision verdict —
@@ -7012,12 +7233,12 @@ async function switchAudio(idx){
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(pos,aidx));}catch(e){ return toast(e.message); }
+    let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(pos,aidx));}catch(e){ return toast(errText(e)); }
     if(!live()) return;
     attachSession(v, PLAYER, info, pos);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open with the chosen audio track.
-    try{ if(!await startCopyHls(v, pos, live)) return; }catch(e){ return toast(e.message); }
+    try{ if(!await startCopyHls(v, pos, live)) return; }catch(e){ return toast(errText(e)); }
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;
@@ -7474,17 +7695,53 @@ window.addEventListener("keydown",e=>{
 const ITEM_FOR_FILE={};
 
 // ---- activity page --------------------------------------------------------
+// True while the view is showing a connection error. The refresh timer is off
+// for exactly as long as this is set: a poller firing every 3 seconds against
+// a dead server repaints its own error state forever, which is how this page
+// used to redraw "Failed to fetch" twenty times a minute over a retry button
+// that could never outlive the next tick (docs §5).
+let ACT_ERROR=false;
 // Where the header pill lands: live streams (with a stop for admins),
 // per-library scan state, and the Trakt story — refreshed every 3s.
 async function viewActivity(){
+  const gen=VIEW_GEN;
   layoutChrome("activity", `<div class="empty">Loading…</div>`);
+  ACT_ERROR=false;
   await renderActivityBody();
-  setPageTimer(renderActivityBody, 3000);
+  if(viewIsCurrent(gen) && !ACT_ERROR) setPageTimer(renderActivityBody, 3000);
+}
+// The retry action for the activity view: repaint, refetch, and put the timer
+// back only if the refetch actually worked — and only if the viewer is still
+// here when it answers.
+async function retryActivity(){
+  const gen=VIEW_GEN;
+  const m=document.getElementById("main");
+  if(m) m.innerHTML=`<div class="empty">Loading…</div>`;
+  ACT_ERROR=false;
+  await renderActivityBody();
+  if(viewIsCurrent(gen) && !ACT_ERROR) setPageTimer(renderActivityBody, 3000);
 }
 async function renderActivityBody(){
   if(location.hash!=="#/activity") return;
-  let d; try{ d=await api("/activity/detail"); }
-  catch(e){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+  // Captured before the await, checked after it. The hash test above runs when
+  // the request is MADE; with a 15s deadline the answer can arrive a whole
+  // page later, and an unguarded catch here would kill the poller the new page
+  // had just installed and paint "No answer from …" over it — behind a Retry
+  // button that reinstalls the ACTIVITY poller on a page that is not Activity.
+  const gen=VIEW_GEN;
+  let d;
+  try{ d=await api("/activity/detail"); }
+  catch(e){
+    if(!viewIsCurrent(gen) || location.hash!=="#/activity") return;
+    ACT_ERROR=true; clearInterval(PAGE_TIMER); PAGE_TIMER=null;
+    const m=document.getElementById("main");
+    if(!m) return;
+    if(e&&e.connectivity) renderConnectionError(m, e, retryActivity);
+    else m.innerHTML=`<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if(!viewIsCurrent(gen) || location.hash!=="#/activity") return;
+  ACT_ERROR=false;
   // S2's consumer check. This table read `d.sessions`, which is the transcode
   // manager's list — so it showed transcodes and HLS copy-remuxes (mislabelled
   // as transcodes) and missed direct play and progressive remux entirely. It
@@ -7562,15 +7819,15 @@ async function renderActivityBody(){
 }
 async function stopSession(id){
   try{ await api(`/activity/sessions/${id}`,{method:"DELETE"}); toast("Stream stopped"); renderActivityBody(); }
-  catch(e){ toast(e.message); }
+  catch(e){ toast(errText(e)); }
 }
 async function stopProducer(){
   try{ const r=await api("/activity/producer",{method:"DELETE"}); toast(r.note||"Stopping"); renderActivityBody(); }
-  catch(e){ toast(e.message); }
+  catch(e){ toast(errText(e)); }
 }
 async function stopOfflinePackage(id){
   try{ await api(`/activity/offline/${id}`,{method:"DELETE"}); toast("Offline download stopped"); renderActivityBody(); }
-  catch(e){ toast(e.message); }
+  catch(e){ toast(errText(e)); }
 }
 
 // ---- settings -------------------------------------------------------------
@@ -7697,7 +7954,7 @@ async function saveSchedule(id,btn){
     await api(`/libraries/${id}/schedule`,{method:"PUT",body:{scan_interval_mins:scan,refresh_interval_mins:ref}});
     toast(scan||ref?"Schedule saved":"Automatic runs turned off");
     render();
-  }catch(e){ toast(e.message||"Couldn't save the schedule"); }
+  }catch(e){ toast(errText(e,"Couldn't save the schedule")); }
   finally{ btn.disabled=false; }
 }
 // Server-wide scheduled maintenance. Per-library scanning lives in the table
@@ -7772,7 +8029,7 @@ async function saveTelemetry(btn){
     await api("/settings",{method:"PUT",body:{
       telemetry_retain_days:Number(document.getElementById("telemetry-retain").value)}});
     toast("Playback telemetry saved"); render();
-  }catch(e){ toast(e.message||"Couldn't save"); }
+  }catch(e){ toast(errText(e,"Couldn't save")); }
   finally{ btn.disabled=false; }
 }
 async function saveMaintenance(btn){
@@ -7784,7 +8041,7 @@ async function saveMaintenance(btn){
       transcode_cleanup_mins:Number(document.getElementById("job-clean").value),
       scan_on_startup:document.getElementById("job-boot").checked}});
     toast("Maintenance schedule saved"); render();
-  }catch(e){ toast(e.message||"Couldn't save"); }
+  }catch(e){ toast(errText(e,"Couldn't save")); }
   finally{ btn.disabled=false; }
 }
 async function savePrecache(btn){
@@ -7794,7 +8051,7 @@ async function savePrecache(btn){
       cache_produce_mins:Number(document.getElementById("cache-produce").value),
       cache_max_gb:Number(document.getElementById("cache-gb").value)}});
     toast("Pre-transcoding saved"); render();
-  }catch(e){ toast(e.message||"Couldn't save"); }
+  }catch(e){ toast(errText(e,"Couldn't save")); }
   finally{ btn.disabled=false; }
 }
 function libRow(l,status){
@@ -8059,7 +8316,7 @@ async function remeasureStorage(btn){
     const st=await api("/system/storage",{method:"POST"});
     if(SETTINGS_DATA&&SETTINGS_DATA.sys) SETTINGS_DATA.sys.storage=st;
     renderSettings();
-  }catch(e){ toast(e.message); btn.disabled=false; btn.textContent=was; }
+  }catch(e){ toast(errText(e)); btn.disabled=false; btn.textContent=was; }
 }
 function playbackSummaryCard(events){
   const rows=Array.isArray(events)?events:[];
@@ -8127,7 +8384,7 @@ async function saveLib(id){
   const kind=s==="anime"?"shows":s, anime=s==="anime";
   const err=document.getElementById("ele-"+id); if(err) err.textContent="";
   try{ await api(`/libraries/${id}`,{method:"PUT",body:{name,kind,paths,anime}}); invalidateLibs(); toast("Library updated"); viewSettings(); }
-  catch(e){ if(err) err.textContent=e.message; }
+  catch(e){ if(err) err.textContent=errText(e); }
 }
 async function scanAll(){
   const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[]; if(!libs.length) return;
@@ -8167,7 +8424,7 @@ async function refreshLogs(){
     box.innerHTML=lines.map(l=>`<div class="log-${esc(l.level)}">${fmtTs(l.ts_ms)} <b>${esc(l.level)}</b> ${esc(l.target)} — ${esc(l.message)}</div>`).join("")
       ||'<span class="muted">Nothing at this level yet.</span>';
     if(stick) box.scrollTop=box.scrollHeight;
-  }catch(e){ box.textContent="Failed to load logs: "+e.message; }
+  }catch(e){ box.textContent="Failed to load logs: "+errText(e); }
 }
 async function addLib(){
   const name=ln.value.trim(), sel=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
@@ -8176,11 +8433,11 @@ async function addLib(){
   const anime = sel==="anime";
   const err=document.getElementById("lerr"); err.textContent="";
   try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); invalidateLibs(); toast("Library added — scanning"); viewSettings(); }
-  catch(e){ err.textContent=e.message; }
+  catch(e){ err.textContent=errText(e); }
 }
-async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
-async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method:"POST"}); toast("Refreshing metadata & artwork…"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
-async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); invalidateLibs(); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
+async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(errText(e))} }
+async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method:"POST"}); toast("Refreshing metadata & artwork…"); setTimeout(settingsTick,400);}catch(e){toast(errText(e))} }
+async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); invalidateLibs(); toast("Deleted"); viewSettings(); }catch(e){toast(errText(e))} }
 // Saving a key over libraries that already exist needs the backfill notice;
 // saving one on a fresh server does not, because the first scan will pick it
 // up on its own. Decided before the save, since `viewSettings` refetches and
@@ -8194,14 +8451,14 @@ async function saveTmdb(){
   const was=!!(SETTINGS_DATA&&SETTINGS_DATA.settings&&SETTINGS_DATA.settings.tmdb_configured);
   const v=tk.value.trim();
   try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:v}}); noteKeySaved("TMDB",v,was); toast("Saved"); viewSettings(); }
-  catch(e){err.textContent=e.message}
+  catch(e){err.textContent=errText(e)}
 }
 async function saveOmdb(){
   const err=document.getElementById("oerr"); err.textContent="";
   const was=!!(SETTINGS_DATA&&SETTINGS_DATA.settings&&SETTINGS_DATA.settings.omdb_configured);
   const v=document.getElementById("ok").value.trim();
   try{ await api("/settings",{method:"PUT",body:{omdb_api_key:v}}); noteKeySaved("OMDb",v,was); toast("Saved"); viewSettings(); }
-  catch(e){err.textContent=e.message}
+  catch(e){err.textContent=errText(e)}
 }
 
 // ---- playback defaults + Trakt (settings page) -----------------------------
@@ -8225,7 +8482,7 @@ async function savePlayback(){
       hls_ahead_max_secs:document.getElementById("pha").value,
       hls_typeless_sliding:document.getElementById("phs").checked}});
     toast("Playback defaults saved");
-  }catch(e){ err.textContent=e.message; }
+  }catch(e){ err.textContent=errText(e); }
 }
 // Pairing with monarr, for the Coming soon rail. The key is stored on the
 // server and used by the server: plurxd makes the call to monarr, so this
@@ -8279,7 +8536,7 @@ async function testMonarr(){
         + (st.watched_pending?`, ${st.watched_pending} waiting`:"")
         + (st.watched_failed?`, ${st.watched_failed} failed`:"");
     }
-  }catch(e){ el.textContent="✗ "+(e.message||String(e)); }
+  }catch(e){ el.textContent="✗ "+errText(e,String(e)); }
 }
 async function saveMonarr(){
   const err=document.getElementById("mnerr"); err.textContent="";
@@ -8291,7 +8548,7 @@ async function saveMonarr(){
     toast("monarr settings saved");
     testMonarr(); // saving without checking is how a typo survives a week
 
-  }catch(e){ err.textContent=e.message||String(e); }
+  }catch(e){ err.textContent=errText(e,String(e)); }
 }
 
 function traktCardHtml(t){
@@ -8334,11 +8591,11 @@ async function saveTraktKeys(){
     TRAKT_EDIT=false;
     TRAKT=await api("/trakt/status");
     paintTrakt(); toast("Trakt keys saved");
-  }catch(e){ err.textContent=e.message; }
+  }catch(e){ err.textContent=errText(e); }
 }
-async function traktLink(){ try{ TRAKT=await api("/trakt/link",{method:"POST"}); paintTrakt(); }catch(e){ toast(e.message); } }
-async function traktUnlink(){ try{ TRAKT=await api("/trakt/link",{method:"DELETE"}); paintTrakt(); toast("Trakt disconnected"); }catch(e){ toast(e.message); } }
-async function traktSyncNow(){ try{ TRAKT=await api("/trakt/sync",{method:"POST"}); paintTrakt(); toast("Sync started"); }catch(e){ toast(e.message); } }
+async function traktLink(){ try{ TRAKT=await api("/trakt/link",{method:"POST"}); paintTrakt(); }catch(e){ toast(errText(e)); } }
+async function traktUnlink(){ try{ TRAKT=await api("/trakt/link",{method:"DELETE"}); paintTrakt(); toast("Trakt disconnected"); }catch(e){ toast(errText(e)); } }
+async function traktSyncNow(){ try{ TRAKT=await api("/trakt/sync",{method:"POST"}); paintTrakt(); toast("Sync started"); }catch(e){ toast(errText(e)); } }
 
 // ---- users (admin) --------------------------------------------------------
 function userRow(u){
@@ -8361,7 +8618,7 @@ async function addUser(){
   if(password.length<8){ err.textContent="Password must be at least 8 characters."; return; }
   if(password!==up2.value){ up2.value=""; up2.focus(); err.textContent="Those two passwords don't match."; return; }
   try{ await api("/users",{method:"POST",body:{username,password,is_admin}}); toast("User added"); viewSettings(); }
-  catch(e){ err.textContent=e.message; }
+  catch(e){ err.textContent=errText(e); }
 }
 async function resetPw(id, name){
   const pw=prompt(`New password for ${name} (min 8 characters). Their current sessions will be signed out.`);
@@ -8375,14 +8632,14 @@ async function resetPw(id, name){
     toast("Those two passwords don't match — nothing was changed.");
     return;
   }
-  try{ await api(`/users/${id}`,{method:"PUT",body:{password:pw}}); toast("Password reset"); }catch(e){ toast(e.message); }
+  try{ await api(`/users/${id}`,{method:"PUT",body:{password:pw}}); toast("Password reset"); }catch(e){ toast(errText(e)); }
 }
 async function setAdmin(id, makeAdmin){
-  try{ await api(`/users/${id}`,{method:"PUT",body:{is_admin:!!makeAdmin}}); toast(makeAdmin?"Now an admin":"Admin revoked"); viewSettings(); }catch(e){ toast(e.message); }
+  try{ await api(`/users/${id}`,{method:"PUT",body:{is_admin:!!makeAdmin}}); toast(makeAdmin?"Now an admin":"Admin revoked"); viewSettings(); }catch(e){ toast(errText(e)); }
 }
 async function delUser(id, name){
   if(!confirm(`Delete ${name}? Their watch history is removed. Media files are untouched.`)) return;
-  try{ await api(`/users/${id}`,{method:"DELETE"}); toast("User deleted"); viewSettings(); }catch(e){ toast(e.message); }
+  try{ await api(`/users/${id}`,{method:"DELETE"}); toast("User deleted"); viewSettings(); }catch(e){ toast(errText(e)); }
 }
 
 // ---- layout: catalog ---------------------------------------------------------
@@ -9640,9 +9897,20 @@ applyLayout();
 // One page-scoped poller at a time; routing away always clears it.
 let PAGE_TIMER=null;
 function setPageTimer(fn,ms){ clearInterval(PAGE_TIMER); PAGE_TIMER=setInterval(fn,ms); }
+// Which view is on screen, as a number that only ever goes up. Every request
+// now has a 15s deadline, so a request CAN outlive the view that made it — and
+// a late failure that paints anyway does not merely show the wrong thing, it
+// shows it over a working page and drags that page's timers down with it. The
+// rule is: a catch may paint, and may touch PAGE_TIMER, only while its own
+// view is still the current one. Same shape as `LIB_LOAD===gen` in
+// eachItemPage(), which has guarded the paging loop against this for longer.
+let VIEW_GEN=0;
+function newViewGen(){ return ++VIEW_GEN; }
+function viewIsCurrent(gen){ return gen===VIEW_GEN; }
 async function render(){
   if(!TOKEN||!ME) return boot();
   clearInterval(PAGE_TIMER);
+  const gen=newViewGen();
   if(!ACT_TIMER) ACT_TIMER=setInterval(pollActivity,4000);
   const h=location.hash||"#/";
   // Item pages inherit the list you arrived from; everything else replaces it
@@ -9662,7 +9930,19 @@ async function render(){
     // armed. Without it, switching layout on Settings scrolled the NEXT page.
     restoreScroll();
   }catch(e){
-    if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
+    // A deep link whose fetch runs out its 15s deadline lands here long after
+    // the viewer gave up and navigated somewhere else. Painting then replaces
+    // a page that is working with an error about a page that is gone, and the
+    // Retry button offers to re-run the route the viewer already abandoned.
+    if(e.message!=="unauthorized" && viewIsCurrent(gen)){
+      const m=document.getElementById("main");
+      // A classified failure gets the full surface, with a retry that re-runs
+      // the route that failed rather than asking for a page reload. Anything
+      // else keeps the server's own sentence in the box it always used.
+      if(e&&e.connectivity) renderConnectionError(m||document.getElementById("app"), e, render);
+      else if(m) m.innerHTML=`<div class="empty">${esc(errText(e))}</div>`;
+      else toast(errText(e));
+    }
   }
 }
 window.addEventListener("hashchange",render);
