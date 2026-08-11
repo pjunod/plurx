@@ -158,7 +158,9 @@ a cold NFS open, not the count — are `docs/STUTTER-4K.md` §5.7.
 
 Nothing in §7 was violated: `SEGMENT_SECONDS` is untouched, hlsenc is still
 the transcode muxer, there is no settings knob, no hls.js or web-app change,
-no change to rescue thresholds or `prefer_segmented`,
+and this segmenter milestone made no change to rescue thresholds or
+`prefer_segmented` (the later 2026-08-10 web-stall correction widened that
+route independently),
 `#EXT-X-INDEPENDENT-SEGMENTS` stays withdrawn, and `Cargo.lock` did not
 change. `SEGMENT_SECONDS`, `Recipe` and `cachekeep` appear nowhere in the
 diff, and the only `produce::` reference is the test that feeds our playlist
@@ -617,8 +619,10 @@ header. Stop.
    knob for it is scope creep. (The floor/ceiling constants are code.)
 4. **No hls.js or web-app changes.** If M4 seems to need one, the server
    output is wrong — fix the output.
-5. **No changes to rescue thresholds, routing (`prefer_segmented`), or the
-   Safari native path** beyond serving the same files it gets today.
+5. **This segmenter milestone makes no changes to rescue thresholds, routing
+   (`prefer_segmented`), or the Safari native path** beyond serving the same
+   files it received when this plan shipped. Later routing work is tracked in
+   [PERF-PLAN.md](PERF-PLAN.md) §4.3bis rather than retrofitted here.
 6. Do not restore `#EXT-X-INDEPENDENT-SEGMENTS` — revisit only with real
    census data showing ceiling cuts ≈ 0 (§4.5).
 7. Do not chase the two load-flaky producer tests; re-run them.

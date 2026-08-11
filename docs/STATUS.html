@@ -92,13 +92,13 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-10 · bounded M2 import verification + first-class audiobooks + Apple build 48 + Android build 26 + tagged v0.2.7; physical acceptance is partially executed</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-11 · web segmented-remux routing + bounded stall recovery + bounded M2 import verification + first-class audiobooks + Apple build 48 + Android build 26 + retrospective work orders + tagged v0.2.7; physical acceptance is partially executed</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.7</div><div class="l">tagged release · fleet evidence recorded</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android build 26 source · Apple build 48 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ segmented remux + stall recovery · Android build 26 source · Apple build 48 source, not yet uploaded</div></div>
     <div class="tile"><div class="v">M2 import ✓</div><div class="l">bounded migration proof · cluster activation next</div></div>
   </div>
 
@@ -112,8 +112,8 @@
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Scanner v1: Plex/Jellyfin + scene naming, ffprobe inspection, incremental rescan by size+mtime, vanished-file reconcile</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Metadata v1: TMDB agent (title+year), artwork caching, offline-safe with no key</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Native API v1: Argon2id local accounts + tokens + first-run setup, browse/hubs, FTS5 search, watch progress + scrobble</span></li>
-        <li class="done-item"><span class="m done">✓ done</span><span class="t">Playback v1: decision engine + data-driven device profiles, direct play, on-the-fly MKV→fMP4 remux, trustworthy resume</span></li>
-        <li class="done-item"><span class="m done">✓ done</span><span class="t">Web app v1: embedded SPA — login/setup, grids, in-modal player, continue-watching, admin</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Playback v1: decision engine + data-driven device profiles, direct play, on-the-fly MKV→fMP4 remux, segmented copy-HLS for browser-compatible probed remuxes, trustworthy resume</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Web app v1: embedded SPA — login/setup, grids, in-modal player, continue-watching, admin, eight-second persistent-stall detection with one bounded position-preserving recovery and recorded outcomes</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Transcode pipeline: NVENC/QSV/VA-API/VideoToolbox + x264 fallback, bitrate ladder, HDR→SDR tone-map, sub burn-in, HLS lifecycle + reaper</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Audio policies: downmix + per-profile codec handling</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Anime: AniList agent (no key), absolute numbering, dual-audio default-track rules</span></li>

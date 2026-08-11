@@ -744,8 +744,9 @@ pub struct MediaShape {
     pub hdr_4k: Vec<(String, i64)>,
     /// Video codec → count.
     pub codecs: Vec<(String, i64)>,
-    /// Files at or above the bitrate where a progressive remux stops coping
-    /// (§4.3bis) — the set that now takes the segmented path.
+    /// Files at or above the former 40 Mb/s progressive-remux floor
+    /// (§4.3bis). This remains the high-bitrate stress population after the
+    /// route widened to every probed remux.
     pub over_segmented_floor: i64,
     pub max_bitrate: Option<i64>,
 }
