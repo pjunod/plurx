@@ -116,3 +116,19 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "Snapping applies only at the live edge"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testSeekRouteSeeksInsideALaterRangeInsteadOfSnappingToAnEarlierEdge"
+
+[[fixes]]
+id = "apple.episode-media-season-card-review-fix"
+commits = ["ae59131b"]
+source = "clients/apple/Sources/Components.swift"
+source_anchor = "func posterCardEpisodeSummaryBadges("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSeasonEpisodeSummaryKeepsResolutionAndRichHDRCompact"
+
+[[fixes]]
+id = "clients.audiobook-timeline-review-fixes"
+commits = ["681336e2"]
+source = "clients/apple/Sources/DetailView.swift"
+source_anchor = "enum AudiobookTimeline"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingParts"

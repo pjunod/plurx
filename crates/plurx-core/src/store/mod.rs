@@ -510,8 +510,8 @@ pub trait MediaStore: Send + Sync + 'static {
         &self,
         ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, i64>, StoreError>;
-    /// Aggregated media facts per item, for the given item ids — the opt-in
-    /// `media` block on the library list.
+    /// Aggregated media facts per item, for the given item ids — the `media`
+    /// block on library and season listings.
     ///
     /// One statement for the whole page, exactly like `item_max_heights`: this
     /// feeds a list, so a per-item lookup is a 200-round-trip page render, and

@@ -268,13 +268,18 @@ ratify or delete two `THEMES` entries). Contrast enforcement live with
 the 36-entry allowlist; shrink-only semantics. §7 debt intentionally
 NOT applied (brand calls — box 4).
 
-### S1 — media facts on the library list (server) — unchanged from v3
+### S1 — media facts on compact item collections (server) — extended from v3
 
-Aggregated optional `media` block, one join/group query, `?facts=1`
-opt-in. Consumers: catalog List mode (G2b's toggle) · deck (G5) · card
-badges. Acceptance as v3 (no N+1 · byte-identical without the param ·
-tolerant Android decoder verified · consumer check closes against
-G2b's library).
+The library list keeps its aggregated `media` block behind the `?facts=1`
+opt-in. A season's item-detail response now adds the same best-file block plus
+`resolution` to playable episode children unconditionally, because that
+response is already the season shelf and asking for each episode detail would
+be an N+1. Both paths use one collection-wide query. Consumers: catalog List
+mode (G2b's toggle) · deck (G5) · library card badges · Apple season episode
+cards. Acceptance keeps v3's library guarantees (no N+1 · byte-identical
+without the parameter · tolerant Android decoder verified) and adds distinct
+two-episode facts on season detail so one child's metadata cannot land on
+another.
 
 **As built, and two corrections to what this section used to say.**
 
