@@ -16,6 +16,7 @@ import retrofit2.http.Query
 private data class NativeApiContractFixture(
     val server: Server,
     val item_detail: ItemDetail,
+    val audiobook_detail: ItemDetail,
     val page: Page,
     val decision: Decision,
 )
@@ -59,6 +60,12 @@ class ModelContractTest {
 
         assertEquals("Contract server", fixture.server.name)
         assertEquals("The Contract", fixture.item_detail.item.title)
+        assertTrue(fixture.audiobook_detail.item.isAudiobook)
+        assertEquals(
+            listOf(0L, 60_000L, 180_000L),
+            fixture.audiobook_detail.files.map(MediaFileDto::part_offset_ms),
+        )
+        assertEquals("Opening", fixture.audiobook_detail.files.first().chapters.first().title)
         assertEquals(20L, fixture.page.items.single().rollup!!.leaves)
         assertEquals("remux", fixture.decision.delivery!!.mode)
         assertEquals("dolby_vision", fixture.decision.delivered_dynamic_range)
@@ -79,6 +86,27 @@ class ModelContractTest {
         assertEquals(2160L, item.resolution)
         assertEquals(listOf("demo"), item.tags)
         assertFalse(item.watch!!.watched)
+    }
+
+    @Test
+    fun audiobookDetailCarriesPlaybackAndChapterMetadata() {
+        val detail = json.decodeFromString<ItemDetail>(
+            """{
+              "item": {"id": 44, "kind": "audiobook", "title": "The Long Book", "runtime_ms": 300000},
+              "files": [{
+                "id": 440, "filename": "01.m4b", "duration_ms": 120000,
+                "container": "mov,mp4,m4a,3gp,3g2,mj2", "part_offset_ms": 120000,
+                "audio_streams": [{"index": 0, "codec": "aac", "channels": 2}],
+                "chapters": [{"index": 0, "title": "Opening", "start_ms": 0, "end_ms": 60000}]
+              }]
+            }""".trimIndent(),
+        )
+
+        assertTrue(detail.item.isAudiobook)
+        assertTrue(detail.item.isPlayable)
+        assertEquals(120_000L, detail.files.single().part_offset_ms)
+        assertEquals("aac", detail.files.single().audio_streams.single().codec)
+        assertEquals("Opening", detail.files.single().chapters.single().title)
     }
 
     @Test

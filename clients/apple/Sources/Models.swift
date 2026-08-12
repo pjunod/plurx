@@ -69,7 +69,9 @@ struct Item: Codable, Identifiable, Hashable {
     var rollup: WatchRollup?
 
     var isMovieOrEpisode: Bool { kind == "movie" || kind == "episode" }
-    var isPlayable: Bool { isMovieOrEpisode || kind == "video" }
+    var isPlayable: Bool { isMovieOrEpisode || kind == "video" || kind == "audiobook" }
+    var isBook: Bool { kind == "book" }
+    var isAudiobook: Bool { kind == "audiobook" }
 }
 
 /// A list-safe summary of the best file behind an item. Season detail uses
@@ -313,7 +315,17 @@ struct MediaFile: Codable, Identifiable {
     var hdr: String?
     var hdrFormat: String?
     var bitrate: Int?
-    var audioStreams: [AudioTrack]?
+    var audioStreams: [AudioTrack]? = nil
+    var partOffsetMs: Int? = nil
+    var chapters: [BookChapter]? = nil
+    var available: Bool? = true
+}
+
+struct BookChapter: Codable, Hashable {
+    let index: Int
+    let title: String
+    let startMs: Int
+    let endMs: Int
 }
 
 struct ItemDetail: Codable {

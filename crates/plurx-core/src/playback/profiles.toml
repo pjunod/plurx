@@ -8,7 +8,7 @@
 [web-h264]
 # The safe baseline every modern browser can play via <video>/MSE.
 description = "Browsers (H.264/AAC baseline)"
-containers = ["mp4", "m4v", "webm", "mov"]
+containers = ["mp4", "m4v", "webm", "mov", "m4a", "m4b", "mp3", "aac", "flac", "ogg", "opus", "wav"]
 video_codecs = ["h264", "vp8", "vp9", "av1"]
 audio_codecs = ["aac", "mp3", "opus", "vorbis", "flac"]
 max_height = 2160
@@ -18,7 +18,7 @@ supports_hdr = false
 # Permissive profile for native players that handle almost anything
 # (Media3/ExoPlayer, Infuse-class). Used by native clients in Phase 5.
 description = "Native players (direct play almost anything)"
-containers = ["mkv", "mp4", "m4v", "webm", "mov", "ts", "avi"]
+containers = ["mkv", "mp4", "m4v", "webm", "mov", "ts", "avi", "m4a", "m4b", "mp3", "aac", "flac", "ogg", "opus", "wav", "wma"]
 video_codecs = ["h264", "hevc", "vp8", "vp9", "av1", "mpeg4", "mpeg2video"]
 audio_codecs = ["aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "dts", "truehd"]
 supports_hdr = true

@@ -1126,7 +1126,9 @@ fn copy_input_args(
         0
     };
 
-    // Copy the video untouched; map the chosen (or first) audio; drop subs.
+    // Copy video when present; map the chosen (or first) audio; drop subs.
+    // The optional video map is what lets the same established remux path
+    // deliver an audio-only audiobook whose codec needs conversion to AAC.
     //
     // And drop CHAPTERS, which `-map` does not govern. ffmpeg's mp4 muxer
     // writes a source's chapters as a QuickTime `text` track plus a `chpl`
@@ -1144,7 +1146,7 @@ fn copy_input_args(
     args.push("-map_chapters".into());
     args.push("-1".into());
     args.push("-map".into());
-    args.push("0:v:0".into());
+    args.push("0:v:0?".into());
     args.push("-map".into());
     match audio_index {
         Some(i) => args.push(format!("{audio_input}:a:{i}?")),
@@ -1802,6 +1804,37 @@ mod tests {
         assert!(!joined.contains("libx264"));
         assert!(!joined.contains("scale="));
         assert!(!joined.contains("tonemap"));
+    }
+
+    #[test]
+    fn audio_only_copy_can_convert_an_audiobook_without_a_video_stream() {
+        let mut media = file(None);
+        media.video_codec = None;
+        media.video_profile = None;
+        media.width = None;
+        media.height = None;
+        media.bit_depth = None;
+        media.audio_streams = vec![crate::domain::AudioStream {
+            index: 0,
+            codec: "wmav2".into(),
+            channels: Some(2),
+            default: true,
+            ..Default::default()
+        }];
+
+        let joined = hls_copy_args(
+            &media,
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            false,
+            "/tmp/audiobook",
+        )
+        .join(" ");
+        assert!(joined.contains("-map 0:v:0?"));
+        assert!(joined.contains("-map 0:a:0?"));
+        assert!(joined.contains("-c:a aac"));
     }
 
     #[test]

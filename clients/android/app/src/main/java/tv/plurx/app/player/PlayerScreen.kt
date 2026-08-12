@@ -155,7 +155,14 @@ private data class Plan(
     override val subtitles: List<SubTrack>,
     val ladder: List<Rung>,
     val declaredOffsetMs: Long?,
-) : PlanLike
+    val progressOffsetMs: Long,
+    val itemDurationMs: Long?,
+    val nextAudiobookPartId: Long?,
+) : PlanLike {
+    fun globalPosition(localPositionMs: Long): Long =
+        audiobookGlobalPosition(localPositionMs, progressOffsetMs)
+    val progressDurationMs: Long get() = itemDurationMs ?: durationMs
+}
 
 private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan? = try {
     val detail = vm.itemDetail(itemId)
@@ -197,6 +204,11 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         subtitles = decision.subtitles,
         ladder = decision.ladder,
         declaredOffsetMs = decision.declared_offset_ms,
+        progressOffsetMs = if (detail.item.isAudiobook) file?.part_offset_ms ?: 0L else 0L,
+        itemDurationMs = if (detail.item.isAudiobook) detail.item.runtime_ms else null,
+        nextAudiobookPartId = if (detail.item.isAudiobook) {
+            nextAudiobookPartId(detail.files, fileId)
+        } else null,
     )
 } catch (cancelled: CancellationException) {
     // A superseded load (Retry, or a new file) unwinding. Returning null here
@@ -204,6 +216,14 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
     throw cancelled
 } catch (_: Exception) {
     null
+}
+
+internal fun audiobookGlobalPosition(localPositionMs: Long, partOffsetMs: Long): Long =
+    partOffsetMs.coerceAtLeast(0L) + localPositionMs.coerceAtLeast(0L)
+
+internal fun nextAudiobookPartId(files: List<MediaFileDto>, currentFileId: Long): Long? {
+    val index = files.indexOfFirst { it.id == currentFileId }
+    return if (index >= 0) files.drop(index + 1).firstOrNull { it.available }?.id else null
 }
 
 internal fun playerSubtitle(item: tv.plurx.app.data.Item): String? = buildList {
@@ -602,15 +622,17 @@ private fun PlayerContent(
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
-                if (!playing) vm.postProgress(itemId, controller.realPosition(), plan.durationMs)
+                if (!playing) vm.postProgress(itemId, plan.globalPosition(controller.realPosition()), plan.progressDurationMs)
             }
 
             override fun onPlaybackStateChanged(state: Int) {
                 buffering = state == Player.STATE_BUFFERING
                 if (state == Player.STATE_ENDED) {
-                    vm.postProgress(itemId, plan.durationMs, plan.durationMs)
+                    vm.postProgress(itemId, plan.globalPosition(plan.durationMs), plan.progressDurationMs)
                     controlsVisible = true
-                    if (autoplayNext && !findingNext) {
+                    if (plan.nextAudiobookPartId != null) {
+                        playNext(PlaybackTarget(itemId, plan.nextAudiobookPartId, 0))
+                    } else if (autoplayNext && !findingNext) {
                         findingNext = true
                         scope.launch {
                             val next = catchingUnlessCancelled { vm.nextEpisode(itemId) }.getOrNull()
@@ -636,7 +658,7 @@ private fun PlayerContent(
         controller.player.addListener(listener)
         controller.startAt(startMs, startReason, attemptOpenedAtMs)
         onDispose {
-            vm.postProgress(itemId, controller.realPosition(), plan.durationMs)
+            vm.postProgress(itemId, plan.globalPosition(controller.realPosition()), plan.progressDurationMs)
             controller.player.removeListener(listener)
             controller.release()
         }
@@ -751,7 +773,7 @@ private fun PlayerContent(
     LaunchedEffect(controller) {
         while (true) {
             delay(10_000)
-            if (isPlaying) vm.reportProgress(itemId, controller.realPosition(), plan.durationMs)
+            if (isPlaying) vm.reportProgress(itemId, plan.globalPosition(controller.realPosition()), plan.progressDurationMs)
         }
     }
     LaunchedEffect(lastInteraction, isPlaying, panel) {

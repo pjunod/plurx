@@ -183,9 +183,13 @@ async fn element_for(state: &AppState, item: &Item, view: View) -> Result<plex::
                 view,
             ))
         }
-        // Home-library kinds are not exposed through the façade; the handlers
-        // above filter them out before we get here.
-        ItemKind::Folder | ItemKind::Video | ItemKind::Photo => Err(ApiError::NotFound("metadata")),
+        // Home and Books kinds are not exposed through the façade; the
+        // handlers above filter them out before we get here.
+        ItemKind::Book
+        | ItemKind::Audiobook
+        | ItemKind::Folder
+        | ItemKind::Video
+        | ItemKind::Photo => Err(ApiError::NotFound("metadata")),
     }
 }
 

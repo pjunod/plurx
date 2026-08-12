@@ -28,14 +28,14 @@ impl From<Option<WatchState>> for View {
 }
 
 /// The Plex section type for a library, or `None` for library kinds the
-/// façade doesn't expose. Home libraries are deliberately absent: Plex has no
-/// section type for a folder tree of camera files, and a half-mapped section
-/// breaks Kodi clients harder than an absent one.
+/// façade doesn't expose. Home and Books libraries are deliberately absent:
+/// Plex has no faithful section/item model for either surface, and a
+/// half-mapped section breaks Kodi clients harder than an absent one.
 fn section_type(kind: LibraryKind) -> Option<&'static str> {
     match kind {
         LibraryKind::Movies => Some("movie"),
         LibraryKind::Shows => Some("show"),
-        LibraryKind::Home => None,
+        LibraryKind::Books | LibraryKind::Home => None,
     }
 }
 
@@ -47,7 +47,11 @@ fn item_type(kind: ItemKind) -> Option<&'static str> {
         ItemKind::Show => Some("show"),
         ItemKind::Season => Some("season"),
         ItemKind::Episode => Some("episode"),
-        ItemKind::Folder | ItemKind::Video | ItemKind::Photo => None,
+        ItemKind::Book
+        | ItemKind::Audiobook
+        | ItemKind::Folder
+        | ItemKind::Video
+        | ItemKind::Photo => None,
     }
 }
 

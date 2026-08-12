@@ -135,6 +135,37 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn find_book(
+        &self,
+        library_id: i64,
+        kind: ItemKind,
+        title: &str,
+        year: Option<i32>,
+        identity_path: Option<&str>,
+    ) -> Result<Option<Item>, StoreError> {
+        debug_assert!(matches!(kind, ItemKind::Book | ItemKind::Audiobook));
+        let kind = kind.as_str().to_owned();
+        let title = title.to_owned();
+        let identity_path = identity_path.map(str::to_owned);
+        self.with_conn(move |conn| {
+            Ok(find_by(
+                conn,
+                &format!(
+                    "SELECT {ITEM_COLS} FROM items
+                     WHERE library_id = ?1 AND kind = ?2
+                       AND title = ?3 COLLATE NOCASE AND year IS ?4
+                       AND (?5 IS NULL OR EXISTS (
+                           SELECT 1 FROM files f WHERE f.item_id = items.id
+                             AND (f.path = ?5 OR (
+                               substr(f.path, 1, length(?5)) = ?5
+                               AND substr(f.path, length(?5) + 1, 1) = '/'))))"
+                ),
+                params![library_id, kind, title, year, identity_path],
+            )?)
+        })
+        .await
+    }
+
     async fn find_show(
         &self,
         library_id: i64,
@@ -301,9 +332,9 @@ impl MediaStore for SqliteStore {
                 }
                 ItemSort::Recorded => "(recorded_at IS NULL), recorded_at DESC, sort_title ASC",
             };
-            // Top level = what a library's grid shows: movies and shows, plus
-            // (home libraries) whatever sits directly under a root.
-            const TOP: &str = "(kind IN ('movie','show') \
+            // Top level = what a library's grid shows: movies, shows, books,
+            // audiobooks, plus (home libraries) whatever sits under a root.
+            const TOP: &str = "(kind IN ('movie','show','book','audiobook') \
                  OR (kind IN ('folder','video','photo') AND parent_id IS NULL))";
             // Genres are a JSON array (migration v13), so membership is a
             // `json_each` scan rather than an index probe. Written as
@@ -376,7 +407,7 @@ impl MediaStore for SqliteStore {
                      LEFT JOIN items season
                             ON season.id = i.parent_id AND i.kind = 'episode'
                      LEFT JOIN items show ON show.id = season.parent_id
-                     WHERE i.kind IN ('movie','episode','video','folder')
+                     WHERE i.kind IN ('movie','episode','video','folder','book','audiobook')
                        AND (?1 IS NULL OR i.library_id = ?1)
                  )
                  SELECT {r}, r.rail_show_title, r.rail_season_poster
@@ -414,7 +445,7 @@ impl MediaStore for SqliteStore {
                         ON season.id = i.parent_id AND i.kind = 'episode'
                  LEFT JOIN items show ON show.id = season.parent_id
                  WHERE items_fts MATCH ?1
-                   AND i.kind IN ('movie','show','episode','folder','video','photo')
+                   AND i.kind IN ('movie','show','episode','folder','video','photo','book','audiobook')
                  ORDER BY rank LIMIT ?2",
                 i = item_cols("i")
             ))?;
@@ -1210,7 +1241,7 @@ impl MediaStore for SqliteStore {
             let mut pruned_items = 0_u64;
             pruned_items += tx.execute(
                 "DELETE FROM items WHERE library_id = ?1 \
-                 AND kind IN ('movie','episode','video','photo') \
+                 AND kind IN ('movie','episode','video','photo','book','audiobook') \
                  AND id NOT IN (SELECT item_id FROM files)",
                 params![library_id],
             )? as u64;
@@ -1308,7 +1339,7 @@ impl MediaStore for SqliteStore {
             // Bottom-up: file-less leaves, then empty seasons, then empty shows.
             removed += tx.execute(
                 "DELETE FROM items
-                 WHERE library_id = ?1 AND kind IN ('movie','episode','video','photo')
+                 WHERE library_id = ?1 AND kind IN ('movie','episode','video','photo','book','audiobook')
                    AND id NOT IN (SELECT item_id FROM files)",
                 params![library_id],
             )? as u64;

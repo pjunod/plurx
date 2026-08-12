@@ -10,7 +10,7 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use plurx_core::domain::MediaFile;
+use plurx_core::domain::{ItemKind, MediaFile};
 use plurx_core::playback::{self, Decision};
 use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,20 @@ fn content_type(path: &Path) -> &'static str {
         Some("mkv") => "video/x-matroska",
         Some("ts") | Some("m2ts") => "video/mp2t",
         Some("avi") => "video/x-msvideo",
+        Some("m4a") | Some("m4b") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("ogg") | Some("opus") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("wma") => "audio/x-ms-wma",
+        Some("epub") => "application/epub+zip",
+        Some("pdf") => "application/pdf",
+        Some("mobi") => "application/x-mobipocket-ebook",
+        Some("azw") | Some("azw3") => "application/vnd.amazon.ebook",
+        Some("fb2") => "application/x-fictionbook+xml",
+        Some("cbz") => "application/vnd.comicbook+zip",
+        Some("cbr") => "application/vnd.comicbook-rar",
         // Home libraries serve stills through the same range-capable helper.
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("png") => "image/png",
@@ -945,6 +959,28 @@ pub async fn direct(
     served
 }
 
+/// GET /api/v1/files/:id/content — original bytes for a text book.
+///
+/// Separate from `direct` because opening an EPUB/PDF is not timed playback:
+/// it must not announce a viewer, scrobble, or manufacture audio progress.
+pub async fn book_content(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    AxPath(id): AxPath<i64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let file = load_file(&state, id).await?;
+    let item = state
+        .store
+        .get_item(file.item_id)
+        .await?
+        .ok_or(ApiError::NotFound("item"))?;
+    if item.kind != ItemKind::Book {
+        return Err(ApiError::NotFound("book content"));
+    }
+    serve_file_range(&file.path, &headers).await
+}
+
 // The caps fields are inlined (not `#[serde(flatten)]`ed) because axum's
 // urlencoded Query decoder doesn't support flatten.
 #[derive(Deserialize)]
@@ -1350,10 +1386,11 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     } else {
         0
     };
-    // Video + the chosen audio track, no subtitles into the MP4.
+    // Optional video + the chosen audio track, no subtitles into the MP4.
+    // Audio-only books share this remux path when their source codec needs AAC.
     cmd.args([
         "-map",
-        "0:v:0",
+        "0:v:0?",
         "-map",
         &format!("{audio_input}:a:{audio_index}?"),
         "-sn",
@@ -1790,6 +1827,12 @@ mod tests {
         assert_eq!(content_type(Path::new("a.mp4")), "video/mp4");
         assert_eq!(content_type(Path::new("a.mkv")), "video/x-matroska");
         assert_eq!(content_type(Path::new("a.webm")), "video/webm");
+        assert_eq!(content_type(Path::new("a.m4b")), "audio/mp4");
+        assert_eq!(content_type(Path::new("a.aac")), "audio/aac");
+        assert_eq!(content_type(Path::new("a.mp3")), "audio/mpeg");
+        assert_eq!(content_type(Path::new("a.flac")), "audio/flac");
+        assert_eq!(content_type(Path::new("a.epub")), "application/epub+zip");
+        assert_eq!(content_type(Path::new("a.pdf")), "application/pdf");
     }
 
     #[test]

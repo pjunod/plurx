@@ -948,10 +948,10 @@ impl JobManager {
         repairs: Option<&[i64]>,
     ) -> EnrichOutcome {
         let mut outcome = EnrichOutcome::default();
-        // Home libraries have no provider at all: their enrichment is local
-        // artwork (frame grabs and adopted sidecar images). Anime libraries
-        // enrich from AniList (no key needed); everything else from TMDB when
-        // a key is configured.
+        // Home libraries have no provider: their enrichment is local artwork.
+        // Books currently keep file-derived identity and embedded media facts;
+        // there is no provider to call. Anime uses AniList; movie/show
+        // libraries use TMDB when a key is configured.
         if library.kind == LibraryKind::Home {
             outcome.local_art = Some(
                 metadata::local::enrich_home_library(
@@ -963,6 +963,10 @@ impl JobManager {
                 )
                 .await,
             );
+        } else if library.kind == LibraryKind::Books {
+            // Deliberately empty. Treating Books as the generic TMDB arm would
+            // spend provider calls on titles TMDB cannot identify and could
+            // attach an unrelated film's artwork to a book with the same name.
         } else if library.anime {
             let client = AniListClient::new();
             outcome.enrich = Some(
