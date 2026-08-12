@@ -16,6 +16,7 @@ import retrofit2.http.Query
 private data class NativeApiContractFixture(
     val server: Server,
     val item_detail: ItemDetail,
+    val audiobook_detail: ItemDetail,
     val page: Page,
     val decision: Decision,
 )
@@ -59,6 +60,12 @@ class ModelContractTest {
 
         assertEquals("Contract server", fixture.server.name)
         assertEquals("The Contract", fixture.item_detail.item.title)
+        assertTrue(fixture.audiobook_detail.item.isAudiobook)
+        assertEquals(
+            listOf(0L, 60_000L, 180_000L),
+            fixture.audiobook_detail.files.map(MediaFileDto::part_offset_ms),
+        )
+        assertEquals("Opening", fixture.audiobook_detail.files.first().chapters.first().title)
         assertEquals(20L, fixture.page.items.single().rollup!!.leaves)
         assertEquals("remux", fixture.decision.delivery!!.mode)
         assertEquals("dolby_vision", fixture.decision.delivered_dynamic_range)

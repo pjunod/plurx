@@ -119,6 +119,10 @@ pub struct ParsedEpisode {
 pub struct ParsedBook {
     pub title: String,
     pub year: Option<i32>,
+    /// Stable scanner identity: the work directory for numbered parts, or the
+    /// file itself for a single-file work. It retains any author directory so
+    /// two authors' identically titled books never collapse into one item.
+    pub identity_path: std::path::PathBuf,
 }
 
 /// Parse a text book or audiobook from a path beneath one of `roots`.
@@ -145,23 +149,31 @@ pub fn parse_book(path: &Path, roots: &[std::path::PathBuf]) -> ParsedBook {
         .unwrap_or_default();
 
     let parent = dirs.last().copied();
-    let source = match parent {
+    let (source, identity_path) = match parent {
         // `Title/Disc 1/01.mp3` → Title, not Disc 1.
-        Some(p) if track_like(p) && dirs.len() >= 2 => dirs[dirs.len() - 2],
+        Some(p) if track_like(p) && dirs.len() >= 2 => (
+            dirs[dirs.len() - 2],
+            path.parent()
+                .and_then(Path::parent)
+                .unwrap_or(path)
+                .to_path_buf(),
+        ),
         // `Title/01.mp3` and `Author/Title/01.mp3` → the enclosing work.
-        Some(p) if track_like(stem) => p,
+        Some(p) if track_like(stem) => (p, path.parent().unwrap_or(path).to_path_buf()),
         // A descriptive loose file is already the strongest title signal.
-        _ => stem,
+        _ => (stem, path.to_path_buf()),
     };
 
     match extract_year(source) {
         Some((year, at)) if !title_before_cruft(&source[..at]).is_empty() => ParsedBook {
             title: title_before_cruft(&source[..at]),
             year: Some(year),
+            identity_path,
         },
         _ => ParsedBook {
             title: clean_title(source),
             year: None,
+            identity_path,
         },
     }
 }
@@ -671,6 +683,9 @@ mod tests {
             ParsedBook {
                 title: "The Dispossessed".into(),
                 year: Some(1974),
+                identity_path: PathBuf::from(
+                    "/books/Ursula K. Le Guin/The Dispossessed (1974).epub"
+                ),
             }
         );
         assert_eq!(
@@ -678,6 +693,7 @@ mod tests {
             ParsedBook {
                 title: "Project Hail Mary".into(),
                 year: None,
+                identity_path: PathBuf::from("/books/Project Hail Mary.m4b"),
             }
         );
     }

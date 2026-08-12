@@ -6,6 +6,15 @@ import org.junit.Test
 class CapsPolicyTest {
 
     @Test
+    fun directPlayContainersIncludeSupportedAudiobookSources() {
+        val containers = DIRECT_PLAY_CONTAINERS.split(',').toSet()
+        assertEquals(
+            setOf("m4a", "m4b", "mp3", "aac", "flac", "ogg", "opus", "wav"),
+            containers.intersect(setOf("m4a", "m4b", "mp3", "aac", "flac", "ogg", "opus", "wav")),
+        )
+    }
+
+    @Test
     fun dolbyVisionClaimsOnlyTheSingleLayerDeliveryProfiles() {
         // A Shield-class decoder lists dual-layer P7 alongside 4/5/8.
         val decoder = listOf(

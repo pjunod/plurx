@@ -1069,12 +1069,23 @@ async fn refresh_audiobook_runtimes(
         if item.kind != ItemKind::Audiobook {
             continue;
         }
-        let duration_ms = store
+        let durations = store
             .files_for_item(item_id)
             .await?
             .into_iter()
-            .filter_map(|file| file.duration_ms)
-            .sum::<i64>();
+            .filter_map(|file| file.duration_ms.filter(|duration| *duration > 0))
+            .collect::<Vec<_>>();
+        if durations.is_empty() {
+            // Unknown is not zero. A failed or old probe should keep the
+            // runtime absent so the next successful scan can supply it.
+            continue;
+        }
+        let duration_ms = durations.into_iter().sum::<i64>();
+        if item.runtime_ms == Some(duration_ms) {
+            // On hiqlite this is a consensus write, so an unchanged scheduled
+            // scan must not rewrite every audiobook on the shelf.
+            continue;
+        }
         store
             .apply_metadata(
                 item_id,
@@ -1134,8 +1145,15 @@ async fn place_item(
                 ));
             };
             let parsed = parse::parse_book(path, &library.paths);
+            let identity_path = parsed.identity_path.to_string_lossy();
             if let Some(existing) = store
-                .find_book(library.id, kind, &parsed.title, parsed.year)
+                .find_book(
+                    library.id,
+                    kind,
+                    &parsed.title,
+                    parsed.year,
+                    Some(&identity_path),
+                )
                 .await?
             {
                 return Ok(Placement::Placed(home::Placed {
@@ -1354,6 +1372,8 @@ mod tests {
             "Andy Weir/Project Hail Mary/Disc 1/Chapter 02.m4a",
         )
         .await;
+        write_fake_video(dir.path(), "Author One/Shared Title/01.mp3").await;
+        write_fake_video(dir.path(), "Author Two/Shared Title/01.mp3").await;
         // A video in the same tree is not a book by accident.
         write_fake_video(dir.path(), "Andy Weir/interview.mp4").await;
 
@@ -1367,13 +1387,27 @@ mod tests {
             .await
             .expect("lib");
         let report = scan_library(&store, &lib).await.expect("scan");
-        assert_eq!(report.added, 3, "the EPUB and two audio parts were indexed");
+        assert_eq!(
+            report.added, 5,
+            "the EPUB and four audio parts were indexed"
+        );
 
         let page = store
             .list_top_items(lib.id, ItemSort::Title, 0, 20)
             .await
             .expect("items");
-        assert_eq!(page.total, 2, "audio parts collapse into one work");
+        assert_eq!(
+            page.total, 4,
+            "parts of one work collapse, but two authors' same title stays separate"
+        );
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|item| item.kind == ItemKind::Audiobook && item.title == "Shared Title")
+                .count(),
+            2,
+            "the author directory is part of scanner identity"
+        );
         let text = page
             .items
             .iter()
@@ -1485,6 +1519,65 @@ mod tests {
                 .expect("audiobook item disappeared")
                 .runtime_ms,
             Some(60_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn audiobook_runtime_stays_unknown_when_no_part_was_timed() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Untimed Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/contract/untimed-books")],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item_id = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Audiobook,
+                parent_id: None,
+                title: "Untimed".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("audiobook");
+        let file_id = store
+            .upsert_file(
+                item_id,
+                "/contract/untimed-books/Untimed/Part 1.mp3",
+                10,
+                1,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("untimed part");
+
+        refresh_audiobook_runtimes(
+            &store,
+            &library,
+            &[PlacedFile {
+                item_id,
+                file_id,
+                path: "/contract/untimed-books/Untimed/Part 1.mp3".into(),
+            }],
+        )
+        .await
+        .expect("runtime refresh");
+
+        assert_eq!(
+            store
+                .get_item(item_id)
+                .await
+                .expect("item")
+                .expect("audiobook")
+                .runtime_ms,
+            None,
+            "a failed probe is unknown, not a zero-length book"
         );
     }
 

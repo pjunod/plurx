@@ -365,6 +365,28 @@ struct PlayContext: Identifiable {
     var overview: String? = nil
 }
 
+enum AudiobookTimeline {
+    static func localPosition(globalPositionMs: Int, partOffsetMs: Int) -> Int {
+        max(0, globalPositionMs - max(0, partOffsetMs))
+    }
+
+    static func globalPosition(localPositionMs: Int, partOffsetMs: Int) -> Int {
+        max(0, partOffsetMs) + max(0, localPositionMs)
+    }
+
+    static func file(at globalPositionMs: Int, in files: [MediaFile]) -> MediaFile? {
+        let available = files.filter { $0.available != false }
+        return available.last(where: {
+            globalPositionMs >= max(0, $0.partOffsetMs ?? 0)
+        }) ?? available.first
+    }
+
+    static func nextFile(after fileId: Int, in files: [MediaFile]) -> MediaFile? {
+        guard let index = files.firstIndex(where: { $0.id == fileId }) else { return nil }
+        return files.dropFirst(index + 1).first(where: { $0.available != false })
+    }
+}
+
 enum DetailLayoutMetrics {
     static let maximumBodyWidth: CGFloat = 980 - (2 * screenHPad)
 
@@ -677,7 +699,10 @@ struct DetailView: View {
                        onPlaybackStopped: { positionMs in
                            updateVisibleProgress(
                                itemId: ctx.itemId,
-                               positionMs: ctx.progressOffsetMs + positionMs,
+                               positionMs: AudiobookTimeline.globalPosition(
+                                   localPositionMs: positionMs,
+                                   partOffsetMs: ctx.progressOffsetMs
+                               ),
                                durationMs: ctx.itemDurationMs ?? ctx.durationMs
                            )
                        })
@@ -751,11 +776,12 @@ struct DetailView: View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
         let resumeMs = item.watch?.positionMs ?? 0
-        let file = Self.playbackFile(in: detail, positionMs: resumeMs)
-        let durationMs = item.isAudiobook ? (item.runtimeMs ?? file?.durationMs) : (file?.durationMs ?? item.runtimeMs)
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0
             && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
@@ -908,10 +934,11 @@ struct DetailView: View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
         let resumeMs = item.watch?.positionMs ?? 0
-        let file = Self.playbackFile(in: detail, positionMs: resumeMs)
-        let durationMs = item.isAudiobook ? (item.runtimeMs ?? file?.durationMs) : (file?.durationMs ?? item.runtimeMs)
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottom) {
@@ -1018,10 +1045,11 @@ struct DetailView: View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
         let resumeMs = item.watch?.positionMs ?? 0
-        let file = Self.playbackFile(in: detail, positionMs: resumeMs)
-        let durationMs = item.isAudiobook ? (item.runtimeMs ?? file?.durationMs) : (file?.durationMs ?? item.runtimeMs)
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
@@ -1074,7 +1102,9 @@ struct DetailView: View {
                             }
                         }
 
-                        watchButton(detail)
+                        if !item.isBook {
+                            watchButton(detail)
+                        }
                     }
                     .padding(.top, 3)
 
@@ -1369,6 +1399,12 @@ struct DetailView: View {
     private func audiobookContents(_ detail: ItemDetail) -> some View {
         let files = detail.files ?? []
         if detail.item.isAudiobook, !files.isEmpty {
+            let resumeMs = detail.item.watch?.positionMs ?? 0
+            let durationMs = detail.item.runtimeMs
+                ?? files.compactMap(\.durationMs).reduce(0, +)
+            let canResume = resumeMs > 3000
+                && (durationMs <= 0 || Double(resumeMs) <= Double(durationMs) * 0.95)
+            let resumeFile = AudiobookTimeline.file(at: resumeMs, in: files)
             DetailBodyFrame {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(files.count > 1 ? "PARTS & CHAPTERS" : "CHAPTERS")
@@ -1398,7 +1434,13 @@ struct DetailView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
 
                                 Button {
-                                    playAudiobook(detail, file: file, startMs: 0)
+                                    let startMs = canResume && resumeFile?.id == file.id
+                                        ? AudiobookTimeline.localPosition(
+                                            globalPositionMs: resumeMs,
+                                            partOffsetMs: file.partOffsetMs ?? 0
+                                        )
+                                        : 0
+                                    playAudiobook(detail, file: file, startMs: startMs)
                                 } label: {
                                     Label("Play part", systemImage: "play.fill")
                                         .lineLimit(1)
@@ -1486,9 +1528,9 @@ struct DetailView: View {
     /// Select the audiobook part containing the item-level resume position.
     /// Movies and single-file books keep the established first-file behavior.
     static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
-        let files = (detail.files ?? []).filter { $0.available != false }
+        let files = detail.files ?? []
         guard detail.item.isAudiobook else { return files.first }
-        return files.last(where: { positionMs >= ($0.partOffsetMs ?? 0) }) ?? files.first
+        return AudiobookTimeline.file(at: positionMs, in: files)
     }
 
     static func itemMetadataBadges(
@@ -1690,7 +1732,7 @@ struct DetailView: View {
                         startOverButton(item: item, file: file, durationMs: durationMs)
                     }
                 }
-                if let file, item.isPlayable {
+                if let file, item.isPlayable, !item.isAudiobook {
                     mobileDownloadButton(detail: detail, file: file, compact: false)
                 }
                 if !item.isBook { watchButton(detail) }
@@ -1716,7 +1758,7 @@ struct DetailView: View {
                         mobileStartOverButton(item: item, file: file, durationMs: durationMs)
                     }
 
-                    if let file, item.isPlayable {
+                    if let file, item.isPlayable, !item.isAudiobook {
                         mobileDownloadButton(detail: detail, file: file, compact: true)
                     }
 
@@ -1917,7 +1959,10 @@ struct DetailView: View {
     ) -> some View {
         let partOffset = item.isAudiobook ? (file.partOffsetMs ?? 0) : 0
         let localDuration = file.durationMs ?? durationMs
-        let localResume = max(0, resumeMs - partOffset)
+        let localResume = AudiobookTimeline.localPosition(
+            globalPositionMs: resumeMs,
+            partOffsetMs: partOffset
+        )
         let action = {
             play = PlayContext(
                 itemId: item.id,

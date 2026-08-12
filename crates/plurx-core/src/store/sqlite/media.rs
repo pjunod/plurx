@@ -141,19 +141,26 @@ impl MediaStore for SqliteStore {
         kind: ItemKind,
         title: &str,
         year: Option<i32>,
+        identity_path: Option<&str>,
     ) -> Result<Option<Item>, StoreError> {
         debug_assert!(matches!(kind, ItemKind::Book | ItemKind::Audiobook));
         let kind = kind.as_str().to_owned();
         let title = title.to_owned();
+        let identity_path = identity_path.map(str::to_owned);
         self.with_conn(move |conn| {
             Ok(find_by(
                 conn,
                 &format!(
                     "SELECT {ITEM_COLS} FROM items
                      WHERE library_id = ?1 AND kind = ?2
-                       AND title = ?3 COLLATE NOCASE AND year IS ?4"
+                       AND title = ?3 COLLATE NOCASE AND year IS ?4
+                       AND (?5 IS NULL OR EXISTS (
+                           SELECT 1 FROM files f WHERE f.item_id = items.id
+                             AND (f.path = ?5 OR (
+                               substr(f.path, 1, length(?5)) = ?5
+                               AND substr(f.path, length(?5) + 1, 1) = '/'))))"
                 ),
-                params![library_id, kind, title, year],
+                params![library_id, kind, title, year, identity_path],
             )?)
         })
         .await

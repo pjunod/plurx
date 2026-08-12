@@ -330,6 +330,7 @@ pub trait MediaStore: Send + Sync + 'static {
         kind: ItemKind,
         title: &str,
         year: Option<i32>,
+        identity_path: Option<&str>,
     ) -> Result<Option<Item>, StoreError>;
     async fn find_show(
         &self,

@@ -26,6 +26,7 @@ private struct LayoutFramePreferenceKey: PreferenceKey {
 private struct NativeAPIContractFixture: Decodable {
     let server: ServerInfo
     let itemDetail: ItemDetail
+    let audiobookDetail: ItemDetail
     let page: Page
     let decision: Decision
 }
@@ -259,6 +260,9 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(fixture.server.name, "Contract server")
         XCTAssertEqual(fixture.itemDetail.item.title, "The Contract")
+        XCTAssertTrue(fixture.audiobookDetail.item.isAudiobook)
+        XCTAssertEqual(fixture.audiobookDetail.files?.map(\.partOffsetMs), [0, 60_000, 180_000])
+        XCTAssertEqual(fixture.audiobookDetail.files?.first?.chapters?.first?.title, "Opening")
         XCTAssertEqual(fixture.page.items?.first?.rollup?.leaves, 20)
         XCTAssertEqual(fixture.decision.delivery?.mode, "remux")
         XCTAssertEqual(fixture.decision.deliveredDynamicRange, "dolby_vision")
@@ -2581,6 +2585,11 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(hdrOnly["dvprofile"], "")
         XCTAssertEqual(hdrOnly["dvhls"], "1")
         XCTAssertEqual(hdrOnly["vcodec"], "h264,hevc")
+        XCTAssertEqual(
+            hdrOnly["container"],
+            "mp4,mov,m4v,m4a,m4b,mp3,aac,flac,wav",
+            "supported audiobook sources must stay on AVPlayer's direct range path"
+        )
 
         let dolbyVision = dictionary(Caps.query(
             hevc: true,
@@ -3145,6 +3154,18 @@ final class AppleClientTests: XCTestCase {
             finished: true,
             autoplay: true,
             offline: false
+        ), .findNext)
+        XCTAssertNil(PlayerView.audiobookNaturalEndAction(
+            finished: false,
+            alreadyFinding: false
+        ))
+        XCTAssertNil(PlayerView.audiobookNaturalEndAction(
+            finished: true,
+            alreadyFinding: true
+        ))
+        XCTAssertEqual(PlayerView.audiobookNaturalEndAction(
+            finished: true,
+            alreadyFinding: false
         ), .findNext)
     }
 
@@ -4368,6 +4389,43 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(detail.files?.first?.chapters?.first?.title, "Opening")
         XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 119_999)?.id, 440)
         XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 120_000)?.id, 441)
+    }
+
+    func testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingParts() throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: AppleClientTests.self).url(
+                forResource: "native-api",
+                withExtension: "json"
+            )
+        )
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fixture = try decoder.decode(
+            NativeAPIContractFixture.self,
+            from: Data(contentsOf: fixtureURL)
+        )
+        var files = try XCTUnwrap(fixture.audiobookDetail.files)
+
+        let local = AudiobookTimeline.localPosition(
+            globalPositionMs: 75_000,
+            partOffsetMs: 60_000
+        )
+        XCTAssertEqual(local, 15_000)
+        XCTAssertEqual(
+            AudiobookTimeline.globalPosition(
+                localPositionMs: local,
+                partOffsetMs: 60_000
+            ),
+            75_000
+        )
+
+        files[1].available = false
+        XCTAssertEqual(
+            AudiobookTimeline.nextFile(after: files[0].id, in: files)?.id,
+            files[2].id,
+            "natural end skips an unavailable physical part"
+        )
+        XCTAssertNil(AudiobookTimeline.nextFile(after: files[2].id, in: files))
     }
 
     func testPosterSizesAreOrderedAndMatchTheWebChoices() {

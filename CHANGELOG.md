@@ -10,6 +10,17 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Audiobook resume and multipart progress now stay on one book timeline.**
+  SQLite and Hiqlite clamp audiobook progress against the sum of its parts,
+  natural part ordering keeps `Part 2` before `Part 10`, and author/title
+  directory identity prevents same-titled books by different authors from
+  collapsing together. Apple and Android select a resumed part only while the
+  book is actually resumable, map local player time back to global progress,
+  skip missing parts, and return Start over to the first available part.
+  Native capability reports now direct-play supported audio containers instead
+  of routing them through the video HLS path. Shared server/Apple/Android
+  contract coverage pins ordered offsets, audio facts, and chapters.
+
 - **Web playback no longer waits forever on a starved remux.** Every probed
   remux now prefers copy-video HLS when the browser proves it can accept the
   exact video/audio pair through MediaSource; explicit **Original · one

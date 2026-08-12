@@ -178,6 +178,9 @@ inside one Books library while keeping their actions and metadata honest.
   library cards and details. The web player also provides one cross-part
   scrubber; native scrubbers seek within the current physical part and advance
   automatically at its end.
+- **Audiobook offline packages are not shipped yet.** Native clients hide the
+  existing video-only download action for audiobooks; playback currently needs
+  access to the server even when the source would otherwise direct-play.
 - **No book metadata provider or built-in ebook renderer.** Titles/authors come
   from the file/folder layout and audio facts from the container. The client
   hands an ebook to the browser/platform viewer. DRM-protected books are not
@@ -186,7 +189,9 @@ inside one Books library while keeping their actions and metadata honest.
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters
 are embedded in a file; loose parts still appear as ordered Parts even without
-authored chapter markers.
+authored chapter markers. Source and simulator tests cover direct-play routing,
+resume selection, global progress, Start over, and missing-part advancement;
+the physical Apple/Android device matrix remains a release acceptance step.
 
 ---
 

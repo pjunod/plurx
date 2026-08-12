@@ -9,12 +9,16 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-10): source is v0.2.7, Apple build 48. Native text
+> Status (2026-08-12): source is v0.2.7, Apple build 48. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
 > landed. Build 48 adds first-class audiobook details and playback through the
-> shared audio player and progress path; physical-device acceptance remains
-> pending. Build 46 also emits the Performance II N0 TTFF beacon at the first
+> shared audio player and progress path. Source and simulator coverage verifies
+> audio-container direct-play routing, resume/Start over selection, global
+> progress, and missing-part advancement; physical-device acceptance remains
+> pending. The native scrubber remains local to the current audiobook part and
+> audiobook offline packages are not yet supported. Build 46 also emits the
+> Performance II N0 TTFF beacon at the first
 > advancing online frame, including the live HLS session id when one exists and
 > separating cold starts from resumes; passing real-device ingest remains
 > unclaimed. The default-off `pgs-v1` overlay client

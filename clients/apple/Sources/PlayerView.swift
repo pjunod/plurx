@@ -798,7 +798,10 @@ struct PlayerView: View {
         .onChange(of: optionMenuOpen) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
             let action = itemDurationMs != nil && offlineItem == nil
-                ? PlayerNaturalEndAction.findNext
+                ? Self.audiobookNaturalEndAction(
+                    finished: finished,
+                    alreadyFinding: findingNext
+                )
                 : Self.naturalEndAction(
                     finished: finished,
                     autoplay: model.autoplay,
@@ -918,6 +921,16 @@ struct PlayerView: View {
     ) -> PlayerNaturalEndAction? {
         guard finished else { return nil }
         return autoplay && !offline ? .findNext : .dismiss
+    }
+
+    static func audiobookNaturalEndAction(
+        finished: Bool,
+        alreadyFinding: Bool
+    ) -> PlayerNaturalEndAction? {
+        guard finished, !alreadyFinding else { return nil }
+        // Physical parts are one logical work, so crossing the seam does not
+        // depend on the separate "autoplay next episode" preference.
+        return .findNext
     }
 
     /// The one teardown path for natural completion, manual Close/Menu, and

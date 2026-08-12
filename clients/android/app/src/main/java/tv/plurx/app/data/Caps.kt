@@ -75,8 +75,10 @@ object Caps {
             "device" to Build.MODEL,
             "vcodec" to video.joinToString(","),
             "acodec" to audio.joinToString(","),
-            // ExoPlayer plays these containers natively (MKV/TS included).
-            "container" to "mkv,mp4,webm,mov,ts",
+            // Media3's progressive extractors handle the audiobook containers
+            // too. Leaving them out routes audio-only sources through the
+            // video HLS machinery even when this device can play them raw.
+            "container" to DIRECT_PLAY_CONTAINERS,
             "hdr" to if (hdr) "1" else "0",
         ) + dolbyVision
         Log.i(
@@ -156,6 +158,9 @@ object Caps {
         }
     }
 }
+
+internal const val DIRECT_PLAY_CONTAINERS =
+    "mkv,mp4,webm,mov,ts,m4a,m4b,mp3,aac,flac,ogg,opus,wav"
 
 /**
  * `Display.HdrCapabilities.HDR_TYPE_*`, restated so the pure badge policy can

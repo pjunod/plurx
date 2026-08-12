@@ -115,9 +115,13 @@ impl WatchStore for SqliteStore {
             // number is only a fallback for files ffprobe couldn't time.
             let known: Option<i64> = conn
                 .query_row(
-                    "SELECT duration_ms FROM files
-                     WHERE item_id = ?1 AND duration_ms IS NOT NULL AND duration_ms > 0
-                     ORDER BY duration_ms DESC LIMIT 1",
+                    "SELECT CASE WHEN i.kind = 'audiobook'
+                                 THEN SUM(f.duration_ms)
+                                 ELSE MAX(f.duration_ms) END
+                     FROM items i
+                     JOIN files f ON f.item_id = i.id
+                     WHERE i.id = ?1 AND f.duration_ms IS NOT NULL AND f.duration_ms > 0
+                     GROUP BY i.kind",
                     params![item_id],
                     |row| row.get(0),
                 )
@@ -193,9 +197,13 @@ impl WatchStore for SqliteStore {
         self.with_conn(move |conn| {
             let known: Option<i64> = conn
                 .query_row(
-                    "SELECT duration_ms FROM files
-                     WHERE item_id = ?1 AND duration_ms IS NOT NULL AND duration_ms > 0
-                     ORDER BY duration_ms DESC LIMIT 1",
+                    "SELECT CASE WHEN i.kind = 'audiobook'
+                                 THEN SUM(f.duration_ms)
+                                 ELSE MAX(f.duration_ms) END
+                     FROM items i
+                     JOIN files f ON f.item_id = i.id
+                     WHERE i.id = ?1 AND f.duration_ms IS NOT NULL AND f.duration_ms > 0
+                     GROUP BY i.kind",
                     params![item_id],
                     |row| row.get(0),
                 )

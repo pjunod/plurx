@@ -2664,7 +2664,10 @@ final class PlayerController: ObservableObject {
 
     private func report(_ position: Int) {
         guard position > 0 else { return }
-        let globalPosition = progressOffsetMs + position
+        let globalPosition = AudiobookTimeline.globalPosition(
+            localPositionMs: position,
+            partOffsetMs: progressOffsetMs
+        )
         let duration = itemDurationMs ?? (knownDurationMs > 0 ? knownDurationMs : nil)
         #if os(iOS)
         if let offlineId {

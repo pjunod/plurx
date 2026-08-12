@@ -733,11 +733,9 @@ final class AppModel: ObservableObject {
     /// Continue the next physical file of one logical audiobook timeline.
     func nextAudiobookPart(itemId: Int, after fileId: Int) async -> PlayContext? {
         guard let detail = try? await itemDetail(itemId), detail.item.isAudiobook else { return nil }
-        let files = (detail.files ?? []).filter { $0.available != false }
-        guard let index = files.firstIndex(where: { $0.id == fileId }), files.indices.contains(index + 1) else {
+        guard let next = AudiobookTimeline.nextFile(after: fileId, in: detail.files ?? []) else {
             return nil
         }
-        let next = files[index + 1]
         return PlayContext(
             itemId: itemId,
             fileId: next.id,

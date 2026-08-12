@@ -43,8 +43,11 @@ enum Caps {
         if av1 { vcodec.append("av1") }
         // AVPlayer handles these audio codecs; DTS / TrueHD are deliberately out.
         let acodec = ["aac", "ac3", "eac3", "alac", "mp3"]
-        // Containers AVPlayer will direct-play from a progressive URL.
-        let container = ["mp4", "mov", "m4v"]
+        // Containers AVPlayer will direct-play from a progressive URL. Audio
+        // containers matter here too: omitting M4B made a perfectly playable
+        // audiobook enter the video-oriented HLS copy path and fail before
+        // its first frame-equivalent audio sample on physical devices.
+        let container = ["mp4", "mov", "m4v", "m4a", "m4b", "mp3", "aac", "flac", "wav"]
         let supportsDolbyVision = hevc && displayHDR && dolbyVision
 
         return [

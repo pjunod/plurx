@@ -166,10 +166,11 @@ private fun DetailContent(
     val scope = rememberCoroutineScope()
     var startingEpisodeId by remember(item.id) { mutableStateOf<Long?>(null) }
     val resumeMs = item.watch?.position_ms ?: 0L
-    val best = playbackFile(item, detail.files, resumeMs)
-    val durationMs = if (item.isAudiobook) item.runtime_ms ?: best?.duration_ms else best?.duration_ms ?: item.runtime_ms
+    val resumeFile = playbackFile(item, detail.files, resumeMs)
+    val durationMs = if (item.isAudiobook) item.runtime_ms ?: resumeFile?.duration_ms else resumeFile?.duration_ms ?: item.runtime_ms
     val nearlyDone = durationMs != null && durationMs > 0 && resumeMs > durationMs * 0.95
     val canResume = resumeMs > 3_000 && !nearlyDone
+    val best = playbackFile(item, detail.files, if (canResume) resumeMs else 0L)
     val heroHeight = when (formFactor) {
         FormFactor.Compact -> 230.dp
         FormFactor.Expanded -> 300.dp
@@ -278,7 +279,12 @@ private fun DetailContent(
                     detail.files.forEachIndexed { index, file ->
                         VersionCard(
                             file = file,
-                            showPlay = detail.files.size > 1 && file.available,
+                            showPlay = !item.isBook && detail.files.size > 1 && file.available,
+                            playStartMs = if (item.isAudiobook && canResume && best?.id == file.id) {
+                                audiobookLocalPosition(resumeMs, file.part_offset_ms)
+                            } else {
+                                0L
+                            },
                             onPlay = { startMs ->
                                 onPlay(
                                     item.id,
@@ -474,9 +480,13 @@ private fun Actions(
     ) { /* denial is benign; Android still exposes foreground work */ }
     var changingWatch by remember { mutableStateOf(false) }
     var downloadError by remember(item.id) { mutableStateOf<String?>(null) }
-    val playable = playbackFile(item, files, resumeMs)
+    val playable = playbackFile(item, files, if (canResume) resumeMs else 0L)
     val startOverFile = if (item.isAudiobook) files.firstOrNull { it.available } ?: playable else playable
-    val localResume = if (item.isAudiobook) (resumeMs - (playable?.part_offset_ms ?: 0)).coerceAtLeast(0) else resumeMs
+    val localResume = if (item.isAudiobook) {
+        audiobookLocalPosition(resumeMs, playable?.part_offset_ms ?: 0L)
+    } else {
+        resumeMs
+    }
     val offline = playable?.let { file -> offlineRecords.firstOrNull {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
             it.fileId == file.id
@@ -537,7 +547,10 @@ private fun Actions(
                     }
                 }
             }
-            if (OfflineDownloads.canUse(context)) {
+            // The current package builder prices and encodes a video ladder.
+            // Audio-only offline packages need their own contract; do not offer
+            // a button that reserves video-sized quota and then cannot finish.
+            if (!item.isAudiobook && OfflineDownloads.canUse(context)) {
                 item {
                     TvOutlinedButton(
                         enabled = offline?.isPlayable != true,
@@ -647,6 +660,7 @@ internal fun DetailPrimaryActionButton(
 private fun VersionCard(
     file: MediaFileDto,
     showPlay: Boolean,
+    playStartMs: Long,
     onPlay: (Long) -> Unit,
     label: String?,
     showChapters: Boolean,
@@ -659,7 +673,7 @@ private fun VersionCard(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label ?: file.filename, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
             if (!file.available) SpecChip("Missing", MaterialTheme.colorScheme.error)
-            if (showPlay) TvOutlinedButton(onClick = { onPlay(0L) }) { Text("Play") }
+            if (showPlay) TvOutlinedButton(onClick = { onPlay(playStartMs) }) { Text("Play") }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(detailMediaFacts(file), key = { it.kind }) { fact ->
@@ -760,11 +774,14 @@ private fun fileSpecLine(file: MediaFileDto): String {
     return bits.joinToString("   ")
 }
 
-private fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
+internal fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
     val available = files.filter { it.available }
     if (!item.isAudiobook) return available.firstOrNull()
     return available.lastOrNull { positionMs >= it.part_offset_ms } ?: available.firstOrNull()
 }
+
+internal fun audiobookLocalPosition(globalPositionMs: Long, partOffsetMs: Long): Long =
+    (globalPositionMs - partOffsetMs).coerceAtLeast(0L)
 
 private fun metaLine(item: Item, durationMs: Long?): String = buildList {
     if (item.kind == "episode") {

@@ -1,7 +1,9 @@
 //! Browsing: library grids, item detail, home hubs, and search. Every item is
 //! annotated with the requesting user's watch state.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path as FsPath;
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -15,6 +17,54 @@ use crate::state::AppState;
 
 const DEFAULT_LIMIT: i64 = 60;
 const MAX_LIMIT: i64 = 200;
+
+/// Compare paths the way a listener reads numbered parts: Part 2 precedes
+/// Part 10 even though lexical ordering puts `10` first. Non-numeric runs are
+/// compared case-insensitively, with the original spelling as a stable tie.
+fn natural_path_cmp(left: &FsPath, right: &FsPath) -> Ordering {
+    fn chunks(value: &str) -> Vec<(&str, bool)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut digit = value.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        for (index, byte) in value.bytes().enumerate().skip(1) {
+            let next = byte.is_ascii_digit();
+            if next != digit {
+                out.push((&value[start..index], digit));
+                start = index;
+                digit = next;
+            }
+        }
+        if start < value.len() {
+            out.push((&value[start..], digit));
+        }
+        out
+    }
+
+    let left_text = left.to_string_lossy();
+    let right_text = right.to_string_lossy();
+    let left_chunks = chunks(&left_text);
+    let right_chunks = chunks(&right_text);
+    for ((left, left_digit), (right, right_digit)) in left_chunks.iter().zip(&right_chunks) {
+        let order = if *left_digit && *right_digit {
+            let left_trimmed = left.trim_start_matches('0');
+            let right_trimmed = right.trim_start_matches('0');
+            left_trimmed
+                .len()
+                .cmp(&right_trimmed.len())
+                .then_with(|| left_trimmed.cmp(right_trimmed))
+                .then_with(|| left.len().cmp(&right.len()))
+        } else {
+            left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    left_chunks
+        .len()
+        .cmp(&right_chunks.len())
+        .then_with(|| left_text.cmp(&right_text))
+}
 
 fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
@@ -246,7 +296,7 @@ pub async fn item_detail(
         // Generic media versions sort best-quality first. Audiobook files are
         // sequential parts, not alternate versions, so their path order is
         // the playback order.
-        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files.sort_by(|left, right| natural_path_cmp(&left.path, &right.path));
     }
 
     // Check each file actually resolves on disk right now, so the client can

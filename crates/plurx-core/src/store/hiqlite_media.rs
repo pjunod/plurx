@@ -674,6 +674,7 @@ impl MediaStore for HiqliteAuthStore {
         kind: ItemKind,
         title: &str,
         year: Option<i32>,
+        identity_path: Option<&str>,
     ) -> Result<Option<Item>, StoreError> {
         debug_assert!(matches!(kind, ItemKind::Book | ItemKind::Audiobook));
         one_item(
@@ -681,9 +682,13 @@ impl MediaStore for HiqliteAuthStore {
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
-                         AND kind = $2 AND title = $3 COLLATE NOCASE AND year IS $4"
+                         AND kind = $2 AND title = $3 COLLATE NOCASE AND year IS $4 \
+                         AND ($5 IS NULL OR EXISTS (SELECT 1 FROM files f \
+                           WHERE f.item_id = items.id AND (f.path = $5 OR ( \
+                             substr(f.path, 1, length($5)) = $5 AND \
+                             substr(f.path, length($5) + 1, 1) = '/'))))"
                     ),
-                    params!(library_id, kind.as_str(), title, year),
+                    params!(library_id, kind.as_str(), title, year, identity_path),
                 )
                 .await
                 .map_err(database_error)?,
@@ -1879,8 +1884,10 @@ impl WatchStore for HiqliteAuthStore {
         let at = recorded_at.unwrap_or(now).clamp(0, now);
         let sql = "WITH input(duration_ms) AS ( \
                        SELECT COALESCE( \
-                           (SELECT MAX(duration_ms) FROM files \
-                            WHERE item_id = $1 AND duration_ms > 0), \
+                           (SELECT CASE WHEN i.kind = 'audiobook' \
+                                        THEN SUM(f.duration_ms) ELSE MAX(f.duration_ms) END \
+                            FROM items i JOIN files f ON f.item_id = i.id \
+                            WHERE i.id = $1 AND f.duration_ms > 0 GROUP BY i.kind), \
                            CASE WHEN $2 > 0 THEN $2 END) \
                    ), normalized(position_ms, duration_ms) AS ( \
                        SELECT CASE WHEN duration_ms IS NULL THEN MAX($3, 0) \
@@ -1938,8 +1945,10 @@ impl WatchStore for HiqliteAuthStore {
     ) -> Result<Option<WatchState>, StoreError> {
         let sql = "WITH input(duration_ms) AS ( \
                        SELECT COALESCE( \
-                           (SELECT MAX(duration_ms) FROM files \
-                            WHERE item_id = $1 AND duration_ms > 0), \
+                           (SELECT CASE WHEN i.kind = 'audiobook' \
+                                        THEN SUM(f.duration_ms) ELSE MAX(f.duration_ms) END \
+                            FROM items i JOIN files f ON f.item_id = i.id \
+                            WHERE i.id = $1 AND f.duration_ms > 0 GROUP BY i.kind), \
                            CASE WHEN $2 > 0 THEN $2 END) \
                    ), normalized(position_ms, duration_ms) AS ( \
                        SELECT CASE WHEN duration_ms IS NULL THEN MAX($3, 0) \

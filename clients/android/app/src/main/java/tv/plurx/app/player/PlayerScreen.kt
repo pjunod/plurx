@@ -159,7 +159,8 @@ private data class Plan(
     val itemDurationMs: Long?,
     val nextAudiobookPartId: Long?,
 ) : PlanLike {
-    fun globalPosition(localPositionMs: Long): Long = progressOffsetMs + localPositionMs
+    fun globalPosition(localPositionMs: Long): Long =
+        audiobookGlobalPosition(localPositionMs, progressOffsetMs)
     val progressDurationMs: Long get() = itemDurationMs ?: durationMs
 }
 
@@ -206,8 +207,7 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         progressOffsetMs = if (detail.item.isAudiobook) file?.part_offset_ms ?: 0L else 0L,
         itemDurationMs = if (detail.item.isAudiobook) detail.item.runtime_ms else null,
         nextAudiobookPartId = if (detail.item.isAudiobook) {
-            val index = detail.files.indexOfFirst { it.id == fileId }
-            if (index >= 0) detail.files.drop(index + 1).firstOrNull { it.available }?.id else null
+            nextAudiobookPartId(detail.files, fileId)
         } else null,
     )
 } catch (cancelled: CancellationException) {
@@ -216,6 +216,14 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
     throw cancelled
 } catch (_: Exception) {
     null
+}
+
+internal fun audiobookGlobalPosition(localPositionMs: Long, partOffsetMs: Long): Long =
+    partOffsetMs.coerceAtLeast(0L) + localPositionMs.coerceAtLeast(0L)
+
+internal fun nextAudiobookPartId(files: List<MediaFileDto>, currentFileId: Long): Long? {
+    val index = files.indexOfFirst { it.id == currentFileId }
+    return if (index >= 0) files.drop(index + 1).firstOrNull { it.available }?.id else null
 }
 
 internal fun playerSubtitle(item: tv.plurx.app.data.Item): String? = buildList {

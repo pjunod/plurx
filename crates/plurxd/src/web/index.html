@@ -3992,7 +3992,9 @@ function specBadges(f){
   const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${mediaIcon('video')}${esc(c)}</span>`);
   if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
   const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${mediaIcon('dynamic')}${esc(h.text)}</span>`);
-  const au=premiumAudio(f)||((f.audio_streams||[])[0]&&codecLabel(f.audio_streams[0].codec));
+  // Keep the established movie badge policy (only premium audio) while giving
+  // an audio-only source a useful primary-codec badge.
+  const au=premiumAudio(f)||(!f.video_codec&&(f.audio_streams||[])[0]&&codecLabel(f.audio_streams[0].codec));
   if(au) b.push(`<span class="vbadge audio">${mediaIcon('audio')}${esc(au)}</span>`);
   return b.join("");
 }
@@ -4031,7 +4033,7 @@ function specBlock(f){
   const aud=(f.audio_streams||[]).map(audioLabel).filter(Boolean).join("  /  ")||"—";
   const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size),fmtDur(f.duration_ms)].filter(Boolean).join(" · ");
   return `<dl class="specs">
-    ${vid?`<dt>Video</dt><dd>${esc(vid)}</dd>`:''}
+    ${vid||!(f.audio_streams||[]).length?`<dt>Video</dt><dd>${esc(vid||"—")}</dd>`:''}
     <dt>Audio</dt><dd>${esc(aud)}</dd>
     <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
 }
