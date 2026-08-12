@@ -12,10 +12,10 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `48` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `49` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 48 adds first-class audiobook details and
+> same regression suite. Build 49 adds first-class audiobook details and
 > playback through the shared audio player and progress path; physical-device
 > acceptance remains pending. Build 46 adds a one-shot, session-joined TTFF
 > beacon
