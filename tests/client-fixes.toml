@@ -132,3 +132,11 @@ source = "clients/apple/Sources/DetailView.swift"
 source_anchor = "enum AudiobookTimeline"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingParts"
+
+[[fixes]]
+id = "apple.build-49-documentation-alignment"
+commits = ["c52c38b7"]
+source = "clients/apple/README.md"
+source_anchor = "build `49`"
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"
