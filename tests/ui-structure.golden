@@ -823,7 +823,6 @@ catalog|item@1280x860|dom|div.px-pop > div#profilemenu.amenu|1
 catalog|item@1280x860|dom|div.px-pop > div#sizemenu.amenu|1
 catalog|item@1280x860|dom|div.px-pop > div#thememenu.amenu|1
 catalog|item@1280x860|dom|div.px-user > div.px-pop|1
-catalog|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|item@1280x860|dom|div.version > dl.specs|1
@@ -838,10 +837,9 @@ catalog|item@1280x860|dom|nav.px-nav[aria-label=*] > a|3
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|item@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-catalog|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
+catalog|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|item@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -937,7 +935,6 @@ catalog|item@390x780|dom|div.px-pop > div#profilemenu.amenu|1
 catalog|item@390x780|dom|div.px-pop > div#sizemenu.amenu|1
 catalog|item@390x780|dom|div.px-pop > div#thememenu.amenu|1
 catalog|item@390x780|dom|div.px-user > div.px-pop|1
-catalog|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|item@390x780|dom|div.version > dl.specs|1
@@ -952,10 +949,9 @@ catalog|item@390x780|dom|nav.px-nav[aria-label=*] > a|3
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|item@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-catalog|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
+catalog|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|item@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -1355,7 +1351,6 @@ catalog|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@1280x860|dom|div.row > button.pbtn[text]|1
 catalog|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
 catalog|player@1280x860|dom|div.statshd > span[text]|1
-catalog|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|player@1280x860|dom|div.version > dl.specs|1
@@ -1370,10 +1365,10 @@ catalog|player@1280x860|dom|nav.px-nav[aria-label=*] > a|3
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|player@1280x860|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+catalog|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-catalog|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
+catalog|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|player@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -1514,7 +1509,6 @@ catalog|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@390x780|dom|div.row > button.pbtn[text]|1
 catalog|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
 catalog|player@390x780|dom|div.statshd > span[text]|1
-catalog|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 catalog|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 catalog|player@390x780|dom|div.version > dl.specs|1
@@ -1529,10 +1523,10 @@ catalog|player@390x780|dom|nav.px-nav[aria-label=*] > a|3
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > a.px-tab|2
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[aria-expanded=false aria-controls=* type=button]|1
 catalog|player@390x780|dom|nav.px-tabs[aria-label=*] > button.px-tab[type=button]|1
-catalog|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+catalog|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 catalog|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-catalog|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
+catalog|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 catalog|player@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
@@ -2664,7 +2658,6 @@ classic|item@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
 classic|item@1280x860|dom|div.phnav > div.crumbs|1
 classic|item@1280x860|dom|div.poster > div.art.ph[text]|1
 classic|item@1280x860|dom|div.topctl > div|4
-classic|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 classic|item@1280x860|dom|div.version > dl.specs|1
@@ -2681,10 +2674,9 @@ classic|item@1280x860|dom|header.top > span.spacer|1
 classic|item@1280x860|dom|main#main > div.hero|1
 classic|item@1280x860|dom|nav > a.active[text]|1
 classic|item@1280x860|dom|nav > a[text]|2
-classic|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-classic|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
+classic|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
 classic|item@1280x860|dom|svg[aria-hidden=true] > rect|4
 classic|item@1280x860|focus|000|a.logo "cinema"
 classic|item@1280x860|focus|001|a.active "home"
@@ -2746,7 +2738,6 @@ classic|item@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
 classic|item@390x780|dom|div.phnav > div.crumbs|1
 classic|item@390x780|dom|div.poster > div.art.ph[text]|1
 classic|item@390x780|dom|div.topctl > div|4
-classic|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 classic|item@390x780|dom|div.version > dl.specs|1
@@ -2763,10 +2754,9 @@ classic|item@390x780|dom|header.top > span.spacer|1
 classic|item@390x780|dom|main#main > div.hero|1
 classic|item@390x780|dom|nav > a.active[text]|1
 classic|item@390x780|dom|nav > a[text]|2
-classic|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-classic|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
+classic|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
 classic|item@390x780|dom|svg[aria-hidden=true] > rect|4
 classic|item@390x780|focus|000|a.logo "cinema"
 classic|item@390x780|focus|001|a.active "home"
@@ -3042,7 +3032,6 @@ classic|player@1280x860|dom|div.row > button.pbtn[text]|1
 classic|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
 classic|player@1280x860|dom|div.statshd > span[text]|1
 classic|player@1280x860|dom|div.topctl > div|4
-classic|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 classic|player@1280x860|dom|div.version > dl.specs|1
@@ -3059,10 +3048,10 @@ classic|player@1280x860|dom|header.top > span.spacer|1
 classic|player@1280x860|dom|main#main > div.hero|1
 classic|player@1280x860|dom|nav > a.active[text]|1
 classic|player@1280x860|dom|nav > a[text]|2
-classic|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+classic|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-classic|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
+classic|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
 classic|player@1280x860|dom|svg[aria-hidden=true] > rect|4
 classic|player@1280x860|focus|000|button.ghost.sm "Mark watched"
 classic|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -3172,7 +3161,6 @@ classic|player@390x780|dom|div.row > button.pbtn[text]|1
 classic|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
 classic|player@390x780|dom|div.statshd > span[text]|1
 classic|player@390x780|dom|div.topctl > div|4
-classic|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 classic|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 classic|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 classic|player@390x780|dom|div.version > dl.specs|1
@@ -3189,10 +3177,10 @@ classic|player@390x780|dom|header.top > span.spacer|1
 classic|player@390x780|dom|main#main > div.hero|1
 classic|player@390x780|dom|nav > a.active[text]|1
 classic|player@390x780|dom|nav > a[text]|2
-classic|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+classic|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-classic|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
+classic|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
 classic|player@390x780|dom|svg[aria-hidden=true] > rect|4
 classic|player@390x780|focus|000|button.ghost.sm "Mark watched"
 classic|player@390x780|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -4287,7 +4275,6 @@ theater|item@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
 theater|item@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
 theater|item@1280x860|dom|div.th-pop > div#thememenu.amenu|1
 theater|item@1280x860|dom|div.th-rest > div.version|1
-theater|item@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 theater|item@1280x860|dom|div.version > dl.specs|1
@@ -4305,10 +4292,9 @@ theater|item@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|item@1280x860|dom|main#main > div.th-rest|1
 theater|item@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|item@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|item@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|3
+theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
 theater|item@1280x860|dom|svg[aria-hidden=true] > rect|4
 theater|item@1280x860|focus|000|a.logo "cinema"
 theater|item@1280x860|focus|001|a "Home"
@@ -4373,7 +4359,6 @@ theater|item@390x780|dom|div.th-pop > div#profilemenu.amenu|1
 theater|item@390x780|dom|div.th-pop > div#sizemenu.amenu|1
 theater|item@390x780|dom|div.th-pop > div#thememenu.amenu|1
 theater|item@390x780|dom|div.th-rest > div.version|1
-theater|item@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 theater|item@390x780|dom|div.version > dl.specs|1
@@ -4391,10 +4376,9 @@ theater|item@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|item@390x780|dom|main#main > div.th-rest|1
 theater|item@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|item@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|item@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
-theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|3
+theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
 theater|item@390x780|dom|svg[aria-hidden=true] > rect|4
 theater|item@390x780|focus|000|a.logo "cinema"
 theater|item@390x780|focus|001|input#q.search "Search cinema"
@@ -4681,7 +4665,6 @@ theater|player@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
 theater|player@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
 theater|player@1280x860|dom|div.th-pop > div#thememenu.amenu|1
 theater|player@1280x860|dom|div.th-rest > div.version|1
-theater|player@1280x860|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
 theater|player@1280x860|dom|div.version > dl.specs|1
@@ -4699,10 +4682,10 @@ theater|player@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|player@1280x860|dom|main#main > div.th-rest|1
 theater|player@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|player@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+theater|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-theater|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|5
+theater|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
 theater|player@1280x860|dom|svg[aria-hidden=true] > rect|4
 theater|player@1280x860|focus|000|button.ghost.sm "Mark watched"
 theater|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
@@ -4815,7 +4798,6 @@ theater|player@390x780|dom|div.th-pop > div#profilemenu.amenu|1
 theater|player@390x780|dom|div.th-pop > div#sizemenu.amenu|1
 theater|player@390x780|dom|div.th-pop > div#thememenu.amenu|1
 theater|player@390x780|dom|div.th-rest > div.version|1
-theater|player@390x780|dom|div.vbadges > span.audio.vbadge[text]|1
 theater|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 theater|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
 theater|player@390x780|dom|div.version > dl.specs|1
@@ -4833,10 +4815,10 @@ theater|player@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
 theater|player@390x780|dom|main#main > div.th-rest|1
 theater|player@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|player@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
-theater|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+theater|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
-theater|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|5
+theater|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
 theater|player@390x780|dom|svg[aria-hidden=true] > rect|4
 theater|player@390x780|focus|000|button.ghost.sm "Mark watched"
 theater|player@390x780|focus|001|a "Home"
