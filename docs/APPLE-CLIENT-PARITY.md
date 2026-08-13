@@ -9,17 +9,17 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-14): source is v0.2.7, Apple build 58. Native text
+> Status (2026-08-14): source is v0.2.7, Apple build 59. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 58 distinguishes a recognized `pgs-v1` Overlay from the
+> landed. Build 59 keeps every supported-but-unavailable iOS PiP state tappable
+> long enough to explain it, including a detached AVKit controller and the in-
+> app-only PGS overlay; actual PiP start and return remain unverified on physical
+> iPhone and iPad hardware. Build 58 distinguishes a recognized `pgs-v1` Overlay
+> from the
 > Burn-in fallback in the subtitle menu and ships the decidable physical-iPad
 > run in
 > [APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md).
-> The iOS PiP control keeps every supported-but-unavailable state tappable long
-> enough to explain it, including a detached AVKit controller and the in-app-
-> only PGS overlay; actual PiP start and return remain unverified on physical
-> iPhone and iPad hardware.
 > Build 57 requires Select to engage tvOS progress scrubbing, leaving
 > left/right free to cross the transport row without a seek. Build 56 restores
 > bidirectional tvOS focus between show/season header actions and their non-empty
@@ -47,7 +47,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 58 has not reached
+> resolved status. Repository evidence still says build 59 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
