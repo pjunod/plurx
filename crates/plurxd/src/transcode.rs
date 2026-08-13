@@ -6259,15 +6259,28 @@ mod tests {
             .apply_rate_control_settings(RateMode::Bitrate, None)
             .await
             .expect("replicated write");
+        assert_eq!(
+            RATE_CONTROL_REFRESH,
+            Duration::from_secs(2),
+            "the replicated hot-path snapshot contract is a literal two seconds"
+        );
         let refresh = tokio::spawn(Arc::clone(&peer).rate_control_refresh_loop());
-        tokio::task::yield_now().await;
-        tokio::time::advance(RATE_CONTROL_REFRESH).await;
+        // Sleeping yields until the worker has constructed its interval and
+        // both tasks reach the real first deadline. Subsequent yields let the
+        // refresh finish without weakening the two-second bound.
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(RATE_CONTROL_REFRESH).await;
         for _ in 0..100 {
+            tokio::task::yield_now().await;
             if peer.effective_rate_control(Encoder::Software) == EffectiveRateControl::Vbr {
                 break;
             }
-            tokio::task::yield_now().await;
         }
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            RATE_CONTROL_REFRESH,
+            "the peer snapshot must refresh within the advertised two-second period"
+        );
         assert_eq!(
             peer.effective_rate_control(Encoder::Software),
             EffectiveRateControl::Vbr,
