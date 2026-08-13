@@ -12,10 +12,11 @@ use crate::error::StoreError;
 use crate::store::OfflinePackageStore;
 
 const PACKAGE_COLS: &str = "id, request_id, user_id, file_id, node_id, source_path, \
-    source_size, source_mtime, recipe_hash, target_height, audio_index, audio_offset_ms, \
+    source_size, source_mtime, recipe_hash, effective_rate_control, target_height, audio_index, audio_offset_ms, \
     output_width, output_height, subtitle_index, subtitle_language, subtitle_mode, state, phase, progress_millis, estimated_bytes, \
     reserved_bytes, actual_bytes, duration_ms, error_code, error_message, created_at, updated_at, \
     last_access_at, expires_at";
+const PACKAGE_COL_COUNT: usize = 31;
 
 fn package_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfflinePackage> {
     Ok(OfflinePackage {
@@ -28,27 +29,28 @@ fn package_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfflinePackage>
         source_size: row.get(6)?,
         source_mtime: row.get(7)?,
         recipe_hash: row.get(8)?,
-        target_height: row.get(9)?,
-        audio_index: row.get(10)?,
-        audio_offset_ms: row.get(11)?,
-        output_width: row.get(12)?,
-        output_height: row.get(13)?,
-        subtitle_index: row.get(14)?,
-        subtitle_language: row.get(15)?,
-        subtitle_mode: row.get(16)?,
-        state: row.get(17)?,
-        phase: row.get(18)?,
-        progress_millis: row.get(19)?,
-        estimated_bytes: row.get(20)?,
-        reserved_bytes: row.get(21)?,
-        actual_bytes: row.get(22)?,
-        duration_ms: row.get(23)?,
-        error_code: row.get(24)?,
-        error_message: row.get(25)?,
-        created_at: row.get(26)?,
-        updated_at: row.get(27)?,
-        last_access_at: row.get(28)?,
-        expires_at: row.get(29)?,
+        effective_rate_control: row.get(9)?,
+        target_height: row.get(10)?,
+        audio_index: row.get(11)?,
+        audio_offset_ms: row.get(12)?,
+        output_width: row.get(13)?,
+        output_height: row.get(14)?,
+        subtitle_index: row.get(15)?,
+        subtitle_language: row.get(16)?,
+        subtitle_mode: row.get(17)?,
+        state: row.get(18)?,
+        phase: row.get(19)?,
+        progress_millis: row.get(20)?,
+        estimated_bytes: row.get(21)?,
+        reserved_bytes: row.get(22)?,
+        actual_bytes: row.get(23)?,
+        duration_ms: row.get(24)?,
+        error_code: row.get(25)?,
+        error_message: row.get(26)?,
+        created_at: row.get(27)?,
+        updated_at: row.get(28)?,
+        last_access_at: row.get(29)?,
+        expires_at: row.get(30)?,
     })
 }
 
@@ -93,6 +95,14 @@ impl OfflinePackageStore for SqliteStore {
         max_bytes_per_user: i64,
         max_bytes_global: i64,
     ) -> Result<OfflineCreateOutcome, StoreError> {
+        if crate::transcode::EffectiveRateControl::parse_snapshot(&package.effective_rate_control)
+            .is_none()
+        {
+            return Err(StoreError::Database(format!(
+                "invalid offline effective rate control {:?}",
+                package.effective_rate_control
+            )));
+        }
         let requested = package.clone();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
@@ -161,13 +171,13 @@ impl OfflinePackageStore for SqliteStore {
             tx.execute(
                 "INSERT INTO offline_packages (
                     id, request_id, user_id, file_id, node_id, source_path,
-                    source_size, source_mtime, target_height, audio_index,
+                    source_size, source_mtime, effective_rate_control, target_height, audio_index,
                     audio_offset_ms, output_width, output_height, subtitle_index,
                     subtitle_language, subtitle_mode, state, phase,
                     estimated_bytes, reserved_bytes, expires_at
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, 'queued', 'waiting_for_encoder', ?17, ?18, ?19
+                    ?14, ?15, ?16, ?17, 'queued', 'waiting_for_encoder', ?18, ?19, ?20
                  )",
                 params![
                     requested.id,
@@ -178,6 +188,7 @@ impl OfflinePackageStore for SqliteStore {
                     requested.source_path,
                     requested.source_size,
                     requested.source_mtime,
+                    requested.effective_rate_control,
                     requested.target_height,
                     requested.audio_index,
                     requested.audio_offset_ms,
@@ -294,7 +305,7 @@ impl OfflinePackageStore for SqliteStore {
                 .query_map(params![node, now, active_since, limit], |row| {
                     Ok(OfflineActivityPackage {
                         package: package_from_row(row)?,
-                        lease_active: row.get(30)?,
+                        lease_active: row.get(PACKAGE_COL_COUNT)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -665,8 +676,14 @@ impl OfflinePackageStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use super::{PACKAGE_COLS, PACKAGE_COL_COUNT};
     use crate::domain::{NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome};
     use crate::store::{OfflinePackageStore, SqliteStore, UserStore};
+
+    #[test]
+    fn package_column_count_tracks_the_positional_mapper() {
+        assert_eq!(PACKAGE_COLS.split(", ").count(), PACKAGE_COL_COUNT);
+    }
 
     fn request_for(request_id: &str, user_id: i64) -> NewOfflinePackage {
         NewOfflinePackage {
@@ -678,6 +695,7 @@ mod tests {
             source_path: "/media/movie.mkv".to_owned(),
             source_size: 1_000,
             source_mtime: 7,
+            effective_rate_control: "vbr".to_owned(),
             target_height: 720,
             output_width: Some(1280),
             output_height: Some(720),
@@ -705,14 +723,17 @@ mod tests {
     #[tokio::test]
     async fn create_is_idempotent_and_detects_choice_conflicts() {
         let store = store().await;
-        let requested = request("one");
-        assert!(matches!(
-            store
-                .create_offline_package(&requested, 10, 1_000, 2_000)
-                .await
-                .expect("create"),
-            OfflineCreateOutcome::Created(_)
-        ));
+        let mut requested = request("one");
+        requested.effective_rate_control = "qvbr:21".to_owned();
+        let created = match store
+            .create_offline_package(&requested, 10, 1_000, 2_000)
+            .await
+            .expect("create")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(created.effective_rate_control, "qvbr:21");
         assert!(matches!(
             store
                 .create_offline_package(&requested, 10, 1_000, 2_000)
@@ -721,15 +742,27 @@ mod tests {
             OfflineCreateOutcome::Existing(_)
         ));
 
-        let mut changed = requested;
-        changed.target_height = 1080;
+        let mut changed = requested.clone();
+        changed.effective_rate_control = "vbr".to_owned();
+        let OfflineCreateOutcome::Existing(existing) = store
+            .create_offline_package(&changed, 10, 1_000, 2_000)
+            .await
+            .expect("server-policy retry")
+        else {
+            panic!("a server-derived rate-control change broke request idempotency");
+        };
         assert_eq!(
-            store
-                .create_offline_package(&changed, 10, 1_000, 2_000)
-                .await
-                .expect("conflict"),
-            OfflineCreateOutcome::RequestConflict
+            existing.effective_rate_control, "qvbr:21",
+            "the first accepted request owns the immutable package snapshot"
         );
+
+        let mut invalid = request("invalid");
+        invalid.effective_rate_control = "qvbr:256".to_owned();
+        let error = store
+            .create_offline_package(&invalid, 10, 1_000, 2_000)
+            .await
+            .expect_err("out-of-range snapshots must fail before insertion");
+        assert!(error.to_string().contains("invalid offline effective"));
     }
 
     #[tokio::test]
@@ -898,6 +931,7 @@ mod tests {
             .expect("queued package");
         assert_eq!(claimed.id, package.id);
         assert_eq!(claimed.state, "preparing");
+        assert_eq!(claimed.effective_rate_control, "vbr");
         store
             .update_offline_progress(&package.id, "transcoding", 600)
             .await

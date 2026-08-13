@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS offline_packages (
     source_size       INTEGER NOT NULL,
     source_mtime      INTEGER NOT NULL,
     recipe_hash       TEXT,
+    effective_rate_control TEXT NOT NULL DEFAULT 'vbr'
+        CHECK (effective_rate_control = 'vbr'
+               OR (effective_rate_control GLOB 'qvbr:[0-9]*'
+                   AND substr(effective_rate_control, 6) NOT GLOB '*[^0-9]*'
+                   AND length(substr(effective_rate_control, 6)) BETWEEN 1 AND 3
+                   AND CAST(substr(effective_rate_control, 6) AS INTEGER) BETWEEN 0 AND 255
+                   AND printf('%d', CAST(substr(effective_rate_control, 6) AS INTEGER)) =
+                       substr(effective_rate_control, 6))),
     target_height     INTEGER NOT NULL,
     output_width      INTEGER,
     output_height     INTEGER,
@@ -201,7 +209,8 @@ pub(super) async fn local_durable_digest(client: &TimedClient) -> Result<String,
         offline_packages: rows(
             client,
             "SELECT json_array(id, request_id, user_id, file_id, node_id, source_path, \
-                    source_size, source_mtime, recipe_hash, target_height, output_width, \
+                    source_size, source_mtime, recipe_hash, effective_rate_control, \
+                    target_height, output_width, \
                     output_height, audio_index, audio_offset_ms, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
@@ -935,6 +944,7 @@ struct OfflinePackageRow {
     source_size: i64,
     source_mtime: i64,
     recipe_hash: Option<String>,
+    effective_rate_control: String,
     target_height: i64,
     audio_index: Option<i64>,
     audio_offset_ms: i64,
@@ -970,6 +980,7 @@ impl From<&mut Row<'_>> for OfflinePackageRow {
             source_size: row.get("source_size"),
             source_mtime: row.get("source_mtime"),
             recipe_hash: row.get("recipe_hash"),
+            effective_rate_control: row.get("effective_rate_control"),
             target_height: row.get("target_height"),
             audio_index: row.get("audio_index"),
             audio_offset_ms: row.get("audio_offset_ms"),
@@ -1007,6 +1018,7 @@ impl From<OfflinePackageRow> for OfflinePackage {
             source_size: row.source_size,
             source_mtime: row.source_mtime,
             recipe_hash: row.recipe_hash,
+            effective_rate_control: row.effective_rate_control,
             target_height: row.target_height,
             audio_index: row.audio_index,
             audio_offset_ms: row.audio_offset_ms,
@@ -1033,7 +1045,7 @@ impl From<OfflinePackageRow> for OfflinePackage {
 }
 
 const PACKAGE_COLS: &str = "id, request_id, user_id, file_id, node_id, source_path, \
-    source_size, source_mtime, recipe_hash, target_height, audio_index, audio_offset_ms, \
+    source_size, source_mtime, recipe_hash, effective_rate_control, target_height, audio_index, audio_offset_ms, \
     output_width, output_height, subtitle_index, subtitle_language, subtitle_mode, state, \
     phase, progress_millis, estimated_bytes, reserved_bytes, actual_bytes, duration_ms, \
     error_code, error_message, created_at, updated_at, last_access_at, expires_at";
@@ -1174,29 +1186,39 @@ impl OfflinePackageStore for HiqliteAuthStore {
         max_bytes_per_user: i64,
         max_bytes_global: i64,
     ) -> Result<OfflineCreateOutcome, StoreError> {
+        if crate::transcode::EffectiveRateControl::parse_snapshot(&package.effective_rate_control)
+            .is_none()
+        {
+            return Err(StoreError::Database(format!(
+                "invalid offline effective rate control {:?}",
+                package.effective_rate_control
+            )));
+        }
         let now = self.now()?;
         let sql = "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
-                    source_path, source_size, source_mtime, target_height, audio_index, \
+                    source_path, source_size, source_mtime, effective_rate_control, \
+                    target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, created_at, updated_at, last_access_at, \
                     expires_at) \
                  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                    $15, $16, 'queued', 'waiting_for_encoder', 0, $17, $18, $19, $19, $19, $20 \
+                    $15, $16, $17, 'queued', 'waiting_for_encoder', 0, $18, $19, $20, $20, $20, $21 \
                  WHERE NOT EXISTS (SELECT 1 FROM offline_packages \
                      WHERE user_id = $3 AND request_id = $2) \
-                   AND $21 > 0 \
-                   AND (SELECT COUNT(*) FROM offline_packages WHERE user_id = $3) < $21 \
-                   AND $18 >= 0 AND $22 >= $18 \
+                   AND $22 > 0 \
+                   AND (SELECT COUNT(*) FROM offline_packages WHERE user_id = $3) < $22 \
+                   AND $19 >= 0 AND $23 >= $19 \
                    AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE user_id = $3 \
-                       AND state IN ('queued', 'preparing', 'ready')) <= $22 - $18 \
-                   AND $23 >= $18 \
+                       AND state IN ('queued', 'preparing', 'ready')) <= $23 - $19 \
+                   AND $24 >= $19 \
                    AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE node_id = $5 \
-                       AND state IN ('queued', 'preparing', 'ready')) <= $23 - $18 \
+                       AND state IN ('queued', 'preparing', 'ready')) <= $24 - $19 \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
-                    source_size, source_mtime, recipe_hash, target_height, audio_index, \
+                    source_size, source_mtime, recipe_hash, effective_rate_control, \
+                    target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
@@ -1216,6 +1238,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
                         package.source_path.as_str(),
                         package.source_size,
                         package.source_mtime,
+                        package.effective_rate_control.as_str(),
                         package.target_height,
                         package.audio_index,
                         package.audio_offset_ms,
@@ -1481,7 +1504,8 @@ impl OfflinePackageStore for HiqliteAuthStore {
                               candidate.created_at, candidate.id LIMIT 1) \
                    AND state = 'queued' \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
-                    source_size, source_mtime, recipe_hash, target_height, audio_index, \
+                    source_size, source_mtime, recipe_hash, effective_rate_control, \
+                    target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \

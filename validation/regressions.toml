@@ -236,3 +236,9 @@ commits = ["617356c9", "ec7777dd"]
 points = ["playback.pipeline", "web.experience"]
 checks = ["rust-gate", "web-static", "playback-exhaustive"]
 reason = "Playback routing units, browser policy tests, and the deterministic playback matrix pin segmented-remux eligibility, bounded persistent-stall recovery, true reconnects, per-track audio compatibility, and recovery telemetry."
+
+[[coverage]]
+commits = ["593c7aca"]
+points = ["offline.viewing", "persistence.upgrades", "operations.packaging"]
+checks = ["offline-contract", "cluster-auth", "operations-contract"]
+reason = "SQLite, HTTP, and shared-store contracts pin first-write-wins offline request idempotency across a server policy change; harness counterexamples reject producer, offline, direct-delivery, and competing-session contamination before and during capture."

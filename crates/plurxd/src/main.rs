@@ -335,6 +335,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
         system,
         logs,
     );
+    // The stored request is not an ffmpeg contract. Exercise the exact
+    // production rate-control arguments against this boot's real drivers and
+    // publish only the effective result before any session can start.
+    state.transcode.initialize_rate_control().await?;
+    tokio::spawn(std::sync::Arc::clone(&state.transcode).rate_control_refresh_loop());
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
     tokio::spawn(std::sync::Arc::clone(&state.offline).run());

@@ -16,7 +16,10 @@ mod encoder;
 mod pipeline;
 mod recipe;
 
-pub use encoder::{detect_encoders, Encoder, EncoderCaps};
+pub use encoder::{
+    detect_encoders, validate_quality_rate_control, validate_quality_rate_control_yielding,
+    EffectiveRateControl, Encoder, EncoderCaps, QualityRateControlValidation, QualityRc, RateMode,
+};
 pub use pipeline::{Pipeline, CANDIDATES as PIPELINE_CANDIDATES};
 pub use recipe::{PipelineDigest, Recipe};
 
@@ -415,7 +418,7 @@ pub enum ToneMap {
 }
 
 /// What to burn into the video (image subs must be burned; text subs can be).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleBurn {
     /// 0-based index among the file's subtitle streams.
     pub subtitle_index: i64,
@@ -424,10 +427,14 @@ pub struct SubtitleBurn {
 }
 
 /// Everything needed to build a transcode command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscodeOptions {
     pub target_height: i64,
     pub video_bitrate_kbps: u32,
+    /// Validated rate control. Requested settings never reach this struct: a
+    /// refused quality mode is represented as VBR before args or identity are
+    /// built.
+    pub effective_rate_control: EffectiveRateControl,
     /// Audio: output channel count (2 = stereo downmix) and bitrate.
     pub audio_channels: u32,
     pub audio_bitrate_kbps: u32,
@@ -479,6 +486,7 @@ impl Default for TranscodeOptions {
         TranscodeOptions {
             target_height: 1080,
             video_bitrate_kbps: 8000,
+            effective_rate_control: EffectiveRateControl::Vbr,
             audio_channels: 2,
             audio_bitrate_kbps: AUDIO_BITRATE_KBPS_DEFAULT,
             audio_index: None,
@@ -916,6 +924,7 @@ pub fn hls_args(
     }
     args.extend(encoder.encode_args(
         opts.video_bitrate_kbps,
+        opts.effective_rate_control,
         opts.force_idr,
         opts.software_threads,
     ));

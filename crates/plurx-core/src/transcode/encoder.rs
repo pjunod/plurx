@@ -16,7 +16,94 @@ pub enum Encoder {
     VideoToolbox,
 }
 
+/// The operator's requested rate-control family.
+///
+/// This value is never allowed into a cache recipe. A request becomes an
+/// [`EffectiveRateControl`] only after this node has exercised the exact
+/// production arguments against its real encoder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RateMode {
+    #[default]
+    Bitrate,
+    Quality,
+}
+
+impl RateMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bitrate" => Some(Self::Bitrate),
+            "quality" => Some(Self::Quality),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bitrate => "bitrate",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+/// The rate control that production will actually execute.
+///
+/// Requested quality mode may resolve back to [`Self::Vbr`] when the real
+/// driver refuses its family-specific quality arguments. Only this effective
+/// value reaches ffmpeg or the recipe hash, so fallback bytes can never be
+/// cached under a requested-but-unavailable identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EffectiveRateControl {
+    #[default]
+    Vbr,
+    Qvbr {
+        quality: u8,
+    },
+}
+
+impl EffectiveRateControl {
+    /// Stable recipe bytes. The VBR spelling is the pre-N1 literal and must
+    /// never change: existing cache entries depend on it byte-for-byte.
+    pub fn recipe_value(self) -> String {
+        match self {
+            Self::Vbr => "vbr:maxrate1.5x:bufsize2x".to_owned(),
+            Self::Qvbr { quality } => {
+                format!("qvbr:q{quality}:maxrate1.5x:bufsize2x")
+            }
+        }
+    }
+
+    /// One-column durable representation for an offline package snapshot.
+    pub fn snapshot_value(self) -> String {
+        match self {
+            Self::Vbr => "vbr".to_owned(),
+            Self::Qvbr { quality } => format!("qvbr:{quality}"),
+        }
+    }
+
+    pub fn parse_snapshot(value: &str) -> Option<Self> {
+        if value == "vbr" {
+            return Some(Self::Vbr);
+        }
+        let encoded = value.strip_prefix("qvbr:")?;
+        let quality = encoded.parse::<u8>().ok()?;
+        if encoded != quality.to_string() {
+            return None;
+        }
+        Some(Self::Qvbr { quality })
+    }
+}
+
 impl Encoder {
+    /// Candidate family defaults. D5 requires the nynuc corpus run to
+    /// calibrate these before N1 acceptance; explicit `transcode.quality`
+    /// overrides let that run sweep candidates without changing code.
+    pub fn default_quality(self) -> u8 {
+        match self {
+            Encoder::Software | Encoder::Nvenc | Encoder::Qsv | Encoder::Vaapi => 23,
+            Encoder::VideoToolbox => 65,
+        }
+    }
+
     /// The ffmpeg H.264 encoder name.
     ///
     /// **Every arm is H.264 8-bit, and something outside this file depends on
@@ -128,6 +215,7 @@ impl Encoder {
     pub fn encode_args(
         self,
         bitrate_kbps: u32,
+        rate_control: EffectiveRateControl,
         force_idr: bool,
         software_threads: Option<u32>,
     ) -> Vec<String> {
@@ -135,11 +223,12 @@ impl Encoder {
         let maxrate = format!("{}k", bitrate_kbps * 3 / 2);
         let bufsize = format!("{}k", bitrate_kbps * 2);
         let idr = force_idr.then(|| self.forced_idr_flag()).flatten();
-        let rate_control = |v: Vec<&str>| -> Vec<String> {
+        let bounded = |v: Vec<&str>, include_target: bool| -> Vec<String> {
             let mut args: Vec<String> = v.into_iter().map(str::to_owned).collect();
+            if include_target {
+                args.extend(["-b:v".to_owned(), br.clone()]);
+            }
             args.extend([
-                "-b:v".to_owned(),
-                br.clone(),
                 "-maxrate".to_owned(),
                 maxrate.clone(),
                 "-bufsize".to_owned(),
@@ -152,7 +241,14 @@ impl Encoder {
         };
         match self {
             Encoder::Software => {
-                let mut args = rate_control(vec!["-c:v", "libx264", "-preset", "veryfast"]);
+                let mut base = vec!["-c:v", "libx264", "-preset", "veryfast"];
+                let include_target = matches!(rate_control, EffectiveRateControl::Vbr);
+                let quality;
+                if let EffectiveRateControl::Qvbr { quality: q } = rate_control {
+                    quality = q.to_string();
+                    base.extend(["-crf", quality.as_str()]);
+                }
+                let mut args = bounded(base, include_target);
                 args.extend(["-profile:v".to_owned(), "high".to_owned()]);
                 // Explicit, when the admission pool granted a budget. x264's
                 // own default is cores x 1.5 — the right call for the only
@@ -164,16 +260,48 @@ impl Encoder {
                 }
                 args
             }
-            Encoder::Nvenc => rate_control(vec!["-c:v", "h264_nvenc", "-preset", "p4"]),
-            Encoder::VideoToolbox => rate_control(vec!["-c:v", "h264_videotoolbox"]),
+            Encoder::Nvenc => {
+                let quality;
+                let mut base = vec!["-c:v", "h264_nvenc", "-preset", "p4"];
+                if let EffectiveRateControl::Qvbr { quality: q } = rate_control {
+                    quality = q.to_string();
+                    base.extend(["-rc", "vbr", "-cq", quality.as_str()]);
+                }
+                bounded(base, true)
+            }
+            Encoder::VideoToolbox => {
+                let quality;
+                let mut base = vec!["-c:v", "h264_videotoolbox"];
+                if let EffectiveRateControl::Qvbr { quality: q } = rate_control {
+                    quality = q.to_string();
+                    base.extend(["-q:v", quality.as_str()]);
+                }
+                bounded(base, true)
+            }
             // No explicit `-rc_mode`. ffmpeg's VAAPI encoder already selects
             // VBR when maxrate exceeds bitrate, and then falls back to whatever
             // the driver actually implements. Forcing VBR would turn a
             // CBR-only driver from "works, roughly bounded" into "fails
             // validation, no hardware at all" — a worse outcome than the
             // slightly looser bound it was meant to tighten.
-            Encoder::Vaapi => rate_control(vec!["-c:v", "h264_vaapi"]),
-            Encoder::Qsv => rate_control(vec!["-c:v", "h264_qsv"]),
+            Encoder::Vaapi => {
+                let quality;
+                let mut base = vec!["-c:v", "h264_vaapi"];
+                if let EffectiveRateControl::Qvbr { quality: q } = rate_control {
+                    quality = q.to_string();
+                    base.extend(["-rc_mode", "QVBR", "-global_quality", quality.as_str()]);
+                }
+                bounded(base, true)
+            }
+            Encoder::Qsv => {
+                let quality;
+                let mut base = vec!["-c:v", "h264_qsv"];
+                if let EffectiveRateControl::Qvbr { quality: q } = rate_control {
+                    quality = q.to_string();
+                    base.extend(["-global_quality", quality.as_str()]);
+                }
+                bounded(base, true)
+            }
         }
     }
 }
@@ -217,6 +345,42 @@ impl ForcedIdr {
     }
 }
 
+/// Which encoder families accepted their production quality-mode arguments.
+///
+/// A compiled encoder and even a working VBR encode are not evidence for this
+/// capability: QVBR/CQ support varies by driver. Every true bit comes from a
+/// real 15-frame encode using the same argument builder as production.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct QualityRc {
+    pub software: bool,
+    pub nvenc: bool,
+    pub qsv: bool,
+    pub vaapi: bool,
+    pub videotoolbox: bool,
+}
+
+impl QualityRc {
+    pub fn set_supported(&mut self, encoder: Encoder, usable: bool) {
+        match encoder {
+            Encoder::Software => self.software = usable,
+            Encoder::Nvenc => self.nvenc = usable,
+            Encoder::Qsv => self.qsv = usable,
+            Encoder::Vaapi => self.vaapi = usable,
+            Encoder::VideoToolbox => self.videotoolbox = usable,
+        }
+    }
+
+    pub fn supported_by(&self, encoder: Encoder) -> bool {
+        match encoder {
+            Encoder::Software => self.software,
+            Encoder::Nvenc => self.nvenc,
+            Encoder::Qsv => self.qsv,
+            Encoder::Vaapi => self.vaapi,
+            Encoder::VideoToolbox => self.videotoolbox,
+        }
+    }
+}
+
 /// Which encoders this ffmpeg build exposes.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct EncoderCaps {
@@ -226,6 +390,8 @@ pub struct EncoderCaps {
     pub videotoolbox: bool,
     #[serde(default)]
     pub forced_idr: ForcedIdr,
+    #[serde(default)]
+    pub quality_rc: QualityRc,
 }
 
 impl EncoderCaps {
@@ -236,6 +402,16 @@ impl EncoderCaps {
             Encoder::Vaapi => self.vaapi = usable,
             Encoder::VideoToolbox => self.videotoolbox = usable,
             Encoder::Software => {}
+        }
+    }
+
+    pub fn available(&self, encoder: Encoder) -> bool {
+        match encoder {
+            Encoder::Software => true,
+            Encoder::Nvenc => self.nvenc,
+            Encoder::Qsv => self.qsv,
+            Encoder::Vaapi => self.vaapi,
+            Encoder::VideoToolbox => self.videotoolbox,
         }
     }
 
@@ -277,6 +453,7 @@ pub fn parse_encoder_list(output: &str) -> EncoderCaps {
         // Compiled-in says nothing about which options a driver will take;
         // that is what `validate` measures.
         forced_idr: ForcedIdr::default(),
+        quality_rc: QualityRc::default(),
     }
 }
 
@@ -305,7 +482,11 @@ const PROBE_BITRATE_KBPS: u32 = 4_000;
 /// that accepts the encoder and rejects `-maxrate` would pass here and fail at
 /// play time, on a viewer's first press of play, with the fallback machinery
 /// discovering it (PERF-PLAN §4.6, review R4).
-fn validation_args(encoder: Encoder, force_idr: bool) -> Vec<String> {
+fn validation_args(
+    encoder: Encoder,
+    rate_control: EffectiveRateControl,
+    force_idr: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
     args.extend(encoder.init_args());
     args.extend([
@@ -325,7 +506,7 @@ fn validation_args(encoder: Encoder, force_idr: bool) -> Vec<String> {
     }
     args.push("-vf".into());
     args.push(vf);
-    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS, force_idr, None));
+    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS, rate_control, force_idr, None));
     args.extend(["-f".into(), "null".into(), "-".into()]);
     args
 }
@@ -356,9 +537,14 @@ fn first_cause(stderr: &str) -> &str {
 }
 
 /// One probe run. `Ok(())` on success, `Err(stderr)` otherwise.
-async fn try_encode(ffmpeg_bin: &str, encoder: Encoder, force_idr: bool) -> Result<(), String> {
+async fn try_encode(
+    ffmpeg_bin: &str,
+    encoder: Encoder,
+    rate_control: EffectiveRateControl,
+    force_idr: bool,
+) -> Result<(), String> {
     match tokio::process::Command::new(ffmpeg_bin)
-        .args(validation_args(encoder, force_idr))
+        .args(validation_args(encoder, rate_control, force_idr))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -368,6 +554,115 @@ async fn try_encode(ffmpeg_bin: &str, encoder: Encoder, force_idr: bool) -> Resu
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Result of a runtime quality-rate-control probe.
+///
+/// `Yielded` is deliberately distinct from `Refused`: a viewer or higher
+/// priority background job arriving says nothing about whether the encoder
+/// accepts the quality flags. Callers must keep the last published capability
+/// and try again later rather than turning contention into a false fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityRateControlValidation {
+    Supported,
+    Refused,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDeferReason {
+    Priority,
+    Deadline,
+}
+
+enum YieldingProbe {
+    Completed(Result<(), String>),
+    Deferred(ProbeDeferReason),
+}
+
+/// A healthy production-argument probe encodes half a second of synthetic
+/// media. Three seconds leaves wide driver-startup slack without letting a
+/// wedged runtime probe retain admission and the background lane indefinitely.
+const RUNTIME_QUALITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run the production-argument probe while giving a caller a short-interval
+/// cancellation point. The child is killed and reaped before `Deferred` is
+/// returned, so a background validation cannot leave an unaccounted encoder
+/// competing with the viewer it yielded to.
+async fn try_encode_yielding<F>(
+    ffmpeg_bin: &str,
+    encoder: Encoder,
+    rate_control: EffectiveRateControl,
+    force_idr: bool,
+    timeout: std::time::Duration,
+    should_yield: F,
+) -> YieldingProbe
+where
+    F: Fn() -> bool,
+{
+    if should_yield() {
+        return YieldingProbe::Deferred(ProbeDeferReason::Priority);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let mut command = tokio::process::Command::new(ffmpeg_bin);
+    command
+        .args(validation_args(encoder, rate_control, force_idr))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return YieldingProbe::Completed(Err(error.to_string())),
+    };
+    let mut stderr = child.stderr.take().expect("piped probe stderr");
+    let stderr_reader = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    loop {
+        if should_yield() {
+            let _ = child.kill().await;
+            let _ = stderr_reader.await;
+            return YieldingProbe::Deferred(ProbeDeferReason::Priority);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = stderr_reader.await;
+            return YieldingProbe::Deferred(ProbeDeferReason::Deadline);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stderr = match stderr_reader.await {
+                    Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => error.to_string(),
+                };
+                return YieldingProbe::Completed(if status.success() {
+                    Ok(())
+                } else {
+                    Err(stderr)
+                });
+            }
+            Ok(None) => {
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await
+            }
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = stderr_reader.await;
+                return YieldingProbe::Completed(Err(error.to_string()));
+            }
+        }
     }
 }
 
@@ -382,7 +677,7 @@ async fn try_encode(ffmpeg_bin: &str, encoder: Encoder, force_idr: bool) -> Resu
 /// refuses the flag.
 async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> Verdict {
     let wants_idr = encoder.forced_idr_flag().is_some();
-    match try_encode(ffmpeg_bin, encoder, wants_idr).await {
+    match try_encode(ffmpeg_bin, encoder, EffectiveRateControl::Vbr, wants_idr).await {
         Ok(()) => {
             tracing::info!(
                 encoder = encoder.label(),
@@ -399,7 +694,7 @@ async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> Verdict {
             // up on the whole family. Losing a GPU because one option was not
             // recognised would be a far worse trade than the long segments the
             // option exists to prevent.
-            match try_encode(ffmpeg_bin, encoder, false).await {
+            match try_encode(ffmpeg_bin, encoder, EffectiveRateControl::Vbr, false).await {
                 Ok(()) => {
                     tracing::warn!(
                         encoder = encoder.label(),
@@ -445,6 +740,103 @@ async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> Verdict {
     }
 }
 
+/// Exercise one explicit quality value against the exact production argument
+/// set. Runtime settings changes call this before publishing a new effective
+/// mode; boot detection calls it for each usable family's candidate default.
+pub async fn validate_quality_rate_control(
+    ffmpeg_bin: &str,
+    encoder: Encoder,
+    quality: u8,
+    force_idr: bool,
+) -> bool {
+    match try_encode(
+        ffmpeg_bin,
+        encoder,
+        EffectiveRateControl::Qvbr { quality },
+        force_idr,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                encoder = encoder.label(),
+                quality,
+                "quality rate control validated"
+            );
+            true
+        }
+        Err(why) => {
+            tracing::warn!(
+                encoder = encoder.label(),
+                quality,
+                reason = first_cause(&why),
+                "quality rate control refused — effective mode falls back to VBR"
+            );
+            false
+        }
+    }
+}
+
+/// Runtime form of [`validate_quality_rate_control`] that yields to playback.
+/// Boot validation has no viewers and uses the simpler non-yielding form;
+/// settings refresh and admin changes use this one under background admission.
+pub async fn validate_quality_rate_control_yielding<F>(
+    ffmpeg_bin: &str,
+    encoder: Encoder,
+    quality: u8,
+    force_idr: bool,
+    should_yield: F,
+) -> QualityRateControlValidation
+where
+    F: Fn() -> bool,
+{
+    match try_encode_yielding(
+        ffmpeg_bin,
+        encoder,
+        EffectiveRateControl::Qvbr { quality },
+        force_idr,
+        RUNTIME_QUALITY_PROBE_TIMEOUT,
+        should_yield,
+    )
+    .await
+    {
+        YieldingProbe::Completed(Ok(())) => {
+            tracing::info!(
+                encoder = encoder.label(),
+                quality,
+                "quality rate control validated"
+            );
+            QualityRateControlValidation::Supported
+        }
+        YieldingProbe::Completed(Err(why)) => {
+            tracing::warn!(
+                encoder = encoder.label(),
+                quality,
+                reason = first_cause(&why),
+                "quality rate control refused — effective mode falls back to VBR"
+            );
+            QualityRateControlValidation::Refused
+        }
+        YieldingProbe::Deferred(ProbeDeferReason::Priority) => {
+            tracing::debug!(
+                encoder = encoder.label(),
+                quality,
+                "quality rate-control validation yielded to playback"
+            );
+            QualityRateControlValidation::Deferred
+        }
+        YieldingProbe::Deferred(ProbeDeferReason::Deadline) => {
+            tracing::warn!(
+                encoder = encoder.label(),
+                quality,
+                timeout_ms = RUNTIME_QUALITY_PROBE_TIMEOUT.as_millis(),
+                "quality rate-control validation timed out — keeping the previous effective snapshot"
+            );
+            QualityRateControlValidation::Deferred
+        }
+    }
+}
+
 /// Detect *usable* encoders: parse the build's encoder list, then test-encode
 /// each candidate so we never pick a compiled-but-nonfunctional GPU path.
 pub async fn detect_encoders(ffmpeg_bin: &str) -> EncoderCaps {
@@ -480,12 +872,31 @@ pub async fn detect_encoders(ffmpeg_bin: &str) -> EncoderCaps {
         if verdict.forced_idr {
             caps.forced_idr.set(encoder);
         }
+        if verdict.usable {
+            let quality = encoder.default_quality();
+            let quality_rc =
+                validate_quality_rate_control(ffmpeg_bin, encoder, quality, verdict.forced_idr)
+                    .await;
+            caps.quality_rc.set_supported(encoder, quality_rc);
+        }
     }
+    // Software is always the encoder fallback, but its quality arguments still
+    // need the same behavioral proof as hardware before they become effective.
+    let software_quality = Encoder::Software.default_quality();
+    let software_quality_rc =
+        validate_quality_rate_control(ffmpeg_bin, Encoder::Software, software_quality, false).await;
+    caps.quality_rc
+        .set_supported(Encoder::Software, software_quality_rc);
     tracing::info!(
         nvenc = caps.nvenc,
         qsv = caps.qsv,
         vaapi = caps.vaapi,
         videotoolbox = caps.videotoolbox,
+        quality_software = caps.quality_rc.software,
+        quality_nvenc = caps.quality_rc.nvenc,
+        quality_qsv = caps.quality_rc.qsv,
+        quality_vaapi = caps.quality_rc.vaapi,
+        quality_videotoolbox = caps.quality_rc.videotoolbox,
         "usable hardware encoders (validated); software x264 always available"
     );
     caps
@@ -657,7 +1068,7 @@ mod tests {
             Encoder::Vaapi,
             Encoder::Qsv,
         ] {
-            let args = encoder.encode_args(4000, false, None);
+            let args = encoder.encode_args(4000, EffectiveRateControl::Vbr, false, None);
             assert!(has(&args, encoder.video_codec()), "{encoder:?} codec");
             // 4000k target → 1.5x cap over a 2x window.
             assert!(
@@ -674,9 +1085,99 @@ mod tests {
             );
         }
         // Per-family extras survive the shared rate-control block.
-        let sw = Encoder::Software.encode_args(4000, false, None);
+        let sw = Encoder::Software.encode_args(4000, EffectiveRateControl::Vbr, false, None);
         assert!(has(&sw, "veryfast") && has(&sw, "high"));
-        assert!(has(&Encoder::Nvenc.encode_args(4000, false, None), "p4"));
+        assert!(has(
+            &Encoder::Nvenc.encode_args(4000, EffectiveRateControl::Vbr, false, None),
+            "p4"
+        ));
+    }
+
+    #[test]
+    fn quality_mode_uses_each_family_contract_and_keeps_the_caps() {
+        let q = EffectiveRateControl::Qvbr { quality: 22 };
+        let cases: &[(Encoder, &[&str])] = &[
+            (Encoder::Software, &["-crf", "22"]),
+            (Encoder::Qsv, &["-global_quality", "22"]),
+            (
+                Encoder::Vaapi,
+                &["-rc_mode", "QVBR", "-global_quality", "22"],
+            ),
+            (Encoder::Nvenc, &["-rc", "vbr", "-cq", "22"]),
+            (Encoder::VideoToolbox, &["-q:v", "22"]),
+        ];
+        for (encoder, expected) in cases {
+            let args = encoder.encode_args(4000, q, false, None);
+            assert!(
+                args.windows(expected.len()).any(|window| {
+                    window
+                        .iter()
+                        .map(String::as_str)
+                        .eq(expected.iter().copied())
+                }),
+                "{encoder:?}: missing {expected:?} in {args:?}"
+            );
+            assert!(has(&args, "-maxrate") && has(&args, "6000k"));
+            assert!(has(&args, "-bufsize") && has(&args, "8000k"));
+            assert_eq!(
+                has(&args, "-b:v"),
+                *encoder != Encoder::Software,
+                "capped CRF has no bitrate target; hardware quality modes retain it"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_vbr_has_no_quality_only_flags() {
+        for encoder in ALL {
+            let args = encoder.encode_args(4000, EffectiveRateControl::Vbr, false, None);
+            for flag in ["-crf", "-global_quality", "-rc_mode", "-cq", "-q:v"] {
+                assert!(
+                    !has(&args, flag),
+                    "{encoder:?} VBR contains {flag}: {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn requested_and_effective_values_round_trip_without_aliases() {
+        assert_eq!(RateMode::parse("bitrate"), Some(RateMode::Bitrate));
+        assert_eq!(RateMode::parse(" QUALITY "), Some(RateMode::Quality));
+        assert_eq!(RateMode::parse("cq"), None);
+        assert_eq!(RateMode::Bitrate.as_str(), "bitrate");
+        assert_eq!(RateMode::Quality.as_str(), "quality");
+
+        for value in [
+            EffectiveRateControl::Vbr,
+            EffectiveRateControl::Qvbr { quality: 0 },
+            EffectiveRateControl::Qvbr { quality: 23 },
+            EffectiveRateControl::Qvbr { quality: u8::MAX },
+        ] {
+            assert_eq!(
+                EffectiveRateControl::parse_snapshot(&value.snapshot_value()),
+                Some(value)
+            );
+        }
+        assert_eq!(EffectiveRateControl::parse_snapshot("qvbr:256"), None);
+        assert_eq!(EffectiveRateControl::parse_snapshot("quality:23"), None);
+        assert_eq!(EffectiveRateControl::parse_snapshot("qvbr:023"), None);
+        assert_eq!(EffectiveRateControl::parse_snapshot(" qvbr:23"), None);
+    }
+
+    #[test]
+    fn quality_capability_is_per_family() {
+        let mut caps = QualityRc::default();
+        caps.set_supported(Encoder::Qsv, true);
+        assert!(caps.supported_by(Encoder::Qsv));
+        for encoder in [
+            Encoder::Software,
+            Encoder::Nvenc,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            assert!(!caps.supported_by(encoder), "{encoder:?}");
+        }
     }
 
     /// The admission pool's thread budget reaches x264 as an explicit
@@ -686,11 +1187,12 @@ mod tests {
     /// only session on the box.
     #[test]
     fn the_thread_budget_is_explicit_and_software_only() {
-        let sw = Encoder::Software.encode_args(4000, false, Some(3));
+        let sw = Encoder::Software.encode_args(4000, EffectiveRateControl::Vbr, false, Some(3));
         let t = sw.iter().position(|a| a == "-threads").expect("-threads");
         assert_eq!(sw[t + 1], "3", "the granted budget, verbatim");
 
-        let unbudgeted = Encoder::Software.encode_args(4000, false, None);
+        let unbudgeted =
+            Encoder::Software.encode_args(4000, EffectiveRateControl::Vbr, false, None);
         assert!(
             !unbudgeted.iter().any(|a| a == "-threads"),
             "no budget, no flag"
@@ -702,7 +1204,7 @@ mod tests {
             Encoder::VideoToolbox,
         ] {
             assert!(
-                !hw.encode_args(4000, false, Some(3))
+                !hw.encode_args(4000, EffectiveRateControl::Vbr, false, Some(3))
                     .iter()
                     .any(|a| a == "-threads"),
                 "{hw:?} must ignore a software budget"
@@ -719,14 +1221,14 @@ mod tests {
     /// silently stops being used.
     #[test]
     fn each_family_gets_its_own_spelling_of_forced_idr() {
-        let qsv = Encoder::Qsv.encode_args(4000, true, None);
+        let qsv = Encoder::Qsv.encode_args(4000, EffectiveRateControl::Vbr, true, None);
         assert!(has(&qsv, "-forced_idr"), "{qsv:?}");
         assert!(
             !has(&qsv, "-forced-idr"),
             "QSV got NVENC's spelling: {qsv:?}"
         );
 
-        let nvenc = Encoder::Nvenc.encode_args(4000, true, None);
+        let nvenc = Encoder::Nvenc.encode_args(4000, EffectiveRateControl::Vbr, true, None);
         assert!(has(&nvenc, "-forced-idr"), "{nvenc:?}");
         assert!(
             !has(&nvenc, "-forced_idr"),
@@ -751,7 +1253,7 @@ mod tests {
     fn families_that_do_not_need_forced_idr_never_receive_it() {
         for encoder in [Encoder::Software, Encoder::Vaapi, Encoder::VideoToolbox] {
             assert_eq!(encoder.forced_idr_flag(), None, "{encoder:?}");
-            let args = encoder.encode_args(4000, true, None);
+            let args = encoder.encode_args(4000, EffectiveRateControl::Vbr, true, None);
             assert!(
                 !args.iter().any(|a| a.starts_with("-forced")),
                 "{encoder:?} was handed a forced-IDR flag it has no option for: {args:?}"
@@ -764,7 +1266,7 @@ mod tests {
     #[test]
     fn forced_idr_is_off_unless_the_probe_asked_for_it() {
         for encoder in [Encoder::Qsv, Encoder::Nvenc] {
-            let args = encoder.encode_args(4000, false, None);
+            let args = encoder.encode_args(4000, EffectiveRateControl::Vbr, false, None);
             assert!(
                 !args.iter().any(|a| a.starts_with("-forced")),
                 "{encoder:?}: {args:?}"
@@ -803,8 +1305,13 @@ mod tests {
             Encoder::Qsv,
         ] {
             let force_idr = encoder.forced_idr_flag().is_some();
-            let probe = validation_args(encoder, force_idr);
-            let production = encoder.encode_args(PROBE_BITRATE_KBPS, force_idr, None);
+            let probe = validation_args(encoder, EffectiveRateControl::Vbr, force_idr);
+            let production = encoder.encode_args(
+                PROBE_BITRATE_KBPS,
+                EffectiveRateControl::Vbr,
+                force_idr,
+                None,
+            );
             let at = probe
                 .windows(production.len())
                 .position(|w| w == production.as_slice());
@@ -824,6 +1331,24 @@ mod tests {
                 );
             }
             assert_eq!(&probe[probe.len() - 3..], &["-f", "null", "-"]);
+        }
+    }
+
+    #[test]
+    fn the_quality_probe_encodes_with_the_production_quality_arguments() {
+        for encoder in ALL {
+            let force_idr = encoder.forced_idr_flag().is_some();
+            let q = EffectiveRateControl::Qvbr {
+                quality: encoder.default_quality(),
+            };
+            let probe = validation_args(encoder, q, force_idr);
+            let production = encoder.encode_args(PROBE_BITRATE_KBPS, q, force_idr, None);
+            assert!(
+                probe
+                    .windows(production.len())
+                    .any(|window| window == production.as_slice()),
+                "{encoder:?}: quality probe drifted from production\nprobe: {probe:?}\nproduction: {production:?}"
+            );
         }
     }
 
@@ -851,13 +1376,113 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_family_that_refuses_quality_stays_usable_and_reports_no_quality_cap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("ffmpeg");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+               *\" -encoders \"*) printf ' V..... h264_qsv Intel QuickSync\\n' ;;\n\
+               *\" -global_quality \"*) echo 'Error applying option global_quality: Invalid argument' >&2; exit 1 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+        )
+        .expect("write fake ffmpeg");
+        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).expect("chmod");
+
+        let caps = detect_encoders(fake.to_str().expect("path")).await;
+        assert!(caps.qsv, "legacy VBR validation succeeded");
+        assert!(caps.forced_idr.qsv, "the VBR IDR argument succeeded");
+        assert!(
+            !caps.quality_rc.qsv,
+            "a refused QVBR probe must never become an effective capability"
+        );
+        assert!(
+            caps.quality_rc.software,
+            "the same build accepted software capped CRF; fallback is per family"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runtime_quality_probe_kills_its_encoder_when_playback_arrives() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("ffmpeg");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake ffmpeg");
+        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).expect("chmod");
+
+        let yield_now = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&yield_now);
+        let fake = fake.to_string_lossy().into_owned();
+        let probe = tokio::spawn(async move {
+            validate_quality_rate_control_yielding(&fake, Encoder::Software, 23, false, move || {
+                observed.load(Ordering::Acquire)
+            })
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        yield_now.store(true, Ordering::Release);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), probe)
+                .await
+                .expect("the killed probe exits promptly")
+                .expect("probe task"),
+            QualityRateControlValidation::Deferred
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wedged_runtime_probe_is_killed_at_its_deadline_not_marked_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("ffmpeg");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake ffmpeg");
+        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).expect("chmod");
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            try_encode_yielding(
+                fake.to_str().expect("path"),
+                Encoder::Software,
+                EffectiveRateControl::Qvbr { quality: 23 },
+                false,
+                std::time::Duration::from_millis(100),
+                || false,
+            )
+            .await,
+            YieldingProbe::Deferred(ProbeDeferReason::Deadline)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the timeout must bound and reap the child promptly"
+        );
+    }
+
     /// A one-frame clip is not a test of an encoder that buffers frames: it
     /// emits nothing, and "nothing was written into output file" is
     /// indistinguishable from a dead device. This probe has to be long enough
     /// to fill a lookahead and large enough to clear hardware minimums.
     #[test]
     fn the_probe_clip_is_long_enough_to_produce_packets() {
-        let args = validation_args(Encoder::Nvenc, false);
+        let args = validation_args(Encoder::Nvenc, EffectiveRateControl::Vbr, false);
         let src = args
             .iter()
             .find(|a| a.starts_with("testsrc="))

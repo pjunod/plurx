@@ -1,6 +1,8 @@
 """Contract tests for the Performance II N1 live-session harness."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,17 @@ ROOT = Path(__file__).resolve().parents[2]
 BENCH = runpy.run_path(str(ROOT / "scripts/bench"))
 G = BENCH["rate_control_report"].__globals__
 MISSING = object()
+
+
+def activity_state(*, session_ids=(), deliveries=None, offline=None, producing=None):
+    if deliveries is None:
+        deliveries = [{"session_id": session_id} for session_id in session_ids]
+    return {
+        "sessions": [{"id": session_id} for session_id in session_ids],
+        "deliveries": deliveries,
+        "offline": list(offline or []),
+        "producing": producing,
+    }
 
 
 def file_sha(path):
@@ -81,6 +94,10 @@ class SessionApi:
         delete_error=False,
         stuck_after_delete=False,
         initially_active=0,
+        active_counts=None,
+        activity_before=None,
+        activity_during=None,
+        activity_sequence=None,
     ):
         self.vod = vod
         self.origin_ms = origin_ms
@@ -92,12 +109,27 @@ class SessionApi:
         self.delete_error = delete_error
         self.stuck_after_delete = stuck_after_delete
         self.active = initially_active
+        self.active_counts = list(active_counts or [])
+        self.activity_before = activity_before
+        self.activity_during = activity_during
+        self.activity_sequence = list(activity_sequence or [])
         self.deleted = False
         self.posted = False
 
     def call(self, path, method="GET", body=None):
         if path == "/system":
-            return {"active_transcodes": self.active}
+            active = self.active_counts.pop(0) if self.active_counts else self.active
+            return {"active_transcodes": active}
+        if path == "/activity/detail":
+            if self.activity_sequence:
+                return self.activity_sequence.pop(0)
+            configured = self.activity_during if self.posted else self.activity_before
+            if configured is not None:
+                return configured
+            if self.active == 0:
+                return activity_state()
+            session_id = "session-capability" if self.posted else "other-session"
+            return activity_state(session_ids=(session_id,))
         if method == "POST":
             self.posted = True
             self.active = 1
@@ -145,6 +177,8 @@ class FullApi:
         active_counts=None,
         default_active=0,
         selected_encoder="qsv-h264",
+        activity_details=None,
+        default_activity=None,
     ):
         self.references = references
         self.hdr = hdr
@@ -154,6 +188,8 @@ class FullApi:
         self.active_counts = list(active_counts or [])
         self.default_active = default_active
         self.selected_encoder = selected_encoder
+        self.activity_details = list(activity_details or [])
+        self.default_activity = default_activity or activity_state()
         self.settings = {
             "transcode_rate_mode": "bitrate",
             "transcode_quality": None,
@@ -175,6 +211,10 @@ class FullApi:
                 "encoder_selected": self.selected_encoder,
                 "active_transcodes": active,
             }
+        if path == "/activity/detail":
+            if self.activity_details:
+                return self.activity_details.pop(0)
+            return self.default_activity
         if path == "/libraries":
             return [{"id": 9}]
         if path == "/libraries/9/items":
@@ -250,9 +290,9 @@ def passing_measurement(mode, encoder="qsv-h264"):
         "vmaf": 95.0,
         "peak_window_kbps": 100.0,
         "peak_window_seconds": 10.0,
-        "peak_window_role": "configured_complete_served_segment_window_diagnostic",
+        "peak_window_role": "complete_served_segment_10_second_peak_measurement",
         "bufsize_window_peak_kbps": 125.0,
-        "bufsize_window_peak_role": "perf2_v2_candidate_diagnostic",
+        "bufsize_window_peak_role": "diagnostic_nonbinding_derived_bufsize_window",
         "limits": {
             "requested_height": 1080,
             "advertised_height": 1080,
@@ -263,10 +303,19 @@ def passing_measurement(mode, encoder="qsv-h264"):
             "video_bufsize_kbits": 16000.0,
             "bufsize_window_seconds": 4 / 3,
             "theoretical_vbv_allowance_kbps": 90.0,
-            "theoretical_vbv_role": "diagnostic_pending_owner_ratification",
+            "theoretical_vbv_role": "diagnostic_nonbinding",
             "advertised_peak_kbps": 12160.0,
-            "advertised_peak_role": "diagnostic_pending_owner_ratification",
-            "peak_contract_status": "unratified_owner_decision_required",
+            "advertised_peak_role": (
+                "binding_limit_for_10_second_complete_served_segment_peak"
+            ),
+            "binding_gate": {
+                "measurement": "peak_window_kbps",
+                "window_seconds": 10.0,
+                "comparison": "less_than_or_equal",
+                "limit": "advertised_peak_kbps",
+                "scope": "full_n1_vbr_qvbr_acceptance",
+            },
+            "peak_contract_status": "owner_ratified_2026-08-12",
         },
     }
 
@@ -387,6 +436,28 @@ class RateControlBenchCase(unittest.TestCase):
         document = json.loads(path.read_text())
         self.assertEqual(document["purpose"], "vbr_smoke")
         self.assertEqual({fixture["class"] for fixture in document["fixtures"]}, {"easy", "hard"})
+        self.assertTrue(all(fixture["dynamic_range"] == "sdr" for fixture in document["fixtures"]))
+        self.assertNotIn("ffmpeg_args", path.read_text())
+
+    def test_checked_in_n1_manifest_pins_the_verified_easy_and_hard_bytes(self):
+        path = ROOT / "scripts/perf2-rate-control-n1-corpus.json"
+        document = json.loads(path.read_text())
+        self.assertEqual(document["purpose"], "n1_acceptance")
+        self.assertEqual(
+            [fixture["class"] for fixture in document["fixtures"]],
+            ["easy", "hard"],
+        )
+        self.assertEqual(
+            [fixture["reference_sha256"] for fixture in document["fixtures"]],
+            [
+                "6a3539090d77f8e465178c8c66b190f6aade705cf42b4c512ae7bdd7c22341a9",
+                "2c6924d0fa6f5ebcc230e9020e209831aa08adbcfc8584517d71de539332cd54",
+            ],
+        )
+        self.assertEqual(
+            len({fixture["filename"] for fixture in document["fixtures"]}),
+            len(document["fixtures"]),
+        )
         self.assertTrue(all(fixture["dynamic_range"] == "sdr" for fixture in document["fixtures"]))
         self.assertNotIn("ffmpeg_args", path.read_text())
 
@@ -608,6 +679,81 @@ class RateControlBenchCase(unittest.TestCase):
                 )
         self.assertFalse(api.posted)
 
+    def test_capture_refuses_producer_offline_and_non_hls_delivery_before_creation(self):
+        cases = (
+            (activity_state(producing={"title": "producer"}), "producing=yes"),
+            (activity_state(offline=[{"id": "offline"}]), "offline=1"),
+            (
+                activity_state(deliveries=[{"session_id": None, "method": "direct"}]),
+                "deliveries=1",
+            ),
+        )
+        for activity, message in cases:
+            api = SessionApi(activity_before=activity)
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(BENCH["BenchError"], message):
+                    BENCH["capture_live_session"](
+                        api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                        "qsv-h264",
+                    )
+                self.assertFalse(api.posted)
+
+    def test_capture_refuses_second_session_that_joins_during_capture(self):
+        api = SessionApi(
+            active_counts=[0, 1, 2],
+            activity_sequence=[
+                activity_state(),
+                activity_state(session_ids=("session-capability",)),
+                activity_state(session_ids=("session-capability", "other-session")),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                BENCH["BenchError"], "not the sole active transcode"
+            ):
+                BENCH["capture_live_session"](
+                    api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
+                )
+        self.assertTrue(api.deleted)
+
+    def test_capture_refuses_producer_that_starts_during_capture(self):
+        api = SessionApi(
+            active_counts=[0, 1, 1],
+            activity_sequence=[
+                activity_state(),
+                activity_state(session_ids=("session-capability",)),
+                activity_state(
+                    session_ids=("session-capability",),
+                    producing={"title": "producer"},
+                ),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(BENCH["BenchError"], "producing=yes"):
+                BENCH["capture_live_session"](
+                    api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
+                )
+        self.assertTrue(api.deleted)
+
+    def test_full_preflight_refuses_background_work_before_settings_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            api = FullApi(
+                references,
+                default_activity=activity_state(producing={"title": "producer"}),
+            )
+            with mock.patch.dict(G, patched_harness()):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest), api=api
+                )
+            self.assertFalse(report["passed"])
+            self.assertIn("producing=yes", report["failures"][0]["detail"])
+            self.assertEqual(api.puts, [])
+
     def test_server_source_hdr_is_fail_closed_when_unknown_or_non_sdr(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -670,20 +816,17 @@ class RateControlBenchCase(unittest.TestCase):
             with mock.patch.dict(G, patched_harness()):
                 report = BENCH["rate_control_report"](args, api=api)
 
-            self.assertFalse(report["passed"])
-            self.assertFalse(report["acceptance"]["eligible"])
+            self.assertTrue(report["passed"])
+            self.assertTrue(report["acceptance"]["eligible"])
             self.assertEqual(
                 report["acceptance"]["scope"],
-                "diagnostic_unratified_peak_contract",
+                "full_n1_quantitative_acceptance",
             )
             self.assertEqual(
                 report["acceptance"]["peak_contract_status"],
-                "unratified_owner_decision_required",
+                "owner_ratified_2026-08-12",
             )
-            self.assertEqual(
-                [failure["code"] for failure in report["failures"]],
-                ["peak_contract_unratified"],
-            )
+            self.assertEqual(report["failures"], [])
             self.assertEqual(report["acceptance"]["required_vmaf_model"], "vmaf_v0.6.1")
             self.assertEqual(report["acceptance"]["required_vmaf_subsample"], 1)
             self.assertEqual(report["acceptance"]["required_rate_window_seconds"], 10.0)
@@ -704,7 +847,7 @@ class RateControlBenchCase(unittest.TestCase):
                 file_sha(server_manifest),
             )
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "quality", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
@@ -717,10 +860,17 @@ class RateControlBenchCase(unittest.TestCase):
                 and fixture["server_file_identity"]["available"] is True
                 for fixture in report["fixtures"]
             ))
+
             self.assertTrue(all(
                 measured["limits"]["peak_contract_status"]
-                == "unratified_owner_decision_required"
-                and "binding_gate" not in measured["limits"]
+                == "owner_ratified_2026-08-12"
+                and measured["limits"]["binding_gate"] == {
+                    "measurement": "peak_window_kbps",
+                    "window_seconds": 10.0,
+                    "comparison": "less_than_or_equal",
+                    "limit": "advertised_peak_kbps",
+                    "scope": "full_n1_vbr_qvbr_acceptance",
+                }
                 for fixture in report["fixtures"]
                 for measured in fixture["modes"].values()
             ))
@@ -730,6 +880,25 @@ class RateControlBenchCase(unittest.TestCase):
             self.assertNotIn("must-not-leak", rendered)
             self.assertFalse(report["production"]["vmaf_scorer_used_for_encoding"])
             self.assertEqual(report["vmaf_scorer"]["role"], "scoring_only_never_production_encoding")
+
+    def test_omitting_quality_explicitly_clears_a_preexisting_override(self):
+        api = FullApi({})
+        api.settings["transcode_quality"] = 19
+        contract = BENCH["setting_contract"](api.call("/settings"))
+        evidence = BENCH["update_rate_setting"](
+            api,
+            contract,
+            "qvbr",
+            quality=None,
+        )
+        self.assertEqual(api.puts, [{
+            "transcode_rate_mode": "quality",
+            "transcode_quality": None,
+        }])
+        self.assertEqual(evidence["verified_settings_response"], {
+            "transcode_rate_mode": "quality",
+            "transcode_quality": None,
+        })
 
     def test_full_subset_is_diagnostic_nonzero_even_when_measurements_pass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -761,7 +930,7 @@ class RateControlBenchCase(unittest.TestCase):
                 )
             self.assertFalse(report["passed"])
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
 
@@ -776,11 +945,8 @@ class RateControlBenchCase(unittest.TestCase):
                 report = BENCH["rate_control_report"](
                     harness_args(root, corpus, server_manifest), api=api
                 )
-            self.assertFalse(report["passed"])
-            self.assertEqual(
-                [failure["code"] for failure in report["failures"]],
-                ["peak_contract_unratified"],
-            )
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["failures"], [])
             self.assertEqual(api.puts[-1], {
                 "transcode_rate_mode": "bitrate",
                 "transcode_quality": None,
@@ -812,7 +978,7 @@ class RateControlBenchCase(unittest.TestCase):
             })
             self.assertNotIn("must-not-leak", json.dumps(failure, sort_keys=True))
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "quality", "transcode_quality": 22},
             ])
             self.assertEqual(api.settings["transcode_rate_mode"], "quality")
@@ -862,11 +1028,11 @@ class RateControlBenchCase(unittest.TestCase):
                 for failure in report["failures"]
             ))
             self.assertEqual(api.puts, [
-                {"transcode_rate_mode": "bitrate"},
+                {"transcode_rate_mode": "bitrate", "transcode_quality": 22},
                 {"transcode_rate_mode": "bitrate", "transcode_quality": None},
             ])
 
-    def test_unratified_peak_is_diagnostic_while_resolved_gates_still_fail(self):
+    def test_ratified_peak_and_other_resolved_gates_fail_together(self):
         fixture = {
             "identity": "easy",
             "class": "easy",
@@ -885,9 +1051,112 @@ class RateControlBenchCase(unittest.TestCase):
         codes = {failure["code"] for failure in failures}
         self.assertEqual(codes, {
             "encoder_identity_mismatch", "vmaf_regression", "easy_bytes_regression",
-            "speed_regression",
+            "speed_regression", "advertised_peak_exceeded",
         })
-        self.assertFalse(any("peak" in code for code in codes))
+
+    def test_advertised_peak_exact_boundary_passes_and_each_mode_overshoot_fails(self):
+        def fixture():
+            return {
+                "identity": "easy",
+                "class": "easy",
+                "modes": {
+                    "vbr": passing_measurement("vbr"),
+                    "qvbr": passing_measurement("qvbr"),
+                },
+            }
+
+        boundary = fixture()
+        for measured in boundary["modes"].values():
+            measured["peak_window_kbps"] = measured["limits"]["advertised_peak_kbps"]
+        self.assertEqual(BENCH["evaluate_rate_control"]([boundary]), [])
+
+        for mode in ("vbr", "qvbr"):
+            with self.subTest(mode=mode):
+                overshoot = fixture()
+                overshoot["modes"][mode]["peak_window_kbps"] = 12160.001
+                peak_failures = [
+                    failure
+                    for failure in BENCH["evaluate_rate_control"]([overshoot])
+                    if failure["code"] == "advertised_peak_exceeded"
+                ]
+                self.assertEqual(peak_failures, [{
+                    "code": "advertised_peak_exceeded",
+                    "fixture": "easy",
+                    "mode": mode,
+                    "observed_kbps": 12160.001,
+                    "limit_kbps": 12160.0,
+                    "window_seconds": 10.0,
+                }])
+
+    def test_missing_invalid_or_wrong_window_peak_evidence_fails_closed(self):
+        cases = (
+            ("peak_window_kbps", MISSING),
+            ("peak_window_kbps", None),
+            ("peak_window_kbps", float("nan")),
+            ("peak_window_kbps", float("inf")),
+            ("peak_window_kbps", 0.0),
+            ("peak_window_kbps", True),
+            ("peak_window_kbps", "12160"),
+            ("peak_window_seconds", MISSING),
+            ("peak_window_seconds", 12.0),
+            ("advertised_peak_kbps", MISSING),
+            ("advertised_peak_kbps", -1.0),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                fixture = {
+                    "identity": "easy",
+                    "class": "easy",
+                    "modes": {
+                        "vbr": passing_measurement("vbr"),
+                        "qvbr": passing_measurement("qvbr"),
+                    },
+                }
+                measured = fixture["modes"]["qvbr"]
+                target = measured["limits"] if field == "advertised_peak_kbps" else measured
+                if value is MISSING:
+                    target.pop(field)
+                else:
+                    target[field] = value
+                failures = BENCH["evaluate_rate_control"]([fixture])
+                self.assertTrue(any(
+                    failure["code"] == "peak_evidence_invalid"
+                    and failure["mode"] == "qvbr"
+                    and field in failure["invalid_fields"]
+                    for failure in failures
+                ))
+                json.dumps(failures, allow_nan=False)
+
+        fixture = {
+            "identity": "easy",
+            "class": "easy",
+            "modes": {
+                "vbr": passing_measurement("vbr"),
+                "qvbr": passing_measurement("qvbr"),
+            },
+        }
+        fixture["modes"]["qvbr"]["limits"] = None
+        failures = BENCH["evaluate_rate_control"]([fixture])
+        self.assertTrue(any(
+            failure["code"] == "peak_evidence_invalid"
+            and failure["mode"] == "qvbr"
+            and "advertised_peak_kbps" in failure["invalid_fields"]
+            for failure in failures
+        ))
+
+    def test_bufsize_window_and_theoretical_vbv_remain_nonbinding_diagnostics(self):
+        fixture = {
+            "identity": "easy",
+            "class": "easy",
+            "modes": {
+                "vbr": passing_measurement("vbr"),
+                "qvbr": passing_measurement("qvbr"),
+            },
+        }
+        for measured in fixture["modes"].values():
+            measured["bufsize_window_peak_kbps"] = 1_000_000.0
+            measured["limits"]["theoretical_vbv_allowance_kbps"] = 1.0
+        self.assertEqual(BENCH["evaluate_rate_control"]([fixture]), [])
 
     def test_duration_mismatch_and_rate_limit_derivation_are_pinned(self):
         fixture = {
@@ -916,16 +1185,23 @@ class RateControlBenchCase(unittest.TestCase):
         self.assertAlmostEqual(limits["bufsize_window_seconds"], 4 / 3)
         self.assertEqual(
             limits["peak_contract_status"],
-            "unratified_owner_decision_required",
+            "owner_ratified_2026-08-12",
         )
         self.assertEqual(
             limits["advertised_peak_role"],
-            "diagnostic_pending_owner_ratification",
+            "binding_limit_for_10_second_complete_served_segment_peak",
         )
         self.assertEqual(
             limits["theoretical_vbv_role"],
-            "diagnostic_pending_owner_ratification",
+            "diagnostic_nonbinding",
         )
+        self.assertEqual(limits["binding_gate"], {
+            "measurement": "peak_window_kbps",
+            "window_seconds": 10.0,
+            "comparison": "less_than_or_equal",
+            "limit": "advertised_peak_kbps",
+            "scope": "full_n1_vbr_qvbr_acceptance",
+        })
         with self.assertRaisesRegex(
             BENCH["BenchError"], "internally inconsistent ladder rung"
         ):
@@ -934,7 +1210,7 @@ class RateControlBenchCase(unittest.TestCase):
                 10.0,
             )
 
-    def test_measured_capture_records_both_disputed_peak_windows(self):
+    def test_measured_capture_records_binding_and_diagnostic_peak_windows(self):
         segments = [
             {"duration_seconds": 2.0, "bytes": 3_000_000},
             *[
@@ -973,12 +1249,12 @@ class RateControlBenchCase(unittest.TestCase):
         self.assertEqual(measured["peak_window_seconds"], 10.0)
         self.assertEqual(
             measured["peak_window_role"],
-            "configured_complete_served_segment_window_diagnostic",
+            "complete_served_segment_10_second_peak_measurement",
         )
         self.assertEqual(measured["bufsize_window_peak_kbps"], 12000.0)
         self.assertEqual(
             measured["bufsize_window_peak_role"],
-            "perf2_v2_candidate_diagnostic",
+            "diagnostic_nonbinding_derived_bufsize_window",
         )
         self.assertAlmostEqual(measured["limits"]["bufsize_window_seconds"], 4 / 3)
 
@@ -994,6 +1270,45 @@ class RateControlBenchCase(unittest.TestCase):
         self.assertEqual(smoke_measurement["peak_window_seconds"], 12.0)
         self.assertEqual(smoke_measurement["peak_window_kbps"], 2833.333)
         self.assertNotIn("10_second", smoke_measurement["peak_window_role"])
+        self.assertEqual(
+            smoke_measurement["limits"]["advertised_peak_role"],
+            "reference_only_for_nonacceptance_window",
+        )
+        self.assertNotIn("binding_gate", smoke_measurement["limits"])
+
+    def test_smoke_console_does_not_label_a_twelve_second_peak_as_binding(self):
+        measured = passing_measurement("vbr")
+        measured["peak_window_seconds"] = 12.0
+        measured["peak_window_role"] = (
+            "configured_complete_served_segment_window_nonacceptance"
+        )
+        measured["limits"].pop("binding_gate")
+        measured["limits"]["advertised_peak_role"] = (
+            "reference_only_for_nonacceptance_window"
+        )
+        report = {
+            "acceptance": {"eligible": False},
+            "fixtures": [{
+                "identity": "easy",
+                "modes": {"vbr": measured},
+            }],
+            "passed": True,
+            "failures": [],
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            BENCH["print_rate_control"](report)
+        self.assertIn("12s nonacceptance peak", output.getvalue())
+        self.assertIn("advertised reference", output.getvalue())
+        self.assertNotIn("10s binding", output.getvalue())
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            BENCH["print_rate_control"]({
+                "acceptance": None,
+                "fixtures": [],
+                "passed": False,
+                "failures": [{"code": "harness_error"}],
+            })
 
     def test_zero_speed_cannot_pass_full_comparison(self):
         for baseline, candidate, expected_modes in (

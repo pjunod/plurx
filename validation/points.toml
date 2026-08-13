@@ -509,7 +509,7 @@ paths = [
   "deploy/**",
   "crates/plurxd/build.rs",
   "crates/plurxd/src/version.rs",
-  "scripts/{bench,dv-evidence,gop-census,mkpgs,perf-report,perf2-rate-control-smoke-corpus.json,ship}",
+  "scripts/{bench,dv-evidence,gop-census,mkpgs,perf-report,perf2-rate-control-n1-corpus.json,perf2-rate-control-smoke-corpus.json,ship}",
   "scripts/container-smoke",
   "tests/operations/**",
 ]

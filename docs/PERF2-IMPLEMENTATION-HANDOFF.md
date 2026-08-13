@@ -101,9 +101,9 @@ good the feature is.
 
 ## 2. Decisions in force
 
-Paul ratified PERF2-PLAN §14's recommended defaults on 2026-08-09. Every one
-remains a runtime setting, so changing one later is a settings flip, not a code
-change. In force for implementation:
+Paul ratified PERF2-PLAN §14's recommended runtime defaults on 2026-08-09 and
+the N1 peak/storage contracts on 2026-08-12. D1–D6 remain runtime settings;
+D7–D8 are binding implementation contracts. In force for implementation:
 
 | Decision | Implement as |
 |---|---|
@@ -113,9 +113,12 @@ change. In force for implementation:
 | D4 HEVC auto | ship `transcode.output_codec = h264`; `auto` is opt-in |
 | D5 quality targets | family-tuned defaults calibrated during N1 acceptance |
 | D6 LLM backend | `none`, forever the default |
+| D7 N1 peak gate | each mode's exact 10 s complete-served-segment peak ≤ unchanged advertised peak; derived bufsize-window and theoretical VBV remain diagnostics |
+| D8 N1 offline identity | one non-null `vbr` / `qvbr:<q>` column; SQLite v18, replicated v5/protocol v4 fresh bootstrap/import, existing replicated v4 refused, N3 SQLite v19 |
 
-If the operator ratifies otherwise mid-build, the change lands as a
-settings-default commit with a CHANGELOG line — nothing structural.
+If the operator changes D1–D6 mid-build, that lands as a settings-default
+commit with a CHANGELOG line. Changing D7 or D8 is a new contract decision and
+must follow the stop-and-flag rule.
 
 ---
 
@@ -379,6 +382,8 @@ maintenance. Full acceptance also requires the exact VMAF model,
 `n_subsample=1`, 10-second window, 0.25-second poll, 3-second settle delay,
 recorded timing, usable server video facts, identical cross-mode ladder facts,
 and session/status identity equal to the server-selected encoder. Idle checks
+also reject producer/offline/other-delivery activity before mutation or
+capture, and every capture poll requires exactly the owned HLS session. They
 are immediate observations,
 not GET-to-PUT locks; bounded polling may still include one in-flight 30-second
 HTTP timeout and otherwise reports the safe two-field manual rollback body.
@@ -387,19 +392,23 @@ flags or fallback: N1's boot/production tests and the separate forced-fallback
 acceptance run must do that. Then:
 `EffectiveRateControl` resolved post-validation; the single
 `effective_recipe()` builder replacing the four constructor sites
-(`transcode.rs:2430,2607,2694` + the test helper); the per-family flag
-arms in the `rate_control` closure (`encoder.rs:138-152` — boot
-validation covers new flags for free via `validation_args`,
-`encoder.rs:328`); offline packages persisting effective recipe inputs
-at creation.
+(`transcode.rs:2473,2755,2941,3014` + the cross-path fixture at `:5980`);
+the per-family flag arms in `Encoder::encode_args`
+(`encoder.rs:215-306` — boot validation covers the same production arguments
+via `validation_args`, `encoder.rs:485`, pinned at `:1338-1352`); offline
+packages persisting effective recipe inputs
+at creation. Owner decisions recorded 2026-08-12: the full harness binds the
+10-second complete-served-segment peak to the advertised peak; the derived
+bufsize-window observation and theoretical VBV allowance stay diagnostic.
+Offline packages use one non-null `effective_rate_control` column (`vbr` or
+`qvbr:<q>`), SQLite v18 with existing rows defaulted/backfilled to `vbr`, and
+replicated schema v5 with protocol v4; N3's SQLite migration moves to v19.
 *Stop-and-flag if:* the legacy VBR digest bytes cannot be preserved
 exactly; or a driver family needs flags that `validation_args`'s
-15-frame probe cannot exercise; or offline snapshot storage wants a
-schema change beyond a column (that is v18+ territory — say so); or the owner
-has not ratified whether peak acceptance uses v2's bufsize window or PR #131's
-10-second complete-served-segment window. Until that choice is recorded, both
-candidate-window observed peaks and the 10-second VBV allowance remain
-diagnostic, and a full artifact must stay ineligible and non-passing.
+15-frame probe cannot exercise; or offline snapshot storage needs anything
+beyond that ratified single column; or implementation would change the
+ratified 10-second binding peak. Such a change is a new §11 contract decision,
+not an implementation detail.
 *Acceptance:* plan §4's block, on nynuc, numbers in the PR.
 
 ### N2 — per-title analysis (plan §5)
@@ -419,7 +428,7 @@ decision).
 
 **The spike is not optional.** N3.0 proves the continuation protocol on
 fixtures (every enabled encoder family) with the §6.4 packet gates as
-its exit; only then does the v18 schema, producer `kind=prefix`, or any
+its exit; only then does the v19 schema, producer `kind=prefix`, or any
 serving change land. The serving contract is the plan's, verbatim:
 server-owned served playlist, `-output_ts_offset` + `-start_number`,
 fresh source `stat` equality before publish, artifact manifest

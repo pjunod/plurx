@@ -22,7 +22,10 @@ use super::{keys, ApiKeyStore, PlaybackTelemetryStore, SettingsStore, UserStore}
 use crate::domain::{ApiKey, PlaybackEvent, PlaybackEventQuery, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 4;
+// v5 is a fresh-bootstrap/import schema. There is deliberately no in-place
+// replicated v4 migration here: existing clusters must fail compatibility
+// until the clustering upgrade protocol owns that transition.
+pub const AUTH_SCHEMA_VERSION: i64 = 5;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -560,6 +563,30 @@ impl SettingsStore for HiqliteAuthStore {
         Ok(rows.into_iter().next().map(|row| row.value))
     }
 
+    async fn get_setting_pair(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError> {
+        let sql = "SELECT key, value FROM settings WHERE key = $1 OR key = $2 ORDER BY key";
+        validate_sql(sql)?;
+        let rows = timeout_store(
+            self.client()
+                .query_consistent_map::<SettingEntryRow, _>(sql, params!(first, second)),
+        )
+        .await?;
+        let mut pair = (None, None);
+        for row in rows {
+            if row.key == first {
+                pair.0 = Some(row.value.clone());
+            }
+            if row.key == second {
+                pair.1 = Some(row.value);
+            }
+        }
+        Ok(pair)
+    }
+
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = self.now()?;
         self.execute(
@@ -569,6 +596,26 @@ impl SettingsStore for HiqliteAuthStore {
             params!(key, value, now),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn put_settings(&self, values: &[(&str, &str)]) -> Result<(), StoreError> {
+        let now = self.now()?;
+        let sql = "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                   ON CONFLICT(key) DO UPDATE SET \
+                   value = excluded.value, updated_at = excluded.updated_at";
+        validate_sql(sql)?;
+        self.client()
+            .txn(
+                values
+                    .iter()
+                    .map(|(key, value)| (sql.to_owned(), params!(*key, *value, now))),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1046,6 +1093,20 @@ impl From<&mut Row<'_>> for SettingValueRow {
     }
 }
 
+struct SettingEntryRow {
+    key: String,
+    value: String,
+}
+
+impl From<&mut Row<'_>> for SettingEntryRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            key: row.get("key"),
+            value: row.get("value"),
+        }
+    }
+}
+
 struct UserRow {
     id: i64,
     username: String,
@@ -1270,6 +1331,15 @@ mod tests {
         )
         .expect_err("old schema must refuse");
         assert!(error.to_string().contains("incompatible"));
+
+        let existing_v4 = CompatibilityRow {
+            schema_version: 4,
+            protocol_min: AUTH_PROTOCOL_VERSION,
+            protocol_max: AUTH_PROTOCOL_VERSION,
+        };
+        let error = verify_compatibility_rows(vec![existing_v4], ClusterCompatibility::CURRENT)
+            .expect_err("fresh-bootstrap v5 must not imply an in-place v4 upgrade");
+        assert!(error.to_string().contains("schema 4 is incompatible"));
 
         let old_protocol = ClusterCompatibility {
             schema_version: AUTH_SCHEMA_VERSION,

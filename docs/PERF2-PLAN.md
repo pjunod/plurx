@@ -321,23 +321,43 @@ each stall instant, joined in one record. An Android play produces a
 
 ## 4. N1 — Quality-bounded rate control
 
-**Implementation status (2026-08-09):** the live-session capture/offline-score
-rate-control harness and the legacy-VBR golden recipe fixture are implemented
-in source. Production encoding remains the deployed server's unchanged
-Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is behavior-probed and
-scores captured bytes on the controller only after the production session
-ends; it never encodes playback or becomes a live-path dependency. No scorer is
-installed or needed on nynuc or in compose: nynuc performs production encoding
-and the accepted laptop controller scorer runs afterward. No N1 encoder flags
-or settings are implemented by this slice. The named-machine quantitative
-capture/full comparison remains unclaimed, as do N1 boot/production evidence
-and the separate forced-fallback run that prove the requested mode executed.
-PR #131 review also stop-flagged the peak contract: v2 named an advertised-peak
-gate over a bufsize window, while the merged harness implemented a 10-second
-complete-served-segment advertised-peak gate. The harness records observed
-served-byte peaks over both candidate windows plus the 10-second theoretical
-VBV allowance. Neither interpretation is binding until the owner ratifies one;
-full artifacts remain explicitly ineligible and non-passing meanwhile.
+**Implementation status (2026-08-12):** the harness, runtime settings,
+per-family quality arguments, behavioral validation/fallback, atomically
+published effective mode, single recipe builder, legacy-VBR golden identity,
+and pinned full SDR corpus are implemented in source. A two-second background
+refresh on each server reads the replicated requested pair and validates
+changes against that node's encoder. Those runtime probes share the existing
+offline/speculative encoder lane, reserve background admission, defer behind
+viewer/offline work, and kill/defer the probe if a viewer or offline job
+arrives. A three-second per-family deadline kills/reaps a wedged probe and
+defers the change; timeout or contention does not become a false capability
+refusal. Session
+creation remains an in-memory snapshot read, and one live session keeps one
+captured generation through fallback. Live sessions and the speculative
+producer can use the validated effective quality mode. The owner ratified the
+one-column offline snapshot on 2026-08-12: SQLite v18 and replicated schema v5
+persist exactly `vbr` or `qvbr:<q>` when a package is created, existing rows
+backfill to `vbr`, and every resume uses that immutable value rather than the
+mutable global request. The replicated protocol remains v4 because no wire
+operation changes; schema v5 applies to fresh bootstrap/import, and an existing
+v4 cluster stays refused until the clustering upgrade protocol exists. N3's
+previously reserved SQLite v18 migration moves to v19.
+Production encoding still uses the deployed
+server's Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is
+behavior-probed and scores captured bytes on the controller only after the
+production session ends; it never encodes playback or becomes a live-path
+dependency. No scorer is installed or needed on nynuc or in compose: nynuc
+performs production encoding and the accepted laptop controller scorer runs
+afterward. The named-machine quantitative capture/full comparison remains
+unclaimed, as do N1 boot/production evidence and the separate forced-fallback
+run that prove the requested mode executed.
+The owner also ratified the 10-second complete-served-segment advertised-peak
+gate on 2026-08-12. A fixed 10-second window spans five nominal HLS segments
+and is stable under the served-segment measurement quantum; the derived
+`bufsize / maxrate` window is about 1.33 seconds under the current caps and
+collapses to a single two-second segment. The harness keeps the derived-window
+observation and 10-second theoretical VBV allowance as diagnostics, but only
+the observed 10-second peak is binding against `Rung.peak_kbps`.
 
 **Objective:** stop paying fixed bitrates for content that doesn't need
 them. Same encoders, same ladder heights, same caps — but the target
@@ -351,8 +371,8 @@ Jellyfin moved its QSV defaults the same direction in
 
 ### 4.1 Per-family quality modes
 
-One new arm in the `rate_control` closure (`encoder.rs:138-152`), keyed
-by a `RateMode` in `TranscodeOptions`:
+One new arm in `Encoder::encode_args` (`encoder.rs:215-306`), keyed by the
+effective rate control in `TranscodeOptions`:
 
 | Family | Quality mode | Flags (caps retained) |
 |---|---|---|
@@ -368,8 +388,9 @@ BANDWIDTH stays honest, and the client-facing contract does not move.
 
 ### 4.2 Guarded by boot validation, not hope
 
-`validation_args()` runs the production argument set (`encoder.rs:328`;
-pinned by the window-comparison test at `encoder.rs:797-828`), so every
+`validation_args()` runs the production argument set (`encoder.rs:485`;
+pinned by `the_quality_probe_encodes_with_the_production_quality_arguments` at
+`encoder.rs:1338-1352`), so every
 new flag is exercised against the real driver at boot. ICQ/QVBR
 availability genuinely varies by generation and driver (Intel's own
 tracker has holes — [media-driver #1597](https://github.com/intel/media-driver/issues/1597));
@@ -377,6 +398,21 @@ the failure mode is therefore *a boot log line and a per-family
 fallback to today's VBR*, never a viewer-facing error. A family whose
 quality mode fails validation records that in the new `EncoderCaps`
 fields (§3.5) and keeps bitrate mode.
+
+Missing or empty durable quality is the valid family-default request. A
+present nonempty value that cannot parse as the bounded integer is corruption,
+not an alias for that default: boot, refresh, and settings reporting fail the
+whole pair closed to bitrate with no quality override.
+
+Runtime revalidation is lower priority than playback. It shares the serialized
+offline/speculative encoder lane, reserves the same background
+hardware/software admission used by speculative work, refuses to start while
+viewer or offline work is waiting, and terminates its probe if either arrives.
+A three-second per-family deadline also terminates and reaps a wedged child. A
+yielded or timed-out probe retains the last validated snapshot and is retried;
+it is never recorded as a driver refusal. A direct admin quality
+change that cannot acquire that safe probe window returns conflict before
+either requested setting is written.
 
 ### 4.3 Contract changes — one effective identity, everywhere (review R4)
 
@@ -388,15 +424,13 @@ fields (§3.5) and keeps bitrate mode.
   validation and atomically publishes the new effective mode; a
   session never hashes a requested-but-unvalidated value, so a
   fallback can never cache one encoding under another's identity.
-- **One `effective_recipe()` builder feeds every path.** The tree has
-  four recipe constructors today (live lookup, speculative producer,
-  offline, tests — `transcode.rs:2430,2607,2694`); changing their
-  digest strings independently is a drift trap. They collapse into one
-  builder whose input is the normalized, validated `TranscodeOptions`
-  (rate control included; output codec joins it in N5). `rate_control`
-  moves from the manager-level `PipelineDigest` constant
-  (`recipe.rs:72`) into the per-recipe fields, since N2 makes quality
-  per-title.
+- **One `effective_recipe()` builder feeds every path.** The implemented
+  builder (`transcode.rs:2473`) receives normalized, validated
+  `TranscodeOptions` and is used by live lookup, speculative production, and
+  offline production (`transcode.rs:2755,2941,3014`). The binding cross-path
+  fixture starts at `transcode.rs:5980`. Rate control is hashed as a
+  per-recipe field (`recipe.rs:100-104`), which preserves per-title quality for
+  N2; output codec joins the normalized options in N5.
 - **Legacy digest bytes are preserved exactly.** Bitrate mode keeps
   `vbr:maxrate1.5x:bufsize2x` byte-for-byte (golden-hash fixtures pin
   it); every effective QVBR value hashes differently (inequality
@@ -405,10 +439,17 @@ fields (§3.5) and keeps bitrate mode.
 - **Offline packages pin their effective recipe at creation.** A
   package can yield and requeue mid-preparation, and
   `set_offline_package_recipe` accepts only the original hash
-  (`store/sqlite/offline.rs:423-438`) — a hot setting change
+  (`store/sqlite/offline.rs:441-455`) — a hot setting change
   mid-package would strand it. The package row persists its effective
   recipe inputs at creation; every resume rebuilds from that snapshot,
-  never from current settings.
+  never from current settings. The ratified one-column representation is
+  `vbr` or `qvbr:<q>` in SQLite v18 and replicated schema v5; the v18 default
+  and backfill are `vbr`, so an upgrade cannot silently reinterpret an
+  in-progress package. The snapshot is server-derived and first-write-wins
+  under the client's `request_id`: a transport retry after a global policy
+  change returns the original package and value. This is an additive schema
+  change, but downgrade still
+  requires restoring the matching pre-deploy database snapshot.
 - `EncoderCaps` gains per-family `quality_rc: bool` from validation.
 - Settings: `transcode.rate_mode` = `bitrate` (default) | `quality`;
   `transcode.quality` = an optional single override — unset means the
@@ -433,16 +474,17 @@ explicit separate scorer decodes them for VMAF offline. Shape:
 --vmaf-model vmaf_v0.6.1 --vmaf-subsample 1
 --rate-window 10.0 --poll 0.25
 --settings-settle 3.0
---json out/rate-control.json`. **Peak-contract stop:** the harness records the
-observed complete-segment peak over both the 10-second PR #131 window and v2's
-derived `bufsize / maxrate` window, plus the inferred 10-second
-`maxrate + bufsize/window` allowance, as diagnostics. It sets
-`acceptance.eligible: false`, emits `peak_contract_unratified`, and fails
-nonzero. Owner ratification must choose the binding peak definition before N1
-acceptance can proceed. The remaining full-comparison contract requires unique
+--json out/rate-control.json`. The observed complete-served-segment peak over
+exactly 10 seconds is binding for both VBR and requested quality mode and must
+not exceed the unchanged advertised `Rung.peak_kbps`. The observed peak over
+the derived `bufsize / maxrate` window and the inferred 10-second
+`maxrate + bufsize/window` allowance remain recorded, explicitly nonbinding
+diagnostics. The full-comparison contract also requires unique
 filenames, resolved reference paths, and pinned hashes across equal nonempty
 easy/hard SDR halves;
-full-corpus scope; maintenance-node exclusivity; exact model, subsample,
+full-corpus scope; maintenance-node exclusivity proven at each boundary by no
+producer/offline/other-delivery activity and exactly one owned capture session;
+exact model, subsample,
 window, poll, and settle parameters; recorded measurement timing; probed and
 available server video facts; stable StartResponse/status identity equal to the
 server-selected encoder; and identical advertised/derived ladder facts across
@@ -452,8 +494,8 @@ between completed responses, while one in-flight HTTP request may add its
 flags or fallback executed; N1 boot validation/production tests and a separate
 forced-fallback run supply that evidence. The scorer never encodes production
 playback, becomes `PLURX_FFMPEG`, joins the compose service, or enters the live
-path. After peak-contract ratification, quality mode must produce ≤ the bytes
-of bitrate mode on the easy half of the corpus at equal-or-better VMAF (VMAF
+path. Quality mode must produce ≤ the bytes of bitrate mode on the easy half
+of the corpus at equal-or-better VMAF (VMAF
 offline only,
 `n_subsample=1` — never in the live path, principle 7); encode speed within
 10% of bitrate mode; a session on a family whose driver refuses the mode
@@ -1168,13 +1210,15 @@ All changes flow through the single `effective_recipe()` builder
   constant to a per-recipe field carrying the *effective* mode —
   legacy bytes preserved exactly for bitrate mode (`vbr:…`), distinct
   per effective QVBR value; golden-hash + cross-path fixtures pin it.
-  Offline packages persist their effective recipe inputs at creation.
+  Offline packages persist their effective recipe inputs at creation in
+  SQLite **v18** and replicated schema **v5** (`vbr` or `qvbr:<q>`; existing
+  rows default/backfill to `vbr`). The replicated protocol remains v4.
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
 - N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
-  manifest on location rows (schema **v18**; N0's telemetry table is
-  **v17** — unique versions per slice, review R8, renumbered after the
-  pre-existing offline-package v16 migration was discovered); `prefix_secs` in
+  manifest on location rows (schema **v19**; N0's telemetry table is
+  **v17** and N1's offline rate-control snapshot is **v18** — unique versions
+  per slice, review R8); `prefix_secs` in
   the recipe.
 - N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
   HEVC changes the `muxer`/`segment_policy` fields — its own
@@ -1297,6 +1341,19 @@ settings and may be amended without changing the contracts below.
    the `command` adapter with a local 8B model is the
    no-strings option; the `http` adapter is better prose for cents a
    day. Nothing in the product will ever notice the difference.
+7. **D7 — N1 peak gate.** Ratified 2026-08-12: bind each mode's
+   complete-served-segment rolling peak over exactly 10 seconds to the
+   unchanged advertised `Rung.peak_kbps`. Keep the observed derived
+   `bufsize / maxrate` window and theoretical 10-second VBV allowance as
+   nonbinding diagnostics. Five nominal HLS segments make the fixed window
+   reviewable; the current derived window is shorter than one segment.
+8. **D8 — N1 offline identity storage.** Ratified 2026-08-12: one non-null
+   `offline_packages.effective_rate_control` column containing `vbr` or
+   `qvbr:<q>`. SQLite v18 defaults/backfills existing rows to `vbr`;
+   replicated schema v5 uses the same representation for fresh
+   bootstrap/import and keeps protocol v4. Existing replicated v4 clusters
+   remain refused pending the clustering upgrade protocol. N3's SQLite
+   migration moves to v19.
 
 ---
 
