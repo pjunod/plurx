@@ -163,9 +163,13 @@ The evidence window starts only after the first presented frame. Stage-zero
 byte and time counters reset there, and each stage's measured rate spans only
 its first through last delivered byte, so browser preparation before a transfer
 and player idle after it cannot dilute a leaked pre-cliff rate. A one-second
-rolling peak accompanies the whole-stage rate so slower delivery later in the
-stage cannot hide a short shaper leak. The configured 1.25 tolerance admits the
-bucket's deliberate 250 ms credit without admitting a faster sustained window.
+rolling peak accompanies the whole-stage rate so later slow delivery cannot
+dilute a qualifying mid-stage burst. Its sensitivity is explicit: some window
+must carry more than `1.25 × cap × 1 s` of bytes to fail the gate. Shorter or
+smaller bursts can stay below that bound; the whole-stage rate and the
+post-cliff cap remain the other independent checks. The 1.25 tolerance admits
+the bucket's deliberate 250 ms credit without admitting a faster sustained
+window.
 Only token reservations share the global scheduler; downstream socket drain
 remains per-connection, so one non-reading response cannot stop the rest of the
 shaped link. The proxy freezes one telemetry snapshot when the observation ends
@@ -202,9 +206,17 @@ describe adaptation. Every artifact therefore carries an `outcome`:
 
 The criteria live in `tests/playback/cases.json` beside the case, not in the
 script: restarts, upgrades per 60 s, the recovery deadline, and the sustained
-window are review material. Because the player rebuilds its per-attempt stall
-counter when it changes sessions, the scorer folds counter resets into one
-monotonic run-level count before deciding whether a window was stall-free.
+window are review material. The player gives every attempt a globally
+monotonic identity, while its raw stall counter carries across in-place
+`newAttempt()` changes and resets only when `play()` creates a new player
+object. The harness samples both identities. Attempt transitions therefore
+count same-reason restarts directly; a player-object transition records a
+`counter_rebase` and rebases the raw counter before deciding whether a window
+was stall-free. The current `stall-recovery` case restarts the live object, so
+its counter remains exact at any poll rate. A future case that can replace more
+than one player object between samples needs a player-owned monotonic total
+before it can claim the same evidence; intermediate counters would otherwise
+be unobservable.
 
 **What it deliberately does not do.** It injects no probe onto the play path,
 changes no rate control, and does not steer the player. Choosing a rung in

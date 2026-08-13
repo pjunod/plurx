@@ -436,6 +436,10 @@ function sample(atMs, overrides = {}) {
     height: 360,
     ttff_ms: 500,
     stalls: 0,
+    attempt_id: "a1",
+    attempt_reason: "cold-start",
+    player_generation: 1,
+    play_started_at: null,
     paused: false,
     seeking: false,
     ready_state: 4,
@@ -576,13 +580,43 @@ test("a new player attempt is a restart even when its rung and TTFF match", () =
     ...row,
     height: 720,
     ttff_ms: 1570,
-    attempt_reason: index < 20 ? "cold-start" : "stall-restart",
+    attempt_id: index < 20 ? "a1" : "a2",
+    attempt_reason: "stall-restart",
   }));
   const events = lab.rungHistory(restarted);
   assert.equal(events.length, 1,
     "the attempt identity is authoritative when presentation symptoms are unchanged");
   assert.equal(events[0].direction, "restart");
   assert.equal(events[0].attempt_reason, "stall-restart");
+});
+
+test("consecutive same-reason attempts cannot collapse below the restart budget", () => {
+  const restarted = healthyTimeline().map((row, index) => ({
+    ...row,
+    height: 720,
+    ttff_ms: 1570,
+    attempt_id: index < 10 ? "a1" : index < 20 ? "a2" : "a3",
+    attempt_reason: "stall-restart",
+  }));
+  const events = lab.rungHistory(restarted);
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.attempt_id), ["a2", "a3"]);
+  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: restarted }));
+  assert.equal(score.metrics.restarts, 2);
+  assert.equal(score.outcome, "recovery");
+  assert.ok(score.errors.some((error) => /automatic restarts/.test(error)), score.errors.join("; "));
+});
+
+test("attempt sequence gaps retain restarts hidden inside one sample interval", () => {
+  const restarted = healthyTimeline().map((row, index) => ({
+    ...row,
+    attempt_id: index < 20 ? "a1" : "a3",
+    attempt_reason: "stall-restart",
+  }));
+  const events = lab.rungHistory(restarted);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].restart_count, 2);
+  assert.equal(lab.scoreRecovery(CRITERIA, observation({ timeline: restarted })).metrics.restarts, 2);
 });
 
 // Both of the following were real defects, found by running the harness for
@@ -644,7 +678,9 @@ test("a restart cannot erase later stalls by resetting the player counter", () =
   const reset = healthyTimeline().map((row, index) => ({
     ...row,
     height: index < 20 ? 720 : 480,
+    attempt_id: index < 20 ? "a1" : "a2",
     attempt_reason: index < 20 ? "cold-start" : "quality",
+    player_generation: index < 20 ? 1 : 2,
     stalls: index < 20 ? 5 : index < 30 ? 0 : index < 38 ? 1 : 2,
   }));
   assert.equal(lab.rungHistory(reset).length, 1, "the counter reset occurs at one permitted restart");
@@ -655,21 +691,40 @@ test("a restart cannot erase later stalls by resetting the player counter", () =
   assert.match(score.errors[0], /never held/);
 });
 
-test("an equal-count restart cannot credit recovery before post-restart stalls", () => {
-  const reset = healthyTimeline().map((row, index) => ({
+test("an in-place restart does not recount stalls carried by the same player", () => {
+  const carried = healthyTimeline().map((row, index) => ({
     ...row,
     height: 720,
-    attempt_reason: index < 3 ? "cold-start" : "stall-restart",
+    attempt_id: index < 31 ? "a1" : "a2",
+    attempt_reason: index < 31 ? "cold-start" : "stall-restart",
     stalls: index === 0 ? 0 : index === 1 ? 1 : 2,
   }));
-  const events = lab.rungHistory(reset);
+  const events = lab.rungHistory(carried);
   assert.equal(events.length, 1);
-  assert.equal(events[0].at_ms, 3000);
-  assert.equal(lab.timeToSustained(reset, 10, 0.9), 3000,
-    "the first clean window starts after the equal-count restart, not before its two stalls");
-  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: reset }));
+  assert.equal(events[0].at_ms, 31_000);
+  assert.equal(events[0].counter_rebase, false);
+  assert.equal(lab.timeToSustained(carried, 10, 0.9), 2000,
+    "the restart must not add the same two pre-restart stalls a second time");
+  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: carried }));
   assert.equal(score.outcome, "passed");
-  assert.equal(score.metrics.recovered_after_ms, 3000);
+  assert.equal(score.metrics.recovered_after_ms, 2000);
+  assert.equal(score.metrics.restarts, 1);
+});
+
+test("missing attempt identity or an unexplained counter reset invalidates the run", () => {
+  const missing = healthyTimeline();
+  missing[5] = { ...missing[5], attempt_id: null };
+  const missingScore = lab.scoreRecovery(CRITERIA, observation({ timeline: missing }));
+  assert.equal(missingScore.outcome, "harness");
+  assert.match(missingScore.errors[0], /missing player attempt/);
+
+  const reset = healthyTimeline().map((row, index) => ({
+    ...row,
+    stalls: index < 10 ? 3 : 0,
+  }));
+  const resetScore = lab.scoreRecovery(CRITERIA, observation({ timeline: reset }));
+  assert.equal(resetScore.outcome, "harness");
+  assert.match(resetScore.errors[0], /decreased without an object rebase/);
 });
 
 // ------------------------------------------------------------ the artifact
