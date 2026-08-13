@@ -3707,6 +3707,22 @@ impl TranscodeManager {
         self.admissions.wait_for_slot()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_publish_supported_quality(&self, quality: u8) -> Encoder {
+        let encoder = self.encoder().await;
+        let mut quality_rc = QualityRc::default();
+        quality_rc.set_supported(encoder, true);
+        self.publish_rate_control(
+            RateControlSnapshot {
+                requested_mode: RateMode::Quality,
+                requested_quality: Some(quality),
+                quality_rc,
+            },
+            encoder,
+        );
+        encoder
+    }
+
     async fn validate_rate_control_snapshot(
         &self,
         mode: RateMode,

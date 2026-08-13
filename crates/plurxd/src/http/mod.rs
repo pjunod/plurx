@@ -2810,6 +2810,7 @@ mod tests {
         use plurx_core::domain::{
             AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
         };
+        use plurx_core::transcode::EffectiveRateControl;
 
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
@@ -2929,6 +2930,12 @@ mod tests {
         )
         .await;
         assert_eq!(status_code, StatusCode::OK, "{quality}");
+        let selected = state.transcode.test_publish_supported_quality(22).await;
+        assert_eq!(
+            state.transcode.effective_rate_control(selected),
+            EffectiveRateControl::Qvbr { quality: 22 },
+            "the retry must be made under a different effective server policy"
+        );
 
         let (status_code, retry) = call(&app, create()).await;
         assert_eq!(status_code, StatusCode::ACCEPTED, "{retry}");

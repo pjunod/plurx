@@ -424,15 +424,13 @@ either requested setting is written.
   validation and atomically publishes the new effective mode; a
   session never hashes a requested-but-unvalidated value, so a
   fallback can never cache one encoding under another's identity.
-- **One `effective_recipe()` builder feeds every path.** The tree has
-  four recipe constructors today (live lookup, speculative producer,
-  offline, tests — `transcode.rs:2430,2607,2694`); changing their
-  digest strings independently is a drift trap. They collapse into one
-  builder whose input is the normalized, validated `TranscodeOptions`
-  (rate control included; output codec joins it in N5). `rate_control`
-  moves from the manager-level `PipelineDigest` constant
-  (`recipe.rs:72`) into the per-recipe fields, since N2 makes quality
-  per-title.
+- **One `effective_recipe()` builder feeds every path.** The implemented
+  builder (`transcode.rs:2473`) receives normalized, validated
+  `TranscodeOptions` and is used by live lookup, speculative production, and
+  offline production (`transcode.rs:2755,2941,3014`). The binding cross-path
+  fixture starts at `transcode.rs:5980`. Rate control is hashed as a
+  per-recipe field (`recipe.rs:100-104`), which preserves per-title quality for
+  N2; output codec joins the normalized options in N5.
 - **Legacy digest bytes are preserved exactly.** Bitrate mode keeps
   `vbr:maxrate1.5x:bufsize2x` byte-for-byte (golden-hash fixtures pin
   it); every effective QVBR value hashes differently (inequality
@@ -441,7 +439,7 @@ either requested setting is written.
 - **Offline packages pin their effective recipe at creation.** A
   package can yield and requeue mid-preparation, and
   `set_offline_package_recipe` accepts only the original hash
-  (`store/sqlite/offline.rs:423-438`) — a hot setting change
+  (`store/sqlite/offline.rs:441-455`) — a hot setting change
   mid-package would strand it. The package row persists its effective
   recipe inputs at creation; every resume rebuilds from that snapshot,
   never from current settings. The ratified one-column representation is
