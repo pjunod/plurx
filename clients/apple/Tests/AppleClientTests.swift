@@ -4175,8 +4175,32 @@ final class AppleClientTests: XCTestCase {
             900,
             "the first row must begin inside the usable area below the tvOS tab bar"
         )
-        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "show"), .poster)
-        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "season"), .episode)
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "show"), .poster)
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "season"), .episode)
+    }
+
+    func testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate() {
+        XCTAssertEqual(
+            episodeCardAction(for: .artwork, itemID: 72),
+            .play
+        )
+        XCTAssertEqual(
+            episodeCardAction(for: .copy, itemID: 72),
+            .navigate(.item(72))
+        )
+        XCTAssertEqual(tvEpisodeCardSelectionAction(), .play)
+
+        var item = Item(id: 72, kind: "episode", title: "The Target")
+        item.episodeNumber = 3
+        XCTAssertEqual(episodeCardPlayAccessibilityLabel(item), "Play 3. The Target")
+        XCTAssertEqual(
+            episodeCardDetailsAccessibilityLabel(item),
+            "View details for 3. The Target"
+        )
+        XCTAssertNotEqual(
+            episodeCardPlayAccessibilityLabel(item),
+            episodeCardDetailsAccessibilityLabel(item)
+        )
     }
 
     func testTVPlayableDetailUsesOneCinematicViewportAndUsefulMetadata() throws {

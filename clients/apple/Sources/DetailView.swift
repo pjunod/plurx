@@ -677,6 +677,7 @@ struct DetailView: View {
     let itemId: Int
     @State private var detail: ItemDetail?
     @State private var play: PlayContext?
+    @State private var startingEpisodeID: Int?
     @State private var loadError: String?
     @State private var watchBusy = false
     @State private var actionError: String?
@@ -947,7 +948,12 @@ struct DetailView: View {
             audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
-                MediaRow(title: childrenHeading(item.kind), items: children)
+                MediaRow(
+                    title: childrenHeading(item.kind),
+                    items: children,
+                    style: Self.seriesChildStyle(for: item.kind),
+                    onPlayEpisode: playEpisodeFromSeason
+                )
                     .padding(.top, 18)
             }
         }
@@ -1110,7 +1116,12 @@ struct DetailView: View {
             audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
-                MediaRow(title: childrenHeading(item.kind), items: children)
+                MediaRow(
+                    title: childrenHeading(item.kind),
+                    items: children,
+                    style: Self.seriesChildStyle(for: item.kind),
+                    onPlayEpisode: playEpisodeFromSeason
+                )
                     .padding(.top, 18)
             }
         }
@@ -1204,7 +1215,12 @@ struct DetailView: View {
             audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
-                MediaRow(title: childrenHeading(item.kind), items: children)
+                MediaRow(
+                    title: childrenHeading(item.kind),
+                    items: children,
+                    style: Self.seriesChildStyle(for: item.kind),
+                    onPlayEpisode: playEpisodeFromSeason
+                )
                     .padding(.top, 8)
             }
         }
@@ -1391,7 +1407,8 @@ struct DetailView: View {
                 MediaRow(
                     title: childrenHeading(item.kind),
                     items: children,
-                    style: Self.tvSeriesChildStyle(for: item.kind)
+                    style: Self.seriesChildStyle(for: item.kind),
+                    onPlayEpisode: playEpisodeFromSeason
                 )
                 .padding(.top, 4)
             }
@@ -1447,10 +1464,6 @@ struct DetailView: View {
         return parts.joined(separator: "   ·   ")
     }
 
-    static func tvSeriesChildStyle(for kind: String) -> MediaRowStyle {
-        kind == "season" ? .episode : .poster
-    }
-
     static func hasTVPrimaryAction(
         _ detail: ItemDetail,
         seriesPlayback: PlayContext?
@@ -1472,6 +1485,10 @@ struct DetailView: View {
         .focused($tvFocusedAction, equals: .primaryAction)
     }
     #endif
+
+    static func seriesChildStyle(for kind: String) -> MediaRowStyle {
+        kind == "season" ? .episode : .poster
+    }
 
     @ViewBuilder
     private func audiobookContents(_ detail: ItemDetail) -> some View {
@@ -2137,25 +2154,13 @@ struct DetailView: View {
         resumeMs: Int,
         canResume: Bool
     ) -> some View {
-        let partOffset = item.isAudiobook ? (file.partOffsetMs ?? 0) : 0
-        let localDuration = file.durationMs ?? durationMs
-        let localResume = AudiobookTimeline.localPosition(
-            globalPositionMs: resumeMs,
-            partOffsetMs: partOffset
-        )
         let action = {
-            play = PlayContext(
-                itemId: item.id,
-                fileId: file.id,
-                startMs: canResume ? localResume : 0,
-                durationMs: localDuration,
-                progressOffsetMs: partOffset,
-                itemDurationMs: item.isAudiobook ? durationMs : nil,
-                title: item.title,
-                subtitle: playbackSubtitle(item),
-                year: item.year,
-                airDate: item.airDate,
-                overview: item.overview
+            play = primaryPlayContext(
+                item: item,
+                file: file,
+                durationMs: durationMs,
+                resumeMs: resumeMs,
+                canResume: canResume
             )
         }
         #if os(tvOS)
@@ -2182,6 +2187,69 @@ struct DetailView: View {
         .buttonStyle(IOSDetailPrimaryActionButtonStyle())
         .accessibilityLabel(canResume ? "Resume from \(formatTime(resumeMs))" : "Play")
         #endif
+    }
+
+    /// Resolve a season-card play through the same context builder and player
+    /// cover as the episode detail page's primary Play / Resume action.
+    private func playEpisodeFromSeason(_ summary: Item) {
+        guard startingEpisodeID == nil else { return }
+        startingEpisodeID = summary.id
+        actionError = nil
+        Task {
+            defer { startingEpisodeID = nil }
+            do {
+                let loaded = try await model.itemDetail(summary.id)
+                let item = loaded.item
+                let resumeMs = item.watch?.positionMs ?? summary.watch?.positionMs ?? 0
+                guard let file = Self.playbackFile(in: loaded, positionMs: resumeMs) else {
+                    actionError = "This episode has no playable file."
+                    return
+                }
+                let durationMs = file.durationMs ?? item.runtimeMs ?? summary.runtimeMs ?? 0
+                let canResume = AppModel.resumableStartMs(
+                    positionMs: resumeMs,
+                    durationMs: durationMs
+                ) > 0
+                play = primaryPlayContext(
+                    item: item,
+                    file: file,
+                    durationMs: durationMs,
+                    resumeMs: resumeMs,
+                    canResume: canResume
+                )
+            } catch {
+                actionError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func primaryPlayContext(
+        item: Item,
+        file: MediaFile,
+        durationMs: Int,
+        resumeMs: Int,
+        canResume: Bool
+    ) -> PlayContext {
+        let partOffset = item.isAudiobook ? (file.partOffsetMs ?? 0) : 0
+        return PlayContext(
+            itemId: item.id,
+            fileId: file.id,
+            startMs: canResume
+                ? AudiobookTimeline.localPosition(
+                    globalPositionMs: resumeMs,
+                    partOffsetMs: partOffset
+                )
+                : 0,
+            durationMs: file.durationMs ?? durationMs,
+            progressOffsetMs: partOffset,
+            itemDurationMs: item.isAudiobook ? durationMs : nil,
+            title: item.title,
+            subtitle: playbackSubtitle(item),
+            year: item.year,
+            airDate: item.airDate,
+            overview: item.overview
+        )
     }
 
     private func startOverButton(item: Item, file: MediaFile, durationMs: Int) -> some View {

@@ -9,10 +9,12 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-13): source is v0.2.7, Apple build 52. Native text
+> Status (2026-08-13): source is v0.2.7, Apple build 53. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 52 preserves completed offline asset locations across the
+> landed. Build 53 gives season episode artwork a direct Play action while the
+> copy remains Details on iPhone/iPad; tvOS keeps one lifted card whose Select
+> action plays. Build 52 preserves completed offline asset locations across the
 > equivalent `/private/var` and `/var` container spellings returned by the
 > system. Build 51 divides long final audio tails into bounded HLS segments,
 > completes repeated boundaries in the final 5% at their actual media position,
@@ -60,7 +62,7 @@ Vision investigation are recorded in
 | Session | Local login and remembered token | Local login, silent reconnect, bearer token in the Keychain (`TokenVault.swift`) so a new build does not sign the viewer out | — |
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode | Sorting, filters, denser iPad/tvOS layouts |
 | Session | Local login and remembered token | Local login and silent reconnect; bearer in the Keychain; origin and token are written together, so changing servers cannot leave the previous server's credential on disk; a 401/403 on any request after bootstrap clears the token and returns to the login screen instead of printing "Server returned 401" on every screen | Verify Keychain behavior across device restore and app replacement |
-| Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
+| Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; in a season listing, artwork plays that episode while the copy opens its detail page on iOS/iPadOS, and tvOS keeps one focus target whose Select action plays; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; a seek inside the growing playlist's advertised window moves the item's own clock instantly (`seekRoute`, mapped through `media_origin_ms`, held 1.5 s off the live edge), while out-of-window targets reopen the session at the film position after a 350 ms coalescing pause so a press burst costs one create; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped, and the predecessor item's supersession 404s no longer advance the recovery ladder mid-change. In a full-screen iOS window, the status bar and Home indicator stay while any player overlay is visible and retire after the last one leaves; windowed iPad status bars remain system-owned. | Device-verify in-window scrubs land without a spinner, out-of-window scrubs recover cleanly, iPad full-screen/Split View chrome, iPhone portrait/landscape, PiP return, hammered tvOS step-seeks during a quality change, and long transcodes |
@@ -270,6 +272,21 @@ hubs, libraries, and Coming Soon go out together, shelves and library pages
 publish as they arrive, and the spinner is reserved for a screen that has never
 held anything — so pull-to-refresh, leaving the player, and returning from the
 background all refresh in place instead of blanking.
+
+### Episode cards split on touch; tvOS keeps one focus target
+
+On iPhone and iPad, the landscape artwork in a season listing is a Play action;
+the title, metadata, and media badges below it are one separate Details action
+that opens `Route.item`. VoiceOver receives those two labels separately, because
+combining them would make the interaction depend on sighted hit testing again.
+
+tvOS deliberately does not copy that split. The focus engine selects a card,
+not a geometric half of one, so an episode card keeps its existing single lift
+and Select starts playback. This trades the card's previous detail navigation
+for the primary couch action instead of exposing two actions the Siri Remote
+cannot aim at. The season header's Play action and each card both reach the
+same `PlayContext` player cover; this is browse routing, not a second playback
+policy.
 
 ### 5. What the dynamic-range badge is allowed to claim
 
