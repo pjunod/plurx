@@ -160,16 +160,20 @@ at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
 edge the suite exists to observe.
 
 The evidence window starts only after the first presented frame. Stage-zero
-byte and time counters reset there, and each stage's measured rate spans only
-its first through last delivered byte, so browser preparation before a transfer
-and player idle after it cannot dilute a leaked pre-cliff rate. A one-second
-rolling peak accompanies the whole-stage rate so later slow delivery cannot
-dilute a qualifying mid-stage burst. Its sensitivity is explicit: some window
-must carry more than `1.25 × cap × 1 s` of bytes to fail the gate. Shorter or
-smaller bursts can stay below that bound; the whole-stage rate and the
-post-cliff cap remain the other independent checks. The 1.25 tolerance admits
-the bucket's deliberate 250 ms credit without admitting a faster sustained
-window.
+byte and time counters reset there. Each stage's whole-stage rate extends the
+first-to-last sample interval by the first delivered slice's cap-time, because
+the interval contains one fewer reservation wait than its byte count. That
+keeps browser preparation and player idle out without biasing a short stage
+high by `N/(N-1)`. A one-second rolling peak accompanies the whole-stage rate
+so later slow delivery cannot dilute a qualifying mid-stage burst. Its
+sensitivity is explicit: some window must carry more than
+`1.25 × cap × 1 s` of bytes to fail the gate. Shorter or smaller bursts can
+stay below that bound; the whole-stage rate and the post-cliff cap remain the
+other independent checks. The bucket's deliberate 250 ms credit consumes most
+of the 1.25 tolerance; slice quantization consumes the remainder. Scheduler
+delay lengthens the observed window and lowers the measured peak instead of
+spending additional headroom. The whole-stage estimator does not spend the
+tolerance on first-slice bias.
 Only token reservations share the global scheduler; downstream socket drain
 remains per-connection, so one non-reading response cannot stop the rest of the
 shaped link. The proxy freezes one telemetry snapshot when the observation ends
@@ -213,8 +217,8 @@ object. The harness samples both identities. Attempt transitions therefore
 count same-reason restarts directly; a player-object transition records a
 `counter_rebase` and rebases the raw counter before deciding whether a window
 was stall-free. The current `stall-recovery` case restarts the live object, so
-its counter remains exact at any poll rate. A future case that can replace more
-than one player object between samples needs a player-owned monotonic total
+its counter remains exact at any poll rate. A future case that can replace one
+or more player objects between samples needs a player-owned monotonic total
 before it can claim the same evidence; intermediate counters would otherwise
 be unobservable.
 

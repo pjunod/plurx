@@ -355,7 +355,10 @@ test("browser startup dead time cannot dilute a pre-cliff shaper leak", async ()
   shaper.record(750_000, true);
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
-  assert.equal(telemetry.stages[0].measured_kbps, 12_000);
+  assert.equal(telemetry.stages[0].measured_kbps, 6857.1,
+    "the whole-stage estimator includes the first delivered slice's cap-time");
+  assert.equal(telemetry.stages[0].peak_kbps, 12_000,
+    "the rolling peak still exposes the burst without counting browser startup");
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
   await shaper.close();
 });
@@ -375,7 +378,9 @@ test("idle time after the last byte cannot dilute a pre-cliff shaper leak", asyn
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
   assert.equal(telemetry.stages[0].held_seconds, 3.5);
-  assert.equal(telemetry.stages[0].measured_kbps, 13_714.3);
+  assert.equal(telemetry.stages[0].measured_kbps, 7384.6);
+  assert.equal(telemetry.stages[0].peak_kbps, 24_000,
+    "the last-byte boundary cannot dilute the delivered burst");
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
   await shaper.close();
 });
@@ -397,9 +402,31 @@ test("slower delivery after a mid-stage burst cannot dilute a shaper leak", asyn
   shaper.record(1_000_000, true);
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
-  assert.equal(telemetry.stages[0].measured_kbps, 4_320);
+  assert.equal(telemetry.stages[0].measured_kbps, 3692.3);
   assert.equal(telemetry.stages[0].peak_kbps, 13_600);
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
+  await shaper.close();
+});
+
+test("whole-stage rate includes the first slice's earning time", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("1mbps-to-0.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 0;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  const sliceBytes = 16 * 1024;
+  const sliceMs = sliceBytes * 8 / 1000;
+  for (let index = 0; index < 8; index += 1) {
+    shaper.record(sliceBytes, true);
+    now += sliceMs;
+  }
+  shaper.applyCliff();
+  const before = shaper.telemetry().stages[0];
+  assert.equal(before.measured_kbps, 1000,
+    "eight slices at the cap must not report the old 8/7 first-slice bias");
+  assert.equal(before.measured_media_kbps, 1000);
   await shaper.close();
 });
 
@@ -506,6 +533,15 @@ test("a shaper that leaked more than its cap fails as a shaping fault", () => {
   const score = lab.scoreRecovery(CRITERIA, leaked);
   assert.equal(score.outcome, "shaping");
   assert.match(score.errors[0], /leaked/);
+});
+
+test("a stage with no delivery samples invalidates shaping evidence", () => {
+  const missing = observation();
+  missing.shaping.stages[1].measured_kbps = null;
+  missing.shaping.stages[1].peak_kbps = null;
+  const score = lab.scoreRecovery(CRITERIA, missing);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /no delivery samples for after-cliff/);
 });
 
 test("a shaping transport error invalidates the recovery verdict", () => {
