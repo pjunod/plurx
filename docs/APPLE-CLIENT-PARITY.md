@@ -9,10 +9,12 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-12): source is v0.2.7, Apple build 51. Native text
+> Status (2026-08-13): source is v0.2.7, Apple build 52. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 51 divides long final audio tails into bounded HLS segments,
+> landed. Build 52 preserves completed offline asset locations across the
+> equivalent `/private/var` and `/var` container spellings returned by the
+> system. Build 51 divides long final audio tails into bounded HLS segments,
 > completes repeated boundaries in the final 5% at their actual media position,
 > and gives genuinely early repeats a telemetered **Try Again** / **Close**
 > failure instead of another automatic reopen. Build 49 adds first-class
@@ -31,7 +33,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 51 has not reached
+> resolved status. Repository evidence still says build 52 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -73,7 +75,7 @@ Vision investigation are recorded in
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
 | PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP controls on the AVPlayer surface | Add AirPlay affordances and remote-device session tests |
-| Offline/downloads | Missing | App-managed HLS packages on iPhone/iPad; durable background transfer, local-only playback, progress merge, quota/activity UI; hidden on tvOS | Physical background/process-death, airplane-mode, selected-subtitle, midpoint-seek, and removal-reconciliation matrix |
+| Offline/downloads | Missing | App-managed HLS packages on iPhone/iPad; durable background transfer, local-only playback, progress merge, quota/activity UI; `/private/var` and `/var` spellings of the same app container persist as one relaunch-safe asset path, and rejected locations leave a local diagnostic without exposing the path; hidden on tvOS | Physical background/process-death, airplane-mode, selected-subtitle, midpoint-seek, and removal-reconciliation matrix |
 | Accessibility | Browser semantics and keyboard controls | SwiftUI labels and tvOS focus basics | P2: VoiceOver, Dynamic Type, Reduce Motion, contrast, and focus audit |
 
 ## Recommended sequence

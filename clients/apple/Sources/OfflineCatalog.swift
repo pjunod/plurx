@@ -147,16 +147,45 @@ actor OfflineCatalog {
     }
 
     static func relativeLocalPath(for url: URL) -> String? {
-        let root = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).standardizedFileURL
-        let target = url.standardizedFileURL
-        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        guard target.path.hasPrefix(prefix) else { return nil }
-        return String(target.path.dropFirst(prefix.count))
+        relativeLocalPath(
+            for: url,
+            homeDirectory: URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        )
+    }
+
+    /// AVFoundation and Foundation can spell the same iOS data container as
+    /// `/private/var/...` and `/var/...`. Compare normalized path components
+    /// rather than raw strings so that alias cannot discard a completed asset.
+    /// Exact components also keep a sibling such as `<container>-other` from
+    /// passing the descendant check.
+    static func relativeLocalPath(for url: URL, homeDirectory: URL) -> String? {
+        let root = comparablePathComponents(for: homeDirectory)
+        let target = comparablePathComponents(for: url)
+        guard target.count > root.count,
+              target.starts(with: root)
+        else { return nil }
+        return target.dropFirst(root.count).joined(separator: "/")
     }
 
     static func localURL(for relativePath: String) -> URL {
-        URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-            .appendingPathComponent(relativePath)
+        localURL(
+            for: relativePath,
+            homeDirectory: URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        )
+    }
+
+    static func localURL(for relativePath: String, homeDirectory: URL) -> URL {
+        homeDirectory.appendingPathComponent(relativePath)
+    }
+
+    private static func comparablePathComponents(for url: URL) -> [String] {
+        let components = url.standardizedFileURL.pathComponents
+        guard components.count > 2,
+              components[0] == "/",
+              components[1] == "private",
+              components[2] == "var"
+        else { return components }
+        return ["/"] + Array(components.dropFirst(2))
     }
 
     private static func decodeIndex(at url: URL) -> [String: OfflineItem]? {
