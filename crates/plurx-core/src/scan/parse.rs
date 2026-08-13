@@ -112,6 +112,97 @@ pub struct ParsedEpisode {
     pub episode_title: Option<String>,
 }
 
+/// A book work derived from its shelf path. Text and audio formats use the
+/// same identity rule; the scanner keeps their media types separate when it
+/// looks the item up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedBook {
+    pub title: String,
+    pub year: Option<i32>,
+    /// Stable scanner identity: the work directory for numbered parts, or the
+    /// file itself for a single-file work. It retains any author directory so
+    /// two authors' identically titled books never collapse into one item.
+    pub identity_path: std::path::PathBuf,
+}
+
+/// Parse a text book or audiobook from a path beneath one of `roots`.
+///
+/// Audiobooks are often one M4B, but just as often a directory of `01.mp3`,
+/// `Track 02.flac`, or `Disc 1/Chapter 03.m4a`. In those cases the enclosing
+/// work directory is the identity; for a loose descriptive file, the stem is.
+/// This keeps a multi-file audiobook as one item without collapsing an
+/// author's entire shelf into one title.
+pub fn parse_book(path: &Path, roots: &[std::path::PathBuf]) -> ParsedBook {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let relative = roots.iter().find_map(|root| path.strip_prefix(root).ok());
+    let dirs: Vec<&str> = relative
+        .and_then(Path::parent)
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let parent = dirs.last().copied();
+    let (source, identity_path) = match parent {
+        // `Title/Disc 1/01.mp3` → Title, not Disc 1.
+        Some(p) if track_like(p) && dirs.len() >= 2 => (
+            dirs[dirs.len() - 2],
+            path.parent()
+                .and_then(Path::parent)
+                .unwrap_or(path)
+                .to_path_buf(),
+        ),
+        // `Title/01.mp3` and `Author/Title/01.mp3` → the enclosing work.
+        Some(p) if track_like(stem) => (p, path.parent().unwrap_or(path).to_path_buf()),
+        // A descriptive loose file is already the strongest title signal.
+        _ => (stem, path.to_path_buf()),
+    };
+
+    match extract_year(source) {
+        Some((year, at)) if !title_before_cruft(&source[..at]).is_empty() => ParsedBook {
+            title: title_before_cruft(&source[..at]),
+            year: Some(year),
+            identity_path,
+        },
+        _ => ParsedBook {
+            title: clean_title(source),
+            year: None,
+            identity_path,
+        },
+    }
+}
+
+fn track_like(raw: &str) -> bool {
+    let normalized = raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['.', '_', '-'], " ");
+    let normalized = normalized.trim();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let short_number = |token: &str| {
+        !token.is_empty() && token.len() <= 3 && token.chars().all(|c| c.is_ascii_digit())
+    };
+    // `01.mp3` and `01 - The Beginning.mp3`, but not the single-file book
+    // `1984.m4b`.
+    if tokens.first().is_some_and(|token| short_number(token)) {
+        return true;
+    }
+    ["track", "chapter", "part", "disc", "disk", "cd"]
+        .iter()
+        .any(|prefix| {
+            tokens.first().is_some_and(|first| {
+                (first == prefix && tokens.get(1).is_some_and(|token| short_number(token)))
+                    || first.strip_prefix(prefix).is_some_and(&short_number)
+            })
+        })
+}
+
 /// Normalize separators and collapse whitespace. Dots/underscores become
 /// spaces only in scene-style names (no existing spaces), so real titles like
 /// "Mr. Robot" survive.
@@ -579,6 +670,59 @@ mod tests {
     }
     fn home(p: &str) -> ParsedHomeMedia {
         parse_home_media(&PathBuf::from(p))
+    }
+
+    fn book(p: &str) -> ParsedBook {
+        parse_book(&PathBuf::from(p), &[PathBuf::from("/books")])
+    }
+
+    #[test]
+    fn books_keep_text_and_single_file_audio_titles() {
+        assert_eq!(
+            book("/books/Ursula K. Le Guin/The Dispossessed (1974).epub"),
+            ParsedBook {
+                title: "The Dispossessed".into(),
+                year: Some(1974),
+                identity_path: PathBuf::from(
+                    "/books/Ursula K. Le Guin/The Dispossessed (1974).epub"
+                ),
+            }
+        );
+        assert_eq!(
+            book("/books/Project Hail Mary.m4b"),
+            ParsedBook {
+                title: "Project Hail Mary".into(),
+                year: None,
+                identity_path: PathBuf::from("/books/Project Hail Mary.m4b"),
+            }
+        );
+    }
+
+    #[test]
+    fn audiobook_tracks_collapse_to_the_work_directory() {
+        assert_eq!(
+            book("/books/Andy Weir/Project Hail Mary/01.mp3").title,
+            "Project Hail Mary"
+        );
+        assert_eq!(
+            book("/books/Andy Weir/Project Hail Mary/Disc 1/Chapter 03.m4a").title,
+            "Project Hail Mary"
+        );
+        assert_eq!(
+            book("/books/Andy Weir/Project Hail Mary/01 - A Question.mp3").title,
+            "Project Hail Mary"
+        );
+        assert_eq!(
+            book("/books/Andy Weir/Project Hail Mary/Chapter 04 Grace.mp3").title,
+            "Project Hail Mary"
+        );
+        // A descriptive file under an author directory stays the title; the
+        // author must never become one giant audiobook.
+        assert_eq!(
+            book("/books/Andy Weir/The Martian.m4b").title,
+            "The Martian"
+        );
+        assert_eq!(book("/books/George Orwell/1984.m4b").title, "1984");
     }
 
     #[test]

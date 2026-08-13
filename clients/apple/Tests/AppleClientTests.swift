@@ -26,6 +26,7 @@ private struct LayoutFramePreferenceKey: PreferenceKey {
 private struct NativeAPIContractFixture: Decodable {
     let server: ServerInfo
     let itemDetail: ItemDetail
+    let audiobookDetail: ItemDetail
     let page: Page
     let decision: Decision
 }
@@ -259,6 +260,9 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(fixture.server.name, "Contract server")
         XCTAssertEqual(fixture.itemDetail.item.title, "The Contract")
+        XCTAssertTrue(fixture.audiobookDetail.item.isAudiobook)
+        XCTAssertEqual(fixture.audiobookDetail.files?.map(\.partOffsetMs), [0, 60_000, 180_000])
+        XCTAssertEqual(fixture.audiobookDetail.files?.first?.chapters?.first?.title, "Opening")
         XCTAssertEqual(fixture.page.items?.first?.rollup?.leaves, 20)
         XCTAssertEqual(fixture.decision.delivery?.mode, "remux")
         XCTAssertEqual(fixture.decision.deliveredDynamicRange, "dolby_vision")
@@ -2581,6 +2585,11 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(hdrOnly["dvprofile"], "")
         XCTAssertEqual(hdrOnly["dvhls"], "1")
         XCTAssertEqual(hdrOnly["vcodec"], "h264,hevc")
+        XCTAssertEqual(
+            hdrOnly["container"],
+            "mp4,mov,m4v,m4a,m4b,mp3,aac,flac,wav",
+            "supported audiobook sources must stay on AVPlayer's direct range path"
+        )
 
         let dolbyVision = dictionary(Caps.query(
             hevc: true,
@@ -3081,6 +3090,138 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testSeasonEpisodeSummaryKeepsResolutionAndRichHDRCompact() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let item = try decoder.decode(Item.self, from: Data(#"""
+        {"id":72,"kind":"episode","title":"The Target","season_number":1,
+         "episode_number":1,
+         "media":{"files":2,"bytes":80000000042,"video":"HEVC","height":2160,
+                  "hdr":"dolby_vision",
+                  "hdr_format":"Dolby Vision · Profile 7 (HDR10-compatible)",
+                  "audio":"TrueHD 7.1","container":"MKV"}}
+        """#.utf8))
+
+        XCTAssertEqual(item.media?.height, 2160)
+        XCTAssertEqual(item.media?.hdrFormat, "Dolby Vision · Profile 7 (HDR10-compatible)")
+        let badges = try XCTUnwrap(posterCardEpisodeSummaryBadges(item))
+        XCTAssertEqual(badges.map(\.kind), [.resolution, .dynamicRange])
+        XCTAssertEqual(badges.map(\.mark), [nil, "DV P7"])
+        XCTAssertEqual(badges.map(\.accessibilityLabel), [
+            "4K", "Dolby Vision · Profile 7 (HDR10-compatible)",
+        ])
+        XCTAssertNil(posterCardEpisodeSummaryBadges(
+            Item(id: 73, kind: "movie", title: "Not a season child")
+        ))
+    }
+
+    func testEpisodeDetailMediaInfoUsesExistingFileAndAudioFields() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let item = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":72,"kind":"episode","title":"The Target","season_number":1,"episode_number":1}"#.utf8)
+        )
+        let file = try decoder.decode(MediaFile.self, from: Data(#"""
+        {"id":11,"filename":"The.Target.S01E01.mkv","size":80000000000,
+         "duration_ms":3540000,"container":"mkv","video_codec":"hevc",
+         "video_profile":"Main 10","width":3840,"height":2160,"bit_depth":10,
+         "hdr":"dolby_vision",
+         "hdr_format":"Dolby Vision · Profile 7 (HDR10-compatible)",
+         "bitrate":48200000,
+         "audio_streams":[
+           {"index":0,"codec":"truehd","channels":8,"language":"eng",
+            "title":"Dolby Atmos","default":true},
+           {"index":1,"codec":"aac","channels":2,"language":"jpn",
+            "default":false}
+         ]}
+        """#.utf8))
+
+        let rows = DetailView.episodeMediaInfoRows(file)
+        XCTAssertEqual(rows, [
+            EpisodeMediaInfoRow(
+                label: "Video",
+                value: "HEVC · Main 10 · 3840×2160 · Dolby Vision · Profile 7 (HDR10-compatible) · 10-bit · 48 Mb/s"
+            ),
+            EpisodeMediaInfoRow(
+                label: "Audio",
+                value: "Dolby Atmos 7.1 · ENG / AAC 2.0 · JPN"
+            ),
+            EpisodeMediaInfoRow(
+                label: "File",
+                value: "The.Target.S01E01.mkv · MKV · 74.5 GB"
+            ),
+        ])
+        XCTAssertLessThanOrEqual(
+            EpisodeMediaInfoMetrics.maximumWidth,
+            DetailLayoutMetrics.maximumBodyWidth
+        )
+        for availableWidth: CGFloat in [320, 744, 1_366] {
+            let controller = UIHostingController(rootView: DetailViewportFrame {
+                DetailBodyFrame {
+                    EpisodeMediaInfoSection(rows: rows)
+                }
+            })
+            let measured = controller.sizeThatFits(
+                in: CGSize(width: availableWidth, height: 10_000)
+            )
+            XCTAssertLessThanOrEqual(measured.width, availableWidth + 0.5)
+        }
+
+        let badges = DetailView.itemMetadataBadges(
+            item,
+            file: file,
+            durationMs: file.durationMs,
+            includeSeries: false
+        )
+        XCTAssertEqual(badges.map(\.kind), [
+            .episode, .runtime, .resolution, .video, .dynamicRange, .audio,
+        ])
+        XCTAssertEqual(badges.last?.mark, "ATMOS 7.1")
+        XCTAssertEqual(badges.last?.accessibilityLabel, "Dolby Atmos 7.1")
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testEpisodeMediaInfoLabelsGrowAtAccessibilityTextSizes() {
+        func measuredLabelWidth(_ sizeCategory: ContentSizeCategory) -> CGFloat {
+            let controller = UIHostingController(rootView:
+                EpisodeMediaInfoLabel(text: "Audio")
+                    .environment(\.sizeCategory, sizeCategory)
+            )
+            return controller.sizeThatFits(
+                in: CGSize(width: 320, height: 1_000)
+            ).width
+        }
+
+        let standardWidth = measuredLabelWidth(.large)
+        let accessibilityWidth = measuredLabelWidth(.accessibilityExtraExtraExtraLarge)
+        XCTAssertEqual(
+            standardWidth,
+            EpisodeMediaInfoMetrics.minimumLabelWidth,
+            accuracy: 0.5
+        )
+        XCTAssertGreaterThan(
+            accessibilityWidth,
+            EpisodeMediaInfoMetrics.minimumLabelWidth,
+            "large Dynamic Type labels must grow instead of truncating inside a fixed column"
+        )
+
+        let controller = UIHostingController(rootView:
+            EpisodeMediaInfoSection(rows: [
+                EpisodeMediaInfoRow(label: "Video", value: "3840×2160 · Dolby Vision"),
+                EpisodeMediaInfoRow(label: "Audio", value: "Dolby Atmos 7.1 · ENG"),
+                EpisodeMediaInfoRow(label: "File", value: "Episode.mkv · 74.5 GB"),
+            ])
+            .environment(\.sizeCategory, .accessibilityExtraExtraExtraLarge)
+        )
+        let measured = controller.sizeThatFits(
+            in: CGSize(width: 320, height: 10_000)
+        )
+        XCTAssertLessThanOrEqual(measured.width, 320.5)
+    }
+    #endif
+
     func testPlayerOverlayAutoHidesWheneverItIsIdle() {
         XCTAssertFalse(PlayerView.shouldAutoHideControls(
             visible: true,
@@ -3145,6 +3286,18 @@ final class AppleClientTests: XCTestCase {
             finished: true,
             autoplay: true,
             offline: false
+        ), .findNext)
+        XCTAssertNil(PlayerView.audiobookNaturalEndAction(
+            finished: false,
+            alreadyFinding: false
+        ))
+        XCTAssertNil(PlayerView.audiobookNaturalEndAction(
+            finished: true,
+            alreadyFinding: true
+        ))
+        XCTAssertEqual(PlayerView.audiobookNaturalEndAction(
+            finished: true,
+            alreadyFinding: false
         ), .findNext)
     }
 
@@ -4339,11 +4492,72 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(finalWaiters, 0)
     }
 
-    func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {
+    func testPluralServerLibraryKindsMapToNativeCollections() {
         XCTAssertEqual(AppModel.canonicalLibraryKind("movies"), "movie")
         XCTAssertEqual(AppModel.canonicalLibraryKind("shows"), "show")
+        XCTAssertEqual(AppModel.canonicalLibraryKind("books"), "book")
         XCTAssertEqual(AppModel.canonicalLibraryKind("home"), "home")
         XCTAssertEqual(AppModel.canonicalLibraryKind("MOVIES"), "movie")
+    }
+
+    func testAudiobookDetailDecodesPartsChaptersAndSelectsTheResumePart() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let detail = try decoder.decode(ItemDetail.self, from: Data(#"""
+        {
+          "item":{"id":44,"kind":"audiobook","title":"The Long Book","runtime_ms":300000},
+          "files":[
+            {"id":440,"filename":"01.m4b","duration_ms":120000,"part_offset_ms":0,
+             "container":"mov,mp4,m4a,3gp,3g2,mj2","audio_streams":[{"index":0,"codec":"aac","default":true}],
+             "chapters":[{"index":0,"title":"Opening","start_ms":0,"end_ms":60000}]},
+            {"id":441,"filename":"02.m4b","duration_ms":180000,"part_offset_ms":120000}
+          ]
+        }
+        """#.utf8))
+
+        XCTAssertTrue(detail.item.isAudiobook)
+        XCTAssertTrue(detail.item.isPlayable)
+        XCTAssertEqual(detail.files?.first?.audioStreams?.first?.codec, "aac")
+        XCTAssertEqual(detail.files?.first?.chapters?.first?.title, "Opening")
+        XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 119_999)?.id, 440)
+        XCTAssertEqual(DetailView.playbackFile(in: detail, positionMs: 120_000)?.id, 441)
+    }
+
+    func testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingParts() throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: AppleClientTests.self).url(
+                forResource: "native-api",
+                withExtension: "json"
+            )
+        )
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fixture = try decoder.decode(
+            NativeAPIContractFixture.self,
+            from: Data(contentsOf: fixtureURL)
+        )
+        var files = try XCTUnwrap(fixture.audiobookDetail.files)
+
+        let local = AudiobookTimeline.localPosition(
+            globalPositionMs: 75_000,
+            partOffsetMs: 60_000
+        )
+        XCTAssertEqual(local, 15_000)
+        XCTAssertEqual(
+            AudiobookTimeline.globalPosition(
+                localPositionMs: local,
+                partOffsetMs: 60_000
+            ),
+            75_000
+        )
+
+        files[1].available = false
+        XCTAssertEqual(
+            AudiobookTimeline.nextFile(after: files[0].id, in: files)?.id,
+            files[2].id,
+            "natural end skips an unavailable physical part"
+        )
+        XCTAssertNil(AudiobookTimeline.nextFile(after: files[2].id, in: files))
     }
 
     func testPosterSizesAreOrderedAndMatchTheWebChoices() {

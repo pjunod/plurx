@@ -10,6 +10,17 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Audiobook resume and multipart progress now stay on one book timeline.**
+  SQLite and Hiqlite clamp audiobook progress against the sum of its parts,
+  natural part ordering keeps `Part 2` before `Part 10`, and author/title
+  directory identity prevents same-titled books by different authors from
+  collapsing together. Apple and Android select a resumed part only while the
+  book is actually resumable, map local player time back to global progress,
+  skip missing parts, and return Start over to the first available part.
+  Native capability reports now direct-play supported audio containers instead
+  of routing them through the video HLS path. Shared server/Apple/Android
+  contract coverage pins ordered offsets, audio facts, and chapters.
+
 - **Web playback no longer waits forever on a starved remux.** Every probed
   remux now prefers copy-video HLS when the browser proves it can accept the
   exact video/audio pair through MediaSource; explicit **Original · one
@@ -47,6 +58,17 @@ bump may break compatibility and a **patch** bump never does.
   back to the pre-scrub position.
 
 ### Added
+
+- **TV episode lists and details now name the media they will open.** Season
+  detail responses attach each episode's best-file resolution and HDR facts in
+  one batched query, so the Apple season shelf can show a compact resolution +
+  HDR pair without one request per episode. iPhone and iPad keep their compact
+  poster cards; Apple TV keeps its landscape episode cards. Episode detail now
+  adds a width-bounded Media Info panel for codec/profile, exact dimensions,
+  HDR format, bit depth, bitrate, audio tracks, container, filename, and size,
+  plus the preferred audio format in the existing badge row. The richer file
+  fields already existed on the detail response; this exposes them without
+  widening the season shelf into a spec table.
 
 - **Performance II N1 gains guarded quality-mode plumbing and its measurement
   harness.** New admin rate-mode/quality settings move as one complete pair and

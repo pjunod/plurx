@@ -1,11 +1,11 @@
-//! What one library-list row can say about the media behind it.
+//! What one compact item row can say about the media behind it.
 //!
-//! The item detail response carries a `FileDto` per file and the client works
-//! the badges out itself. A list cannot: it would need every file of every
-//! item on the page, which is the fan-out this module exists to avoid. So the
-//! store aggregates in SQL (one statement for the whole page) and hands each
-//! item's answer here to be turned into the terse strings a card or a table
-//! row prints.
+//! A playable item's own detail response carries a `FileDto` per file and the
+//! client works the badges out itself. Compact collections cannot: a library
+//! page or a season's episode children would need every file of every item,
+//! which is the fan-out this module exists to avoid. So the store aggregates
+//! in SQL (one statement for the whole collection) and hands each item's
+//! answer here to be turned into the terse strings a card or table row prints.
 //!
 //! The labels are deliberately the ones `web/index.html` already prints
 //! (`codecLabel`, `hdrChip`, `premiumAudio`, `fmtChannels`). A second

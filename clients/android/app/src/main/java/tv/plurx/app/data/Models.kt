@@ -86,6 +86,9 @@ data class Item(
     val rollup: Rollup? = null,
 ) {
     val isPlayableVideo get() = kind == "movie" || kind == "episode" || kind == "video"
+    val isPlayable get() = isPlayableVideo || kind == "audiobook"
+    val isBook get() = kind == "book"
+    val isAudiobook get() = kind == "audiobook"
 }
 
 @Serializable
@@ -143,9 +146,19 @@ data class MediaFileDto(
     val bitrate: Long? = null,
     val audio_streams: List<AudioStream> = emptyList(),
     val subtitle_streams: List<SubtitleStream> = emptyList(),
+    val part_offset_ms: Long = 0,
+    val chapters: List<BookChapter> = emptyList(),
     val available: Boolean = true,
     val probed: Boolean = true,
     val missing_path: String? = null,
+)
+
+@Serializable
+data class BookChapter(
+    val index: Long,
+    val title: String,
+    val start_ms: Long,
+    val end_ms: Long,
 )
 
 @Serializable

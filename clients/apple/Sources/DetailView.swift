@@ -9,6 +9,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
         case resolution
         case video
         case dynamicRange
+        case audio
     }
 
     let kind: Kind
@@ -77,7 +78,7 @@ struct ItemMetadataBadgeRow: View {
 
     static func usesStyledMediaBadge(_ badge: ItemMetadataBadge) -> Bool {
         switch badge.kind {
-        case .resolution, .video, .dynamicRange:
+        case .resolution, .video, .dynamicRange, .audio:
             return true
         case .series, .episode, .year, .runtime:
             return false
@@ -145,6 +146,8 @@ struct IOSWebMediaBadge: View {
             return badge.accessibilityLabel.localizedCaseInsensitiveContains("Dolby")
                 ? Color(red: 0.79, green: 0.60, blue: 0.17)
                 : Color(red: 0.07, green: 0.70, blue: 0.65)
+        case .audio:
+            return Color(red: 0.50, green: 0.56, blue: 0.88)
         default:
             return Palette.onBg
         }
@@ -203,6 +206,20 @@ private struct IOSWebMediaGlyph: View {
                 context.fill(Self.sparkle(center: CGPoint(x: 19, y: 5), outer: 4, inner: 1.3), with: .foreground)
                 context.fill(Self.sparkle(center: CGPoint(x: 19, y: 19), outer: 4, inner: 1.3), with: .foreground)
 
+            case .audio:
+                let bars: [(x: CGFloat, y: CGFloat, height: CGFloat)] = [
+                    (3.0, 10.0, 4.0),
+                    (7.0, 6.0, 12.0),
+                    (11.0, 2.0, 20.0),
+                    (15.0, 6.0, 12.0),
+                    (19.0, 10.0, 4.0),
+                ]
+                for (x, y, height) in bars {
+                    var bar = Path()
+                    bar.addRect(CGRect(x: x, y: y, width: 2, height: height))
+                    context.fill(bar, with: .foreground)
+                }
+
             default:
                 break
             }
@@ -229,6 +246,73 @@ private struct IOSWebMediaGlyph: View {
     }
 }
 #endif
+
+struct EpisodeMediaInfoRow: Equatable, Identifiable {
+    let label: String
+    let value: String
+
+    var id: String { label }
+}
+
+enum EpisodeMediaInfoMetrics {
+    /// A technical value line should wrap before it turns into an iPad-wide
+    /// ruler. Phones naturally use less than this through DetailBodyFrame.
+    static let maximumWidth: CGFloat = 620
+    static let minimumLabelWidth: CGFloat = 48
+}
+
+struct EpisodeMediaInfoLabel: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(.caption, design: .rounded).weight(.semibold))
+            .foregroundStyle(Palette.muted)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: EpisodeMediaInfoMetrics.minimumLabelWidth, alignment: .leading)
+    }
+}
+
+struct EpisodeMediaInfoSection: View {
+    let rows: [EpisodeMediaInfoRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("MEDIA INFO")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(1.5)
+                .foregroundStyle(Palette.accent.opacity(0.9))
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    if index > 0 {
+                        Divider().overlay(Palette.outline.opacity(0.5))
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        EpisodeMediaInfoLabel(text: row.label)
+                        Text(row.value)
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(Palette.onBg.opacity(0.82))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.vertical, 8)
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .padding(.horizontal, 11)
+            .background(
+                Palette.surfaceHi.opacity(0.66),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Palette.outline.opacity(0.72), lineWidth: 0.75)
+            }
+        }
+        .frame(maxWidth: EpisodeMediaInfoMetrics.maximumWidth, alignment: .leading)
+    }
+}
 
 /// Clickable ancestors for a detail page. The server returns these outermost
 /// first, so an episode naturally reads "Show / Season" and a season reads
@@ -346,11 +430,35 @@ struct PlayContext: Identifiable {
     let fileId: Int
     let startMs: Int
     let durationMs: Int
+    var progressOffsetMs: Int = 0
+    var itemDurationMs: Int? = nil
     let title: String
     var subtitle: String? = nil
     var year: Int? = nil
     var airDate: String? = nil
     var overview: String? = nil
+}
+
+enum AudiobookTimeline {
+    static func localPosition(globalPositionMs: Int, partOffsetMs: Int) -> Int {
+        max(0, globalPositionMs - max(0, partOffsetMs))
+    }
+
+    static func globalPosition(localPositionMs: Int, partOffsetMs: Int) -> Int {
+        max(0, partOffsetMs) + max(0, localPositionMs)
+    }
+
+    static func file(at globalPositionMs: Int, in files: [MediaFile]) -> MediaFile? {
+        let available = files.filter { $0.available != false }
+        return available.last(where: {
+            globalPositionMs >= max(0, $0.partOffsetMs ?? 0)
+        }) ?? available.first
+    }
+
+    static func nextFile(after fileId: Int, in files: [MediaFile]) -> MediaFile? {
+        guard let index = files.firstIndex(where: { $0.id == fileId }) else { return nil }
+        return files.dropFirst(index + 1).first(where: { $0.available != false })
+    }
 }
 
 enum DetailLayoutMetrics {
@@ -563,6 +671,7 @@ struct DetailView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #if os(iOS)
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @ObservedObject private var downloads = OfflineDownloadManager.shared
     #endif
     let itemId: Int
@@ -656,14 +765,19 @@ struct DetailView: View {
         }) { ctx in
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
+                       progressOffsetMs: ctx.progressOffsetMs,
+                       itemDurationMs: ctx.itemDurationMs,
                        subtitle: ctx.subtitle, year: ctx.year, airDate: ctx.airDate,
                        overview: ctx.overview,
                        onPlayNext: { play = $0 },
                        onPlaybackStopped: { positionMs in
                            updateVisibleProgress(
                                itemId: ctx.itemId,
-                               positionMs: positionMs,
-                               durationMs: ctx.durationMs
+                               positionMs: AudiobookTimeline.globalPosition(
+                                   localPositionMs: positionMs,
+                                   partOffsetMs: ctx.progressOffsetMs
+                               ),
+                               durationMs: ctx.itemDurationMs ?? ctx.durationMs
                            )
                        })
                 .id(ctx.id)
@@ -735,12 +849,13 @@ struct DetailView: View {
     private func mobileContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
-        let file = detail.files?.first
-        let durationMs = file?.durationMs ?? item.runtimeMs
         let resumeMs = item.watch?.positionMs ?? 0
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0
             && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
@@ -823,9 +938,13 @@ struct DetailView: View {
                         }
                         .padding(.top, 3)
                     }
+
+                    episodeMediaInfo(item: item, file: file)
                 }
             }
             .padding(.top, 10)
+
+            audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
@@ -890,11 +1009,12 @@ struct DetailView: View {
     private func standardContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
-        let file = detail.files?.first
-        let durationMs = file?.durationMs ?? item.runtimeMs
         let resumeMs = item.watch?.positionMs ?? 0
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottom) {
@@ -977,6 +1097,8 @@ struct DetailView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.top, 6)
                     }
+
+                    episodeMediaInfo(item: item, file: file)
                 }
             }
             #if os(iOS)
@@ -984,6 +1106,8 @@ struct DetailView: View {
             #else
             .padding(.top, 8)
             #endif
+
+            audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
@@ -998,11 +1122,12 @@ struct DetailView: View {
     private func tvPlayableContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []
-        let file = detail.files?.first
-        let durationMs = file?.durationMs ?? item.runtimeMs
         let resumeMs = item.watch?.positionMs ?? 0
+        let resumeFile = Self.playbackFile(in: detail, positionMs: resumeMs)
+        let durationMs = item.isAudiobook ? (item.runtimeMs ?? resumeFile?.durationMs) : (resumeFile?.durationMs ?? item.runtimeMs)
         let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
+        let file = Self.playbackFile(in: detail, positionMs: canResume ? resumeMs : 0)
 
         return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
@@ -1055,7 +1180,9 @@ struct DetailView: View {
                             }
                         }
 
-                        watchButton(detail)
+                        if !item.isBook {
+                            watchButton(detail)
+                        }
                     }
                     .padding(.top, 3)
 
@@ -1073,6 +1200,8 @@ struct DetailView: View {
             .frame(height: TVPlayableDetailMetrics.heroHeight)
             .clipped()
             .containerRelativeFrame(.vertical, alignment: .center)
+
+            audiobookContents(detail)
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
@@ -1164,6 +1293,9 @@ struct DetailView: View {
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
             parts.append(tvCodecLabel(codec))
+        }
+        if item.isAudiobook, let codec = file?.audioStreams?.first?.codec, !codec.isEmpty {
+            parts.append(codec.uppercased())
         }
         return parts
     }
@@ -1341,6 +1473,251 @@ struct DetailView: View {
     }
     #endif
 
+    @ViewBuilder
+    private func audiobookContents(_ detail: ItemDetail) -> some View {
+        let files = detail.files ?? []
+        if detail.item.isAudiobook, !files.isEmpty {
+            let resumeMs = detail.item.watch?.positionMs ?? 0
+            let durationMs = detail.item.runtimeMs
+                ?? files.compactMap(\.durationMs).reduce(0, +)
+            let canResume = resumeMs > 3000
+                && (durationMs <= 0 || Double(resumeMs) <= Double(durationMs) * 0.95)
+            let resumeFile = AudiobookTimeline.file(at: resumeMs, in: files)
+            DetailBodyFrame {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(files.count > 1 ? "PARTS & CHAPTERS" : "CHAPTERS")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .tracking(1.5)
+                        .foregroundStyle(Palette.accent)
+
+                    ForEach(files.indices, id: \.self) { index in
+                        let file = files[index]
+                        VStack(alignment: .leading, spacing: 9) {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(files.count > 1 ? "Part \(index + 1)" : "Audio")
+                                        .font(.headline)
+                                        .foregroundStyle(Palette.onBg)
+                                    Text(Self.audiobookFileDetails(file))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(Palette.onBg.opacity(0.68))
+                                        .lineLimit(2)
+                                    if let filename = file.filename, !filename.isEmpty {
+                                        Text(filename)
+                                            .font(.caption)
+                                            .foregroundStyle(Palette.onBg.opacity(0.5))
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Button {
+                                    let startMs = canResume && resumeFile?.id == file.id
+                                        ? AudiobookTimeline.localPosition(
+                                            globalPositionMs: resumeMs,
+                                            partOffsetMs: file.partOffsetMs ?? 0
+                                        )
+                                        : 0
+                                    playAudiobook(detail, file: file, startMs: startMs)
+                                } label: {
+                                    Label("Play part", systemImage: "play.fill")
+                                        .lineLimit(1)
+                                }
+                                #if os(tvOS)
+                                .buttonStyle(TVShelfActionButtonStyle())
+                                #else
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Palette.accent)
+                                #endif
+                                .disabled(file.available == false)
+                            }
+
+                            ForEach(file.chapters ?? [], id: \.index) { chapter in
+                                Button {
+                                    playAudiobook(detail, file: file, startMs: chapter.startMs, chapter: chapter.title)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "waveform")
+                                            .foregroundStyle(Palette.accent)
+                                        Text(chapter.title)
+                                            .lineLimit(1)
+                                        Spacer(minLength: 12)
+                                        Text(formatTime((file.partOffsetMs ?? 0) + chapter.startMs))
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundStyle(Palette.onBg.opacity(0.62))
+                                    }
+                                    .foregroundStyle(Palette.onBg)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 9)
+                                    .background(Palette.surfaceHi, in: RoundedRectangle(cornerRadius: 10))
+                                }
+                                #if os(tvOS)
+                                .buttonStyle(TVHeroButtonStyle())
+                                #else
+                                .buttonStyle(.plain)
+                                #endif
+                                .disabled(file.available == false)
+                            }
+                        }
+                        .padding(14)
+                        .background(Palette.surface, in: RoundedRectangle(cornerRadius: 14))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Palette.outline.opacity(0.72), lineWidth: 1)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 18)
+        }
+    }
+
+    private static func audiobookFileDetails(_ file: MediaFile) -> String {
+        var parts: [String] = []
+        if let duration = file.durationMs, duration > 0 { parts.append(formatTime(duration)) }
+        if let container = file.container, !container.isEmpty { parts.append(container.uppercased()) }
+        if let codec = file.audioStreams?.first?.codec, !codec.isEmpty { parts.append(codec.uppercased()) }
+        return parts.isEmpty ? "Audio details unavailable" : parts.joined(separator: "  ·  ")
+    }
+
+    private func playAudiobook(
+        _ detail: ItemDetail,
+        file: MediaFile,
+        startMs: Int,
+        chapter: String? = nil
+    ) {
+        let item = detail.item
+        let itemDuration = item.runtimeMs ?? (detail.files ?? []).compactMap(\.durationMs).reduce(0, +)
+        play = PlayContext(
+            itemId: item.id,
+            fileId: file.id,
+            startMs: startMs,
+            durationMs: file.durationMs ?? itemDuration,
+            progressOffsetMs: file.partOffsetMs ?? 0,
+            itemDurationMs: itemDuration,
+            title: item.title,
+            subtitle: chapter ?? playbackSubtitle(item),
+            year: item.year,
+            airDate: item.airDate,
+            overview: item.overview
+        )
+    }
+
+    /// Select the audiobook part containing the item-level resume position.
+    /// Movies and single-file books keep the established first-file behavior.
+    static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
+        let files = detail.files ?? []
+        guard detail.item.isAudiobook else { return files.first }
+        return AudiobookTimeline.file(at: positionMs, in: files)
+    }
+
+    @ViewBuilder
+    private func episodeMediaInfo(item: Item, file: MediaFile?) -> some View {
+        if item.kind == "episode", let file {
+            let rows = Self.episodeMediaInfoRows(file)
+            if !rows.isEmpty {
+                EpisodeMediaInfoSection(rows: rows)
+                    .padding(.top, 3)
+            }
+        }
+    }
+
+    static func episodeMediaInfoRows(_ file: MediaFile) -> [EpisodeMediaInfoRow] {
+        var rows: [EpisodeMediaInfoRow] = []
+        var video: [String] = []
+
+        if let codec = nonempty(file.videoCodec) {
+            video.append(tvCodecLabel(codec))
+        }
+        if let profile = nonempty(file.videoProfile) {
+            video.append(profile)
+        }
+        if let width = file.width, width > 0, let height = file.height, height > 0 {
+            video.append("\(width)×\(height)")
+        } else if let resolution = resolutionLabel(width: file.width, height: file.height) {
+            video.append(resolution)
+        }
+        if let format = nonempty(file.hdrFormat) {
+            video.append(format)
+        } else if let grade = DynamicRange.source(hdr: file.hdr, hdrFormat: nil) {
+            video.append(DynamicRange.longLabel(grade))
+        }
+        if let bitDepth = file.bitDepth, bitDepth > 0 {
+            video.append("\(bitDepth)-bit")
+        }
+        if let bitrate = mediaBitrateLabel(file.bitrate) {
+            video.append(bitrate)
+        }
+        if !video.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "Video", value: video.joined(separator: " · ")))
+        }
+
+        let audio = (file.audioStreams ?? []).compactMap(audioDescription(_:))
+        if !audio.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "Audio", value: audio.joined(separator: " / ")))
+        }
+
+        var storedFile: [String] = []
+        if let filename = nonempty(file.filename) {
+            storedFile.append(filename)
+        }
+        if let container = nonempty(file.container) {
+            storedFile.append(container.uppercased())
+        }
+        if let size = mediaFileSizeLabel(file.size) {
+            storedFile.append(size)
+        }
+        if !storedFile.isEmpty {
+            rows.append(EpisodeMediaInfoRow(label: "File", value: storedFile.joined(separator: " · ")))
+        }
+
+        return rows
+    }
+
+    private static func nonempty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func preferredAudioTrack(_ file: MediaFile) -> AudioTrack? {
+        let tracks = file.audioStreams ?? []
+        return tracks.first(where: {
+            $0.title?.localizedCaseInsensitiveContains("atmos") == true
+        }) ?? tracks.first(where: { $0.default }) ?? tracks.first
+    }
+
+    private static func audioDescription(_ track: AudioTrack) -> String? {
+        guard let sound = PlayerView.soundLabel(track) else { return nil }
+        let languageCode = nonempty(track.language)
+        let language = languageCode?.lowercased() == "und"
+            ? nil
+            : languageCode?.uppercased()
+        return [sound.accessibilityLabel, language]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private static func mediaBitrateLabel(_ bitsPerSecond: Int?) -> String? {
+        guard let bitsPerSecond, bitsPerSecond > 0 else { return nil }
+        if bitsPerSecond >= 1_000_000 {
+            let megabits = Double(bitsPerSecond) / 1_000_000
+            return bitsPerSecond >= 10_000_000
+                ? String(format: "%.0f Mb/s", megabits)
+                : String(format: "%.1f Mb/s", megabits)
+        }
+        return "\(Int((Double(bitsPerSecond) / 1_000).rounded())) kb/s"
+    }
+
+    private static func mediaFileSizeLabel(_ bytes: Int?) -> String? {
+        guard let bytes, bytes > 0 else { return nil }
+        let gibibytes = Double(bytes) / 1_073_741_824
+        if gibibytes >= 1 {
+            return String(format: "%.1f GB", gibibytes)
+        }
+        let mebibytes = Double(bytes) / 1_048_576
+        return String(format: "%.1f MB", mebibytes)
+    }
+
     static func itemMetadataBadges(
         _ item: Item,
         file: MediaFile?,
@@ -1385,15 +1762,10 @@ struct DetailView: View {
                 accessibilityLabel: runtime
             ))
         }
-        if let resolution = file.flatMap({
+        if let badge = resolutionBadge(file.flatMap({
             resolutionLabel(width: $0.width, height: $0.height)
-        }) ?? resolutionLabel(item.resolution) {
-            badges.append(ItemMetadataBadge(
-                kind: .resolution,
-                symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
-                mark: resolution == "4K" ? nil : resolution.uppercased(),
-                accessibilityLabel: resolution
-            ))
+        }) ?? resolutionLabel(item.resolution)) {
+            badges.append(badge)
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
             let label = tvCodecLabel(codec)
@@ -1420,6 +1792,15 @@ struct DetailView: View {
                 symbol: range.symbol,
                 mark: range.mark,
                 accessibilityLabel: range.accessibilityLabel
+            ))
+        }
+        if let audio = file.flatMap({ preferredAudioTrack($0) }),
+           let sound = PlayerView.soundLabel(audio) {
+            badges.append(ItemMetadataBadge(
+                kind: .audio,
+                symbol: "waveform",
+                mark: sound.mark,
+                accessibilityLabel: sound.accessibilityLabel
             ))
         }
         return badges
@@ -1516,6 +1897,9 @@ struct DetailView: View {
             horizontalSizeClass: horizontalSizeClass
         ) {
             HStack(spacing: 10) {
+                if let file, item.isBook {
+                    openBookButton(file)
+                }
                 if let file, item.isPlayable {
                     resumeButton(
                         item: item,
@@ -1528,14 +1912,17 @@ struct DetailView: View {
                         startOverButton(item: item, file: file, durationMs: durationMs)
                     }
                 }
-                if let file, item.isPlayable {
+                if let file, item.isPlayable, !item.isAudiobook {
                     mobileDownloadButton(detail: detail, file: file, compact: false)
                 }
-                watchButton(detail)
+                if !item.isBook { watchButton(detail) }
             }
             .frame(maxWidth: hasPlayback ? .infinity : 220, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 10) {
+                if let file, item.isBook {
+                    openBookButton(file)
+                }
                 if let file, item.isPlayable {
                     resumeButton(
                         item: item,
@@ -1551,11 +1938,11 @@ struct DetailView: View {
                         mobileStartOverButton(item: item, file: file, durationMs: durationMs)
                     }
 
-                    if let file, item.isPlayable {
+                    if let file, item.isPlayable, !item.isAudiobook {
                         mobileDownloadButton(detail: detail, file: file, compact: true)
                     }
 
-                    mobileWatchButton(detail)
+                    if !item.isBook { mobileWatchButton(detail) }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1563,17 +1950,35 @@ struct DetailView: View {
         }
     }
 
+    private func openBookButton(_ file: MediaFile) -> some View {
+        return Button {
+            if let url = Session.shared.mediaURL("/api/v1/files/\(file.id)/content") {
+                openURL(url)
+            }
+        } label: {
+            Label("Open book", systemImage: "book.fill")
+                .font(.subheadline.weight(.semibold))
+        }
+        .buttonStyle(IOSDetailPrimaryActionButtonStyle())
+    }
+
     private func mobileStartOverButton(
         item: Item,
         file: MediaFile,
         durationMs: Int
     ) -> some View {
-        Button {
+        let startFile = item.isAudiobook
+            ? ((detail?.files ?? []).first(where: { $0.available != false }) ?? file)
+            : file
+        let partOffset = item.isAudiobook ? (startFile.partOffsetMs ?? 0) : 0
+        return Button {
             play = PlayContext(
                 itemId: item.id,
-                fileId: file.id,
+                fileId: startFile.id,
                 startMs: 0,
-                durationMs: durationMs,
+                durationMs: startFile.durationMs ?? durationMs,
+                progressOffsetMs: partOffset,
+                itemDurationMs: item.isAudiobook ? durationMs : nil,
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,
@@ -1732,12 +2137,20 @@ struct DetailView: View {
         resumeMs: Int,
         canResume: Bool
     ) -> some View {
+        let partOffset = item.isAudiobook ? (file.partOffsetMs ?? 0) : 0
+        let localDuration = file.durationMs ?? durationMs
+        let localResume = AudiobookTimeline.localPosition(
+            globalPositionMs: resumeMs,
+            partOffsetMs: partOffset
+        )
         let action = {
             play = PlayContext(
                 itemId: item.id,
                 fileId: file.id,
-                startMs: canResume ? resumeMs : 0,
-                durationMs: durationMs,
+                startMs: canResume ? localResume : 0,
+                durationMs: localDuration,
+                progressOffsetMs: partOffset,
+                itemDurationMs: item.isAudiobook ? durationMs : nil,
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,
@@ -1772,12 +2185,18 @@ struct DetailView: View {
     }
 
     private func startOverButton(item: Item, file: MediaFile, durationMs: Int) -> some View {
-        Button {
+        let startFile = item.isAudiobook
+            ? ((detail?.files ?? []).first(where: { $0.available != false }) ?? file)
+            : file
+        let partOffset = item.isAudiobook ? (startFile.partOffsetMs ?? 0) : 0
+        return Button {
             play = PlayContext(
                 itemId: item.id,
-                fileId: file.id,
+                fileId: startFile.id,
                 startMs: 0,
-                durationMs: durationMs,
+                durationMs: startFile.durationMs ?? durationMs,
+                progressOffsetMs: partOffset,
+                itemDurationMs: item.isAudiobook ? durationMs : nil,
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,

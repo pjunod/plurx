@@ -623,6 +623,22 @@ mod tests {
     }
 
     #[test]
+    fn audio_only_audiobook_direct_plays_on_web() {
+        let mut audiobook = file("m4b", "h264", "aac");
+        audiobook.video_codec = None;
+        audiobook.video_profile = None;
+        audiobook.width = None;
+        audiobook.height = None;
+        audiobook.bit_depth = None;
+        audiobook.hdr = None;
+        audiobook.hdr_format = None;
+
+        let decision = decide(&audiobook, default_profile(), true);
+        assert_eq!(decision.method, PlaybackMethod::DirectPlay);
+        assert!(decision.reasons.is_empty());
+    }
+
+    #[test]
     fn mkv_h264_aac_remuxes_on_web() {
         // Right codecs, wrong container → remux, no audio transcode.
         let d = decide(&file("mkv", "h264", "aac"), default_profile(), true);

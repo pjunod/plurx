@@ -116,3 +116,27 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "Snapping applies only at the live edge"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testSeekRouteSeeksInsideALaterRangeInsteadOfSnappingToAnEarlierEdge"
+
+[[fixes]]
+id = "apple.episode-media-season-card-review-fix"
+commits = ["ae59131b"]
+source = "clients/apple/Sources/Components.swift"
+source_anchor = "func posterCardEpisodeSummaryBadges("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSeasonEpisodeSummaryKeepsResolutionAndRichHDRCompact"
+
+[[fixes]]
+id = "clients.audiobook-timeline-review-fixes"
+commits = ["681336e2"]
+source = "clients/apple/Sources/DetailView.swift"
+source_anchor = "enum AudiobookTimeline"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingParts"
+
+[[fixes]]
+id = "apple.build-49-documentation-alignment"
+commits = ["c52c38b7"]
+source = "clients/apple/README.md"
+source_anchor = "build `49`"
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"

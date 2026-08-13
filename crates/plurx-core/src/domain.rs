@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 pub enum LibraryKind {
     Movies,
     Shows,
+    /// Text books and audiobooks. The scanner classifies each file by format,
+    /// so one shelf can hold both without forcing the user to maintain two
+    /// copies of the same directory tree.
+    Books,
     /// Home video & photos: a folder tree of camera files. No metadata
     /// provider — the source of truth is the disk (folder layout, optional
     /// Kodi-style `.nfo` sidecars, embedded dates). See docs/HOMEVIDEO-PLAN.md.
@@ -26,6 +30,7 @@ impl LibraryKind {
         match self {
             LibraryKind::Movies => "movies",
             LibraryKind::Shows => "shows",
+            LibraryKind::Books => "books",
             LibraryKind::Home => "home",
         }
     }
@@ -34,6 +39,7 @@ impl LibraryKind {
         match s {
             "movies" => Some(LibraryKind::Movies),
             "shows" => Some(LibraryKind::Shows),
+            "books" => Some(LibraryKind::Books),
             "home" => Some(LibraryKind::Home),
             _ => None,
         }
@@ -74,7 +80,7 @@ pub struct NewLibrary {
 }
 
 // ---------------------------------------------------------------------------
-// Items (movie | show | season | episode | folder | video | photo)
+// Items (movie | show | season | episode | book | audiobook | folder | video | photo)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +90,14 @@ pub enum ItemKind {
     Show,
     Season,
     Episode,
+    /// A readable text/illustrated book file (EPUB, PDF, MOBI, comic archive,
+    /// and related formats). Served as the original file; it has no playback
+    /// progress timeline.
+    Book,
+    /// One audiobook work. It may own one long file (commonly M4B) or several
+    /// chapter/part files; every file uses the normal audio probe and playback
+    /// pipeline.
+    Audiobook,
     /// A mirrored directory in a `home` library ("2019", "Beach Trip").
     /// Folders have no files of their own — they group other items.
     Folder,
@@ -101,6 +115,8 @@ impl ItemKind {
             ItemKind::Show => "show",
             ItemKind::Season => "season",
             ItemKind::Episode => "episode",
+            ItemKind::Book => "book",
+            ItemKind::Audiobook => "audiobook",
             ItemKind::Folder => "folder",
             ItemKind::Video => "video",
             ItemKind::Photo => "photo",
@@ -113,6 +129,8 @@ impl ItemKind {
             "show" => Some(ItemKind::Show),
             "season" => Some(ItemKind::Season),
             "episode" => Some(ItemKind::Episode),
+            "book" => Some(ItemKind::Book),
+            "audiobook" => Some(ItemKind::Audiobook),
             "folder" => Some(ItemKind::Folder),
             "video" => Some(ItemKind::Video),
             "photo" => Some(ItemKind::Photo),
@@ -473,8 +491,9 @@ pub struct WatchState {
 /// finished instead of forever offering to mark it watched again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct WatchRollup {
-    /// Playable descendants — movies, episodes, home videos. Photos and
-    /// containers don't count; you don't watch them.
+    /// Playable descendants — movies, episodes, audiobooks, home videos.
+    /// Text books, photos, and containers don't count; they have no timed
+    /// playback progress.
     pub leaves: i64,
     pub watched: i64,
 }

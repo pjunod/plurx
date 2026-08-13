@@ -1815,7 +1815,7 @@ catalog|settings@1280x860|dom|select#cache-produce > option[text]|4
 catalog|settings@1280x860|dom|select#job-art > option[text]|5
 catalog|settings@1280x860|dom|select#job-clean > option[text]|4
 catalog|settings@1280x860|dom|select#job-probe > option[text]|5
-catalog|settings@1280x860|dom|select#lk > option[text]|4
+catalog|settings@1280x860|dom|select#lk > option[text]|5
 catalog|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 catalog|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 catalog|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -1909,7 +1909,7 @@ catalog|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 catalog|settings@1280x860|focus|035|button.ghost.sm "Edit"
 catalog|settings@1280x860|focus|036|button.ghost.sm "Delete"
 catalog|settings@1280x860|focus|037|input#ln "Library name"
-catalog|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+catalog|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 catalog|settings@1280x860|focus|039|input#lp "Media paths"
 catalog|settings@1280x860|focus|040|button "Add & scan"
 catalog|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -2015,7 +2015,7 @@ catalog|settings@390x780|dom|select#cache-produce > option[text]|4
 catalog|settings@390x780|dom|select#job-art > option[text]|5
 catalog|settings@390x780|dom|select#job-clean > option[text]|4
 catalog|settings@390x780|dom|select#job-probe > option[text]|5
-catalog|settings@390x780|dom|select#lk > option[text]|4
+catalog|settings@390x780|dom|select#lk > option[text]|5
 catalog|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 catalog|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 catalog|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -2106,7 +2106,7 @@ catalog|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artw
 catalog|settings@390x780|focus|032|button.ghost.sm "Edit"
 catalog|settings@390x780|focus|033|button.ghost.sm "Delete"
 catalog|settings@390x780|focus|034|input#ln "Library name"
-catalog|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
+catalog|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 catalog|settings@390x780|focus|036|input#lp "Media paths"
 catalog|settings@390x780|focus|037|button "Add & scan"
 catalog|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
@@ -3386,7 +3386,7 @@ classic|settings@1280x860|dom|select#cache-produce > option[text]|4
 classic|settings@1280x860|dom|select#job-art > option[text]|5
 classic|settings@1280x860|dom|select#job-clean > option[text]|4
 classic|settings@1280x860|dom|select#job-probe > option[text]|5
-classic|settings@1280x860|dom|select#lk > option[text]|4
+classic|settings@1280x860|dom|select#lk > option[text]|5
 classic|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 classic|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 classic|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -3477,7 +3477,7 @@ classic|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 classic|settings@1280x860|focus|035|button.ghost.sm "Edit"
 classic|settings@1280x860|focus|036|button.ghost.sm "Delete"
 classic|settings@1280x860|focus|037|input#ln "Library name"
-classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 classic|settings@1280x860|focus|039|input#lp "Media paths"
 classic|settings@1280x860|focus|040|button "Add & scan"
 classic|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -3560,7 +3560,7 @@ classic|settings@390x780|dom|select#cache-produce > option[text]|4
 classic|settings@390x780|dom|select#job-art > option[text]|5
 classic|settings@390x780|dom|select#job-clean > option[text]|4
 classic|settings@390x780|dom|select#job-probe > option[text]|5
-classic|settings@390x780|dom|select#lk > option[text]|4
+classic|settings@390x780|dom|select#lk > option[text]|5
 classic|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 classic|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 classic|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -3651,7 +3651,7 @@ classic|settings@390x780|focus|034|button.ghost.sm "Re-fetch all metadata & artw
 classic|settings@390x780|focus|035|button.ghost.sm "Edit"
 classic|settings@390x780|focus|036|button.ghost.sm "Delete"
 classic|settings@390x780|focus|037|input#ln "Library name"
-classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 classic|settings@390x780|focus|039|input#lp "Media paths"
 classic|settings@390x780|focus|040|button "Add & scan"
 classic|settings@390x780|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -5038,7 +5038,7 @@ theater|settings@1280x860|dom|select#cache-produce > option[text]|4
 theater|settings@1280x860|dom|select#job-art > option[text]|5
 theater|settings@1280x860|dom|select#job-clean > option[text]|4
 theater|settings@1280x860|dom|select#job-probe > option[text]|5
-theater|settings@1280x860|dom|select#lk > option[text]|4
+theater|settings@1280x860|dom|select#lk > option[text]|5
 theater|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
 theater|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
 theater|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
@@ -5129,7 +5129,7 @@ theater|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & art
 theater|settings@1280x860|focus|035|button.ghost.sm "Edit"
 theater|settings@1280x860|focus|036|button.ghost.sm "Delete"
 theater|settings@1280x860|focus|037|input#ln "Library name"
-theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 theater|settings@1280x860|focus|039|input#lp "Media paths"
 theater|settings@1280x860|focus|040|button "Add & scan"
 theater|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
@@ -5215,7 +5215,7 @@ theater|settings@390x780|dom|select#cache-produce > option[text]|4
 theater|settings@390x780|dom|select#job-art > option[text]|5
 theater|settings@390x780|dom|select#job-clean > option[text]|4
 theater|settings@390x780|dom|select#job-probe > option[text]|5
-theater|settings@390x780|dom|select#lk > option[text]|4
+theater|settings@390x780|dom|select#lk > option[text]|5
 theater|settings@390x780|dom|select#sched-ref-1 > option[text]|4
 theater|settings@390x780|dom|select#sched-ref-2 > option[text]|4
 theater|settings@390x780|dom|select#sched-ref-3 > option[text]|4
@@ -5303,7 +5303,7 @@ theater|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artw
 theater|settings@390x780|focus|032|button.ghost.sm "Edit"
 theater|settings@390x780|focus|033|button.ghost.sm "Delete"
 theater|settings@390x780|focus|034|input#ln "Library name"
-theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
 theater|settings@390x780|focus|036|input#lp "Media paths"
 theater|settings@390x780|focus|037|button "Add & scan"
 theater|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail

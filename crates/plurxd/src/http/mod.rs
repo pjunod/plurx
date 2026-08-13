@@ -149,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/offline/media/{token}/{segment}", get(offline::segment))
         .route("/files/{id}/direct", get(stream::direct))
+        .route("/files/{id}/content", get(stream::book_content))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route(
             "/files/{id}/subs/{index}/overlay.json",
@@ -3333,6 +3334,96 @@ mod tests {
         ep: i64,
     }
 
+    struct AudiobookSeed {
+        item: i64,
+    }
+
+    async fn seed_audiobook(state: &AppState) -> AudiobookSeed {
+        use plurx_core::domain::{
+            AudioStream, ItemKind, LibraryKind, MetadataPatch, NewItem, NewLibrary, ProbeResult,
+        };
+
+        let dir = std::env::temp_dir().join(format!("plurx-audiobook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("audiobook dir");
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: format!("Audiobooks {}", uuid::Uuid::new_v4()),
+                kind: LibraryKind::Books,
+                paths: vec![dir.clone()],
+                anime: false,
+            })
+            .await
+            .expect("audiobook library");
+        let item = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Audiobook,
+                parent_id: None,
+                title: "The Contract Audiobook".into(),
+                year: Some(2026),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("audiobook item");
+
+        // Insert in deliberately hostile lexical/insertion order. The detail
+        // endpoint owns playback order and must return 1, 2, 10.
+        for (filename, duration_ms) in [
+            ("Part 10.mp3", 300_000),
+            ("Part 2.mp3", 120_000),
+            ("Part 1.mp3", 60_000),
+        ] {
+            let path = dir.join(filename);
+            std::fs::write(&path, b"audio fixture").expect("audiobook part");
+            let chapters = if filename == "Part 1.mp3" {
+                Some(
+                    r#"{"chapters":[{"id":0,"start_time":"0.000","end_time":"30.000","tags":{"title":"Opening"}}]}"#
+                        .to_owned(),
+                )
+            } else {
+                Some(r#"{"chapters":[]}"#.to_owned())
+            };
+            state
+                .store
+                .upsert_file(
+                    item,
+                    &path.to_string_lossy(),
+                    13,
+                    duration_ms,
+                    &ProbeResult {
+                        duration_ms: Some(duration_ms),
+                        container: Some("mp3".into()),
+                        audio_streams: vec![AudioStream {
+                            index: 0,
+                            codec: "mp3".into(),
+                            channels: Some(2),
+                            default: true,
+                            ..Default::default()
+                        }],
+                        raw_json: chapters,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("audiobook file");
+        }
+        state
+            .store
+            .apply_metadata(
+                item,
+                &MetadataPatch {
+                    runtime_ms: Some(480_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("audiobook runtime");
+        AudiobookSeed { item }
+    }
+
     async fn seed_content(state: &AppState) -> Seed {
         use plurx_core::domain::{
             AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
@@ -4283,6 +4374,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn season_detail_children_include_batched_resolution_and_hdr_facts() {
+        use plurx_core::domain::{AudioStream, ItemKind, NewItem, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let path =
+            std::env::temp_dir().join(format!("plurx-season-facts-{}.mkv", uuid::Uuid::new_v4()));
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &path.to_string_lossy(),
+                80_000_000_000,
+                2,
+                &ProbeResult {
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(3840),
+                    height: Some(2160),
+                    bit_depth: Some(10),
+                    hdr: Some("dolby_vision".into()),
+                    hdr_format: Some("Dolby Vision · Profile 7 (HDR10-compatible)".into()),
+                    bitrate: Some(48_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "truehd".into(),
+                        channels: Some(8),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("4K episode file");
+
+        let second_episode = state
+            .store
+            .insert_item(&NewItem {
+                library_id: seeded.lib,
+                kind: ItemKind::Episode,
+                parent_id: Some(seeded.season),
+                title: "The Detail".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(2),
+            })
+            .await
+            .expect("second episode");
+        let second_path = std::env::temp_dir().join(format!(
+            "plurx-season-facts-second-{}.mp4",
+            uuid::Uuid::new_v4()
+        ));
+        state
+            .store
+            .upsert_file(
+                second_episode,
+                &second_path.to_string_lossy(),
+                7_000_000_000,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1280),
+                    height: Some(720),
+                    bit_depth: Some(8),
+                    hdr: Some("hdr10".into()),
+                    hdr_format: Some("HDR10".into()),
+                    bitrate: Some(5_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        channels: Some(2),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("720p episode file");
+
+        let (status, season) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", seeded.season), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{season}");
+        let episodes = season["children"].as_array().expect("season episodes");
+        assert_eq!(episodes.len(), 2, "{season}");
+        let episode = &episodes[0];
+        assert_eq!(episode["id"], seeded.ep);
+        assert_eq!(episode["resolution"], 2160);
+        assert_eq!(
+            episode["media"],
+            json!({
+                "files": 2,
+                "bytes": 80_000_000_042_i64,
+                "video": "HEVC",
+                "height": 2160,
+                "hdr": "dolby_vision",
+                "hdr_format": "Dolby Vision · Profile 7 (HDR10-compatible)",
+                "audio": "TrueHD 7.1",
+                "container": "MKV"
+            })
+        );
+        let second = &episodes[1];
+        assert_eq!(second["id"], second_episode);
+        assert_eq!(second["resolution"], 720);
+        assert_eq!(
+            second["media"],
+            json!({
+                "files": 1,
+                "bytes": 7_000_000_000_i64,
+                "video": "H.264",
+                "height": 720,
+                "hdr": "hdr10",
+                "hdr_format": "HDR10",
+                "audio": "AAC 2.0",
+                "container": "MP4"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn shared_native_api_fixture_uses_the_servers_live_wire_keys() {
         const FIXTURE: &str = include_str!("../../../../tests/contracts/native-api.json");
 
@@ -4308,6 +4527,7 @@ mod tests {
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let seeded = seed_content(&state).await;
+        let audiobook = seed_audiobook(&state).await;
         let (_, server) = call(&app, get("/api/v1/server", None)).await;
         assert_pointers(
             &contract["server"],
@@ -4349,6 +4569,40 @@ mod tests {
                 "/ancestors",
             ],
         );
+
+        let (_, audiobook_detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", audiobook.item), Some(&admin)),
+        )
+        .await;
+        assert_pointers(
+            &contract["audiobook_detail"],
+            &audiobook_detail,
+            &[
+                "/item/kind",
+                "/item/runtime_ms",
+                "/files/0/chapters/0/index",
+                "/files/0/chapters/0/title",
+                "/files/0/chapters/0/start_ms",
+                "/files/0/chapters/0/end_ms",
+                "/files/1/part_offset_ms",
+            ],
+        );
+        assert_eq!(
+            audiobook_detail["files"]
+                .as_array()
+                .expect("audiobook files")
+                .iter()
+                .map(|file| file["filename"].as_str().expect("filename"))
+                .collect::<Vec<_>>(),
+            ["Part 1.mp3", "Part 2.mp3", "Part 10.mp3"]
+        );
+        assert!(
+            audiobook_detail["files"][0].get("part_offset_ms").is_none(),
+            "the zero offset keeps its backwards-compatible omitted shape"
+        );
+        assert_eq!(audiobook_detail["files"][1]["part_offset_ms"], 60_000);
+        assert_eq!(audiobook_detail["files"][2]["part_offset_ms"], 180_000);
 
         let (_, page) = call(
             &app,

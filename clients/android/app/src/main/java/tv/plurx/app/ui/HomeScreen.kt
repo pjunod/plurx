@@ -448,6 +448,7 @@ private fun homeCollections(
             val title = when (kind) {
                 "movie", "movies" -> "Movies"
                 "show", "shows" -> "TV shows"
+                "book", "books" -> "Books"
                 "home" -> "Home videos"
                 else -> kind.replaceFirstChar { it.uppercase() }
             }
@@ -462,6 +463,7 @@ private fun homeCollections(
 private fun libraryKindOrder(kind: String): Int = when (kind) {
     "movie", "movies" -> 0
     "show", "shows" -> 1
-    "home" -> 2
+    "book", "books" -> 2
+    "home" -> 3
     else -> Int.MAX_VALUE
 }
