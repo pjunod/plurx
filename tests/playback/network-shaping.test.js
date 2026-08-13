@@ -222,6 +222,102 @@ test("closing interrupts an active throttled response", async () => {
   });
 });
 
+test("browser restarts cancel upstream streams without phantom bytes or link debt", async () => {
+  let largeClosedResolve;
+  let largeClosedCount = 0;
+  const largeClosed = new Promise((resolve) => { largeClosedResolve = resolve; });
+  const origin = http.createServer((request, response) => {
+    const large = request.url.includes("/files/1/");
+    response.writeHead(200, { "content-type": "application/octet-stream" });
+    if (!large) {
+      response.end(Buffer.alloc(1024, 0x61));
+      return;
+    }
+    response.flushHeaders();
+    const timer = setInterval(() => response.write(Buffer.alloc(16 * 1024, 0x61)), 10);
+    response.once("close", () => {
+      clearInterval(timer);
+      largeClosedCount += 1;
+      if (largeClosedCount === 6) largeClosedResolve();
+    });
+  });
+  await new Promise((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const target = `http://127.0.0.1:${origin.address().port}`;
+  const shaper = new lab.ShapingProxy(lab.parseNetworkProfile("128kbps-to-64kbps"), target);
+  const base = await shaper.start();
+  try {
+    const controllers = Array.from({ length: 6 }, () => new AbortController());
+    const requests = controllers.map((controller) =>
+      fetch(`${base}/api/v1/files/1/direct`, { signal: controller.signal })
+        .then((response) => response.arrayBuffer())
+        .catch(() => null));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    for (const controller of controllers) controller.abort();
+    await Promise.all(requests);
+    await Promise.race([
+      largeClosed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("canceled upstream stayed open")), 750)),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(Object.values(shaper.agent.sockets).flat().length, 0,
+      "canceled transfers release every active upstream Agent socket");
+
+    const smallStarted = Date.now();
+    const small = await fetch(`${base}/api/v1/files/2/direct`);
+    assert.equal((await small.arrayBuffer()).byteLength, 1024);
+    assert.ok(Date.now() - smallStarted < 500,
+      "the canceled 16 KiB reservation must not delay the replacement request");
+
+    const telemetry = shaper.telemetry();
+    assert.deepEqual(telemetry.transport_errors, [], "a deliberate player restart is not a link fault");
+    assert.equal(telemetry.stages[0].media_bytes, 1024,
+      "only the replacement response, not the canceled slice, is counted as delivered");
+  } finally {
+    await shaper.close();
+    await new Promise((resolve) => origin.close(resolve));
+  }
+});
+
+test("browser startup dead time cannot dilute a pre-cliff shaper leak", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 1_000;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  shaper.record(500_000, false); // page assets before the first frame
+  now = 30_000;
+  shaper.beginEvidence();
+  // Twelve Mb/s delivered over the one active second after 30 seconds of
+  // browser setup. Measuring from proxy bind would dilute this to 387 kb/s.
+  shaper.record(1_500_000, true);
+  now = 31_000;
+  shaper.applyCliff();
+  const telemetry = shaper.telemetry();
+  assert.equal(telemetry.stages[0].measured_kbps, 12_000);
+  assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
+  await shaper.close();
+});
+
+test("one immutable shaping snapshot is reused after the evidence window closes", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 1_000;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  shaper.record(1_000, true);
+  const frozen = shaper.freezeTelemetry();
+  now = 60_000;
+  shaper.record(5_000, true);
+  assert.strictEqual(shaper.telemetry(), frozen);
+  assert.equal(shaper.telemetry().stages[0].bytes, 1_000,
+    "later cleanup activity cannot rewrite the retained throughput account");
+  await shaper.close();
+});
+
 test("a shaper that cannot bind says so, and leaves no listening socket behind", async () => {
   const profile = lab.parseNetworkProfile("8mbps-to-1.5mbps");
   const shaper = new lab.ShapingProxy(profile, "http://127.0.0.1:1");
@@ -445,7 +541,22 @@ test("sustained playback is only credited when the clock really advanced", () =>
   const stalled = good.map((row) => ({ ...row, absolute_time: 0 }));
   assert.equal(lab.timeToSustained(stalled, 10, 0.9), null);
   const restalled = good.map((row, index) => ({ ...row, stalls: index > 3 ? 1 : 0 }));
-  assert.ok(lab.timeToSustained(restalled, 10, 0.9) === null || lab.timeToSustained(restalled, 10, 0.9) >= 4000);
+  assert.equal(lab.timeToSustained(restalled, 10, 0.9), 4000);
+});
+
+test("a restart cannot erase later stalls by resetting the player counter", () => {
+  const reset = healthyTimeline().map((row, index) => ({
+    ...row,
+    height: index < 20 ? 720 : 480,
+    attempt_reason: index < 20 ? "cold-start" : "quality",
+    stalls: index < 20 ? 5 : index < 30 ? 0 : index < 38 ? 1 : 2,
+  }));
+  assert.equal(lab.rungHistory(reset).length, 1, "the counter reset occurs at one permitted restart");
+  assert.equal(lab.timeToSustained(reset, 10, 0.9), null,
+    "two post-restart stalls leave too little clean runway to prove recovery");
+  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: reset }));
+  assert.equal(score.outcome, "recovery");
+  assert.match(score.errors[0], /never held/);
 });
 
 // ------------------------------------------------------------ the artifact
@@ -594,10 +705,131 @@ test("a shaped suite refuses to run unshaped and retains the harness failure", a
   });
 });
 
-test("the normalize command exits nonzero on a missing artifact", () => {
-  const result = cli(["normalize", "--json", path.join(os.tmpdir(), "plurx-does-not-exist.json")]);
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /could not be read/);
+function lifecycleDependencies(manifest, result, state, startError = null) {
+  const fixture = manifest.fixtures.find((entry) => entry.id === "shaping-mpeg4-mp3-720");
+  const server = {
+    baseUrl: "http://127.0.0.1:41001",
+    runtime: "/tmp/playback-lab-contract-runtime",
+    token: "contract-token",
+    files: new Map([[fixture.filename, { id: 1, filename: fixture.filename }]]),
+    close: async () => { state.server_closed += 1; },
+  };
+  const shaper = {
+    start: async () => {
+      if (startError) throw startError;
+      return "http://127.0.0.1:41002";
+    },
+    close: async () => { state.shaper_closed += 1; },
+    telemetry: () => ({
+      profile: "8mbps-to-1.5mbps",
+      spec: "8mbps-to-1.5mbps",
+      cliff_after_seconds: 12,
+      cliff_applied_at_ms: result?.shaping?.cliff_applied_at_ms ?? null,
+      transport_errors: [],
+      stages: result?.shaping?.stages || [],
+    }),
+  };
+  const driver = {
+    start: async () => {},
+    close: async () => { state.driver_closed += 1; },
+    exec: async () => true,
+  };
+  return {
+    buildFixtures: async () => ({
+      directory: "/tmp/playback-lab-contract-fixtures",
+      metadata: { [fixture.id]: { duration_ms: 120_000 } },
+    }),
+    startServer: async () => server,
+    createShaper: () => shaper,
+    createDriver: () => driver,
+    prepareBrowser: async () => ({
+      browser: "Contract Browser",
+      caps: { vcodec: "h264", acodec: "aac", hdr: 0 },
+      native_hls: false,
+    }),
+    api: async (_base, route) => route.startsWith("/system/logs") ? [] : { version: "contract" },
+    runOneCase: async (_driver, _server, _manifest, _fixture, testCase) => ({
+      name: testCase.name,
+      fixture: testCase.fixture,
+      quality: testCase.quality,
+      operation: testCase.operation,
+      status: result.status,
+      outcome: result.outcome,
+      duration_ms: 0,
+      errors: result.errors,
+      warnings: [],
+      metrics: result.metrics,
+      shaping: result.shaping,
+    }),
+  };
+}
+
+test("an unavailable shaper fails the full run, retains artifacts, and cleans owned state", async () => {
+  await withTempDir(async (directory) => {
+    const manifest = lab.loadManifest();
+    const json = path.join(directory, "unavailable.json");
+    const junit = path.join(directory, "unavailable.xml");
+    const state = { server_closed: 0, shaper_closed: 0, driver_closed: 0 };
+    const dependencies = lifecycleDependencies(
+      manifest, null, state, new Error("network shaping is unavailable: EACCES"),
+    );
+    const outcome = await lab.executeRun(manifest, {
+      suite: "stall-recovery", network_profile: "8mbps-to-1.5mbps", json, junit,
+    }, dependencies);
+    assert.equal(outcome.code, 1);
+    assert.match(outcome.error.message, /shaping is unavailable/);
+    assert.deepEqual(state, { server_closed: 1, shaper_closed: 1, driver_closed: 0 });
+    assert.equal(JSON.parse(await fsp.readFile(json, "utf8")).outcome, "harness");
+    assert.match(await fsp.readFile(junit, "utf8"), /failures="1"/);
+  });
+});
+
+test("missed-cliff and failed-recovery verdicts fail the full run and clean every owner", async () => {
+  const missed = lab.scoreRecovery(CRITERIA, observation({
+    shaping: { cliff_applied_at_ms: null, stages: observation().shaping.stages },
+  }));
+  const frozen = healthyTimeline().map((row, index) =>
+    index < 5 ? row : { ...row, absolute_time: 5 });
+  const recovery = lab.scoreRecovery(CRITERIA, observation({ timeline: frozen }));
+  for (const [name, score] of [["missed-cliff", missed], ["failed-recovery", recovery]]) {
+    await withTempDir(async (directory) => {
+      const manifest = lab.loadManifest();
+      const json = path.join(directory, `${name}.json`);
+      const junit = path.join(directory, `${name}.xml`);
+      const state = { server_closed: 0, shaper_closed: 0, driver_closed: 0 };
+      const result = { ...score, status: "failed", shaping: observation().shaping };
+      if (name === "missed-cliff") result.shaping = { ...result.shaping, cliff_applied_at_ms: null };
+      const outcome = await lab.executeRun(manifest, {
+        suite: "stall-recovery", network_profile: "8mbps-to-1.5mbps", json, junit,
+      }, lifecycleDependencies(manifest, result, state));
+      assert.deepEqual(outcome, { code: 1, error: null });
+      assert.deepEqual(state, { server_closed: 1, shaper_closed: 1, driver_closed: 1 });
+      const artifact = JSON.parse(await fsp.readFile(json, "utf8"));
+      assert.equal(artifact.outcome, score.outcome);
+      assert.deepEqual(artifact.summary, { total: 1, passed: 0, failed: 1 });
+      assert.match(await fsp.readFile(junit, "utf8"), /failures="1"/);
+    });
+  }
+});
+
+test("the normalize command exits nonzero on missing and invalid artifacts", async () => {
+  await withTempDir(async (directory) => {
+    const missing = cli(["normalize", "--json", path.join(directory, "absent.json")]);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /could not be read/);
+
+    const malformedPath = path.join(directory, "malformed.json");
+    await fsp.writeFile(malformedPath, "{ not json", "utf8");
+    const malformed = cli(["normalize", "--json", malformedPath]);
+    assert.equal(malformed.status, 1);
+    assert.match(malformed.stderr, /not valid JSON/);
+
+    const foreignPath = path.join(directory, "foreign.json");
+    await fsp.writeFile(foreignPath, JSON.stringify({ hello: "world" }), "utf8");
+    const foreign = cli(["normalize", "--json", foreignPath]);
+    assert.equal(foreign.status, 1);
+    assert.match(foreign.stderr, /not a playback-lab report/);
+  });
 });
 
 test("the normalize command emits a stable trace for a real artifact", async () => {

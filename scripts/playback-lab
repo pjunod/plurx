@@ -592,6 +592,11 @@ class TokenBucket {
     this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.bytesPerMs);
   }
 
+  refund(bytes, nowMs) {
+    this.refill(nowMs);
+    this.tokens = Math.min(this.capacity, this.tokens + bytes);
+  }
+
   /**
    * Claim `bytes` now and return how long the caller must wait first. Debt is
    * allowed to go negative and is repaid by time, which is what makes the
@@ -649,12 +654,15 @@ class ShapingProxy {
     this.closed = false;
     this.limiterTail = Promise.resolve();
     this.limiterWaiters = new Set();
+    this.frozenTelemetry = null;
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
       kbps: stage.kbps,
       entered_at_ms: null,
       left_at_ms: null,
+      first_byte_at_ms: null,
+      last_byte_at_ms: null,
       bytes: 0,
       media_bytes: 0,
     }));
@@ -683,6 +691,18 @@ class ShapingProxy {
     return this.baseUrl;
   }
 
+  /** Start stage-zero evidence after the browser has presented its first frame. */
+  beginEvidence() {
+    const stage = this.stages[this.stageIndex];
+    const at = this.now() - this.startedAt;
+    stage.entered_at_ms = at;
+    stage.left_at_ms = null;
+    stage.first_byte_at_ms = null;
+    stage.last_byte_at_ms = null;
+    stage.bytes = 0;
+    stage.media_bytes = 0;
+  }
+
   /** Drop the link to the next stage. Called once, at a point the report keeps. */
   applyCliff() {
     if (this.stageIndex + 1 >= this.stages.length) return null;
@@ -698,6 +718,9 @@ class ShapingProxy {
 
   record(bytes, media) {
     const stage = this.stages[this.stageIndex];
+    const at = this.now() - this.startedAt;
+    if (stage.first_byte_at_ms === null) stage.first_byte_at_ms = at;
+    stage.last_byte_at_ms = at;
     stage.bytes += bytes;
     if (media) stage.media_bytes += bytes;
   }
@@ -705,6 +728,17 @@ class ShapingProxy {
   handle(request, response) {
     const media = isMediaPath(request.url);
     const route = diagnosticPath(request.url);
+    const transfer = { cancelled: false, upstreamResponse: null };
+    const cancel = () => {
+      // `close` also fires after a successful response. Only an unfinished
+      // downstream is a browser cancellation, which is normal when the player
+      // replaces a rung/session during recovery.
+      if (response.writableFinished || transfer.cancelled) return;
+      transfer.cancelled = true;
+      this.wakeLimiter();
+      transfer.upstreamResponse?.destroy();
+      upstream.destroy();
+    };
     const upstream = http.request({
       agent: this.agent,
       host: this.target.hostname,
@@ -713,19 +747,32 @@ class ShapingProxy {
       method: request.method,
       headers: { ...request.headers, host: this.target.host },
     }, (upstreamResponse) => {
+      transfer.upstreamResponse = upstreamResponse;
+      if (transfer.cancelled) {
+        upstreamResponse.destroy();
+        return;
+      }
       response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
-      this.pump(upstreamResponse, response, media).catch((error) => {
-        if (!this.closed) this.errors.push(`${request.method} ${route}: ${error.message}`);
+      this.pump(upstreamResponse, response, media, () => transfer.cancelled).catch((error) => {
+        if (!this.closed && !transfer.cancelled) {
+          this.errors.push(`${request.method} ${route}: ${error.message}`);
+        }
         upstreamResponse.destroy();
         response.destroy();
+      }).finally(() => {
+        request.off("aborted", cancel);
+        response.off("close", cancel);
       });
     });
     upstream.on("error", (error) => {
-      if (!this.closed) this.errors.push(`${request.method} ${route}: ${error.message}`);
+      if (transfer.cancelled || this.closed) return;
+      this.errors.push(`${request.method} ${route}: ${error.message}`);
       if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
       response.end("playback-lab shaper: upstream error");
     });
-    request.on("error", () => upstream.destroy());
+    request.once("aborted", cancel);
+    response.once("close", cancel);
+    request.on("error", cancel);
     request.pipe(upstream);
   }
 
@@ -736,20 +783,54 @@ class ShapingProxy {
    * through the low-rate stage. `applyCliff` wakes the one active reservation,
    * which recomputes its remaining debt at the new rate.
    */
-  throttle(bytes) {
-    const reservation = this.limiterTail.then(() => this.waitForBudget(bytes));
-    this.limiterTail = reservation.catch(() => {});
-    return reservation;
+  writeShaped(slice, sink, media, cancelled) {
+    const delivery = this.limiterTail.then(() => this.deliverSlice(slice, sink, media, cancelled));
+    this.limiterTail = delivery.catch(() => {});
+    return delivery;
   }
 
-  async waitForBudget(bytes) {
-    if (this.closed) throw new Error("shaper closed");
-    let delay = this.bucket.reserve(bytes, this.now());
-    while (delay > 0) {
-      await this.waitForLimiter(delay);
+  async deliverSlice(slice, sink, media, cancelled) {
+    let reserved = false;
+    let committed = false;
+    try {
       if (this.closed) throw new Error("shaper closed");
-      delay = this.bucket.delay(this.now());
+      if (cancelled()) throw new Error("client cancelled the transfer");
+      let delay = this.bucket.reserve(slice.length, this.now());
+      reserved = true;
+      while (delay > 0) {
+        await this.waitForLimiter(delay);
+        if (this.closed) throw new Error("shaper closed");
+        if (cancelled()) throw new Error("client cancelled the transfer");
+        delay = this.bucket.delay(this.now());
+      }
+      if (cancelled() || sink.destroyed || !sink.writable) {
+        throw new Error("client cancelled the transfer");
+      }
+      if (!sink.write(slice)) await this.waitForDrain(sink, cancelled);
+      if (cancelled() || sink.destroyed) throw new Error("client cancelled the transfer");
+      this.record(slice.length, media);
+      committed = true;
+    } finally {
+      // A canceled restart must not leave debt in the shared link or meter a
+      // slice the browser never received. The next rendition gets only the
+      // credit genuinely earned while the canceled reservation was waiting.
+      if (reserved && !committed && !this.closed) this.bucket.refund(slice.length, this.now());
     }
+  }
+
+  waitForDrain(sink, cancelled) {
+    return new Promise((resolve, reject) => {
+      const done = (error) => {
+        sink.off("drain", onDrain);
+        sink.off("close", onClose);
+        error ? reject(error) : resolve();
+      };
+      const onDrain = () => done();
+      const onClose = () => done(new Error("client cancelled the transfer"));
+      if (cancelled() || sink.destroyed) return done(new Error("client cancelled the transfer"));
+      sink.once("drain", onDrain);
+      sink.once("close", onClose);
+    });
   }
 
   waitForLimiter(delay) {
@@ -769,33 +850,17 @@ class ShapingProxy {
     for (const wake of [...this.limiterWaiters]) wake();
   }
 
-  async pump(source, sink, media) {
+  async pump(source, sink, media, cancelled) {
     try {
       for await (const chunk of source) {
         for (let offset = 0; offset < chunk.length; offset += SHAPER_SLICE_BYTES) {
           const slice = chunk.subarray(offset, offset + SHAPER_SLICE_BYTES);
-          await this.throttle(slice.length);
-          this.record(slice.length, media);
-          if (!sink.write(slice)) {
-            // Both listeners are removed on either outcome: a long transfer
-            // backpressures thousands of times, and leaking one listener per
-            // slice would warn and then grow without bound.
-            await new Promise((resolve, reject) => {
-              const done = (error) => {
-                sink.off("drain", onDrain);
-                sink.off("close", onClose);
-                error ? reject(error) : resolve();
-              };
-              const onDrain = () => done();
-              const onClose = () => done(new Error("client closed the connection"));
-              sink.once("drain", onDrain);
-              sink.once("close", onClose);
-            });
-          }
+          await this.writeShaped(slice, sink, media, cancelled);
         }
       }
-      sink.end();
+      if (!cancelled()) sink.end();
     } catch (error) {
+      if (cancelled()) return;
       sink.destroy();
       throw error;
     }
@@ -806,7 +871,7 @@ class ShapingProxy {
    * that proves the shaper held: it may sit below the cap because the player
    * asked for less, but it may never sit meaningfully above it.
    */
-  telemetry() {
+  telemetrySnapshot() {
     const endedAt = this.now() - this.startedAt;
     return {
       profile: this.profile.id,
@@ -816,7 +881,11 @@ class ShapingProxy {
       transport_errors: this.errors.slice(-10),
       stages: this.stages.map((stage) => {
         const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
-        const seconds = stage.entered_at_ms === null ? 0 : Math.max(0, left - stage.entered_at_ms) / 1000;
+        // Browser launch and page preparation happen after the proxy binds.
+        // Starting the rate window at the first delivered byte keeps that dead
+        // time from hiding a shaper leak in the pre-cliff average.
+        const activeStart = stage.first_byte_at_ms;
+        const seconds = activeStart === null ? 0 : Math.max(0, left - activeStart) / 1000;
         return {
           ...stage,
           held_seconds: Number(seconds.toFixed(3)),
@@ -827,7 +896,17 @@ class ShapingProxy {
     };
   }
 
+  telemetry() {
+    return this.frozenTelemetry || this.telemetrySnapshot();
+  }
+
+  freezeTelemetry() {
+    if (!this.frozenTelemetry) this.frozenTelemetry = this.telemetrySnapshot();
+    return this.frozenTelemetry;
+  }
+
   async close() {
+    this.freezeTelemetry();
     this.closed = true;
     this.wakeLimiter();
     this.agent.destroy();
@@ -1431,6 +1510,10 @@ async function observeShapedCliff(driver, shaper, testCase, start) {
   // Both windows are timestamped from their own start, and the recovery window
   // from the cliff itself, so every `at_ms` in the artifact reads as "since the
   // cliff" without the reader having to subtract anything.
+  // Reset stage-zero measurement only after the first frame. Browser launch,
+  // page assets, and player preparation are not part of the shaped baseline and
+  // must not dilute a pre-cliff leak below the ceiling check.
+  shaper.beginEvidence();
   const baselineStart = performance.now();
   const beforeCliff = await sampleWindow(
     driver, shaper.profile.cliff_after_seconds, intervalMs, baselineStart, baseline,
@@ -1444,7 +1527,10 @@ async function observeShapedCliff(driver, shaper, testCase, start) {
     driver, criteria.recovery_observe_seconds ?? 45, intervalMs, cliffOrigin, timeline,
   );
   const observation = {
-    shaping: shaper.telemetry(),
+    // End the evidence window with the sampled observation. The same immutable
+    // snapshot is reused at the report top level after cleanup, so one artifact
+    // cannot contain two throughput accounts for the same stage.
+    shaping: shaper.freezeTelemetry(),
     baseline_clock_rate: baselineElapsed > 0 ? baselineAdvanced / baselineElapsed : 0,
     pre_cliff_runway_seconds: Number(beforeCliff.video.runway || 0),
     baseline_error: beforeCliff.video.error
@@ -1575,11 +1661,23 @@ function timeToSustained(timeline, sustainedSeconds, minimumRate) {
   if (last.media_error !== null && last.media_error !== undefined) return null;
   if (last.paused === true || last.seeking === true) return null;
   if (last.ready_state !== null && last.ready_state !== undefined && last.ready_state < 2) return null;
+  // PLAYER is rebuilt for every rendition/session restart, resetting its raw
+  // stall counter. Convert those per-attempt counters into a monotonic series;
+  // otherwise a reset from 5 to 0 can hide new stalls and award recovery.
+  const cumulativeStalls = [0];
+  let previousStalls = Number(timeline[0].stalls || 0);
+  for (let index = 1; index < timeline.length; index += 1) {
+    const stalls = Number(timeline[index].stalls || 0);
+    const delta = stalls >= previousStalls ? stalls - previousStalls : stalls;
+    cumulativeStalls.push(cumulativeStalls[index - 1] + Math.max(0, delta));
+    previousStalls = stalls;
+  }
   const windowMs = sustainedSeconds * 1000;
-  for (const from of timeline) {
+  for (let index = 0; index < timeline.length; index += 1) {
+    const from = timeline[index];
     // Too little left to prove anything; every later start is shorter still.
     if (last.at_ms - from.at_ms < windowMs) break;
-    if (last.stalls > from.stalls) continue;
+    if (cumulativeStalls[cumulativeStalls.length - 1] > cumulativeStalls[index]) continue;
     const elapsed = (last.at_ms - from.at_ms) / 1000;
     if (elapsed > 0 && (last.absolute_time - from.absolute_time) / elapsed >= minimumRate) return from.at_ms;
   }
@@ -1940,7 +2038,7 @@ async function writeFatalRunReport(options, error) {
   error.reportWritten = true;
 }
 
-async function runSuite(manifest, options) {
+async function runSuite(manifest, options, dependencies = {}) {
   const suite = options.suite || "smoke";
   const browserName = options.browser || "chrome";
   if (!new Set(["chrome", "safari", "edge", "firefox"]).has(browserName)) {
@@ -1959,9 +2057,9 @@ async function runSuite(manifest, options) {
   }
   process.stdout.write("\n");
   const wanted = new Set(plan.cases.map((testCase) => testCase.fixture));
-  const corpus = await buildFixtures(manifest, options, wanted);
+  const corpus = await (dependencies.buildFixtures || buildFixtures)(manifest, options, wanted);
   process.stdout.write("\nSTART   isolated plurx server\n");
-  const server = await startServer(options, corpus.directory);
+  const server = await (dependencies.startServer || startServer)(options, corpus.directory);
   const missing = manifest.fixtures
     .filter((fixture) => wanted.has(fixture.id))
     .filter((fixture) => !server.files.has(fixture.filename));
@@ -1976,7 +2074,9 @@ async function runSuite(manifest, options) {
   let playerBaseUrl = server.baseUrl;
   if (profile) {
     try {
-      shaper = new ShapingProxy(profile, server.baseUrl);
+      shaper = dependencies.createShaper
+        ? dependencies.createShaper(profile, server.baseUrl)
+        : new ShapingProxy(profile, server.baseUrl);
       playerBaseUrl = await shaper.start(options.shaper_binder);
     } catch (error) {
       if (shaper) await shaper.close().catch(() => {});
@@ -1988,23 +2088,25 @@ async function runSuite(manifest, options) {
       `${profile.stages[1].kbps} kb/s ${profile.cliff_after_seconds}s after the first frame\n`,
     );
   }
-  let driver;
-  if (browserName === "safari") {
-    driver = new SafariDriver(options, playerBaseUrl, server.runtime);
-  } else if (browserName === "firefox") {
-    driver = new FirefoxDriver(options, playerBaseUrl, server.runtime);
-  } else {
-    driver = new CdpDriver(options, playerBaseUrl, server.runtime, browserName);
-  }
+  let driver = null;
   let browserInfo = null;
   let system = null;
   let fatal = null;
   const results = [];
   try {
+    if (dependencies.createDriver) {
+      driver = dependencies.createDriver(options, playerBaseUrl, server.runtime, browserName);
+    } else if (browserName === "safari") {
+      driver = new SafariDriver(options, playerBaseUrl, server.runtime);
+    } else if (browserName === "firefox") {
+      driver = new FirefoxDriver(options, playerBaseUrl, server.runtime);
+    } else {
+      driver = new CdpDriver(options, playerBaseUrl, server.runtime, browserName);
+    }
     process.stdout.write(`START   ${browserName} player\n`);
     await driver.start();
-    browserInfo = await prepareBrowser(driver, server.token);
-    system = await api(server.baseUrl, "/system", { token: server.token });
+    browserInfo = await (dependencies.prepareBrowser || prepareBrowser)(driver, server.token);
+    system = await (dependencies.api || api)(server.baseUrl, "/system", { token: server.token });
     process.stdout.write(`CAPS    ${browserInfo.browser}: video=${browserInfo.caps.vcodec} · audio=${browserInfo.caps.acodec} · hdr=${browserInfo.caps.hdr} · native_hls=${browserInfo.native_hls}\n\n`);
     for (let index = 0; index < plan.cases.length; index += 1) {
       const testCase = plan.cases[index];
@@ -2013,7 +2115,9 @@ async function runSuite(manifest, options) {
       const caseLogStart = Date.now();
       let result;
       try {
-        result = await runOneCase(driver, server, manifest, fixture, testCase, browserInfo, options.observe, shaper);
+        result = await (dependencies.runOneCase || runOneCase)(
+          driver, server, manifest, fixture, testCase, browserInfo, options.observe, shaper,
+        );
       } catch (error) {
         result = {
           name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
@@ -2034,7 +2138,9 @@ async function runSuite(manifest, options) {
         }
       }
       try {
-        const logs = await api(server.baseUrl, "/system/logs?level=trace&limit=500", { token: server.token });
+        const logs = await (dependencies.api || api)(
+          server.baseUrl, "/system/logs?level=trace&limit=500", { token: server.token },
+        );
         result.server_logs = logs.filter((entry) => entry.ts_ms >= caseLogStart - 100);
         result.diagnostics = result.server_logs
           .filter((entry) => entry.level === "ERROR" || entry.level === "WARN")
@@ -2066,7 +2172,7 @@ async function runSuite(manifest, options) {
     // needs to know which layer died, and a missing file answers nothing.
     fatal = error;
   } finally {
-    await driver.close().catch(() => {});
+    if (driver) await driver.close().catch(() => {});
     if (shaper) await shaper.close().catch(() => {});
     await server.close(options.keep_runtime);
   }
@@ -2103,7 +2209,16 @@ async function runSuite(manifest, options) {
     fatal.reportWritten = true;
     throw fatal;
   }
-  if (passed !== results.length) process.exitCode = 1;
+  return passed === results.length ? 0 : 1;
+}
+
+async function executeRun(manifest, options, dependencies = {}) {
+  try {
+    return { code: await runSuite(manifest, options, dependencies), error: null };
+  } catch (error) {
+    if (!error.reportWritten) await writeFatalRunReport(options, error);
+    return { code: 1, error };
+  }
 }
 
 /**
@@ -2153,12 +2268,9 @@ async function main() {
   }
   if (command === "normalize") return normalizeCommand(options);
   if (command === "run") {
-    try {
-      await runSuite(loadManifest(), options);
-    } catch (error) {
-      if (!error.reportWritten) await writeFatalRunReport(options, error);
-      throw error;
-    }
+    const outcome = await executeRun(loadManifest(), options);
+    if (outcome.error) throw outcome.error;
+    if (outcome.code !== 0) process.exitCode = outcome.code;
     return;
   }
   const manifest = loadManifest();
@@ -2175,6 +2287,7 @@ module.exports = {
   ShapingProxy,
   TokenBucket,
   diagnosticPath,
+  executeRun,
   expandCases,
   fixturesForBuild,
   isMediaPath,

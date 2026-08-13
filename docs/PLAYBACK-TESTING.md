@@ -159,6 +159,14 @@ Pre-cliff credit is clamped when the rate drops. Without that, a bucket filled
 at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
 edge the suite exists to observe.
 
+The evidence window starts only after the first presented frame. Stage-zero
+byte and time counters reset there, and each stage's measured rate begins with
+its first delivered byte, so browser launch and page preparation cannot dilute
+a leaked pre-cliff rate. The proxy freezes one telemetry snapshot when the
+observation ends and reuses it at both result and report level. Browser-side
+request cancellation during a rendition restart closes the matching upstream
+request, refunds an undelivered reservation, and is not a link error.
+
 **The profile grammar** is `<high>-to-<low>[@<seconds>]`, e.g.
 `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`. The descent is mandatory: a flat
 or rising "cliff" is refused, because accepting one would let a green
@@ -188,7 +196,9 @@ describe adaptation. Every artifact therefore carries an `outcome`:
 
 The criteria live in `tests/playback/cases.json` beside the case, not in the
 script: restarts, upgrades per 60 s, the recovery deadline, and the sustained
-window are review material.
+window are review material. Because the player rebuilds its per-attempt stall
+counter when it changes sessions, the scorer folds counter resets into one
+monotonic run-level count before deciding whether a window was stall-free.
 
 **What it deliberately does not do.** It injects no probe onto the play path,
 changes no rate control, and does not steer the player. Choosing a rung in
