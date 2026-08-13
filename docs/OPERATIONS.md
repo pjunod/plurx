@@ -502,13 +502,23 @@ nonempty value that cannot parse as the bounded integer marks the durable pair
 corrupt; boot, refresh, and `GET /settings` all report/use legacy bitrate with
 no override rather than silently turning corruption into default-quality mode.
 
-Live sessions and speculative production may use the validated quality
-identity. Resumable offline packages are temporarily pinned to legacy VBR
-instead: a package must persist its effective rate-control snapshot to survive
-a yield and later resume, and that storage migration remains an explicit owner
-decision. Do not describe offline packages as quality-mode output until the
-snapshot schema and the effective-QVBR live/producer/offline identity test land
-together.
+Live sessions, speculative production, and newly requested offline packages
+use the validated effective identity. An offline package stores exactly `vbr`
+or `qvbr:<q>` when it is created and reuses that value after every yield or
+restart; it never reads the current global pair on resume. SQLite v18 adds the
+non-null column and backfills existing packages to `vbr`. Replicated schema v5
+has the same column while retaining protocol v4. N3's cache-artifact migration
+therefore moves to SQLite v19. Production still opens the SQLite backend; the
+replicated v5 definition is for fresh bootstrap/import. N1 does not invent the
+cluster rolling-migration protocol: an existing replicated v4 cluster remains
+incompatible and must not be pointed at this binary.
+
+Deploy this schema-bearing N1 server change to the fleet as one coordinated
+maintenance operation through `scripts/ship`, which takes the documented
+pre-deploy SQLite backups. The migration is additive and does not rewrite or
+delete media, but an older binary refuses the newer database. A rollback is
+therefore the standard restore of each node's matching pre-deploy database
+snapshot plus its old binary, not a code-only downgrade.
 
 ### Rate-control acceptance captures production, then scores offline
 
@@ -622,9 +632,7 @@ scripts/bench rate-control \
 The command above measures the explicit `q=22` calibration candidate only; it
 cannot ratify the currently provisional unset/default value. D5 requires a
 nynuc sweep, updating the selected family default to the winning measured
-value, and rerunning that exact default without `--quality`. Until the peak
-contract is also ratified, every full artifact remains ineligible and exits
-nonzero even when its other diagnostics are green.
+value, and rerunning that exact default without `--quality`.
 
 Omitting `--quality` explicitly sends and verifies
 `transcode_quality: null` for both captures; it does not preserve a preexisting
@@ -728,40 +736,36 @@ quality-mode cap is not an equal comparison. Peak rate uses the same
 complete-served-segment rolling windows as `scripts/perf-report`; incomplete
 tail windows are ignored.
 
-Peak acceptance is stop-flagged after PR #131 review. PERF2-PLAN v2 named the
-advertised peak over a bufsize window; PR #131 implemented the advertised peak
-over 10-second complete served-segment windows and retained the inferred
-`maxrate + bufsize/window` value as a diagnostic. The harness now records the
-observed peak over both candidate windows: exactly `10.0` seconds for PR #131,
-and `video_bufsize_kbits / video_maxrate_kbps` seconds for v2. Because served
-segments are the measurement quantum, the latter is the rate of the shortest
-complete-segment span meeting that derived duration. The JSON also keeps the
-10-second theoretical VBV allowance separate from both observed peaks.
+The owner ratified the 10-second complete-served-segment gate on 2026-08-12.
+For each VBR and requested-quality capture, the observed peak over exactly
+`10.0` seconds must be no greater than the unchanged advertised
+`Rung.peak_kbps`. Ten seconds spans five nominal two-second HLS segments and is
+stable under this served-segment measurement. The derived
+`video_bufsize_kbits / video_maxrate_kbps` window is about 1.33 seconds under
+the current caps, shorter than one nominal segment; its shortest qualifying
+complete-segment observation remains useful diagnosis but is not a portable
+binding gate. The JSON also keeps the theoretical 10-second
+`maxrate + bufsize/window` allowance separate and nonbinding.
 
-The owner has not ratified either peak gate. The JSON labels both observed
-peaks diagnostic, sets
-`acceptance.eligible: false`, emits `peak_contract_unratified`, and cannot
-report `passed: true` for `vbr,qvbr`. Do not present that artifact as N1
-acceptance until the plan records the owner's chosen peak contract.
-
-Apart from that deliberate stop, the diagnostic comparison still checks that
+The full comparison also checks that
 both modes supplied finite, strictly positive server-speed p10 measurements
 and that the requested quality-mode capture did not lower VMAF, grow bytes on
 easy content, or lose more than 10% server encode speed. It does not prove QVBR
 flags executed. Failures are explicit
 `vmaf_regression`, `easy_bytes_regression`, `speed_invalid`,
 `speed_nonpositive`, `speed_regression`, `encoder_identity_mismatch`,
-`ladder_identity_mismatch`, `duration_mismatch`, `peak_contract_unratified`,
+`ladder_identity_mismatch`, `duration_mismatch`, `peak_evidence_invalid`,
+`advertised_peak_exceeded`,
 `diagnostic_subset_not_acceptance`, `harness_error`, or
 `setting_restore_failed`.
 Missing `libvmaf` fails; it never skips quality scoring. A quantitative harness
-run proves settings acknowledgement and measured output only after every stop
-condition has been resolved; it does not prove that the intended encoder flags
+run proves settings acknowledgement and measured output only after every gate
+passes; it does not prove that the intended encoder flags
 or forced fallback executed. N1's production tests and boot validation must
 prove settings-to-flags behavior, and the plan's separate forced-fallback run
 must supply that evidence. TTFS is not N1 evidence. Keep the JSON as the PR
-artifact, and do not claim the named-machine full comparison without both peak
-ratification and the actual run.
+artifact, and do not claim the named-machine full comparison without the actual
+run.
 
 ### Where the transcode scratch lives
 

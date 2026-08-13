@@ -497,10 +497,26 @@ impl OfflineManager {
                 return;
             }
         };
+        let Some(effective_rate_control) =
+            plurx_core::transcode::EffectiveRateControl::parse_snapshot(
+                &package.effective_rate_control,
+            )
+        else {
+            self.fail(
+                &package,
+                "validating",
+                "invalid_rate_control",
+                "The download's encoding identity is invalid.",
+                work_started,
+            )
+            .await;
+            return;
+        };
         let spec = OfflineSpec {
             target_height: package.target_height,
             audio_index: package.audio_index,
             subtitle,
+            effective_rate_control,
         };
         let _ = self
             .store
@@ -734,6 +750,7 @@ mod tests {
             source_size: 3,
             source_mtime: 4,
             recipe_hash: None,
+            effective_rate_control: "vbr".into(),
             target_height: 720,
             output_width: Some(1280),
             output_height: Some(720),

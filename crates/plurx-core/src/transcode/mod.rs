@@ -418,7 +418,7 @@ pub enum ToneMap {
 }
 
 /// What to burn into the video (image subs must be burned; text subs can be).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleBurn {
     /// 0-based index among the file's subtitle streams.
     pub subtitle_index: i64,
@@ -427,7 +427,7 @@ pub struct SubtitleBurn {
 }
 
 /// Everything needed to build a transcode command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscodeOptions {
     pub target_height: i64,
     pub video_bitrate_kbps: u32,

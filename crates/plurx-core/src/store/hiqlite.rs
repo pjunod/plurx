@@ -22,7 +22,10 @@ use super::{keys, ApiKeyStore, PlaybackTelemetryStore, SettingsStore, UserStore}
 use crate::domain::{ApiKey, PlaybackEvent, PlaybackEventQuery, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 4;
+// v5 is a fresh-bootstrap/import schema. There is deliberately no in-place
+// replicated v4 migration here: existing clusters must fail compatibility
+// until the clustering upgrade protocol owns that transition.
+pub const AUTH_SCHEMA_VERSION: i64 = 5;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1328,6 +1331,15 @@ mod tests {
         )
         .expect_err("old schema must refuse");
         assert!(error.to_string().contains("incompatible"));
+
+        let existing_v4 = CompatibilityRow {
+            schema_version: 4,
+            protocol_min: AUTH_PROTOCOL_VERSION,
+            protocol_max: AUTH_PROTOCOL_VERSION,
+        };
+        let error = verify_compatibility_rows(vec![existing_v4], ClusterCompatibility::CURRENT)
+            .expect_err("fresh-bootstrap v5 must not imply an in-place v4 upgrade");
+        assert!(error.to_string().contains("schema 4 is incompatible"));
 
         let old_protocol = ClusterCompatibility {
             schema_version: AUTH_SCHEMA_VERSION,

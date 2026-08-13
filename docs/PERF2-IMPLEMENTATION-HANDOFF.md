@@ -391,15 +391,18 @@ acceptance run must do that. Then:
 arms in the `rate_control` closure (`encoder.rs:138-152` — boot
 validation covers new flags for free via `validation_args`,
 `encoder.rs:328`); offline packages persisting effective recipe inputs
-at creation.
+at creation. Owner decisions recorded 2026-08-12: the full harness binds the
+10-second complete-served-segment peak to the advertised peak; the derived
+bufsize-window observation and theoretical VBV allowance stay diagnostic.
+Offline packages use one non-null `effective_rate_control` column (`vbr` or
+`qvbr:<q>`), SQLite v18 with existing rows defaulted/backfilled to `vbr`, and
+replicated schema v5 with protocol v4; N3's SQLite migration moves to v19.
 *Stop-and-flag if:* the legacy VBR digest bytes cannot be preserved
 exactly; or a driver family needs flags that `validation_args`'s
-15-frame probe cannot exercise; or offline snapshot storage wants a
-schema change beyond a column (that is v18+ territory — say so); or the owner
-has not ratified whether peak acceptance uses v2's bufsize window or PR #131's
-10-second complete-served-segment window. Until that choice is recorded, both
-candidate-window observed peaks and the 10-second VBV allowance remain
-diagnostic, and a full artifact must stay ineligible and non-passing.
+15-frame probe cannot exercise; or offline snapshot storage needs anything
+beyond that ratified single column; or implementation would change the
+ratified 10-second binding peak. Such a change is a new §11 contract decision,
+not an implementation detail.
 *Acceptance:* plan §4's block, on nynuc, numbers in the PR.
 
 ### N2 — per-title analysis (plan §5)

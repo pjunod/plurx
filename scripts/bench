@@ -109,7 +109,7 @@ RATE_CONTROL_ACCEPTANCE_VMAF_SUBSAMPLE = 1
 RATE_CONTROL_ACCEPTANCE_RATE_WINDOW = 10.0
 RATE_CONTROL_ACCEPTANCE_POLL = 0.25
 RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE = 3.0
-RATE_CONTROL_PEAK_CONTRACT_STATUS = "unratified_owner_decision_required"
+RATE_CONTROL_PEAK_CONTRACT_STATUS = "owner_ratified_2026-08-12"
 LADDER_IDENTITY_FIELDS = (
     "requested_height",
     "advertised_height",
@@ -486,7 +486,7 @@ def rolling_segment_peak(segments, window_seconds):
 
 
 def rate_limits(rung, window_seconds):
-    """Record both candidate peak interpretations without choosing one."""
+    """Record the advertised peak gate and the nonbinding VBV diagnostics."""
     advertised_total = positive_number(rung.get("total_kbps"), "ladder.total_kbps")
     advertised_peak = positive_number(rung.get("peak_kbps"), "ladder.peak_kbps")
     # Current StartResponse rungs define total=video+audio and
@@ -499,7 +499,7 @@ def rate_limits(rung, window_seconds):
     video_maxrate = advertised_peak - audio
     video_bufsize = nominal * 2
     bufsize_window = video_bufsize / video_maxrate
-    return {
+    limits = {
         "advertised_total_kbps": advertised_total,
         "derived_nominal_video_kbps": nominal,
         "derived_audio_kbps": audio,
@@ -514,11 +514,24 @@ def rate_limits(rung, window_seconds):
         "window_seconds": window_seconds,
         "theoretical_vbv_allowance_kbps": video_maxrate + video_bufsize / window_seconds,
         "theoretical_vbv_window_seconds": window_seconds,
-        "theoretical_vbv_role": "diagnostic_pending_owner_ratification",
+        "theoretical_vbv_role": "diagnostic_nonbinding",
         "advertised_peak_kbps": advertised_peak,
-        "advertised_peak_role": "diagnostic_pending_owner_ratification",
+        "advertised_peak_role": (
+            "binding_limit_for_10_second_complete_served_segment_peak"
+            if window_seconds == RATE_CONTROL_ACCEPTANCE_RATE_WINDOW
+            else "reference_only_for_nonacceptance_window"
+        ),
         "peak_contract_status": RATE_CONTROL_PEAK_CONTRACT_STATUS,
     }
+    if window_seconds == RATE_CONTROL_ACCEPTANCE_RATE_WINDOW:
+        limits["binding_gate"] = {
+            "measurement": "peak_window_kbps",
+            "window_seconds": RATE_CONTROL_ACCEPTANCE_RATE_WINDOW,
+            "comparison": "less_than_or_equal",
+            "limit": "advertised_peak_kbps",
+            "scope": "full_n1_vbr_qvbr_acceptance",
+        }
+    return limits
 
 
 def safe_server_url(base):
@@ -953,18 +966,20 @@ def restore_rate_settings(api, contract, poll_seconds, idle_timeout_seconds):
 
 
 def evaluate_rate_control(fixture_rows):
-    """Apply resolved comparison gates; peak policy remains stop-flagged."""
+    """Apply the owner-ratified full N1 comparison gates."""
     failures = []
     for fixture in fixture_rows:
         name = fixture["identity"]
         if set(fixture["modes"]) == set(RATE_CONTROL_FULL_MODES):
             vbr, qvbr = fixture["modes"]["vbr"], fixture["modes"]["qvbr"]
+            vbr_limits = vbr.get("limits")
+            qvbr_limits = qvbr.get("limits")
             baseline_ladder = {
-                field: vbr.get("limits", {}).get(field)
+                field: vbr_limits.get(field) if isinstance(vbr_limits, dict) else None
                 for field in LADDER_IDENTITY_FIELDS
             }
             candidate_ladder = {
-                field: qvbr.get("limits", {}).get(field)
+                field: qvbr_limits.get(field) if isinstance(qvbr_limits, dict) else None
                 for field in LADDER_IDENTITY_FIELDS
             }
             if (
@@ -995,6 +1010,53 @@ def evaluate_rate_control(fixture_rows):
                 "baseline_seconds": round(vbr["captured_media_seconds"], 6),
                 "candidate_seconds": round(qvbr["captured_media_seconds"], 6),
             })
+        for mode, measured in (("vbr", vbr), ("qvbr", qvbr)):
+            measured_limits = measured.get("limits")
+            evidence = {
+                "peak_window_kbps": measured.get("peak_window_kbps"),
+                "peak_window_seconds": measured.get("peak_window_seconds"),
+                "advertised_peak_kbps": (
+                    measured_limits.get("advertised_peak_kbps")
+                    if isinstance(measured_limits, dict)
+                    else None
+                ),
+            }
+            invalid = []
+            for field, value in evidence.items():
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    invalid.append(field)
+            if (
+                "peak_window_seconds" not in invalid
+                and evidence["peak_window_seconds"]
+                != RATE_CONTROL_ACCEPTANCE_RATE_WINDOW
+            ):
+                invalid.append("peak_window_seconds")
+            if invalid:
+                failures.append({
+                    "code": "peak_evidence_invalid",
+                    "fixture": name,
+                    "mode": mode,
+                    "invalid_fields": invalid,
+                    "observed": {
+                        field: repr(evidence[field])
+                        for field in invalid
+                    },
+                    "required_window_seconds": RATE_CONTROL_ACCEPTANCE_RATE_WINDOW,
+                })
+            elif evidence["peak_window_kbps"] > evidence["advertised_peak_kbps"]:
+                failures.append({
+                    "code": "advertised_peak_exceeded",
+                    "fixture": name,
+                    "mode": mode,
+                    "observed_kbps": round(evidence["peak_window_kbps"], 3),
+                    "limit_kbps": round(evidence["advertised_peak_kbps"], 3),
+                    "window_seconds": RATE_CONTROL_ACCEPTANCE_RATE_WINDOW,
+                })
         if qvbr["vmaf"] + 1e-9 < vbr["vmaf"]:
             failures.append({
                 "code": "vmaf_regression",
@@ -1083,10 +1145,14 @@ def measured_capture(capture, fixture, scorer, model, n_subsample, rate_window):
         "peak_window_kbps": round(peak, 3),
         "peak_window_start_seconds": round(peak_at, 6),
         "peak_window_seconds": rate_window,
-        "peak_window_role": "configured_complete_served_segment_window_diagnostic",
+        "peak_window_role": (
+            "complete_served_segment_10_second_peak_measurement"
+            if rate_window == RATE_CONTROL_ACCEPTANCE_RATE_WINDOW
+            else "configured_complete_served_segment_window_nonacceptance"
+        ),
         "bufsize_window_peak_kbps": round(bufsize_peak, 3),
         "bufsize_window_peak_start_seconds": round(bufsize_peak_at, 6),
-        "bufsize_window_peak_role": "perf2_v2_candidate_diagnostic",
+        "bufsize_window_peak_role": "diagnostic_nonbinding_derived_bufsize_window",
         "limits": limits,
         "capture_playlist": capture["playlist_path"].name,
     }
@@ -1275,21 +1341,22 @@ def rate_control_report(args, api=None):
                     )
         subset = bool(args.only)
         report["acceptance"] = {
-            "eligible": False,
+            "eligible": selected_modes == RATE_CONTROL_FULL_MODES and not subset,
             "scope": (
                 "diagnostic_subset_non_acceptance"
                 if subset
                 else (
-                    "diagnostic_unratified_peak_contract"
+                    "full_n1_quantitative_acceptance"
                     if selected_modes == RATE_CONTROL_FULL_MODES
                     else "vbr_smoke_non_acceptance"
                 )
             ),
             "peak_contract_status": RATE_CONTROL_PEAK_CONTRACT_STATUS,
             "peak_evidence_scope": (
-                "observed complete-served-segment peaks over the 10-second PR #131 "
-                "window and v2's derived bufsize/maxrate window, plus the theoretical "
-                "10-second VBV allowance, are diagnostics until owner ratification"
+                "each mode's observed complete-served-segment rolling peak over exactly "
+                "10 seconds is binding at or below advertised_peak_kbps; the observed "
+                "derived-bufsize-window peak and theoretical 10-second VBV allowance "
+                "are diagnostic and nonbinding"
             ),
             "effective_mode_evidence": (
                 "settings DTO acknowledgement plus stable encoder identity only; "
@@ -1301,15 +1368,6 @@ def rate_control_report(args, api=None):
             "required_poll_seconds": RATE_CONTROL_ACCEPTANCE_POLL,
             "required_settings_settle_seconds": RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE,
         }
-        if selected_modes == RATE_CONTROL_FULL_MODES:
-            report["failures"].append({
-                "code": "peak_contract_unratified",
-                "detail": (
-                    "N1 peak acceptance is stop-flagged: PERF2-PLAN v2 named a "
-                    "bufsize window, while PR #131 implemented a 10-second complete-served-"
-                    "segment window; owner ratification is required before passed:true"
-                ),
-            })
         if args.only:
             fixtures = [fixture for fixture in fixtures if fixture["identity"] == args.only]
             if not fixtures:
@@ -1473,16 +1531,24 @@ def write_json(path, document):
 
 
 def print_rate_control(report):
+    binding_peak = bool((report.get("acceptance") or {}).get("eligible"))
     for fixture in report.get("fixtures", []):
         for mode, measured in fixture.get("modes", {}).items():
             limits = measured["limits"]
+            peak_label = (
+                f"{measured['peak_window_seconds']:g}s "
+                f"{'binding' if binding_peak else 'nonacceptance'} peak"
+            )
+            advertised_label = (
+                "advertised limit" if binding_peak else "advertised reference"
+            )
             print(
                 f"{fixture['identity']}/{mode}: bytes {measured['bytes']}; "
                 f"VMAF {measured['vmaf']:.3f}; speed p10 {measured['speed_p10']}; "
-                f"10s peak {measured['peak_window_kbps']:.0f} kb/s · "
-                f"bufsize-window peak {measured['bufsize_window_peak_kbps']:.0f} kb/s · "
+                f"{peak_label} {measured['peak_window_kbps']:.0f} kb/s · "
+                f"bufsize-window diagnostic {measured['bufsize_window_peak_kbps']:.0f} kb/s · "
                 f"VBV diagnostic {limits['theoretical_vbv_allowance_kbps']:.0f} · "
-                f"advertised diagnostic {limits['advertised_peak_kbps']:.0f}"
+                f"{advertised_label} {limits['advertised_peak_kbps']:.0f}"
             )
     if report.get("passed"):
         print("PASS: captured production HLS satisfies the selected harness gates")

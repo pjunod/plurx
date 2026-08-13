@@ -81,11 +81,14 @@ impl EffectiveRateControl {
     }
 
     pub fn parse_snapshot(value: &str) -> Option<Self> {
-        let value = value.trim();
         if value == "vbr" {
             return Some(Self::Vbr);
         }
-        let quality = value.strip_prefix("qvbr:")?.parse::<u8>().ok()?;
+        let encoded = value.strip_prefix("qvbr:")?;
+        let quality = encoded.parse::<u8>().ok()?;
+        if encoded != quality.to_string() {
+            return None;
+        }
         Some(Self::Qvbr { quality })
     }
 }
@@ -1158,6 +1161,8 @@ mod tests {
         }
         assert_eq!(EffectiveRateControl::parse_snapshot("qvbr:256"), None);
         assert_eq!(EffectiveRateControl::parse_snapshot("quality:23"), None);
+        assert_eq!(EffectiveRateControl::parse_snapshot("qvbr:023"), None);
+        assert_eq!(EffectiveRateControl::parse_snapshot(" qvbr:23"), None);
     }
 
     #[test]

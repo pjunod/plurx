@@ -518,6 +518,7 @@ const TABLES: &[TablePlan] = &[
             "source_size",
             "source_mtime",
             "recipe_hash",
+            "effective_rate_control",
             "target_height",
             "output_width",
             "output_height",
@@ -1217,6 +1218,11 @@ fn value_projection(table: TablePlan, schema_version: i64, qualify: bool) -> Str
         .map(|column| {
             if table.name == "watched_outbox" && *column == "claim_until" && schema_version < 16 {
                 "0".to_owned()
+            } else if table.name == "offline_packages"
+                && *column == "effective_rate_control"
+                && schema_version < 18
+            {
+                "'vbr'".to_owned()
             } else if qualify {
                 format!("source.{column}")
             } else {
@@ -1368,6 +1374,19 @@ mod tests {
         let current = value_projection(table, SQLITE_SCHEMA_VERSION, false);
         assert!(v14.ends_with("updated_at, 0"));
         assert!(current.ends_with("updated_at, claim_until"));
+    }
+
+    #[test]
+    fn pre_v18_offline_projection_supplies_legacy_vbr_snapshot() {
+        let table = TABLES
+            .iter()
+            .find(|table| table.name == "offline_packages")
+            .copied()
+            .expect("offline package plan");
+        let v17 = value_projection(table, 17, false);
+        let current = value_projection(table, SQLITE_SCHEMA_VERSION, false);
+        assert!(v17.contains("recipe_hash, 'vbr', target_height"));
+        assert!(current.contains("recipe_hash, effective_rate_control, target_height"));
     }
 
     #[test]

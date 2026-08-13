@@ -527,6 +527,10 @@ pub struct OfflinePackage {
     pub source_size: i64,
     pub source_mtime: i64,
     pub recipe_hash: Option<String>,
+    /// Effective encoder rate control captured when the request was created.
+    /// A queued package may yield and resume after the global setting changes,
+    /// so its recipe must never be rebuilt from mutable policy.
+    pub effective_rate_control: String,
     pub target_height: i64,
     /// Exact even-sized output frame computed with the transcoder's scaler
     /// arithmetic. Optional only for legacy/unprobed sources.
@@ -597,6 +601,8 @@ pub struct NewOfflinePackage {
     pub source_path: String,
     pub source_size: i64,
     pub source_mtime: i64,
+    /// Canonical [`crate::transcode::EffectiveRateControl::snapshot_value`].
+    pub effective_rate_control: String,
     pub target_height: i64,
     pub output_width: Option<i64>,
     pub output_height: Option<i64>,

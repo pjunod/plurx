@@ -534,6 +534,20 @@ const MIGRATIONS: &[&str] = &[
     // v17: bounded, node-local playback telemetry. No foreign keys on purpose:
     // events outlive users/files, and retention is strictly age-based.
     PLAYBACK_EVENTS_SCHEMA,
+    // v18: immutable effective rate-control identity for resumable offline
+    // packages. Existing rows were created before quality mode could be
+    // durable, so their only truthful value is the legacy VBR recipe.
+    // SQLite's CHECK limits the representation family; the exact u8 grammar
+    // is validated in Rust at admission and consumption boundaries.
+    "ALTER TABLE offline_packages ADD COLUMN effective_rate_control TEXT NOT NULL
+        DEFAULT 'vbr'
+        CHECK (effective_rate_control = 'vbr'
+               OR (effective_rate_control GLOB 'qvbr:[0-9]*'
+                   AND substr(effective_rate_control, 6) NOT GLOB '*[^0-9]*'
+                   AND length(substr(effective_rate_control, 6)) BETWEEN 1 AND 3
+                   AND CAST(substr(effective_rate_control, 6) AS INTEGER) BETWEEN 0 AND 255
+                   AND printf('%d', CAST(substr(effective_rate_control, 6) AS INTEGER)) =
+                       substr(effective_rate_control, 6)));",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1211,7 +1225,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 17,
+            version, 18,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1357,7 +1371,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1367,6 +1381,68 @@ mod tests {
                 )
                 .expect("index lookup");
             assert_eq!(present, 1, "missing {index}");
+        }
+    }
+
+    #[test]
+    fn v18_backfills_offline_rate_control_without_retargeting_packages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(17) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 17)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash) VALUES (1, 'paul', 'hash')",
+                [],
+            )
+            .expect("seed user");
+            conn.execute(
+                "INSERT INTO offline_packages
+                    (id, request_id, user_id, file_id, node_id, source_path, source_size,
+                     source_mtime, target_height, subtitle_mode, state, phase, expires_at)
+                 VALUES ('package', 'request', 1, 9, 'node', '/media/movie.mkv', 1000,
+                         7, 720, 'none', 'queued', 'waiting_for_encoder', 10000)",
+                [],
+            )
+            .expect("seed v17 package");
+        }
+
+        SqliteStore::open(&db).expect("migrate v17 to v18");
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row(
+                "SELECT effective_rate_control FROM offline_packages WHERE id = 'package'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("backfilled snapshot"),
+            "vbr"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            18
+        );
+        assert!(conn
+            .execute(
+                "UPDATE offline_packages SET effective_rate_control = 'cbr' WHERE id = 'package'",
+                [],
+            )
+            .is_err());
+        for invalid in ["qvbr:", "qvbr:21junk", "qvbr:256", "qvbr:021"] {
+            assert!(
+                conn.execute(
+                    "UPDATE offline_packages SET effective_rate_control = ?1 WHERE id = 'package'",
+                    [invalid],
+                )
+                .is_err(),
+                "constraint accepted {invalid}"
+            );
         }
     }
 

@@ -32,6 +32,8 @@ use plurx_core::domain::{
     PlaybackEventQuery, ProbeResult, TraktAuth,
 };
 #[cfg(feature = "hiqlite-store")]
+use plurx_core::store::OfflinePackageStore;
+#[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
     HiqliteAuthStore, MediaStore, PlaybackTelemetryStore, UserStore, WatchStore,
 };
@@ -498,9 +500,10 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
                          2048, 1, 124, 125);
              INSERT INTO offline_packages
                  (id, request_id, user_id, file_id, node_id, source_path, source_size,
-                  source_mtime, target_height, subtitle_mode, state, phase, expires_at)
+                  source_mtime, effective_rate_control, target_height, subtitle_mode,
+                  state, phase, expires_at)
                  VALUES ('fixture-package', 'fixture-request', 7, 30, 'fixture-node',
-                         '/fixture/shows/season-1.mkv', 4096, 115, 720, 'none',
+                         '/fixture/shows/season-1.mkv', 4096, 115, 'qvbr:21', 720, 'none',
                          'ready', 'complete', 999999);
              INSERT INTO offline_package_leases
                  (token_hash, package_id, created_at, last_access_at, expires_at)
@@ -658,6 +661,16 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
     assert_eq!(store.count_users().await.expect("imported user count"), 1);
     assert_eq!(
         store
+            .offline_package_for_user("fixture-package", 7)
+            .await
+            .expect("read imported v14 package")
+            .expect("imported v14 package")
+            .effective_rate_control,
+        "vbr",
+        "a pre-v18 source must receive the only truthful legacy identity"
+    );
+    assert_eq!(
+        store
             .get_file(30)
             .await
             .expect("read imported file")
@@ -731,6 +744,15 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
         .await
         .expect("import populated current backup");
     assert_eq!(report.search_rows, 2);
+    assert_eq!(
+        store
+            .offline_package_for_user("fixture-package", 7)
+            .await
+            .expect("read imported current package")
+            .expect("imported current package")
+            .effective_rate_control,
+        "qvbr:21"
+    );
     for table in [
         "library_roots",
         "scan_reconcile_guards",
@@ -2238,6 +2260,7 @@ fn offline_request(id: &str, request_id: &str, user_id: i64, file_id: i64) -> Ne
         source_path: "/offline-contract/movie.mkv".into(),
         source_size: 10_000,
         source_mtime: 1,
+        effective_rate_control: "qvbr:21".into(),
         target_height: 1_080,
         output_width: Some(1_920),
         output_height: Some(1_080),
@@ -2257,13 +2280,14 @@ async fn offline_package_contract_runs_through_dyn_store() {
     for_each_backend(|store, backend| async move {
         let (user_id, file_id) = seed_file(&store, "offline-contract").await;
         let first = offline_request("package-1", "request-1", user_id, file_id);
-        assert!(matches!(
-            store
-                .create_offline_package(&first, 10, 100_000, 100_000)
-                .await
-                .expect("create package"),
-            OfflineCreateOutcome::Created(_)
-        ));
+        let OfflineCreateOutcome::Created(created) = store
+            .create_offline_package(&first, 10, 100_000, 100_000)
+            .await
+            .expect("create package")
+        else {
+            panic!("backend {backend} did not create package");
+        };
+        assert_eq!(created.effective_rate_control, "qvbr:21");
         assert!(matches!(
             store
                 .create_offline_package(&first, 10, 100_000, 100_000)
@@ -2355,15 +2379,13 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .await
             .expect("stats");
         assert_eq!(stats.queued, 1);
-        assert_eq!(
-            store
-                .claim_next_offline_package("offline-node")
-                .await
-                .expect("claim")
-                .expect("package")
-                .id,
-            first.id
-        );
+        let claimed = store
+            .claim_next_offline_package("offline-node")
+            .await
+            .expect("claim")
+            .expect("package");
+        assert_eq!(claimed.id, first.id);
+        assert_eq!(claimed.effective_rate_control, "qvbr:21");
         assert_eq!(
             store
                 .reset_interrupted_offline_packages("offline-node")

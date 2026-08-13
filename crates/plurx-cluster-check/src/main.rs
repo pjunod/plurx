@@ -1404,6 +1404,7 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         source_path: format!("/cluster/media/{suffix}/proof-{suffix}.mkv"),
         source_size: 1_000 + ordinal as i64,
         source_mtime: 1_700_000_000 + ordinal as i64,
+        effective_rate_control: "vbr".to_owned(),
         target_height: 720,
         output_width: Some(1280),
         output_height: Some(720),

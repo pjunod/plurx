@@ -66,9 +66,13 @@ bump may break compatibility and a **patch** bump never does.
   VideoToolbox have family-specific quality flags with the existing ladder
   caps; a failed quality probe leaves that family usable on byte-for-byte
   legacy VBR. Live sessions and speculative production share one effective
-  recipe builder. Resumable offline packages intentionally remain on legacy
-  VBR until the owner ratifies the durable effective-rate-control snapshot
-  schema; the quality-mode cross-path fixture is blocked on that same decision.
+  recipe builder. SQLite v18 and replicated schema v5 now persist each offline
+  package's exact effective `vbr` or `qvbr:<q>` snapshot at creation (existing
+  SQLite rows default/backfill to `vbr`), so yield, restart, and a later global
+  setting change cannot alter its recipe identity. Replicated v5 is the fresh
+  bootstrap/import schema; existing v4 clusters remain refused rather than
+  being auto-migrated without the clustering upgrade protocol. The replicated
+  protocol remains v4, and N3's planned SQLite migration moves to v19.
   `scripts/bench rate-control` now opens uncached HLS sessions on the deployed
   plurxd, captures the segments that its production Jellyfin FFmpeg actually
   served, and only after each encode ends scores those bytes offline with an
@@ -81,10 +85,11 @@ bump may break compatibility and a **patch** bump never does.
   `n1_acceptance` corpus; proves pinned, balanced SDR fixture identity; and
   reports bytes, VMAF, server speed, the 10-second complete-segment observed
   peak, the separately observed derived-bufsize-window peak, and the inferred
-  10-second VBV allowance. The two peak interpretations are diagnostics pending
-  owner ratification after PR #131 review; a full run
-  emits `peak_contract_unratified` and cannot report `passed: true`. For the
-  eventual full comparison, missing,
+  10-second VBV allowance. The owner ratified the observed 10-second
+  complete-served-segment peak as the binding gate against the unchanged
+  advertised peak on 2026-08-12. The shorter derived-bufsize-window observation
+  and theoretical allowance remain nonbinding diagnostics. For the full
+  comparison, missing,
   non-finite, or zero speed fails explicitly rather than allowing a zero/zero
   comparison. Full VBR/QVBR runs
   require maintenance-node exclusivity, exact model/subsample/window/poll/settle
@@ -100,7 +105,7 @@ bump may break compatibility and a **patch** bump never does.
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer
   runs afterward. Source implementation is not acceptance: the named-machine
   full comparison, boot/production proof, and separate forced-fallback run
-  remain unclaimed, and the peak contract remains stop-flagged.
+  remain unclaimed.
 
 - **Performance II N0 makes playback telemetry durable and queryable.** Client
   beacons keep their existing human log lines and additionally enter a bounded,

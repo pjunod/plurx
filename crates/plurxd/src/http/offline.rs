@@ -383,6 +383,11 @@ pub async fn create(
 
     let expires_at = now_unix().saturating_add(PACKAGE_TTL_SECS);
     let output_size = plurx_core::transcode::output_size(&file, rung.height);
+    let effective_rate_control = state
+        .transcode
+        .effective_rate_control_for_new_offline_package()
+        .await
+        .snapshot_value();
     let new = NewOfflinePackage {
         id: uuid::Uuid::new_v4().to_string(),
         request_id: request.request_id,
@@ -392,6 +397,7 @@ pub async fn create(
         source_path: file.path.to_string_lossy().into_owned(),
         source_size: file.size,
         source_mtime: file.mtime,
+        effective_rate_control,
         target_height: rung.height,
         output_width: output_size.map(|(width, _)| width),
         output_height: output_size.map(|(_, height)| height),

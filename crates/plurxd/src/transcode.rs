@@ -2047,6 +2047,8 @@ pub struct OfflineSpec {
     pub target_height: i64,
     pub audio_index: Option<i64>,
     pub subtitle: OfflineSubtitle,
+    /// Immutable package identity captured when the request was accepted.
+    pub effective_rate_control: EffectiveRateControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2546,35 +2548,6 @@ impl TranscodeManager {
         }
     }
 
-    /// The options a session with this shape would run with.
-    ///
-    /// One builder, because the cache asks the question twice — once to name
-    /// what it is looking for, once to name what it is about to produce — and
-    /// two spellings of "what this session is" would eventually disagree,
-    /// which is a cache that never hits or, worse, one that hits wrongly.
-    #[allow(clippy::too_many_arguments)] // one session's worth of knobs
-    fn options_for(
-        &self,
-        encoder: Encoder,
-        file: &plurx_core::domain::MediaFile,
-        target_height: i64,
-        start_seconds: f64,
-        audio_index: Option<i64>,
-        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
-        software_threads: Option<u32>,
-    ) -> TranscodeOptions {
-        self.options_for_tone_map(
-            encoder,
-            file,
-            target_height,
-            start_seconds,
-            audio_index,
-            subtitle_burn,
-            software_threads,
-            tone_map_pref(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn options_for_tone_map(
         &self,
@@ -2623,15 +2596,103 @@ impl TranscodeManager {
         }
     }
 
-    /// Keep resumable offline packages on the immutable pre-N1 identity until
-    /// their effective rate control can be persisted with the package row.
-    ///
-    /// A package may yield and resume after the global setting changes. Using
-    /// that mutable setting would rebuild a different recipe and strand the
-    /// package behind its already-pinned hash. The durable snapshot needs a
-    /// ratified storage migration, so the safe interim behavior is legacy VBR.
-    fn pin_offline_rate_control(opts: &mut TranscodeOptions) {
-        opts.effective_rate_control = EffectiveRateControl::Vbr;
+    /// Normalize one path's inputs with the effective rate control that path
+    /// captured. Keeping the final overwrite here is load-bearing: the base
+    /// builder reads the manager's current snapshot, which may have changed
+    /// since a live/speculative generation was captured and must never replace
+    /// an offline package's durable value.
+    #[allow(clippy::too_many_arguments)]
+    fn options_for_effective_rate_control(
+        &self,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        start_seconds: f64,
+        audio_index: Option<i64>,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+        software_threads: Option<u32>,
+        tone_map: ToneMap,
+        effective_rate_control: EffectiveRateControl,
+    ) -> TranscodeOptions {
+        let mut opts = self.options_for_tone_map(
+            encoder,
+            file,
+            target_height,
+            start_seconds,
+            audio_index,
+            subtitle_burn,
+            software_threads,
+            tone_map,
+        );
+        opts.effective_rate_control = effective_rate_control;
+        opts
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn live_lookup_options(
+        &self,
+        rate_control: RateControlSnapshot,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        start_seconds: f64,
+        audio_index: Option<i64>,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+        software_threads: Option<u32>,
+    ) -> TranscodeOptions {
+        self.options_for_effective_rate_control(
+            encoder,
+            file,
+            target_height,
+            start_seconds,
+            audio_index,
+            subtitle_burn,
+            software_threads,
+            tone_map_pref(),
+            rate_control.effective_for(encoder),
+        )
+    }
+
+    fn speculative_producer_options(
+        &self,
+        rate_control: RateControlSnapshot,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        audio_index: Option<i64>,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+    ) -> TranscodeOptions {
+        self.options_for_effective_rate_control(
+            encoder,
+            file,
+            target_height,
+            0.0,
+            audio_index,
+            subtitle_burn,
+            None,
+            tone_map_pref(),
+            rate_control.effective_for(encoder),
+        )
+    }
+
+    fn offline_package_options(
+        &self,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        spec: &OfflineSpec,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+    ) -> TranscodeOptions {
+        self.options_for_effective_rate_control(
+            encoder,
+            file,
+            spec.target_height,
+            0.0,
+            spec.audio_index,
+            subtitle_burn,
+            None,
+            ToneMap::Zscale,
+            spec.effective_rate_control,
+        )
     }
 
     /// A lossless-enough sidecar for simple text codecs. ASS/SSA remains
@@ -2867,18 +2928,14 @@ impl TranscodeManager {
             audio_index,
             subtitle_burn,
         } = self.select_tracks(file, None, None).await;
-        let mut opts = self.options_for(
+        let opts = self.speculative_producer_options(
+            rate_control,
             encoder,
             file,
             target_height,
-            0.0,
             audio_index,
             subtitle_burn,
-            // Parts pick their own budget from the Background permit they run
-            // under (produce_into) — and the recipe hash excludes it anyway.
-            None,
         );
-        opts.effective_rate_control = rate_control.effective_for(encoder);
         let mut digest = self.digest().ok_or("no cache digest")?;
         let hash = self
             .effective_recipe(&mut digest, file, &opts, encoder, false)
@@ -2951,17 +3008,7 @@ impl TranscodeManager {
             }
             OfflineSubtitle::None | OfflineSubtitle::Native(_) => None,
         };
-        let mut opts = self.options_for_tone_map(
-            encoder,
-            file,
-            spec.target_height,
-            0.0,
-            spec.audio_index,
-            subtitle_burn,
-            None,
-            ToneMap::Zscale,
-        );
-        Self::pin_offline_rate_control(&mut opts);
+        let opts = self.offline_package_options(encoder, file, spec, subtitle_burn);
         let mut digest = self.digest().ok_or("no cache digest")?;
         let hash = self
             .effective_recipe(&mut digest, file, &opts, encoder, false)
@@ -3649,6 +3696,12 @@ impl TranscodeManager {
         self.rate_control_snapshot().effective_for(encoder)
     }
 
+    /// Capture the exact effective mode selected for a new resumable package.
+    /// Callers persist this value before queueing any encoder work.
+    pub async fn effective_rate_control_for_new_offline_package(&self) -> EffectiveRateControl {
+        self.effective_rate_control(self.encoder().await)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_mark_live_waiting(&self) -> crate::admission::LiveWait {
         self.admissions.wait_for_slot()
@@ -4127,7 +4180,8 @@ impl TranscodeManager {
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
         let mut encoder = self.encoder().await;
-        let mut opts = self.options_for(
+        let opts = self.live_lookup_options(
+            rate_control,
             encoder,
             &file,
             target_height,
@@ -4136,7 +4190,6 @@ impl TranscodeManager {
             subtitle_burn.clone(),
             None,
         );
-        opts.effective_rate_control = rate_control.effective_for(encoder);
         if let Some(info) = self
             .serve_cached(&file, &opts, encoder, &item_title, user_name, playback_id)
             .await
@@ -4261,7 +4314,8 @@ impl TranscodeManager {
         // patched. Same builder, so the two cannot describe different sessions.
         // The software permit's thread budget rides in the same rebuild: what
         // admission reserved is exactly what x264 is told to spend.
-        let mut opts = self.options_for(
+        let opts = self.live_lookup_options(
+            rate_control,
             encoder,
             &file,
             target_height,
@@ -4270,7 +4324,6 @@ impl TranscodeManager {
             subtitle_burn,
             sw_permit.as_ref().map(|p| p.threads() as u32),
         );
-        opts.effective_rate_control = rate_control.effective_for(encoder);
         let pacing = self.pacing(false).await;
         let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
@@ -5924,7 +5977,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_identity_stays_vbr_until_its_snapshot_is_durable() {
+    async fn effective_qvbr_identity_matches_live_speculative_and_offline_paths() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let encoder = Encoder::Software;
+        let mut supported = QualityRc::default();
+        supported.set_supported(encoder, true);
+        let captured = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: Some(21),
+            quality_rc: supported,
+        };
+
+        // Deliberately publish a different current value. Each path below
+        // must apply its captured/durable q21 after the base builder reads q29;
+        // otherwise the full-options equality fails before hashes are compared.
+        *mgr.rate_control
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RateControlSnapshot {
+            requested_mode: RateMode::Quality,
+            requested_quality: Some(29),
+            quality_rc: supported,
+        };
+        assert_eq!(
+            mgr.effective_rate_control(encoder),
+            EffectiveRateControl::Qvbr { quality: 29 }
+        );
+
+        let Tracks {
+            audio_index,
+            subtitle_burn,
+        } = mgr.select_tracks(&file, None, None).await;
+        let live = mgr.live_lookup_options(
+            captured,
+            encoder,
+            &file,
+            720,
+            0.0,
+            audio_index,
+            subtitle_burn.clone(),
+            None,
+        );
+        let speculative = mgr.speculative_producer_options(
+            captured,
+            encoder,
+            &file,
+            720,
+            audio_index,
+            subtitle_burn,
+        );
+        let offline_spec = OfflineSpec {
+            target_height: 720,
+            audio_index,
+            subtitle: OfflineSubtitle::None,
+            effective_rate_control: EffectiveRateControl::Qvbr { quality: 21 },
+        };
+        let offline = mgr.offline_package_options(encoder, &file, &offline_spec, None);
+
+        assert_eq!(
+            live.effective_rate_control,
+            EffectiveRateControl::Qvbr { quality: 21 }
+        );
+        assert_eq!(
+            live, speculative,
+            "producer normalization drifted from live"
+        );
+        assert_eq!(live, offline, "offline normalization drifted from live");
+
+        let hash = |opts: &TranscodeOptions| {
+            let mut digest = mgr.digest().expect("cache configured");
+            mgr.effective_recipe(&mut digest, &file, opts, encoder, false)
+                .hash()
+        };
+        let expected = hash(&live);
+        assert_eq!(hash(&speculative), expected);
+        assert_eq!(hash(&offline), expected);
+
+        // Mutation sentinels: each path's rate-control input independently
+        // changes both its normalized options and its content identity. These
+        // make a forgotten overwrite or a hard-coded shared value observable.
+        let live_vbr = mgr.live_lookup_options(
+            RateControlSnapshot::bitrate(supported),
+            encoder,
+            &file,
+            720,
+            0.0,
+            audio_index,
+            None,
+            None,
+        );
+        assert_ne!(live_vbr, live);
+        assert_ne!(hash(&live_vbr), expected);
+
+        let speculative_q22 = mgr.speculative_producer_options(
+            RateControlSnapshot {
+                requested_mode: RateMode::Quality,
+                requested_quality: Some(22),
+                quality_rc: supported,
+            },
+            encoder,
+            &file,
+            720,
+            audio_index,
+            None,
+        );
+        assert_ne!(speculative_q22, speculative);
+        assert_ne!(hash(&speculative_q22), expected);
+
+        let offline_q23 = OfflineSpec {
+            effective_rate_control: EffectiveRateControl::Qvbr { quality: 23 },
+            ..offline_spec
+        };
+        let offline_q23 = mgr.offline_package_options(encoder, &file, &offline_q23, None);
+        assert_ne!(offline_q23, offline);
+        assert_ne!(hash(&offline_q23), expected);
+    }
+
+    #[tokio::test]
+    async fn offline_identity_uses_durable_snapshot_across_hot_change() {
         use plurx_core::domain::{NewOfflinePackage, OfflineCreateOutcome};
         use plurx_core::store::SqliteStore;
 
@@ -5945,6 +6119,7 @@ mod tests {
             source_path: file.path.to_string_lossy().into_owned(),
             source_size: file.size,
             source_mtime: file.mtime,
+            effective_rate_control: "qvbr:21".to_owned(),
             target_height: 720,
             output_width: Some(1280),
             output_height: Some(720),
@@ -5983,6 +6158,7 @@ mod tests {
             target_height: 720,
             audio_index: None,
             subtitle: OfflineSubtitle::None,
+            effective_rate_control: EffectiveRateControl::Qvbr { quality: 21 },
         };
         set_quality(21);
         assert!(matches!(
@@ -8293,7 +8469,16 @@ mod tests {
         height: i64,
     ) -> String {
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, file, height, 0.0, None, None, None);
+        let opts = mgr.options_for_tone_map(
+            encoder,
+            file,
+            height,
+            0.0,
+            None,
+            None,
+            None,
+            tone_map_pref(),
+        );
         let mut digest = mgr.digest().expect("cache configured");
         mgr.effective_recipe(&mut digest, file, &opts, encoder, false)
             .hash()
@@ -8324,7 +8509,8 @@ mod tests {
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let hash = recipe_hash_for(&mgr, &file, 1080).await;
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None, None);
+        let opts =
+            mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
         let look = || mgr.serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1");
 
         // Nothing claimed yet.
@@ -8869,6 +9055,7 @@ mod tests {
             source_path: file.path.to_string_lossy().into_owned(),
             source_size: file.size,
             source_mtime: file.mtime,
+            effective_rate_control: "vbr".to_owned(),
             target_height: 240,
             output_width: Some(320),
             output_height: Some(240),
@@ -8925,6 +9112,7 @@ mod tests {
                     target_height: 240,
                     audio_index: None,
                     subtitle: OfflineSubtitle::None,
+                    effective_rate_control: EffectiveRateControl::Vbr,
                 },
                 Instant::now() + Duration::from_secs(180),
                 &tokio_util::sync::CancellationToken::new(),
@@ -9228,7 +9416,8 @@ mod tests {
         assert!(mgr.digest().is_none());
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None, None);
+        let opts =
+            mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
         assert!(mgr
             .serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1")
             .await
