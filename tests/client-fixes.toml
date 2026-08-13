@@ -135,7 +135,7 @@ test_anchor = "testAudiobookTimelineRoundTripsProgressAndAdvancesPastMissingPart
 
 [[fixes]]
 id = "apple.early-end-playback-loop"
-commits = ["4b17fc62", "fa2343fa"]
+commits = ["4b17fc62", "fa2343fa", "c58a4307"]
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "nonisolated static func endAction("
 test = "clients/apple/Tests/AppleClientTests.swift"
