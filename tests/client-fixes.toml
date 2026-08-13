@@ -148,3 +148,11 @@ source = "clients/apple/README.md"
 source_anchor = "build `49`"
 test = "tests/operations/test_mobile_build_claims.py"
 test_anchor = "test_repository_build_claims_match_release_inputs"
+
+[[fixes]]
+id = "apple.offline-download-location"
+commits = ["a78d0d5a"]
+source = "clients/apple/Sources/OfflineCatalog.swift"
+source_anchor = "static func relativeLocalPath(for url: URL, homeDirectory: URL) -> String?"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testCompletedOfflineDownloadAcceptsPrivateVarLocationAlias"
