@@ -373,6 +373,29 @@ test("idle time after the last byte cannot dilute a pre-cliff shaper leak", asyn
   await shaper.close();
 });
 
+test("slower delivery after a mid-stage burst cannot dilute a shaper leak", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 0;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  // A 13.6 Mb/s one-second burst followed by slower delivery averages to only
+  // 4.32 Mb/s over the whole active stage. The burst must remain observable.
+  shaper.record(850_000, true);
+  now = 999;
+  shaper.record(850_000, true);
+  now = 5_000;
+  shaper.record(1_000_000, true);
+  shaper.applyCliff();
+  const telemetry = shaper.telemetry();
+  assert.equal(telemetry.stages[0].measured_kbps, 4_320);
+  assert.equal(telemetry.stages[0].peak_kbps, 13_600);
+  assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
+  await shaper.close();
+});
+
 test("one immutable shaping snapshot is reused after the evidence window closes", async () => {
   const shaper = new lab.ShapingProxy(
     lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",

@@ -162,11 +162,14 @@ edge the suite exists to observe.
 The evidence window starts only after the first presented frame. Stage-zero
 byte and time counters reset there, and each stage's measured rate spans only
 its first through last delivered byte, so browser preparation before a transfer
-and player idle after it cannot dilute a leaked pre-cliff rate. Only token
-reservations share the global scheduler; downstream socket drain remains
-per-connection, so one non-reading response cannot stop the rest of the shaped
-link. The proxy freezes one telemetry snapshot when the observation ends and
-reuses it at both result and report level. Browser-side request cancellation
+and player idle after it cannot dilute a leaked pre-cliff rate. A one-second
+rolling peak accompanies the whole-stage rate so slower delivery later in the
+stage cannot hide a short shaper leak. The configured 1.25 tolerance admits the
+bucket's deliberate 250 ms credit without admitting a faster sustained window.
+Only token reservations share the global scheduler; downstream socket drain
+remains per-connection, so one non-reading response cannot stop the rest of the
+shaped link. The proxy freezes one telemetry snapshot when the observation ends
+and reuses it at both result and report level. Browser-side request cancellation
 during a rendition restart closes the matching upstream request, refunds an
 undelivered reservation, and is not a link error.
 

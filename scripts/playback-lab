@@ -562,6 +562,7 @@ async function freePort() {
 // post-cliff burst out of pre-cliff credit.
 const SHAPER_BURST_MS = 250;
 const SHAPER_SLICE_BYTES = 16 * 1024;
+const SHAPER_TELEMETRY_WINDOW_MS = 1_000;
 
 /**
  * The rate limiter, kept free of sockets and wall-clock so it can be tested
@@ -655,6 +656,7 @@ class ShapingProxy {
     this.limiterTail = Promise.resolve();
     this.limiterWaiters = new Set();
     this.frozenTelemetry = null;
+    this.deliverySamples = profile.stages.map(() => []);
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -701,6 +703,7 @@ class ShapingProxy {
     stage.last_byte_at_ms = null;
     stage.bytes = 0;
     stage.media_bytes = 0;
+    this.deliverySamples[this.stageIndex] = [];
   }
 
   /** Drop the link to the next stage. Called once, at a point the report keeps. */
@@ -723,6 +726,7 @@ class ShapingProxy {
     stage.last_byte_at_ms = at;
     stage.bytes += bytes;
     if (media) stage.media_bytes += bytes;
+    this.deliverySamples[this.stageIndex].push({ at_ms: at, bytes, media });
   }
 
   handle(request, response) {
@@ -903,11 +907,29 @@ class ShapingProxy {
         const seconds = activeStart === null || activeEnd === null
           ? 0
           : Math.max(0, activeEnd - activeStart) / 1000;
+        const peakRate = (mediaOnly) => {
+          const samples = this.deliverySamples[stage.index];
+          let first = 0;
+          let bytes = 0;
+          let peak = 0;
+          for (let last = 0; last < samples.length; last += 1) {
+            if (!mediaOnly || samples[last].media) bytes += samples[last].bytes;
+            const cutoff = samples[last].at_ms - SHAPER_TELEMETRY_WINDOW_MS;
+            while (samples[first]?.at_ms < cutoff) {
+              if (!mediaOnly || samples[first].media) bytes -= samples[first].bytes;
+              first += 1;
+            }
+            peak = Math.max(peak, bytes * 8 / SHAPER_TELEMETRY_WINDOW_MS);
+          }
+          return samples.length ? Number(peak.toFixed(1)) : null;
+        };
         return {
           ...stage,
           held_seconds: Number(seconds.toFixed(3)),
           measured_kbps: seconds > 0 ? Number(((stage.bytes * 8) / 1000 / seconds).toFixed(1)) : null,
           measured_media_kbps: seconds > 0 ? Number(((stage.media_bytes * 8) / 1000 / seconds).toFixed(1)) : null,
+          peak_kbps: peakRate(false),
+          peak_media_kbps: peakRate(true),
         };
       }),
     };
@@ -1733,10 +1755,13 @@ function scoreRecovery(criteria, observation) {
     };
   }
   for (const stage of [before, after]) {
-    if (stage.measured_kbps !== null && stage.measured_kbps > stage.kbps * tolerance) {
+    const observedRate = Math.max(
+      ...[stage.measured_kbps, stage.peak_kbps].filter((rate) => Number.isFinite(rate)),
+    );
+    if (observedRate > stage.kbps * tolerance) {
       return {
         outcome: "shaping",
-        errors: [`the shaper leaked: ${stage.label} delivered ${stage.measured_kbps} kb/s over a ${stage.kbps} kb/s cap`],
+        errors: [`the shaper leaked: ${stage.label} delivered ${observedRate} kb/s over a ${stage.kbps} kb/s cap`],
         metrics: { shaping },
       };
     }
