@@ -600,6 +600,11 @@ class TokenBucket {
   reserve(bytes, nowMs) {
     this.refill(nowMs);
     this.tokens -= bytes;
+    return this.delay(nowMs);
+  }
+
+  delay(nowMs) {
+    this.refill(nowMs);
     return this.tokens < 0 ? -this.tokens / this.bytesPerMs : 0;
   }
 }
@@ -614,6 +619,13 @@ function isMediaPath(urlPath) {
     || /\/files\/\d+\/direct$/.test(route)
     || /\/offline\/media\//.test(route)
     || /\.(m3u8|ts|m4s|mp4)$/.test(route);
+}
+
+// Proxy diagnostics name the route, never its query. Media requests carry the
+// isolated lab bearer token in `?token=...`; even an ephemeral credential has
+// no place in a retained artifact.
+function diagnosticPath(urlPath) {
+  return String(urlPath || "").split(/[?#]/)[0] || "/";
 }
 
 function sleep(ms) {
@@ -634,6 +646,9 @@ class ShapingProxy {
     this.bucket = new TokenBucket(profile.stages[0].kbps, performance.now());
     this.agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
     this.errors = [];
+    this.closed = false;
+    this.limiterTail = Promise.resolve();
+    this.limiterWaiters = new Set();
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -677,6 +692,7 @@ class ShapingProxy {
     const stage = this.stages[this.stageIndex];
     stage.entered_at_ms = at;
     this.bucket.setRate(stage.kbps, this.now());
+    this.wakeLimiter();
     return at;
   }
 
@@ -688,6 +704,7 @@ class ShapingProxy {
 
   handle(request, response) {
     const media = isMediaPath(request.url);
+    const route = diagnosticPath(request.url);
     const upstream = http.request({
       agent: this.agent,
       host: this.target.hostname,
@@ -698,13 +715,13 @@ class ShapingProxy {
     }, (upstreamResponse) => {
       response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
       this.pump(upstreamResponse, response, media).catch((error) => {
-        this.errors.push(`${request.method} ${request.url}: ${error.message}`);
+        if (!this.closed) this.errors.push(`${request.method} ${route}: ${error.message}`);
         upstreamResponse.destroy();
         response.destroy();
       });
     });
     upstream.on("error", (error) => {
-      this.errors.push(`${request.method} ${request.url}: ${error.message}`);
+      if (!this.closed) this.errors.push(`${request.method} ${route}: ${error.message}`);
       if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
       response.end("playback-lab shaper: upstream error");
     });
@@ -712,13 +729,52 @@ class ShapingProxy {
     request.pipe(upstream);
   }
 
+  /**
+   * Serialize reservations across every connection. A token bucket is shared
+   * state, but independent sleeps are not a shared scheduler: requests queued
+   * before the cliff would otherwise retain their high-rate timers and burst
+   * through the low-rate stage. `applyCliff` wakes the one active reservation,
+   * which recomputes its remaining debt at the new rate.
+   */
+  throttle(bytes) {
+    const reservation = this.limiterTail.then(() => this.waitForBudget(bytes));
+    this.limiterTail = reservation.catch(() => {});
+    return reservation;
+  }
+
+  async waitForBudget(bytes) {
+    if (this.closed) throw new Error("shaper closed");
+    let delay = this.bucket.reserve(bytes, this.now());
+    while (delay > 0) {
+      await this.waitForLimiter(delay);
+      if (this.closed) throw new Error("shaper closed");
+      delay = this.bucket.delay(this.now());
+    }
+  }
+
+  waitForLimiter(delay) {
+    return new Promise((resolve) => {
+      let timer;
+      const wake = () => {
+        clearTimeout(timer);
+        this.limiterWaiters.delete(wake);
+        resolve();
+      };
+      timer = setTimeout(wake, delay);
+      this.limiterWaiters.add(wake);
+    });
+  }
+
+  wakeLimiter() {
+    for (const wake of [...this.limiterWaiters]) wake();
+  }
+
   async pump(source, sink, media) {
     try {
       for await (const chunk of source) {
         for (let offset = 0; offset < chunk.length; offset += SHAPER_SLICE_BYTES) {
           const slice = chunk.subarray(offset, offset + SHAPER_SLICE_BYTES);
-          const delay = this.bucket.reserve(slice.length, this.now());
-          if (delay > 0) await sleep(delay);
+          await this.throttle(slice.length);
           this.record(slice.length, media);
           if (!sink.write(slice)) {
             // Both listeners are removed on either outcome: a long transfer
@@ -772,10 +828,13 @@ class ShapingProxy {
   }
 
   async close() {
+    this.closed = true;
+    this.wakeLimiter();
     this.agent.destroy();
     if (!this.server) return;
-    await new Promise((resolve) => this.server.close(resolve));
+    const closed = new Promise((resolve) => this.server.close(resolve));
     this.server.closeAllConnections?.();
+    await closed;
   }
 }
 
@@ -1513,6 +1572,9 @@ function peakUpgradeRate(events, windowMs = 60_000) {
 function timeToSustained(timeline, sustainedSeconds, minimumRate) {
   if (timeline.length < 2) return null;
   const last = timeline[timeline.length - 1];
+  if (last.media_error !== null && last.media_error !== undefined) return null;
+  if (last.paused === true || last.seeking === true) return null;
+  if (last.ready_state !== null && last.ready_state !== undefined && last.ready_state < 2) return null;
   const windowMs = sustainedSeconds * 1000;
   for (const from of timeline) {
     // Too little left to prove anything; every later start is shorter still.
@@ -1543,6 +1605,13 @@ function scoreRecovery(criteria, observation) {
 
   if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
     return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
+  }
+  if (shaping.transport_errors?.length) {
+    return {
+      outcome: "shaping",
+      errors: [`the shaping proxy reported ${shaping.transport_errors.length} transport error(s)`],
+      metrics: { shaping },
+    };
   }
   for (const stage of [before, after]) {
     if (stage.measured_kbps !== null && stage.measured_kbps > stage.kbps * tolerance) {
@@ -1589,7 +1658,27 @@ function scoreRecovery(criteria, observation) {
     };
   }
 
-  const timeline = observation.timeline;
+  const timeline = observation.timeline || [];
+  if (!timeline.length) {
+    return {
+      outcome: "harness",
+      errors: ["the post-cliff observation contains no player samples"],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  const mediaFailure = timeline.find((sample) =>
+    sample.media_error !== null && sample.media_error !== undefined);
+  if (mediaFailure) {
+    return {
+      outcome: "browser_playback",
+      errors: [`the player reported media error ${mediaFailure.media_error} after the cliff`],
+      metrics: {
+        shaping,
+        baseline_clock_rate: baselineRate,
+        media_error_at_ms: mediaFailure.at_ms,
+      },
+    };
+  }
   const events = rungHistory(timeline);
   const restarts = events.length;
   const upgrades = peakUpgradeRate(events);
@@ -1795,6 +1884,62 @@ async function writeReport(report, options) {
   return { jsonPath, junitPath };
 }
 
+function sanitizedText(value) {
+  return String(value)
+    .replace(/([?&](?:token|x-plex-token)=)[^&\s"']+/gi, "$1<redacted>")
+    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer <redacted>");
+}
+
+function sanitizedError(error) {
+  return sanitizedText(error?.message || error || "unknown harness failure");
+}
+
+function harnessFailureResult(error) {
+  const message = sanitizedError(error);
+  return {
+    name: "playback-lab harness",
+    fixture: null,
+    quality: null,
+    operation: "harness",
+    status: "failed",
+    outcome: "harness",
+    duration_ms: 0,
+    errors: [message],
+    warnings: [],
+    metrics: {},
+  };
+}
+
+async function writeFatalRunReport(options, error) {
+  const result = harnessFailureResult(error);
+  let profile = null;
+  try {
+    profile = parseNetworkProfile(options.network_profile);
+  } catch (_) {
+    // The parse error is already the retained failure; an invalid profile is
+    // not represented as though it were an applied link.
+  }
+  const report = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    suite: options.suite || "smoke",
+    browser: { browser: options.browser || "chrome" },
+    network_profile: profile,
+    shaping: null,
+    server: null,
+    corpus: {},
+    outcome: "harness",
+    fatal_error: result.errors[0],
+    summary: { total: 1, passed: 0, failed: 1 },
+    results: [result],
+  };
+  const paths = await writeReport(report, options);
+  process.stdout.write(`\nRESULT  0/1 passed · outcome harness\n`);
+  process.stdout.write(`JSON    ${paths.jsonPath}\n`);
+  process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
+  error.reportWritten = true;
+}
+
 async function runSuite(manifest, options) {
   const suite = options.suite || "smoke";
   const browserName = options.browser || "chrome";
@@ -1925,6 +2070,7 @@ async function runSuite(manifest, options) {
     if (shaper) await shaper.close().catch(() => {});
     await server.close(options.keep_runtime);
   }
+  if (fatal) results.push(harnessFailureResult(fatal));
   const passed = results.filter((result) => result.status === "passed").length;
   const report = {
     schema_version: 1,
@@ -1945,7 +2091,7 @@ async function runSuite(manifest, options) {
     corpus: corpus.metadata,
     outcome: fatal ? "harness" : results.find((result) => result.outcome && result.status !== "passed")?.outcome
       || (passed === results.length ? "passed" : "browser_playback"),
-    fatal_error: fatal ? fatal.message : null,
+    fatal_error: fatal ? sanitizedError(fatal) : null,
     summary: { total: results.length, passed, failed: results.length - passed },
     results,
   };
@@ -1953,7 +2099,10 @@ async function runSuite(manifest, options) {
   process.stdout.write(`\nRESULT  ${passed}/${results.length} passed · outcome ${report.outcome}\n`);
   process.stdout.write(`JSON    ${paths.jsonPath}\n`);
   process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
-  if (fatal) throw fatal;
+  if (fatal) {
+    fatal.reportWritten = true;
+    throw fatal;
+  }
   if (passed !== results.length) process.exitCode = 1;
 }
 
@@ -2003,11 +2152,19 @@ async function main() {
     return;
   }
   if (command === "normalize") return normalizeCommand(options);
+  if (command === "run") {
+    try {
+      await runSuite(loadManifest(), options);
+    } catch (error) {
+      if (!error.reportWritten) await writeFatalRunReport(options, error);
+      throw error;
+    }
+    return;
+  }
   const manifest = loadManifest();
   if (command === "doctor") doctor(options);
   else if (command === "fixtures") await buildFixtures(manifest, options);
   else if (command === "plan") printPlan(manifest, options.suite || "smoke", options.case);
-  else if (command === "run") await runSuite(manifest, options);
   else throw new Error(`unknown command ${command}`);
 }
 
@@ -2017,6 +2174,7 @@ module.exports = {
   NETWORK_PROFILES,
   ShapingProxy,
   TokenBucket,
+  diagnosticPath,
   expandCases,
   fixturesForBuild,
   isMediaPath,
@@ -2028,11 +2186,12 @@ module.exports = {
   rungHistory,
   scoreRecovery,
   timeToSustained,
+  writeFatalRunReport,
 };
 
 if (require.main === module) {
   main().catch((error) => {
-    process.stderr.write(`playback-lab: ${error.stack || error.message}\n`);
+    process.stderr.write(`playback-lab: ${sanitizedText(error.stack || error.message)}\n`);
     process.exitCode = 1;
   });
 }

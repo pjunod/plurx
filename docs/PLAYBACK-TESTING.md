@@ -179,8 +179,9 @@ describe adaptation. Every artifact therefore carries an `outcome`:
 
 | `outcome` | What it says |
 |---|---|
-| `shaping` | The cliff never applied, or the shaper delivered more than its cap. The run proves nothing about playback. |
-| `browser_playback` | The session failed before the cliff, so the cliff cannot be blamed. |
+| `passed` | The shaped link and baseline were trustworthy, and the session met every recovery criterion. |
+| `shaping` | The cliff never applied, the proxy reported a transport error, or the shaper delivered more than its cap. The run proves nothing about playback. |
+| `browser_playback` | The baseline was unhealthy, or the player reported a media failure. There is no trustworthy recovery verdict. |
 | `server_supply` | The link still had headroom and the player starved anyway — a producer problem, not an adaptation problem. |
 | `recovery` | The link was shaped, the baseline was healthy, and the session did not answer the cliff within its criteria. |
 | `harness` | The observation was too short to outlast banked runway, or the run itself failed before it could produce a playback verdict. |
@@ -199,14 +200,21 @@ suite is not part of `make validate`.
 
 **Comparing runs.** `scripts/playback-lab normalize --json <artifact>` reduces
 a report to its behavioral shape with UUIDs, ports, wall-clock, temporary
-paths, and durations removed. Two unshaped runs on one machine normalize
-identically, which is how "the harness did not change existing playback
-behavior" is demonstrated rather than claimed:
+paths, and durations removed. Run the same unshaped smoke suite against the
+base commit and the candidate on the same machine, then compare their traces.
+Equality is the acceptance evidence that the inactive harness did not alter
+existing playback behavior; unit tests or two candidate-only runs do not prove
+that claim:
 
 ```bash
-scripts/playback-lab run --suite smoke --json out/a.json
-scripts/playback-lab normalize --json out/a.json --out out/a.trace.json
-# ...then the same for a second run, and diff the two traces.
+# In a full clone at the base commit:
+scripts/playback-lab run --suite smoke --json out/base.json
+scripts/playback-lab normalize --json out/base.json --out out/base.trace.json
+
+# In a separate full clone at the candidate commit, on the same machine:
+scripts/playback-lab run --suite smoke --json out/head.json
+scripts/playback-lab normalize --json out/head.json --out out/head.trace.json
+diff -u out/base.trace.json out/head.trace.json
 ```
 
 The shaping fixture is opt-in: it is built only for the suite that plays it,

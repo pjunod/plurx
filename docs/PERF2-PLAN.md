@@ -915,14 +915,17 @@ per-client reopen behavior rides client versions.
 
 **Acceptance:** playback-lab first grows the shaping layer it
 deliberately lacked (review R7 — the harness slice precedes the
-feature). **That harness slice has landed** (#143): the loopback shaper,
-the `stall-recovery` suite, the recovery criteria, and the normalized
-baseline are described in
+feature). Issue #143 implements the loopback shaper, the
+`stall-recovery` suite, the recovery criteria, and the normalization
+command described in
 [PLAYBACK-TESTING.md](PLAYBACK-TESTING.md#network-shaping--a-bandwidth-cliff-you-can-reproduce-and-timestamp).
 It creates the condition and records the answer; it decides no rungs,
 which is the rest of this milestone's work. Until the controller lands, a
 `stall-recovery` run is expected to fail with `outcome: recovery`, and
-that recorded failure is the baseline the controller must move. Shape:
+that recorded failure is the baseline the controller must move. The
+base-versus-candidate normalized smoke equality and a green required gate are
+acceptance evidence to record before closing #143; source and helper tests do
+not substitute for either run. Shape:
 `scripts/playback-lab run --suite stall-recovery
 --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json`,
 failing nonzero when recovery misses the criteria. On it: the 8 →

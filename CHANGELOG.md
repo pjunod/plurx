@@ -81,11 +81,13 @@ bump may break compatibility and a **patch** bump never does.
   8mbps-to-1.5mbps --json <artifact>` meters everything the browser pulls
   through one shared loopback token bucket and drops the rate at a recorded
   moment, so adaptation can be measured instead of asserted. It needs no root
-  and no kernel-level shaping, leaves no state behind, and touches no live
-  server or library. The artifact classifies its own outcome — `shaping`,
-  `browser_playback`, `server_supply`, `recovery`, or `harness` — so a cliff
-  that never applied or a shaper that leaked can never be misread as a verdict
-  about playback; recovery criteria are reviewable in
+  and no kernel-level shaping, leaves no kernel or temporary-runtime state
+  after cleanup, and touches no live server or library; retained fixtures and
+  JSON/JUnit reports are its deliberate output. The artifact classifies its
+  outcome — `passed`, `shaping`, `browser_playback`, `server_supply`,
+  `recovery`, or `harness` — so a cliff that never applied, a proxy transport
+  error, or a shaper that leaked can never be misread as a verdict about
+  playback; recovery criteria are reviewable in
   `tests/playback/cases.json`, and `playback-lab normalize` reduces a report to
   its behavioral shape with UUIDs, ports, wall-clock, and temporary paths
   removed. This is the harness Performance II N4 requires before its Auto

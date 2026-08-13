@@ -122,6 +122,12 @@ test("media supply is told apart from the control plane", () => {
   }
 });
 
+test("proxy diagnostics strip bearer-token query strings", () => {
+  const route = lab.diagnosticPath("/api/v1/files/12/direct?token=secret-lab-token&part=1");
+  assert.equal(route, "/api/v1/files/12/direct");
+  assert.doesNotMatch(route, /secret-lab-token|token=/);
+});
+
 // ------------------------------------------------------------- the shaper
 
 async function withOrigin(bytes, run) {
@@ -179,6 +185,43 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
   });
 });
 
+test("concurrent reservations are rescheduled at the cliff instead of bursting", async () => {
+  await withOrigin(16 * 1024, async (origin) => {
+    const profile = lab.parseNetworkProfile("8mbps-to-1mbps");
+    const shaper = new lab.ShapingProxy(profile, origin);
+    const base = await shaper.start();
+    try {
+      const requests = Array.from({ length: 8 }, () =>
+        fetch(`${base}/api/v1/files/1/direct`).then((response) => response.arrayBuffer()));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      shaper.applyCliff();
+      await Promise.all(requests);
+      const after = shaper.telemetry().stages[1];
+      assert.ok(after.media_bytes > 0, "concurrent media crossed the post-cliff stage");
+      assert.ok(after.measured_kbps <= after.kbps * 1.25,
+        `concurrent requests delivered ${after.measured_kbps} kb/s over a ${after.kbps} kb/s cap`);
+    } finally {
+      await shaper.close();
+    }
+  });
+});
+
+test("closing interrupts an active throttled response", async () => {
+  await withOrigin(1024 * 1024, async (origin) => {
+    const shaper = new lab.ShapingProxy(lab.parseNetworkProfile("8kbps-to-4kbps"), origin);
+    const base = await shaper.start();
+    const request = fetch(`${base}/api/v1/files/1/direct`)
+      .then((response) => response.arrayBuffer())
+      .catch(() => null);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await Promise.race([
+      shaper.close(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("shaper close timed out")), 1000)),
+    ]);
+    await request;
+  });
+});
+
 test("a shaper that cannot bind says so, and leaves no listening socket behind", async () => {
   const profile = lab.parseNetworkProfile("8mbps-to-1.5mbps");
   const shaper = new lab.ShapingProxy(profile, "http://127.0.0.1:1");
@@ -201,6 +244,10 @@ function sample(atMs, overrides = {}) {
     height: 360,
     ttff_ms: 500,
     stalls: 0,
+    paused: false,
+    seeking: false,
+    ready_state: 4,
+    media_error: null,
     ...overrides,
   };
 }
@@ -258,6 +305,14 @@ test("a shaper that leaked more than its cap fails as a shaping fault", () => {
   assert.match(score.errors[0], /leaked/);
 });
 
+test("a shaping transport error invalidates the recovery verdict", () => {
+  const broken = observation();
+  broken.shaping.transport_errors = ["GET /hls/session/000001.ts: connection reset"];
+  const score = lab.scoreRecovery(CRITERIA, broken);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /transport error/);
+});
+
 test("a baseline that was never sustainable cannot be read as a recovery verdict", () => {
   const score = lab.scoreRecovery(CRITERIA, observation({ baseline_clock_rate: 0.2 }));
   assert.equal(score.outcome, "browser_playback");
@@ -274,6 +329,16 @@ test("a session that never recovers fails", () => {
   const score = lab.scoreRecovery(CRITERIA, observation({ timeline: frozen }));
   assert.ok(score.errors.some((error) => /never held/.test(error)), score.errors.join("; "));
   assert.notEqual(score.outcome, "passed");
+});
+
+test("a fatal post-cliff media error cannot score as recovery", () => {
+  const failed = healthyTimeline();
+  failed[failed.length - 1] = {
+    ...failed[failed.length - 1], media_error: 3, paused: true, ready_state: 0,
+  };
+  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: failed }));
+  assert.equal(score.outcome, "browser_playback");
+  assert.match(score.errors[0], /media error 3/);
 });
 
 test("a link with headroom that still starved is reported as a supply fault", () => {
@@ -436,6 +501,18 @@ test("a missing, unparseable, or foreign artifact is refused rather than read as
   });
 });
 
+test("fatal artifacts retain the failure without retaining credentials", async () => {
+  await withTempDir(async (directory) => {
+    const json = path.join(directory, "fatal.json");
+    const junit = path.join(directory, "fatal.xml");
+    const error = new Error("fetch /hls/1.m3u8?token=secret-lab-token with Bearer secret-bearer failed");
+    await lab.writeFatalRunReport({ suite: "stall-recovery", json, junit }, error);
+    const retained = `${await fsp.readFile(json, "utf8")}\n${await fsp.readFile(junit, "utf8")}`;
+    assert.doesNotMatch(retained, /secret-lab-token|secret-bearer/);
+    assert.match(retained, /<redacted>/);
+  });
+});
+
 test("normalization removes every run-local value and keeps the behavioral shape", () => {
   const noisy = JSON.parse(JSON.stringify(ARTIFACT));
   noisy.results[0].errors = [
@@ -489,17 +566,32 @@ test("the manifest keeps the stall-recovery suite reviewable and opt-in", () => 
   assert.deepEqual(shapedCorpus.map((fixture) => fixture.id), ["shaping-mpeg4-mp3-720"]);
 });
 
-test("the run command exits nonzero on a bad profile before it builds anything", () => {
-  const result = cli(["run", "--suite", "stall-recovery", "--network-profile", "8mbps-to-9mbps"]);
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /must descend/);
-  assert.doesNotMatch(result.stdout, /BUILD|START/, "no corpus or server work happens first");
+test("the run command retains JSON and JUnit when a bad profile exits nonzero", async () => {
+  await withTempDir(async (directory) => {
+    const json = path.join(directory, "bad-profile.json");
+    const junit = path.join(directory, "bad-profile.xml");
+    const result = cli([
+      "run", "--suite", "stall-recovery", "--network-profile", "8mbps-to-9mbps",
+      "--json", json, "--junit", junit,
+    ]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /must descend/);
+    assert.doesNotMatch(result.stdout, /BUILD|START/, "no corpus or server work happens first");
+    const artifact = JSON.parse(await fsp.readFile(json, "utf8"));
+    assert.equal(artifact.outcome, "harness");
+    assert.deepEqual(artifact.summary, { total: 1, passed: 0, failed: 1 });
+    assert.match(await fsp.readFile(junit, "utf8"), /failures="1"/);
+  });
 });
 
-test("a shaped suite refuses to run unshaped, which would silently prove nothing", () => {
-  const result = cli(["run", "--suite", "stall-recovery"]);
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /--network-profile/);
+test("a shaped suite refuses to run unshaped and retains the harness failure", async () => {
+  await withTempDir(async (directory) => {
+    const artifact = path.join(directory, "unshaped.json");
+    const result = cli(["run", "--suite", "stall-recovery", "--json", artifact]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--network-profile/);
+    assert.equal(JSON.parse(await fsp.readFile(artifact, "utf8")).outcome, "harness");
+  });
 });
 
 test("the normalize command exits nonzero on a missing artifact", () => {
