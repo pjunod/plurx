@@ -9,10 +9,12 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-12): source is v0.2.7, Apple build 49. Native text
+> Status (2026-08-12): source is v0.2.7, Apple build 50. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 49 adds first-class audiobook details and playback through the
+> landed. Build 50 fixes final HLS boundaries whose audio outlasts video and
+> bounds repeated early-end recovery at one reopen. Build 49 adds first-class
+> audiobook details and playback through the
 > shared audio player and progress path. Source and simulator coverage verifies
 > audio-container direct-play routing, resume/Start over selection, global
 > progress, and missing-part advancement; physical-device acceptance remains
@@ -27,7 +29,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 49 has not reached
+> resolved status. Repository evidence still says build 50 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.

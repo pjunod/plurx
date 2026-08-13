@@ -194,7 +194,7 @@ id = "apple.item-end"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func endAction("
 test = "clients/apple/Tests/AppleClientTests.swift"
-test_anchor = "testUnknownDurationEndReopensUntilAnEndIsCorroborated"
+test_anchor = "testEarlyEndGetsOneReopenButCannotLoopAtTheSamePosition"
 
 [[decisions]]
 id = "apple.pgs-overlay"
