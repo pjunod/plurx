@@ -15,6 +15,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const fsp = fs.promises;
 const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -206,6 +207,57 @@ test("concurrent reservations are rescheduled at the cliff instead of bursting",
   });
 });
 
+test("one non-reading response cannot block another shaped connection", async () => {
+  const origin = http.createServer((request, response) => {
+    response.writeHead(200, { "content-type": "application/octet-stream" });
+    response.end(Buffer.alloc(request.url.includes("/files/1/") ? 64 * 1024 * 1024 : 16 * 1024, 0x61));
+  });
+  await new Promise((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const target = `http://127.0.0.1:${origin.address().port}`;
+  const shaper = new lab.ShapingProxy(lab.parseNetworkProfile("400mbps-to-200mbps"), target);
+  let blockedDrainResolve;
+  let blockedDrainSeen = false;
+  const blockedDrain = new Promise((resolve) => { blockedDrainResolve = resolve; });
+  const waitForDrain = shaper.waitForDrain.bind(shaper);
+  shaper.waitForDrain = (sink, cancelled) => {
+    const waiting = waitForDrain(sink, cancelled);
+    const timer = setTimeout(() => {
+      if (blockedDrainSeen) return;
+      blockedDrainSeen = true;
+      blockedDrainResolve();
+    }, 100);
+    return waiting.finally(() => clearTimeout(timer));
+  };
+  const base = await shaper.start();
+  const stuck = net.connect(shaper.port, "127.0.0.1");
+  try {
+    await new Promise((resolve, reject) => {
+      stuck.once("connect", resolve);
+      stuck.once("error", reject);
+    });
+    stuck.write(
+      "GET /api/v1/files/1/direct HTTP/1.1\r\n" +
+      "Host: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n",
+    );
+    stuck.pause();
+    await Promise.race([
+      blockedDrain,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("non-reading client never backpressured")), 3000)),
+    ]);
+
+    const started = Date.now();
+    const healthy = await fetch(`${base}/hls/healthy/seg0.ts`, { signal: AbortSignal.timeout(1000) });
+    assert.equal((await healthy.arrayBuffer()).byteLength, 16 * 1024);
+    assert.ok(Date.now() - started < 1000, "a healthy connection must not wait for another socket to drain");
+    assert.deepEqual(shaper.telemetry().transport_errors, []);
+  } finally {
+    stuck.destroy();
+    await shaper.close();
+    origin.closeAllConnections?.();
+    await new Promise((resolve) => origin.close(resolve));
+  }
+});
+
 test("closing interrupts an active throttled response", async () => {
   await withOrigin(1024 * 1024, async (origin) => {
     const shaper = new lab.ShapingProxy(lab.parseNetworkProfile("8kbps-to-4kbps"), origin);
@@ -291,11 +343,32 @@ test("browser startup dead time cannot dilute a pre-cliff shaper leak", async ()
   shaper.beginEvidence();
   // Twelve Mb/s delivered over the one active second after 30 seconds of
   // browser setup. Measuring from proxy bind would dilute this to 387 kb/s.
-  shaper.record(1_500_000, true);
+  shaper.record(750_000, true);
   now = 31_000;
+  shaper.record(750_000, true);
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
   assert.equal(telemetry.stages[0].measured_kbps, 12_000);
+  assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
+  await shaper.close();
+});
+
+test("idle time after the last byte cannot dilute a pre-cliff shaper leak", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 0;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  shaper.record(3_000_000, true);
+  now = 3_500;
+  shaper.record(3_000_000, true);
+  now = 11_500; // the player's buffer is full until the cliff
+  shaper.applyCliff();
+  const telemetry = shaper.telemetry();
+  assert.equal(telemetry.stages[0].held_seconds, 3.5);
+  assert.equal(telemetry.stages[0].measured_kbps, 13_714.3);
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
   await shaper.close();
 });
@@ -557,6 +630,23 @@ test("a restart cannot erase later stalls by resetting the player counter", () =
   const score = lab.scoreRecovery(CRITERIA, observation({ timeline: reset }));
   assert.equal(score.outcome, "recovery");
   assert.match(score.errors[0], /never held/);
+});
+
+test("an equal-count restart cannot credit recovery before post-restart stalls", () => {
+  const reset = healthyTimeline().map((row, index) => ({
+    ...row,
+    height: 720,
+    attempt_reason: index < 3 ? "cold-start" : "stall-restart",
+    stalls: index === 0 ? 0 : index === 1 ? 1 : 2,
+  }));
+  const events = lab.rungHistory(reset);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].at_ms, 3000);
+  assert.equal(lab.timeToSustained(reset, 10, 0.9), 3000,
+    "the first clean window starts after the equal-count restart, not before its two stalls");
+  const score = lab.scoreRecovery(CRITERIA, observation({ timeline: reset }));
+  assert.equal(score.outcome, "passed");
+  assert.equal(score.metrics.recovered_after_ms, 3000);
 });
 
 // ------------------------------------------------------------ the artifact

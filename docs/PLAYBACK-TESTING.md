@@ -160,12 +160,15 @@ at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
 edge the suite exists to observe.
 
 The evidence window starts only after the first presented frame. Stage-zero
-byte and time counters reset there, and each stage's measured rate begins with
-its first delivered byte, so browser launch and page preparation cannot dilute
-a leaked pre-cliff rate. The proxy freezes one telemetry snapshot when the
-observation ends and reuses it at both result and report level. Browser-side
-request cancellation during a rendition restart closes the matching upstream
-request, refunds an undelivered reservation, and is not a link error.
+byte and time counters reset there, and each stage's measured rate spans only
+its first through last delivered byte, so browser preparation before a transfer
+and player idle after it cannot dilute a leaked pre-cliff rate. Only token
+reservations share the global scheduler; downstream socket drain remains
+per-connection, so one non-reading response cannot stop the rest of the shaped
+link. The proxy freezes one telemetry snapshot when the observation ends and
+reuses it at both result and report level. Browser-side request cancellation
+during a rendition restart closes the matching upstream request, refunds an
+undelivered reservation, and is not a link error.
 
 **The profile grammar** is `<high>-to-<low>[@<seconds>]`, e.g.
 `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`. The descent is mandatory: a flat
