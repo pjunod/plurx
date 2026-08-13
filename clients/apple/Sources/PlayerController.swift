@@ -41,6 +41,47 @@ private struct ApplePlaybackFailureLog: Encodable {
     }
 }
 
+/// A repeated end notification at one early media boundary is a terminal
+/// playback failure even though AVPlayer reports no NSError. Give it its own
+/// event so server logs do not mislabel a playlist/timestamp failure as a
+/// decoder failure.
+struct ApplePlaybackEarlyEndLog: Encodable, Equatable {
+    let level = "error"
+    let event = "avplayer_early_end"
+    let message: String
+    let method: String
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let detail: String
+    let ua = "Apple AVPlayer"
+
+    init(
+        positionMs: Int,
+        expectedDurationMs: Int?,
+        isGrowingPlaylist: Bool,
+        message: String,
+        method: String,
+        title: String,
+        fileId: Int,
+        vcodec: String?
+    ) {
+        self.message = message
+        self.method = method
+        self.title = title
+        self.fileId = fileId
+        self.vcodec = vcodec
+        let expected = expectedDurationMs.map(String.init) ?? "unknown"
+        detail = "position_ms=\(max(0, positionMs)) · expected_duration_ms=\(expected) · growing=\(isGrowingPlaylist) · outcome=terminal"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, title, detail, ua
+        case fileId = "file_id"
+        case vcodec
+    }
+}
+
 /// One start-or-resume time-to-first-frame measurement. The live HLS session
 /// id is carried as a typed field so the server can join this client-observed
 /// wait to the producer and pacing state that existed when the first frame
@@ -640,6 +681,7 @@ enum SubtitleSelectionRoute: Equatable {
 
 enum PlayerItemEndAction: Equatable {
     case reopen
+    case stop
     case finish(durationMs: Int)
 }
 
@@ -665,6 +707,14 @@ final class PlayerController: ObservableObject {
     /// sessions inside that contract while leaving direct and completed-VOD
     /// items under AVPlayer's normal policy.
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
+    static let repeatedEndToleranceMs = 250
+    static let naturalEndToleranceMs = 15_000
+    static let gracefulRepeatedEndFraction = 0.95
+    static let playbackStartFailureTitle = "Couldn't start playback."
+    static let playbackStoppedFailureTitle = "Playback stopped."
+    static let earlyEndFailureTitle = "Playback stopped early."
+    static let repeatedEarlyEndMessage =
+        "Playback ended early at the same position after retrying the stream."
 
     static func configureBuffering(_ item: AVPlayerItem, growingHLS: Bool) {
         item.preferredForwardBufferDuration = growingHLS
@@ -673,9 +723,11 @@ final class PlayerController: ObservableObject {
     }
 
     /// AVPlayer can announce the temporary end of a growing playlist. A
-    /// server duration proves where the title ends; a finite item duration is
-    /// a safe fallback for direct/offline files whose catalog row was never
-    /// probed. With neither, reopening is safer than ejecting the viewer.
+    /// server duration proves where the title should end; a finite item
+    /// duration is a safe fallback for direct/offline files whose catalog row
+    /// was never probed. One early end may reopen, but the replacement ending
+    /// at the same clock position is terminal: reopening it again cannot make
+    /// progress and otherwise creates an unbounded session loop.
     nonisolated static func endAction(
         knownDurationMs: Int,
         itemDurationMs: Int?,
@@ -688,14 +740,24 @@ final class PlayerController: ObservableObject {
             : isGrowingPlaylist
                 ? nil
                 : itemDurationMs.flatMap { $0 > 0 ? $0 : nil }
+        let repeatedAtSamePosition = previousUncorroboratedEndMs
+            .map {
+                abs(max(0, endedAt) - max(0, $0)) < repeatedEndToleranceMs
+            }
+            ?? false
         guard let durationMs = corroboratedDuration else {
-            guard !isGrowingPlaylist,
-                  let previousUncorroboratedEndMs,
-                  abs(endedAt - previousUncorroboratedEndMs) < 250
-            else { return .reopen }
-            return .finish(durationMs: max(endedAt, previousUncorroboratedEndMs))
+            guard repeatedAtSamePosition else { return .reopen }
+            if isGrowingPlaylist { return .stop }
+            return .finish(durationMs: max(endedAt, previousUncorroboratedEndMs ?? 0))
         }
-        guard endedAt >= durationMs - 15_000 else { return .reopen }
+        guard endedAt >= durationMs - naturalEndToleranceMs else {
+            guard repeatedAtSamePosition else { return .reopen }
+            let terminalPosition = max(endedAt, previousUncorroboratedEndMs ?? 0)
+            if Double(terminalPosition) / Double(durationMs) >= gracefulRepeatedEndFraction {
+                return .finish(durationMs: terminalPosition)
+            }
+            return .stop
+        }
         return .finish(durationMs: durationMs)
     }
 
@@ -720,6 +782,7 @@ final class PlayerController: ObservableObject {
     @Published private(set) var isVOD = false
     @Published private(set) var failed = false
     @Published private(set) var playbackError: String?
+    @Published private(set) var playbackFailureTitle = PlayerController.playbackStartFailureTitle
     @Published private(set) var playbackNotice: String?
     @Published private(set) var finished = false
     @Published private(set) var pgsOverlayWindow: PGSOverlayWindow?
@@ -761,10 +824,11 @@ final class PlayerController: ObservableObject {
     private var ttffMeasurement = ApplePlaybackTTFFState()
     private var ttffReason = "cold-start"
     private var stallObservation = PlaybackStallObservationState()
-    /// A completed/VOD item with no usable catalog or AVPlayer duration gets
-    /// one reopen. A second end at the same position finishes instead of
-    /// creating an unbounded session loop. Growing playlists never set this.
-    private var lastUncorroboratedEndMs: Int?
+    /// An item that ends before its expected boundary gets one reopen. A
+    /// second end at the same position finishes an otherwise uncorroborated
+    /// local item, or stops a growing/known-duration stream visibly, instead
+    /// of creating an unbounded session loop.
+    private(set) var lastUncorroboratedEndMs: Int?
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
     private var activeBurnedSubtitle: Int?
@@ -809,7 +873,7 @@ final class PlayerController: ObservableObject {
     private var openGeneration = 0
     /// The transport the viewer asked for, which is not what AVPlayer reports
     /// while it buffers or after an item fails. Reopens restore this.
-    private var wantsPlayback = true
+    private(set) var wantsPlayback = true
     /// The last rate the player was genuinely playing at, so a viewer paused
     /// at 1.5× resumes at 1.5× rather than at the 0 the transport reports
     /// while paused (P2-5).
@@ -905,6 +969,7 @@ final class PlayerController: ObservableObject {
         self.currentMs = max(0, startMs)
         self.title = title
         finished = false
+        playbackFailureTitle = Self.playbackStartFailureTitle
         subtitleReadiness = model.subtitleReadiness
         wantsNativeSubtitleRenditions = false
         canRetryCurrentItemWithHDRBase = false
@@ -970,6 +1035,7 @@ final class PlayerController: ObservableObject {
         currentMs = max(0, offline.positionMs)
         title = offline.title
         finished = false
+        playbackFailureTitle = Self.playbackStartFailureTitle
         selectedHeight = offline.actualHeight
         selectedAudio = offline.audioLabel == nil ? nil : 0
         selectedSubtitle = offline.subtitleIndex == nil ? nil : 0
@@ -1107,6 +1173,31 @@ final class PlayerController: ObservableObject {
             wantsPlayback = true
         }
         updateNowPlaying()
+    }
+
+    /// A terminal automatic retry stays terminal until the viewer explicitly
+    /// asks for another attempt. This keeps a malformed boundary from becoming
+    /// an automatic loop while still offering recovery without dismissing the
+    /// player.
+    func retryAfterPlaybackFailure() {
+        guard started, failed, decision != nil else { return }
+        let position = currentMs
+        failed = false
+        playbackError = nil
+        playbackFailureTitle = Self.playbackStartFailureTitle
+        lastUncorroboratedEndMs = nil
+        wantsPlayback = true
+        #if os(iOS)
+        if offlineAssetURL != nil {
+            Task { await reloadOffline(at: position) }
+            return
+        }
+        #endif
+        Task { await reopen(at: position) }
+    }
+
+    var canRetryPlaybackFailure: Bool {
+        started && decision != nil
     }
 
     func skip(seconds: Double) {
@@ -1468,6 +1559,7 @@ final class PlayerController: ObservableObject {
         isChangingStream = true
         failed = false
         playbackError = nil
+        playbackFailureTitle = Self.playbackStartFailureTitle
         // P2-5: a reopen must not un-pause a viewer who paused before changing
         // audio, quality, or a burned subtitle — and must not pause one whose
         // player merely happens to be stopped right now, which is the state a
@@ -2096,6 +2188,7 @@ final class PlayerController: ObservableObject {
             wantsPlayback = terminal.wantsPlayback
             isChangingStream = false
             failed = terminal.failed
+            playbackFailureTitle = Self.playbackStoppedFailureTitle
             playbackError = terminal.message
         }
     }
@@ -2109,6 +2202,9 @@ final class PlayerController: ObservableObject {
     private func fail(_ error: Error) {
         isChangingStream = false
         failed = player.currentItem == nil || error is PlaybackPreparationError
+        playbackFailureTitle = currentMs > 0
+            ? Self.playbackStoppedFailureTitle
+            : Self.playbackStartFailureTitle
         playbackError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
@@ -2165,11 +2261,7 @@ final class PlayerController: ObservableObject {
                 self.stallObservation.noteRecoveredStagnation(
                     self.playbackRecoveryMonitor.takeRecoveredStagnantDurationMs()
                 )
-                if let endedAt = self.lastUncorroboratedEndMs,
-                   self.currentMs >= endedAt + 250
-                {
-                    self.lastUncorroboratedEndMs = nil
-                }
+                self.observeProgressPastEarlyEnd(self.currentMs)
                 self.updateNowPlaying()
                 if self.isPlaying && self.currentMs - self.lastReportedMs >= 10_000 {
                     self.lastReportedMs = self.currentMs
@@ -2178,6 +2270,74 @@ final class PlayerController: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Record the bounded retry before it happens, and clear it on every
+    /// terminal route. Keeping this state transition outside the notification
+    /// closure makes the actual controller wiring regression-testable.
+    func prepareObservedEndAction(
+        knownDurationMs: Int,
+        itemDurationMs: Int?,
+        isGrowingPlaylist: Bool,
+        endedAt: Int
+    ) -> PlayerItemEndAction {
+        let action = Self.endAction(
+            knownDurationMs: knownDurationMs,
+            itemDurationMs: itemDurationMs,
+            isGrowingPlaylist: isGrowingPlaylist,
+            endedAt: endedAt,
+            previousUncorroboratedEndMs: lastUncorroboratedEndMs
+        )
+        switch action {
+        case .reopen:
+            lastUncorroboratedEndMs = endedAt
+        case .stop, .finish:
+            lastUncorroboratedEndMs = nil
+        }
+        return action
+    }
+
+    /// Advancing one tolerance window past the failed boundary proves the
+    /// replacement made progress and earns a fresh bounded retry later.
+    func observeProgressPastEarlyEnd(_ positionMs: Int) {
+        guard let endedAt = lastUncorroboratedEndMs,
+              positionMs >= endedAt,
+              positionMs - endedAt >= Self.repeatedEndToleranceMs
+        else { return }
+        lastUncorroboratedEndMs = nil
+    }
+
+    func stopAfterRepeatedEarlyEnd(
+        at endedAt: Int,
+        expectedDurationMs: Int?,
+        isGrowingPlaylist: Bool
+    ) {
+        lastUncorroboratedEndMs = nil
+        player.pause()
+        currentMs = max(0, endedAt)
+        report(currentMs)
+        isPlaying = false
+        wantsPlayback = false
+        failed = true
+        finished = false
+        playbackFailureTitle = Self.earlyEndFailureTitle
+        playbackError = Self.repeatedEarlyEndMessage
+        reportEarlyEndFailure(
+            at: currentMs,
+            expectedDurationMs: expectedDurationMs,
+            isGrowingPlaylist: isGrowingPlaylist
+        )
+        updateNowPlaying()
+    }
+
+    func finishAfterObservedEnd(at durationMs: Int) {
+        lastUncorroboratedEndMs = nil
+        isPlaying = false
+        wantsPlayback = false
+        currentMs = max(0, durationMs)
+        report(currentMs)
+        updateNowPlaying()
+        finished = true
     }
 
     private func observeEnd(of item: AVPlayerItem) {
@@ -2199,30 +2359,30 @@ final class PlayerController: ObservableObject {
                     ? Int(itemDurationSeconds * 1000)
                     : nil
                 let isGrowingPlaylist = self.sessionId != nil && !self.isVOD
-                switch Self.endAction(
+                switch self.prepareObservedEndAction(
                     knownDurationMs: self.knownDurationMs,
                     itemDurationMs: itemDurationMs,
                     isGrowingPlaylist: isGrowingPlaylist,
-                    endedAt: endedAt,
-                    previousUncorroboratedEndMs: self.lastUncorroboratedEndMs
+                    endedAt: endedAt
                 ) {
                 case .reopen:
                     // The viewer did not pause — the playlist merely announced
                     // its current end — and `wantsPlayback` still says so, so
                     // this continuation keeps playing.
-                    if !isGrowingPlaylist, self.knownDurationMs <= 0, itemDurationMs == nil {
-                        self.lastUncorroboratedEndMs = endedAt
-                    }
                     await self.reopen(at: endedAt)
                     return
+                case .stop:
+                    let expectedDurationMs = self.knownDurationMs > 0
+                        ? self.knownDurationMs
+                        : itemDurationMs
+                    self.stopAfterRepeatedEarlyEnd(
+                        at: endedAt,
+                        expectedDurationMs: expectedDurationMs,
+                        isGrowingPlaylist: isGrowingPlaylist
+                    )
+                    return
                 case .finish(let durationMs):
-                    self.lastUncorroboratedEndMs = nil
-                    self.isPlaying = false
-                    self.wantsPlayback = false
-                    self.currentMs = durationMs
-                    self.report(self.currentMs)
-                    self.updateNowPlaying()
-                    self.finished = true
+                    self.finishAfterObservedEnd(at: durationMs)
                 }
             }
         }
@@ -2271,6 +2431,9 @@ final class PlayerController: ObservableObject {
         wantsPlayback = false
         isChangingStream = false
         failed = true
+        playbackFailureTitle = currentMs > 0
+            ? Self.playbackStoppedFailureTitle
+            : Self.playbackStartFailureTitle
         playbackError = item.error?.localizedDescription
             ?? PlaybackPreparationError.failed.localizedDescription
     }
@@ -2297,6 +2460,27 @@ final class PlayerController: ObservableObject {
             )
         )
         postClientLog(payload)
+    }
+
+    private func reportEarlyEndFailure(
+        at positionMs: Int,
+        expectedDurationMs: Int?,
+        isGrowingPlaylist: Bool
+    ) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        guard model != nil else { return }
+        postClientLog(ApplePlaybackEarlyEndLog(
+            positionMs: positionMs,
+            expectedDurationMs: expectedDurationMs,
+            isGrowingPlaylist: isGrowingPlaylist,
+            message: Self.repeatedEarlyEndMessage,
+            method: clientLogMethod,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec
+        ))
     }
 
     private func reportPlaybackTTFFIfNeeded(at positionMs: Int, playing: Bool) {
@@ -2623,6 +2807,7 @@ final class PlayerController: ObservableObject {
             wantsPlayback = false
             isChangingStream = false
             failed = true
+            playbackFailureTitle = Self.playbackStoppedFailureTitle
             playbackError =
                 "The HDR stream stopped responding. Playback was stopped instead of switching to SDR."
             return true

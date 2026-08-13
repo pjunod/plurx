@@ -465,21 +465,31 @@ async fn finish(
         // the picture stops early, which is worse than a playlist that simply
         // stops growing.
         let final_ok = match seg.finish() {
-            Ok(Some(published)) => match out.write_segment(&published).await {
-                Ok(()) => true,
-                Err(e) if session_gone(&e) => {
-                    tracing::debug!(
-                        session = %session_id,
-                        "session directory went away before the final segment; stopping"
-                    );
-                    false
+            Ok(published) => {
+                let mut wrote_all = true;
+                for segment in published {
+                    match out.write_segment(&segment).await {
+                        Ok(()) => {}
+                        Err(e) if session_gone(&e) => {
+                            tracing::debug!(
+                                session = %session_id,
+                                "session directory went away before the final segment; stopping"
+                            );
+                            wrote_all = false;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session = %session_id,
+                                "writing a final segment: {e}"
+                            );
+                            wrote_all = false;
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(session = %session_id, "writing the final segment: {e}");
-                    false
-                }
-            },
-            Ok(None) => true,
+                wrote_all
+            }
             Err(e) => {
                 tracing::error!(session = %session_id, "merging the final segment: {e}");
                 false
