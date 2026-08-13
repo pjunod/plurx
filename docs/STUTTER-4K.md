@@ -902,6 +902,43 @@ bought nothing and cost boundaries — each one a dropped frame on an open-GOP
 disc — on every source quiet enough for the duration ceiling to bind. §5.6's
 cut-rule numbers stand as written again.
 
+### 5.7bis The 57:11 Apple TV loop — the final audio tail was one segment
+
+Reported 2026-08-12 on *Dexter: New Blood* S01E01: tvOS reached 57:11, then
+repeated the same second indefinitely. The file's last video frame is at
+57:11 but audio continues to 57:56, and ffmpeg carries both in one final
+fragment. The segmenter correctly stopped declaring that fragment as the
+last video frame's 0.333 seconds — which would hide 45 seconds of real media
+— but the first correction made the opposite mistake: it published the whole
+audio tail as one `#EXTINF:45.243` segment. That also raised
+`#EXT-X-TARGETDURATION` to 46 seconds, so AVPlayer's recovery reload waited at
+the exact bad boundary it was trying to cross.
+
+**The server now divides the tail; it never lies about it.** End-of-stream
+media is split at encoded sample boundaries. The first final segment keeps
+all video intact; later segments carry the remaining audio in intervals no
+longer than `COPY_SEGMENT_MAX_SECS` (15 seconds). No duration is clamped and
+no sample is shortened, invented or discarded. A sample that begins before
+the first boundary stays beside the final video, so that segment may outlast
+video by at most one source audio sample — one AAC frame on the reported file
+— but the difference is bounded and occurs once, not once per fragment. The
+regression
+`a_mixed_final_fragment_splits_its_trailing_audio_at_the_ceiling` checks the
+segment bound, the intact video run, and the exact summed audio duration;
+`joins_are_gapless_and_overlap_free` reads the serialized segments back and
+checks each `EXTINF` against their actual track durations.
+
+**The tvOS guard is intentionally secondary.** A genuine final segment from
+the fixed server advances through 57:11, so the client recovery is for a
+truncated source, an older server during rollout, or another malformed media
+boundary. One early AVPlayer end reopens the same delivery once. A replacement
+ending within 249 ms of the same position cannot reopen automatically again:
+if it is at or past 95% of a known duration, playback finishes at the actual
+media boundary; otherwise the player pauses, records progress, emits an
+`avplayer_early_end` error, and offers **Try Again** or **Close**. Advancing
+250 ms rearms the single retry. The existing natural-end allowance remains
+15 seconds and finishes at the known catalog duration.
+
 ### 5.8 The stop at 12.5 seconds, and the chase that reported nothing
 
 Same evening, same reference file, gate build running: "still pausing to

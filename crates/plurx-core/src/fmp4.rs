@@ -2076,6 +2076,19 @@ impl Published {
     }
 }
 
+/// Convert an interval between track clocks without rounding it shorter. The
+/// ceiling is a safety boundary, so losing a fractional destination tick here
+/// could move a sample that starts exactly on the boundary into the preceding
+/// segment.
+fn scale_ticks(ticks: u64, from_timescale: u32, to_timescale: u32) -> u64 {
+    let from = from_timescale.max(1) as u128;
+    let scaled = (ticks as u128)
+        .saturating_mul(to_timescale.max(1) as u128)
+        .saturating_add(from - 1)
+        / from;
+    scaled.min(u64::MAX as u128) as u64
+}
+
 /// Accumulates fragments and publishes segments that start on clean keyframes.
 ///
 /// Pure by design: the daemon feeds it fragments and writes what comes back
@@ -2129,20 +2142,25 @@ impl Segmenter {
     /// falling back only when video duration is exactly zero truncates that
     /// mixed final segment in the playlist. Ordinary cuts still use video: an
     /// audio frame of per-fragment drift must not accumulate across the film.
-    fn pending_seconds(&self, reason: CutReason) -> f64 {
+    fn seconds_for(&self, fragments: &[Fragment], reason: CutReason) -> f64 {
         let video_ticks: u64 = self
-            .pending
-            .iter()
-            .map(|f| f.video_duration(&self.init))
-            .sum();
+            .init
+            .video()
+            .map(|video| {
+                fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.track(video.id))
+                    .map(TrackFragment::duration)
+                    .sum()
+            })
+            .unwrap_or(0);
         let video_seconds = video_ticks as f64 / self.video_timescale as f64;
         if video_ticks > 0 && reason != CutReason::EndOfStream {
             return video_seconds;
         }
         let mut longest = video_seconds;
         for track in &self.init.tracks {
-            let ticks: u64 = self
-                .pending
+            let ticks: u64 = fragments
                 .iter()
                 .filter_map(|f| f.track(track.id))
                 .map(|t| t.duration())
@@ -2186,17 +2204,169 @@ impl Segmenter {
         Ok(published)
     }
 
-    /// End of stream: whatever is still pending becomes the last segment.
-    pub fn finish(&mut self) -> Result<Option<Published>, Fmp4Error> {
+    /// End of stream: whatever is still pending becomes the final segment(s).
+    ///
+    /// A muxed fragment can contain the last video frame followed by a much
+    /// longer audio tail. Publishing that whole fragment as one HLS segment
+    /// makes its truthful `EXTINF` arbitrarily large and raises the playlist's
+    /// reload interval with it. Split only at audio sample boundaries here:
+    /// video remains intact, every encoded sample is copied verbatim, and the
+    /// tail stays within the same duration ceiling as the rest of the stream.
+    pub fn finish(&mut self) -> Result<Vec<Published>, Fmp4Error> {
         if self.pending.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        self.flush(CutReason::EndOfStream).map(Some)
+        let chunks = self.end_of_stream_chunks()?;
+        let mut published = Vec::with_capacity(chunks.len());
+        for (offset, fragments) in chunks.iter().enumerate() {
+            let index = self.next_index + offset as u64;
+            let seconds = self.seconds_for(fragments, CutReason::EndOfStream);
+            let segment = merge(fragments, &self.init, index as u32 + 1)?;
+            published.push(Published {
+                index,
+                segment,
+                reason: CutReason::EndOfStream,
+                seconds,
+            });
+        }
+
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.pending_ticks = 0;
+        self.next_index += published.len() as u64;
+        self.counts.segments += published.len() as u64;
+        self.counts.tfdt_adjustments += published
+            .iter()
+            .map(|item| item.segment.stats.tfdt_adjustments)
+            .sum::<u32>();
+        Ok(published)
+    }
+
+    /// Partition the pending media without rewriting a sample. The first
+    /// chunk is allowed to be as long as the unsplittable video run; later
+    /// chunks contain only trailing tracks and observe the policy ceiling.
+    fn end_of_stream_chunks(&self) -> Result<Vec<Vec<Fragment>>, Fmp4Error> {
+        let video_ticks: u64 = self
+            .pending
+            .iter()
+            .map(|fragment| fragment.video_duration(&self.init))
+            .sum();
+        let mut chunks: Vec<Vec<Fragment>> = Vec::new();
+
+        for track in &self.init.tracks {
+            let ceiling = scale_ticks(
+                self.policy.max_ticks,
+                self.video_timescale,
+                track.timescale.max(1),
+            )
+            .max(1);
+            let video_limit =
+                scale_ticks(video_ticks, self.video_timescale, track.timescale.max(1));
+            let first_limit = ceiling.max(video_limit);
+            let allow_boundary_sample = video_ticks > 0;
+            let mut chunk_index = 0usize;
+            let mut chunk_ticks = 0u64;
+
+            for fragment in &self.pending {
+                let Some(track_fragment) = fragment.track(track.id) else {
+                    continue;
+                };
+                let mut decode_time = track_fragment.base_decode_time;
+                for run in &track_fragment.runs {
+                    let mut data_offset = run.data_offset;
+                    let mut group_start = 0usize;
+                    while group_start < run.samples.len() {
+                        let sample = run.samples[group_start];
+                        let limit = if chunk_index == 0 {
+                            first_limit
+                        } else {
+                            ceiling
+                        };
+                        if sample.duration as u64 > ceiling {
+                            return Err(Fmp4Error::Unsupported(format!(
+                                "track {} has a {:.3}s sample longer than the {:.3}s HLS ceiling",
+                                track.id,
+                                sample.duration as f64 / track.timescale.max(1) as f64,
+                                ceiling as f64 / track.timescale.max(1) as f64,
+                            )));
+                        }
+                        let crosses_limit = chunk_ticks > 0
+                            && chunk_ticks.saturating_add(sample.duration as u64) > limit;
+                        let starts_after_video_boundary =
+                            chunk_index == 0 && allow_boundary_sample && chunk_ticks >= limit;
+                        if starts_after_video_boundary
+                            || (crosses_limit && !(chunk_index == 0 && allow_boundary_sample))
+                        {
+                            chunk_index += 1;
+                            chunk_ticks = 0;
+                            continue;
+                        }
+
+                        let selected_chunk = chunk_index;
+                        let selected_decode_time = decode_time;
+                        let selected_data_offset = data_offset;
+                        let mut group_end = group_start;
+                        while group_end < run.samples.len() {
+                            let candidate = run.samples[group_end];
+                            if candidate.duration as u64 > ceiling {
+                                return Err(Fmp4Error::Unsupported(format!(
+                                    "track {} has a {:.3}s sample longer than the {:.3}s HLS ceiling",
+                                    track.id,
+                                    candidate.duration as f64 / track.timescale.max(1) as f64,
+                                    ceiling as f64 / track.timescale.max(1) as f64,
+                                )));
+                            }
+                            let limit = if chunk_index == 0 {
+                                first_limit
+                            } else {
+                                ceiling
+                            };
+                            let crosses_limit = chunk_ticks > 0
+                                && chunk_ticks.saturating_add(candidate.duration as u64) > limit;
+                            let starts_after_video_boundary =
+                                chunk_index == 0 && allow_boundary_sample && chunk_ticks >= limit;
+                            if starts_after_video_boundary
+                                || (crosses_limit && !(chunk_index == 0 && allow_boundary_sample))
+                            {
+                                break;
+                            }
+                            chunk_ticks += candidate.duration as u64;
+                            decode_time += candidate.duration as u64;
+                            data_offset += candidate.size as usize;
+                            group_end += 1;
+                        }
+
+                        if chunks.len() <= selected_chunk {
+                            chunks.resize_with(selected_chunk + 1, Vec::new);
+                        }
+                        chunks[selected_chunk].push(Fragment {
+                            bytes: fragment.bytes.clone(),
+                            mdat_payload: fragment.mdat_payload.clone(),
+                            tracks: vec![TrackFragment {
+                                track_id: track.id,
+                                base_decode_time: selected_decode_time,
+                                runs: vec![Run {
+                                    data_offset: selected_data_offset,
+                                    samples: run.samples[group_start..group_end].to_vec(),
+                                }],
+                            }],
+                        });
+                        group_start = group_end;
+                    }
+                }
+            }
+        }
+
+        chunks.retain(|chunk| !chunk.is_empty());
+        if chunks.is_empty() {
+            return malformed("no track survived the end-of-stream split");
+        }
+        Ok(chunks)
     }
 
     fn flush(&mut self, reason: CutReason) -> Result<Published, Fmp4Error> {
         let index = self.next_index;
-        let seconds = self.pending_seconds(reason);
+        let seconds = self.seconds_for(&self.pending, reason);
         let segment = merge(&self.pending, &self.init, index as u32 + 1)?;
         self.pending.clear();
         self.pending_bytes = 0;
@@ -2753,9 +2923,7 @@ mod tests {
                 out.push(p);
             }
         }
-        if let Some(p) = seg.finish().expect("final merge") {
-            out.push(p);
-        }
+        out.extend(seg.finish().expect("final merge"));
         (init, out, seg.counts())
     }
 
@@ -2890,20 +3058,45 @@ mod tests {
             }
         }
 
-        // And the playlist matches the complete video timeline plus only the
-        // final segment's legitimate trailing-media extension. Earlier
-        // segments stay pinned to video so per-fragment audio drift cannot
-        // accumulate across the film.
+        // And every playlist duration is derived from the media that was
+        // actually serialized into that segment. This is intentionally read
+        // back from the output bytes rather than reconstructed from
+        // `Published::seconds`: the latter made the old whole-playlist
+        // invariant tautological for the final segment.
         let video = init.video().expect("video");
-        let claimed: f64 = published.iter().map(|p| p.seconds).sum();
-        let actual_video = end.get(&video.id).copied().unwrap_or(0) as f64 / video.timescale as f64;
-        let final_segment = published.last().expect("a final segment");
-        let final_video = final_segment.segment.video_ticks as f64 / video.timescale.max(1) as f64;
-        let actual = actual_video + (final_segment.seconds - final_video).max(0.0);
-        assert!(
-            (claimed - actual).abs() < 1e-6,
-            "EXTINF sums to {claimed}s against {actual}s of media"
-        );
+        let mut actual = 0.0;
+        for (index, item) in published.iter().enumerate() {
+            let mut feed = init.bytes.clone();
+            feed.extend_from_slice(&item.segment.bytes);
+            let (_, fragments, _) = read_all(&feed);
+            let fragment = &fragments[0];
+            let video_seconds = fragment
+                .track(video.id)
+                .map(|track| track.duration() as f64 / video.timescale.max(1) as f64)
+                .unwrap_or(0.0);
+            let longest_seconds = init
+                .tracks
+                .iter()
+                .filter_map(|track| {
+                    fragment.track(track.id).map(|track_fragment| {
+                        track_fragment.duration() as f64 / track.timescale.max(1) as f64
+                    })
+                })
+                .fold(0.0f64, f64::max);
+            let expected = if item.reason == CutReason::EndOfStream {
+                longest_seconds
+            } else {
+                video_seconds
+            };
+            assert!(
+                (item.seconds - expected).abs() < 1e-6,
+                "segment {index} declares {}s against {expected}s of serialized media",
+                item.seconds
+            );
+            actual += expected;
+        }
+        let claimed: f64 = published.iter().map(|item| item.seconds).sum();
+        assert!((claimed - actual).abs() < 1e-6);
     }
 
     /// Two tracks go in, two tracks come out, with the same durations —
@@ -3358,7 +3551,9 @@ mod tests {
             );
             assert!(seg.push(stripped).expect("push").is_none());
         }
-        let published = seg.finish().expect("finish").expect("a final segment");
+        let published = seg.finish().expect("finish");
+        assert_eq!(published.len(), 1, "short audio tail stays in one segment");
+        let published = &published[0];
         assert_eq!(
             published.segment.video_ticks, 0,
             "video was supposed to be gone"
@@ -3372,11 +3567,12 @@ mod tests {
 
     /// Dexter: New Blood S01E01 ends its video at 57:11 but carries audio to
     /// 57:56. ffmpeg puts the last video frames and that 45-second audio tail
-    /// in one final fragment. Measuring the fragment from its non-zero video
-    /// duration published `EXTINF:0.333`, so AVPlayer ended and the client
-    /// reopened at 57:11 forever instead of consuming the audio tail.
+    /// in one final fragment. The duration must cover every real sample, but
+    /// publishing one 45-second segment also raises `TARGETDURATION` to 46 and
+    /// leaves AVPlayer waiting at the boundary. The tail is therefore divided
+    /// at sample boundaries without changing or dropping a sample.
     #[test]
-    fn a_mixed_final_fragment_uses_its_trailing_audio_duration() {
+    fn a_mixed_final_fragment_splits_its_trailing_audio_at_the_ceiling() {
         let feed = pipe("open-gop");
         let (init, frags, _) = read_all(&feed);
         let video = init.video().expect("video");
@@ -3386,20 +3582,28 @@ mod tests {
             .find(|track| track.kind == TrackKind::Audio)
             .expect("audio");
         let mut tail = frags[0].clone();
+        let wanted_video_ticks = tail.video_duration(&init) + 45 * video.timescale.max(1) as u64;
 
+        let maximum_audio_sample_seconds;
         {
             let audio_fragment = tail
                 .tracks
                 .iter_mut()
                 .find(|track| track.track_id == audio.id)
                 .expect("audio fragment");
-            let last_sample = audio_fragment
-                .runs
-                .iter_mut()
-                .flat_map(|run| run.samples.iter_mut())
-                .last()
-                .expect("audio sample");
-            last_sample.duration += 45 * audio.timescale;
+            let source_runs = audio_fragment.runs.clone();
+            maximum_audio_sample_seconds = source_runs
+                .iter()
+                .flat_map(|run| run.samples.iter())
+                .map(|sample| sample.duration)
+                .max()
+                .expect("audio sample") as f64
+                / audio.timescale.max(1) as f64;
+            while audio_fragment.duration() * video.timescale.max(1) as u64
+                <= wanted_video_ticks * audio.timescale.max(1) as u64
+            {
+                audio_fragment.runs.extend(source_runs.clone());
+            }
         }
 
         let video_seconds = tail.video_duration(&init) as f64 / video.timescale.max(1) as f64;
@@ -3416,23 +3620,41 @@ mod tests {
             "the regression needs the material audio tail"
         );
 
-        let policy = CutPolicy::new(
-            u32::MAX / video.timescale.max(1),
-            u32::MAX / video.timescale.max(1),
-            usize::MAX,
-            u32::MAX,
-            video.timescale,
-        );
+        let max_seconds = 15;
+        let policy = CutPolicy::new(6, 2, usize::MAX, max_seconds, video.timescale);
         let mut seg = Segmenter::new(init, policy);
         assert!(seg.push(tail).expect("push").is_none());
-        let published = seg.finish().expect("finish").expect("a final segment");
+        let published = seg.finish().expect("finish");
 
-        assert!(published.segment.video_ticks > 0);
-        assert_eq!(published.reason, CutReason::EndOfStream);
+        assert!(published.len() >= 3, "the material tail was not split");
+        assert!(published[0].segment.video_ticks > 0);
         assert!(
-            (published.seconds - audio_seconds).abs() < 1e-6,
-            "EXTINF {} did not cover the {:.6}s audio tail",
-            published.seconds,
+            published
+                .iter()
+                .skip(1)
+                .all(|item| item.segment.video_ticks == 0),
+            "video must remain intact in the first final segment"
+        );
+        assert!(published
+            .iter()
+            .all(|item| item.reason == CutReason::EndOfStream));
+        let longest = published
+            .iter()
+            .map(|item| item.seconds)
+            .fold(0.0f64, f64::max);
+        assert!(
+            longest <= max_seconds as f64 + maximum_audio_sample_seconds + 1e-6,
+            "a split final segment still declared {longest:.6}s"
+        );
+        assert_eq!(
+            longest.ceil(),
+            16.0,
+            "the Dexter-shaped tail raised TARGETDURATION above one sample of rounding"
+        );
+        let claimed: f64 = published.iter().map(|item| item.seconds).sum();
+        assert!(
+            (claimed - audio_seconds).abs() < 1e-6,
+            "split EXTINF totals {claimed:.6}s instead of the {:.6}s audio tail",
             audio_seconds
         );
     }

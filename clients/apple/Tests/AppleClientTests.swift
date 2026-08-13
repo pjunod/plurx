@@ -3360,12 +3360,150 @@ final class AppleClientTests: XCTestCase {
             previousUncorroboratedEndMs: 120_000
         ), .stop, "a repeated end before the catalog duration must not reopen forever")
         XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 3_476_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 3_431_000,
+            previousUncorroboratedEndMs: 3_431_000
+        ), .finish(durationMs: 3_431_000), "a repeated end in the final 5% finishes at the real media boundary")
+        XCTAssertEqual(PlayerController.endAction(
             knownDurationMs: 0,
             itemDurationMs: nil,
             isGrowingPlaylist: false,
             endedAt: 121_000,
             previousUncorroboratedEndMs: 120_000
         ), .reopen, "positional progress earns a fresh bounded retry")
+    }
+
+    func testEarlyEndThresholdBoundariesArePinned() {
+        XCTAssertEqual(PlayerController.repeatedEndToleranceMs, 250)
+        XCTAssertEqual(PlayerController.naturalEndToleranceMs, 15_000)
+        XCTAssertEqual(PlayerController.gracefulRepeatedEndFraction, 0.95)
+
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 100_249,
+            previousUncorroboratedEndMs: 100_000
+        ), .stop, "249 ms is still the same failed boundary")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 100_250,
+            previousUncorroboratedEndMs: 100_000
+        ), .reopen, "250 ms of progress rearms the bounded retry")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 185_000
+        ), .finish(durationMs: 200_000), "the 15-second natural-end boundary is inclusive")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 184_999
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 1_000_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 950_000,
+            previousUncorroboratedEndMs: 950_000
+        ), .finish(durationMs: 950_000), "the final 5% repeated-end boundary is inclusive")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 1_000_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 949_999,
+            previousUncorroboratedEndMs: 949_999
+        ), .stop)
+    }
+
+    @MainActor
+    func testControllerRecordsRearmsAndAppliesTerminalEarlyEnds() {
+        let controller = PlayerController()
+        XCTAssertEqual(controller.prepareObservedEndAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 100_000
+        ), .reopen)
+        XCTAssertEqual(controller.lastUncorroboratedEndMs, 100_000)
+
+        controller.observeProgressPastEarlyEnd(100_249)
+        XCTAssertEqual(controller.lastUncorroboratedEndMs, 100_000)
+        controller.observeProgressPastEarlyEnd(100_250)
+        XCTAssertNil(controller.lastUncorroboratedEndMs)
+
+        XCTAssertEqual(controller.prepareObservedEndAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 100_000
+        ), .reopen)
+        XCTAssertEqual(controller.prepareObservedEndAction(
+            knownDurationMs: 200_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 100_000
+        ), .stop)
+        controller.stopAfterRepeatedEarlyEnd(
+            at: 100_000,
+            expectedDurationMs: 200_000,
+            isGrowingPlaylist: true
+        )
+        XCTAssertNil(controller.lastUncorroboratedEndMs)
+        XCTAssertEqual(controller.currentMs, 100_000)
+        XCTAssertFalse(controller.wantsPlayback)
+        XCTAssertTrue(controller.failed)
+        XCTAssertFalse(controller.finished)
+        XCTAssertEqual(controller.playbackFailureTitle, PlayerController.earlyEndFailureTitle)
+        XCTAssertEqual(controller.playbackError, PlayerController.repeatedEarlyEndMessage)
+
+        let nearEnd = PlayerController()
+        XCTAssertEqual(nearEnd.prepareObservedEndAction(
+            knownDurationMs: 3_476_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 3_431_000
+        ), .reopen)
+        XCTAssertEqual(nearEnd.prepareObservedEndAction(
+            knownDurationMs: 3_476_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 3_431_000
+        ), .finish(durationMs: 3_431_000))
+        nearEnd.finishAfterObservedEnd(at: 3_431_000)
+        XCTAssertEqual(nearEnd.currentMs, 3_431_000)
+        XCTAssertFalse(nearEnd.wantsPlayback)
+        XCTAssertTrue(nearEnd.finished)
+        XCTAssertFalse(nearEnd.failed)
+    }
+
+    func testRepeatedEarlyEndTelemetryNamesTheTerminalBoundary() throws {
+        let payload = ApplePlaybackEarlyEndLog(
+            positionMs: 100_000,
+            expectedDurationMs: 200_000,
+            isGrowingPlaylist: true,
+            message: PlayerController.repeatedEarlyEndMessage,
+            method: "copy",
+            title: "Episode",
+            fileId: 42,
+            vcodec: "hevc"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as? [String: Any]
+        )
+        XCTAssertEqual(object["event"] as? String, "avplayer_early_end")
+        XCTAssertEqual(object["level"] as? String, "error")
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(
+            object["detail"] as? String,
+            "position_ms=100000 · expected_duration_ms=200000 · growing=true · outcome=terminal"
+        )
     }
 
     @MainActor
