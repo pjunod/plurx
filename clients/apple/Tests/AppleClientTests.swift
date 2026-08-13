@@ -814,6 +814,78 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerSeekDirection.up.seconds, 30)
     }
 
+    func testTVProgressOnlySeeksAfterTheViewerEngagesIt() {
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: false,
+                direction: .left
+            ),
+            .focus(.skipForward)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: false,
+                direction: .right,
+                progressRightNeighbor: .audio
+            ),
+            .focus(.audio)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: true,
+                direction: .left
+            ),
+            .seek(seconds: -10)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: true,
+                direction: .right
+            ),
+            .seek(seconds: 10)
+        )
+    }
+
+    func testTVHiddenControlsKeepDirectionalSeeking() {
+        for direction in PlayerSeekDirection.allCases {
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .reveal,
+                    progressEngaged: false,
+                    direction: direction
+                ),
+                .seek(seconds: direction.seconds),
+                "hidden controls should preserve the \(direction) seek"
+            )
+        }
+    }
+
+    func testTVProgressUpAndDownRoutingIsDeliberate() {
+        for engaged in [false, true] {
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .up
+                ),
+                .ignore,
+                "the progress bar is already at the top of the transport row"
+            )
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .down
+                ),
+                .focus(.playPause)
+            )
+        }
+    }
+
     func testLiveSeekTargetClearsOnlyAfterTheAttachedReopen() {
         var state = PlayerSeekState()
         _ = state.absolute(90_000, durationMs: 600_000)
