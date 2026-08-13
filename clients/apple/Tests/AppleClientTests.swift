@@ -2806,6 +2806,36 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testPictureInPictureUnavailablePathsStayReachable() {
+        let waiting = PictureInPictureController.controlState(
+            isSupported: true,
+            isActive: false,
+            isPossible: false,
+            hasAttachedController: true
+        )
+        XCTAssertTrue(waiting.isButtonEnabled)
+        XCTAssertEqual(waiting.command, .unavailable)
+        XCTAssertEqual(waiting.messageOnTap, "Picture in Picture isn't ready yet.")
+
+        let detachedWithStaleAvailability = PictureInPictureController.controlState(
+            isSupported: true,
+            isActive: false,
+            isPossible: true,
+            hasAttachedController: false
+        )
+        XCTAssertTrue(detachedWithStaleAvailability.isButtonEnabled)
+        XCTAssertEqual(detachedWithStaleAvailability.command, .unavailable)
+        XCTAssertEqual(
+            detachedWithStaleAvailability.messageOnTap,
+            "Picture in Picture isn't ready yet."
+        )
+
+        XCTAssertEqual(
+            PlayerController.pictureInPictureUnavailableNotice(pgsOverlayIsActive: true),
+            PlayerController.pgsOverlayExternalPlaybackNotice
+        )
+    }
+
     func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
         XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
             isTearingDown: false,

@@ -1698,7 +1698,8 @@ struct PlayerView: View {
     }
 
     private var pictureInPictureButton: some View {
-        Button {
+        let controlState = pictureInPicture.controlState
+        return Button {
             guard controller.allowsPictureInPictureCommand() else { return }
             pictureInPicture.toggle()
             revealControls()
@@ -1706,7 +1707,7 @@ struct PlayerView: View {
             Image(systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
                 .foregroundStyle(pictureInPicture.isActive ? Palette.accent : .white)
         }
-        .disabled(!pictureInPicture.isActive && !pictureInPicture.isPossible)
+        .disabled(!controlState.isButtonEnabled)
         .accessibilityLabel(pictureInPicture.isActive
                             ? "Stop Picture in Picture"
                             : "Start Picture in Picture")
