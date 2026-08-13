@@ -146,8 +146,12 @@ async function withOrigin(bytes, run) {
 }
 
 test("the shaper holds the link, applies the cliff, and records both stages", async () => {
-  await withOrigin(128 * 1024, async (origin) => {
-    const profile = lab.parseNetworkProfile("1mbps-to-0.25mbps");
+  // Keep each stage well beyond the bucket's 250 ms starting credit and the
+  // first recorded slice. A one-second transfer puts that deliberate credit
+  // on the 1.25 telemetry boundary and turns scheduler jitter into a false
+  // leak; this payload holds the same bound over a multi-second window.
+  await withOrigin(256 * 1024, async (origin) => {
+    const profile = lab.parseNetworkProfile("1mbps-to-0.5mbps");
     const shaper = new lab.ShapingProxy(profile, origin);
     const base = await shaper.start();
     try {
@@ -155,7 +159,7 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
       const first = await fetch(`${base}/api/v1/files/1/direct`);
       await first.arrayBuffer();
       const firstMs = Date.now() - before;
-      assert.ok(firstMs > 500, `128 KB over a 1 Mb/s link cannot arrive in ${firstMs}ms`);
+      assert.ok(firstMs > 1_500, `256 KB over a 1 Mb/s link cannot arrive in ${firstMs}ms`);
 
       const cliffAt = shaper.applyCliff();
       assert.ok(cliffAt > 0, "the cliff point is recorded");
@@ -164,7 +168,10 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
       const second = await fetch(`${base}/api/v1/files/1/direct`);
       await second.arrayBuffer();
       const secondMs = Date.now() - afterStart;
-      assert.ok(secondMs > firstMs * 2, `the post-cliff fetch must be far slower (${firstMs}ms then ${secondMs}ms)`);
+      // The configured rate halves. Wall-clock fetches also contain fixed HTTP
+      // overhead, so require a clearly slower transfer without asserting an
+      // impossible strictly-greater-than 2x boundary around timer rounding.
+      assert.ok(secondMs > firstMs * 1.75, `the post-cliff fetch must be far slower (${firstMs}ms then ${secondMs}ms)`);
 
       const telemetry = shaper.telemetry();
       assert.equal(telemetry.stages.length, 2);
