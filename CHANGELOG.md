@@ -76,6 +76,24 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **The playback lab can now drive a session through a bandwidth cliff.**
+  `scripts/playback-lab run --suite stall-recovery --network-profile
+  8mbps-to-1.5mbps --json <artifact>` meters everything the browser pulls
+  through one shared loopback token bucket and drops the rate at a recorded
+  moment, so adaptation can be measured instead of asserted. It needs no root
+  and no kernel-level shaping, leaves no state behind, and touches no live
+  server or library. The artifact classifies its own outcome — `shaping`,
+  `browser_playback`, `server_supply`, `recovery`, or `harness` — so a cliff
+  that never applied or a shaper that leaked can never be misread as a verdict
+  about playback; recovery criteria are reviewable in
+  `tests/playback/cases.json`, and `playback-lab normalize` reduces a report to
+  its behavioral shape with UUIDs, ports, wall-clock, and temporary paths
+  removed. This is the harness Performance II N4 requires before its Auto
+  controller; it creates the condition and records the answer, and chooses no
+  quality rung itself. Existing suites and case counts are unchanged; the new
+  120-second shaping fixture is opt-in and built only for the suite that plays
+  it.
+
 - **TV episode lists and details now name the media they will open.** Season
   detail responses attach each episode's best-file resolution and HDR facts in
   one batched query, so the Apple season shelf can show a compact resolution +

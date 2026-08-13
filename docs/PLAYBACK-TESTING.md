@@ -39,6 +39,10 @@ make playback-fixtures     # build + ffprobe the corpus; cached under target/
 make playback-smoke        # 11 risk-weighted Chrome cases, about 2–4 minutes
 make playback-full         # 44 Chrome cases: every fixture × quality + restarts
 
+# Fault injection: drive a session through a bandwidth cliff (see below).
+scripts/playback-lab run --suite stall-recovery \
+  --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json
+
 # Safari: first enable Develop → Allow Remote Automation in Safari.
 # macOS may also require you to run `safaridriver --enable` once yourself.
 scripts/playback-lab doctor --browser safari
@@ -93,6 +97,7 @@ branch; do not multiply the suite merely because another axis exists.
 | `transcode-mpeg4-mp3-720.avi` | Unsupported video codec forces a real video transcode. |
 | `direct-vp9-opus-720.webm` | Non-MP4 direct path where this browser reports VP9 + Opus. |
 | `hevc-hdr-open-gop-2160.mkv` | 3840×2160 · 10-bit PQ/BT.2020 · open GOP · approximately 48 Mb/s, preserving the high-bitrate copy/segmenter stress case. |
+| `shaping-mpeg4-mp3-720.avi` | Opt-in, `stall-recovery` only: the same forced-transcode shape as the AVI above, but 120 s long so a cliff at 12 s still leaves a full recovery window. |
 
 Generation is cached. Every invocation still runs `ffprobe` and rejects a file
 whose codec, streams, dimensions, HDR tags, duration, or critical bitrate no
@@ -122,6 +127,91 @@ failure that once turned a 4K remux into a 720p transcode. TTFF, runway, dropped
 frames, `MediaCapabilities`, encoder, and server-ahead health are recorded but
 not all are hard gates yet; promote a number to a gate only after it is stable
 across the target hardware.
+
+## Network shaping — a bandwidth cliff you can reproduce and timestamp
+
+The `stall-recovery` suite is fault injection, not a correctness matrix. It
+holds a link at one rate until the session has proven itself, drops it to a
+lower rate at a recorded moment, and then records what the session did about
+it. It is the harness [PERF2-PLAN.md §7](PERF2-PLAN.md) requires *before* the
+N4 Auto controller exists, so that the controller's acceptance can be measured
+rather than asserted.
+
+```bash
+scripts/playback-lab run --suite stall-recovery \
+  --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json
+```
+
+**How the shaping works.** A loopback reverse proxy sits between the browser
+and the isolated server, metering every byte the browser pulls through one
+shared token bucket. This process keeps talking to the server directly, so the
+harness's own polling never competes with the shaped budget. Three properties
+follow, and each is the reason it is not an OS-level shaper:
+
+- it needs no root, no `pfctl`/`tc`, and no kernel state that could outlive a
+  failed run or affect anything else on the machine;
+- the cliff is a function call, so the report can timestamp it exactly rather
+  than infer it; and
+- the bucket is shared across connections, so the cliff constrains *the link*
+  rather than whichever request happened to be open.
+
+Pre-cliff credit is clamped when the rate drops. Without that, a bucket filled
+at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
+edge the suite exists to observe.
+
+**The profile grammar** is `<high>-to-<low>[@<seconds>]`, e.g.
+`8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`. The descent is mandatory: a flat
+or rising "cliff" is refused, because accepting one would let a green
+stall-recovery run mean nothing at all. The cliff defaults to 12 s after the
+first presented frame.
+
+**Why 8 → 1.5 Mb/s.** It is the ladder's own geometry. The 1080 rung costs
+about 8.16 Mb/s and the 720 rung about 4.16 Mb/s, so 8 Mb/s comfortably feeds
+the rung the corpus source starts on; 1.5 Mb/s leaves only the 360 rung
+(≈1.36 Mb/s) sustainable. The cliff therefore demands a real way down rather
+than a cosmetic one.
+
+**What a failure means.** The checks run in a fixed order, because that order
+is the diagnosis. An unapplied or leaked cliff invalidates everything after
+it; a baseline that was never healthy makes a post-cliff failure meaningless.
+Only when the link and the baseline are both trustworthy does the verdict
+describe adaptation. Every artifact therefore carries an `outcome`:
+
+| `outcome` | What it says |
+|---|---|
+| `shaping` | The cliff never applied, or the shaper delivered more than its cap. The run proves nothing about playback. |
+| `browser_playback` | The session failed before the cliff, so the cliff cannot be blamed. |
+| `server_supply` | The link still had headroom and the player starved anyway — a producer problem, not an adaptation problem. |
+| `recovery` | The link was shaped, the baseline was healthy, and the session did not answer the cliff within its criteria. |
+| `harness` | The observation was too short to outlast banked runway, or the run itself failed before it could produce a playback verdict. |
+
+The criteria live in `tests/playback/cases.json` beside the case, not in the
+script: restarts, upgrades per 60 s, the recovery deadline, and the sustained
+window are review material.
+
+**What it deliberately does not do.** It injects no probe onto the play path,
+changes no rate control, and does not steer the player. Choosing a rung in
+response to the cliff is the N4 controller's job; this harness only creates the
+condition and records the answer. Until that controller lands, a
+`stall-recovery` run is *expected* to fail with `outcome: recovery` — that
+recorded failure is the baseline the controller has to move, which is why the
+suite is not part of `make validate`.
+
+**Comparing runs.** `scripts/playback-lab normalize --json <artifact>` reduces
+a report to its behavioral shape with UUIDs, ports, wall-clock, temporary
+paths, and durations removed. Two unshaped runs on one machine normalize
+identically, which is how "the harness did not change existing playback
+behavior" is demonstrated rather than claimed:
+
+```bash
+scripts/playback-lab run --suite smoke --json out/a.json
+scripts/playback-lab normalize --json out/a.json --out out/a.trace.json
+# ...then the same for a second run, and diff the two traces.
+```
+
+The shaping fixture is opt-in: it is built only for the suite that plays it,
+and it is excluded from `full`'s source × quality product, so the existing
+suites keep exactly their previous cases and corpus.
 
 ## Reports keep enough evidence to reproduce the failing layer
 
@@ -225,8 +315,11 @@ probe contract is stable.
 - **No exhaustive codec-profile proof.** H.264 and HEVC each contain more
   profiles, levels, reference-frame patterns, and vendor quirks than a small
   generated corpus can represent.
-- **No WAN or congested-Wi-Fi simulation.** This is a correctness and local
-  performance harness. Network shaping is a separate fault-injection layer.
+- **No WAN or congested-Wi-Fi *fidelity*.** The shaping layer above injects a
+  bandwidth cliff, and that is all it claims: one shared rate limit, changed at
+  a known moment. It models no latency, jitter, loss, reordering, competing
+  traffic, or radio behavior, so it can prove that a session answers a
+  bandwidth collapse — never that it behaves like a particular real network.
 - **No visual-quality oracle yet.** It detects presentation failure, cadence,
   size, and fallback; it does not score banding, color accuracy, or subtitle
   placement from screenshots.

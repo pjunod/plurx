@@ -51,6 +51,14 @@
       "builder": "hevc_hdr_open_gop_mkv",
       "description": "High-bitrate 4K 10-bit HEVC HDR open-GOP MKV; copy-HLS, progressive-remux, and tone-map stress case",
       "tags": ["remux", "transcode", "hevc", "aac", "mkv", "2160p", "hdr", "high-bitrate", "open-gop", "seek"]
+    },
+    {
+      "id": "shaping-mpeg4-mp3-720",
+      "filename": "shaping-mpeg4-mp3-720.avi",
+      "builder": "mpeg4_mp3_avi_long",
+      "opt_in": true,
+      "description": "120s 720p MPEG-4 Part 2 + MP3 in AVI; forces the transcode ladder and runs long enough to hold a bandwidth cliff and watch the recovery",
+      "tags": ["transcode", "mpeg4", "mp3", "avi", "720p", "sdr", "ladder", "shaping"]
     }
   ],
   "suites": {
@@ -90,6 +98,27 @@
         {"fixture": "remux-h264-multitrack-1080", "quality": "720", "operation": "audio-switch"},
         {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "subtitle-toggle"},
         {"fixture": "remux-h264-multitrack-1080", "quality": "nomse", "operation": "subtitle-toggle"}
+      ]
+    },
+    "stall-recovery": {
+      "requires_network_profile": true,
+      "cases": [
+        {
+          "fixture": "shaping-mpeg4-mp3-720",
+          "quality": "auto",
+          "operation": "shaped-cliff",
+          "recovery": {
+            "sample_interval_seconds": 1,
+            "recovery_observe_seconds": 45,
+            "shaping_tolerance": 1.25,
+            "baseline_minimum_clock_rate": 0.9,
+            "maximum_automatic_restarts": 1,
+            "maximum_upgrades_per_60s": 1,
+            "recovery_deadline_seconds": 30,
+            "sustained_seconds": 10,
+            "sustained_minimum_clock_rate": 0.9
+          }
+        }
       ]
     }
   }

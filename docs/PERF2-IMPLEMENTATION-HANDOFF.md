@@ -443,7 +443,14 @@ prefixes are wanted before N5.1's container work (forbidden — plan
 
 ### N4 — sustained smoothness (plan §7; review R5)
 
-Shaping harness for playback-lab first. Then the web controller
+Shaping harness for playback-lab first — **done in #143**: `--network-profile
+<high>-to-<low>[@<seconds>]`, the `stall-recovery` suite, the `shaping` /
+`browser_playback` / `server_supply` / `recovery` outcome classification, and
+`playback-lab normalize` for the controller-off baseline. Read
+[PLAYBACK-TESTING.md](PLAYBACK-TESTING.md#network-shaping--a-bandwidth-cliff-you-can-reproduce-and-timestamp)
+before touching it; its recovery criteria live in `tests/playback/cases.json`,
+so tuning them is a reviewable manifest change and never a script edit. Then
+the web controller
 (consuming the served ladder; `decideRung` pure + table-tested), priors
 (server tables + `prior_kbps` in decision/session responses +
 `auto_height` consult), and the reopen contract: `previous_session_id`

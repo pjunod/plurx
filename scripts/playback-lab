@@ -10,6 +10,7 @@
 
 const fs = require("node:fs");
 const fsp = fs.promises;
+const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -21,29 +22,111 @@ const DEFAULT_FIXTURE_DIR = path.join(ROOT, "target", "playback-lab", "fixtures"
 const DEFAULT_REPORT_DIR = path.join(ROOT, "target", "playback-lab", "reports");
 const ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
+// How long the shaper waits, after the first presented frame, before it drops
+// the link. Long enough that a healthy session has proven itself at the high
+// rate, so a post-cliff failure is attributable to the cliff and not to a
+// session that was never sustainable.
+const DEFAULT_CLIFF_AFTER_SECONDS = 12;
+
+// The named links. A profile is a descent: a rate that holds, then a lower
+// rate that holds. Only what the plan's acceptance shape needs is named here;
+// the parser below accepts the same grammar for one-off experiments.
+const NETWORK_PROFILES = {
+  "8mbps-to-1.5mbps": {
+    description: "8 Mb/s holds, then a cliff to 1.5 Mb/s (PERF2-PLAN §7 acceptance)",
+  },
+};
+
+function parseRate(text) {
+  const match = /^(\d+(?:\.\d+)?)(kbps|mbps)$/.exec(String(text).trim().toLowerCase());
+  if (!match) throw new Error(`rate "${text}" must look like 8mbps or 1500kbps`);
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`rate "${text}" must be positive`);
+  const kbps = match[2] === "mbps" ? value * 1000 : value;
+  if (kbps < 1) throw new Error(`rate "${text}" is below the 1 kb/s floor`);
+  return Math.round(kbps);
+}
+
+/**
+ * `<high>-to-<low>[@<seconds>]`, e.g. `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`.
+ *
+ * The descent is mandatory. A profile that rises, or holds flat, cannot make a
+ * cliff, and silently accepting one would let a green stall-recovery run mean
+ * nothing at all — the single most expensive failure this harness could have.
+ */
+function parseNetworkProfile(spec) {
+  if (spec === undefined || spec === null || spec === false || spec === "" || spec === "none") {
+    return null;
+  }
+  if (spec === true) throw new Error("--network-profile needs a value, e.g. 8mbps-to-1.5mbps");
+  const raw = String(spec).trim().toLowerCase();
+  const profileParts = raw.split("@");
+  if (profileParts.length > 2) {
+    throw new Error(`network profile "${spec}" has more than one cliff delay`);
+  }
+  const [shape, cliffText] = profileParts;
+  const parts = shape.split("-to-");
+  if (parts.length !== 2) {
+    const known = Object.keys(NETWORK_PROFILES).join(", ");
+    throw new Error(`unknown network profile "${spec}"; known profiles: ${known}`);
+  }
+  const from = parseRate(parts[0]);
+  const to = parseRate(parts[1]);
+  if (to >= from) {
+    throw new Error(`network profile "${spec}" must descend: ${to} kb/s is not below ${from} kb/s`);
+  }
+  let cliffAfterSeconds = DEFAULT_CLIFF_AFTER_SECONDS;
+  if (cliffText !== undefined) {
+    cliffAfterSeconds = Number(cliffText);
+    if (!Number.isFinite(cliffAfterSeconds) || cliffAfterSeconds <= 0) {
+      throw new Error(`network profile "${spec}" needs a positive cliff delay in seconds`);
+    }
+  }
+  const id = `${parts[0]}-to-${parts[1]}`;
+  return {
+    id,
+    spec: raw,
+    description: NETWORK_PROFILES[id]?.description || `${from} kb/s, then a cliff to ${to} kb/s`,
+    cliff_after_seconds: cliffAfterSeconds,
+    stages: [
+      { index: 0, label: "before-cliff", kbps: from },
+      { index: 1, label: "after-cliff", kbps: to },
+    ],
+  };
+}
+
 function usage() {
   process.stdout.write(`plurx playback lab
 
 Usage:
   scripts/playback-lab doctor [--browser chrome|safari|edge|firefox]
   scripts/playback-lab fixtures [--rebuild] [--fixtures DIR]
-  scripts/playback-lab plan [--suite smoke|full] [--case TEXT]
-  scripts/playback-lab run [--suite smoke|full] [--browser chrome|safari|edge|firefox]
+  scripts/playback-lab plan [--suite smoke|full|stall-recovery] [--case TEXT]
+  scripts/playback-lab run [--suite smoke|full|stall-recovery]
+                             [--browser chrome|safari|edge|firefox]
                              [--case TEXT] [--observe SECONDS]
+                             [--network-profile NAME] [--json PATH] [--junit PATH]
                              [--fixtures DIR] [--server PATH]
                              [--chrome PATH] [--edge PATH]
                              [--firefox PATH] [--geckodriver PATH]
                              [--headed] [--keep-runtime]
+  scripts/playback-lab normalize --json PATH [--out PATH]
 
 Commands:
-  doctor    Verify the external programs and browser automation surface.
-  fixtures  Generate and ffprobe-verify the deterministic media corpus.
-  plan      Print the cases without starting a server or browser.
-  run       Boot an isolated server, scan the corpus, and play every case.
+  doctor     Verify the external programs and browser automation surface.
+  fixtures   Generate and ffprobe-verify the deterministic media corpus.
+  plan       Print the cases without starting a server or browser.
+  run        Boot an isolated server, scan the corpus, and play every case.
+  normalize  Scrub a report's run-local values so two runs can be compared.
 
 The smoke suite covers each verdict plus the high-risk 4K transport forks and
 seek/audio/subtitle restarts. The full suite adds every fixture x quality mode.
+The stall-recovery suite drives a shaped link through a bandwidth cliff and
+records how the session answers it.
 Reports are written below target/playback-lab/reports/ as JSON and JUnit XML.
+
+Network profiles (--network-profile), applied by a local loopback shaper:
+${Object.keys(NETWORK_PROFILES).map((id) => `  ${id.padEnd(20)} ${NETWORK_PROFILES[id].description}`).join("\n")}
 `);
 }
 
@@ -100,8 +183,10 @@ function expandCases(manifest, suiteName, filter) {
   const fixtures = fixtureMap(manifest);
   const cases = [];
   if (suite.cross_product) {
+    // "all" means the general corpus. An opt-in fixture exists for one named
+    // suite and must not silently widen the full matrix.
     const fixtureIds = suite.cross_product.fixtures === "all"
-      ? manifest.fixtures.map((fixture) => fixture.id)
+      ? manifest.fixtures.filter((fixture) => !fixture.opt_in).map((fixture) => fixture.id)
       : suite.cross_product.fixtures;
     const qualities = suite.cross_product.qualities === "all"
       ? manifest.qualities
@@ -312,6 +397,17 @@ function fixtureCommand(fixture, output, directory, fixtures) {
         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-q:v", "3",
         "-c:a", "libmp3lame", "-b:a", "192k", "-shortest", output,
       ];
+    // Same forced-transcode shape as above, but long enough that a cliff at
+    // 12 s still leaves a full recovery window — and rate-capped rather than
+    // quality-capped so its size stays predictable.
+    case "mpeg4_mp3_avi_long":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=120",
+        "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=120",
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-b:v", "3M",
+        "-c:a", "libmp3lame", "-b:a", "192k", "-shortest", output,
+      ];
     case "vp9_opus_webm":
       return [
         ...ffmpegPrefix(),
@@ -376,6 +472,7 @@ function verifyFixture(fixture, file) {
     h264_aac_mp4: { video: "h264", audio: ["aac"], width: 1920, height: 1080, minDuration: 20 },
     h264_multitrack_mkv: { video: "h264", audio: ["aac", "ac3"], subtitles: 1, width: 1920, height: 1080, minDuration: 20 },
     mpeg4_mp3_avi: { video: "mpeg4", audio: ["mp3"], width: 1280, height: 720, minDuration: 20 },
+    mpeg4_mp3_avi_long: { video: "mpeg4", audio: ["mp3"], width: 1280, height: 720, minDuration: 110 },
     vp9_opus_webm: { video: "vp9", audio: ["opus"], width: 1280, height: 720, minDuration: 20 },
     hevc_hdr_open_gop_mkv: { video: "hevc", audio: ["aac"], width: 3840, height: 2160, hdr: true, minBitrate: 40_000_000, minDuration: 16 },
   }[fixture.builder];
@@ -402,12 +499,17 @@ function verifyFixture(fixture, file) {
   };
 }
 
-async function buildFixtures(manifest, options) {
+/**
+ * `wanted` restricts the build to the fixtures a plan actually uses, so an
+ * opt-in corpus member costs nothing to the suites that never play it.
+ */
+async function buildFixtures(manifest, options, wanted) {
   const directory = path.resolve(options.fixtures || DEFAULT_FIXTURE_DIR);
   await fsp.mkdir(directory, { recursive: true });
   const fixtures = fixtureMap(manifest);
   const metadata = {};
-  for (const fixture of manifest.fixtures) {
+  const selected = fixturesForBuild(manifest, wanted);
+  for (const fixture of selected) {
     const output = path.join(directory, fixture.filename);
     let valid = false;
     if (!options.rebuild && fs.existsSync(output)) {
@@ -433,6 +535,17 @@ async function buildFixtures(manifest, options) {
   return { directory, metadata };
 }
 
+function fixturesForBuild(manifest, wanted) {
+  const needed = wanted ? new Set(wanted) : null;
+  if (needed) {
+    // A fixture built by copying another's video needs that other one present.
+    for (const fixture of manifest.fixtures) {
+      if (needed.has(fixture.id) && fixture.depends_on) needed.add(fixture.depends_on);
+    }
+  }
+  return manifest.fixtures.filter((fixture) => needed ? needed.has(fixture.id) : !fixture.opt_in);
+}
+
 async function freePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -443,6 +556,227 @@ async function freePort() {
       server.close(() => resolve(port));
     });
   });
+}
+
+// A bucket wide enough to keep TCP moving, narrow enough that it cannot fund a
+// post-cliff burst out of pre-cliff credit.
+const SHAPER_BURST_MS = 250;
+const SHAPER_SLICE_BYTES = 16 * 1024;
+
+/**
+ * The rate limiter, kept free of sockets and wall-clock so it can be tested
+ * directly: every method takes the current millisecond from its caller.
+ */
+class TokenBucket {
+  constructor(kbps, nowMs = 0) {
+    this.tokens = 0;
+    this.updatedAt = nowMs;
+    this.bytesPerMs = 0;
+    this.capacity = 0;
+    this.setRate(kbps, nowMs);
+  }
+
+  setRate(kbps, nowMs) {
+    if (!Number.isFinite(kbps) || kbps <= 0) throw new Error(`shaper rate must be positive, got ${kbps}`);
+    this.refill(nowMs);
+    this.kbps = kbps;
+    this.bytesPerMs = kbps / 8; // kb/s ÷ 8 = bytes per millisecond
+    this.capacity = this.bytesPerMs * SHAPER_BURST_MS;
+    // Drop pre-cliff credit that the new, lower rate never earned.
+    if (this.tokens > this.capacity) this.tokens = this.capacity;
+  }
+
+  refill(nowMs) {
+    const elapsed = Math.max(0, nowMs - this.updatedAt);
+    this.updatedAt = nowMs;
+    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.bytesPerMs);
+  }
+
+  /**
+   * Claim `bytes` now and return how long the caller must wait first. Debt is
+   * allowed to go negative and is repaid by time, which is what makes the
+   * long-run average exactly the configured rate instead of merely near it.
+   */
+  reserve(bytes, nowMs) {
+    this.refill(nowMs);
+    this.tokens -= bytes;
+    return this.tokens < 0 ? -this.tokens / this.bytesPerMs : 0;
+  }
+}
+
+// Bytes that are the stream itself, as opposed to the app shell and control
+// plane. Recorded separately so a report can say whether the shaped budget was
+// actually spent on media supply.
+function isMediaPath(urlPath) {
+  const route = String(urlPath || "").split("?")[0];
+  return /\/hls\//.test(route)
+    || /\/stream\.mp4$/.test(route)
+    || /\/files\/\d+\/direct$/.test(route)
+    || /\/offline\/media\//.test(route)
+    || /\.(m3u8|ts|m4s|mp4)$/.test(route);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A loopback reverse proxy that meters everything the browser pulls through one
+ * shared bucket. It is deliberately not an OS-level shaper: no root, no
+ * kernel state to leak into the next run, no machine-wide blast radius, and the
+ * cliff is a function call the report can timestamp.
+ */
+class ShapingProxy {
+  constructor(profile, targetOrigin) {
+    this.profile = profile;
+    this.target = new URL(targetOrigin);
+    this.stageIndex = 0;
+    this.bucket = new TokenBucket(profile.stages[0].kbps, performance.now());
+    this.agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+    this.errors = [];
+    this.stages = profile.stages.map((stage) => ({
+      index: stage.index,
+      label: stage.label,
+      kbps: stage.kbps,
+      entered_at_ms: null,
+      left_at_ms: null,
+      bytes: 0,
+      media_bytes: 0,
+    }));
+  }
+
+  now() {
+    return performance.now();
+  }
+
+  async start(binder) {
+    const bind = binder || ((server) => new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve(server.address().port));
+    }));
+    this.server = http.createServer((request, response) => this.handle(request, response));
+    this.server.keepAliveTimeout = 30_000;
+    try {
+      this.port = await bind(this.server);
+    } catch (error) {
+      throw new Error(`network shaping is unavailable: ${error.message}`);
+    }
+    if (!this.port) throw new Error("network shaping is unavailable: the shaper bound no port");
+    this.startedAt = this.now();
+    this.stages[0].entered_at_ms = 0;
+    this.baseUrl = `http://127.0.0.1:${this.port}`;
+    return this.baseUrl;
+  }
+
+  /** Drop the link to the next stage. Called once, at a point the report keeps. */
+  applyCliff() {
+    if (this.stageIndex + 1 >= this.stages.length) return null;
+    const at = this.now() - this.startedAt;
+    this.stages[this.stageIndex].left_at_ms = at;
+    this.stageIndex += 1;
+    const stage = this.stages[this.stageIndex];
+    stage.entered_at_ms = at;
+    this.bucket.setRate(stage.kbps, this.now());
+    return at;
+  }
+
+  record(bytes, media) {
+    const stage = this.stages[this.stageIndex];
+    stage.bytes += bytes;
+    if (media) stage.media_bytes += bytes;
+  }
+
+  handle(request, response) {
+    const media = isMediaPath(request.url);
+    const upstream = http.request({
+      agent: this.agent,
+      host: this.target.hostname,
+      port: this.target.port,
+      path: request.url,
+      method: request.method,
+      headers: { ...request.headers, host: this.target.host },
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
+      this.pump(upstreamResponse, response, media).catch((error) => {
+        this.errors.push(`${request.method} ${request.url}: ${error.message}`);
+        upstreamResponse.destroy();
+        response.destroy();
+      });
+    });
+    upstream.on("error", (error) => {
+      this.errors.push(`${request.method} ${request.url}: ${error.message}`);
+      if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
+      response.end("playback-lab shaper: upstream error");
+    });
+    request.on("error", () => upstream.destroy());
+    request.pipe(upstream);
+  }
+
+  async pump(source, sink, media) {
+    try {
+      for await (const chunk of source) {
+        for (let offset = 0; offset < chunk.length; offset += SHAPER_SLICE_BYTES) {
+          const slice = chunk.subarray(offset, offset + SHAPER_SLICE_BYTES);
+          const delay = this.bucket.reserve(slice.length, this.now());
+          if (delay > 0) await sleep(delay);
+          this.record(slice.length, media);
+          if (!sink.write(slice)) {
+            // Both listeners are removed on either outcome: a long transfer
+            // backpressures thousands of times, and leaking one listener per
+            // slice would warn and then grow without bound.
+            await new Promise((resolve, reject) => {
+              const done = (error) => {
+                sink.off("drain", onDrain);
+                sink.off("close", onClose);
+                error ? reject(error) : resolve();
+              };
+              const onDrain = () => done();
+              const onClose = () => done(new Error("client closed the connection"));
+              sink.once("drain", onDrain);
+              sink.once("close", onClose);
+            });
+          }
+        }
+      }
+      sink.end();
+    } catch (error) {
+      sink.destroy();
+      throw error;
+    }
+  }
+
+  /**
+   * What the link actually delivered, per stage. `measured_kbps` is the number
+   * that proves the shaper held: it may sit below the cap because the player
+   * asked for less, but it may never sit meaningfully above it.
+   */
+  telemetry() {
+    const endedAt = this.now() - this.startedAt;
+    return {
+      profile: this.profile.id,
+      spec: this.profile.spec,
+      cliff_after_seconds: this.profile.cliff_after_seconds,
+      cliff_applied_at_ms: this.stages[1] ? this.stages[1].entered_at_ms : null,
+      transport_errors: this.errors.slice(-10),
+      stages: this.stages.map((stage) => {
+        const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
+        const seconds = stage.entered_at_ms === null ? 0 : Math.max(0, left - stage.entered_at_ms) / 1000;
+        return {
+          ...stage,
+          held_seconds: Number(seconds.toFixed(3)),
+          measured_kbps: seconds > 0 ? Number(((stage.bytes * 8) / 1000 / seconds).toFixed(1)) : null,
+          measured_media_kbps: seconds > 0 ? Number(((stage.media_bytes * 8) / 1000 / seconds).toFixed(1)) : null,
+        };
+      }),
+    };
+  }
+
+  async close() {
+    this.agent.destroy();
+    if (!this.server) return;
+    await new Promise((resolve) => this.server.close(resolve));
+    this.server.closeAllConnections?.();
+  }
 }
 
 async function stopChild(child, graceMs = 5_000) {
@@ -987,6 +1321,83 @@ function hitchTotal(snapshot) {
   return (h.back || 0) + (h.held || 0) + (h.late || 0) + (h.drop || 0) + (h.gap || 0);
 }
 
+/** One row of the timeline: everything a later rung decision could need. */
+function sampleFrom(snapshot, atMs) {
+  return {
+    at_ms: Math.round(atMs),
+    absolute_time: snapshot.video.absolute_time,
+    current_time: snapshot.video.current_time,
+    width: snapshot.video.width,
+    height: snapshot.video.height,
+    ready_state: snapshot.video.ready_state,
+    paused: snapshot.video.paused,
+    seeking: snapshot.video.seeking,
+    runway_seconds: snapshot.video.runway,
+    dropped_frames: snapshot.video.dropped,
+    media_error: snapshot.video.error ? snapshot.video.error.code : null,
+    stalls: snapshot.stalls || 0,
+    stalls_by_kind: snapshot.stalls_by_kind || null,
+    stall_recoveries: snapshot.stall_recoveries || 0,
+    hitches: hitchTotal(snapshot),
+    ttff_ms: snapshot.ttff_ms ?? null,
+    method: snapshot.method || null,
+    decided_method: snapshot.decided_method || null,
+    attempt_reason: snapshot.attempt_reason || null,
+    server_health: snapshot.health || null,
+  };
+}
+
+async function sampleWindow(driver, seconds, intervalMs, originMs, sink) {
+  const deadline = performance.now() + seconds * 1000;
+  let last = null;
+  while (performance.now() < deadline) {
+    last = await driver.eval(playerSnapshotExpression());
+    sink.push(sampleFrom(last, performance.now() - originMs));
+    await sleep(Math.max(0, Math.min(intervalMs, deadline - performance.now())));
+  }
+  last = await driver.eval(playerSnapshotExpression());
+  sink.push(sampleFrom(last, performance.now() - originMs));
+  return last;
+}
+
+/**
+ * Hold the link high until the session has proven itself, drop it, then watch.
+ * The harness applies the cliff and records the timeline; it deliberately makes
+ * no attempt to steer the player, which is N4's job and not this slice's.
+ */
+async function observeShapedCliff(driver, shaper, testCase, start) {
+  const criteria = testCase.recovery || {};
+  const intervalMs = (criteria.sample_interval_seconds ?? 1) * 1000;
+  const baseline = [];
+  // Both windows are timestamped from their own start, and the recovery window
+  // from the cliff itself, so every `at_ms` in the artifact reads as "since the
+  // cliff" without the reader having to subtract anything.
+  const baselineStart = performance.now();
+  const beforeCliff = await sampleWindow(
+    driver, shaper.profile.cliff_after_seconds, intervalMs, baselineStart, baseline,
+  );
+  const baselineElapsed = (performance.now() - baselineStart) / 1000;
+  const baselineAdvanced = beforeCliff.video.absolute_time - start.video.absolute_time;
+  const cliffAtMs = shaper.applyCliff();
+  const cliffOrigin = performance.now();
+  const timeline = [];
+  const afterCliff = await sampleWindow(
+    driver, criteria.recovery_observe_seconds ?? 45, intervalMs, cliffOrigin, timeline,
+  );
+  const observation = {
+    shaping: shaper.telemetry(),
+    baseline_clock_rate: baselineElapsed > 0 ? baselineAdvanced / baselineElapsed : 0,
+    pre_cliff_runway_seconds: Number(beforeCliff.video.runway || 0),
+    baseline_error: beforeCliff.video.error
+      ? `media error ${beforeCliff.video.error.code}: ${beforeCliff.video.error.message || "unknown"}`
+      : !beforeCliff.started ? "the player never reached a presented frame" : null,
+    baseline,
+    timeline,
+  };
+  const score = scoreRecovery(criteria, observation);
+  return { observation, score, cliffAtMs, end: afterCliff };
+}
+
 function scoreCase(manifest, testCase, decision, start, end, elapsedSeconds) {
   const thresholds = manifest.thresholds;
   const errors = [];
@@ -1042,7 +1453,230 @@ function scoreCase(manifest, testCase, decision, start, end, elapsedSeconds) {
   };
 }
 
-async function runOneCase(driver, server, manifest, fixture, testCase, browserInfo, observeOverride) {
+/**
+ * Compress a sampled timeline into the rung history N4 will judge. A quality
+ * switch in plurx is a session restart (PERF2-PLAN §7.1), so a change in the
+ * decoded height or a fresh TTFF beacon both mark one — counting them
+ * separately would double-count the same restart.
+ */
+function rungHistory(timeline) {
+  const events = [];
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1];
+    const sample = timeline[index];
+    const heightChanged = sample.height > 0 && previous.height > 0 && sample.height !== previous.height;
+    const ttffChanged = sample.ttff_ms !== null
+      && previous.ttff_ms !== null
+      && sample.ttff_ms !== previous.ttff_ms;
+    // A reconnect can select the same rung and produce the same rounded TTFF.
+    // The player exposes its attempt reason specifically so that restart is
+    // still visible in that case; relying on presentation symptoms alone made
+    // a real controller-off run report zero restarts after `stall-restart`.
+    const attemptChanged = Boolean(sample.attempt_reason)
+      && Boolean(previous.attempt_reason)
+      && sample.attempt_reason !== previous.attempt_reason;
+    const restarted = ttffChanged || attemptChanged;
+    if (!heightChanged && !restarted) continue;
+    events.push({
+      at_ms: sample.at_ms,
+      from_height: previous.height,
+      to_height: sample.height,
+      direction: !heightChanged ? "restart" : sample.height > previous.height ? "up" : "down",
+      attempt_reason: sample.attempt_reason || null,
+    });
+  }
+  return events;
+}
+
+/** The widest count of upgrades inside any 60-second window. */
+function peakUpgradeRate(events, windowMs = 60_000) {
+  const upgrades = events.filter((event) => event.direction === "up");
+  let peak = 0;
+  for (const anchor of upgrades) {
+    const inWindow = upgrades.filter((event) => event.at_ms >= anchor.at_ms && event.at_ms < anchor.at_ms + windowMs);
+    peak = Math.max(peak, inWindow.length);
+  }
+  return peak;
+}
+
+/**
+ * The first moment from which playback held at `minimumRate` with no new stall
+ * *for the rest of the observation*. Null means it never did.
+ *
+ * Holding to the end is the load-bearing part. A player that keeps presenting
+ * for ten seconds on buffer it filled before the cliff looks identical, over
+ * that window, to one that genuinely found a sustainable rung — and then
+ * starves. Requiring the window to reach the end of the observation is what
+ * separates recovery from drainage, and the observation must therefore be
+ * longer than the runway the pre-cliff rate could bank.
+ */
+function timeToSustained(timeline, sustainedSeconds, minimumRate) {
+  if (timeline.length < 2) return null;
+  const last = timeline[timeline.length - 1];
+  const windowMs = sustainedSeconds * 1000;
+  for (const from of timeline) {
+    // Too little left to prove anything; every later start is shorter still.
+    if (last.at_ms - from.at_ms < windowMs) break;
+    if (last.stalls > from.stalls) continue;
+    const elapsed = (last.at_ms - from.at_ms) / 1000;
+    if (elapsed > 0 && (last.absolute_time - from.absolute_time) / elapsed >= minimumRate) return from.at_ms;
+  }
+  return null;
+}
+
+/**
+ * Judge a shaped run. The order of the checks is the diagnosis: a leaked or
+ * unapplied cliff invalidates everything after it, and a baseline that was
+ * never healthy makes a post-cliff failure meaningless. Only once the link and
+ * the baseline are trustworthy does a verdict about recovery mean anything.
+ */
+function sustainedSecondsOf(criteria) {
+  return criteria.sustained_seconds ?? 10;
+}
+
+function scoreRecovery(criteria, observation) {
+  const errors = [];
+  const shaping = observation.shaping;
+  const after = shaping.stages[1];
+  const before = shaping.stages[0];
+  const tolerance = criteria.shaping_tolerance ?? 1.25;
+
+  if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
+    return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
+  }
+  for (const stage of [before, after]) {
+    if (stage.measured_kbps !== null && stage.measured_kbps > stage.kbps * tolerance) {
+      return {
+        outcome: "shaping",
+        errors: [`the shaper leaked: ${stage.label} delivered ${stage.measured_kbps} kb/s over a ${stage.kbps} kb/s cap`],
+        metrics: { shaping },
+      };
+    }
+  }
+
+  const baselineRate = observation.baseline_clock_rate;
+  if (observation.baseline_error) {
+    return {
+      outcome: "browser_playback",
+      errors: [`the session failed before the cliff: ${observation.baseline_error}`],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  if (baselineRate < (criteria.baseline_minimum_clock_rate ?? 0.9)) {
+    return {
+      outcome: "browser_playback",
+      errors: [
+        `the pre-cliff baseline was not sustainable (${baselineRate.toFixed(3)}x at ${before.kbps} kb/s), ` +
+        "so the cliff cannot prove anything about recovery",
+      ],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+
+  // The runway banked at the high rate is exactly how long a doomed session can
+  // impersonate a recovered one. If the observation cannot outlast it, the run
+  // is not evidence about recovery no matter how it scores.
+  const runway = observation.pre_cliff_runway_seconds ?? 0;
+  const observeSeconds = criteria.recovery_observe_seconds ?? 45;
+  if (observeSeconds < runway + sustainedSecondsOf(criteria)) {
+    return {
+      outcome: "harness",
+      errors: [
+        `the ${observeSeconds}s recovery window cannot outlast the ${runway.toFixed(1)}s of runway ` +
+        `banked before the cliff plus a ${sustainedSecondsOf(criteria)}s sustained window`,
+      ],
+      metrics: { shaping, baseline_clock_rate: baselineRate, pre_cliff_runway_seconds: runway },
+    };
+  }
+
+  const timeline = observation.timeline;
+  const events = rungHistory(timeline);
+  const restarts = events.length;
+  const upgrades = peakUpgradeRate(events);
+  const sustainedSeconds = sustainedSecondsOf(criteria);
+  const sustainedRate = criteria.sustained_minimum_clock_rate ?? 0.9;
+  const recoveredAt = timeToSustained(timeline, sustainedSeconds, sustainedRate);
+  const deadlineMs = (criteria.recovery_deadline_seconds ?? 45) * 1000;
+  const headroom = after.measured_media_kbps !== null && after.measured_media_kbps < after.kbps * 0.6;
+
+  if (recoveredAt === null) {
+    errors.push(
+      `playback never held ${sustainedSeconds}s at ${sustainedRate}x after the cliff ` +
+      `(${after.kbps} kb/s link, ${restarts} restarts)`,
+    );
+  } else if (recoveredAt > deadlineMs) {
+    errors.push(`recovery took ${(recoveredAt / 1000).toFixed(1)}s, want <= ${(deadlineMs / 1000).toFixed(0)}s`);
+  }
+  if (restarts > (criteria.maximum_automatic_restarts ?? 1)) {
+    errors.push(`${restarts} automatic restarts, want <= ${criteria.maximum_automatic_restarts ?? 1}`);
+  }
+  if (upgrades > (criteria.maximum_upgrades_per_60s ?? 1)) {
+    errors.push(`${upgrades} upgrades inside one 60s window, want <= ${criteria.maximum_upgrades_per_60s ?? 1}`);
+  }
+
+  // A starved player on a link that still had room is a supply problem, not an
+  // adaptation problem. Saying so is the difference between a useful artifact
+  // and one that blames the controller for the producer.
+  const outcome = errors.length === 0 ? "passed" : headroom && recoveredAt === null ? "server_supply" : "recovery";
+  return {
+    outcome,
+    errors,
+    metrics: {
+      shaping,
+      baseline_clock_rate: baselineRate,
+      pre_cliff_runway_seconds: runway,
+      restarts,
+      peak_upgrades_per_60s: upgrades,
+      recovered_after_ms: recoveredAt,
+      rung_events: events,
+      samples: timeline.length,
+    },
+  };
+}
+
+const NORMALIZE_RULES = [
+  [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>"],
+  [/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<timestamp>"],
+  [/127\.0\.0\.1:\d+/g, "127.0.0.1:<port>"],
+  [/(\/var\/folders\/|\/tmp\/)[^\s"']*plurx-playback-lab-[^\s"',)]*/g, "<runtime>"],
+  [/\b\d+(\.\d+)?\s?ms\b/g, "<duration>"],
+];
+
+function normalizeText(value) {
+  return NORMALIZE_RULES.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), String(value));
+}
+
+/**
+ * The behavioral shape of a run with every run-local value removed: no UUIDs,
+ * ports, wall-clock, temp paths, or timings. Two runs of the same suite on the
+ * same machine must produce identical output, which is what lets "the
+ * controller is off" be proven rather than asserted.
+ */
+function normalizeTrace(report) {
+  return {
+    schema_version: report.schema_version,
+    suite: report.suite,
+    browser: report.browser?.browser || null,
+    network_profile: report.network_profile?.id || null,
+    summary: report.summary,
+    results: (report.results || []).map((result) => ({
+      name: result.name,
+      status: result.status,
+      operation: result.operation,
+      decision_method: result.decision?.method ?? null,
+      delivery_mode: result.decision?.delivery?.mode ?? null,
+      actual_method: result.metrics?.actual_method ?? null,
+      copy_hls: result.metrics?.copy_hls ?? null,
+      encoder: result.metrics?.encoder ?? null,
+      decoded_dimensions: result.metrics?.decoded_dimensions ?? null,
+      tried_fallback: result.end?.tried_fallback ?? null,
+      errors: (result.errors || []).map(normalizeText),
+      warnings: (result.warnings || []).map(normalizeText),
+    })),
+  };
+}
+
+async function runOneCase(driver, server, manifest, fixture, testCase, browserInfo, observeOverride, shaper) {
   const file = server.files.get(fixture.filename);
   if (!file) throw new Error(`scanner did not return ${fixture.filename}`);
   await setCasePreferences(driver, testCase.quality);
@@ -1072,6 +1706,27 @@ async function runOneCase(driver, server, manifest, fixture, testCase, browserIn
       name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
       status: "failed", duration_ms: Date.now() - startedAt,
       errors: [`media error ${start.video.error.code}: ${start.video.error.message || "unknown"}`], warnings: [], decision, start, end: start,
+    };
+  }
+  if (testCase.operation === "shaped-cliff") {
+    if (!shaper) throw new Error("a shaped-cliff case needs --network-profile");
+    const shaped = await observeShapedCliff(driver, shaper, testCase, start);
+    return {
+      name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+      status: shaped.score.errors.length ? "failed" : "passed",
+      outcome: shaped.score.outcome,
+      duration_ms: Date.now() - startedAt,
+      errors: shaped.score.errors,
+      warnings: shaped.observation.shaping.transport_errors.length
+        ? [`shaper reported ${shaped.observation.shaping.transport_errors.length} transport errors`] : [],
+      metrics: shaped.score.metrics,
+      operation_detail: { cliff_applied_at_ms: shaped.cliffAtMs },
+      shaping: shaped.observation.shaping,
+      baseline: shaped.observation.baseline,
+      timeline: shaped.observation.timeline,
+      decision,
+      start,
+      end: shaped.end,
     };
   }
   let operation = null;
@@ -1121,7 +1776,7 @@ function junit(report) {
     const failure = result.status === "passed" ? "" :
       `<failure message="${xmlEscape(result.errors.join("; "))}">${xmlEscape(JSON.stringify(result, null, 2))}</failure>`;
     const output = xmlEscape(JSON.stringify({ metrics: result.metrics, warnings: result.warnings }, null, 2));
-    return `  <testcase classname="playback.${xmlEscape(report.browser.browser)}" name="${xmlEscape(result.name)}" time="${(result.duration_ms / 1000).toFixed(3)}">${failure}<system-out>${output}</system-out></testcase>`;
+    return `  <testcase classname="playback.${xmlEscape(report.browser?.browser || "unknown")}" name="${xmlEscape(result.name)}" time="${(result.duration_ms / 1000).toFixed(3)}">${failure}<system-out>${output}</system-out></testcase>`;
   }).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="plurx playback ${xmlEscape(report.suite)}" tests="${report.results.length}" failures="${failures}" time="${totalSeconds.toFixed(3)}">\n${cases}\n</testsuite>\n`;
 }
@@ -1129,7 +1784,8 @@ function junit(report) {
 async function writeReport(report, options) {
   await fsp.mkdir(DEFAULT_REPORT_DIR, { recursive: true });
   const stamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
-  const stem = path.join(DEFAULT_REPORT_DIR, `${stamp}-${report.browser.browser.toLowerCase()}-${report.suite}`);
+  const label = (report.browser?.browser || "unknown").toLowerCase();
+  const stem = path.join(DEFAULT_REPORT_DIR, `${stamp}-${label}-${report.suite}`);
   const jsonPath = path.resolve(options.json || `${stem}.json`);
   const junitPath = path.resolve(options.junit || `${stem}.xml`);
   await fsp.mkdir(path.dirname(jsonPath), { recursive: true });
@@ -1148,31 +1804,62 @@ async function runSuite(manifest, options) {
   if (options.observe !== undefined && !(Number(options.observe) > 0)) {
     throw new Error("--observe must be a positive number of seconds");
   }
+  // Parsed before the corpus is built: a typo in the profile should cost a
+  // second, not the 195 MB fixture build and a server boot.
+  const profile = parseNetworkProfile(options.network_profile);
   const plan = printPlan(manifest, suite, options.case);
+  const shapedCases = plan.cases.filter((testCase) => testCase.operation === "shaped-cliff");
+  if ((shapedCases.length || manifest.suites[suite]?.requires_network_profile) && !profile) {
+    throw new Error(`suite ${suite} has shaped-cliff cases; pass --network-profile, e.g. 8mbps-to-1.5mbps`);
+  }
   process.stdout.write("\n");
-  const corpus = await buildFixtures(manifest, options);
+  const wanted = new Set(plan.cases.map((testCase) => testCase.fixture));
+  const corpus = await buildFixtures(manifest, options, wanted);
   process.stdout.write("\nSTART   isolated plurx server\n");
   const server = await startServer(options, corpus.directory);
-  const missing = manifest.fixtures.filter((fixture) => !server.files.has(fixture.filename));
+  const missing = manifest.fixtures
+    .filter((fixture) => wanted.has(fixture.id))
+    .filter((fixture) => !server.files.has(fixture.filename));
   if (missing.length) {
     await server.close(options.keep_runtime);
     throw new Error(`scan missed fixtures: ${missing.map((fixture) => fixture.filename).join(", ")}`);
   }
+  // The browser pulls through the shaper; this process keeps talking to the
+  // server directly, so the control plane never competes with the shaped
+  // budget and never distorts the throughput the report attributes to media.
+  let shaper = null;
+  let playerBaseUrl = server.baseUrl;
+  if (profile) {
+    try {
+      shaper = new ShapingProxy(profile, server.baseUrl);
+      playerBaseUrl = await shaper.start(options.shaper_binder);
+    } catch (error) {
+      if (shaper) await shaper.close().catch(() => {});
+      await server.close(options.keep_runtime);
+      throw error;
+    }
+    process.stdout.write(
+      `SHAPE   ${profile.spec}: ${profile.stages[0].kbps} kb/s, cliff to ` +
+      `${profile.stages[1].kbps} kb/s ${profile.cliff_after_seconds}s after the first frame\n`,
+    );
+  }
   let driver;
   if (browserName === "safari") {
-    driver = new SafariDriver(options, server.baseUrl, server.runtime);
+    driver = new SafariDriver(options, playerBaseUrl, server.runtime);
   } else if (browserName === "firefox") {
-    driver = new FirefoxDriver(options, server.baseUrl, server.runtime);
+    driver = new FirefoxDriver(options, playerBaseUrl, server.runtime);
   } else {
-    driver = new CdpDriver(options, server.baseUrl, server.runtime, browserName);
+    driver = new CdpDriver(options, playerBaseUrl, server.runtime, browserName);
   }
-  let browserInfo;
+  let browserInfo = null;
+  let system = null;
+  let fatal = null;
   const results = [];
   try {
     process.stdout.write(`START   ${browserName} player\n`);
     await driver.start();
     browserInfo = await prepareBrowser(driver, server.token);
-    const system = await api(server.baseUrl, "/system", { token: server.token });
+    system = await api(server.baseUrl, "/system", { token: server.token });
     process.stdout.write(`CAPS    ${browserInfo.browser}: video=${browserInfo.caps.vcodec} · audio=${browserInfo.caps.acodec} · hdr=${browserInfo.caps.hdr} · native_hls=${browserInfo.native_hls}\n\n`);
     for (let index = 0; index < plan.cases.length; index += 1) {
       const testCase = plan.cases[index];
@@ -1181,7 +1868,7 @@ async function runSuite(manifest, options) {
       const caseLogStart = Date.now();
       let result;
       try {
-        result = await runOneCase(driver, server, manifest, fixture, testCase, browserInfo, options.observe);
+        result = await runOneCase(driver, server, manifest, fixture, testCase, browserInfo, options.observe, shaper);
       } catch (error) {
         result = {
           name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
@@ -1213,42 +1900,99 @@ async function runSuite(manifest, options) {
         result.diagnostics = [];
       }
       results.push(result);
-      if (result.status === "passed") {
+      if (result.status === "passed" && result.operation === "shaped-cliff") {
+        const m = result.metrics;
+        process.stdout.write(
+          `PASS         cliff held · recovered in ${(m.recovered_after_ms / 1000).toFixed(1)}s · ` +
+          `${m.restarts} restarts · ${m.peak_upgrades_per_60s} upgrades/60s\n`,
+        );
+      } else if (result.status === "passed") {
         const m = result.metrics;
         process.stdout.write(`PASS         ${m.decision_method} -> ${m.actual_method}${m.copy_hls ? " / copy-HLS" : ""} · TTFF ${m.ttff_ms ?? "?"} ms · clock ${m.clock_rate.toFixed(3)}x · hitches ${m.hitches} · stalls ${m.stalls}\n`);
       } else {
-        process.stdout.write(`FAIL         ${result.errors.join("; ")}\n`);
-        for (const diagnostic of result.diagnostics.slice(-5)) {
+        process.stdout.write(`FAIL    ${result.outcome ? `[${result.outcome}] ` : ""}     ${result.errors.join("; ")}\n`);
+        for (const diagnostic of (result.diagnostics || []).slice(-5)) {
           process.stdout.write(`SERVER       ${diagnostic.level} ${diagnostic.target}: ${diagnostic.message}\n`);
         }
       }
     }
-    const passed = results.filter((result) => result.status === "passed").length;
-    const report = {
-      schema_version: 1,
-      generated_at: new Date().toISOString(),
-      suite,
-      browser: browserInfo,
-      server: {
-        base_url: server.baseUrl,
-        version: system.version,
-        build: system.build,
-        ffmpeg_version: system.ffmpeg_version,
-        encoder_selected: system.encoder_selected,
-        tone_map: system.tone_map,
-      },
-      corpus: corpus.metadata,
-      summary: { total: results.length, passed, failed: results.length - passed },
-      results,
-    };
-    const paths = await writeReport(report, options);
-    process.stdout.write(`\nRESULT  ${passed}/${results.length} passed\n`);
-    process.stdout.write(`JSON    ${paths.jsonPath}\n`);
-    process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
-    if (passed !== results.length) process.exitCode = 1;
+  } catch (error) {
+    // Keep the artifact. A run that dies mid-suite is exactly when the reader
+    // needs to know which layer died, and a missing file answers nothing.
+    fatal = error;
   } finally {
     await driver.close().catch(() => {});
+    if (shaper) await shaper.close().catch(() => {});
     await server.close(options.keep_runtime);
+  }
+  const passed = results.filter((result) => result.status === "passed").length;
+  const report = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    suite,
+    browser: browserInfo,
+    network_profile: profile,
+    shaping: shaper ? shaper.telemetry() : null,
+    server: {
+      base_url: server.baseUrl,
+      player_base_url: playerBaseUrl,
+      version: system?.version ?? null,
+      build: system?.build ?? null,
+      ffmpeg_version: system?.ffmpeg_version ?? null,
+      encoder_selected: system?.encoder_selected ?? null,
+      tone_map: system?.tone_map ?? null,
+    },
+    corpus: corpus.metadata,
+    outcome: fatal ? "harness" : results.find((result) => result.outcome && result.status !== "passed")?.outcome
+      || (passed === results.length ? "passed" : "browser_playback"),
+    fatal_error: fatal ? fatal.message : null,
+    summary: { total: results.length, passed, failed: results.length - passed },
+    results,
+  };
+  const paths = await writeReport(report, options);
+  process.stdout.write(`\nRESULT  ${passed}/${results.length} passed · outcome ${report.outcome}\n`);
+  process.stdout.write(`JSON    ${paths.jsonPath}\n`);
+  process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
+  if (fatal) throw fatal;
+  if (passed !== results.length) process.exitCode = 1;
+}
+
+/**
+ * Read a report back. Every rejection here is a real failure mode of an
+ * evidence artifact — absent, truncated, or something else entirely — and each
+ * one must be loud, because a silently-empty comparison would "pass".
+ */
+async function loadArtifact(file) {
+  if (!file || file === true) throw new Error("--json PATH is required");
+  const resolved = path.resolve(file);
+  let text;
+  try {
+    text = await fsp.readFile(resolved, "utf8");
+  } catch (error) {
+    throw new Error(`artifact ${resolved} could not be read: ${error.code || error.message}`);
+  }
+  let report;
+  try {
+    report = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`artifact ${resolved} is not valid JSON: ${error.message}`);
+  }
+  if (report === null || typeof report !== "object" || report.schema_version !== 1 || !Array.isArray(report.results)) {
+    throw new Error(`artifact ${resolved} is not a playback-lab report`);
+  }
+  return report;
+}
+
+async function normalizeCommand(options) {
+  const report = await loadArtifact(options.json);
+  const text = `${JSON.stringify(normalizeTrace(report), null, 2)}\n`;
+  if (options.out && options.out !== true) {
+    const target = path.resolve(options.out);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, text, "utf8");
+    process.stdout.write(`NORMAL  ${target}\n`);
+  } else {
+    process.stdout.write(text);
   }
 }
 
@@ -1258,6 +2002,7 @@ async function main() {
     usage();
     return;
   }
+  if (command === "normalize") return normalizeCommand(options);
   const manifest = loadManifest();
   if (command === "doctor") doctor(options);
   else if (command === "fixtures") await buildFixtures(manifest, options);
@@ -1266,7 +2011,28 @@ async function main() {
   else throw new Error(`unknown command ${command}`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`playback-lab: ${error.stack || error.message}\n`);
-  process.exitCode = 1;
-});
+// Required as a module by tests/playback/network-shaping.test.js, which drives
+// the shaping, scoring, and normalization logic without a browser.
+module.exports = {
+  NETWORK_PROFILES,
+  ShapingProxy,
+  TokenBucket,
+  expandCases,
+  fixturesForBuild,
+  isMediaPath,
+  loadArtifact,
+  loadManifest,
+  normalizeTrace,
+  parseNetworkProfile,
+  peakUpgradeRate,
+  rungHistory,
+  scoreRecovery,
+  timeToSustained,
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`playback-lab: ${error.stack || error.message}\n`);
+    process.exitCode = 1;
+  });
+}
