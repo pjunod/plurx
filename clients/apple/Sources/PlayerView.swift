@@ -8,6 +8,7 @@ import UIKit
 private enum PlayerControl: Hashable {
     case reveal
     case close
+    case retry
     case progress
     case marker
     case skipBack
@@ -817,6 +818,10 @@ struct PlayerView: View {
             }
         }
         #if os(tvOS)
+        .onChange(of: controller.failed) { _, failed in
+            guard failed else { return }
+            focusedControl = controller.canRetryPlaybackFailure ? .retry : .close
+        }
         .onChange(of: focusedControl) { _, _ in
             if controlsVisible { restartAutoHideTimer() }
         }
@@ -1061,7 +1066,7 @@ struct PlayerView: View {
 
     private var failureView: some View {
         VStack(spacing: 14) {
-            Text("Couldn't start playback.")
+            Text(controller.playbackFailureTitle)
                 .font(.system(.body, design: .monospaced))
                 .foregroundColor(.white)
             if let error = controller.playbackError {
@@ -1070,12 +1075,21 @@ struct PlayerView: View {
                     .foregroundColor(Palette.muted)
                     .multilineTextAlignment(.center)
             }
-            Button("Close") { finishPlayback() }
-                .buttonStyle(.borderedProminent)
-                .tint(Palette.accent)
-                #if os(tvOS)
-                .focused($focusedControl, equals: .close)
-                #endif
+            HStack(spacing: 12) {
+                if controller.canRetryPlaybackFailure {
+                    Button("Try Again") { controller.retryAfterPlaybackFailure() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Palette.accent)
+                        #if os(tvOS)
+                        .focused($focusedControl, equals: .retry)
+                        #endif
+                }
+                Button("Close") { finishPlayback() }
+                    .buttonStyle(.bordered)
+                    #if os(tvOS)
+                    .focused($focusedControl, equals: .close)
+                    #endif
+            }
         }
         .padding(30)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
