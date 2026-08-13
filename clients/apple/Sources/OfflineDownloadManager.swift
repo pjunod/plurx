@@ -2,6 +2,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import os
 import Security
 
 private actor OfflinePreparationRegistry {
@@ -16,6 +17,7 @@ private actor OfflinePreparationRegistry {
 /// AVFoundation transfer itself is system-owned once it starts.
 final class OfflineDownloadManager: NSObject, ObservableObject {
     static let shared = OfflineDownloadManager()
+    private static let logger = Logger(subsystem: "tv.plurx.app", category: "offline")
 
     @Published private(set) var items: [OfflineItem] = []
     @Published private(set) var otherProfiles: [OfflineProfileSummary] = []
@@ -515,9 +517,18 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }
 
     private func rememberLocation(_ location: URL, for task: AVAssetDownloadTask) {
-        guard let id = task.taskDescription,
-              let relative = OfflineCatalog.relativeLocalPath(for: location)
-        else { return }
+        guard let id = task.taskDescription else {
+            Self.logger.error(
+                "Discarding an offline download location because its task has no catalog identifier"
+            )
+            return
+        }
+        guard let relative = OfflineCatalog.relativeLocalPath(for: location) else {
+            Self.logger.error(
+                "Discarding an offline download location outside the app container for task \(task.taskIdentifier, privacy: .public)"
+            )
+            return
+        }
         var resourceValues = URLResourceValues()
         resourceValues.isExcludedFromBackup = true
         var protectedLocation = location

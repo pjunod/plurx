@@ -238,6 +238,82 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(stored?.state, .downloaded)
         XCTAssertEqual(stored?.bytesDownloaded, 10)
     }
+
+    func testCompletedOfflineDownloadAcceptsPrivateVarLocationAlias() async throws {
+        let containerId = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        let home = URL(
+            fileURLWithPath: "/var/mobile/Containers/Data/Application/\(containerId)",
+            isDirectory: true
+        )
+        let location = URL(
+            fileURLWithPath: "/private/var/mobile/Containers/Data/Application/\(containerId)/Library/com.apple.UserManagedAssets/movie.movpkg",
+            isDirectory: true
+        )
+        let relative = try XCTUnwrap(
+            OfflineCatalog.relativeLocalPath(for: location, homeDirectory: home)
+        )
+
+        XCTAssertEqual(relative, "Library/com.apple.UserManagedAssets/movie.movpkg")
+        XCTAssertEqual(
+            OfflineCatalog.localURL(for: relative, homeDirectory: home).path,
+            "/var/mobile/Containers/Data/Application/\(containerId)/Library/com.apple.UserManagedAssets/movie.movpkg"
+        )
+        XCTAssertNil(OfflineCatalog.relativeLocalPath(
+            for: URL(
+                fileURLWithPath: "/private/var/mobile/Containers/Data/Application/\(containerId)-other/Library/movie.movpkg"
+            ),
+            homeDirectory: home
+        ))
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-catalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let catalog = OfflineCatalog(directory: directory)
+        var item = OfflineItem(
+            id: "aliased-download",
+            requestId: "request",
+            serverInstanceId: "server",
+            userId: 7,
+            itemId: 11,
+            fileId: 13,
+            packageId: "package",
+            leaseToken: nil,
+            manifestURL: nil,
+            title: "Flight",
+            context: nil,
+            durationMs: 90_000,
+            posterFile: nil,
+            requestedHeight: 720,
+            actualHeight: 720,
+            audioLabel: nil,
+            subtitleLabel: nil,
+            subtitleIndex: nil,
+            state: .downloading,
+            phase: "downloading",
+            bytesDownloaded: 9,
+            bytesTotal: 10,
+            localAssetRelativePath: nil,
+            markers: [],
+            positionMs: 0,
+            recordedAt: nil,
+            pendingProgress: false,
+            errorMessage: nil,
+            updatedAt: Date()
+        )
+        try await catalog.upsert(item)
+        item.localAssetRelativePath = relative
+        item.state = .downloaded
+        item.phase = "downloaded"
+        item.bytesDownloaded = item.bytesTotal ?? item.bytesDownloaded
+        try await catalog.replace(item)
+
+        let snapshot = await catalog.item(id: item.id)
+        let stored = try XCTUnwrap(snapshot)
+        XCTAssertTrue(stored.isPlayable)
+        XCTAssertEqual(stored.localAssetRelativePath, relative)
+        XCTAssertEqual(stored.bytesDownloaded, 10)
+    }
+
     override func tearDown() {
         Session.shared.origin = ""
         Session.shared.token = nil
