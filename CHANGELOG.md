@@ -91,7 +91,10 @@ bump may break compatibility and a **patch** bump never does.
   recipe builder. SQLite v18 and replicated schema v5 now persist each offline
   package's exact effective `vbr` or `qvbr:<q>` snapshot at creation (existing
   SQLite rows default/backfill to `vbr`), so yield, restart, and a later global
-  setting change cannot alter its recipe identity. Replicated v5 is the fresh
+  setting change cannot alter its recipe identity. The first accepted
+  `request_id` owns that server-derived value, so a transport retry after a
+  policy flip returns the original package instead of conflicting. Replicated
+  v5 is the fresh
   bootstrap/import schema; existing v4 clusters remain refused rather than
   being auto-migrated without the clustering upgrade protocol. The replicated
   protocol remains v4, and N3's planned SQLite migration moves to v19.
@@ -114,7 +117,9 @@ bump may break compatibility and a **patch** bump never does.
   comparison, missing,
   non-finite, or zero speed fails explicitly rather than allowing a zero/zero
   comparison. Full VBR/QVBR runs
-  require maintenance-node exclusivity, exact model/subsample/window/poll/settle
+  require maintenance-node exclusivity with no producer/offline/other-delivery
+  activity and exactly one owned HLS session throughout capture, exact
+  model/subsample/window/poll/settle
   parameters, recorded measurement timing, probed/available SDR source facts,
   identical cross-mode ladder facts, settings acknowledgements, and a stable
   session encoder equal to the server-selected target. Restoration caps sleeps

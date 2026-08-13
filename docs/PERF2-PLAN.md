@@ -371,8 +371,8 @@ Jellyfin moved its QSV defaults the same direction in
 
 ### 4.1 Per-family quality modes
 
-One new arm in the `rate_control` closure (`encoder.rs:138-152`), keyed
-by a `RateMode` in `TranscodeOptions`:
+One new arm in `Encoder::encode_args` (`encoder.rs:215-306`), keyed by the
+effective rate control in `TranscodeOptions`:
 
 | Family | Quality mode | Flags (caps retained) |
 |---|---|---|
@@ -388,8 +388,9 @@ BANDWIDTH stays honest, and the client-facing contract does not move.
 
 ### 4.2 Guarded by boot validation, not hope
 
-`validation_args()` runs the production argument set (`encoder.rs:328`;
-pinned by the window-comparison test at `encoder.rs:797-828`), so every
+`validation_args()` runs the production argument set (`encoder.rs:485`;
+pinned by `the_quality_probe_encodes_with_the_production_quality_arguments` at
+`encoder.rs:1338-1352`), so every
 new flag is exercised against the real driver at boot. ICQ/QVBR
 availability genuinely varies by generation and driver (Intel's own
 tracker has holes — [media-driver #1597](https://github.com/intel/media-driver/issues/1597));
@@ -446,7 +447,10 @@ either requested setting is written.
   never from current settings. The ratified one-column representation is
   `vbr` or `qvbr:<q>` in SQLite v18 and replicated schema v5; the v18 default
   and backfill are `vbr`, so an upgrade cannot silently reinterpret an
-  in-progress package. This is an additive schema change, but downgrade still
+  in-progress package. The snapshot is server-derived and first-write-wins
+  under the client's `request_id`: a transport retry after a global policy
+  change returns the original package and value. This is an additive schema
+  change, but downgrade still
   requires restoring the matching pre-deploy database snapshot.
 - `EncoderCaps` gains per-family `quality_rc: bool` from validation.
 - Settings: `transcode.rate_mode` = `bitrate` (default) | `quality`;
@@ -480,7 +484,9 @@ the derived `bufsize / maxrate` window and the inferred 10-second
 diagnostics. The full-comparison contract also requires unique
 filenames, resolved reference paths, and pinned hashes across equal nonempty
 easy/hard SDR halves;
-full-corpus scope; maintenance-node exclusivity; exact model, subsample,
+full-corpus scope; maintenance-node exclusivity proven at each boundary by no
+producer/offline/other-delivery activity and exactly one owned capture session;
+exact model, subsample,
 window, poll, and settle parameters; recorded measurement timing; probed and
 available server video facts; stable StartResponse/status identity equal to the
 server-selected encoder; and identical advertised/derived ladder facts across

@@ -513,6 +513,10 @@ replicated v5 definition is for fresh bootstrap/import. N1 does not invent the
 cluster rolling-migration protocol: an existing replicated v4 cluster remains
 incompatible and must not be pointed at this binary.
 
+The effective value is server policy, not a client request option. The first
+accepted `request_id` owns it: retrying the identical create after a global
+rate-control change returns the original package and original snapshot.
+
 Deploy this schema-bearing N1 server change to the fleet as one coordinated
 maintenance operation through `scripts/ship`, which takes the documented
 pre-deploy SQLite backups. The migration is additive and does not rewrite or
@@ -527,11 +531,13 @@ second copy of its encoder arguments. Run `scripts/bench rate-control` on a
 controller that can reach nynuc. The harness opens real plurxd HLS sessions;
 the server's configured production Jellyfin FFmpeg and hardware encoder create
 every segment. It rejects cached VOD and copy sessions, and it refuses to start
-or mutate global settings when the immediately preceding `/system` response
-shows another transcode. Reserve nynuc as a maintenance node and stop playback
-for the whole run. The repeated checks catch a viewer visible at a boundary,
-but the GET and following POST/PUT are not atomic. Reserved-node exclusivity is
-the operational lock.
+or mutate global settings unless the immediately preceding `/system` and
+`/activity/detail` responses show no transcode, delivery, speculative producer,
+or offline work. During capture, every poll must show exactly the harness-owned
+HLS session as the sole session and delivery. Reserve nynuc as a maintenance
+node and stop playback for the whole run. The repeated checks catch competing
+work visible at a boundary, but the GET and following POST/PUT are not atomic.
+Reserved-node exclusivity is the operational lock.
 
 The controller saves each served segment under a generated local filename,
 ends the production session, and only then invokes the explicit

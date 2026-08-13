@@ -2419,6 +2419,16 @@ async fn offline_package_contract_runs_through_dyn_store() {
                 .expect("idempotent create"),
             OfflineCreateOutcome::Existing(_)
         ));
+        let mut changed_server_policy = first.clone();
+        changed_server_policy.effective_rate_control = "vbr".into();
+        let OfflineCreateOutcome::Existing(existing) = store
+            .create_offline_package(&changed_server_policy, 10, 100_000, 100_000)
+            .await
+            .expect("server-derived rate-control retry")
+        else {
+            panic!("backend {backend} broke idempotency after a server policy change");
+        };
+        assert_eq!(existing.effective_rate_control, "qvbr:21");
         let mut changed_expiry = first.clone();
         changed_expiry.expires_at += 1;
         let OfflineCreateOutcome::Existing(existing) = store

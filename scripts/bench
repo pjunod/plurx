@@ -647,6 +647,50 @@ def active_transcodes(api):
     return value
 
 
+def activity_detail(api):
+    value = api.call("/activity/detail")
+    if not isinstance(value, dict):
+        raise BenchError("server did not report valid activity detail")
+    for field in ("sessions", "deliveries", "offline"):
+        if not isinstance(value.get(field), list):
+            raise BenchError(f"server activity detail has no valid {field} list")
+    if value.get("producing") is not None and not isinstance(value["producing"], dict):
+        raise BenchError("server activity detail has an invalid producing value")
+    return value
+
+
+def require_activity_exclusive(api, action, owned_session_id=None):
+    detail = activity_detail(api)
+    sessions = detail["sessions"]
+    deliveries = detail["deliveries"]
+    offline = detail["offline"]
+    producing = detail.get("producing")
+
+    if owned_session_id is None:
+        clean = not sessions and not deliveries and not offline and producing is None
+    else:
+        session_ids = [
+            session.get("id") if isinstance(session, dict) else None
+            for session in sessions
+        ]
+        delivery_session_ids = [
+            delivery.get("session_id") if isinstance(delivery, dict) else None
+            for delivery in deliveries
+        ]
+        clean = (
+            session_ids == [owned_session_id]
+            and delivery_session_ids == [owned_session_id]
+            and not offline
+            and producing is None
+        )
+    if not clean:
+        raise BenchError(
+            f"maintenance-node exclusivity was lost during {action}: "
+            f"sessions={len(sessions)}, deliveries={len(deliveries)}, "
+            f"offline={len(offline)}, producing={'yes' if producing is not None else 'no'}"
+        )
+
+
 def require_server_idle(api, action):
     count = active_transcodes(api)
     if count != 0:
@@ -654,6 +698,17 @@ def require_server_idle(api, action):
             f"server has {count} active transcode(s) before {action}; "
             "maintenance-node exclusivity was lost"
         )
+    require_activity_exclusive(api, action)
+
+
+def require_owned_session_exclusive(api, action, session_id):
+    count = active_transcodes(api)
+    if count != 1:
+        raise BenchError(
+            f"server has {count} active transcode(s) during {action}; "
+            "the harness session is not the sole active transcode"
+        )
+    require_activity_exclusive(api, action, owned_session_id=session_id)
 
 
 def wait_for_server_idle(api, action, poll_seconds, timeout_seconds):
@@ -802,6 +857,11 @@ def capture_live_session(
         started = time.monotonic()
         deadline = started + timeout_seconds
         while media_seconds + 1e-6 < fixture["duration_seconds"]:
+            require_owned_session_exclusive(
+                api,
+                f"capturing {fixture['identity']}/{mode}",
+                session_id,
+            )
             if time.monotonic() >= deadline:
                 raise BenchError(
                     f"{fixture['identity']}/{mode} captured {media_seconds:.3f}s before timeout"
@@ -852,6 +912,11 @@ def capture_live_session(
                         f"{fixture['identity']}/{mode} status reported invalid recent_speed"
                     )
                 speed_samples.append(float(speed))
+            require_owned_session_exclusive(
+                api,
+                f"capturing {fixture['identity']}/{mode}",
+                session_id,
+            )
             if media_seconds + 1e-6 < fixture["duration_seconds"]:
                 sleep(poll_seconds)
 
@@ -953,6 +1018,7 @@ def restore_rate_settings(api, contract, poll_seconds, idle_timeout_seconds):
         poll_seconds,
         idle_timeout_seconds,
     )
+    require_activity_exclusive(api, "restoring original rate-control settings")
     body = {
         contract["rate_field"]: contract["original_rate"],
         contract["quality_field"]: contract["original_quality"],
@@ -1367,6 +1433,11 @@ def rate_control_report(args, api=None):
             "required_rate_window_seconds": RATE_CONTROL_ACCEPTANCE_RATE_WINDOW,
             "required_poll_seconds": RATE_CONTROL_ACCEPTANCE_POLL,
             "required_settings_settle_seconds": RATE_CONTROL_ACCEPTANCE_SETTINGS_SETTLE,
+            "maintenance_exclusivity_evidence": (
+                "activity/detail must show no producer, offline work, or delivery before "
+                "settings changes and session creation; every capture poll must show exactly "
+                "the harness-owned HLS session and delivery"
+            ),
         }
         if args.only:
             fixtures = [fixture for fixture in fixtures if fixture["identity"] == args.only]
@@ -1416,6 +1487,7 @@ def rate_control_report(args, api=None):
             raise BenchError(
                 "server has active transcodes; stop all playback before rate-control capture"
             )
+        require_activity_exclusive(api, "starting rate-control capture")
         resolve_fixture_file_ids(
             api,
             fixtures,
@@ -1759,8 +1831,8 @@ def main():
         "--modes",
         default="vbr",
         help=(
-            "vbr for the current-main smoke; vbr,qvbr only after N1 settings exist "
-            "and remains non-acceptance until the peak contract is ratified"
+            "vbr for a non-acceptance smoke; vbr,qvbr runs the ratified full N1 "
+            "quantitative gates when every required corpus and measurement input is present"
         ),
     )
     rc.add_argument(

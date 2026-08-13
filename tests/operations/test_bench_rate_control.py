@@ -19,6 +19,17 @@ G = BENCH["rate_control_report"].__globals__
 MISSING = object()
 
 
+def activity_state(*, session_ids=(), deliveries=None, offline=None, producing=None):
+    if deliveries is None:
+        deliveries = [{"session_id": session_id} for session_id in session_ids]
+    return {
+        "sessions": [{"id": session_id} for session_id in session_ids],
+        "deliveries": deliveries,
+        "offline": list(offline or []),
+        "producing": producing,
+    }
+
+
 def file_sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -83,6 +94,10 @@ class SessionApi:
         delete_error=False,
         stuck_after_delete=False,
         initially_active=0,
+        active_counts=None,
+        activity_before=None,
+        activity_during=None,
+        activity_sequence=None,
     ):
         self.vod = vod
         self.origin_ms = origin_ms
@@ -94,12 +109,27 @@ class SessionApi:
         self.delete_error = delete_error
         self.stuck_after_delete = stuck_after_delete
         self.active = initially_active
+        self.active_counts = list(active_counts or [])
+        self.activity_before = activity_before
+        self.activity_during = activity_during
+        self.activity_sequence = list(activity_sequence or [])
         self.deleted = False
         self.posted = False
 
     def call(self, path, method="GET", body=None):
         if path == "/system":
-            return {"active_transcodes": self.active}
+            active = self.active_counts.pop(0) if self.active_counts else self.active
+            return {"active_transcodes": active}
+        if path == "/activity/detail":
+            if self.activity_sequence:
+                return self.activity_sequence.pop(0)
+            configured = self.activity_during if self.posted else self.activity_before
+            if configured is not None:
+                return configured
+            if self.active == 0:
+                return activity_state()
+            session_id = "session-capability" if self.posted else "other-session"
+            return activity_state(session_ids=(session_id,))
         if method == "POST":
             self.posted = True
             self.active = 1
@@ -147,6 +177,8 @@ class FullApi:
         active_counts=None,
         default_active=0,
         selected_encoder="qsv-h264",
+        activity_details=None,
+        default_activity=None,
     ):
         self.references = references
         self.hdr = hdr
@@ -156,6 +188,8 @@ class FullApi:
         self.active_counts = list(active_counts or [])
         self.default_active = default_active
         self.selected_encoder = selected_encoder
+        self.activity_details = list(activity_details or [])
+        self.default_activity = default_activity or activity_state()
         self.settings = {
             "transcode_rate_mode": "bitrate",
             "transcode_quality": None,
@@ -177,6 +211,10 @@ class FullApi:
                 "encoder_selected": self.selected_encoder,
                 "active_transcodes": active,
             }
+        if path == "/activity/detail":
+            if self.activity_details:
+                return self.activity_details.pop(0)
+            return self.default_activity
         if path == "/libraries":
             return [{"id": 9}]
         if path == "/libraries/9/items":
@@ -640,6 +678,81 @@ class RateControlBenchCase(unittest.TestCase):
                     "qsv-h264",
                 )
         self.assertFalse(api.posted)
+
+    def test_capture_refuses_producer_offline_and_non_hls_delivery_before_creation(self):
+        cases = (
+            (activity_state(producing={"title": "producer"}), "producing=yes"),
+            (activity_state(offline=[{"id": "offline"}]), "offline=1"),
+            (
+                activity_state(deliveries=[{"session_id": None, "method": "direct"}]),
+                "deliveries=1",
+            ),
+        )
+        for activity, message in cases:
+            api = SessionApi(activity_before=activity)
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(BENCH["BenchError"], message):
+                    BENCH["capture_live_session"](
+                        api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                        "qsv-h264",
+                    )
+                self.assertFalse(api.posted)
+
+    def test_capture_refuses_second_session_that_joins_during_capture(self):
+        api = SessionApi(
+            active_counts=[0, 1, 2],
+            activity_sequence=[
+                activity_state(),
+                activity_state(session_ids=("session-capability",)),
+                activity_state(session_ids=("session-capability", "other-session")),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                BENCH["BenchError"], "not the sole active transcode"
+            ):
+                BENCH["capture_live_session"](
+                    api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
+                )
+        self.assertTrue(api.deleted)
+
+    def test_capture_refuses_producer_that_starts_during_capture(self):
+        api = SessionApi(
+            active_counts=[0, 1, 1],
+            activity_sequence=[
+                activity_state(),
+                activity_state(session_ids=("session-capability",)),
+                activity_state(
+                    session_ids=("session-capability",),
+                    producing={"title": "producer"},
+                ),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(BENCH["BenchError"], "producing=yes"):
+                BENCH["capture_live_session"](
+                    api, capture_fixture(), "vbr", Path(directory), 0.001, 1, 0.01,
+                    "qsv-h264",
+                )
+        self.assertTrue(api.deleted)
+
+    def test_full_preflight_refuses_background_work_before_settings_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, references = write_corpus(root)
+            server_manifest = write_server_manifest(root, references)
+            api = FullApi(
+                references,
+                default_activity=activity_state(producing={"title": "producer"}),
+            )
+            with mock.patch.dict(G, patched_harness()):
+                report = BENCH["rate_control_report"](
+                    harness_args(root, corpus, server_manifest), api=api
+                )
+            self.assertFalse(report["passed"])
+            self.assertIn("producing=yes", report["failures"][0]["detail"])
+            self.assertEqual(api.puts, [])
 
     def test_server_source_hdr_is_fail_closed_when_unknown_or_non_sdr(self):
         with tempfile.TemporaryDirectory() as directory:

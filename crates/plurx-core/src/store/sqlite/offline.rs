@@ -70,7 +70,6 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.source_path == requested.source_path
         && existing.source_size == requested.source_size
         && existing.source_mtime == requested.source_mtime
-        && existing.effective_rate_control == requested.effective_rate_control
         && existing.target_height == requested.target_height
         && existing.output_width == requested.output_width
         && existing.output_height == requested.output_height
@@ -745,12 +744,16 @@ mod tests {
 
         let mut changed = requested.clone();
         changed.effective_rate_control = "vbr".to_owned();
+        let OfflineCreateOutcome::Existing(existing) = store
+            .create_offline_package(&changed, 10, 1_000, 2_000)
+            .await
+            .expect("server-policy retry")
+        else {
+            panic!("a server-derived rate-control change broke request idempotency");
+        };
         assert_eq!(
-            store
-                .create_offline_package(&changed, 10, 1_000, 2_000)
-                .await
-                .expect("conflict"),
-            OfflineCreateOutcome::RequestConflict
+            existing.effective_rate_control, "qvbr:21",
+            "the first accepted request owns the immutable package snapshot"
         );
 
         let mut invalid = request("invalid");

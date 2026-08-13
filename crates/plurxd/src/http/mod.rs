@@ -2912,9 +2912,37 @@ mod tests {
         assert_eq!(first["state"], "queued");
         let package_id = first["id"].as_str().expect("package id").to_owned();
 
+        // Rate control is server policy, not part of the client's idempotent
+        // request. A lost create response retried after an administrator flips
+        // that policy must recover the original package and its first-write
+        // snapshot, never conflict or silently retarget it.
+        let (status_code, quality) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({
+                    "transcode_rate_mode": "quality",
+                    "transcode_quality": 22
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "{quality}");
+
         let (status_code, retry) = call(&app, create()).await;
         assert_eq!(status_code, StatusCode::ACCEPTED, "{retry}");
         assert_eq!(retry["id"], package_id);
+        assert_eq!(
+            state
+                .store
+                .offline_package_for_user(&package_id, 1)
+                .await
+                .expect("retry lookup")
+                .expect("original package")
+                .effective_rate_control,
+            "vbr"
+        );
 
         let (status_code, activity) =
             call(&app, get("/api/v1/activity/detail", Some(&admin))).await;

@@ -1068,7 +1068,6 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.source_path == requested.source_path
         && existing.source_size == requested.source_size
         && existing.source_mtime == requested.source_mtime
-        && existing.effective_rate_control == requested.effective_rate_control
         && existing.target_height == requested.target_height
         && existing.output_width == requested.output_width
         && existing.output_height == requested.output_height
