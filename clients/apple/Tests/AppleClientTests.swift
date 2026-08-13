@@ -3301,7 +3301,7 @@ final class AppleClientTests: XCTestCase {
         ), .findNext)
     }
 
-    func testUnknownDurationEndReopensUntilAnEndIsCorroborated() {
+    func testEarlyEndGetsOneReopenButCannotLoopAtTheSamePosition() {
         XCTAssertEqual(PlayerController.endAction(
             knownDurationMs: 0,
             itemDurationMs: nil,
@@ -3351,7 +3351,14 @@ final class AppleClientTests: XCTestCase {
             isGrowingPlaylist: true,
             endedAt: 120_000,
             previousUncorroboratedEndMs: 120_000
-        ), .reopen, "a genuinely growing playlist may publish more media")
+        ), .stop, "a replacement that ends at the same live edge cannot make progress")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 180_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .stop, "a repeated end before the catalog duration must not reopen forever")
         XCTAssertEqual(PlayerController.endAction(
             knownDurationMs: 0,
             itemDurationMs: nil,

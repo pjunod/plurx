@@ -2064,7 +2064,9 @@ pub struct Published {
     pub index: u64,
     pub segment: Segment,
     pub reason: CutReason,
-    /// `EXTINF`, from summed video sample durations in the video timescale.
+    /// `EXTINF`, normally from summed video sample durations in the video
+    /// timescale. The final segment uses its longest track when audio outlasts
+    /// the last video frame.
     pub seconds: f64,
 }
 
@@ -2122,22 +2124,22 @@ impl Segmenter {
     /// one AAC frame, and using them drifts the playlist against the media
     /// over a film.
     ///
-    /// The fallback exists for exactly one case: a source whose audio outlasts
-    /// its video. ffmpeg keeps muxing audio-only fragments past the last video
-    /// sample, and a run made only of those has zero video duration — which
-    /// would publish `#EXTINF:0.000000`, a segment the playlist claims takes
-    /// no time at all. There is no video timeline left to measure at that
-    /// point, so the longest track present is the honest answer.
-    fn pending_seconds(&self) -> f64 {
+    /// At end of stream the longest track is authoritative. ffmpeg may put the
+    /// last video frame and a much longer audio tail in the same fragment, so
+    /// falling back only when video duration is exactly zero truncates that
+    /// mixed final segment in the playlist. Ordinary cuts still use video: an
+    /// audio frame of per-fragment drift must not accumulate across the film.
+    fn pending_seconds(&self, reason: CutReason) -> f64 {
         let video_ticks: u64 = self
             .pending
             .iter()
             .map(|f| f.video_duration(&self.init))
             .sum();
-        if video_ticks > 0 {
-            return video_ticks as f64 / self.video_timescale as f64;
+        let video_seconds = video_ticks as f64 / self.video_timescale as f64;
+        if video_ticks > 0 && reason != CutReason::EndOfStream {
+            return video_seconds;
         }
-        let mut longest = 0.0f64;
+        let mut longest = video_seconds;
         for track in &self.init.tracks {
             let ticks: u64 = self
                 .pending
@@ -2194,7 +2196,7 @@ impl Segmenter {
 
     fn flush(&mut self, reason: CutReason) -> Result<Published, Fmp4Error> {
         let index = self.next_index;
-        let seconds = self.pending_seconds();
+        let seconds = self.pending_seconds(reason);
         let segment = merge(&self.pending, &self.init, index as u32 + 1)?;
         self.pending.clear();
         self.pending_bytes = 0;
@@ -2888,10 +2890,16 @@ mod tests {
             }
         }
 
-        // And the video timeline the playlist claims matches the media.
+        // And the playlist matches the complete video timeline plus only the
+        // final segment's legitimate trailing-media extension. Earlier
+        // segments stay pinned to video so per-fragment audio drift cannot
+        // accumulate across the film.
         let video = init.video().expect("video");
         let claimed: f64 = published.iter().map(|p| p.seconds).sum();
-        let actual = end.get(&video.id).copied().unwrap_or(0) as f64 / video.timescale as f64;
+        let actual_video = end.get(&video.id).copied().unwrap_or(0) as f64 / video.timescale as f64;
+        let final_segment = published.last().expect("a final segment");
+        let final_video = final_segment.segment.video_ticks as f64 / video.timescale.max(1) as f64;
+        let actual = actual_video + (final_segment.seconds - final_video).max(0.0);
         assert!(
             (claimed - actual).abs() < 1e-6,
             "EXTINF sums to {claimed}s against {actual}s of media"
@@ -3359,6 +3367,73 @@ mod tests {
             published.seconds > 0.1,
             "an audio-only tail published EXTINF {}",
             published.seconds
+        );
+    }
+
+    /// Dexter: New Blood S01E01 ends its video at 57:11 but carries audio to
+    /// 57:56. ffmpeg puts the last video frames and that 45-second audio tail
+    /// in one final fragment. Measuring the fragment from its non-zero video
+    /// duration published `EXTINF:0.333`, so AVPlayer ended and the client
+    /// reopened at 57:11 forever instead of consuming the audio tail.
+    #[test]
+    fn a_mixed_final_fragment_uses_its_trailing_audio_duration() {
+        let feed = pipe("open-gop");
+        let (init, frags, _) = read_all(&feed);
+        let video = init.video().expect("video");
+        let audio = init
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Audio)
+            .expect("audio");
+        let mut tail = frags[0].clone();
+
+        {
+            let audio_fragment = tail
+                .tracks
+                .iter_mut()
+                .find(|track| track.track_id == audio.id)
+                .expect("audio fragment");
+            let last_sample = audio_fragment
+                .runs
+                .iter_mut()
+                .flat_map(|run| run.samples.iter_mut())
+                .last()
+                .expect("audio sample");
+            last_sample.duration += 45 * audio.timescale;
+        }
+
+        let video_seconds = tail.video_duration(&init) as f64 / video.timescale.max(1) as f64;
+        let audio_seconds = tail
+            .track(audio.id)
+            .map(|track| track.duration() as f64 / audio.timescale.max(1) as f64)
+            .expect("audio duration");
+        assert!(
+            video_seconds > 0.0,
+            "the regression needs a last video frame"
+        );
+        assert!(
+            audio_seconds > video_seconds + 40.0,
+            "the regression needs the material audio tail"
+        );
+
+        let policy = CutPolicy::new(
+            u32::MAX / video.timescale.max(1),
+            u32::MAX / video.timescale.max(1),
+            usize::MAX,
+            u32::MAX,
+            video.timescale,
+        );
+        let mut seg = Segmenter::new(init, policy);
+        assert!(seg.push(tail).expect("push").is_none());
+        let published = seg.finish().expect("finish").expect("a final segment");
+
+        assert!(published.segment.video_ticks > 0);
+        assert_eq!(published.reason, CutReason::EndOfStream);
+        assert!(
+            (published.seconds - audio_seconds).abs() < 1e-6,
+            "EXTINF {} did not cover the {:.6}s audio tail",
+            published.seconds,
+            audio_seconds
         );
     }
 

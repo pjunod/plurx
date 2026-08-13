@@ -640,6 +640,7 @@ enum SubtitleSelectionRoute: Equatable {
 
 enum PlayerItemEndAction: Equatable {
     case reopen
+    case stop
     case finish(durationMs: Int)
 }
 
@@ -665,6 +666,8 @@ final class PlayerController: ObservableObject {
     /// sessions inside that contract while leaving direct and completed-VOD
     /// items under AVPlayer's normal policy.
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
+    static let repeatedEarlyEndMessage =
+        "Playback ended early at the same position after retrying the stream."
 
     static func configureBuffering(_ item: AVPlayerItem, growingHLS: Bool) {
         item.preferredForwardBufferDuration = growingHLS
@@ -673,9 +676,11 @@ final class PlayerController: ObservableObject {
     }
 
     /// AVPlayer can announce the temporary end of a growing playlist. A
-    /// server duration proves where the title ends; a finite item duration is
-    /// a safe fallback for direct/offline files whose catalog row was never
-    /// probed. With neither, reopening is safer than ejecting the viewer.
+    /// server duration proves where the title should end; a finite item
+    /// duration is a safe fallback for direct/offline files whose catalog row
+    /// was never probed. One early end may reopen, but the replacement ending
+    /// at the same clock position is terminal: reopening it again cannot make
+    /// progress and otherwise creates an unbounded session loop.
     nonisolated static func endAction(
         knownDurationMs: Int,
         itemDurationMs: Int?,
@@ -688,14 +693,17 @@ final class PlayerController: ObservableObject {
             : isGrowingPlaylist
                 ? nil
                 : itemDurationMs.flatMap { $0 > 0 ? $0 : nil }
+        let repeatedAtSamePosition = previousUncorroboratedEndMs
+            .map { abs(endedAt - $0) < 250 }
+            ?? false
         guard let durationMs = corroboratedDuration else {
-            guard !isGrowingPlaylist,
-                  let previousUncorroboratedEndMs,
-                  abs(endedAt - previousUncorroboratedEndMs) < 250
-            else { return .reopen }
-            return .finish(durationMs: max(endedAt, previousUncorroboratedEndMs))
+            guard repeatedAtSamePosition else { return .reopen }
+            if isGrowingPlaylist { return .stop }
+            return .finish(durationMs: max(endedAt, previousUncorroboratedEndMs ?? 0))
         }
-        guard endedAt >= durationMs - 15_000 else { return .reopen }
+        guard endedAt >= durationMs - 15_000 else {
+            return repeatedAtSamePosition ? .stop : .reopen
+        }
         return .finish(durationMs: durationMs)
     }
 
@@ -761,9 +769,10 @@ final class PlayerController: ObservableObject {
     private var ttffMeasurement = ApplePlaybackTTFFState()
     private var ttffReason = "cold-start"
     private var stallObservation = PlaybackStallObservationState()
-    /// A completed/VOD item with no usable catalog or AVPlayer duration gets
-    /// one reopen. A second end at the same position finishes instead of
-    /// creating an unbounded session loop. Growing playlists never set this.
+    /// An item that ends before its expected boundary gets one reopen. A
+    /// second end at the same position finishes an otherwise uncorroborated
+    /// local item, or stops a growing/known-duration stream visibly, instead
+    /// of creating an unbounded session loop.
     private var lastUncorroboratedEndMs: Int?
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
@@ -2210,10 +2219,17 @@ final class PlayerController: ObservableObject {
                     // The viewer did not pause — the playlist merely announced
                     // its current end — and `wantsPlayback` still says so, so
                     // this continuation keeps playing.
-                    if !isGrowingPlaylist, self.knownDurationMs <= 0, itemDurationMs == nil {
-                        self.lastUncorroboratedEndMs = endedAt
-                    }
+                    self.lastUncorroboratedEndMs = endedAt
                     await self.reopen(at: endedAt)
+                    return
+                case .stop:
+                    self.lastUncorroboratedEndMs = nil
+                    self.player.pause()
+                    self.isPlaying = false
+                    self.wantsPlayback = false
+                    self.failed = true
+                    self.playbackError = Self.repeatedEarlyEndMessage
+                    self.updateNowPlaying()
                     return
                 case .finish(let durationMs):
                     self.lastUncorroboratedEndMs = nil
