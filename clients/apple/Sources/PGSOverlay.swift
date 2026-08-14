@@ -44,7 +44,6 @@ struct PGSOverlayManifest: Codable, Equatable, Sendable {
         var imageDimensions: [String: (width: Int, height: Int)] = [:]
         for cue in cues {
             guard !cue.id.isEmpty,
-                  cue.startMs >= previousEnd,
                   cue.endMs > cue.startMs,
                   cue.endMs <= durationMs,
                   (1...PGSOverlayPolicy.maximumCanvasWidth).contains(cue.canvasWidth),
