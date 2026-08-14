@@ -5065,6 +5065,70 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    private func pgsOverlayManifest(cues: [PGSOverlayCue]) -> PGSOverlayManifest {
+        PGSOverlayManifest(
+            schema: 1,
+            generation: String(repeating: "a", count: 64),
+            fileId: 42,
+            trackIndex: 3,
+            kind: "pgs",
+            timebase: "source_ms",
+            durationMs: 10_000,
+            cues: cues
+        )
+    }
+
+    private func pgsOverlayCue(id: String, startMs: Int, endMs: Int) -> PGSOverlayCue {
+        PGSOverlayCue(
+            id: id,
+            startMs: startMs,
+            endMs: endMs,
+            canvasWidth: 1_920,
+            canvasHeight: 1_080,
+            objects: []
+        )
+    }
+
+    private func assertPGSOverlayManifestIsInvalid(
+        _ manifest: PGSOverlayManifest,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try manifest.validated(fileId: 42, trackIndex: 3),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(error as? PGSOverlayError, .invalidManifest, file: file, line: line)
+        }
+    }
+
+    func testPGSOverlayManifestRejectsOverlappingAndDuplicateCueStarts() {
+        let first = pgsOverlayCue(id: "c1", startMs: 1_000, endMs: 3_000)
+
+        for secondStartMs in [2_000, 1_000] {
+            assertPGSOverlayManifestIsInvalid(pgsOverlayManifest(cues: [
+                first,
+                pgsOverlayCue(id: "c2", startMs: secondStartMs, endMs: 4_000),
+            ]))
+        }
+    }
+
+    func testPGSOverlayManifestRejectsZeroLengthCue() {
+        assertPGSOverlayManifestIsInvalid(pgsOverlayManifest(cues: [
+            pgsOverlayCue(id: "c1", startMs: 1_000, endMs: 1_000),
+        ]))
+    }
+
+    func testPGSOverlayManifestAcceptsExactlyAdjacentCues() {
+        let manifest = pgsOverlayManifest(cues: [
+            pgsOverlayCue(id: "c1", startMs: 1_000, endMs: 2_000),
+            pgsOverlayCue(id: "c2", startMs: 2_000, endMs: 3_000),
+        ])
+
+        XCTAssertNoThrow(try manifest.validated(fileId: 42, trackIndex: 3))
+    }
+
     func testPGSOverlayManifestDecodesAndRejectsIdentityOrTraversalDrift() throws {
         let generation = String(repeating: "a", count: 64)
         let json = Data(#"""
