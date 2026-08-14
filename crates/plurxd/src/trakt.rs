@@ -1097,6 +1097,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_device_link_remains_visible_as_an_error() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Json;
+
+        let (store, user) = store_with_creds().await;
+        let app = axum::Router::new()
+            .route(
+                "/oauth/device/code",
+                post(|| async {
+                    Json(json!({
+                        "device_code": "denied-code",
+                        "user_code": "NOPE",
+                        "verification_url": "https://trakt.tv/activate",
+                        "expires_in": 60,
+                        "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/oauth/device/token",
+                post(|| async { StatusCode::IM_A_TEAPOT }),
+            );
+        let base = serve(app).await;
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+
+        mgr.link_start(user).await.expect("device link");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mgr
+                    .status(user)
+                    .await
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.error.as_deref())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("denial projected into pending status");
+
+        let status = mgr.status(user).await;
+        assert_eq!(
+            status.pending.and_then(|pending| pending.error),
+            Some("the code was denied on trakt.tv".into())
+        );
+        assert!(store
+            .get_trakt_auth(user)
+            .await
+            .expect("read auth")
+            .is_none());
+        assert!(mgr.activity().await.is_none());
+    }
+
+    #[tokio::test]
     async fn sync_user_pulls_a_remote_watch_into_the_store() {
         let (store, user) = store_with_creds().await;
         store
