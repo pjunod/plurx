@@ -1872,12 +1872,20 @@ final class PlayerController: ObservableObject {
     /// Custom application layers are not carried by Apple's system PiP or
     /// external playback surfaces. Refuse that output while PGS is selected;
     /// never replace the current HDR/Dolby Vision bytes with a hidden burn.
+    nonisolated static func pictureInPictureUnavailableNotice(
+        pgsOverlayIsActive: Bool
+    ) -> String? {
+        pgsOverlayIsActive ? pgsOverlayExternalPlaybackNotice : nil
+    }
+
     func allowsPictureInPictureCommand() -> Bool {
-        guard !pgsOverlayIsActive else {
-            showPlaybackNotice(Self.pgsOverlayExternalPlaybackNotice)
-            return false
+        guard let notice = Self.pictureInPictureUnavailableNotice(
+            pgsOverlayIsActive: pgsOverlayIsActive
+        ) else {
+            return true
         }
-        return true
+        showPlaybackNotice(notice)
+        return false
     }
 
     private func updatePGSOverlaySelection(_ index: Int?) {
@@ -2766,7 +2774,7 @@ final class PlayerController: ObservableObject {
 
     static let hdrSubtitleNotice =
         "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
-    static let pgsOverlayExternalPlaybackNotice =
+    nonisolated static let pgsOverlayExternalPlaybackNotice =
         "PGS overlays stay in the app and are not available in Picture in Picture, AirPlay, or external playback. HDR playback was kept unchanged."
 
     static func isHDRDelivery(_ deliveredRange: String?) -> Bool {

@@ -12,10 +12,15 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `58` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `59` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 58 labels a recognized `pgs-v1` subtitle as an
+> same regression suite. Build 59 keeps the iOS Picture in Picture control
+> reachable when AVKit cannot start yet or an in-app PGS overlay blocks system
+> output, bounds the not-ready explanation to five seconds, and rejects stale
+> availability from a detached PiP controller instead of sending a start
+> command through a nil optional. Build 58 labels a
+> recognized `pgs-v1` subtitle as an
 > Overlay instead of the legacy Burn-in fallback, so the physical HDR/Dolby
 > Vision run in
 > [APPLE-PGS-OVERLAY-ACCEPTANCE.md](../../docs/APPLE-PGS-OVERLAY-ACCEPTANCE.md)

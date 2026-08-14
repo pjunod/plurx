@@ -8,6 +8,12 @@ enum PictureInPictureCommand: Equatable {
     case unavailable
 }
 
+struct PictureInPictureControlState: Equatable {
+    let isButtonEnabled: Bool
+    let command: PictureInPictureCommand
+    let messageOnTap: String?
+}
+
 /// Owns the system Picture in Picture controller while PlayerView continues to
 /// own the transport controls. Using the existing AVPlayerLayer avoids
 /// reintroducing AVPlayerViewController's LIVE treatment for growing HLS
@@ -28,10 +34,56 @@ final class PictureInPictureController: NSObject, ObservableObject,
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
     private var activeObservation: NSKeyValueObservation?
+    private var unavailableMessageTask: Task<Void, Never>?
 
     nonisolated static func command(isActive: Bool, isPossible: Bool) -> PictureInPictureCommand {
         if isActive { return .stop }
         return isPossible ? .start : .unavailable
+    }
+
+    /// The rendered control must remain reachable whenever this device supports
+    /// PiP. Availability is an outcome of a tap, not permission to disable the
+    /// only path that can explain why AVKit cannot start yet. Requiring the
+    /// backing controller here also turns a stale published `isPossible` value
+    /// after surface teardown into a visible unavailable result instead of a
+    /// start message sent through a nil optional.
+    nonisolated static func controlState(
+        isSupported: Bool,
+        isActive: Bool,
+        isPossible: Bool,
+        hasAttachedController: Bool
+    ) -> PictureInPictureControlState {
+        guard isSupported else {
+            return PictureInPictureControlState(
+                isButtonEnabled: false,
+                command: .unavailable,
+                messageOnTap: nil
+            )
+        }
+        guard hasAttachedController else {
+            return PictureInPictureControlState(
+                isButtonEnabled: true,
+                command: .unavailable,
+                messageOnTap: "Picture in Picture isn't ready yet."
+            )
+        }
+        let command = command(isActive: isActive, isPossible: isPossible)
+        return PictureInPictureControlState(
+            isButtonEnabled: true,
+            command: command,
+            messageOnTap: command == .unavailable
+                ? "Picture in Picture isn't ready yet."
+                : nil
+        )
+    }
+
+    var controlState: PictureInPictureControlState {
+        Self.controlState(
+            isSupported: isSupported,
+            isActive: isActive,
+            isPossible: isPossible,
+            hasAttachedController: controller != nil
+        )
     }
 
     func attach(to playerLayer: AVPlayerLayer) {
@@ -53,28 +105,75 @@ final class PictureInPictureController: NSObject, ObservableObject,
         possibleObservation = controller.observe(\.isPictureInPicturePossible,
                                                  options: [.initial, .new]) { [weak self] controller, _ in
             Task { @MainActor in
-                self?.isPossible = controller.isPictureInPicturePossible
+                guard let self, self.controller === controller else { return }
+                self.isPossible = controller.isPictureInPicturePossible
+                if self.isPossible { self.clearErrorMessage() }
             }
         }
         activeObservation = controller.observe(\.isPictureInPictureActive,
                                                options: [.initial, .new]) { [weak self] controller, _ in
             Task { @MainActor in
-                self?.isActive = controller.isPictureInPictureActive
+                guard let self, self.controller === controller else { return }
+                self.isActive = controller.isPictureInPictureActive
             }
         }
         #endif
     }
 
     func toggle() {
-        errorMessage = nil
-        switch Self.command(isActive: isActive, isPossible: isPossible) {
+        clearErrorMessage()
+        let state = controlState
+        switch state.command {
         case .start:
-            controller?.startPictureInPicture()
+            guard let controller else {
+                showUnavailableMessage("Picture in Picture isn't ready yet.")
+                return
+            }
+            controller.startPictureInPicture()
         case .stop:
-            controller?.stopPictureInPicture()
+            guard let controller else {
+                showUnavailableMessage("Picture in Picture isn't ready yet.")
+                return
+            }
+            controller.stopPictureInPicture()
         case .unavailable:
-            errorMessage = "Picture in Picture isn't ready yet."
+            showUnavailableMessage(state.messageOnTap)
         }
+    }
+
+    /// A tap while AVKit is not ready is useful feedback, not a playback
+    /// failure. Give it the same bounded lifetime as the other nonfatal player
+    /// notices so one retry cannot pin the banner and iOS system chrome.
+    func showUnavailableMessage(_ message: String?, duration: Duration = .seconds(5)) {
+        unavailableMessageTask?.cancel()
+        unavailableMessageTask = nil
+        errorMessage = message
+        guard let message else { return }
+
+        unavailableMessageTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            guard let self, self.errorMessage == message else { return }
+            self.errorMessage = nil
+            self.unavailableMessageTask = nil
+        }
+    }
+
+    /// AVKit's failure callback describes an attempted start, so unlike a
+    /// not-yet-ready tap it remains until the player state changes.
+    func showPersistentErrorMessage(_ message: String) {
+        unavailableMessageTask?.cancel()
+        unavailableMessageTask = nil
+        errorMessage = message
+    }
+
+    private func clearErrorMessage() {
+        unavailableMessageTask?.cancel()
+        unavailableMessageTask = nil
+        errorMessage = nil
     }
 
     private func stop() {
@@ -100,7 +199,7 @@ final class PictureInPictureController: NSObject, ObservableObject,
         _ pictureInPictureController: AVPictureInPictureController
     ) {
         isActive = true
-        errorMessage = nil
+        clearErrorMessage()
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(
@@ -114,7 +213,9 @@ final class PictureInPictureController: NSObject, ObservableObject,
         failedToStartPictureInPictureWithError error: Error
     ) {
         isActive = false
-        errorMessage = "Picture in Picture couldn't start: \(error.localizedDescription)"
+        showPersistentErrorMessage(
+            "Picture in Picture couldn't start: \(error.localizedDescription)"
+        )
     }
 
     func pictureInPictureController(
