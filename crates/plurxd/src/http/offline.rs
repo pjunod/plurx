@@ -1383,7 +1383,10 @@ mod tests {
         let (code, body) = create_response(&fixture, fixture.file.id, bitmap_subtitle).await;
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["code"], "invalid_track");
-        assert!(body["message"].as_str().unwrap().contains("one-tap"));
+        assert_eq!(
+            body["message"],
+            "This subtitle format cannot be included in a one-tap download yet."
+        );
     }
 
     #[tokio::test]
