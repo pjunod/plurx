@@ -580,7 +580,6 @@ struct MediaRow: View {
                 }
             }
             .padding(.vertical, 10)
-            .tvNavigationFocusSection()
         }
     }
 
