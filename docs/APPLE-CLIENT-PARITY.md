@@ -14,9 +14,10 @@ Vision investigation are recorded in
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
 > landed. Build 59 keeps every supported-but-unavailable iOS PiP state tappable
 > long enough to explain it, including a detached AVKit controller and the in-
-> app-only PGS overlay; actual PiP start and return remain unverified on physical
-> iPhone and iPad hardware. Build 58 distinguishes a recognized `pgs-v1` Overlay
-> from the
+> app-only PGS overlay. The not-ready explanation clears after five seconds so
+> it cannot pin the player banner or iOS system chrome; actual PiP start and
+> return remain unverified on physical iPhone and iPad hardware. Build 58
+> distinguishes a recognized `pgs-v1` Overlay from the
 > Burn-in fallback in the subtitle menu and ships the decidable physical-iPad
 > run in
 > [APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md).
@@ -88,7 +89,7 @@ Vision investigation are recorded in
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
-| PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP control on the AVPlayer surface; source coverage proves unavailable AVKit and in-app-only PGS states remain tappable and explain themselves instead of becoming inert. While a PGS application overlay is active, PiP and external playback are refused with a visible explanation because those outputs do not carry the sibling overlay layer, and the app never substitutes an SDR burn. No physical iPhone/iPad PiP start or return is claimed. | Physically verify PiP start/return on iPhone and iPad, and confirm the documented PGS refusal on iPad Pro; add a dedicated AirPlay affordance and remote-device session tests for non-overlay playback |
+| PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP control on the AVPlayer surface; source coverage proves unavailable AVKit and in-app-only PGS states remain tappable and explain themselves instead of becoming inert. The not-ready explanation clears after five seconds instead of pinning the player banner or iOS system chrome; an AVKit start failure remains visible. While a PGS application overlay is active, PiP and external playback are refused with a visible explanation because those outputs do not carry the sibling overlay layer, and the app never substitutes an SDR burn. No physical iPhone/iPad PiP start or return is claimed. | Physically verify PiP start/return on iPhone and iPad, and confirm the documented PGS refusal on iPad Pro; add a dedicated AirPlay affordance and remote-device session tests for non-overlay playback |
 | Offline/downloads | Missing | App-managed HLS packages on iPhone/iPad; durable background transfer, local-only playback, progress merge, quota/activity UI; `/private/var` and `/var` spellings of the same app container persist as one relaunch-safe asset path, and rejected locations leave a local diagnostic without exposing the path; hidden on tvOS | Physical background/process-death, airplane-mode, selected-subtitle, midpoint-seek, and removal-reconciliation matrix |
 | Accessibility | Browser semantics and keyboard controls | SwiftUI labels and tvOS focus basics | P2: VoiceOver, Dynamic Type, Reduce Motion, contrast, and focus audit |
 

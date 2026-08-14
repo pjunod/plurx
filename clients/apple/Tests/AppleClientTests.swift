@@ -2836,6 +2836,32 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testPictureInPictureUnavailableMessageExpiresWithoutClearingARealFailure() async {
+        let pictureInPicture = PictureInPictureController()
+
+        pictureInPicture.showUnavailableMessage(
+            "Picture in Picture isn't ready yet.",
+            duration: .milliseconds(10)
+        )
+        XCTAssertEqual(
+            pictureInPicture.errorMessage,
+            "Picture in Picture isn't ready yet."
+        )
+
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(pictureInPicture.errorMessage)
+
+        pictureInPicture.showUnavailableMessage(
+            "Picture in Picture isn't ready yet.",
+            duration: .milliseconds(10)
+        )
+        pictureInPicture.showPersistentErrorMessage("AVKit failed to start PiP")
+
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(pictureInPicture.errorMessage, "AVKit failed to start PiP")
+    }
+
     func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
         XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
             isTearingDown: false,

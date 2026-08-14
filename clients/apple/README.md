@@ -17,8 +17,9 @@ only what this hardware genuinely can't play.
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
 > same regression suite. Build 59 keeps the iOS Picture in Picture control
 > reachable when AVKit cannot start yet or an in-app PGS overlay blocks system
-> output, and rejects stale availability from a detached PiP controller instead
-> of sending a start command through a nil optional. Build 58 labels a
+> output, bounds the not-ready explanation to five seconds, and rejects stale
+> availability from a detached PiP controller instead of sending a start
+> command through a nil optional. Build 58 labels a
 > recognized `pgs-v1` subtitle as an
 > Overlay instead of the legacy Burn-in fallback, so the physical HDR/Dolby
 > Vision run in
