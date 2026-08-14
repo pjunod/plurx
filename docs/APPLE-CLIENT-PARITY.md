@@ -300,8 +300,12 @@ sections: the header actions and the non-empty child shelf below them. Pressing
 Down from Play or the watch action therefore enters a show's seasons shelf, and
 does the same from a season header into its episodes shelf. Pressing Up returns
 to the header even when the viewer moved horizontally before leaving the shelf.
-An empty `detail.children` still renders no shelf and claims no focus
-destination, because focus routing must not hide an API or scan problem.
+The same section wrapper covers every populated horizontal browse rail,
+including Home's Coming Soon row, and the playable-detail hero above child
+folders; neighboring vertical bands therefore do not reintroduce the asymmetric
+focus boundary elsewhere. An empty `detail.children` still renders no shelf
+because `MediaRow`'s pre-existing non-empty guard omits it; focus routing must
+not hide an API or scan problem.
 
 ### 5. What the dynamic-range badge is allowed to claim
 

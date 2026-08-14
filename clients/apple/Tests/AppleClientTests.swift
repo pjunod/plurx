@@ -4231,26 +4231,36 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeaders() {
-        XCTAssertTrue(
-            TVMediaRowFocusPolicy.createsDirectionalSection(
-                for: DetailView.seriesChildStyle(for: "show"),
-                itemCount: 2
-            ),
-            "a show header must be able to move down into its seasons shelf"
+        let systemSectionType = String(
+            reflecting: type(of: TVNavigationFocusSection(content: EmptyView()).body)
         )
         XCTAssertTrue(
-            TVMediaRowFocusPolicy.createsDirectionalSection(
-                for: DetailView.seriesChildStyle(for: "season"),
-                itemCount: 8
-            ),
-            "a season header must be able to move down into its episodes shelf"
+            systemSectionType.contains("_FocusSectionModifier"),
+            "the shared focus wrapper must apply SwiftUI's system focus section"
         )
-        XCTAssertFalse(
-            TVMediaRowFocusPolicy.createsDirectionalSection(
-                for: .poster,
-                itemCount: 0
-            ),
-            "an absent shelf must not claim to provide a focus destination"
+
+        let mediaRowType = String(
+            reflecting: type(of: MediaRow(title: "Seasons", items: []).body)
+        )
+        XCTAssertTrue(
+            mediaRowType.contains("TVNavigationFocusSection"),
+            "show and season MediaRow shelves must retain the directional focus wrapper"
+        )
+
+        let comingSoonType = String(
+            reflecting: type(of: ComingSoonRow(entries: []).body)
+        )
+        XCTAssertTrue(
+            comingSoonType.contains("TVNavigationFocusSection"),
+            "Coming Soon must not become the unsectioned shelf below a sectioned Home row"
+        )
+
+        let detailType = String(reflecting: type(of: DetailView(itemId: 1).body))
+        let focusWrapperCount = detailType.components(separatedBy: "TVNavigationFocusSection").count - 1
+        XCTAssertGreaterThanOrEqual(
+            focusWrapperCount,
+            2,
+            "both the series header and the playable-detail hero must remain focus sections"
         )
     }
 

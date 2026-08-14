@@ -16,37 +16,26 @@ enum MediaRowStyle: Equatable {
     case episode
 }
 
-/// A non-empty shelf is a directional focus destination on tvOS, regardless
-/// of its card shape. The matching header is already a focus section; the row
-/// needs the same treatment so focus can cross that boundary in both
-/// directions instead of stopping on the header actions.
-enum TVMediaRowFocusPolicy {
-    static func createsDirectionalSection(
-        for style: MediaRowStyle,
-        itemCount: Int
-    ) -> Bool {
-        guard itemCount > 0 else { return false }
-        switch style {
-        case .poster, .landscape, .episode:
-            return true
-        }
+/// Keeps the system focus modifier in one inspectable view type. Shelves and
+/// detail headers use this wrapper directly, so XCTest can distinguish their
+/// production wiring from an unsectioned view hierarchy.
+struct TVNavigationFocusSection<Content: View>: View {
+    let content: Content
+
+    @ViewBuilder var body: some View {
+        #if os(tvOS)
+        content.focusSection()
+        #else
+        content
+        #endif
     }
 }
 
-private extension View {
-    /// On tvOS, the row's full visual frame guides directional focus to its
-    /// nearest card. Other platforms keep their ordinary touch layout.
-    @ViewBuilder
-    func tvNavigationFocusSection(enabled: Bool) -> some View {
-        #if os(tvOS)
-        if enabled {
-            self.focusSection()
-        } else {
-            self
-        }
-        #else
-        self
-        #endif
+extension View {
+    /// On tvOS, the full visual band guides directional focus to its nearest
+    /// control. Other platforms keep their ordinary touch layout.
+    func tvNavigationFocusSection() -> TVNavigationFocusSection<Self> {
+        TVNavigationFocusSection(content: self)
     }
 }
 
@@ -591,12 +580,7 @@ struct MediaRow: View {
                 }
             }
             .padding(.vertical, 10)
-            .tvNavigationFocusSection(
-                enabled: TVMediaRowFocusPolicy.createsDirectionalSection(
-                    for: style,
-                    itemCount: items.count
-                )
-            )
+            .tvNavigationFocusSection()
         }
     }
 
@@ -713,6 +697,7 @@ struct ComingSoonRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection()
         }
     }
 
