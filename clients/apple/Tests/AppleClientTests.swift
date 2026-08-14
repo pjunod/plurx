@@ -4230,6 +4230,30 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeaders() {
+        XCTAssertTrue(
+            TVMediaRowFocusPolicy.createsDirectionalSection(
+                for: DetailView.seriesChildStyle(for: "show"),
+                itemCount: 2
+            ),
+            "a show header must be able to move down into its seasons shelf"
+        )
+        XCTAssertTrue(
+            TVMediaRowFocusPolicy.createsDirectionalSection(
+                for: DetailView.seriesChildStyle(for: "season"),
+                itemCount: 8
+            ),
+            "a season header must be able to move down into its episodes shelf"
+        )
+        XCTAssertFalse(
+            TVMediaRowFocusPolicy.createsDirectionalSection(
+                for: .poster,
+                itemCount: 0
+            ),
+            "an absent shelf must not claim to provide a focus destination"
+        )
+    }
+
     func testTVPlayableDetailUsesOneCinematicViewportAndUsefulMetadata() throws {
         XCTAssertLessThanOrEqual(
             TVPlayableDetailMetrics.heroHeight,

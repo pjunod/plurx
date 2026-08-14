@@ -291,6 +291,16 @@ cannot aim at. The season header's Play action and each card both reach the
 same `PlayContext` player cover; this is browse routing, not a second playback
 policy.
 
+### Show and season shelves remain reachable from the header
+
+tvOS treats both halves of the show hierarchy boundary as directional focus
+sections: the header actions and the non-empty child shelf below them. Pressing
+Down from Play or the watch action therefore enters a show's seasons shelf, and
+does the same from a season header into its episodes shelf. Pressing Up returns
+to the header even when the viewer moved horizontally before leaving the shelf.
+An empty `detail.children` still renders no shelf and claims no focus
+destination, because focus routing must not hide an API or scan problem.
+
 ### 5. What the dynamic-range badge is allowed to claim
 
 The player's HDR/DV chip used to be built from the source probe alone, which

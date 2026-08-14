@@ -16,6 +16,40 @@ enum MediaRowStyle: Equatable {
     case episode
 }
 
+/// A non-empty shelf is a directional focus destination on tvOS, regardless
+/// of its card shape. The matching header is already a focus section; the row
+/// needs the same treatment so focus can cross that boundary in both
+/// directions instead of stopping on the header actions.
+enum TVMediaRowFocusPolicy {
+    static func createsDirectionalSection(
+        for style: MediaRowStyle,
+        itemCount: Int
+    ) -> Bool {
+        guard itemCount > 0 else { return false }
+        switch style {
+        case .poster, .landscape, .episode:
+            return true
+        }
+    }
+}
+
+private extension View {
+    /// On tvOS, the row's full visual frame guides directional focus to its
+    /// nearest card. Other platforms keep their ordinary touch layout.
+    @ViewBuilder
+    func tvNavigationFocusSection(enabled: Bool) -> some View {
+        #if os(tvOS)
+        if enabled {
+            self.focusSection()
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
+    }
+}
+
 enum LandscapeCardCopyStyle: Equatable {
     case plain
     case accentPanel
@@ -557,6 +591,12 @@ struct MediaRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection(
+                enabled: TVMediaRowFocusPolicy.createsDirectionalSection(
+                    for: style,
+                    itemCount: items.count
+                )
+            )
         }
     }
 
