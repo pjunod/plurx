@@ -573,5 +573,19 @@ mod tests {
             .await
             .expect("v2 prior");
         assert_eq!(prior.sustained_kbps, Some(5_000));
+        assert_eq!(
+            sidecar
+                .prior(7, "safari".to_owned(), "192.0.2.0/24".to_owned())
+                .await
+                .expect("read migrated prior"),
+            Some(prior)
+        );
+        assert_eq!(
+            sidecar
+                .prune_priors(21, 1)
+                .await
+                .expect("prune migrated prior"),
+            1
+        );
     }
 }
