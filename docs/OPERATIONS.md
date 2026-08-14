@@ -430,7 +430,7 @@ they live in that voter's own SQLite sidecar and never pass through Raft.
 it is the API:
 
 ```
-curl -X PUT http://server:8080/api/v1/settings \
+curl -X PUT http://<server>:32400/api/v1/settings \
   -H 'Authorization: Bearer <admin token>' \
   -H 'Content-Type: application/json' \
   -d '{"playback_network_priors": true}'
