@@ -9,10 +9,14 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-14): source is v0.2.7, Apple build 57. Native text
+> Status (2026-08-14): source is v0.2.7, Apple build 58. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 57 requires Select to engage tvOS progress scrubbing, leaving
+> landed. Build 58 distinguishes a recognized `pgs-v1` Overlay from the
+> Burn-in fallback in the subtitle menu and ships the decidable physical-iPad
+> run in
+> [APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md).
+> Build 57 requires Select to engage tvOS progress scrubbing, leaving
 > left/right free to cross the transport row without a seek. Build 56 restores
 > bidirectional tvOS focus between show/season header actions and their non-empty
 > child shelves. Build 53 gives season episode artwork a direct Play action
@@ -39,7 +43,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 57 has not reached
+> resolved status. Repository evidence still says build 58 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -72,15 +76,15 @@ Vision investigation are recorded in
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; on tvOS the progress bar is an ordinary focus stop until Select engages scrubbing, so left/right cross between the transport and option groups without seeking, engaged left/right step by ±10 seconds, and Select/Menu leave scrubbing. Up reaches a visible skip marker above the bar and is deliberately inert when none is present. Hidden controls retain the separate four-direction remote seek path. A seek inside the growing playlist's advertised window moves the item's own clock instantly (`seekRoute`, mapped through `media_origin_ms`, held 1.5 s off the live edge), while out-of-window targets reopen the session at the film position after a 350 ms coalescing pause so a press burst costs one create; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped, and the predecessor item's supersession 404s no longer advance the recovery ladder mid-change. In a full-screen iOS window, the status bar and Home indicator stay while any player overlay is visible and retire after the last one leaves; windowed iPad status bars remain system-owned. | Device-verify in-window scrubs land without a spinner, out-of-window scrubs recover cleanly, iPad full-screen/Split View chrome, iPhone portrait/landscape, PiP return, engage-to-scrub feel and hammered tvOS step-seeks during a quality change on a physical Siri Remote, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Physically verify native selection and the gated PGS overlay across iPhone/iPad and Apple TV |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, styled ASS/SSA, and unrecognized overlay versions retain burn-in/refusal; the menu labels Overlay and Burn-in separately; automatic selection never starts a burn except a forced track (see §2) | Run [the physical acceptance procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) on iPad Pro, then complete the separate iPhone and Apple TV rows |
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
-| Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery; recovery actions, shorter self-recovered AVPlayer stalls, and a one-shot TTFF measurement reach the bounded server client log | Add frame presentation rate and build stamp; validate TTFF ingest and sub-threshold stall cadence on physical iPad |
+| Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery, and selected-subtitle route/state (`PGS overlay · preparing`, ready overlay, unavailable, native WebVTT, or burned in); recovery actions, shorter self-recovered AVPlayer stalls, and a one-shot TTFF measurement reach the bounded server client log | Add frame presentation rate and build stamp; validate TTFF ingest and sub-threshold stall cadence on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
-| PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP controls on the AVPlayer surface | Add AirPlay affordances and remote-device session tests |
+| PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP controls on the AVPlayer surface; while a PGS application overlay is active, PiP and external playback are refused with a visible explanation because those outputs do not carry the sibling overlay layer, and the app never substitutes an SDR burn | Physically confirm the documented refusal on iPad Pro; add a dedicated AirPlay affordance and remote-device session tests for non-overlay playback |
 | Offline/downloads | Missing | App-managed HLS packages on iPhone/iPad; durable background transfer, local-only playback, progress merge, quota/activity UI; `/private/var` and `/var` spellings of the same app container persist as one relaunch-safe asset path, and rejected locations leave a local diagnostic without exposing the path; hidden on tvOS | Physical background/process-death, airplane-mode, selected-subtitle, midpoint-seek, and removal-reconciliation matrix |
 | Accessibility | Browser semantics and keyboard controls | SwiftUI labels and tvOS focus basics | P2: VoiceOver, Dynamic Type, Reduce Motion, contrast, and focus audit |
 
@@ -100,9 +104,12 @@ modes, not merely one compatible MP4:
    restart, no new session, no quality change, no video encoder — and the cues
    stay with the picture across a seek and a resume. The one restart is the
    first native selection on a file that was direct-playing, which enters a
-   session once (§2); every selection after it is in place. A PGS track still
-   reopens at the same film position and burns at source height, and turning
-   subtitles off restores the original delivery plan.
+   session once (§2); every selection after it is in place. A PGS track carrying
+   recognized `overlay: "pgs-v1"` stays on the existing video item and draws
+   positioned images without an encoder; without that capability it retains the
+   legacy SDR burn or HDR refusal. Use
+   [the iPad Pro procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) to prove which path
+   ran and whether HDR/Dolby Vision stayed unchanged.
 5. Episode ending: next episode begins; season rollover begins the first episode
    of the next season; a finale stays stopped.
 
@@ -118,10 +125,13 @@ text track does not replace the player item, change quality, add an FFmpeg
 subtitle filter, or encode video. Resume and seek offsets are reflected in the
 rendition segment timeline.
 
-PGS, VobSub, MP4 `mov_text`, and styled ASS/SSA still reopen at the same film
-position and burn at source height. This is intentional: those formats cannot be
-represented as ordinary WebVTT without losing pixels, timing, or important
-styling, and the server refuses to publish them as renditions.
+PGS with recognized `overlay: "pgs-v1"` instead uses the staged application
+overlay and never reopens or re-encodes video. PGS without that advertised
+capability, VobSub, MP4 `mov_text`, and styled ASS/SSA retain the legacy reopen
+and source-height burn on SDR; the client refuses that burn while HDR/Dolby
+Vision is already being delivered. Those formats cannot be represented as
+ordinary WebVTT without losing pixels, timing, or important styling, and the
+server correctly refuses to publish them as text renditions.
 
 Merely *containing* native text tracks no longer costs a file its direct play.
 Until 2026-08-02 it did: any playable file with a text track opened through a
@@ -200,11 +210,13 @@ against a server that does not send the field — one property,
 `SubtitleTrack.isNativeHLS`, read by every site that asks "can this be a
 rendition?": the master ordinal (`nativeSubtitleOrdinal`), the burn test
 (`subtitleRequiresBurn`), the automatic-selection policy, the session guard
-above, and the "Burn-in" label in the player menu.
+above, and the player-menu route label (`Overlay` for recognized `pgs-v1`,
+`Burn-in` for the fallback).
 
-**Nothing about Apple playback changes today**, and that is worth stating
-plainly rather than claiming a fix that did not happen. The client's hardcoded
-list and `is_native_text_subtitle` name the same four codecs, so the shape that
+**That native-classification change did not alter Apple playback**, and that is
+worth stating plainly rather than claiming a fix that did not happen. The
+client's hardcoded list and `is_native_text_subtitle` name the same four codecs,
+so the shape that
 motivated this — a 2160p WEB-DL MP4 with 23 `mov_text` streams, every one of
 them `text` and none of them in the HLS master — was already routed to burn-in
 by iOS/tvOS and already labelled "Burn-in" in the menu. The client that listed
@@ -217,6 +229,34 @@ convert `mov_text`, or the list is corrected, Apple follows without a client
 release, and a track the server declines to publish can never shift the ordinal
 a viewer's pick resolves to. That is the same reason this client executes
 `delivery` rather than re-deriving policy from `method`.
+
+#### The staged PGS overlay reports its actual path
+
+Build 58 corrects the one remaining contradictory diagnostic. The playback-
+info panel already separated `PGS overlay · preparing`, ready overlay,
+unavailable overlay, native WebVTT, and burned-in subtitles, while its Method
+and Dynamic range rows independently showed whether video stayed direct/remuxed
+and HDR/Dolby Vision. The subtitle menu still appended `Burn-in` to every
+non-WebVTT track, including a recognized `pgs-v1` overlay. It now appends
+`Overlay` for that one protocol and keeps `Burn-in` for missing or unknown
+overlay capabilities.
+
+The output-mode limitation is deliberate. The custom `AVSynchronizedLayer` is
+part of the in-app player and is not carried by Apple's system PiP or external-
+playback video surfaces. With PGS active, the app blocks PiP and disables
+external playback. If AirPlay is already active, selecting PGS is refused. Each
+case shows the same explanation and leaves the existing HDR/Dolby Vision video
+unchanged; neither silently starts a burn.
+
+[APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md) names build
+58, the operator-owned server gate/restart and TestFlight upload, the exact PGS
+codec check, the diagnostic strings, 100/150 ms timing bounds, item-replacement
+trigger or explicit `Not run`, and Yes/No PiP/AirPlay observations. A direct-
+play title with one audio track cannot satisfy the replacement row merely by
+seeking: the operator must choose another qualifying title with a second audio
+track, because without the visible stream-change spinner no item replacement
+was observed and the iPad slice remains incomplete. Until that physical matrix
+is recorded, the client remains staged behind the server's default-off gate.
 
 #### What automatic subtitle selection is allowed to do
 
@@ -346,6 +386,9 @@ source-only by design — there is no session there to report a downgrade agains
 An Apple build is ready for broader TestFlight use when:
 
 - both platform schemes build and their shared tests pass;
+- the staged PGS path has the physical evidence required by
+  [APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md), or remains
+  explicitly default-off and unclaimed;
 - the five real-hardware playback cases above pass on iPhone and Apple TV;
 - a denied local-network permission produces an actionable screen and never a
   misleading “wrong password” message;

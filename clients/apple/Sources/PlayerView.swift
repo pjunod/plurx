@@ -2039,7 +2039,7 @@ struct PlayerView: View {
                 revealControls()
             } label: {
                 Label(
-                    subtitleLabel(track),
+                    Self.subtitleLabel(track),
                     systemImage: controller.selectedSubtitle == track.index
                         ? "checkmark"
                         : "captions.bubble"
@@ -2083,21 +2083,25 @@ struct PlayerView: View {
     }
 
     private func audioLabel(_ track: AudioTrack) -> String {
-        [track.title, languageName(track.language), track.codec.uppercased(),
+        [track.title, Self.languageName(track.language), track.codec.uppercased(),
          track.channels.map { "\($0) ch" }]
             .compactMap { $0 }
             .joined(separator: "  ")
     }
 
-    private func subtitleLabel(_ track: SubtitleTrack) -> String {
+    static func subtitleLabel(_ track: SubtitleTrack) -> String {
         var parts = [track.title, languageName(track.language), track.codec.uppercased()]
             .compactMap { $0 }
         if track.forced { parts.append("Forced") }
-        if !track.isNativeHLS { parts.append("Burn-in") }
+        if track.isPGSOverlay {
+            parts.append("Overlay")
+        } else if !track.isNativeHLS {
+            parts.append("Burn-in")
+        }
         return parts.joined(separator: "  ")
     }
 
-    private func languageName(_ code: String?) -> String? {
+    private static func languageName(_ code: String?) -> String? {
         guard let code else { return nil }
         let names = [
             "eng": "English", "en": "English", "jpn": "Japanese", "ja": "Japanese",
