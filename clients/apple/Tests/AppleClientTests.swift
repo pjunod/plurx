@@ -4230,6 +4230,40 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeaders() {
+        let systemSectionType = String(
+            reflecting: type(of: TVNavigationFocusSection(content: EmptyView()).body)
+        )
+        XCTAssertTrue(
+            systemSectionType.contains("_FocusSectionModifier"),
+            "the shared focus wrapper must apply SwiftUI's system focus section"
+        )
+
+        let mediaRowType = String(
+            reflecting: type(of: MediaRow(title: "Seasons", items: []).body)
+        )
+        XCTAssertTrue(
+            mediaRowType.contains("TVNavigationFocusSection"),
+            "show and season MediaRow shelves must retain the directional focus wrapper"
+        )
+
+        let comingSoonType = String(
+            reflecting: type(of: ComingSoonRow(entries: []).body)
+        )
+        XCTAssertTrue(
+            comingSoonType.contains("TVNavigationFocusSection"),
+            "Coming Soon must not become the unsectioned shelf below a sectioned Home row"
+        )
+
+        let detailType = String(reflecting: type(of: DetailView(itemId: 1).body))
+        let focusWrapperCount = detailType.components(separatedBy: "TVNavigationFocusSection").count - 1
+        XCTAssertGreaterThanOrEqual(
+            focusWrapperCount,
+            2,
+            "both the series header and the playable-detail hero must remain focus sections"
+        )
+    }
+
     func testTVPlayableDetailUsesOneCinematicViewportAndUsefulMetadata() throws {
         XCTAssertLessThanOrEqual(
             TVPlayableDetailMetrics.heroHeight,

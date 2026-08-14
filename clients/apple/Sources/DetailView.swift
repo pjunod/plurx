@@ -1213,6 +1213,7 @@ struct DetailView: View {
             .frame(height: TVPlayableDetailMetrics.heroHeight)
             .clipped()
             .containerRelativeFrame(.vertical, alignment: .center)
+            .tvNavigationFocusSection()
 
             audiobookContents(detail)
 
@@ -1404,7 +1405,7 @@ struct DetailView: View {
             // Treat the full-width header as a focus target. Without this, the
             // focus engine cannot find the narrower action buttons when moving
             // up from episodes at the far-right end of the horizontal shelf.
-            .focusSection()
+            .tvNavigationFocusSection()
 
             if !children.isEmpty {
                 MediaRow(

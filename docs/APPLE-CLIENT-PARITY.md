@@ -9,12 +9,14 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-13): source is v0.2.7, Apple build 53. Native text
+> Status (2026-08-14): source is v0.2.7, Apple build 56. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 53 gives season episode artwork a direct Play action while the
-> copy remains Details on iPhone/iPad; tvOS keeps one lifted card whose Select
-> action plays. Build 52 preserves completed offline asset locations across the
+> landed. Build 56 restores bidirectional tvOS focus between show/season header
+> actions and their non-empty child shelves. Build 53 gives season episode
+> artwork a direct Play action while the copy remains Details on iPhone/iPad;
+> tvOS keeps one lifted card whose Select action plays. Build 52 preserves
+> completed offline asset locations across the
 > equivalent `/private/var` and `/var` container spellings returned by the
 > system. Build 51 divides long final audio tails into bounded HLS segments,
 > completes repeated boundaries in the final 5% at their actual media position,
@@ -35,7 +37,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 53 has not reached
+> resolved status. Repository evidence still says build 56 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -290,6 +292,20 @@ for the primary couch action instead of exposing two actions the Siri Remote
 cannot aim at. The season header's Play action and each card both reach the
 same `PlayContext` player cover; this is browse routing, not a second playback
 policy.
+
+### Show and season shelves remain reachable from the header
+
+tvOS treats both halves of the show hierarchy boundary as directional focus
+sections: the header actions and the non-empty child shelf below them. Pressing
+Down from Play or the watch action therefore enters a show's seasons shelf, and
+does the same from a season header into its episodes shelf. Pressing Up returns
+to the header even when the viewer moved horizontally before leaving the shelf.
+The same section wrapper covers every populated horizontal browse rail,
+including Home's Coming Soon row, and the playable-detail hero above child
+folders; neighboring vertical bands therefore do not reintroduce the asymmetric
+focus boundary elsewhere. An empty `detail.children` still renders no shelf
+because `MediaRow`'s pre-existing non-empty guard omits it; focus routing must
+not hide an API or scan problem.
 
 ### 5. What the dynamic-range badge is allowed to claim
 

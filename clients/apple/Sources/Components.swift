@@ -16,6 +16,29 @@ enum MediaRowStyle: Equatable {
     case episode
 }
 
+/// Keeps the system focus modifier in one inspectable view type. Shelves and
+/// detail headers use this wrapper directly, so XCTest can distinguish their
+/// production wiring from an unsectioned view hierarchy.
+struct TVNavigationFocusSection<Content: View>: View {
+    let content: Content
+
+    @ViewBuilder var body: some View {
+        #if os(tvOS)
+        content.focusSection()
+        #else
+        content
+        #endif
+    }
+}
+
+extension View {
+    /// On tvOS, the full visual band guides directional focus to its nearest
+    /// control. Other platforms keep their ordinary touch layout.
+    func tvNavigationFocusSection() -> TVNavigationFocusSection<Self> {
+        TVNavigationFocusSection(content: self)
+    }
+}
+
 enum LandscapeCardCopyStyle: Equatable {
     case plain
     case accentPanel
@@ -557,6 +580,7 @@ struct MediaRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection()
         }
     }
 
@@ -673,6 +697,7 @@ struct ComingSoonRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection()
         }
     }
 
