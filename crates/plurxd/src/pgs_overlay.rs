@@ -1057,15 +1057,24 @@ mod tests {
         }
     }
 
-    async fn write_empty_manifest(
+    async fn publish_empty_manifest(
+        root: &Path,
         final_dir: &Path,
         file: &MediaFile,
         index: i64,
         generation: &str,
     ) -> Result<(), OverlayError> {
-        tokio::fs::create_dir_all(final_dir.join("objects"))
+        tokio::fs::create_dir_all(root)
             .await
-            .map_err(|error| OverlayError::Internal(error.to_string()))?;
+            .map_err(|error| OverlayError::Internal(format!("creating test cache: {error}")))?;
+        let stage = root.join(format!(".tmp-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&stage)
+            .await
+            .map_err(|error| OverlayError::Internal(format!("creating test stage: {error}")))?;
+        let mut staging = StagingDir::new(stage);
+        tokio::fs::create_dir(staging.path().join("objects"))
+            .await
+            .map_err(|error| OverlayError::Internal(format!("creating test objects: {error}")))?;
         let manifest = OverlayManifest {
             schema: SCHEMA,
             generation: generation.to_owned(),
@@ -1077,12 +1086,27 @@ mod tests {
             cues: vec![],
         };
         tokio::fs::write(
-            final_dir.join("manifest.json"),
+            staging.path().join("manifest.json"),
             serde_json::to_vec(&manifest)
                 .map_err(|error| OverlayError::Internal(error.to_string()))?,
         )
         .await
-        .map_err(|error| OverlayError::Internal(error.to_string()))
+        .map_err(|error| OverlayError::Internal(format!("writing test manifest: {error}")))?;
+        validate_generation(
+            staging.path(),
+            file,
+            index,
+            generation,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await?;
+        tokio::fs::rename(staging.path(), final_dir)
+            .await
+            .map_err(|error| {
+                OverlayError::Internal(format!("publishing test generation: {error}"))
+            })?;
+        staging.disarm();
+        Ok(())
     }
 
     #[test]
@@ -1153,13 +1177,13 @@ mod tests {
         let runner: PrepareRunner = {
             let runs = Arc::clone(&runs);
             let release = Arc::clone(&release);
-            Arc::new(move |_, final_dir, file, index, generation| {
+            Arc::new(move |root, final_dir, file, index, generation| {
                 let runs = Arc::clone(&runs);
                 let release = Arc::clone(&release);
                 Box::pin(async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     let _permit = release.acquire().await.expect("release");
-                    write_empty_manifest(&final_dir, &file, index, &generation).await
+                    publish_empty_manifest(&root, &final_dir, &file, index, &generation).await
                 })
             })
         };
@@ -1221,14 +1245,35 @@ mod tests {
         tokio::fs::write(final_dir.join("manifest.json"), b"")
             .await
             .expect("torn manifest");
+        let rejection = validate_generation(
+            &final_dir,
+            &file,
+            0,
+            &generation(&file, 0),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("the empty manifest must be rejected");
+        assert!(
+            matches!(
+                &rejection,
+                OverlayError::Internal(why)
+                    if why.starts_with("validating PGS manifest: EOF while parsing a value")
+            ),
+            "unexpected torn-generation rejection: {rejection}"
+        );
         let runs = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         let runner: PrepareRunner = {
             let runs = Arc::clone(&runs);
-            Arc::new(move |_, final_dir, file, index, generation| {
+            let release = Arc::clone(&release);
+            Arc::new(move |root, final_dir, file, index, generation| {
                 let runs = Arc::clone(&runs);
+                let release = Arc::clone(&release);
                 Box::pin(async move {
                     runs.fetch_add(1, Ordering::SeqCst);
-                    write_empty_manifest(&final_dir, &file, index, &generation).await
+                    let _permit = release.acquire().await.expect("release");
+                    publish_empty_manifest(&root, &final_dir, &file, index, &generation).await
                 })
             })
         };
@@ -1245,6 +1290,34 @@ mod tests {
             .await,
             Ok(PrepareState::Preparing)
         ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("repair started");
+        assert!(
+            tokio::fs::metadata(&final_dir).await.is_err(),
+            "reader-side validation must remove the torn generation"
+        );
+        for _ in 0..64 {
+            assert!(matches!(
+                prepare_with(
+                    dir.path(),
+                    &file,
+                    0,
+                    Arc::clone(&runner),
+                    PREPARE_TIMEOUT,
+                    false,
+                )
+                .await,
+                Ok(PrepareState::Preparing)
+            ));
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if matches!(
