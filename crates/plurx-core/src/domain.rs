@@ -801,6 +801,35 @@ pub struct PlaybackEventQuery {
     pub limit: i64,
 }
 
+/// Node-local playback history for one coarse client/network tuple.
+///
+/// The fingerprint is deliberately opaque outside the storage boundary. It is
+/// derived from a coarse client class and an IPv4 /24, never a full address,
+/// and must not be returned by an API or written to application logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPrior {
+    pub user_id: i64,
+    pub client_class: String,
+    pub network_fingerprint: String,
+    /// Conservative sustained throughput estimate, in decimal kilobits/s.
+    pub sustained_kbps: Option<u32>,
+    /// Lowest ladder height at which a supply/network stall was observed.
+    pub worst_rung_height: Option<i64>,
+    pub sample_count: u32,
+    pub updated_at_ms: i64,
+}
+
+/// One telemetry-derived update to a [`NetworkPrior`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPriorObservation {
+    pub user_id: i64,
+    pub client_class: String,
+    pub network_fingerprint: String,
+    pub throughput_kbps: Option<u32>,
+    pub starved_rung_height: Option<i64>,
+    pub observed_at_ms: i64,
+}
+
 /// A user's linked Trakt account (tokens + sync bookkeeping).
 #[derive(Debug, Clone)]
 pub struct TraktAuth {

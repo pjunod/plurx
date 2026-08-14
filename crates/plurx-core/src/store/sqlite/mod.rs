@@ -29,7 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
-use crate::store::telemetry::PLAYBACK_EVENTS_SCHEMA;
+use crate::store::telemetry::{NETWORK_PRIORS_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -548,6 +548,10 @@ const MIGRATIONS: &[&str] = &[
                    AND CAST(substr(effective_rate_control, 6) AS INTEGER) BETWEEN 0 AND 255
                    AND printf('%d', CAST(substr(effective_rate_control, 6) AS INTEGER)) =
                        substr(effective_rate_control, 6)));",
+    // v19: opt-in, bounded, node-local network priors. No foreign keys on
+    // purpose: the hiqlite backend carries this exact table in its per-voter
+    // telemetry sidecar rather than replicating observations through Raft.
+    NETWORK_PRIORS_SCHEMA,
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1371,7 +1375,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1426,7 +1430,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            18
+            19
         );
         assert!(conn
             .execute(
@@ -1444,6 +1448,67 @@ mod tests {
                 "constraint accepted {invalid}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn v19_adds_node_local_network_priors_without_touching_v18_rows() {
+        use crate::domain::NetworkPriorObservation;
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(18) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 18)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('migration.proof', 'survives')",
+                [],
+            )
+            .expect("seed v18 row");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v18 to v19");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives")
+        );
+        let prior = store
+            .observe_network_prior(&NetworkPriorObservation {
+                user_id: 1,
+                client_class: "chrome".to_owned(),
+                network_fingerprint: "192.0.2.0/24".to_owned(),
+                throughput_kbps: Some(6_000),
+                observed_at_ms: 1_700_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write v19 prior");
+        assert_eq!(prior.sustained_kbps, Some(6_000));
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            19
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'network_priors_by_updated'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index lookup");
+        assert_eq!(index, 1);
     }
 
     /// v13 adds a column to `items`, which is the migration shape with a

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
 use super::SqliteStore;
-use crate::domain::{PlaybackEvent, PlaybackEventQuery};
+use crate::domain::{NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery};
 use crate::error::StoreError;
-use crate::store::PlaybackTelemetryStore;
+use crate::store::{NetworkPriorStore, PlaybackTelemetryStore};
 
 #[async_trait]
 impl PlaybackTelemetryStore for SqliteStore {
@@ -24,6 +24,37 @@ impl PlaybackTelemetryStore for SqliteStore {
     ) -> Result<Vec<PlaybackEvent>, StoreError> {
         let query = query.clone();
         self.with_read(move |conn| crate::store::telemetry::query(conn, &query))
+            .await
+    }
+}
+
+#[async_trait]
+impl NetworkPriorStore for SqliteStore {
+    async fn observe_network_prior(
+        &self,
+        observation: &NetworkPriorObservation,
+    ) -> Result<NetworkPrior, StoreError> {
+        let observation = observation.clone();
+        self.with_conn(move |conn| crate::store::telemetry::observe_prior(conn, &observation))
+            .await
+    }
+
+    async fn network_prior(
+        &self,
+        user_id: i64,
+        client_class: &str,
+        network_fingerprint: &str,
+    ) -> Result<Option<NetworkPrior>, StoreError> {
+        let client_class = client_class.to_owned();
+        let network_fingerprint = network_fingerprint.to_owned();
+        self.with_read(move |conn| {
+            crate::store::telemetry::get_prior(conn, user_id, &client_class, &network_fingerprint)
+        })
+        .await
+    }
+
+    async fn prune_network_priors(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError> {
+        self.with_conn(move |conn| crate::store::telemetry::prune_priors(conn, before_ms, limit))
             .await
     }
 }

@@ -18,8 +18,12 @@ use sha2::{Digest, Sha256};
 
 use super::replicated::ReplicatedSql;
 use super::telemetry::NodeLocalTelemetry;
-use super::{keys, ApiKeyStore, PlaybackTelemetryStore, SettingsStore, UserStore};
-use crate::domain::{ApiKey, PlaybackEvent, PlaybackEventQuery, User};
+use super::{
+    keys, ApiKeyStore, NetworkPriorStore, PlaybackTelemetryStore, SettingsStore, UserStore,
+};
+use crate::domain::{
+    ApiKey, NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery, User,
+};
 use crate::error::StoreError;
 
 // v5 is a fresh-bootstrap/import schema. There is deliberately no in-place
@@ -529,6 +533,35 @@ impl PlaybackTelemetryStore for HiqliteAuthStore {
         query: &PlaybackEventQuery,
     ) -> Result<Vec<PlaybackEvent>, StoreError> {
         self.telemetry.events(query.clone()).await
+    }
+}
+
+#[async_trait]
+impl NetworkPriorStore for HiqliteAuthStore {
+    async fn observe_network_prior(
+        &self,
+        observation: &NetworkPriorObservation,
+    ) -> Result<NetworkPrior, StoreError> {
+        self.telemetry.observe_prior(observation.clone()).await
+    }
+
+    async fn network_prior(
+        &self,
+        user_id: i64,
+        client_class: &str,
+        network_fingerprint: &str,
+    ) -> Result<Option<NetworkPrior>, StoreError> {
+        self.telemetry
+            .prior(
+                user_id,
+                client_class.to_owned(),
+                network_fingerprint.to_owned(),
+            )
+            .await
+    }
+
+    async fn prune_network_priors(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError> {
+        self.telemetry.prune_priors(before_ms, limit).await
     }
 }
 

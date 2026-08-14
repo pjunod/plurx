@@ -27,9 +27,9 @@ use hiqlite::{Client, Node, NodeConfig};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::prepare_sqlite_import;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
-    NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
-    PlaybackEventQuery, ProbeResult, TraktAuth,
+    scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
+    NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
+    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, TraktAuth,
 };
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
@@ -200,6 +200,11 @@ const TELEMETRY_METHODS: &[&str] = &[
     "record_playback_event",
     "prune_playback_events",
     "playback_events",
+];
+const NETWORK_PRIOR_METHODS: &[&str] = &[
+    "observe_network_prior",
+    "network_prior",
+    "prune_network_priors",
 ];
 
 struct StoreFixture {
@@ -889,13 +894,14 @@ fn contract_inventory_matches_every_store_method() {
         CACHE_METHODS,
         OFFLINE_METHODS,
         TELEMETRY_METHODS,
+        NETWORK_PRIOR_METHODS,
     ]
     .into_iter()
     .flatten()
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 126, "review the Store method count");
+    assert_eq!(declared.len(), 129, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -970,6 +976,48 @@ async fn playback_telemetry_contract_runs_through_dyn_store() {
             .expect("query remaining telemetry");
         assert_eq!(remaining.len(), 1, "backend {backend}");
         assert_eq!(remaining[0].id, second_id, "backend {backend}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn network_prior_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let key = format!(
+            "192.0.{}.0/24",
+            if backend.contains("hiqlite") { 3 } else { 2 }
+        );
+        let prior = store
+            .observe_network_prior(&NetworkPriorObservation {
+                user_id: 71,
+                client_class: "chrome".to_owned(),
+                network_fingerprint: key.clone(),
+                throughput_kbps: Some(8_000),
+                starved_rung_height: Some(1080),
+                observed_at_ms: 1_700_000_000_000,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: observe prior: {error}"));
+        assert_eq!(prior.sustained_kbps, Some(8_000), "{backend}");
+        let loaded = store
+            .network_prior(71, "chrome", &key)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: load prior: {error}"))
+            .expect("stored prior");
+        assert_eq!(loaded, prior, "{backend}");
+        assert_eq!(
+            store
+                .prune_network_priors(1_700_000_000_001, 1)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: prune prior: {error}")),
+            1,
+            "{backend}"
+        );
+        assert!(store
+            .network_prior(71, "chrome", &key)
+            .await
+            .expect("post-prune lookup")
+            .is_none());
     })
     .await;
 }
