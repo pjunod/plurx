@@ -196,3 +196,11 @@ source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = ".disabled(!controlState.isButtonEnabled)"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPictureInPictureUnavailablePathsStayReachable"
+
+[[fixes]]
+id = "apple.pip-unavailable-notice-lifetime"
+commits = ["7efbded2"]
+source = "clients/apple/Sources/PlayerSurface.swift"
+source_anchor = "showUnavailableMessage(state.messageOnTap)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPictureInPictureUnavailableMessageExpiresWithoutClearingARealFailure"
