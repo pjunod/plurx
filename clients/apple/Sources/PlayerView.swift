@@ -4,8 +4,7 @@ import SwiftUI
 import UIKit
 #endif
 
-#if os(tvOS)
-private enum PlayerControl: Hashable {
+enum PlayerControl: Hashable {
     case reveal
     case close
     case retry
@@ -21,7 +20,6 @@ private enum PlayerControl: Hashable {
     case autoplay
     case stats
 }
-#endif
 
 #if os(iOS)
 private enum PlayerOptionMenu: Hashable {
@@ -54,7 +52,7 @@ private struct PlayerOptionMenuButtonStyle: ButtonStyle {
 }
 #endif
 
-enum PlayerSeekDirection {
+enum PlayerSeekDirection: CaseIterable {
     case left
     case right
     case up
@@ -66,6 +64,44 @@ enum PlayerSeekDirection {
         case .right: return 10
         case .up: return 30
         case .down: return -30
+        }
+    }
+}
+
+enum PlayerRemoteMoveOutcome: Equatable {
+    case seek(seconds: Double)
+    case focus(PlayerControl)
+    case ignore
+}
+
+enum TVPlayerRemoteRouting {
+    static func moveOutcome(
+        focusedControl: PlayerControl,
+        progressEngaged: Bool,
+        direction: PlayerSeekDirection,
+        progressRightNeighbor: PlayerControl = .autoplay,
+        markerAvailable: Bool = false
+    ) -> PlayerRemoteMoveOutcome {
+        switch focusedControl {
+        case .reveal:
+            return .seek(seconds: direction.seconds)
+        case .progress:
+            switch direction {
+            case .left:
+                return progressEngaged
+                    ? .seek(seconds: PlayerSeekDirection.left.seconds)
+                    : .focus(.skipForward)
+            case .right:
+                return progressEngaged
+                    ? .seek(seconds: PlayerSeekDirection.right.seconds)
+                    : .focus(progressRightNeighbor)
+            case .down:
+                return .focus(.playPause)
+            case .up:
+                return markerAvailable ? .focus(.marker) : .ignore
+            }
+        default:
+            return .ignore
         }
     }
 }
@@ -617,6 +653,7 @@ struct PlayerView: View {
     #endif
     #if os(tvOS)
     @FocusState private var focusedControl: PlayerControl?
+    @State private var tvProgressEngaged = false
     #endif
 
     var body: some View {
@@ -822,11 +859,15 @@ struct PlayerView: View {
             guard failed else { return }
             focusedControl = controller.canRetryPlaybackFailure ? .retry : .close
         }
-        .onChange(of: focusedControl) { _, _ in
+        .onChange(of: focusedControl) { _, newControl in
+            if newControl != .progress { tvProgressEngaged = false }
             if controlsVisible { restartAutoHideTimer() }
         }
         .onExitCommand {
-            if showStats {
+            if tvProgressEngaged {
+                tvProgressEngaged = false
+                revealControls()
+            } else if showStats {
                 dismissPlaybackInfo()
             } else if controlsVisible {
                 hideControls()
@@ -966,6 +1007,8 @@ struct PlayerView: View {
         isScrubbing = false
         #if os(iOS)
         activeOptionMenu = nil
+        #else
+        tvProgressEngaged = false
         #endif
         pictureInPicture.detach()
         controller.stop(deactivateAudioSession: deactivateAudioSession)
@@ -976,13 +1019,15 @@ struct PlayerView: View {
     /// the controls therefore removes its presentation anchor and dismisses the
     /// menu too. On tvOS, focus on a menu button is the equivalent interaction:
     /// keep the chrome up while the viewer is opening or navigating that menu.
+    /// An engaged progress bar holds it open for the same reason.
     private var optionMenuOpen: Bool {
         #if os(iOS)
         activeOptionMenu != nil
         #else
+        if tvProgressEngaged { return true }
         switch focusedControl {
-        case .audio, .subtitles, .quality: true
-        default: false
+        case .audio, .subtitles, .quality: return true
+        default: return false
         }
         #endif
     }
@@ -1010,6 +1055,8 @@ struct PlayerView: View {
         guard controlsVisible else { return }
         #if os(iOS)
         activeOptionMenu = nil
+        #else
+        tvProgressEngaged = false
         #endif
         withAnimation(.easeOut(duration: 0.2)) {
             controlsVisible = false
@@ -1042,16 +1089,45 @@ struct PlayerView: View {
     }
 
     private func seekFromRemote(_ direction: MoveCommandDirection) {
-        let seekDirection: PlayerSeekDirection
+        guard let seekDirection = Self.playerSeekDirection(direction) else { return }
+        let outcome = TVPlayerRemoteRouting.moveOutcome(
+            focusedControl: .reveal,
+            progressEngaged: false,
+            direction: seekDirection
+        )
+        applyRemoteMoveOutcome(outcome, revealingFromHiddenControls: true)
+    }
+
+    private static func playerSeekDirection(
+        _ direction: MoveCommandDirection
+    ) -> PlayerSeekDirection? {
         switch direction {
-        case .left: seekDirection = .left
-        case .right: seekDirection = .right
-        case .up: seekDirection = .up
-        case .down: seekDirection = .down
-        @unknown default: return
+        case .left: .left
+        case .right: .right
+        case .up: .up
+        case .down: .down
+        @unknown default: nil
         }
-        controller.skip(seconds: seekDirection.seconds)
-        revealControlsFromRemote()
+    }
+
+    private func applyRemoteMoveOutcome(
+        _ outcome: PlayerRemoteMoveOutcome,
+        revealingFromHiddenControls: Bool = false
+    ) {
+        switch outcome {
+        case let .seek(seconds):
+            controller.skip(seconds: seconds)
+            if revealingFromHiddenControls {
+                revealControlsFromRemote()
+            } else {
+                revealControls()
+            }
+        case let .focus(control):
+            focusedControl = control
+            revealControls()
+        case .ignore:
+            revealControls()
+        }
     }
     #endif
 
@@ -1716,8 +1792,11 @@ struct PlayerView: View {
 
     #if os(tvOS)
     /// SwiftUI's Slider is unavailable on tvOS. This focusable bar uses the
-    /// Siri Remote's left/right commands to move through the same absolute
-    /// film timeline in 10-second steps. This is deliberately not a Button:
+    /// Siri Remote's left/right commands as ordinary focus navigation until
+    /// Select engages scrubbing; engaged presses move through the same
+    /// absolute film timeline in 10-second steps. Up reaches a visible skip
+    /// marker above the transport row and is inert when no marker is present;
+    /// Down returns to play/pause. This is not a Button:
     /// tvOS adds a large white pressed/focus surround to Buttons even when the
     /// ordinary focus effect is disabled.
     private var tvProgressBar: some View {
@@ -1749,22 +1828,44 @@ struct PlayerView: View {
                     }
                 }
             }
+            .scaleEffect(y: tvProgressEngaged ? 1.5 : 1)
+            .animation(.easeOut(duration: 0.12), value: tvProgressEngaged)
         }
         .frame(height: 8)
         .contentShape(Rectangle())
         .focusable()
         .focusEffectDisabled()
         .focused($focusedControl, equals: .progress)
-        .onMoveCommand { direction in
-            switch direction {
-            case .left: controller.skip(seconds: PlayerSeekDirection.left.seconds)
-            case .right: controller.skip(seconds: PlayerSeekDirection.right.seconds)
-            case .down: focusedControl = .playPause
-            default: break
-            }
+        .onTapGesture {
+            tvProgressEngaged.toggle()
             revealControls()
         }
-        .accessibilityLabel("Playback position. Left or right seeks 10 seconds.")
+        .onMoveCommand { direction in
+            guard let seekDirection = Self.playerSeekDirection(direction) else { return }
+            applyRemoteMoveOutcome(TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: tvProgressEngaged,
+                direction: seekDirection,
+                progressRightNeighbor: progressRightControl,
+                markerAvailable: controller.activeMarker != nil
+            ))
+        }
+        .accessibilityLabel("Playback position")
+        .accessibilityValue(tvProgressEngaged ? "Scrubbing" : "Not scrubbing")
+        .accessibilityHint(tvProgressEngaged
+            ? "Left or right seeks 10 seconds. Press Select or Menu to finish."
+            : "Press Select to scrub. Left or right moves between controls.")
+    }
+
+    private var progressRightControl: PlayerControl {
+        if pictureInPicture.isSupported,
+           pictureInPicture.isActive || pictureInPicture.isPossible {
+            return .pictureInPicture
+        }
+        if controller.audioTracks.count > 1 { return .audio }
+        if !controller.subtitles.isEmpty { return .subtitles }
+        if !controller.qualityRungs.isEmpty { return .quality }
+        return .autoplay
     }
     #endif
 

@@ -814,6 +814,89 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerSeekDirection.up.seconds, 30)
     }
 
+    func testTVProgressOnlySeeksAfterTheViewerEngagesIt() {
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: false,
+                direction: .left
+            ),
+            .focus(.skipForward)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: false,
+                direction: .right,
+                progressRightNeighbor: .audio
+            ),
+            .focus(.audio)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: true,
+                direction: .left
+            ),
+            .seek(seconds: -10)
+        )
+        XCTAssertEqual(
+            TVPlayerRemoteRouting.moveOutcome(
+                focusedControl: .progress,
+                progressEngaged: true,
+                direction: .right
+            ),
+            .seek(seconds: 10)
+        )
+    }
+
+    func testTVHiddenControlsKeepDirectionalSeeking() {
+        for direction in PlayerSeekDirection.allCases {
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .reveal,
+                    progressEngaged: false,
+                    direction: direction
+                ),
+                .seek(seconds: direction.seconds),
+                "hidden controls should preserve the \(direction) seek"
+            )
+        }
+    }
+
+    func testTVProgressUpAndDownRoutingIsDeliberate() {
+        for engaged in [false, true] {
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .up,
+                    markerAvailable: false
+                ),
+                .ignore,
+                "up should remain inert when there is no visible control above"
+            )
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .up,
+                    markerAvailable: true
+                ),
+                .focus(.marker),
+                "up should reach a visible skip marker above the transport row"
+            )
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .down
+                ),
+                .focus(.playPause)
+            )
+        }
+    }
+
     func testLiveSeekTargetClearsOnlyAfterTheAttachedReopen() {
         var state = PlayerSeekState()
         _ = state.absolute(90_000, durationMs: 600_000)
