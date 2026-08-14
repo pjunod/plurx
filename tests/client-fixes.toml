@@ -175,7 +175,7 @@ test_anchor = "testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeader
 
 [[fixes]]
 id = "apple.tvos-progress-engagement-seeks"
-commits = ["4a0416d1"]
+commits = ["7cf9bec6", "3991d34b"]
 source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = "enum TVPlayerRemoteRouting"
 test = "clients/apple/Tests/AppleClientTests.swift"
