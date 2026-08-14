@@ -36,8 +36,9 @@ enum EpisodeCardAction: Equatable {
     }
 }
 
-/// Keep the region-to-action contract independent of SwiftUI hit testing so a
-/// layout refactor cannot silently turn both halves back into one action.
+/// Keep the region-to-action mapping as a pure contract that XCTest can pin;
+/// `EpisodeCard` remains responsible for wiring each mapped action to its own
+/// SwiftUI control.
 func episodeCardAction(for region: EpisodeCardRegion, itemID: Int) -> EpisodeCardAction {
     switch region {
     case .artwork:
@@ -282,6 +283,7 @@ struct LandscapeCard: View {
 struct EpisodeCard: View {
     let item: Item
     var width: CGFloat = shelfLandscapeWidth
+    var isStarting = false
     let onPlay: () -> Void
 
     var body: some View {
@@ -294,6 +296,7 @@ struct EpisodeCard: View {
         .posterButtonStyle()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(episodeCardPlayAccessibilityLabel(item))
+        .accessibilityValue(tvEpisodeCardAccessibilityValue(item, isStarting: isStarting))
         #else
         VStack(alignment: .leading, spacing: 8) {
             Button {
@@ -304,6 +307,7 @@ struct EpisodeCard: View {
             .buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(episodeCardPlayAccessibilityLabel(item))
+            .accessibilityValue(episodeCardPlayAccessibilityValue(item, isStarting: isStarting))
 
             if let destination = episodeCardAction(
                 for: .copy,
@@ -315,6 +319,7 @@ struct EpisodeCard: View {
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(episodeCardDetailsAccessibilityLabel(item))
+                .accessibilityValue(episodeCardDetailsAccessibilityValue(item))
             }
         }
         .frame(width: width, alignment: .leading)
@@ -371,6 +376,15 @@ struct EpisodeCard: View {
                     }
                 }
             }
+
+            if isStarting {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.black.opacity(0.48))
+                ProgressView()
+                    .tint(.white)
+                    .accessibilityHidden(true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
     }
 
@@ -392,8 +406,12 @@ struct EpisodeCard: View {
     }
 
     private func perform(_ action: EpisodeCardAction) {
-        guard action == .play else { return }
-        onPlay()
+        switch action {
+        case .play:
+            onPlay()
+        case .navigate:
+            assertionFailure("EpisodeCard dispatches navigation through its NavigationLink")
+        }
     }
 }
 
@@ -468,6 +486,7 @@ struct MediaRow: View {
     var collection: LibraryCollection?
     var destination: LibraryCollection?
     var landscapeCopyStyle: LandscapeCardCopyStyle = .plain
+    var startingEpisodeID: Int?
     var onPlayEpisode: ((Item) -> Void)?
 
     var body: some View {
@@ -522,6 +541,10 @@ struct MediaRow: View {
                                 EpisodeCard(
                                     item: item,
                                     width: model.posterSize.landscapeWidth,
+                                    isStarting: episodeCardIsStarting(
+                                        startingEpisodeID: startingEpisodeID,
+                                        itemID: item.id
+                                    ),
                                     onPlay: { onPlayEpisode?(item) }
                                 )
                             }
@@ -573,7 +596,35 @@ func episodeCardDetailsAccessibilityLabel(_ item: Item) -> String {
     "View details for \(episodeCardTitle(item))"
 }
 
-private func episodeCardMeta(_ item: Item) -> String {
+func episodeCardIsStarting(startingEpisodeID: Int?, itemID: Int) -> Bool {
+    startingEpisodeID == itemID
+}
+
+func episodeCardPlayAccessibilityValue(_ item: Item, isStarting: Bool) -> String {
+    if isStarting { return "Starting playback" }
+    if item.watch?.watched == true { return "Watched" }
+    if let position = item.watch?.positionMs, position > 0 {
+        if let remaining = timeRemaining(item) {
+            return "In progress, \(remaining)"
+        }
+        return "In progress"
+    }
+    return "Unwatched"
+}
+
+func episodeCardDetailsAccessibilityValue(_ item: Item) -> String {
+    ([episodeCardMeta(item)] + episodeMediaSummaryBadges(item).map(\.accessibilityLabel))
+        .joined(separator: ", ")
+}
+
+func tvEpisodeCardAccessibilityValue(_ item: Item, isStarting: Bool) -> String {
+    [
+        episodeCardPlayAccessibilityValue(item, isStarting: isStarting),
+        episodeCardDetailsAccessibilityValue(item),
+    ].joined(separator: ", ")
+}
+
+func episodeCardMeta(_ item: Item) -> String {
     var parts: [String] = []
     if let airDate = item.airDate, !airDate.isEmpty {
         parts.append(String(airDate.prefix(10)))

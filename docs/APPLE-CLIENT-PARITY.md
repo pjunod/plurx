@@ -279,6 +279,9 @@ On iPhone and iPad, the landscape artwork in a season listing is a Play action;
 the title, metadata, and media badges below it are one separate Details action
 that opens `Route.item`. VoiceOver receives those two labels separately, because
 combining them would make the interaction depend on sighted hit testing again.
+This changes those season shelves from the previous portrait `PosterCard` tiles
+to 16:9 `EpisodeCard` tiles; the landscape layout is what gives artwork and copy
+independent touch targets without changing every other poster shelf.
 
 tvOS deliberately does not copy that split. The focus engine selects a card,
 not a geometric half of one, so an episode card keeps its existing single lift

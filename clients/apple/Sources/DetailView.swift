@@ -952,6 +952,7 @@ struct DetailView: View {
                     title: childrenHeading(item.kind),
                     items: children,
                     style: Self.seriesChildStyle(for: item.kind),
+                    startingEpisodeID: startingEpisodeID,
                     onPlayEpisode: playEpisodeFromSeason
                 )
                     .padding(.top, 18)
@@ -1120,6 +1121,7 @@ struct DetailView: View {
                     title: childrenHeading(item.kind),
                     items: children,
                     style: Self.seriesChildStyle(for: item.kind),
+                    startingEpisodeID: startingEpisodeID,
                     onPlayEpisode: playEpisodeFromSeason
                 )
                     .padding(.top, 18)
@@ -1219,6 +1221,7 @@ struct DetailView: View {
                     title: childrenHeading(item.kind),
                     items: children,
                     style: Self.seriesChildStyle(for: item.kind),
+                    startingEpisodeID: startingEpisodeID,
                     onPlayEpisode: playEpisodeFromSeason
                 )
                     .padding(.top, 8)
@@ -1408,6 +1411,7 @@ struct DetailView: View {
                     title: childrenHeading(item.kind),
                     items: children,
                     style: Self.seriesChildStyle(for: item.kind),
+                    startingEpisodeID: startingEpisodeID,
                     onPlayEpisode: playEpisodeFromSeason
                 )
                 .padding(.top, 4)
