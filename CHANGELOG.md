@@ -149,10 +149,14 @@ bump may break compatibility and a **patch** bump never does.
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer
   runs afterward. The 2026-08-14 nynuc D5 sweep selected QSV quality 22: 21
   and 22 produced identical QVBR bytes and VMAF on both corpus fixtures, while
-  23 was the first failing value under the easy-byte and VMAF gates. The
-  selected default still requires its post-deploy, no-override acceptance run;
-  the explicit-candidate comparison, boot/production proof, and isolated
-  forced-fallback proof are complete.
+  23 was the first failing value under the easy-byte and VMAF gates. Deployed
+  build `v0.2.7-167-gb6aaed6` then passed the full no-override comparison with
+  `transcode_quality: null`; production logs prove two QSV sessions used
+  `-global_quality 22`, and cleanup restored idle legacy bitrate mode. Final
+  artifact SHA-256:
+  `88e47f2bb20cf166d61f4470419f9ff7c3ea966a77b1f701b909b6952b60cbba`.
+  The explicit candidate, boot/production, and isolated forced-fallback proofs
+  are also complete.
 
 - **Performance II N0 makes playback telemetry durable and queryable.** Client
   beacons keep their existing human log lines and additionally enter a bounded,
