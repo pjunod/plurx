@@ -172,3 +172,11 @@ source = "clients/apple/Sources/Components.swift"
 source_anchor = "struct TVNavigationFocusSection<Content: View>: View"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeaders"
+
+[[fixes]]
+id = "apple.tvos-progress-engagement-seeks"
+commits = ["4a0416d1"]
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "enum TVPlayerRemoteRouting"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testTVProgressOnlySeeksAfterTheViewerEngagesIt"
