@@ -576,6 +576,7 @@ enum ProbeDeferReason {
     Deadline,
 }
 
+#[derive(Debug)]
 enum YieldingProbe {
     Completed(Result<(), String>),
     Deferred(ProbeDeferReason),
@@ -905,6 +906,21 @@ pub async fn detect_encoders(ffmpeg_bin: &str) -> EncoderCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep executable fakes in the checkout rather than creating and
+    // immediately executing them in /tmp. Under Linux process churn that
+    // write-close-exec sequence can transiently fail with ETXTBSY, which says
+    // nothing about the encoder verdict the tests are meant to observe.
+    #[cfg(unix)]
+    const QUALITY_REFUSAL_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/transcode/fixtures/ffmpeg-quality-refusal"
+    );
+    #[cfg(unix)]
+    const WEDGED_PROBE_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/transcode/fixtures/ffmpeg-wedged-probe"
+    );
 
     #[test]
     fn parses_encoder_list() {
@@ -1379,25 +1395,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_family_that_refuses_quality_stays_usable_and_reports_no_quality_cap() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("ffmpeg");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\n\
-             case \" $* \" in\n\
-               *\" -encoders \"*) printf ' V..... h264_qsv Intel QuickSync\\n' ;;\n\
-               *\" -global_quality \"*) echo 'Error applying option global_quality: Invalid argument' >&2; exit 1 ;;\n\
-               *) exit 0 ;;\n\
-             esac\n",
-        )
-        .expect("write fake ffmpeg");
-        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake, permissions).expect("chmod");
-
-        let caps = detect_encoders(fake.to_str().expect("path")).await;
+        let caps = detect_encoders(QUALITY_REFUSAL_FIXTURE).await;
         assert!(caps.qsv, "legacy VBR validation succeeded");
         assert!(caps.forced_idr.qsv, "the VBR IDR argument succeeded");
         assert!(
@@ -1413,24 +1411,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_runtime_quality_probe_kills_its_encoder_when_playback_arrives() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("ffmpeg");
-        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake ffmpeg");
-        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake, permissions).expect("chmod");
-
         let yield_now = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&yield_now);
-        let fake = fake.to_string_lossy().into_owned();
         let probe = tokio::spawn(async move {
-            validate_quality_rate_control_yielding(&fake, Encoder::Software, 23, false, move || {
-                observed.load(Ordering::Acquire)
-            })
+            validate_quality_rate_control_yielding(
+                WEDGED_PROBE_FIXTURE,
+                Encoder::Software,
+                23,
+                false,
+                move || observed.load(Ordering::Acquire),
+            )
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
@@ -1448,28 +1441,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_wedged_runtime_probe_is_killed_at_its_deadline_not_marked_refused() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("ffmpeg");
-        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake ffmpeg");
-        let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake, permissions).expect("chmod");
-
         let started = tokio::time::Instant::now();
-        assert!(matches!(
-            try_encode_yielding(
-                fake.to_str().expect("path"),
-                Encoder::Software,
-                EffectiveRateControl::Qvbr { quality: 23 },
-                false,
-                std::time::Duration::from_millis(100),
-                || false,
-            )
-            .await,
-            YieldingProbe::Deferred(ProbeDeferReason::Deadline)
-        ));
+        let actual = try_encode_yielding(
+            WEDGED_PROBE_FIXTURE,
+            Encoder::Software,
+            EffectiveRateControl::Qvbr { quality: 23 },
+            false,
+            std::time::Duration::from_millis(100),
+            || false,
+        )
+        .await;
+        assert!(
+            matches!(actual, YieldingProbe::Deferred(ProbeDeferReason::Deadline)),
+            "a wedged probe must be deadline-deferred, got {actual:?}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "the timeout must bound and reap the child promptly"

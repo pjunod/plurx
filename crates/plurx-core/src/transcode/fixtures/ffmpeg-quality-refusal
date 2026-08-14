@@ -1,0 +1,9 @@
+#!/bin/sh
+case " $* " in
+  *" -encoders "*) printf ' V..... h264_qsv Intel QuickSync\n' ;;
+  *" -global_quality "*)
+    echo 'Error applying option global_quality: Invalid argument' >&2
+    exit 1
+    ;;
+  *) exit 0 ;;
+esac
