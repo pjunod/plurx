@@ -12,6 +12,7 @@
  */
 
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const fsp = fs.promises;
 const http = require("node:http");
@@ -353,6 +354,16 @@ test("browser restarts cancel upstream streams without phantom bytes or link deb
   }
 });
 
+/**
+ * A real leak both admits and delivers the bytes, so the dilution tests below
+ * drive the ledger and the delivery meter together. Driving only `record` would
+ * describe drain grouping, which is not a leak and is no longer scored.
+ */
+function leak(shaper, bytes, media) {
+  shaper.meterAdmission(bytes, media);
+  shaper.record(bytes, media);
+}
+
 test("browser startup dead time cannot dilute a pre-cliff shaper leak", async () => {
   const shaper = new lab.ShapingProxy(
     lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
@@ -361,20 +372,23 @@ test("browser startup dead time cannot dilute a pre-cliff shaper leak", async ()
   shaper.now = () => now;
   shaper.startedAt = 0;
   shaper.stages[0].entered_at_ms = 0;
-  shaper.record(500_000, false); // page assets before the first frame
+  leak(shaper, 500_000, false); // page assets before the first frame
   now = 30_000;
   shaper.beginEvidence();
-  // Twelve Mb/s delivered over the one active second after 30 seconds of
-  // browser setup. Measuring from proxy bind would dilute this to 387 kb/s.
-  shaper.record(750_000, true);
+  // Twelve Mb/s admitted and delivered over the one active second after 30
+  // seconds of browser setup. Measuring from proxy bind would dilute this to
+  // 387 kb/s.
+  leak(shaper, 750_000, true);
   now = 31_000;
-  shaper.record(750_000, true);
+  leak(shaper, 750_000, true);
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
   assert.equal(telemetry.stages[0].measured_kbps, 6857.1,
     "the whole-stage estimator includes the first delivered slice's cap-time");
   assert.equal(telemetry.stages[0].peak_kbps, 12_000,
     "the rolling peak still exposes the burst without counting browser startup");
+  assert.equal(telemetry.stages[0].admitted_peak_kbps, 12_000,
+    "the scored ledger peak sees the same burst");
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
   await shaper.close();
 });
@@ -387,9 +401,9 @@ test("idle time after the last byte cannot dilute a pre-cliff shaper leak", asyn
   shaper.now = () => now;
   shaper.startedAt = 0;
   shaper.stages[0].entered_at_ms = 0;
-  shaper.record(3_000_000, true);
+  leak(shaper, 3_000_000, true);
   now = 3_500;
-  shaper.record(3_000_000, true);
+  leak(shaper, 3_000_000, true);
   now = 11_500; // the player's buffer is full until the cliff
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
@@ -397,6 +411,8 @@ test("idle time after the last byte cannot dilute a pre-cliff shaper leak", asyn
   assert.equal(telemetry.stages[0].measured_kbps, 7384.6);
   assert.equal(telemetry.stages[0].peak_kbps, 24_000,
     "the last-byte boundary cannot dilute the delivered burst");
+  assert.equal(telemetry.stages[0].admitted_peak_kbps, 24_000,
+    "nor the admitted one");
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
   await shaper.close();
 });
@@ -411,16 +427,116 @@ test("slower delivery after a mid-stage burst cannot dilute a shaper leak", asyn
   shaper.stages[0].entered_at_ms = 0;
   // A 13.6 Mb/s one-second burst followed by slower delivery averages to only
   // 4.32 Mb/s over the whole active stage. The burst must remain observable.
-  shaper.record(850_000, true);
+  leak(shaper, 850_000, true);
   now = 999;
-  shaper.record(850_000, true);
+  leak(shaper, 850_000, true);
   now = 5_000;
-  shaper.record(1_000_000, true);
+  leak(shaper, 1_000_000, true);
   shaper.applyCliff();
   const telemetry = shaper.telemetry();
   assert.equal(telemetry.stages[0].measured_kbps, 3692.3);
   assert.equal(telemetry.stages[0].peak_kbps, 13_600);
+  assert.equal(telemetry.stages[0].admitted_peak_kbps, 13_600);
   assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: telemetry })).outcome, "shaping");
+  await shaper.close();
+});
+
+/**
+ * A downstream sink that holds its slice until the test releases it, which is
+ * what a browser socket does whenever the player stops reading. Reservations
+ * stay serialized through the shared bucket; only the completion is deferred.
+ */
+function heldSink() {
+  const sink = new EventEmitter();
+  sink.destroyed = false;
+  sink.writable = true;
+  sink.written = 0;
+  sink.holding = true;
+  sink.write = (slice) => {
+    sink.written += slice.length;
+    return !sink.holding;
+  };
+  sink.release = () => {
+    sink.holding = false;
+    sink.emit("drain");
+  };
+  return sink;
+}
+
+/** Run the microtask/immediate queues until the shaper stops making progress. */
+async function settle(rounds = 50) {
+  for (let index = 0; index < rounds; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+test("slices held by separate sinks and released together are not a shaper leak", async () => {
+  const shaper = new lab.ShapingProxy(
+    lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
+  );
+  let now = 0;
+  shaper.now = () => now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  // The bucket, not a real timer, decides when a reservation is granted. Paying
+  // the debt by advancing the clock keeps the whole scenario deterministic.
+  // Round up, because a real timer never fires early either.
+  shaper.waitForLimiter = (delay) => {
+    now += Math.ceil(delay);
+    return new Promise((resolve) => setImmediate(resolve));
+  };
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  const open = () => false;
+  shaper.applyCliff();
+
+  // Three connections each take one legally priced slice out of the 1.5 Mb/s
+  // bucket and then stop reading. Every reservation waited its full turn.
+  const held = [heldSink(), heldSink(), heldSink()];
+  const pending = held.map((sink) => shaper.writeShaped(slice, sink, true, open));
+  await settle();
+  for (const sink of held) {
+    assert.equal(sink.written, slice.length, "each held connection was granted exactly one slice");
+  }
+  const grantedBy = now;
+  assert.ok(grantedBy > 250, `three 16 KiB slices cannot be granted in ${grantedBy}ms at 1500 kb/s`);
+
+  // The link then idles long enough to refill the bucket, and all three players
+  // resume reading at the same instant.
+  now = 3_000;
+  for (const sink of held) sink.release();
+  await Promise.all(pending);
+
+  // Fourteen further slices are admitted normally, each one waiting for the
+  // bucket exactly as designed.
+  const free = heldSink();
+  free.holding = false;
+  for (let index = 0; index < 14; index += 1) {
+    await shaper.writeShaped(slice, free, true, open);
+  }
+  // One late slice, so the whole-stage average stays far below its own gate and
+  // cannot be what this test is measuring.
+  now = 7_000;
+  await shaper.writeShaped(slice, free, true, open);
+
+  const after = shaper.telemetry().stages[1];
+  const bound = lab.shaperBurstBoundKbps(1500);
+  // 17 slices land inside one window although only 14 were ever priced into it.
+  assert.equal(after.peak_kbps, 2228.2,
+    "the delivered rolling peak reaches the shape that used to score as a leak");
+  assert.ok(after.peak_kbps > bound,
+    `the delivered peak must exceed the ceiling, got ${after.peak_kbps} against ${bound}`);
+  assert.equal(after.measured_kbps, 577.2);
+  assert.ok(after.measured_kbps < 1500 * 1.25,
+    "the whole-stage average must stay nonbinding, or it is what this test measures");
+
+  const observed = observation();
+  observed.shaping.stages[1] = after;
+  const score = lab.scoreRecovery(CRITERIA, observed);
+  assert.deepEqual(score.errors, [],
+    "deferred drains on separate connections are not evidence that the shaper leaked");
+  assert.equal(score.outcome, "passed");
+  assert.ok(after.admitted_peak_kbps <= bound,
+    `no window admitted past the ceiling, got ${after.admitted_peak_kbps} against ${bound}`);
   await shaper.close();
 });
 
@@ -551,35 +667,48 @@ test("a shaper that leaked more than its cap fails as a shaping fault", () => {
   assert.match(score.errors[0], /leaked/);
 });
 
-// The bucket stores 250 ms of credit, so its designed one-second burst is
-// already 1.25x the cap — the exact old flat `cap * shaping_tolerance` bound.
-// Scoring the rolling peak against the flat cap therefore spent the whole
-// tolerance on designed burst, and a healthy run cleared it by 0.04%.
-test("a rolling peak at the bucket's own designed burst ceiling is not a leak", () => {
+// The bucket stores 250 ms of credit and serialization allows exactly one
+// outstanding claim, so the most a one-second window can take out is 1.25x the
+// cap plus one 16 KiB slice. That ceiling is a consequence of token
+// conservation, not an estimate, so a peak sitting exactly on it is healthy and
+// the tolerance above it covers only reporting quantization.
+test("an admitted peak at the bucket's own conservation ceiling is not a leak", () => {
   const designed = observation();
   const bound = lab.shaperBurstBoundKbps(8000);
-  assert.ok(bound > 8000 * CRITERIA.shaping_tolerance,
-    "the designed burst must exceed the flat cap * tolerance bound, or this proves nothing");
-  designed.shaping.stages[0].peak_kbps = Number(bound.toFixed(1));
+  assert.equal(bound, 8000 * (1 + 250 / 1000) + (16 * 1024 * 8) / 1000,
+    "the ceiling is stored burst, one window of earned rate, and one in-flight slice");
+  designed.shaping.stages[0].admitted_peak_kbps = Number(bound.toFixed(1));
   const score = lab.scoreRecovery(CRITERIA, designed);
   assert.deepEqual(score.errors, []);
   assert.equal(score.outcome, "passed");
 });
 
-test("a rolling peak past the designed burst and its jitter slack is a leak", () => {
+test("an admitted peak past the conservation ceiling is a leak", () => {
   const leaked = observation();
-  leaked.shaping.stages[0].peak_kbps = 12_000;
+  leaked.shaping.stages[0].admitted_peak_kbps = 12_000;
   const score = lab.scoreRecovery(CRITERIA, leaked);
   assert.equal(score.outcome, "shaping");
   assert.match(score.errors[0], /1s burst rate of 12000 kb\/s over a 8000 kb\/s cap/);
+});
+
+// The 1% is reporting slack, not room for structural skew. The ceiling already
+// carries the one in-flight slice serialization permits; a second one — the
+// skew a per-connection drain could add — must still fail.
+test("one slice past the conservation ceiling is already a leak", () => {
+  const leaked = observation();
+  const bound = lab.shaperBurstBoundKbps(1500);
+  leaked.shaping.stages[1].admitted_peak_kbps = Number((bound + (16 * 1024 * 8) / 1000).toFixed(1));
+  const score = lab.scoreRecovery(CRITERIA, leaked);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /1s burst rate/);
 });
 
 test("the burst allowance does not loosen the whole-stage average gate", () => {
   const leaked = observation();
   // Inside the after-cliff burst bound, past the sustained bound of 1875 kb/s.
   leaked.shaping.stages[1].measured_kbps = 1900;
-  leaked.shaping.stages[1].peak_kbps = 1900;
-  assert.ok(1900 < lab.shaperBurstBoundKbps(1500),
+  leaked.shaping.stages[1].admitted_peak_kbps = 1870;
+  assert.ok(1870 < lab.shaperBurstBoundKbps(1500),
     "this rate must clear the burst gate, or it does not isolate the sustained gate");
   const score = lab.scoreRecovery(CRITERIA, leaked);
   assert.equal(score.outcome, "shaping");
@@ -589,7 +718,7 @@ test("the burst allowance does not loosen the whole-stage average gate", () => {
 test("a stage with no delivery samples invalidates shaping evidence", () => {
   const missing = observation();
   missing.shaping.stages[1].measured_kbps = null;
-  missing.shaping.stages[1].peak_kbps = null;
+  missing.shaping.stages[1].admitted_peak_kbps = null;
   const score = lab.scoreRecovery(CRITERIA, missing);
   assert.equal(score.outcome, "shaping");
   assert.match(score.errors[0], /no delivery samples for after-cliff/);

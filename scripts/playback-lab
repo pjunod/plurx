@@ -639,6 +639,28 @@ function sleep(ms) {
 }
 
 /**
+ * The widest `SHAPER_TELEMETRY_WINDOW_MS` rate over a byte series ordered by
+ * time. Entries may be negative — the admission ledger withdraws a refunded
+ * slice — so the running sum is signed and the peak floors at zero.
+ */
+function rollingPeakKbps(samples, mediaOnly) {
+  if (!samples.length) return null;
+  let first = 0;
+  let bytes = 0;
+  let peak = 0;
+  for (let last = 0; last < samples.length; last += 1) {
+    if (!mediaOnly || samples[last].media) bytes += samples[last].bytes;
+    const cutoff = samples[last].at_ms - SHAPER_TELEMETRY_WINDOW_MS;
+    while (samples[first]?.at_ms < cutoff) {
+      if (!mediaOnly || samples[first].media) bytes -= samples[first].bytes;
+      first += 1;
+    }
+    peak = Math.max(peak, bytes * 8 / SHAPER_TELEMETRY_WINDOW_MS);
+  }
+  return Number(peak.toFixed(1));
+}
+
+/**
  * A loopback reverse proxy that meters everything the browser pulls through one
  * shared bucket. It is deliberately not an OS-level shaper: no root, no
  * kernel state to leak into the next run, no machine-wide blast radius, and the
@@ -657,6 +679,7 @@ class ShapingProxy {
     this.limiterWaiters = new Set();
     this.frozenTelemetry = null;
     this.deliverySamples = profile.stages.map(() => []);
+    this.admissionSamples = profile.stages.map(() => []);
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -704,6 +727,7 @@ class ShapingProxy {
     stage.bytes = 0;
     stage.media_bytes = 0;
     this.deliverySamples[this.stageIndex] = [];
+    this.admissionSamples[this.stageIndex] = [];
   }
 
   /** Drop the link to the next stage. Called once, at a point the report keeps. */
@@ -719,11 +743,48 @@ class ShapingProxy {
     return at;
   }
 
+  /**
+   * The bucket's own outflow ledger: `+bytes` at the instant a reservation
+   * claims them, `-bytes` when a canceled write refunds them. Signed, because
+   * the rolling bound this feeds is the bucket's token-conservation identity —
+   * the net bytes taken out of a bucket over a window cannot exceed the credit
+   * it held when the window opened plus what the window earned. Refunds cancel
+   * out of that identity only if the ledger records them the same way the
+   * bucket does.
+   *
+   * Delivery timestamps cannot carry that proof. A slice is priced when it is
+   * claimed but recorded only after its own connection drains, and drains are
+   * deliberately per-connection, so any number of separately priced slices can
+   * land together. Metering the claim keeps the measured event and the bound
+   * describing the same thing.
+   *
+   * `at` is the clock reading the bucket itself used, not a later sample of it,
+   * and the entry is filed against the stage current at that instant. Both keep
+   * the ledger and the bucket from disagreeing across a cliff.
+   */
+  meterAdmission(bytes, media, at = this.now()) {
+    const stageIndex = this.stageIndex;
+    this.admissionSamples[stageIndex].push({ at_ms: at - this.startedAt, bytes, media });
+    return { stageIndex, bytes, media };
+  }
+
+  /** Withdraw a granted slice the browser never received, against its own stage. */
+  meterRefund(admission, at = this.now()) {
+    this.admissionSamples[admission.stageIndex].push({
+      at_ms: at - this.startedAt,
+      bytes: -admission.bytes,
+      media: admission.media,
+    });
+  }
+
   record(bytes, media) {
-    // Reservations are priced against the stage current when they are claimed,
-    // while a completed write is billed to the stage current here. At a cliff,
-    // that can move only the already-in-flight slices across the boundary; the
-    // fixed slice size bounds the resulting conservative (false-leak) bias.
+    // What the browser received, billed to the stage current at completion.
+    // Reservations are priced when they are claimed, so at a cliff every slice
+    // still draining crosses into the next stage's byte count — one per
+    // connection with a write outstanding, not one overall. That is why this
+    // series feeds only the whole-stage average, which has a multi-second
+    // denominator and `shaping_tolerance` to absorb the boundary, and why the
+    // scored rolling peak reads `admissionSamples` instead.
     const stage = this.stages[this.stageIndex];
     const at = this.now() - this.startedAt;
     if (stage.first_byte_at_ms === null) stage.first_byte_at_ms = at;
@@ -792,13 +853,12 @@ class ShapingProxy {
    * which recomputes its remaining debt at the new rate.
    */
   async writeShaped(slice, sink, media, cancelled) {
-    let reserved = false;
+    let admission = null;
     let committed = false;
-    const reservation = this.limiterTail.then(() => this.reserveSlice(slice.length, cancelled));
+    const reservation = this.limiterTail.then(() => this.reserveSlice(slice.length, media, cancelled));
     this.limiterTail = reservation.catch(() => {});
     try {
-      await reservation;
-      reserved = true;
+      admission = await reservation;
       if (this.closed) throw new Error("shaper closed");
       if (cancelled() || sink.destroyed || !sink.writable) {
         throw new Error("client cancelled the transfer");
@@ -811,29 +871,39 @@ class ShapingProxy {
       // A canceled restart must not leave debt in the shared link or meter a
       // slice the browser never received. The next rendition gets only the
       // credit genuinely earned while the canceled reservation was waiting.
-      if (reserved && !committed && !this.closed) {
-        this.bucket.refund(slice.length, this.now());
+      if (admission && !committed && !this.closed) {
+        const at = this.now();
+        this.bucket.refund(slice.length, at);
+        this.meterRefund(admission, at);
         this.wakeLimiter();
       }
     }
   }
 
-  async reserveSlice(bytes, cancelled) {
-    let reserved = false;
+  async reserveSlice(bytes, media, cancelled) {
+    let admission = null;
     try {
       if (this.closed) throw new Error("shaper closed");
       if (cancelled()) throw new Error("client cancelled the transfer");
-      let delay = this.bucket.reserve(bytes, this.now());
-      reserved = true;
+      const at = this.now();
+      let delay = this.bucket.reserve(bytes, at);
+      // Meter the claim at the instant the bucket loses the bytes, using the
+      // clock reading the bucket itself used and the stage current at that
+      // instant. Metering the later grant instead would file a slice priced at
+      // the pre-cliff rate against the post-cliff stage.
+      admission = this.meterAdmission(bytes, media, at);
       while (delay > 0) {
         await this.waitForLimiter(delay);
         if (this.closed) throw new Error("shaper closed");
         if (cancelled()) throw new Error("client cancelled the transfer");
         delay = this.bucket.delay(this.now());
       }
+      return admission;
     } catch (error) {
-      if (reserved && !this.closed) {
-        this.bucket.refund(bytes, this.now());
+      if (admission && !this.closed) {
+        const at = this.now();
+        this.bucket.refund(bytes, at);
+        this.meterRefund(admission, at);
         this.wakeLimiter();
       }
       throw error;
@@ -923,21 +993,6 @@ class ShapingProxy {
           ? (samples[0].bytes * 8) / (stage.kbps * 1000)
           : 0;
         const measuredSeconds = samples.length ? activeSeconds + firstSliceSeconds : 0;
-        const peakRate = (mediaOnly) => {
-          let first = 0;
-          let bytes = 0;
-          let peak = 0;
-          for (let last = 0; last < samples.length; last += 1) {
-            if (!mediaOnly || samples[last].media) bytes += samples[last].bytes;
-            const cutoff = samples[last].at_ms - SHAPER_TELEMETRY_WINDOW_MS;
-            while (samples[first]?.at_ms < cutoff) {
-              if (!mediaOnly || samples[first].media) bytes -= samples[first].bytes;
-              first += 1;
-            }
-            peak = Math.max(peak, bytes * 8 / SHAPER_TELEMETRY_WINDOW_MS);
-          }
-          return samples.length ? Number(peak.toFixed(1)) : null;
-        };
         return {
           ...stage,
           held_seconds: Number(activeSeconds.toFixed(3)),
@@ -947,8 +1002,14 @@ class ShapingProxy {
           measured_media_kbps: measuredSeconds > 0
             ? Number(((stage.media_bytes * 8) / 1000 / measuredSeconds).toFixed(1))
             : null,
-          peak_kbps: peakRate(false),
-          peak_media_kbps: peakRate(true),
+          // What the browser received. Reported because it is what a viewer
+          // would have felt, but deliberately not scored: per-connection drains
+          // can group separately-priced slices, so this rate has no bound the
+          // shaper's design can prove.
+          peak_kbps: rollingPeakKbps(samples, false),
+          peak_media_kbps: rollingPeakKbps(samples, true),
+          // What the bucket let out. This is the scored rate.
+          admitted_peak_kbps: rollingPeakKbps(this.admissionSamples[stage.index], false),
         };
       }),
     };
@@ -1782,17 +1843,29 @@ function sustainedSecondsOf(criteria) {
 }
 
 /**
- * The largest rolling-window rate the bucket is *designed* to allow, which is
- * strictly above the cap and must not be mistaken for a leak.
+ * The largest rolling-window rate the bucket can admit, which is strictly above
+ * the cap and must not be mistaken for a leak.
  *
- * A window of `SHAPER_TELEMETRY_WINDOW_MS` may legitimately carry the bucket's
- * whole `SHAPER_BURST_MS` of stored credit plus a full window of earned rate,
- * and the sample that closes the window is counted whole even though its slice
- * began earning before the window opened. At the default 250 ms burst that is
- * already 1.25x the cap — exactly the old flat `cap * shaping_tolerance` bound,
- * which therefore spent the entire tolerance on designed burst and left nothing
- * for measurement jitter. Scoring the rolling peak against this bound instead
- * makes the peak tolerance measure leakage.
+ * This is the bucket's token-conservation identity, not an estimate. Over any
+ * window that opens just before one claim and closes on another, tokens can
+ * only fall by the net bytes claimed and rise by what the window earned:
+ *
+ *   tokens(end) <= tokens(start) + window * rate - claimed
+ *
+ * `refill` caps every balance at `SHAPER_BURST_MS` of rate, so
+ * `tokens(start) <= burst * rate`. Reservations are serialized, so at most one
+ * claim is outstanding at any instant and every earlier one has already been
+ * granted with a non-negative balance; the closing claim can therefore drive
+ * the balance no further than one slice into debt, giving
+ * `tokens(end) >= -SHAPER_SLICE_BYTES`. Rearranged, the bytes claimed inside a
+ * window cannot exceed `(burst + window) * rate` plus one slice — at the
+ * default 250 ms burst and 1 s window, 1.25x the cap plus 16 KiB.
+ *
+ * That one slice is the whole in-flight term, and serialization is what proves
+ * it. Metering completions instead of claims would need one such term for every
+ * slice separate connections may hold undrained, which the proxy does not
+ * bound: it permits 32 upstream sockets, and per-connection drain is
+ * deliberate.
  */
 function shaperBurstBoundKbps(capKbps) {
   const earned = capKbps * (1 + SHAPER_BURST_MS / SHAPER_TELEMETRY_WINDOW_MS);
@@ -1806,12 +1879,13 @@ function scoreRecovery(criteria, observation) {
   const after = shaping.stages[1];
   const before = shaping.stages[0];
   // Two different questions, so two different bounds. `shaping_tolerance`
-  // bounds the whole-stage average, which converges on the cap because the
-  // bucket repays debt with time. `shaping_peak_tolerance` bounds the rolling
-  // peak, whose designed worst case already sits above the cap, so it needs
-  // only enough slack for measurement jitter.
+  // bounds the whole-stage delivered average, which converges on the cap
+  // because the bucket repays debt with time. `shaping_peak_tolerance` bounds
+  // the rolling admitted peak against `shaperBurstBoundKbps`, which is a proof
+  // rather than an estimate, so the tolerance covers only the 0.1 kb/s
+  // reporting quantum and float rounding — not structural skew.
   const tolerance = criteria.shaping_tolerance ?? 1.25;
-  const peakTolerance = criteria.shaping_peak_tolerance ?? 1.05;
+  const peakTolerance = criteria.shaping_peak_tolerance ?? 1.01;
 
   if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
     return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
@@ -1826,7 +1900,7 @@ function scoreRecovery(criteria, observation) {
   for (const stage of [before, after]) {
     const gates = [
       { rate: stage.measured_kbps, bound: stage.kbps * tolerance, kind: "sustained" },
-      { rate: stage.peak_kbps, bound: shaperBurstBoundKbps(stage.kbps) * peakTolerance, kind: "1s burst" },
+      { rate: stage.admitted_peak_kbps, bound: shaperBurstBoundKbps(stage.kbps) * peakTolerance, kind: "1s burst" },
     ].filter((gate) => Number.isFinite(gate.rate));
     if (!gates.length) {
       return {

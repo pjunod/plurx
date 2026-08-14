@@ -168,29 +168,65 @@ high by `N/(N-1)`. A one-second rolling peak accompanies the whole-stage rate
 so later slow delivery cannot dilute a qualifying mid-stage burst.
 
 The two rates are scored against two different bounds, because they answer two
-different questions.
+different questions — and each bound is applied to the quantity it can prove.
 
-- The whole-stage rate is bounded by `cap × shaping_tolerance` (1.25 by
-  default). An average may sit below the cap when the player asked for less,
-  but it converges on the cap over a stage, because the bucket lets a
-  reservation go into debt and repays it with time. The whole-stage estimator
-  does not spend that tolerance on first-slice bias.
-- The rolling peak is bounded by the bucket's own designed worst case,
-  `cap × (1 + 250 ms / 1 s)` plus one 16 KiB slice, multiplied by
-  `shaping_peak_tolerance` (1.05 by default). A one-second window may
-  legitimately carry the bucket's whole 250 ms of stored credit plus a full
-  second of earned rate, and the sample that closes the window is counted whole
-  even though its slice began earning before the window opened.
+- The whole-stage rate is the **delivered** rate, bounded by
+  `cap × shaping_tolerance` (1.25 by default). An average may sit below the cap
+  when the player asked for less, but it converges on the cap over a stage,
+  because the bucket lets a reservation go into debt and repays it with time.
+  The whole-stage estimator does not spend that tolerance on first-slice bias.
+- The rolling peak is the **admitted** rate, taken from the bucket's own ledger:
+  `+bytes` at the instant a reservation claims them, `-bytes` when a canceled
+  write refunds them. It is bounded by `cap × (1 + 250 ms / 1 s)` plus one
+  16 KiB slice, multiplied by `shaping_peak_tolerance` (1.01 by default).
 
-Scoring the peak against a flat `cap × 1.25` — as this harness first did —
-makes the bound *equal* the design's worst case, so the tolerance is spent
-entirely on designed burst and nothing is left for measurement jitter. A
-healthy 8 Mb/s stage measured 9937–9996 kb/s against that 10000 kb/s bound,
-clearing it by 0.04%. Because a trip yields `outcome: shaping`, meaning the run
-proves nothing about playback, that margin was a false-negative waiting to
-discard a good acceptance run and point the investigation at the shaper. The
-burst-aware bound keeps the same leak sensitivity — a window carrying 12000
-kb/s against an 8000 kb/s cap still fails — while restoring real headroom.
+The admitted ceiling is the bucket's token-conservation identity, not an
+estimate. Over any window that opens just before one claim and closes on
+another, the balance can only fall by the net bytes claimed and rise by what the
+window earned, so `tokens(end) ≤ tokens(start) + window × rate − claimed`.
+`refill` caps every balance at 250 ms of rate, so `tokens(start) ≤ burst ×
+rate`. Reservations are serialized, so at most one claim is outstanding at any
+instant and every earlier one has already been granted with a non-negative
+balance; the closing claim can drive the balance no further than one slice into
+debt, so `tokens(end) ≥ −16 KiB`. Rearranged, no window can claim more than
+`(burst + window) × rate` plus one slice. Refunds cancel out of the identity
+because the ledger records them the same way the bucket does — signed, at the
+moment they happen, against the stage that claimed them.
+
+That single slice is the entire in-flight term, and serialization is what proves
+it.
+
+**Why the peak is metered at admission and not at delivery.** Reservations are
+serialized through the shared bucket, but downstream drain is deliberately
+per-connection, so one non-reading response cannot stall the rest of the link.
+A slice is therefore priced when it is claimed and recorded only when its own
+connection drains, and any number of separately priced slices can be recorded
+together when several players resume reading at once. Three slices held across
+an idle stretch and released together, followed by fourteen normally scheduled
+slices, produce a delivered one-second peak of 2228.2 kb/s on a 1500 kb/s link
+while no reservation ever overspent the bucket — a false `outcome: shaping`,
+which means the run proves nothing about playback. No multiplier repairs that:
+the skew is one in-flight slice *per connection* and the proxy allows 32
+upstream sockets, so the delivered peak has no ceiling the design can state.
+The delivered peak is still reported, because it is what a viewer would have
+felt, but it is not scored.
+
+Because the ceiling is proven rather than estimated, `shaping_peak_tolerance`
+covers only the 0.1 kb/s reporting quantum and float rounding — roughly 100
+kb/s of slack on an 8 Mb/s stage against the ~0.1 kb/s actually needed. It is
+not room for structural skew: the ceiling already carries the one in-flight
+slice serialization permits, and a *second* one (131.1 kb/s) already fails.
+Sensitivity to a real leak is unchanged in the direction that matters: a window
+claiming 12000 kb/s against an 8000 kb/s cap still fails.
+
+The numeric bound is the one this harness has used since the burst-aware
+rewrite. What changed is the series it is applied to. Scored against the
+delivered series it bounded nothing, and a healthy 8 Mb/s stage measuring
+9937–9996 kb/s against the older flat `cap × 1.25` bound cleared it by only
+0.04% — with the grouping above able to push it past. Scored against the ledger
+it is a theorem. The false negative is removed structurally instead of being
+paid for with tolerance, which is why the tolerance could drop from 1.05 to
+1.01.
 
 Scheduler delay lengthens the observed window and lowers the measured peak
 instead of spending additional headroom.
