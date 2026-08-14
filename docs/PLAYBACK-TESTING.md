@@ -160,73 +160,80 @@ at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
 edge the suite exists to observe.
 
 The evidence window starts only after the first presented frame. Stage-zero
-byte and time counters reset there. Each stage's whole-stage rate extends the
-first-to-last sample interval by the first delivered slice's cap-time, because
-the interval contains one fewer reservation wait than its byte count. That
-keeps browser preparation and player idle out without biasing a short stage
-high by `N/(N-1)`. A one-second rolling peak accompanies the whole-stage rate
-so later slow delivery cannot dilute a qualifying mid-stage burst.
+byte, time, and ledger counters reset there.
 
-The two rates are scored against two different bounds, because they answer two
-different questions — and each bound is applied to the quantity it can prove.
+**What is scored, and why it is the ledger.** Every shaped byte is claimed from
+the bucket before it is written, so the proxy keeps that bucket's own outflow
+ledger: `+bytes` at the instant a reservation claims them, `−bytes` when a
+canceled write is refunded, each stamped with the clock reading the bucket used
+and filed against the stage live at that instant. Two quantities are read off
+it, and both are scored against the same identity:
 
-- The whole-stage rate is the **delivered** rate, bounded by
-  `cap × shaping_tolerance` (1.25 by default). An average may sit below the cap
-  when the player asked for less, but it converges on the cap over a stage,
-  because the bucket lets a reservation go into debt and repays it with time.
-  The whole-stage estimator does not spend that tolerance on first-slice bias.
-- The rolling peak is the **admitted** rate, taken from the bucket's own ledger:
-  `+bytes` at the instant a reservation claims them, `-bytes` when a canceled
-  write refunds them. It is bounded by `cap × (1 + 250 ms / 1 s)` plus one
-  16 KiB slice, multiplied by `shaping_peak_tolerance` (1.01 by default).
+- `admitted_bytes` over `admitted_span_ms` — the whole stage, from its first
+  bucket mutation to its last.
+- `admitted_peak_kbps` — the widest one-second rolling window over the same
+  ledger.
 
-The admitted ceiling is the bucket's token-conservation identity, not an
-estimate. Over any window that opens just before one claim and closes on
-another, the balance can only fall by the net bytes claimed and rise by what the
-window earned, so `tokens(end) ≤ tokens(start) + window × rate − claimed`.
-`refill` caps every balance at 250 ms of rate, so `tokens(start) ≤ burst ×
-rate`. Reservations are serialized, so at most one claim is outstanding at any
-instant and every earlier one has already been granted with a non-negative
-balance; the closing claim can drive the balance no further than one slice into
-debt, so `tokens(end) ≥ −16 KiB`. Rearranged, no window can claim more than
-`(burst + window) × rate` plus one slice. Refunds cancel out of the identity
-because the ledger records them the same way the bucket does — signed, at the
-moment they happen, against the stage that claimed them.
+The identity is token conservation, not an estimate. Over any window that opens
+on one claim and closes on another, the balance can only fall by the net bytes
+claimed and rise by what the window earned, so `tokens(end) ≤ tokens(start) +
+window × rate − claimed`. `refill` caps every balance at 250 ms of rate, and
+`setRate` clamps it again when the cliff shrinks the bucket, so `tokens(start) ≤
+burst × rate` at the head of any stage. Reservations are serialized, so at most
+one claim is outstanding at any instant and every earlier one has already been
+granted with a non-negative balance; the closing claim can drive the balance no
+further than one slice into debt, so `tokens(end) ≥ −16 KiB`. Rearranged:
+
+    claimed ≤ (burst + window) × rate + one 16 KiB slice
 
 That single slice is the entire in-flight term, and serialization is what proves
-it.
+it. The same formula scores both gates at the two windows that matter. Over one
+second it is 1.25× the cap plus a slice. Over a stage it amortizes the fixed
+burst and slice terms, so a long stage is held far closer to its cap than a
+short one: on a 45 s stage at 1.5 Mb/s the sustained bound is 1537.9 kb/s, well
+inside the flat `cap × 1.25` (1875 kb/s) it replaced.
 
-**Why the peak is metered at admission and not at delivery.** Reservations are
+Refunds cancel out of the identity only because the ledger records them exactly
+as the bucket does: the credit the bucket actually took — a balance already at
+capacity takes back less than a slice, or none of it — against the stage whose
+bucket took it. There is one bucket, so a refund credits whichever stage is live
+when it happens, never the stage that made the claim. Filing it against the
+claiming stage would hand the post-cliff bucket spendable credit its own ledger
+never saw, and the claims that credit funds would then read as bytes the bucket
+could not have released.
+
+Neither gate takes a tolerance multiplier. A multiplier is an unproved band in
+which a real leak scores as healthy, and the identity leaves nothing for one to
+cover: the sustained gate compares exact byte counts, and the burst gate
+compares its bound at the same 0.1 kb/s quantum the peak is reported in, so the
+only slack is the half-quantum rounding can add. One reporting quantum past the
+ceiling already fails — a rate that the 1% tolerance this replaced would have
+passed.
+
+**Why delivery is reported but not scored as a rate.** Reservations are
 serialized through the shared bucket, but downstream drain is deliberately
 per-connection, so one non-reading response cannot stall the rest of the link.
 A slice is therefore priced when it is claimed and recorded only when its own
 connection drains, and any number of separately priced slices can be recorded
-together when several players resume reading at once. Three slices held across
-an idle stretch and released together, followed by fourteen normally scheduled
-slices, produce a delivered one-second peak of 2228.2 kb/s on a 1500 kb/s link
-while no reservation ever overspent the bucket — a false `outcome: shaping`,
-which means the run proves nothing about playback. No multiplier repairs that:
-the skew is one in-flight slice *per connection* and the proxy allows 32
-upstream sockets, so the delivered peak has no ceiling the design can state.
-The delivered peak is still reported, because it is what a viewer would have
-felt, but it is not scored.
+together when several players resume reading at once. Three connections that
+each take one legally priced slice and then stop reading, releasing together,
+deliver a whole stage in a single instant: 4500 kb/s on a 1500 kb/s link, with a
+one-second delivered peak of 2228.2 kb/s once further legal slices follow. No
+reservation ever overspent the bucket, so scoring either delivered rate invents
+`outcome: shaping` and the run proves nothing about playback. No multiplier and
+no eligibility rule repairs it: the skew is one undrained slice *per
+connection*, the proxy allows 32 upstream sockets, and the grouping can compress
+a stage's delivery interval to zero. `measured_kbps` and `peak_kbps` are still
+reported, because they are what a viewer would have felt.
 
-Because the ceiling is proven rather than estimated, `shaping_peak_tolerance`
-covers only the 0.1 kb/s reporting quantum and float rounding — roughly 100
-kb/s of slack on an 8 Mb/s stage against the ~0.1 kb/s actually needed. It is
-not room for structural skew: the ceiling already carries the one in-flight
-slice serialization permits, and a *second* one (131.1 kb/s) already fails.
-Sensitivity to a real leak is unchanged in the direction that matters: a window
-claiming 12000 kb/s against an 8000 kb/s cap still fails.
-
-The numeric bound is the one this harness has used since the burst-aware
-rewrite. What changed is the series it is applied to. Scored against the
-delivered series it bounded nothing, and a healthy 8 Mb/s stage measuring
-9937–9996 kb/s against the older flat `cap × 1.25` bound cleared it by only
-0.04% — with the grouping above able to push it past. Scored against the ledger
-it is a theorem. The false negative is removed structurally instead of being
-paid for with tolerance, which is why the tolerance could drop from 1.05 to
-1.01.
+Delivered **bytes** are a different matter — a total survives regrouping when a
+rate does not — and they carry the one check the ledger cannot make about
+itself: that nothing reached the browser without being claimed from the bucket
+first. Total delivered bytes are gated against total admitted bytes, allowing
+one undrained slice per connection the proxy will open, which is the evidence
+window's own seam: `beginEvidence` clears both series mid-stage, so a slice
+claimed before the first frame and drained after it is delivered without its
+claim.
 
 Scheduler delay lengthens the observed window and lowers the measured peak
 instead of spending additional headroom.
@@ -258,7 +265,7 @@ describe adaptation. Every artifact therefore carries an `outcome`:
 | `outcome` | What it says |
 |---|---|
 | `passed` | The shaped link and baseline were trustworthy, and the session met every recovery criterion. |
-| `shaping` | The cliff never applied, the proxy reported a transport error, or the shaper delivered more than its cap allows — either a whole-stage average past `shaping_tolerance` or a one-second burst past the bucket's designed worst case. The run proves nothing about playback. |
+| `shaping` | The cliff never applied, the proxy reported a transport error, or the bucket let out more than its own conservation identity allows — over a whole stage, over one second, or as bytes the browser received without a matching claim. The run proves nothing about playback. |
 | `browser_playback` | The baseline was unhealthy, or the player reported a media failure. There is no trustworthy recovery verdict. |
 | `server_supply` | The link still had headroom and the player starved anyway — a producer problem, not an adaptation problem. |
 | `recovery` | The link was shaped, the baseline was healthy, and the session did not answer the cliff within its criteria. |

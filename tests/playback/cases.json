@@ -110,7 +110,6 @@
           "recovery": {
             "sample_interval_seconds": 1,
             "recovery_observe_seconds": 45,
-            "shaping_tolerance": 1.25,
             "baseline_minimum_clock_rate": 0.9,
             "maximum_automatic_restarts": 1,
             "maximum_upgrades_per_60s": 1,

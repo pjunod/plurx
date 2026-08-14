@@ -593,9 +593,17 @@ class TokenBucket {
     this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.bytesPerMs);
   }
 
+  /**
+   * Give back a claim the browser never received, and report the credit the
+   * bucket actually took. A balance already at capacity absorbs less than the
+   * full slice — or none of it — and the ledger that scores this bucket has to
+   * record the mutation that happened rather than the one that was asked for.
+   */
   refund(bytes, nowMs) {
     this.refill(nowMs);
-    this.tokens = Math.min(this.capacity, this.tokens + bytes);
+    const credited = Math.max(0, Math.min(bytes, this.capacity - this.tokens));
+    this.tokens += credited;
+    return credited;
   }
 
   /**
@@ -636,6 +644,12 @@ function diagnosticPath(urlPath) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A byte count over a millisecond window, in kb/s, at the reporting quantum. */
+function spanRateKbps(bytes, spanMs) {
+  if (bytes === null || !Number.isFinite(spanMs) || spanMs <= 0) return null;
+  return Number(((bytes * 8) / spanMs).toFixed(1));
 }
 
 /**
@@ -763,28 +777,34 @@ class ShapingProxy {
    * the ledger and the bucket from disagreeing across a cliff.
    */
   meterAdmission(bytes, media, at = this.now()) {
-    const stageIndex = this.stageIndex;
-    this.admissionSamples[stageIndex].push({ at_ms: at - this.startedAt, bytes, media });
-    return { stageIndex, bytes, media };
+    this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes, media });
+    return { media };
   }
 
-  /** Withdraw a granted slice the browser never received, against its own stage. */
-  meterRefund(admission, at = this.now()) {
-    this.admissionSamples[admission.stageIndex].push({
-      at_ms: at - this.startedAt,
-      bytes: -admission.bytes,
-      media: admission.media,
-    });
+  /**
+   * Withdraw credit the bucket gave back, against the stage that received it.
+   *
+   * There is one bucket, so a refund always credits whichever stage is live
+   * when it happens — never the stage that made the original claim. Filing the
+   * withdrawal against the claiming stage would hand the post-cliff bucket
+   * spendable credit that the post-cliff ledger never saw, and the later claims
+   * that credit funds would then look like bytes the bucket could not have
+   * released. `bytes` is what the bucket actually took back, which is less than
+   * the slice whenever the balance was already near capacity.
+   */
+  meterRefund(bytes, media, at = this.now()) {
+    if (bytes <= 0) return;
+    this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes: -bytes, media });
   }
 
   record(bytes, media) {
     // What the browser received, billed to the stage current at completion.
-    // Reservations are priced when they are claimed, so at a cliff every slice
-    // still draining crosses into the next stage's byte count — one per
-    // connection with a write outstanding, not one overall. That is why this
-    // series feeds only the whole-stage average, which has a multi-second
-    // denominator and `shaping_tolerance` to absorb the boundary, and why the
-    // scored rolling peak reads `admissionSamples` instead.
+    // Reservations are priced when they are claimed and recorded only once
+    // their own connection drains, so this series says when bytes landed, not
+    // when the link released them: at a cliff every still-draining slice
+    // crosses into the next stage, and slices held by separate connections can
+    // land together in any order. Byte totals survive that regrouping and rates
+    // do not, so delivery is scored only as a total, against the ledger below.
     const stage = this.stages[this.stageIndex];
     const at = this.now() - this.startedAt;
     if (stage.first_byte_at_ms === null) stage.first_byte_at_ms = at;
@@ -873,8 +893,7 @@ class ShapingProxy {
       // credit genuinely earned while the canceled reservation was waiting.
       if (admission && !committed && !this.closed) {
         const at = this.now();
-        this.bucket.refund(slice.length, at);
-        this.meterRefund(admission, at);
+        this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at);
         this.wakeLimiter();
       }
     }
@@ -902,8 +921,7 @@ class ShapingProxy {
     } catch (error) {
       if (admission && !this.closed) {
         const at = this.now();
-        this.bucket.refund(bytes, at);
-        this.meterRefund(admission, at);
+        this.meterRefund(this.bucket.refund(bytes, at), admission.media, at);
         this.wakeLimiter();
       }
       throw error;
@@ -959,9 +977,11 @@ class ShapingProxy {
   }
 
   /**
-   * What the link actually delivered, per stage. `measured_kbps` is the number
-   * that proves the shaper held: it may sit below the cap because the player
-   * asked for less, but it may never sit meaningfully above it.
+   * What the link released and what it delivered, per stage. The scored
+   * quantities are the ledger's — `admitted_bytes` over `admitted_span_ms`, and
+   * the rolling `admitted_peak_kbps` — because only those have a bound the
+   * bucket's design can prove. The delivered rates are reported beside them
+   * because they are what a viewer would have felt.
    */
   telemetrySnapshot() {
     const endedAt = this.now() - this.startedAt;
@@ -970,6 +990,10 @@ class ShapingProxy {
       spec: this.profile.spec,
       cliff_after_seconds: this.profile.cliff_after_seconds,
       cliff_applied_at_ms: this.stages[1] ? this.stages[1].entered_at_ms : null,
+      // The two constants the scored bounds are built from, so an artifact can
+      // be rechecked without the script that produced it.
+      slice_bytes: SHAPER_SLICE_BYTES,
+      max_sockets: this.agent.maxSockets,
       transport_errors: this.errors.slice(-10),
       stages: this.stages.map((stage) => {
         const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
@@ -985,14 +1009,24 @@ class ShapingProxy {
         // `record` runs after a reserved slice reaches the downstream socket.
         // The first-to-last sample interval therefore contains N - 1 slice
         // waits while the byte count contains N slices. Add the first slice's
-        // cap-time to keep the estimator unbiased without admitting browser
+        // cap-time to keep the estimate unbiased without admitting browser
         // preparation or trailing player idle into the window. That correction
-        // is exact when delivery holds the configured cap; a real leak makes it
-        // bias low, while the independent rolling peak remains uncorrected.
+        // is exact when delivery holds the configured cap; it cannot make this
+        // an unbiased estimate when drains group, which is why the rate below
+        // is reported and the ledger is what gets scored.
         const firstSliceSeconds = samples.length
           ? (samples[0].bytes * 8) / (stage.kbps * 1000)
           : 0;
         const measuredSeconds = samples.length ? activeSeconds + firstSliceSeconds : 0;
+        const ledger = this.admissionSamples[stage.index];
+        // The window the ledger's own identity is stated over: it opens on the
+        // first mutation of the bucket inside this stage and closes on the last.
+        const admittedSpanMs = ledger.length
+          ? Number((ledger[ledger.length - 1].at_ms - ledger[0].at_ms).toFixed(3))
+          : null;
+        const admittedBytes = ledger.length
+          ? ledger.reduce((total, entry) => total + entry.bytes, 0)
+          : null;
         return {
           ...stage,
           held_seconds: Number(activeSeconds.toFixed(3)),
@@ -1004,12 +1038,16 @@ class ShapingProxy {
             : null,
           // What the browser received. Reported because it is what a viewer
           // would have felt, but deliberately not scored: per-connection drains
-          // can group separately-priced slices, so this rate has no bound the
-          // shaper's design can prove.
+          // can group separately-priced slices, so neither of these rates has a
+          // bound the shaper's design can prove.
           peak_kbps: rollingPeakKbps(samples, false),
           peak_media_kbps: rollingPeakKbps(samples, true),
-          // What the bucket let out. This is the scored rate.
-          admitted_peak_kbps: rollingPeakKbps(this.admissionSamples[stage.index], false),
+          // What the bucket let out, net of refunds. These are the scored
+          // quantities, and the window each is scored over travels with it.
+          admitted_bytes: admittedBytes,
+          admitted_span_ms: admittedSpanMs,
+          admitted_kbps: spanRateKbps(admittedBytes, admittedSpanMs),
+          admitted_peak_kbps: rollingPeakKbps(ledger, false),
         };
       }),
     };
@@ -1843,34 +1881,79 @@ function sustainedSecondsOf(criteria) {
 }
 
 /**
- * The largest rolling-window rate the bucket can admit, which is strictly above
- * the cap and must not be mistaken for a leak.
+ * The most a bucket at `capKbps` can let out over a window of `windowMs`.
  *
  * This is the bucket's token-conservation identity, not an estimate. Over any
- * window that opens just before one claim and closes on another, tokens can
- * only fall by the net bytes claimed and rise by what the window earned:
+ * window that opens on one claim and closes on another, tokens can only fall by
+ * the net bytes claimed and rise by what the window earned:
  *
  *   tokens(end) <= tokens(start) + window * rate - claimed
  *
- * `refill` caps every balance at `SHAPER_BURST_MS` of rate, so
- * `tokens(start) <= burst * rate`. Reservations are serialized, so at most one
- * claim is outstanding at any instant and every earlier one has already been
- * granted with a non-negative balance; the closing claim can therefore drive
- * the balance no further than one slice into debt, giving
- * `tokens(end) >= -SHAPER_SLICE_BYTES`. Rearranged, the bytes claimed inside a
- * window cannot exceed `(burst + window) * rate` plus one slice — at the
- * default 250 ms burst and 1 s window, 1.25x the cap plus 16 KiB.
+ * `refill` caps every balance at `SHAPER_BURST_MS` of rate, and `setRate`
+ * clamps it again when the cliff shrinks the bucket, so
+ * `tokens(start) <= burst * rate` at the head of any stage. Reservations are
+ * serialized, so at most one claim is outstanding at any instant and every
+ * earlier one has already been granted with a non-negative balance; the closing
+ * claim can therefore drive the balance no further than one slice into debt,
+ * giving `tokens(end) >= -SHAPER_SLICE_BYTES`. Rearranged, the bytes claimed
+ * inside a window cannot exceed `(burst + window) * rate` plus one slice.
  *
  * That one slice is the whole in-flight term, and serialization is what proves
- * it. Metering completions instead of claims would need one such term for every
- * slice separate connections may hold undrained, which the proxy does not
- * bound: it permits 32 upstream sockets, and per-connection drain is
- * deliberate.
+ * it. The same identity scores both shaping gates, at the two window lengths
+ * that matter: one second for the rolling burst, and the stage's own ledger
+ * span for the sustained rate — where the fixed burst and slice terms are
+ * amortized, so a long stage is held far closer to its cap than a short one.
+ *
+ * Metering completions instead of claims would need one in-flight term for
+ * every slice separate connections may hold undrained, which the proxy does not
+ * bound below `max_sockets`, and per-connection drain is deliberate.
  */
+function shaperClaimBoundBytes(capKbps, windowMs) {
+  const bytesPerMs = capKbps / 8;
+  return bytesPerMs * (SHAPER_BURST_MS + Math.max(0, windowMs || 0)) + SHAPER_SLICE_BYTES;
+}
+
+/** The same identity at the telemetry window, as a rate. */
 function shaperBurstBoundKbps(capKbps) {
-  const earned = capKbps * (1 + SHAPER_BURST_MS / SHAPER_TELEMETRY_WINDOW_MS);
-  const sliceQuantum = (SHAPER_SLICE_BYTES * 8) / SHAPER_TELEMETRY_WINDOW_MS;
-  return earned + sliceQuantum;
+  return (shaperClaimBoundBytes(capKbps, SHAPER_TELEMETRY_WINDOW_MS) * 8) / SHAPER_TELEMETRY_WINDOW_MS;
+}
+
+/**
+ * The scored shaping gates for one stage: the same conservation identity read
+ * over the stage's own ledger span and over the one-second telemetry window.
+ *
+ * Both are proofs about the bucket, so neither takes a tolerance multiplier. A
+ * multiplier would be an unproved band in which a real leak scores as healthy,
+ * and the identity leaves nothing for one to cover: the sustained gate compares
+ * exact byte counts, and the burst gate compares its bound at the same 0.1 kb/s
+ * quantum the peak is reported in, so the only slack is the half-quantum that
+ * rounding can add.
+ */
+function shapingGates(stage) {
+  const gates = [];
+  if (Number.isFinite(stage.admitted_bytes) && Number.isFinite(stage.admitted_span_ms)) {
+    const boundBytes = shaperClaimBoundBytes(stage.kbps, stage.admitted_span_ms);
+    const rate = spanRateKbps(stage.admitted_bytes, stage.admitted_span_ms);
+    const boundRate = spanRateKbps(boundBytes, stage.admitted_span_ms);
+    gates.push({
+      kind: "sustained",
+      over: stage.admitted_bytes > boundBytes,
+      message: `${stage.label} admitted ${stage.admitted_bytes} B in ${stage.admitted_span_ms} ms`
+        + `${rate === null ? "" : ` (${rate} kb/s)`}, past the ${Math.floor(boundBytes)} B`
+        + `${boundRate === null ? "" : ` (${boundRate} kb/s)`}`
+        + ` its ${stage.kbps} kb/s bucket can release over that window`,
+    });
+  }
+  if (Number.isFinite(stage.admitted_peak_kbps)) {
+    const bound = Number(shaperBurstBoundKbps(stage.kbps).toFixed(1));
+    gates.push({
+      kind: "1s burst",
+      over: stage.admitted_peak_kbps > bound,
+      message: `${stage.label} admitted a 1s burst rate of ${stage.admitted_peak_kbps} kb/s`
+        + ` over a ${stage.kbps} kb/s cap, past its ${bound} kb/s bound`,
+    });
+  }
+  return gates;
 }
 
 function scoreRecovery(criteria, observation) {
@@ -1878,14 +1961,6 @@ function scoreRecovery(criteria, observation) {
   const shaping = observation.shaping;
   const after = shaping.stages[1];
   const before = shaping.stages[0];
-  // Two different questions, so two different bounds. `shaping_tolerance`
-  // bounds the whole-stage delivered average, which converges on the cap
-  // because the bucket repays debt with time. `shaping_peak_tolerance` bounds
-  // the rolling admitted peak against `shaperBurstBoundKbps`, which is a proof
-  // rather than an estimate, so the tolerance covers only the 0.1 kb/s
-  // reporting quantum and float rounding — not structural skew.
-  const tolerance = criteria.shaping_tolerance ?? 1.25;
-  const peakTolerance = criteria.shaping_peak_tolerance ?? 1.01;
 
   if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
     return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
@@ -1898,28 +1973,40 @@ function scoreRecovery(criteria, observation) {
     };
   }
   for (const stage of [before, after]) {
-    const gates = [
-      { rate: stage.measured_kbps, bound: stage.kbps * tolerance, kind: "sustained" },
-      { rate: stage.admitted_peak_kbps, bound: shaperBurstBoundKbps(stage.kbps) * peakTolerance, kind: "1s burst" },
-    ].filter((gate) => Number.isFinite(gate.rate));
-    if (!gates.length) {
+    const gates = shapingGates(stage);
+    if (gates.length < 2) {
       return {
         outcome: "shaping",
-        errors: [`the shaper recorded no delivery samples for ${stage.label}`],
+        errors: [`the shaper recorded no admission ledger for ${stage.label}`],
         metrics: { shaping },
       };
     }
-    const leak = gates.find((gate) => gate.rate > gate.bound);
+    const leak = gates.find((gate) => gate.over);
     if (leak) {
-      return {
-        outcome: "shaping",
-        errors: [
-          `the shaper leaked: ${stage.label} delivered a ${leak.kind} rate of ${leak.rate} kb/s`
-          + ` over a ${stage.kbps} kb/s cap, past its ${Number(leak.bound.toFixed(1))} kb/s bound`,
-        ],
-        metrics: { shaping },
-      };
+      return { outcome: "shaping", errors: [`the shaper leaked: ${leak.message}`], metrics: { shaping } };
     }
+  }
+
+  // Delivery is scored once, as a total. Byte counts survive drain regrouping
+  // and the rates computed from them do not, so this is the only shape a
+  // delivered quantity can be gated in. It proves the one thing the ledger
+  // cannot prove about itself: that nothing reached the browser without being
+  // claimed from the bucket first. The allowance is the evidence window's own
+  // seam — `beginEvidence` clears both series mid-stage, so a slice claimed
+  // before the first frame and drained after it is delivered here without its
+  // claim, at most one per connection the proxy will open.
+  const delivered = shaping.stages.reduce((total, stage) => total + (stage.bytes || 0), 0);
+  const admitted = shaping.stages.reduce((total, stage) => total + (stage.admitted_bytes || 0), 0);
+  const inFlight = (shaping.max_sockets ?? 32) * (shaping.slice_bytes ?? SHAPER_SLICE_BYTES);
+  if (delivered > admitted + inFlight) {
+    return {
+      outcome: "shaping",
+      errors: [
+        `the shaper leaked: the browser received ${delivered} B while the bucket released ${admitted} B`
+        + ` (allowing ${inFlight} B in flight across the evidence window)`,
+      ],
+      metrics: { shaping },
+    };
   }
 
   const baselineRate = observation.baseline_clock_rate;
@@ -2505,6 +2592,7 @@ async function main() {
 // the shaping, scoring, and normalization logic without a browser.
 module.exports = {
   NETWORK_PROFILES,
+  SHAPER_SLICE_BYTES,
   ShapingProxy,
   TokenBucket,
   diagnosticPath,
@@ -2520,6 +2608,7 @@ module.exports = {
   rungHistory,
   scoreRecovery,
   shaperBurstBoundKbps,
+  shaperClaimBoundBytes,
   timeToSustained,
   writeFatalRunReport,
 };

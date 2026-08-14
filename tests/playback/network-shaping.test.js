@@ -470,6 +470,140 @@ async function settle(rounds = 50) {
   }
 }
 
+/** A shaper whose reservations are paid for by advancing the clock, not a timer. */
+function deterministicShaper(spec) {
+  const shaper = new lab.ShapingProxy(lab.parseNetworkProfile(spec), "http://127.0.0.1:1");
+  const clock = { now: 0 };
+  shaper.now = () => clock.now;
+  shaper.startedAt = 0;
+  shaper.stages[0].entered_at_ms = 0;
+  // The bucket, not a real timer, decides when a reservation is granted. Paying
+  // the debt by advancing the clock keeps the whole scenario deterministic.
+  // Round up, because a real timer never fires early either.
+  shaper.waitForLimiter = (delay) => {
+    clock.now += Math.ceil(delay);
+    return new Promise((resolve) => setImmediate(resolve));
+  };
+  return [shaper, clock];
+}
+
+/*
+ * The scored whole-stage quantity is the ledger's, not the delivered stream's,
+ * and this is why. Three connections each take one legally priced slice and
+ * then stop reading; the stage delivers nothing else. Every byte arrives in the
+ * same instant the players resume, so the delivered stage rate is 4500 kb/s on
+ * a 1500 kb/s link — a rate no bound can be stated for, since the skew is one
+ * undrained slice per connection and the proxy opens up to `max_sockets` of
+ * them. Nothing pads this stage: there is no later slice diluting the average
+ * and no burst to isolate. If the run is scored on what the bucket released, it
+ * passes; if it is scored on delivery timing, it invents a shaping fault.
+ */
+test("a stage delivered entirely in one grouped drain is not a shaper leak", async () => {
+  const [shaper, clock] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  const open = () => false;
+  shaper.applyCliff();
+
+  const held = [heldSink(), heldSink(), heldSink()];
+  const pending = held.map((sink) => shaper.writeShaped(slice, sink, true, open));
+  await settle();
+  for (const sink of held) {
+    assert.equal(sink.written, slice.length, "each held connection was granted exactly one slice");
+  }
+  assert.ok(clock.now > 250, `three 16 KiB slices cannot be granted in ${clock.now}ms at 1500 kb/s`);
+
+  clock.now = 3_000;
+  for (const sink of held) sink.release();
+  await Promise.all(pending);
+
+  const after = shaper.telemetry().stages[1];
+  assert.equal(after.measured_kbps, 4500, "the delivered stage rate is the one the reviewer reproduced");
+  assert.ok(after.measured_kbps > 1500 * 1.25, "and it sits past the flat delivered gate this replaced");
+  assert.equal(after.admitted_bytes, 3 * slice.length, "the bucket released exactly three slices");
+  assert.ok(
+    after.admitted_bytes <= lab.shaperClaimBoundBytes(1500, after.admitted_span_ms),
+    `and no more than the ${after.admitted_span_ms} ms window allows`,
+  );
+
+  const observed = observation();
+  observed.shaping.stages[1] = after;
+  const score = lab.scoreRecovery(CRITERIA, observed);
+  assert.deepEqual(score.errors, [],
+    "a stage whose every byte drained at once is not evidence that the shaper leaked");
+  assert.equal(score.outcome, "passed");
+  await shaper.close();
+});
+
+/*
+ * There is one bucket, so a refund credits whichever stage is live when it
+ * happens. Filing the withdrawal against the stage that made the claim would
+ * hand the post-cliff bucket spendable credit its own ledger never saw, and the
+ * claims that credit funds would then read as bytes the bucket could not have
+ * released.
+ */
+test("a refund after the cliff is withdrawn from the stage whose bucket took it", async () => {
+  const [shaper, clock] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  const open = () => false;
+
+  // One pre-cliff slice is granted and then held by a player that stops reading.
+  const held = heldSink();
+  const abandoned = shaper.writeShaped(slice, held, true, open).catch(() => null);
+  await settle();
+  assert.equal(held.written, slice.length);
+  assert.equal(shaper.admissionSamples[0].length, 1, "the claim is filed against the stage that made it");
+
+  // The link idles until the 8 Mb/s bucket is full, then the cliff clamps it.
+  clock.now = 5_000;
+  shaper.applyCliff();
+
+  // The post-cliff stage then claims continuously, so its rolling peak sits on
+  // the bucket's ceiling and one unaccounted slice is enough to break it.
+  const free = heldSink();
+  free.holding = false;
+  for (let index = 0; index < 4; index += 1) await shaper.writeShaped(slice, free, true, open);
+
+  // The abandoned connection closes here. The bucket is in debt, so it takes
+  // the whole slice back and immediately funds another claim with it.
+  held.destroyed = true;
+  held.emit("close");
+  await abandoned;
+  for (let index = 0; index < 16; index += 1) await shaper.writeShaped(slice, free, true, open);
+
+  const refunds = shaper.admissionSamples[1].filter((entry) => entry.bytes < 0);
+  assert.deepEqual(shaper.admissionSamples[0].filter((entry) => entry.bytes < 0), [],
+    "the pre-cliff ledger keeps a claim its bucket really made");
+  assert.deepEqual(refunds.map((entry) => entry.bytes), [-slice.length],
+    "and the post-cliff ledger records the credit its own bucket received");
+
+  const after = shaper.telemetry().stages[1];
+  const bound = Number(lab.shaperBurstBoundKbps(1500).toFixed(1));
+  // 1966.1 kb/s against a 2006.1 kb/s ceiling. Filed against the claiming stage
+  // instead, the same run reads 2097.2 kb/s — one uncancelled slice over the
+  // ceiling, and a healthy bucket reported as a leak.
+  assert.equal(after.admitted_peak_kbps, 1966.1);
+  assert.ok(after.admitted_peak_kbps <= bound,
+    `a refunded slice cannot inflate the peak, got ${after.admitted_peak_kbps} against ${bound}`);
+  assert.ok(after.admitted_peak_kbps + (lab.SHAPER_SLICE_BYTES * 8) / 1000 > bound,
+    "one more unaccounted slice must break the ceiling, or the credit was never binding");
+
+  const observed = observation();
+  observed.shaping.stages[1] = after;
+  const score = lab.scoreRecovery(CRITERIA, observed);
+  assert.deepEqual(score.errors, [], "a canceled transfer across the cliff is not a shaper leak");
+  await shaper.close();
+});
+
+test("a refund is metered as the credit the bucket took, not the slice that was asked back", () => {
+  const bucket = new lab.TokenBucket(1500, 0);
+  bucket.refill(10_000);
+  assert.equal(bucket.tokens, bucket.capacity, "the idle bucket is full");
+  assert.equal(bucket.refund(16 * 1024, 10_000), 0, "a full bucket cannot take a slice back");
+  assert.equal(bucket.tokens, bucket.capacity, "and does not overflow trying");
+  bucket.reserve(16 * 1024, 10_000);
+  assert.equal(bucket.refund(16 * 1024, 10_000), 16 * 1024, "a bucket with room takes the whole slice");
+});
+
 test("slices held by separate sinks and released together are not a shaper leak", async () => {
   const shaper = new lab.ShapingProxy(
     lab.parseNetworkProfile("8mbps-to-1.5mbps"), "http://127.0.0.1:1",
@@ -618,13 +752,38 @@ function healthyTimeline(overrides = {}) {
   return Array.from({ length: 46 }, (_, index) => sample(index * 1000, overrides));
 }
 
+/**
+ * A healthy shaped run. Both stages carry a ledger consistent with what they
+ * delivered, because that is what the scored gates read: `admitted_bytes` over
+ * `admitted_span_ms` for the sustained rate, the rolling admitted peak for the
+ * burst, and delivered bytes only as a total against the ledger's own total.
+ */
+function shapedStage(label, kbps, { spanMs, rate, mediaRate }) {
+  const bytes = Math.round((rate * spanMs) / 8);
+  return {
+    label,
+    kbps,
+    bytes,
+    media_bytes: Math.round((mediaRate * spanMs) / 8),
+    measured_kbps: rate,
+    measured_media_kbps: mediaRate,
+    peak_kbps: rate,
+    admitted_bytes: bytes,
+    admitted_span_ms: spanMs,
+    admitted_kbps: rate,
+    admitted_peak_kbps: rate,
+  };
+}
+
 function observation(extra = {}) {
   return {
     shaping: {
       cliff_applied_at_ms: 12_000,
+      slice_bytes: 16 * 1024,
+      max_sockets: 32,
       stages: [
-        { label: "before-cliff", kbps: 8000, measured_kbps: 4100, measured_media_kbps: 4000 },
-        { label: "after-cliff", kbps: 1500, measured_kbps: 1480, measured_media_kbps: 1400 },
+        shapedStage("before-cliff", 8000, { spanMs: 12_000, rate: 4100, mediaRate: 4000 }),
+        shapedStage("after-cliff", 1500, { spanMs: 45_000, rate: 1480, mediaRate: 1400 }),
       ],
     },
     baseline_clock_rate: 1.0,
@@ -635,8 +794,10 @@ function observation(extra = {}) {
   };
 }
 
+// No shaping tolerance appears here, and none is accepted: both shaping gates
+// are the bucket's own conservation identity, so a multiplier would only be an
+// unproved band in which a real leak scores as healthy.
 const CRITERIA = {
-  shaping_tolerance: 1.25,
   baseline_minimum_clock_rate: 0.9,
   maximum_automatic_restarts: 1,
   maximum_upgrades_per_60s: 1,
@@ -661,10 +822,39 @@ test("a cliff that was never applied fails as a shaping fault, not a player faul
 
 test("a shaper that leaked more than its cap fails as a shaping fault", () => {
   const leaked = observation();
-  leaked.shaping.stages[1].measured_kbps = 6000;
+  const after = leaked.shaping.stages[1];
+  // Four times the cap, admitted and delivered alike, over the whole stage.
+  after.admitted_bytes = Math.round((6000 * after.admitted_span_ms) / 8);
+  after.bytes = after.admitted_bytes;
   const score = lab.scoreRecovery(CRITERIA, leaked);
   assert.equal(score.outcome, "shaping");
   assert.match(score.errors[0], /leaked/);
+  assert.match(score.errors[0], /6000 kb\/s/);
+});
+
+// The sustained gate is the same identity as the burst gate, read over the
+// stage's own ledger span. The fixed burst and slice terms are amortized across
+// that span, so a long stage is held far closer to its cap than the flat 1.25x
+// this gate used to carry: 1537.9 kb/s rather than 1875 kb/s on a 45 s stage.
+test("the sustained bound tightens as the stage it scores gets longer", () => {
+  const rate = (spanMs) => (lab.shaperClaimBoundBytes(1500, spanMs) * 8) / spanMs;
+  assert.ok(rate(1_000) > rate(10_000), "a one-second window may claim more than a ten-second one");
+  assert.ok(rate(45_000) < 1500 * 1.05, `a 45s stage is held within 5% of its cap, got ${rate(45_000)}`);
+  assert.ok(rate(45_000) < 1500 * 1.25, "and well inside the flat tolerance this replaced");
+
+  const leaked = observation();
+  const after = leaked.shaping.stages[1];
+  // 1900 kb/s sustained: inside the old flat 1875 kb/s gate's rounding, inside
+  // the one-second burst bound, and past what the bucket can release over 45 s.
+  after.admitted_bytes = Math.round((1900 * after.admitted_span_ms) / 8);
+  after.bytes = after.admitted_bytes;
+  after.admitted_peak_kbps = 1870;
+  assert.ok(1870 < lab.shaperBurstBoundKbps(1500),
+    "the peak must clear the burst gate, or this does not isolate the sustained gate");
+  const score = lab.scoreRecovery(CRITERIA, leaked);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /sustained|admitted \d+ B in/);
+  assert.match(score.errors[0], /1900 kb\/s/);
 });
 
 // The bucket stores 250 ms of credit and serialization allows exactly one
@@ -691,9 +881,8 @@ test("an admitted peak past the conservation ceiling is a leak", () => {
   assert.match(score.errors[0], /1s burst rate of 12000 kb\/s over a 8000 kb\/s cap/);
 });
 
-// The 1% is reporting slack, not room for structural skew. The ceiling already
-// carries the one in-flight slice serialization permits; a second one — the
-// skew a per-connection drain could add — must still fail.
+// The ceiling already carries the one in-flight slice serialization permits; a
+// second one — the skew a per-connection drain could add — must still fail.
 test("one slice past the conservation ceiling is already a leak", () => {
   const leaked = observation();
   const bound = lab.shaperBurstBoundKbps(1500);
@@ -703,25 +892,57 @@ test("one slice past the conservation ceiling is already a leak", () => {
   assert.match(score.errors[0], /1s burst rate/);
 });
 
-test("the burst allowance does not loosen the whole-stage average gate", () => {
-  const leaked = observation();
-  // Inside the after-cliff burst bound, past the sustained bound of 1875 kb/s.
-  leaked.shaping.stages[1].measured_kbps = 1900;
-  leaked.shaping.stages[1].admitted_peak_kbps = 1870;
-  assert.ok(1870 < lab.shaperBurstBoundKbps(1500),
-    "this rate must clear the burst gate, or it does not isolate the sustained gate");
-  const score = lab.scoreRecovery(CRITERIA, leaked);
-  assert.equal(score.outcome, "shaping");
-  assert.match(score.errors[0], /sustained rate of 1900 kb\/s/);
+// The burst gate carries no tolerance multiplier at all, so the slack above the
+// proven ceiling is exactly what rounding the report to 0.1 kb/s can add — one
+// reporting quantum, not the ~100 kb/s a 1% multiplier granted on this stage.
+test("the burst gate allows one reporting quantum above the ceiling and no more", () => {
+  const bound = lab.shaperBurstBoundKbps(8000);
+  const reported = Number(bound.toFixed(1));
+  assert.ok(Math.abs(reported - bound) <= 0.05, "the ceiling is compared at the quantum it is reported in");
+
+  const designed = observation();
+  designed.shaping.stages[0].admitted_peak_kbps = reported;
+  assert.equal(lab.scoreRecovery(CRITERIA, designed).outcome, "passed");
+
+  const over = observation();
+  over.shaping.stages[0].admitted_peak_kbps = Number((reported + 0.1).toFixed(1));
+  const score = lab.scoreRecovery(CRITERIA, over);
+  assert.equal(score.outcome, "shaping",
+    "0.1 kb/s past the ceiling already fails, so no unproved band survives above it");
+  assert.ok(reported + 0.1 < bound * 1.01,
+    "and that failing rate sits inside the 1% band this replaced, which would have passed it");
 });
 
-test("a stage with no delivery samples invalidates shaping evidence", () => {
+test("a stage with no admission ledger invalidates shaping evidence", () => {
   const missing = observation();
-  missing.shaping.stages[1].measured_kbps = null;
+  missing.shaping.stages[1].admitted_bytes = null;
+  missing.shaping.stages[1].admitted_span_ms = null;
   missing.shaping.stages[1].admitted_peak_kbps = null;
   const score = lab.scoreRecovery(CRITERIA, missing);
   assert.equal(score.outcome, "shaping");
-  assert.match(score.errors[0], /no delivery samples for after-cliff/);
+  assert.match(score.errors[0], /no admission ledger for after-cliff/);
+
+  // A half-populated ledger is a broken artifact, not a healthy stage.
+  const partial = observation();
+  partial.shaping.stages[1].admitted_peak_kbps = null;
+  assert.equal(lab.scoreRecovery(CRITERIA, partial).outcome, "shaping");
+});
+
+// The ledger is the shaper's own bookkeeping, so one thing it cannot establish
+// is that the browser was fed from it. Delivered bytes are gated as a total —
+// the one delivered quantity per-connection drain grouping cannot distort.
+test("bytes the browser received but the bucket never released are a leak", () => {
+  const bypassed = observation();
+  bypassed.shaping.stages[1].bytes += (32 * 16 * 1024) + 1;
+  const score = lab.scoreRecovery(CRITERIA, bypassed);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /the browser received \d+ B while the bucket released \d+ B/);
+
+  // The allowance is the evidence-window seam: at most one undrained slice per
+  // connection the proxy will open. Inside it, the run still scores.
+  const seam = observation();
+  seam.shaping.stages[1].bytes += 32 * 16 * 1024;
+  assert.equal(lab.scoreRecovery(CRITERIA, seam).outcome, "passed");
 });
 
 test("a shaping transport error invalidates the recovery verdict", () => {

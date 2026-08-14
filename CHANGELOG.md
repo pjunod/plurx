@@ -87,20 +87,26 @@ bump may break compatibility and a **patch** bump never does.
   outcome — `passed`, `shaping`, `browser_playback`, `server_supply`,
   `recovery`, or `harness` — so a cliff that never applied, a proxy transport
   error, or a shaper that leaked can never be misread as a verdict about
-  playback. A leak is scored against two bounds rather than one, and each bound
-  is applied to the quantity it can actually prove: the whole-stage *delivered*
-  average against `shaping_tolerance`, and the one-second rolling *admitted*
-  peak — the bucket's own signed ledger of claims and refunds — against its
-  token-conservation ceiling of `cap × (1 + 250 ms / 1 s)` plus one 16 KiB
-  slice. Metering the claim rather than the completion is what makes that
-  ceiling a proof: reservations are serialized, so exactly one claim is ever
-  outstanding, while downstream drains are deliberately per-connection, so any
-  number of separately priced slices can finish together and a delivered peak
-  has no bound the design can state. The delivered peak is still reported,
-  because it is what a viewer would have felt, but it is not scored.
-  `shaping_peak_tolerance` therefore covers only the 0.1 kb/s reporting quantum
-  and float rounding, dropping from 1.05 to 1.01, and a second in-flight slice
-  past the ceiling still fails. Recovery criteria are reviewable in
+  playback. A leak is scored entirely from the bucket's own signed ledger of
+  claims and refunds, against one identity read over two windows: no window may
+  claim more than `(250 ms + window) × rate` plus one 16 KiB slice. Over one
+  second that is the familiar 1.25× burst ceiling; over a whole stage the fixed
+  terms amortize, so a 45-second stage is held to 1537.9 kb/s on a 1.5 Mb/s cap
+  rather than the 1875 kb/s a flat tolerance allowed. Metering the claim rather
+  than the completion is what makes it a proof: reservations are serialized, so
+  exactly one claim is ever outstanding, while downstream drains are
+  deliberately per-connection, so separately priced slices can finish together
+  and no delivered *rate* has a bound the design can state — three connections
+  releasing at once deliver a whole stage in a single instant. Delivered rates
+  are therefore reported, because they are what a viewer would have felt, but
+  never scored; delivered *bytes* are gated as a total against admitted bytes,
+  which is the one check the ledger cannot make about itself — that nothing
+  reached the browser without being claimed first. Neither gate carries a
+  tolerance multiplier, since a multiplier is an unproved band in which a real
+  leak scores as healthy: the sustained gate compares exact byte counts and the
+  burst gate compares its bound at the 0.1 kb/s quantum the peak is reported in,
+  so one quantum past the ceiling already fails. Recovery criteria are
+  reviewable in
   `tests/playback/cases.json`, and `playback-lab normalize` reduces a report to
   its behavioral shape with UUIDs, ports, wall-clock, and temporary paths
   removed. This is the harness Performance II N4 requires before its Auto
