@@ -12,12 +12,14 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `52` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `53` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 52 preserves completed iPhone and iPad offline
-> download locations across the equivalent `/private/var` and `/var` container
-> spellings returned by the system. Build 51 divides a long final audio tail into bounded,
+> same regression suite. Build 53 splits season episode cards into Play artwork
+> and Details copy on iPhone/iPad; tvOS keeps one lifted card whose Select
+> action plays. Build 52 preserves completed iPhone and iPad offline download
+> locations across the equivalent `/private/var` and `/var` container spellings
+> returned by the system. Build 51 divides a long final audio tail into bounded,
 > sample-preserving HLS segments. A repeated near-end boundary now completes at
 > the actual media position; a genuinely early repeat stops with telemetry and
 > **Try Again** / **Close** actions instead of reopening forever. build `49`

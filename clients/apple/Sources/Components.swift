@@ -21,6 +21,39 @@ enum LandscapeCardCopyStyle: Equatable {
     case accentPanel
 }
 
+enum EpisodeCardRegion: Equatable {
+    case artwork
+    case copy
+}
+
+enum EpisodeCardAction: Equatable {
+    case play
+    case navigate(Route)
+
+    var destination: Route? {
+        guard case let .navigate(route) = self else { return nil }
+        return route
+    }
+}
+
+/// Keep the region-to-action mapping as a pure contract that XCTest can pin;
+/// `EpisodeCard` remains responsible for wiring each mapped action to its own
+/// SwiftUI control.
+func episodeCardAction(for region: EpisodeCardRegion, itemID: Int) -> EpisodeCardAction {
+    switch region {
+    case .artwork:
+        return .play
+    case .copy:
+        return .navigate(.item(itemID))
+    }
+}
+
+/// A Siri Remote cannot focus half a card. tvOS therefore keeps one lifted
+/// target and makes Select perform the artwork's primary action: playback.
+func tvEpisodeCardSelectionAction() -> EpisodeCardAction {
+    .play
+}
+
 enum LandscapeAccentPanelMetrics {
     static let fillOpacity = 0.055
     static let strokeOpacity = 0.16
@@ -250,52 +283,113 @@ struct LandscapeCard: View {
 struct EpisodeCard: View {
     let item: Item
     var width: CGFloat = shelfLandscapeWidth
+    var isStarting = false
+    let onPlay: () -> Void
 
     var body: some View {
+        #if os(tvOS)
+        Button {
+            perform(tvEpisodeCardSelectionAction())
+        } label: {
+            cardContent
+        }
+        .posterButtonStyle()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(episodeCardPlayAccessibilityLabel(item))
+        .accessibilityValue(tvEpisodeCardAccessibilityValue(item, isStarting: isStarting))
+        #else
         VStack(alignment: .leading, spacing: 8) {
-            ZStack(alignment: .bottomLeading) {
-                AuthImage(
-                    path: item.backdrop ?? item.poster,
-                    targetSize: CGSize(width: width, height: width * 9 / 16)
-                )
-                    .frame(width: width, height: width * 9 / 16)
-                    .clipped()
-                    .background(Palette.surfaceHi)
-                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+            Button {
+                perform(episodeCardAction(for: .artwork, itemID: item.id))
+            } label: {
+                artwork.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(episodeCardPlayAccessibilityLabel(item))
+            .accessibilityValue(episodeCardPlayAccessibilityValue(item, isStarting: isStarting))
 
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.78)],
-                    startPoint: .center,
-                    endPoint: .bottom
-                )
+            if let destination = episodeCardAction(
+                for: .copy,
+                itemID: item.id
+            ).destination {
+                NavigationLink(value: destination) {
+                    copy.contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(episodeCardDetailsAccessibilityLabel(item))
+                .accessibilityValue(episodeCardDetailsAccessibilityValue(item))
+            }
+        }
+        .frame(width: width, alignment: .leading)
+        #endif
+    }
+
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            artwork
+            copy
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    private var artwork: some View {
+        ZStack(alignment: .bottomLeading) {
+            AuthImage(
+                path: item.backdrop ?? item.poster,
+                targetSize: CGSize(width: width, height: width * 9 / 16)
+            )
+                .frame(width: width, height: width * 9 / 16)
+                .clipped()
+                .background(Palette.surfaceHi)
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
-                if item.watch?.watched == true {
-                    Label("Watched", systemImage: "checkmark.circle.fill")
-                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
-                        .background(.black.opacity(0.72), in: Capsule())
-                        .padding(10)
-                }
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.78)],
+                startPoint: .center,
+                endPoint: .bottom
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
-                let fraction = progressFraction(item.watch, runtimeMs: item.runtimeMs)
-                if fraction > 0, fraction < 0.98 {
-                    GeometryReader { geometry in
-                        VStack {
-                            Spacer()
-                            HStack(spacing: 0) {
-                                Rectangle()
-                                    .fill(Palette.accent)
-                                    .frame(width: geometry.size.width * fraction, height: 5)
-                                Rectangle().fill(.white.opacity(0.2)).frame(height: 5)
-                            }
+            if item.watch?.watched == true {
+                Label("Watched", systemImage: "checkmark.circle.fill")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.72), in: Capsule())
+                    .padding(10)
+            }
+
+            let fraction = progressFraction(item.watch, runtimeMs: item.runtimeMs)
+            if fraction > 0, fraction < 0.98 {
+                GeometryReader { geometry in
+                    VStack {
+                        Spacer()
+                        HStack(spacing: 0) {
+                            Rectangle()
+                                .fill(Palette.accent)
+                                .frame(width: geometry.size.width * fraction, height: 5)
+                            Rectangle().fill(.white.opacity(0.2)).frame(height: 5)
                         }
                     }
                 }
             }
 
+            if isStarting {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.black.opacity(0.48))
+                ProgressView()
+                    .tint(.white)
+                    .accessibilityHidden(true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private var copy: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text(episodeCardTitle(item))
                 .font(.callout.weight(.semibold))
                 .foregroundColor(Palette.onBg)
@@ -309,6 +403,15 @@ struct EpisodeCard: View {
             EpisodeMediaSummary(badges: episodeMediaSummaryBadges(item))
         }
         .frame(width: width, alignment: .leading)
+    }
+
+    private func perform(_ action: EpisodeCardAction) {
+        switch action {
+        case .play:
+            onPlay()
+        case .navigate:
+            assertionFailure("EpisodeCard dispatches navigation through its NavigationLink")
+        }
     }
 }
 
@@ -383,6 +486,8 @@ struct MediaRow: View {
     var collection: LibraryCollection?
     var destination: LibraryCollection?
     var landscapeCopyStyle: LandscapeCardCopyStyle = .plain
+    var startingEpisodeID: Int?
+    var onPlayEpisode: ((Item) -> Void)?
 
     var body: some View {
         if !items.isEmpty {
@@ -413,28 +518,36 @@ struct MediaRow: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: shelfSpacing) {
                         ForEach(items) { item in
-                            NavigationLink(value: Route.item(item.id)) {
-                                switch style {
-                                case .poster:
+                            switch style {
+                            case .poster:
+                                NavigationLink(value: Route.item(item.id)) {
                                     PosterCard(
                                         item: item,
                                         width: model.posterSize.posterWidth
                                     )
-                                case .landscape:
+                                }
+                                .posterButtonStyle()
+                            case .landscape:
+                                NavigationLink(value: Route.item(item.id)) {
                                     LandscapeCard(
                                         item: item,
                                         width: model.posterSize.landscapeWidth,
                                         reservesEpisodeSubtitleLine: reservesEpisodeSubtitleLine,
                                         copyStyle: landscapeCopyStyle
                                     )
-                                case .episode:
-                                    EpisodeCard(
-                                        item: item,
-                                        width: model.posterSize.landscapeWidth
-                                    )
                                 }
+                                .posterButtonStyle()
+                            case .episode:
+                                EpisodeCard(
+                                    item: item,
+                                    width: model.posterSize.landscapeWidth,
+                                    isStarting: episodeCardIsStarting(
+                                        startingEpisodeID: startingEpisodeID,
+                                        itemID: item.id
+                                    ),
+                                    onPlay: { onPlayEpisode?(item) }
+                                )
                             }
-                            .posterButtonStyle()
                         }
                     }
                     .padding(.horizontal, screenHPad)
@@ -470,12 +583,48 @@ private func landscapeCardShowTitle(_ item: Item) -> String? {
     return showTitle
 }
 
-private func episodeCardTitle(_ item: Item) -> String {
+func episodeCardTitle(_ item: Item) -> String {
     guard let number = item.episodeNumber else { return item.title }
     return "\(number). \(item.title)"
 }
 
-private func episodeCardMeta(_ item: Item) -> String {
+func episodeCardPlayAccessibilityLabel(_ item: Item) -> String {
+    "Play \(episodeCardTitle(item))"
+}
+
+func episodeCardDetailsAccessibilityLabel(_ item: Item) -> String {
+    "View details for \(episodeCardTitle(item))"
+}
+
+func episodeCardIsStarting(startingEpisodeID: Int?, itemID: Int) -> Bool {
+    startingEpisodeID == itemID
+}
+
+func episodeCardPlayAccessibilityValue(_ item: Item, isStarting: Bool) -> String {
+    if isStarting { return "Starting playback" }
+    if item.watch?.watched == true { return "Watched" }
+    if let position = item.watch?.positionMs, position > 0 {
+        if let remaining = timeRemaining(item) {
+            return "In progress, \(remaining)"
+        }
+        return "In progress"
+    }
+    return "Unwatched"
+}
+
+func episodeCardDetailsAccessibilityValue(_ item: Item) -> String {
+    ([episodeCardMeta(item)] + episodeMediaSummaryBadges(item).map(\.accessibilityLabel))
+        .joined(separator: ", ")
+}
+
+func tvEpisodeCardAccessibilityValue(_ item: Item, isStarting: Bool) -> String {
+    [
+        episodeCardPlayAccessibilityValue(item, isStarting: isStarting),
+        episodeCardDetailsAccessibilityValue(item),
+    ].joined(separator: ", ")
+}
+
+func episodeCardMeta(_ item: Item) -> String {
     var parts: [String] = []
     if let airDate = item.airDate, !airDate.isEmpty {
         parts.append(String(airDate.prefix(10)))

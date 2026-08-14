@@ -4150,6 +4150,59 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.focusStrokeWidth, 1)
     }
 
+    func testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate() {
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "show"), .poster)
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "season"), .episode)
+        XCTAssertEqual(
+            episodeCardAction(for: .artwork, itemID: 72),
+            .play
+        )
+        XCTAssertEqual(
+            episodeCardAction(for: .copy, itemID: 72),
+            .navigate(.item(72))
+        )
+        XCTAssertEqual(tvEpisodeCardSelectionAction(), .play)
+
+        var item = Item(id: 72, kind: "episode", title: "The Target")
+        item.episodeNumber = 3
+        item.airDate = "2026-08-13T12:00:00Z"
+        item.runtimeMs = 3_600_000
+        item.resolution = 2_160
+        item.watch = Watch(positionMs: 900_000, durationMs: 3_600_000, watched: false)
+        XCTAssertEqual(episodeCardPlayAccessibilityLabel(item), "Play 3. The Target")
+        XCTAssertEqual(
+            episodeCardDetailsAccessibilityLabel(item),
+            "View details for 3. The Target"
+        )
+        XCTAssertNotEqual(
+            episodeCardPlayAccessibilityLabel(item),
+            episodeCardDetailsAccessibilityLabel(item)
+        )
+        XCTAssertEqual(
+            episodeCardPlayAccessibilityValue(item, isStarting: false),
+            "In progress, 45m left"
+        )
+        XCTAssertEqual(
+            episodeCardDetailsAccessibilityValue(item),
+            "2026-08-13   1:00:00   45m left, 4K"
+        )
+        XCTAssertEqual(
+            tvEpisodeCardAccessibilityValue(item, isStarting: false),
+            "In progress, 45m left, 2026-08-13   1:00:00   45m left, 4K"
+        )
+        XCTAssertEqual(
+            episodeCardPlayAccessibilityValue(item, isStarting: true),
+            "Starting playback"
+        )
+        item.watch?.watched = true
+        XCTAssertEqual(
+            episodeCardPlayAccessibilityValue(item, isStarting: false),
+            "Watched"
+        )
+        XCTAssertTrue(episodeCardIsStarting(startingEpisodeID: 72, itemID: 72))
+        XCTAssertFalse(episodeCardIsStarting(startingEpisodeID: 73, itemID: 72))
+    }
+
     #if os(tvOS)
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
@@ -4175,8 +4228,6 @@ final class AppleClientTests: XCTestCase {
             900,
             "the first row must begin inside the usable area below the tvOS tab bar"
         )
-        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "show"), .poster)
-        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "season"), .episode)
     }
 
     func testTVPlayableDetailUsesOneCinematicViewportAndUsefulMetadata() throws {
