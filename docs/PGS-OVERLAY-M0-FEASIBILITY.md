@@ -202,7 +202,7 @@ objects differ because they use different object identifiers even though the
 fixture geometry is the same; this keeps the composition fingerprint sensitive
 to state reuse errors.
 
-Twenty-two focused crate tests (nineteen unit tests and three boundary
+Twenty-three focused crate tests (twenty unit tests and three boundary
 integration tests) currently prove:
 
 - normal show and clear normalization;
