@@ -147,9 +147,12 @@ bump may break compatibility and a **patch** bump never does.
   The smoke path remains visibly non-acceptance. A literal golden
   fixture still pins the current VBR recipe hash. No scorer is installed or
   needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer
-  runs afterward. Source implementation is not acceptance: the named-machine
-  full comparison, boot/production proof, and separate forced-fallback run
-  remain unclaimed.
+  runs afterward. The 2026-08-14 nynuc D5 sweep selected QSV quality 22: 21
+  and 22 produced identical QVBR bytes and VMAF on both corpus fixtures, while
+  23 was the first failing value under the easy-byte and VMAF gates. The
+  selected default still requires its post-deploy, no-override acceptance run;
+  the explicit-candidate comparison, boot/production proof, and isolated
+  forced-fallback proof are complete.
 
 - **Performance II N0 makes playback telemetry durable and queryable.** Client
   beacons keep their existing human log lines and additionally enter a bounded,

@@ -94,12 +94,14 @@ impl EffectiveRateControl {
 }
 
 impl Encoder {
-    /// Candidate family defaults. D5 requires the nynuc corpus run to
-    /// calibrate these before N1 acceptance; explicit `transcode.quality`
-    /// overrides let that run sweep candidates without changing code.
+    /// Family defaults. QSV 22 is the highest passing value from the
+    /// 2026-08-14 nynuc D5 sweep; the other families remain candidates until
+    /// the same corpus runs on hardware that can select them. Explicit
+    /// `transcode.quality` overrides keep those sweeps out of code changes.
     pub fn default_quality(self) -> u8 {
         match self {
-            Encoder::Software | Encoder::Nvenc | Encoder::Qsv | Encoder::Vaapi => 23,
+            Encoder::Qsv => 22,
+            Encoder::Software | Encoder::Nvenc | Encoder::Vaapi => 23,
             Encoder::VideoToolbox => 65,
         }
     }
@@ -1194,6 +1196,15 @@ mod tests {
         ] {
             assert!(!caps.supported_by(encoder), "{encoder:?}");
         }
+    }
+
+    #[test]
+    fn family_quality_defaults_keep_the_measured_qsv_value_pinned() {
+        assert_eq!(Encoder::Qsv.default_quality(), 22);
+        assert_eq!(Encoder::Software.default_quality(), 23);
+        assert_eq!(Encoder::Nvenc.default_quality(), 23);
+        assert_eq!(Encoder::Vaapi.default_quality(), 23);
+        assert_eq!(Encoder::VideoToolbox.default_quality(), 65);
     }
 
     /// The admission pool's thread budget reaches x264 as an explicit

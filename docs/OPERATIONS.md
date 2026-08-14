@@ -475,11 +475,22 @@ curl -fsS -X PUT \
   http://nynuc:32400/api/v1/settings
 ```
 
-The built-in quality numbers are calibration candidates until N1's nynuc run
-accepts one value per encoder family. Do not treat source defaults or a
-successful 15-frame validation probe as D5 evidence. Effective VBR retains the
-literal legacy recipe bytes; each effective quality value has a distinct
-recipe identity, so a requested mode that falls back cannot poison the cache.
+QSV's built-in value is **22**, selected by the 2026-08-14 nynuc D5 sweep.
+Values 21 and 22 produced byte-for-byte identical QVBR captures on both corpus
+halves; 23 was the first failing value because the easy clip grew by 940 bytes
+and lost 0.004328 VMAF. Choosing the highest passing value keeps the most
+compression headroom without crossing either binding gate. The other family
+defaults remain calibration candidates until the corpus runs on hardware that
+can select them; a successful 15-frame validation probe is capability evidence,
+not D5 calibration.
+
+The q=22 result is deliberately modest: easy-content bytes fell from
+31,764,104 to 31,763,916, while the hard clip gained 0.020034 VMAF and grew
+0.53%. It proves bounded flat-quality behavior on nynuc; it does not claim the
+plan's expected 10–35% typical-content savings from this two-clip corpus.
+Effective VBR retains the literal legacy recipe bytes; each effective quality
+value has a distinct recipe identity, so a requested mode that falls back
+cannot poison the cache.
 
 Both rate-control fields are required whenever either is updated; the server
 stores them as one pair. In a cluster the requested pair replicates, while a
