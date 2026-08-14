@@ -1550,13 +1550,19 @@ mod startup_tests {
             .expect("bind");
 
         let daemon = daemon_off_the_mdns_port().expect("mDNS daemon");
-        // Withdraw it first. Nothing was ever registered, so this puts no
-        // record on the network at any point.
+        // Withdraw it first, and wait for the daemon to report that it has
+        // actually stopped — otherwise the withdrawal inside `serve` races the
+        // daemon thread and may still be accepted, which is not the case this
+        // owns. Nothing was ever registered, so no record reaches the network.
         daemon
             .shutdown()
-            .expect("the first withdrawal is the real one");
+            .expect("the first withdrawal is the real one")
+            .recv()
+            .expect("the daemon reports when it has stopped");
 
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let logs = Arc::new(logbuf::LogBuffer::new(64));
+        let _capture = capturing(&logs);
         let served = tokio::spawn(serve(listener, app, progress, Some(daemon), async move {
             let _ = stopped.await;
         }));
@@ -1567,6 +1573,106 @@ mod startup_tests {
             .expect("serve must finish inside the drain window")
             .expect("join")
             .expect("a discovery daemon that cannot be withdrawn is not a failed shutdown");
+
+        // Exiting 0 is only half of it. A withdrawal that silently did not
+        // happen leaves a record on the LAN for a server that is gone, so the
+        // operator has to be told which half of the drain failed.
+        let warned = logs.tail("warn", 64);
+        assert!(
+            warned
+                .iter()
+                .any(|entry| entry.message.contains("Bonjour discovery shutdown failed")),
+            "the failed withdrawal must reach the operator: {warned:?}"
+        );
+    }
+
+    /// Playback progress is coalesced in memory, so the beats between one
+    /// durable commit and the next exist nowhere else. A `docker stop` in that
+    /// window must commit them rather than drop them — resuming a film minutes
+    /// behind where it was left is the failure an operator actually sees — and
+    /// the drain says how many it saved.
+    #[tokio::test]
+    async fn playback_progress_pending_at_shutdown_is_committed_not_lost() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = booted_state(tmp.path());
+        let store = Arc::clone(&state.store);
+        let progress = Arc::clone(&state.progress);
+
+        let user = store
+            .create_user("viewer", "hash", false)
+            .await
+            .expect("user");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Films".to_owned(),
+                kind: LibraryKind::Movies,
+                paths: vec![std::path::PathBuf::from("/films")],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Interrupted".to_owned(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+
+        // The first beat commits durably; the second lands inside the commit
+        // window and so exists only in memory. That is the one at risk.
+        progress
+            .put(user.id, item, 1_000, Some(100_000))
+            .await
+            .expect("leading beat");
+        progress
+            .put(user.id, item, 7_000, Some(100_000))
+            .await
+            .expect("pending beat");
+
+        let app = http::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let logs = Arc::new(logbuf::LogBuffer::new(64));
+        let _capture = capturing(&logs);
+        let served = tokio::spawn(serve(listener, app, progress, None, async move {
+            let _ = stopped.await;
+        }));
+        stop.send(()).expect("stop");
+
+        tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("serve must finish inside the drain window")
+            .expect("join")
+            .expect("a clean drain");
+
+        assert_eq!(
+            store
+                .watch_state(user.id, item)
+                .await
+                .expect("watch state")
+                .expect("a watched item")
+                .position_ms,
+            7_000,
+            "the beat that was only in memory has to survive the shutdown"
+        );
+        let flushed = logs.tail("info", 64);
+        assert!(
+            flushed.iter().any(|entry| entry
+                .message
+                .contains("flushed coalesced playback progress during shutdown")
+                && entry.message.contains("flushed=1")),
+            "the drain must report what it saved: {flushed:?}"
+        );
     }
 
     /// A loopback bind is common behind a proxy. Advertising it would put a
@@ -2424,6 +2530,34 @@ mod startup_tests {
         assert!(mdns_advertising_enabled());
     }
 
+    /// Run a closure with every event it emits captured, and hand back the log.
+    ///
+    /// A `tracing` macro only evaluates its fields when a subscriber wants
+    /// them, so a test with no subscriber is not exercising the log line it
+    /// thinks it is. Reuses the buffer layer the settings page reads.
+    fn captured(body: impl FnOnce()) -> Arc<logbuf::LogBuffer> {
+        use tracing_subscriber::prelude::*;
+        let logs = Arc::new(logbuf::LogBuffer::new(64));
+        let subscriber =
+            tracing_subscriber::registry().with(logbuf::BufferLayer(Arc::clone(&logs)));
+        tracing::subscriber::with_default(subscriber, body);
+        logs
+    }
+
+    /// The async counterpart: capture on this thread until the guard drops.
+    ///
+    /// `#[tokio::test]` runs a current-thread runtime, so the tasks the code
+    /// under test spawns are polled on this thread too and their events land in
+    /// the same buffer. Attaching the subscriber to one future would not reach
+    /// them, and a warning from a spawned task is exactly what a best-effort
+    /// subsystem reports itself with.
+    fn capturing(logs: &Arc<logbuf::LogBuffer>) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::prelude::*;
+        tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(logbuf::BufferLayer(Arc::clone(logs))),
+        )
+    }
+
     /// A daemon that records what it was asked to publish and can be told to
     /// refuse either call. Nothing here opens a socket, which is what keeps
     /// the mandatory unit and coverage gates off the local network.
@@ -2455,18 +2589,21 @@ mod startup_tests {
 
     /// The whole of what a successful registration publishes: the record every
     /// client on the LAN discovers this server by. A wrong port or a missing
-    /// identity property here is a server nothing can connect to.
+    /// identity property here is a server nothing can connect to, and the log
+    /// line is how an operator confirms which port went out.
     #[test]
     fn a_registration_publishes_the_record_clients_discover() {
         let daemon = FakeDaemon::default();
-        register_advertiser(
-            &daemon,
-            "plurxd-selftest-instance",
-            "Living Room",
-            "192.168.1.9:32400".parse().expect("addr"),
-            "0.2.0",
-        )
-        .expect("a daemon that accepts both calls registers");
+        let logs = captured(|| {
+            register_advertiser(
+                &daemon,
+                "plurxd-selftest-instance",
+                "Living Room",
+                "192.168.1.9:32400".parse().expect("addr"),
+                "0.2.0",
+            )
+            .expect("a daemon that accepts both calls registers");
+        });
 
         let registered = daemon.registered.lock().expect("lock");
         assert_eq!(registered.len(), 1, "exactly one record is published");
@@ -2478,6 +2615,141 @@ mod startup_tests {
             "{}",
             service.get_fullname()
         );
+
+        let announced = logs.tail("info", 8);
+        let line = announced
+            .iter()
+            .find(|entry| {
+                entry
+                    .message
+                    .contains("Bonjour discovery advertiser registered")
+            })
+            .unwrap_or_else(|| panic!("a registration must be logged: {announced:?}"));
+        assert!(
+            line.message.contains("port=32400"),
+            "the log must name the port that was published: {}",
+            line.message
+        );
+    }
+
+    /// A record that cannot be built is the third way a registration fails,
+    /// and the one an operator can cause by typing: a server name past the
+    /// 255-byte TXT limit. It has to surface as an error the boot carries on
+    /// from, never a panic, and nothing may be published for it.
+    #[test]
+    fn a_server_name_too_long_to_advertise_is_an_error_not_a_panic() {
+        let daemon = FakeDaemon::default();
+        let error = format!(
+            "{:#}",
+            register_advertiser(
+                &daemon,
+                "instance-1",
+                &"Living Room ".repeat(30),
+                "192.168.1.9:32400".parse().expect("addr"),
+                "0.2.0",
+            )
+            .expect_err("a record that cannot be built is an error")
+        );
+        assert!(error.contains("255-byte limit"), "{error}");
+        assert!(
+            daemon.registered.lock().expect("lock").is_empty(),
+            "nothing may be published for a record that was never built"
+        );
+    }
+
+    /// The real daemon's monitor hands back a stream that ends when the daemon
+    /// does. That is what lets the monitor thread exit with the server instead
+    /// of outliving it; nothing is registered, so nothing reaches the network.
+    #[test]
+    fn a_real_daemons_monitor_ends_with_the_daemon() {
+        let daemon = daemon_off_the_mdns_port().expect("mDNS daemon");
+        let mut events = MdnsRegistrar::monitor(&daemon).expect("a live daemon can be monitored");
+        daemon.shutdown().expect("withdrawal");
+
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Drains whatever the shutdown itself emitted, then ends.
+            while events.next().is_some() {}
+            let _ = done.send(());
+        });
+        ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a daemon that is gone must end its event stream");
+    }
+
+    /// A GDM port the kernel will not give up is the ordinary case on a box
+    /// already running Plex. It must leave the server running and say so —
+    /// discovery is best-effort, and a warning is the only trace there is.
+    #[tokio::test]
+    async fn a_gdm_port_that_cannot_be_bound_is_a_warning_not_a_failure() {
+        // Hold the port first, so the responder's bind is refused. Loopback
+        // UDP only: this never joins a multicast group.
+        let held = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("holding a port");
+        let taken = held.local_addr().expect("addr").port();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_in(tmp.path());
+        let logs = Arc::new(logbuf::LogBuffer::new(64));
+        let _capture = capturing(&logs);
+        // The responder is spawned, not awaited — a bind that fails must not be
+        // something the caller waits on.
+        spawn_gdm_responder(&config, "instance-1".to_owned(), taken);
+        for _ in 0..50 {
+            if !logs.tail("warn", 8).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let warned = logs.tail("warn", 8);
+        let line = warned
+            .iter()
+            .find(|entry| {
+                entry
+                    .message
+                    .contains("GDM discovery responder unavailable")
+            })
+            .unwrap_or_else(|| panic!("a refused GDM bind must be logged: {warned:?}"));
+        assert!(
+            line.message.contains("binding GDM port"),
+            "the operator needs the reason, not just the symptom: {}",
+            line.message
+        );
+    }
+
+    /// The one line an operator reads to confirm which server, which node, and
+    /// which data directory this process actually came up on. A cluster makes
+    /// the two identities easy to confuse, so both have to be in it.
+    #[test]
+    fn the_startup_line_names_both_identities_and_the_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_in(tmp.path());
+        let identity = plurx_core::cluster::ClusterIdentity {
+            cluster_id: "cluster-abc".to_owned(),
+            node_id: "node-2".to_owned(),
+            raft_id: 1,
+        };
+
+        let logs = captured(|| log_startup(&config, &identity));
+        let started = logs.tail("info", 8);
+        let line = started
+            .iter()
+            .find(|entry| entry.message.contains("plurxd starting"))
+            .unwrap_or_else(|| panic!("startup must be logged: {started:?}"));
+        for expected in [
+            "instance_id=cluster-abc",
+            "node_id=node-2",
+            crate::version::SEMVER,
+            &tmp.path().display().to_string(),
+        ] {
+            assert!(
+                line.message.contains(expected),
+                "the startup line must name {expected}: {}",
+                line.message
+            );
+        }
     }
 
     /// Monitoring is established before the record exists. A daemon that
@@ -2538,12 +2810,7 @@ mod startup_tests {
     /// errors, ignores the ordinary traffic, and ends when the daemon does.
     #[test]
     fn the_monitor_logs_daemon_errors_and_nothing_else() {
-        use tracing_subscriber::prelude::*;
-
-        let logs = Arc::new(logbuf::LogBuffer::new(16));
-        let subscriber =
-            tracing_subscriber::registry().with(logbuf::BufferLayer(Arc::clone(&logs)));
-        tracing::subscriber::with_default(subscriber, || {
+        let logs = captured(|| {
             log_mdns_events(
                 vec![
                     mdns_sd::DaemonEvent::Announce(
