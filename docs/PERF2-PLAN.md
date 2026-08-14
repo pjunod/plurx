@@ -321,10 +321,11 @@ each stall instant, joined in one record. An Android play produces a
 
 ## 4. N1 — Quality-bounded rate control
 
-**Implementation status (2026-08-12):** the harness, runtime settings,
+**Implementation status (2026-08-14):** the harness, runtime settings,
 per-family quality arguments, behavioral validation/fallback, atomically
 published effective mode, single recipe builder, legacy-VBR golden identity,
-and pinned full SDR corpus are implemented in source. A two-second background
+and pinned full SDR corpus are implemented and accepted on the reserved nynuc
+QSV path. A two-second background
 refresh on each server reads the replicated requested pair and validates
 changes against that node's encoder. Those runtime probes share the existing
 offline/speculative encoder lane, reserve background admission, defer behind
@@ -348,9 +349,21 @@ behavior-probed and scores captured bytes on the controller only after the
 production session ends; it never encodes playback or becomes a live-path
 dependency. No scorer is installed or needed on nynuc or in compose: nynuc
 performs production encoding and the accepted laptop controller scorer runs
-afterward. The named-machine quantitative capture/full comparison remains
-unclaimed, as do N1 boot/production evidence and the separate forced-fallback
-run that prove the requested mode executed.
+afterward. The named-machine evidence is complete. The deployed
+`v0.2.7-167-gb6aaed6` build passed the full corpus with no quality override;
+the artifact records `transcode_quality: null`, and four production argument
+logs prove two legacy VBR sessions plus two QSV sessions using
+`-global_quality 22`. The isolated forced-fallback session also passed.
+Artifact SHA-256 values are:
+
+- final deployed-default comparison: `88e47f2bb20cf166d61f4470419f9ff7c3ea966a77b1f701b909b6952b60cbba`;
+- explicit q=22 calibration candidate: `67b617edc758c862cf8f9040bab1eae62e4a247674d30aeb08c41ec9964db69e`;
+- isolated forced-fallback proof: `4b5efac48d77459cddf20894bbdc2318cda1dad88745e3d5a9e12c2216d715ab`.
+
+The q=21 and q=22 candidate captures were byte-for-byte identical on both
+fixtures; q=23 was the first failure. QSV therefore defaults to 22. Other
+encoder-family values remain candidates until equivalent hardware can run the
+same calibration; that does not weaken the accepted nynuc QSV path.
 The owner also ratified the 10-second complete-served-segment advertised-peak
 gate on 2026-08-12. A fixed 10-second window spans five nominal HLS segments
 and is stable under the served-segment measurement quantum; the derived
@@ -1331,11 +1344,12 @@ settings and may be amended without changing the contracts below.
    acceptance has survived a fleet cycle. The efficiency is free;
    the compatibility matrix is the only risk and it is per-client
    gated.
-5. **D5 — quality-mode targets.** N1 ships family-tuned defaults
-   calibrated on the corpus (one number per family); N2's per-title
-   targets supersede them where analysis exists. The corpus
-   calibration run is part of N1 acceptance, so this decision is
-   "accept the calibrated numbers," not "invent numbers."
+5. **D5 — quality-mode targets.** Accepted 2026-08-14 for nynuc QSV: quality
+   22 is the highest passing value from the q=21/22/23 corpus sweep. QSV 21
+   and 22 were byte-for-byte identical; 23 was the first failure. Other
+   family values remain provisional until the same corpus can run on their
+   hardware. N2's per-title targets supersede these defaults where analysis
+   exists.
 6. **D6 — LLM backend.** `none` is the shipped default forever
    (principle 2). Recommendation beyond that is personal preference:
    the `command` adapter with a local 8B model is the
