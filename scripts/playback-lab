@@ -694,6 +694,12 @@ class ShapingProxy {
     this.frozenTelemetry = null;
     this.deliverySamples = profile.stages.map(() => []);
     this.admissionSamples = profile.stages.map(() => []);
+    // Claims priced by the bucket but not yet delivered or refunded. Held by
+    // identity, not as a count, so the evidence seam below can exempt exactly
+    // the slices that crossed it instead of a blanket per-socket allowance.
+    this.pendingClaims = new Set();
+    this.evidencePendingBytes = 0;
+    this.carriedOverBytes = 0;
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -742,6 +748,18 @@ class ShapingProxy {
     stage.media_bytes = 0;
     this.deliverySamples[this.stageIndex] = [];
     this.admissionSamples[this.stageIndex] = [];
+    // Clearing the ledger opens a seam: a slice the bucket already priced can
+    // be delivered after the reset with its claim left in the discarded series.
+    // Snapshot exactly which claims are outstanding at this instant so the
+    // delivery gate can exempt those completions and nothing else. Marking the
+    // claims themselves — rather than trusting a `max_sockets x slice_bytes`
+    // ceiling — keeps an unclaimed byte unexempt even when it is the only one.
+    this.evidencePendingBytes = 0;
+    this.carriedOverBytes = 0;
+    for (const claim of this.pendingClaims) {
+      claim.crossedEvidenceSeam = true;
+      this.evidencePendingBytes += claim.bytes;
+    }
   }
 
   /** Drop the link to the next stage. Called once, at a point the report keeps. */
@@ -778,7 +796,20 @@ class ShapingProxy {
    */
   meterAdmission(bytes, media, at = this.now()) {
     this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes, media });
-    return { media };
+    // The claim stays outstanding until its slice is delivered or refunded. It
+    // is the provenance the delivery gate needs: an exemption is granted to a
+    // completion only when it can name the claim it belongs to.
+    const claim = { media, bytes, crossedEvidenceSeam: false };
+    this.pendingClaims.add(claim);
+    return claim;
+  }
+
+  /**
+   * Retire a claim without delivering it. The bytes never reach the exemption,
+   * so a canceled pre-seam reservation cannot widen the delivery allowance.
+   */
+  settleClaim(claim) {
+    if (claim) this.pendingClaims.delete(claim);
   }
 
   /**
@@ -797,7 +828,16 @@ class ShapingProxy {
     this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes: -bytes, media });
   }
 
-  record(bytes, media) {
+  record(bytes, media, claim = null) {
+    // A completion is exempt from the delivery gate only when it carries the
+    // identity of a claim that was already outstanding when `beginEvidence`
+    // discarded the ledger holding it. Crediting the claim's own bytes — once,
+    // and only on delivery — bounds the allowance by what actually crossed the
+    // seam instead of by how many sockets the proxy may open.
+    if (claim?.crossedEvidenceSeam && this.pendingClaims.has(claim)) {
+      this.carriedOverBytes += Math.min(bytes, claim.bytes);
+    }
+    this.settleClaim(claim);
     // What the browser received, billed to the stage current at completion.
     // Reservations are priced when they are claimed and recorded only once
     // their own connection drains, so this series says when bytes landed, not
@@ -884,17 +924,32 @@ class ShapingProxy {
         throw new Error("client cancelled the transfer");
       }
       if (!sink.write(slice)) await this.waitForDrain(sink, cancelled);
-      if (cancelled() || sink.destroyed) throw new Error("client cancelled the transfer");
-      this.record(slice.length, media);
+      // The downstream has taken the slice: either the write was accepted
+      // outright or `drain` reported the buffer emptied behind it. That is the
+      // commit point, and it is deliberately reached before the cancellation
+      // check below. A close landing between `drain` and this continuation
+      // resuming used to refund the reservation and drop the delivery, so the
+      // bucket got back credit it had already spent on bytes the socket
+      // accepted and the artifact showed neither — the limiter could then
+      // release the same bytes a second time and still score clean. A
+      // reservation the client abandons *before* the downstream takes it is
+      // the genuinely refundable case, and `waitForDrain` still rejects there.
       committed = true;
+      this.record(slice.length, media, admission);
+      if (cancelled() || sink.destroyed) throw new Error("client cancelled the transfer");
     } finally {
-      // A canceled restart must not leave debt in the shared link or meter a
-      // slice the browser never received. The next rendition gets only the
-      // credit genuinely earned while the canceled reservation was waiting.
-      if (admission && !committed && !this.closed) {
-        const at = this.now();
-        this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at);
-        this.wakeLimiter();
+      // A restart canceled *before* the downstream write must not leave debt in
+      // the shared link or meter a slice the browser never received. The next
+      // rendition gets only the credit genuinely earned while the canceled
+      // reservation was waiting. `committed` is set at the write, so this path
+      // can only be reached by a reservation that never reached the socket.
+      if (admission && !committed) {
+        this.settleClaim(admission);
+        if (!this.closed) {
+          const at = this.now();
+          this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at);
+          this.wakeLimiter();
+        }
       }
     }
   }
@@ -919,10 +974,13 @@ class ShapingProxy {
       }
       return admission;
     } catch (error) {
-      if (admission && !this.closed) {
-        const at = this.now();
-        this.meterRefund(this.bucket.refund(bytes, at), admission.media, at);
-        this.wakeLimiter();
+      if (admission) {
+        this.settleClaim(admission);
+        if (!this.closed) {
+          const at = this.now();
+          this.meterRefund(this.bucket.refund(bytes, at), admission.media, at);
+          this.wakeLimiter();
+        }
       }
       throw error;
     }
@@ -990,10 +1048,18 @@ class ShapingProxy {
       spec: this.profile.spec,
       cliff_after_seconds: this.profile.cliff_after_seconds,
       cliff_applied_at_ms: this.stages[1] ? this.stages[1].entered_at_ms : null,
-      // The two constants the scored bounds are built from, so an artifact can
-      // be rechecked without the script that produced it.
+      // The constants the scored bounds are built from, so an artifact can be
+      // rechecked without the script that produced it. `max_sockets` is
+      // reported for context only; no scored bound is derived from it any more.
       slice_bytes: SHAPER_SLICE_BYTES,
       max_sockets: this.agent.maxSockets,
+      // The measured evidence seam. `evidence_pending_claim_bytes` is what the
+      // bucket had priced but not yet delivered when `beginEvidence` discarded
+      // the ledger; `carried_over_bytes` is how much of that was actually
+      // delivered afterwards. Only the latter is exempt from the delivery gate,
+      // so an artifact records the provenance of every byte it excuses.
+      evidence_pending_claim_bytes: this.evidencePendingBytes,
+      carried_over_bytes: this.carriedOverBytes,
       transport_errors: this.errors.slice(-10),
       stages: this.stages.map((stage) => {
         const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
@@ -1991,19 +2057,25 @@ function scoreRecovery(criteria, observation) {
   // and the rates computed from them do not, so this is the only shape a
   // delivered quantity can be gated in. It proves the one thing the ledger
   // cannot prove about itself: that nothing reached the browser without being
-  // claimed from the bucket first. The allowance is the evidence window's own
-  // seam — `beginEvidence` clears both series mid-stage, so a slice claimed
-  // before the first frame and drained after it is delivered here without its
-  // claim, at most one per connection the proxy will open.
+  // claimed from the bucket first.
+  //
+  // The allowance is the evidence window's own seam, measured rather than
+  // assumed. `beginEvidence` clears both series mid-stage, so a slice the
+  // bucket priced before the first frame can be delivered after it with its
+  // claim in the discarded ledger. The shaper marks exactly those outstanding
+  // claims and counts a byte here only when the completion names one of them.
+  // A blanket `max_sockets x slice_bytes` ceiling would instead excuse that
+  // many unclaimed bytes from anywhere in the run — at 1.5 Mb/s, seconds of
+  // link capacity with no provenance at all.
   const delivered = shaping.stages.reduce((total, stage) => total + (stage.bytes || 0), 0);
   const admitted = shaping.stages.reduce((total, stage) => total + (stage.admitted_bytes || 0), 0);
-  const inFlight = (shaping.max_sockets ?? 32) * (shaping.slice_bytes ?? SHAPER_SLICE_BYTES);
-  if (delivered > admitted + inFlight) {
+  const carriedOver = shaping.carried_over_bytes ?? 0;
+  if (delivered > admitted + carriedOver) {
     return {
       outcome: "shaping",
       errors: [
         `the shaper leaked: the browser received ${delivered} B while the bucket released ${admitted} B`
-        + ` (allowing ${inFlight} B in flight across the evidence window)`,
+        + ` (exempting ${carriedOver} B claimed before the evidence window and delivered inside it)`,
       ],
       metrics: { shaping },
     };

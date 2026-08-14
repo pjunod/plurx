@@ -229,11 +229,24 @@ reported, because they are what a viewer would have felt.
 Delivered **bytes** are a different matter — a total survives regrouping when a
 rate does not — and they carry the one check the ledger cannot make about
 itself: that nothing reached the browser without being claimed from the bucket
-first. Total delivered bytes are gated against total admitted bytes, allowing
-one undrained slice per connection the proxy will open, which is the evidence
-window's own seam: `beginEvidence` clears both series mid-stage, so a slice
-claimed before the first frame and drained after it is delivered without its
-claim.
+first. Total delivered bytes are gated against total admitted bytes.
+
+That gate needs one exemption, because `beginEvidence` clears both series
+mid-stage: a slice the bucket priced before the first presented frame can be
+delivered after it with its claim in the discarded ledger. The exemption is
+**measured, not assumed**. The shaper holds every priced-but-undelivered claim
+by identity, marks exactly those outstanding when the evidence window opens, and
+counts a byte as exempt only when the completion names one of them. A claim that
+is refunded instead of delivered never becomes allowance. The artifact records
+both quantities — `evidence_pending_claim_bytes`, what was in flight at the
+seam, and `carried_over_bytes`, how much of it actually crossed — so the
+provenance of every excused byte is re-checkable without the script.
+
+A blanket `max_sockets × slice_bytes` ceiling was wrong here and was removed: at
+32 sockets it excused 512 KiB of delivery with no claim behind it anywhere in
+the run, which at 1.5 Mb/s is 2.8 seconds of link capacity scoring `passed`.
+`max_sockets` is still reported for context, but no scored bound is derived from
+it.
 
 Scheduler delay lengthens the observed window and lowers the measured peak
 instead of spending additional headroom.
@@ -243,6 +256,16 @@ shaped link. The proxy freezes one telemetry snapshot when the observation ends
 and reuses it at both result and report level. Browser-side request cancellation
 during a rendition restart closes the matching upstream request, refunds an
 undelivered reservation, and is not a link error.
+
+A reservation stops being refundable the moment the downstream takes its slice —
+either `write` accepted it outright or `drain` reported the buffer emptied behind
+it. A `close` arriving after that point, including one that lands between `drain`
+and the continuation resuming, leaves both the admission and the delivery
+standing. Refunding there would return credit the bucket had already spent on
+bytes the socket accepted and drop the delivery from the artifact at the same
+time, letting the limiter release those bytes a second time and still score
+clean. Only a transfer the client abandons *before* the downstream takes the
+slice is refunded, which is the rung switch the stall-recovery suite exercises.
 
 **The profile grammar** is `<high>-to-<low>[@<seconds>]`, e.g.
 `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`. The descent is mandatory: a flat

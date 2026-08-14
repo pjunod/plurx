@@ -597,10 +597,145 @@ test("a refund after the cliff is withdrawn from the stage whose bucket took it"
   assert.ok(after.admitted_peak_kbps + (lab.SHAPER_SLICE_BYTES * 8) / 1000 > bound,
     "one more unaccounted slice must break the ceiling, or the credit was never binding");
 
+  // End to end the abandoned slice balances: it is claimed pre-cliff, refunded
+  // post-cliff, and never delivered, so the shaper's own totals agree without
+  // any allowance at all.
+  const whole = shaper.telemetry();
+  assert.equal(whole.stages.reduce((total, stage) => total + stage.bytes, 0), 327_680);
+  assert.equal(whole.stages.reduce((total, stage) => total + stage.admitted_bytes, 0), 327_680);
+
   const observed = observation();
   observed.shaping.stages[1] = after;
+  // `after` records a refund of a claim the pre-cliff bucket really made, so
+  // the synthetic pre-cliff stage has to carry that claim for the two stages to
+  // describe one run. Without it the pair is missing 16 KiB of admission that
+  // the real telemetry above has.
+  observed.shaping.stages[0].admitted_bytes += slice.length;
   const score = lab.scoreRecovery(CRITERIA, observed);
   assert.deepEqual(score.errors, [], "a canceled transfer across the cliff is not a shaper leak");
+  await shaper.close();
+});
+
+/*
+ * A slice the downstream has already taken is spent. The reservation used to
+ * stay refundable until after the post-drain cancellation check, so a `close`
+ * landing between `drain` and that continuation resuming handed the bucket back
+ * credit it had spent on bytes the socket accepted, and dropped the delivery
+ * from the artifact at the same time. Reproduced at 32 sinks: 524,288 B went
+ * downstream against a 250,759 B one-second bound and still scored `passed`.
+ */
+test("a drain-then-close race can neither refund a taken slice nor erase it", async () => {
+  const [shaper] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  let closing = false;
+  const open = () => closing;
+
+  const sinks = [];
+  const writes = [];
+  for (let index = 0; index < 32; index += 1) {
+    const sink = heldSink();
+    sinks.push(sink);
+    writes.push(shaper.writeShaped(slice, sink, true, open).catch(() => null));
+  }
+  await settle();
+  const accepted = sinks.reduce((total, sink) => total + sink.written, 0);
+  assert.equal(accepted, 32 * slice.length, "every sink took its slice");
+
+  // Each sink drains — the bytes are downstream's — and only then closes,
+  // before the continuation that follows the drain can resume.
+  for (const sink of sinks) sink.release();
+  closing = true;
+  for (const sink of sinks) {
+    sink.destroyed = true;
+    sink.emit("close");
+  }
+  await Promise.all(writes);
+
+  const telemetry = shaper.telemetry();
+  const delivered = telemetry.stages.reduce((total, stage) => total + stage.bytes, 0);
+  const admitted = telemetry.stages.reduce((total, stage) => total + stage.admitted_bytes, 0);
+  assert.equal(delivered, accepted, "a taken slice cannot vanish from the artifact");
+  assert.equal(admitted, accepted, "and cannot be refunded back into the bucket");
+  assert.deepEqual(
+    telemetry.stages.flatMap((stage, index) => shaper.admissionSamples[index])
+      .filter((entry) => entry.bytes < 0),
+    [],
+    "no refund is filed for a slice the downstream already took",
+  );
+
+  // The old behavior scored this clean while the link carried every byte.
+  const observed = observation();
+  observed.shaping.stages[1] = telemetry.stages[0];
+  assert.equal(delivered > admitted, false, "delivery never exceeds admission after the race");
+  await shaper.close();
+});
+
+/*
+ * `beginEvidence` discards the ledger mid-stage, so a slice the bucket priced
+ * before the first presented frame can be delivered after it with its claim in
+ * the discarded series. The allowance for that seam used to be a blanket
+ * `max_sockets x slice_bytes` — 512 KiB usable by delivery with no claim behind
+ * it anywhere. It is now the measured bytes of the claims that actually crossed.
+ */
+test("the evidence seam exempts the claims that crossed it and nothing else", async () => {
+  const [shaper] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  const open = () => false;
+
+  // One slice is priced, then held by a sink that has not drained yet.
+  const held = heldSink();
+  const crossing = shaper.writeShaped(slice, held, true, open);
+  await settle();
+  assert.equal(shaper.pendingClaims.size, 1, "the claim is outstanding at the seam");
+
+  // The first frame arrives and the ledger holding that claim is discarded.
+  shaper.beginEvidence();
+  assert.equal(shaper.telemetry().evidence_pending_claim_bytes, slice.length,
+    "the artifact records what was actually in flight, not a socket-count ceiling");
+  assert.equal(shaper.telemetry().carried_over_bytes, 0, "nothing has crossed yet");
+
+  // It drains after the reset, so this completion is the genuine carry-over.
+  held.release();
+  await crossing;
+  assert.equal(shaper.telemetry().carried_over_bytes, slice.length);
+
+  const carried = shaper.telemetry();
+  const delivered = carried.stages.reduce((total, stage) => total + stage.bytes, 0);
+  const admitted = carried.stages.reduce((total, stage) => total + stage.admitted_bytes, 0);
+  assert.equal(delivered - admitted, slice.length,
+    "the delivery outruns the surviving ledger by exactly the slice that crossed");
+
+  // Scored with its provenance the run is clean; one unclaimed byte past it is
+  // not, where the blanket allowance would have excused 512 KiB of it.
+  const observed = observation();
+  observed.shaping.carried_over_bytes = slice.length;
+  observed.shaping.stages[1].bytes += slice.length;
+  assert.equal(lab.scoreRecovery(CRITERIA, observed).outcome, "passed");
+  observed.shaping.stages[1].bytes += 1;
+  assert.equal(lab.scoreRecovery(CRITERIA, observed).outcome, "shaping");
+  await shaper.close();
+});
+
+test("a claim canceled before it is delivered never widens the seam allowance", async () => {
+  const [shaper] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  let closing = false;
+
+  const held = heldSink();
+  const abandoned = shaper.writeShaped(slice, held, true, () => closing).catch(() => null);
+  await settle();
+  shaper.beginEvidence();
+  assert.equal(shaper.telemetry().evidence_pending_claim_bytes, slice.length);
+
+  // The player abandons the rung before the sink ever drains, so the slice
+  // never reached the wire. It is refunded, and it is not a carry-over.
+  closing = true;
+  held.destroyed = true;
+  held.emit("close");
+  await abandoned;
+  assert.equal(shaper.telemetry().carried_over_bytes, 0,
+    "a refunded claim cannot be spent as delivery allowance");
+  assert.equal(shaper.pendingClaims.size, 0, "and it is no longer outstanding");
   await shaper.close();
 });
 
@@ -947,12 +1082,48 @@ test("bytes the browser received but the bucket never released are a leak", () =
   const score = lab.scoreRecovery(CRITERIA, bypassed);
   assert.equal(score.outcome, "shaping");
   assert.match(score.errors[0], /the browser received \d+ B while the bucket released \d+ B/);
+});
 
-  // The allowance is the evidence-window seam: at most one undrained slice per
-  // connection the proxy will open. Inside it, the run still scores.
+// The exemption is provenance, not a ceiling. A blanket `max_sockets x
+// slice_bytes` allowance excused 512 KiB of delivery that no claim anywhere
+// accounted for — at 1.5 Mb/s, 2.8 seconds of link capacity scoring `passed`.
+test("unclaimed delivery is a leak at any size, down to a single slice", () => {
+  // No claim crossed the seam, so nothing is exempt and one slice is enough.
+  const oneSlice = observation();
+  oneSlice.shaping.carried_over_bytes = 0;
+  oneSlice.shaping.stages[1].bytes += 16 * 1024;
+  const score = lab.scoreRecovery(CRITERIA, oneSlice);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /exempting 0 B claimed before the evidence window/);
+
+  // The old blanket allowance is not available to unclaimed bytes any more.
+  const blanket = observation();
+  blanket.shaping.carried_over_bytes = 0;
+  blanket.shaping.stages[1].bytes += 32 * 16 * 1024;
+  assert.equal(lab.scoreRecovery(CRITERIA, blanket).outcome, "shaping");
+
+  // An artifact with no seam field at all exempts nothing rather than 512 KiB.
+  const absent = observation();
+  delete absent.shaping.carried_over_bytes;
+  absent.shaping.stages[1].bytes += 16 * 1024;
+  assert.equal(lab.scoreRecovery(CRITERIA, absent).outcome, "shaping");
+});
+
+test("a genuine pre-evidence in-flight completion is exempt for exactly its bytes", () => {
+  // A slice the bucket priced before `beginEvidence` and delivered after it is
+  // real traffic with a real claim; the run still scores.
   const seam = observation();
-  seam.shaping.stages[1].bytes += 32 * 16 * 1024;
+  seam.shaping.carried_over_bytes = 3 * 16 * 1024;
+  seam.shaping.stages[1].bytes += 3 * 16 * 1024;
   assert.equal(lab.scoreRecovery(CRITERIA, seam).outcome, "passed");
+
+  // One byte past what actually crossed the seam is still a leak.
+  const overrun = observation();
+  overrun.shaping.carried_over_bytes = 3 * 16 * 1024;
+  overrun.shaping.stages[1].bytes += (3 * 16 * 1024) + 1;
+  const score = lab.scoreRecovery(CRITERIA, overrun);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /exempting 49152 B claimed before the evidence window/);
 });
 
 test("a shaping transport error invalidates the recovery verdict", () => {
