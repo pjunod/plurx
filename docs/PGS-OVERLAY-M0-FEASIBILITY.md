@@ -1,11 +1,11 @@
 # PGS overlay Milestone 0 — feasibility evidence
 
-**Status:** in progress; bounded parser, fuzz laboratory, default-off
-Milestone 1 server producer, and automated Apple Milestone 2 client complete;
-physical-device evidence pending ·
+**Status:** in progress; repository-owned parser and boundary prerequisites
+reconciled, default-off Milestone 1 server producer and automated clients
+complete; controlled production corpus and physical-device evidence pending ·
 **Decision:** continue the bounded FFmpeg-to-SUP architecture, do not use the
 candidate's direct MKV/M2TS path, and do not enable PGS overlay in production
-yet · **Updated:** 2026-08-09
+yet · **Updated:** 2026-08-14
 
 Companion to [PGS_OVERLAY_PLAN.md](PGS_OVERLAY_PLAN.md). This is the evidence
 ledger for that plan's Milestone 0. It distinguishes what this branch proves
@@ -42,10 +42,14 @@ unchanged:
   the `0xC0` state recognized by FFmpeg and reported in some multi-clip input;
 - the 0.6.0 source contains no fuzz target or property-test harness.
 
-The adapter addresses the raw-SUP subset by doing an allocation-free structural
-preflight, running the candidate with history disabled, validating display
-state before bitmap allocation, and using a strict Plurx-owned RLE decoder and
-normalizer. It deliberately does not wrap the candidate's MKV/M2TS readers.
+The adapter addresses the raw-SUP subset by opening one file identity for both
+an allocation-free structural preflight and the parse, then verifying the same
+content digest on both passes. Plurx owns display-set assembly and PCS parsing;
+the candidate supplies the remaining bounded payload decoders. That boundary
+supports the `0xC0` Epoch Continue state the candidate omits, unwraps the
+32-bit PTS clock, validates display state before bitmap allocation, and uses a
+strict Plurx-owned RLE decoder and normalizer. It deliberately does not wrap
+the candidate's MKV/M2TS readers.
 
 This is a conditional **continue** through server-contract review, not a
 production go decision.
@@ -59,10 +63,17 @@ surface:
 - the staged server producer depends on it; clients never parse raw PGS;
 - only raw SUP input is accepted;
 - preflight rejects unknown segment types, truncated headers or payloads,
-  incomplete display sets, backwards PTS, and configured byte/count excesses;
+  incomplete display sets, ordinary backwards PTS, and configured byte/count
+  excesses;
+- one open file handle pins input identity across preflight and parse, while a
+  digest comparison rejects in-place content changes between the two passes;
+- the 32-bit 90 kHz timestamp is unwrapped across a jump larger than half its
+  range; smaller backwards jumps remain malformed;
+- Plurx-owned display-set and PCS parsing retains `0xC0` Epoch Continue in file
+  order and flushes the preceding palette/object cache, matching FFmpeg;
 - the adapter resolves palette and object reuse across display sets;
-- Acquisition Point and Epoch Start both discard the preceding palette and
-  object cache, matching FFmpeg's reference state transition;
+- Acquisition Point, Epoch Start, and Epoch Continue discard the preceding
+  palette and object cache, matching FFmpeg's reference state transition;
 - ODS fragments must form a complete object of exactly the declared length;
 - strict RLE rejects zero-length runs, truncated escape forms, row overflow,
   extra rows, and incomplete images;
@@ -146,8 +157,13 @@ instead of depending on an untracked developer-machine installation. The first
 workspace scan used advisory database revision
 `6d7aef354b4144c1ede046034adfd00246d3b0c0` (updated 2026-08-04) and found
 RUSTSEC-2026-0194 and RUSTSEC-2026-0195 in `quick-xml` 0.38.4. This branch
-upgrades the direct dependency to the patched 0.41 line; the rerun must be
-clean before merge.
+upgraded the direct dependency to the patched 0.41 line. The latest official
+workspace, vendored-lock, and fuzz scans over these unchanged lockfiles passed
+in GitHub Actions run `31422757657` on 2026-08-10 with advisory database
+revision `e26c6017b1dc91480abe4c875a15f6eadebb72ad`: zero vulnerabilities and
+no ignore list. The workspace scan separately reports the informational
+`RUSTSEC-2025-0141` unmaintained notice for `bincode` 2.0.1; it is not a hidden
+ignore or a vulnerability finding.
 
 The dependency is young and lightly adopted. Exact pinning is therefore
 mandatory. Any upgrade requires repeating the source audit, malformed corpus,
@@ -186,19 +202,26 @@ objects differ because they use different object identifiers even though the
 fixture geometry is the same; this keeps the composition fingerprint sensitive
 to state reuse errors.
 
-Twelve focused tests currently prove:
+Twenty-two focused crate tests (nineteen unit tests and three boundary
+integration tests) currently prove:
 
 - normal show and clear normalization;
 - palette update with object reuse;
+- object update with palette reuse;
 - cache invalidation at an Acquisition Point;
+- cache invalidation at both Epoch Start and Epoch Continue;
 - strict rejection of the candidate decoder's transparent-padding behavior;
 - canvas rejection before bitmap decode;
 - truncated display-set rejection;
-- ordered handling of duplicate timestamps and rejection of backwards time;
+- 32-bit PTS wrap unwrapping while an ordinary backwards jump is rejected;
+- ordered handling of identical timestamps;
 - preflight segment bounding before candidate assembly;
 - fragmented-object reassembly before strict decode;
 - multiple simultaneous objects with authored crop rectangles;
-- explicit rejection of the unsupported `0xC0` composition state;
+- owned parsing and normalization of the `0xC0` Epoch Continue composition
+  state;
+- one open input identity across structural preflight and parsing, even when the
+  pathname is replaced;
 - deterministic mutation of every fixture truncation and hundreds of
   single-byte state changes without a panic.
 
@@ -212,10 +235,12 @@ input at 1 MiB, one decoded object at 8 MiB, and retained object pixels at
 16 MiB so a generated header cannot turn the campaign into an allocation test
 of the host.
 
-The nightly workflow now runs that target for 15 minutes against the committed
-corpus, uploads any reproducer under `fuzz/artifacts`, and fails after artifact
-publication when libFuzzer reports a crash. This is the recurring safety net;
-the longer production-seed campaign remains release evidence.
+The committed corpus contains both the minimal malformed header seed and the
+2,504-byte valid SUP emitted by `scripts/mkpgs 1920 1080`. The nightly workflow
+runs that target for 15 minutes against the committed corpus, uploads any
+reproducer under `fuzz/artifacts`, and fails after artifact publication when
+libFuzzer reports a crash. This is the recurring safety net; a longer campaign
+over controlled production seeds remains release evidence.
 
 The 2026-08-04 campaign used cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, and
 Rust nightly 2026-08-01 with address sanitizer. Seeded with the deterministic
@@ -264,8 +289,9 @@ timing-spike question; it must not be silently baked into the manifest.
 
 The reference rawvideo MD5 is `1aec365ed729807384b42199138ea085` for a visible
 frame and `9b2c4088acb2c896d5d79adbe4b893ac` for a clear black frame. This proves
-packet timing and visible geometry for the deterministic fixture. Pixel-for-pixel
-RGBA comparison, palette effects, and production-media comparison remain open.
+packet timing and visible geometry for the deterministic fixture. The committed
+colored-cue sample also matches FFmpeg's BT.709 palette conversion exactly;
+full-track pixel comparison against controlled production media remains open.
 
 ### 5.3 Production cold-scan attempt
 
@@ -304,8 +330,9 @@ cargo fuzz run inspect_sup /tmp/plurx-pgs-corpus -- \
   -max_total_time=60 -rss_limit_mb=1024 -timeout=5 -max_len=1048576
 ```
 
-The generated SUP and JSON are laboratory artifacts under `target/`; they are
-not committed media fixtures. The fuzz sub-workspace pins its required nightly
+The generated SUP and JSON under `target/` remain disposable laboratory
+artifacts. One deterministic copy of that SUP is committed only as a fuzz seed;
+it contains no operator media. The fuzz sub-workspace pins its required nightly
 toolchain in `fuzz/rust-toolchain.toml`; `cargo-fuzz` remains an explicitly
 installed developer tool rather than a shipped dependency.
 
@@ -313,10 +340,10 @@ installed developer tool rather than a shipped dependency.
 
 | Required evidence | State | Evidence or next action |
 |---|---|---|
-| Exact dependency and security assessment | Pass when CI is green | Source, license, checksum, dependency tree, and unsafe-code scan recorded; the official RustSec action scans every dependency-changing PR with no ignores. |
+| Exact dependency and security assessment | Pass | The latest applicable official action, run `31422757657`, scanned the unchanged workspace, vendored, and fuzz dependency graphs at advisory-database revision `e26c6017b1dc91480abe4c875a15f6eadebb72ad`; it reported zero vulnerabilities and no ignores. The workspace-only `RUSTSEC-2025-0141` bincode notice remains informational. |
 | Bounded Plurx-owned adapter | Pass for raw SUP | Exact pin, preflight, strict normalizer, limits, and focused tests are in this branch. |
 | Production files 5559 and 5698 | Partial | File 5559 cold demux was stopped at 179 seconds and 2 MiB incomplete output; file 5698 was left untouched during active playback. Repeat off-hours with progress and a deadline. |
-| Malformed-input campaign | Partial pass + nightly gate | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. A bounded nightly campaign now preserves crash artifacts and fails on a reproducer; add controlled production seeds and a longer campaign. |
+| Malformed-input campaign | Partial pass + nightly gate | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. The valid 2,504-byte generated SUP is now committed beside the malformed-header seed, and the bounded nightly campaign preserves crash artifacts and fails on a reproducer. Add title-free controlled production seeds and rerun the longer campaign. |
 | FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; HD canvases now use BT.709 and a colored-cue RGBA sample matches the committed FFmpeg fixture. Repeat on production tracks. |
 | Apple timed-overlay prototype | Automated pass; physical pending | The iOS/tvOS client uses `AVSynchronizedLayer` over `AVPlayerLayer.videoRect`; shared simulator tests cover non-zero `base_ms`, seek-window reconciliation, authored-canvas layout, selection/off, and player-item replacement. Run the timing matrix on supported physical devices. |
 | Android timed-overlay prototype | Pending | Exercise `SurfaceView`, tunneling, source-time mapping, and timeline epochs on a physical supported device. |
@@ -333,9 +360,9 @@ off by default. The final schema is in
 
 | Required evidence | State | Evidence |
 |---|---|---|
-| Complete composition normalization | Pass | `normalize_sup` emits complete positioned RGBA snapshots and explicit clear events without exposing `libpgs` types; fingerprint-only inspection retains its allocation profile. |
-| Malformed/limit behavior | Pass | Existing structural/RLE/state tests plus aggregate normalized-RGBA bounds; the 306,124-execution ASan corpus remains the parser baseline. |
-| Golden manifest/object behavior | Pass for deterministic fixture | Complete-state coalescing, authored clear gaps, content-addressed PNG deduplication, interval ordering, object existence, content hashes, and geometry are validated before publication. Representative production goldens remain part of physical acceptance. |
+| Complete composition normalization | Pass | `normalize_sup` emits complete positioned RGBA snapshots and explicit clear events without exposing `libpgs` types. The owned display-set/PCS adapter retains Epoch Continue, applies its cache reset, and unwraps the 32-bit PTS clock before normalization. |
+| Malformed/limit behavior | Pass | Existing structural/RLE/state tests, stable-input digest checks, and aggregate normalized-RGBA bounds protect the adapter; the 306,124-execution ASan corpus remains the parser baseline. |
+| Golden manifest/object behavior | Pass for deterministic fixture | Complete-state coalescing, last-state-wins handling at an identical source millisecond, a media-duration clamp when the final clear is absent, authored clear gaps, 1080p authored-canvas geometry over 4K video, content-addressed PNG deduplication, object existence, and content hashes are validated before publication. Representative production goldens remain part of physical acceptance. |
 | Authentication and codec typing | Pass | Route regression proves both manifest and object authentication, PGS-only 415 behavior, generation matching, and immutable object headers. |
 | Concurrency, durability, and atomicity | Pass | One producer owns a generation, peer requests receive preparation state, files and directories are synced before the whole-directory rename, and a torn or evicted generation is removed and re-prepared instead of remaining a permanent failure. |
 | Deadline and retry suppression | Pass | Ten-minute producer bound, two-minute bounded negative memo, and focused injected-timeout regression. |
@@ -372,32 +399,24 @@ burning and converting Dolby Vision/HDR to SDR. This is automated behavior
 evidence only: physical iPhone, iPad, and Apple TV timing and display-mode
 verification remain required.
 
-## 9. Remaining parser and device work
+## 9. Parser-prerequisite verdicts
 
-Before the parser decision can become a production go:
+The seven prerequisites tracked by issue 168 have the following disposition:
 
-1. Extend the fuzz corpus with controlled production SUP tracks and run a
-   longer sanitizer campaign. The deterministic seed and mutation regression
-   remain the required fast baseline.
-2. Add the remaining plan fixtures: object update with palette reuse, 1080p
-   canvas on 4K video, missing clear, and production palette effects. Multiple
-   simultaneous objects, crop rectangles, fragment sequences, and duplicate
-   timestamps now have focused coverage.
-3. Resolve PTS wrap and define whether identical timestamps are coalesced or
-   retained in file order in the eventual manifest.
-4. Test multi-clip inputs for the `0xC0` composition state. If it occurs in
-   supported media, parse PCS through the owned adapter or review a candidate
-   fork rather than silently dropping a valid display set.
-5. Retain FFmpeg-to-bounded-SUP for the staged producer. Reconsider direct
-   container parsing only through a separately reviewed fork with input and
-   expansion limits; the current direct MKV/M2TS API remains a no-go.
-6. Make input identity stable across preflight and parse. The feasibility API
-   detects a changed file size, but the dependency only accepts a path and
-   reopens it; a production boundary must eliminate that time-of-check/time-of-use
-   gap.
-7. Record the RustSec action result and advisory-database revision on the
-   implementation PR; do not add an advisory ignore merely to turn the check
-   green.
+| # | Verdict | Evidence and remaining action |
+|---:|---|---|
+| 1 | Partial | The committed corpus now includes a valid generated SUP as well as the malformed seed, and the nightly sanitizer gate runs for 15 minutes. Private production media cannot enter git: obtain title-free, sanitized SUP extracts covering files 5559 and 5698 plus a representative multi-clip title, then run the same 15-minute-or-longer campaign and attach its summary to the parent issue. |
+| 2 | Done | Focused tests cover palette update with object reuse, object update with palette reuse, simultaneous cropped objects, fragmented ODS sequences, identical timestamps, the FFmpeg-matched BT.709 colored cue, 1080p authored canvas over 4K video, and a missing final clear clamped to media duration. |
+| 3 | Done | The adapter unwraps only a backwards raw-PTS jump larger than half of the 32-bit clock and still rejects ordinary backwards time. Display sets at the same source millisecond remain in file order; manifest compilation keeps the last complete state and emits no duplicate cue start. Both native clients already require monotonically ordered, non-overlapping cues, so the manifest contract remains compatible. |
+| 4 | Partial (parser closed) | The Plurx-owned PCS adapter accepts `0xC0`, measures it, resets the epoch cache, and has acceptance and stale-cache regressions. Whether the state occurs in representative multi-clip media remains part of the controlled production corpus request in item 1. |
+| 5 | Done | The staged producer still invokes FFmpeg for one selected PGS track and admits only its bounded raw-SUP output. Neither the HTTP module nor parser accepts MKV or M2TS input directly. |
+| 6 | Done | The producer opens the staged SUP once, uses that handle for preflight and parse, and compares SHA-256 digests across both passes. A boundary test replaces the pathname after open and proves that parsing remains on the original file identity. |
+| 7 | Done | Official RustSec action run `31422757657` used database revision `e26c6017b1dc91480abe4c875a15f6eadebb72ad`, found zero vulnerabilities across workspace, vendored, and fuzz scans, and used no advisory ignores. This branch does not change any Cargo manifest or lockfile from that audited dependency graph. |
+
+Items 1 and 4 share one external evidence gap rather than an additional parser
+change: a controlled, sanitized production corpus must exercise authoring
+patterns that cannot be inferred from the generated fixture. Record that result
+on the parent issue before the feature gate is considered for enablement.
 
 ## 10. Go/no-go criteria for production enablement
 
@@ -420,6 +439,12 @@ its implementation PR:
 Until then, the correct result for PGS on active HDR/Dolby Vision playback
 remains a visible refusal to burn, preserving the video presentation rather
 than silently switching to SDR.
+
+The repository-owned parser and raw-SUP boundary prerequisites are therefore
+closed except for the explicitly identified production-corpus measurement.
+That result does not satisfy the production-media, physical-device, HDR/Dolby
+Vision, or operational cold-extraction gates above, and it does not authorize
+enabling `PLURX_PGS_OVERLAY` by default.
 
 ## 11. Versioning
 
