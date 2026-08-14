@@ -3912,10 +3912,7 @@ impl TranscodeManager {
         self.refresh_rate_control_locked().await
     }
 
-    /// Keep the in-memory hot-path snapshot within the plan's two-second TTL.
-    /// Store reads and behavioral probes stay entirely off session creation;
-    /// live/producer paths only copy the already-published snapshot.
-    pub async fn rate_control_refresh_loop(self: Arc<Self>) {
+    async fn rate_control_refresh_loop_inner(self: Arc<Self>, stop_after_first: bool) {
         let start = tokio::time::Instant::now() + RATE_CONTROL_REFRESH;
         let mut interval = tokio::time::interval_at(start, RATE_CONTROL_REFRESH);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3930,7 +3927,22 @@ impl TranscodeManager {
                     tracing::warn!(%error, "could not refresh replicated rate-control settings")
                 }
             }
+            if stop_after_first {
+                return;
+            }
         }
+    }
+
+    /// Keep the in-memory hot-path snapshot within the plan's two-second TTL.
+    /// Store reads and behavioral probes stay entirely off session creation;
+    /// live/producer paths only copy the already-published snapshot.
+    pub async fn rate_control_refresh_loop(self: Arc<Self>) {
+        self.rate_control_refresh_loop_inner(false).await;
+    }
+
+    #[cfg(test)]
+    async fn rate_control_refresh_once(self: Arc<Self>) {
+        self.rate_control_refresh_loop_inner(true).await;
     }
 
     /// Load the durable request at boot, exercise the real production args,
@@ -6264,18 +6276,14 @@ mod tests {
             Duration::from_secs(2),
             "the replicated hot-path snapshot contract is a literal two seconds"
         );
-        let refresh = tokio::spawn(Arc::clone(&peer).rate_control_refresh_loop());
+        let refresh = tokio::spawn(Arc::clone(&peer).rate_control_refresh_once());
         // Sleeping yields until the worker has constructed its interval and
-        // both tasks reach the real first deadline. Subsequent yields let the
-        // refresh finish without weakening the two-second bound.
+        // both tasks reach the real first deadline. Awaiting the one-cycle
+        // harness observes the blocking store read rather than guessing how
+        // many scheduler yields it needs to finish.
         let started = tokio::time::Instant::now();
         tokio::time::sleep(RATE_CONTROL_REFRESH).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            if peer.effective_rate_control(Encoder::Software) == EffectiveRateControl::Vbr {
-                break;
-            }
-        }
+        refresh.await.expect("rate-control refresh task");
         assert_eq!(
             tokio::time::Instant::now() - started,
             RATE_CONTROL_REFRESH,
@@ -6286,7 +6294,6 @@ mod tests {
             EffectiveRateControl::Vbr,
             "the two-second refresher must replace the peer's stale snapshot"
         );
-        refresh.abort();
     }
 
     #[tokio::test]
