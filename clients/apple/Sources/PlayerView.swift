@@ -79,7 +79,8 @@ enum TVPlayerRemoteRouting {
         focusedControl: PlayerControl,
         progressEngaged: Bool,
         direction: PlayerSeekDirection,
-        progressRightNeighbor: PlayerControl = .autoplay
+        progressRightNeighbor: PlayerControl = .autoplay,
+        markerAvailable: Bool = false
     ) -> PlayerRemoteMoveOutcome {
         switch focusedControl {
         case .reveal:
@@ -97,7 +98,7 @@ enum TVPlayerRemoteRouting {
             case .down:
                 return .focus(.playPause)
             case .up:
-                return .ignore
+                return markerAvailable ? .focus(.marker) : .ignore
             }
         default:
             return .ignore
@@ -1793,8 +1794,9 @@ struct PlayerView: View {
     /// SwiftUI's Slider is unavailable on tvOS. This focusable bar uses the
     /// Siri Remote's left/right commands as ordinary focus navigation until
     /// Select engages scrubbing; engaged presses move through the same
-    /// absolute film timeline in 10-second steps. Up is intentionally inert
-    /// because this is the top row; Down returns to play/pause. This is not a Button:
+    /// absolute film timeline in 10-second steps. Up reaches a visible skip
+    /// marker above the transport row and is inert when no marker is present;
+    /// Down returns to play/pause. This is not a Button:
     /// tvOS adds a large white pressed/focus surround to Buttons even when the
     /// ordinary focus effect is disabled.
     private var tvProgressBar: some View {
@@ -1844,7 +1846,8 @@ struct PlayerView: View {
                 focusedControl: .progress,
                 progressEngaged: tvProgressEngaged,
                 direction: seekDirection,
-                progressRightNeighbor: progressRightControl
+                progressRightNeighbor: progressRightControl,
+                markerAvailable: controller.activeMarker != nil
             ))
         }
         .accessibilityLabel("Playback position")

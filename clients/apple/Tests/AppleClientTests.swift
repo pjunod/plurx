@@ -870,10 +870,21 @@ final class AppleClientTests: XCTestCase {
                 TVPlayerRemoteRouting.moveOutcome(
                     focusedControl: .progress,
                     progressEngaged: engaged,
-                    direction: .up
+                    direction: .up,
+                    markerAvailable: false
                 ),
                 .ignore,
-                "the progress bar is already at the top of the transport row"
+                "up should remain inert when there is no visible control above"
+            )
+            XCTAssertEqual(
+                TVPlayerRemoteRouting.moveOutcome(
+                    focusedControl: .progress,
+                    progressEngaged: engaged,
+                    direction: .up,
+                    markerAvailable: true
+                ),
+                .focus(.marker),
+                "up should reach a visible skip marker above the transport row"
             )
             XCTAssertEqual(
                 TVPlayerRemoteRouting.moveOutcome(
