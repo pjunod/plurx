@@ -2806,6 +2806,62 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testPictureInPictureUnavailablePathsStayReachable() {
+        let waiting = PictureInPictureController.controlState(
+            isSupported: true,
+            isActive: false,
+            isPossible: false,
+            hasAttachedController: true
+        )
+        XCTAssertTrue(waiting.isButtonEnabled)
+        XCTAssertEqual(waiting.command, .unavailable)
+        XCTAssertEqual(waiting.messageOnTap, "Picture in Picture isn't ready yet.")
+
+        let detachedWithStaleAvailability = PictureInPictureController.controlState(
+            isSupported: true,
+            isActive: false,
+            isPossible: true,
+            hasAttachedController: false
+        )
+        XCTAssertTrue(detachedWithStaleAvailability.isButtonEnabled)
+        XCTAssertEqual(detachedWithStaleAvailability.command, .unavailable)
+        XCTAssertEqual(
+            detachedWithStaleAvailability.messageOnTap,
+            "Picture in Picture isn't ready yet."
+        )
+
+        XCTAssertEqual(
+            PlayerController.pictureInPictureUnavailableNotice(pgsOverlayIsActive: true),
+            PlayerController.pgsOverlayExternalPlaybackNotice
+        )
+    }
+
+    @MainActor
+    func testPictureInPictureUnavailableMessageExpiresWithoutClearingARealFailure() async {
+        let pictureInPicture = PictureInPictureController()
+
+        pictureInPicture.showUnavailableMessage(
+            "Picture in Picture isn't ready yet.",
+            duration: .milliseconds(10)
+        )
+        XCTAssertEqual(
+            pictureInPicture.errorMessage,
+            "Picture in Picture isn't ready yet."
+        )
+
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(pictureInPicture.errorMessage)
+
+        pictureInPicture.showUnavailableMessage(
+            "Picture in Picture isn't ready yet.",
+            duration: .milliseconds(10)
+        )
+        pictureInPicture.showPersistentErrorMessage("AVKit failed to start PiP")
+
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(pictureInPicture.errorMessage, "AVKit failed to start PiP")
+    }
+
     func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
         XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
             isTearingDown: false,

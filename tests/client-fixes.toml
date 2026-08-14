@@ -188,3 +188,19 @@ source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = "static func subtitleLabel(_ track: SubtitleTrack) -> String"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPGSOverlayMenuDistinguishesOverlayFromBurnIn"
+
+[[fixes]]
+id = "apple.pip-unavailable-paths-reachable"
+commits = ["0faab85", "abe102d"]
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = ".disabled(!controlState.isButtonEnabled)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPictureInPictureUnavailablePathsStayReachable"
+
+[[fixes]]
+id = "apple.pip-unavailable-notice-lifetime"
+commits = ["7efbded2"]
+source = "clients/apple/Sources/PlayerSurface.swift"
+source_anchor = "showUnavailableMessage(state.messageOnTap)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPictureInPictureUnavailableMessageExpiresWithoutClearingARealFailure"
