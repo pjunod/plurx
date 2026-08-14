@@ -97,17 +97,44 @@ The server-side half landed 2026-08-14 behind the default-off
 `playback.network_priors` setting. N0 client telemetry maintains one node-local
 row per user · fixed client class · IPv4 `/24`; no full address is stored or
 returned. Each row carries a 25% sustained-throughput EWMA and the lowest rung
-that reported a supply/network stall. It expires after 30 days, and each
-user/client class keeps at most 64 network rows.
+that reported a supply/network stall, with the time of that stall. An unused
+row is pruned after 30 days, the starvation verdict inside it stops being
+believed after 7 (below), and each user/client class keeps at most 64 network
+rows.
+
+The client class is derived from the request's own `User-Agent` and from
+nothing else. That is a correctness requirement, not a style choice: the class
+is part of the row's primary key, so a class the reporting path derives
+differently from the consulting path writes priors that are maintained forever
+and never read. Every path uses the one derivation.
 
 `/decision` and session-create responses expose only
 `prior_kbps: Option<u32>`. Without a matching prior, `auto_height` returns the
-same encoder/source-capped height it returned before this feature. With one, a
-known-starved client starts below its lowest failed rung; otherwise Auto picks
-the highest rung whose advertised peak fits the EWMA, including the existing
-cap on a proven-fast LAN. Rows stay off Raft by design, so another cluster
-voter starts cold. The future web controller still has to seed hls.js and pick
-its opening rung from this field; no client behavior changed in this slice.
+same encoder/source-capped height it returned before this feature. With one,
+both signals apply and the lower rung wins: a known-starved client starts below
+its lowest failed rung, and Auto then picks the highest rung whose advertised
+peak fits the EWMA, including the existing cap on a proven-fast LAN. Rows stay
+off Raft by design, so another cluster voter starts cold. The future web
+controller still has to seed hls.js and pick its opening rung from this field;
+no client behavior changed in this slice.
+
+**A starvation verdict recovers.** It is the stronger signal — a known supply
+failure beats an EWMA collected during healthy playback — but it is not
+permanent. It stops binding 7 days after the stall that recorded it, and the
+first observation past that horizon retires it from the row: a healthy sample
+clears it, and a fresh stall replaces it outright rather than being combined
+with a rung the link has since outgrown. Any starvation re-stamps the horizon,
+so a link that genuinely still starves stays capped.
+
+Without that horizon the verdict was a monotonic minimum nothing could raise.
+One transient stall — a roommate's download, a brief Wi-Fi dropout — pinned
+that user/class//24 one rung below its stall for as long as the row lived, and
+because every observation refreshes `updated_at_ms`, an actively used row never
+reached the 30-day retention either. The EWMA became dead code for that tuple
+in both directions, so "a proven-fast LAN client starts at the cap" was
+unreachable once a tuple had any starvation history. Applying both signals and
+taking the lower rung restores the downward half; the horizon restores the
+upward half.
 
 ## Phase 2 — Auto (the actual feature; controller revised per review R3)
 

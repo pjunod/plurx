@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
 
-use crate::domain::{NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery};
+use crate::domain::{
+    NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery,
+    NETWORK_PRIOR_STARVED_TTL_MS,
+};
 use crate::error::StoreError;
 
 pub(crate) const PLAYBACK_EVENTS_SCHEMA: &str = "
@@ -51,6 +54,7 @@ CREATE TABLE network_priors (
     network_fingerprint TEXT NOT NULL,
     sustained_kbps      INTEGER,
     worst_rung_height   INTEGER,
+    starved_at_ms       INTEGER,
     sample_count        INTEGER NOT NULL DEFAULT 0,
     updated_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (user_id, client_class, network_fingerprint)
@@ -172,15 +176,16 @@ fn prior_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkPrior> {
     let sustained_kbps = row
         .get::<_, Option<i64>>(3)?
         .and_then(|value| u32::try_from(value).ok());
-    let sample_count = u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX);
+    let sample_count = u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX);
     Ok(NetworkPrior {
         user_id: row.get(0)?,
         client_class: row.get(1)?,
         network_fingerprint: row.get(2)?,
         sustained_kbps,
         worst_rung_height: row.get(4)?,
+        starved_at_ms: row.get(5)?,
         sample_count,
-        updated_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
     })
 }
 
@@ -199,11 +204,24 @@ pub(crate) fn observe_prior(
     }
 
     let transaction = conn.unchecked_transaction()?;
+    // The starvation verdict is still the stronger signal while it is fresh —
+    // a `min` that a later stall can only lower — but it now expires. Past
+    // `NETWORK_PRIOR_STARVED_TTL_MS` from the starvation that set it, the next
+    // observation to touch the row retires it: a healthy sample clears the
+    // verdict, and a new stall replaces it outright instead of being `min`ed
+    // against history the link has since outgrown. Expiry is measured against
+    // the observation's own server-stamped time, so it needs no clock here and
+    // stays deterministic under test.
     transaction.execute(
         "INSERT INTO network_priors (
              user_id, client_class, network_fingerprint, sustained_kbps,
-             worst_rung_height, sample_count, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END, ?6)
+             worst_rung_height, starved_at_ms, sample_count, updated_at_ms
+         ) VALUES (
+             ?1, ?2, ?3, ?4, ?5,
+             CASE WHEN ?5 IS NULL THEN NULL ELSE ?6 END,
+             CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END,
+             ?6
+         )
          ON CONFLICT(user_id, client_class, network_fingerprint) DO UPDATE SET
              sustained_kbps = CASE
                  WHEN excluded.sustained_kbps IS NULL THEN network_priors.sustained_kbps
@@ -211,9 +229,18 @@ pub(crate) fn observe_prior(
                  ELSE (network_priors.sustained_kbps * 3 + excluded.sustained_kbps + 2) / 4
              END,
              worst_rung_height = CASE
+                 WHEN network_priors.starved_at_ms IS NULL
+                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?7
+                     THEN excluded.worst_rung_height
                  WHEN excluded.worst_rung_height IS NULL THEN network_priors.worst_rung_height
-                 WHEN network_priors.worst_rung_height IS NULL THEN excluded.worst_rung_height
                  ELSE min(network_priors.worst_rung_height, excluded.worst_rung_height)
+             END,
+             starved_at_ms = CASE
+                 WHEN excluded.starved_at_ms IS NOT NULL THEN excluded.starved_at_ms
+                 WHEN network_priors.starved_at_ms IS NULL
+                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?7
+                     THEN NULL
+                 ELSE network_priors.starved_at_ms
              END,
              sample_count = min(
                  network_priors.sample_count
@@ -229,6 +256,7 @@ pub(crate) fn observe_prior(
             observation.throughput_kbps.map(i64::from),
             observation.starved_rung_height,
             observation.observed_at_ms,
+            NETWORK_PRIOR_STARVED_TTL_MS,
         ],
     )?;
     transaction.execute(
@@ -248,7 +276,7 @@ pub(crate) fn observe_prior(
     )?;
     let prior = transaction.query_row(
         "SELECT user_id, client_class, network_fingerprint, sustained_kbps,
-                worst_rung_height, sample_count, updated_at_ms
+                worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          FROM network_priors
          WHERE user_id = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
         params![
@@ -272,7 +300,7 @@ pub(crate) fn get_prior(
 
     conn.query_row(
         "SELECT user_id, client_class, network_fingerprint, sustained_kbps,
-                worst_rung_height, sample_count, updated_at_ms
+                worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          FROM network_priors
          WHERE user_id = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
         params![user_id, client_class, network_fingerprint],
@@ -469,6 +497,144 @@ mod tests {
         )
         .expect("stale observation returns current row");
         assert_eq!(stale, second, "late telemetry must not rewrite the prior");
+    }
+
+    /// The verdict has to be able to expire. As a permanent monotonic `min` it
+    /// made one transient stall cap a tuple for the row's whole life, and
+    /// because every observation refreshes `updated_at_ms`, retention never
+    /// rescued an actively used row either.
+    #[test]
+    fn a_starvation_verdict_ages_out_and_a_later_stall_re_arms_it() {
+        let conn = prior_connection();
+        let starved = observe_prior(
+            &conn,
+            &observation("192.0.2.0/24", Some(4_000), Some(1080), 1_000),
+        )
+        .expect("starved observation");
+        assert_eq!(starved.worst_rung_height, Some(1080));
+        assert_eq!(starved.starved_at_ms, Some(1_000));
+
+        // Healthy traffic inside the horizon keeps the verdict, and keeps its
+        // original stamp rather than sliding the horizon forward.
+        let within = observe_prior(
+            &conn,
+            &observation(
+                "192.0.2.0/24",
+                Some(20_000),
+                None,
+                1_000 + NETWORK_PRIOR_STARVED_TTL_MS,
+            ),
+        )
+        .expect("observation inside the horizon");
+        assert_eq!(within.worst_rung_height, Some(1080));
+        assert_eq!(within.starved_at_ms, Some(1_000));
+
+        // The first observation past the horizon retires it.
+        let expired = observe_prior(
+            &conn,
+            &observation(
+                "192.0.2.0/24",
+                Some(20_000),
+                None,
+                1_001 + NETWORK_PRIOR_STARVED_TTL_MS,
+            ),
+        )
+        .expect("observation past the horizon");
+        assert_eq!(expired.worst_rung_height, None);
+        assert_eq!(expired.starved_at_ms, None);
+        assert!(
+            expired.sustained_kbps.is_some_and(|kbps| kbps > 4_000),
+            "retiring the verdict must not disturb the throughput estimate"
+        );
+
+        // A genuinely still-bad link re-arms it, and a verdict recorded after
+        // the old one expired replaces it instead of being `min`ed against
+        // history the link has since outgrown.
+        let rearmed = observe_prior(
+            &conn,
+            &observation(
+                "192.0.2.0/24",
+                None,
+                Some(720),
+                2_000 + NETWORK_PRIOR_STARVED_TTL_MS,
+            ),
+        )
+        .expect("re-armed observation");
+        assert_eq!(rearmed.worst_rung_height, Some(720));
+        assert_eq!(
+            rearmed.starved_at_ms,
+            Some(2_000 + NETWORK_PRIOR_STARVED_TTL_MS)
+        );
+
+        let raised = observe_prior(
+            &conn,
+            &observation(
+                "192.0.2.0/24",
+                None,
+                Some(1080),
+                3_000 + NETWORK_PRIOR_STARVED_TTL_MS,
+            ),
+        )
+        .expect("higher starvation inside the horizon");
+        assert_eq!(
+            raised.worst_rung_height,
+            Some(720),
+            "inside the horizon the lowest starved rung still wins"
+        );
+        assert_eq!(
+            raised.starved_at_ms,
+            Some(3_000 + NETWORK_PRIOR_STARVED_TTL_MS),
+            "any starvation is evidence the link still starves, so it re-stamps"
+        );
+
+        let replaced = observe_prior(
+            &conn,
+            &observation(
+                "192.0.2.0/24",
+                None,
+                Some(1080),
+                3_001 + 2 * NETWORK_PRIOR_STARVED_TTL_MS,
+            ),
+        )
+        .expect("starvation past the horizon");
+        assert_eq!(
+            replaced.worst_rung_height,
+            Some(1080),
+            "an expired verdict is replaced, not min'd"
+        );
+    }
+
+    #[test]
+    fn the_expiry_horizon_is_the_one_the_consult_reads() {
+        use crate::domain::NetworkPrior;
+
+        let prior = NetworkPrior {
+            worst_rung_height: Some(720),
+            starved_at_ms: Some(1_000),
+            ..NetworkPrior::default()
+        };
+        assert_eq!(
+            prior.active_starved_rung(1_000 + NETWORK_PRIOR_STARVED_TTL_MS),
+            Some(720)
+        );
+        assert_eq!(
+            prior.active_starved_rung(1_001 + NETWORK_PRIOR_STARVED_TTL_MS),
+            None
+        );
+        assert_eq!(
+            NetworkPrior {
+                starved_at_ms: None,
+                ..prior.clone()
+            }
+            .active_starved_rung(1_000),
+            None,
+            "an unstamped verdict must not bind forever"
+        );
+        assert_eq!(
+            prior.active_starved_rung(0),
+            Some(720),
+            "a backwards clock step must not retire a fresh verdict"
+        );
     }
 
     #[test]

@@ -4054,7 +4054,7 @@ impl TranscodeManager {
             .filter(|h| *h > 0)
             .unwrap_or(max)
             .clamp(MIN_HEIGHT, max);
-        auto_height_from_prior(current, source_height, prior)
+        auto_height_from_prior(current, source_height, prior, unix_ms())
     }
 
     /// The admin's playback language preferences (Settings → Playback
@@ -5777,6 +5777,15 @@ async fn gc_expired_segments(session: &Session) {
 }
 
 /// A sensible video bitrate (kbps) for a target height.
+/// Wall-clock milliseconds, for comparing a stored prior's age against the
+/// starvation verdict's TTL.
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 fn bitrate_for_height(height: i64) -> u32 {
     match height {
         h if h >= 2160 => 20_000,
@@ -5834,40 +5843,50 @@ pub fn ladder(source_height: Option<i64>) -> Vec<Rung> {
 
 /// Apply the node-local prior to the already encoder-capped Auto choice.
 /// Absence is an exact identity operation, which is the default-off contract.
+///
+/// Both signals the prior carries are applied, and the lower rung wins. The
+/// starvation verdict used to return early, which made the throughput estimate
+/// dead code for any tuple that had ever stalled — including in the downward
+/// direction, so a link that later collapsed still started at the rung below
+/// its old starvation. `now_ms` is here because the verdict expires
+/// ([`plurx_core::domain::NETWORK_PRIOR_STARVED_TTL_MS`]); a tuple whose
+/// starvation has aged out is decided by throughput alone, which is what lets
+/// a link that has since recovered reach the cap again.
 fn auto_height_from_prior(
     current: i64,
     source_height: Option<i64>,
     prior: Option<&plurx_core::domain::NetworkPrior>,
+    now_ms: i64,
 ) -> i64 {
     let Some(prior) = prior else {
         return current;
     };
+    let mut height = current;
 
     // A known supply failure is stronger evidence than an EWMA collected
     // during healthy playback. Start below the lowest rung known to starve.
-    if let Some(starved) = prior.worst_rung_height.filter(|height| *height > 0) {
+    if let Some(starved) = prior.active_starved_rung(now_ms) {
         let below = LADDER_HEIGHTS
             .iter()
             .rev()
             .copied()
             .find(|height| *height < starved)
             .unwrap_or(MIN_HEIGHT);
-        return current.min(below).max(MIN_HEIGHT);
+        height = height.min(below);
     }
 
-    let Some(sustained_kbps) = prior.sustained_kbps else {
-        return current;
-    };
-    let current_peak =
-        bitrate_for_height(current) * 3 / 2 + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT;
-    if sustained_kbps >= current_peak {
-        return current;
+    if let Some(sustained_kbps) = prior.sustained_kbps {
+        let peak =
+            bitrate_for_height(height) * 3 / 2 + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT;
+        if sustained_kbps < peak {
+            height = ladder(source_height)
+                .into_iter()
+                .find(|rung| rung.height <= height && rung.peak_kbps <= sustained_kbps)
+                .map(|rung| rung.height)
+                .unwrap_or(MIN_HEIGHT);
+        }
     }
-    ladder(source_height)
-        .into_iter()
-        .find(|rung| rung.height <= current && rung.peak_kbps <= sustained_kbps)
-        .map(|rung| rung.height)
-        .unwrap_or(MIN_HEIGHT)
+    height.max(MIN_HEIGHT)
 }
 
 /// Snap an explicitly requested height onto the ladder: nearest rung, ties
@@ -6605,12 +6624,23 @@ mod tests {
 
     #[test]
     fn network_prior_adjusts_only_the_auto_starting_choice() {
-        use plurx_core::domain::NetworkPrior;
+        use plurx_core::domain::{NetworkPrior, NETWORK_PRIOR_STARVED_TTL_MS};
 
-        let prior = |sustained_kbps, worst_rung_height| NetworkPrior {
+        // A fixed "now" well past the TTL, so a case can place its starvation
+        // either inside or outside the horizon without touching a real clock.
+        const NOW_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+        let fresh_ms = NOW_MS - NETWORK_PRIOR_STARVED_TTL_MS + 1;
+        let expired_ms = NOW_MS - NETWORK_PRIOR_STARVED_TTL_MS - 1;
+
+        let prior = |sustained_kbps, worst_rung_height: Option<i64>| NetworkPrior {
             sustained_kbps,
             worst_rung_height,
+            starved_at_ms: worst_rung_height.map(|_| fresh_ms),
             ..NetworkPrior::default()
+        };
+        let aged = |sustained_kbps, worst_rung_height: Option<i64>| NetworkPrior {
+            starved_at_ms: worst_rung_height.map(|_| expired_ms),
+            ..prior(sustained_kbps, worst_rung_height)
         };
         let cases = [
             (1080, None, 1080, "absent prior is today's exact choice"),
@@ -6644,10 +6674,41 @@ mod tests {
                 480,
                 "history never upscales a smaller source",
             ),
+            // The two halves of the recovery rule (review finding 2). Without
+            // them one transient stall pins a tuple one rung down for the row's
+            // whole life, and the EWMA is dead code in both directions.
+            (
+                1080,
+                Some(aged(Some(20_000), Some(1080))),
+                1080,
+                "an aged-out starvation stops binding, so a proven-fast link reaches the cap",
+            ),
+            (
+                1080,
+                Some(prior(Some(2_000), Some(1080))),
+                360,
+                "a fresh starved cap still lets a collapsed EWMA correct further down",
+            ),
+            (
+                1080,
+                Some(aged(Some(2_000), Some(1080))),
+                360,
+                "an aged-out verdict leaves the EWMA deciding alone",
+            ),
+            (
+                1080,
+                Some(NetworkPrior {
+                    worst_rung_height: Some(1080),
+                    starved_at_ms: None,
+                    ..NetworkPrior::default()
+                }),
+                1080,
+                "a verdict with no stamp is treated as expired, not permanent",
+            ),
         ];
         for (current, prior, expected, reason) in cases {
             assert_eq!(
-                auto_height_from_prior(current, Some(current), prior.as_ref()),
+                auto_height_from_prior(current, Some(current), prior.as_ref(), NOW_MS),
                 expected,
                 "{reason}"
             );

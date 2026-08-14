@@ -220,7 +220,7 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
-    let identity = super::network::identity(&headers, remote, None);
+    let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
     let height = match req.height {

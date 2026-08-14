@@ -567,7 +567,9 @@ pub async fn client_log(
     }
 
     let event = client_playback_event(&ev, user.id);
-    let network = super::network::identity(&headers, remote, ev.ua.as_deref());
+    // Deliberately not `ev.ua`: the class must come from the same input the
+    // read paths use, or the prior is written under a key nothing reads.
+    let network = super::network::identity(&headers, remote);
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);
     tokio::spawn(async move {

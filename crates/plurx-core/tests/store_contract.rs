@@ -999,6 +999,12 @@ async fn network_prior_contract_runs_through_dyn_store() {
             .await
             .unwrap_or_else(|error| panic!("{backend}: observe prior: {error}"));
         assert_eq!(prior.sustained_kbps, Some(8_000), "{backend}");
+        assert_eq!(prior.worst_rung_height, Some(1080), "{backend}");
+        assert_eq!(
+            prior.starved_at_ms,
+            Some(1_700_000_000_000),
+            "{backend}: the verdict's expiry stamp is part of the durable contract"
+        );
         let loaded = store
             .network_prior(71, "chrome", &key)
             .await

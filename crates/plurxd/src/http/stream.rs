@@ -712,7 +712,7 @@ pub async fn decision(
     headers: HeaderMap,
     super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<DecisionResponse>, ApiError> {
-    let identity = super::network::identity(&headers, remote, q.client.as_deref());
+    let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
     let mut file = load_file(&state, id).await?;

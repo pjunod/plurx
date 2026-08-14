@@ -841,16 +841,22 @@ since adds:
 `playback.network_priors` defaults off. When enabled, N0 client telemetry folds
 the conservative minimum of its client estimate and joined server delivery
 rate into a 25% EWMA. A supply/network stall records the lowest height known to
-starve. Rows are node-local, retained for 30 days, and capped at 64 networks per
-user/client class; a client routed to another cluster voter therefore starts
-cold, the tradeoff ratified in D9. The table stores only the client class and
-IPv4 `/24`, never a full address.
+starve, and when. Rows are node-local, retained for 30 days, and capped at 64
+networks per user/client class; a client routed to another cluster voter
+therefore starts cold, the tradeoff ratified in D9. The table stores only the
+client class and IPv4 `/24`, never a full address. The class is derived from
+the request's own `User-Agent` on every path — the class is part of the primary
+key, so the reporting path and the consulting path must not derive it
+differently.
 
 `/decision` and session-create responses now return the optional derived
 `prior_kbps`. Server-side Auto preserves its previous answer exactly without a
-matching prior; with one, it starts below the lowest starved rung or selects the
-highest rung whose advertised peak fits the EWMA. The web controller does not
-consume the field yet; that remains in the N4 controller slice.
+matching prior; with one it applies both signals and takes the lower rung —
+below the lowest starved rung, and within the highest rung whose advertised
+peak fits the EWMA. The starvation verdict expires 7 days after the stall that
+recorded it so a transient dropout cannot cap a link permanently
+(`docs/ADAPTIVE-QUALITY.md` carries the recovery rule). The web controller does
+not consume the field yet; that remains in the N4 controller slice.
 
 The evidence for remembering networks is strong
 ([CS2P](https://users.ece.cmu.edu/~vsekar/assets/pdf/sigcomm16_cs2p.pdf):

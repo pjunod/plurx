@@ -423,7 +423,52 @@ they live in that voter's own SQLite sidecar and never pass through Raft.
 
 | Runtime setting | Default | Meaning |
 |---|---:|---|
-| `telemetry.retain_days` | 30 | Days to keep playback rows. `0` disables row writes and pruning while preserving the existing client log lines |
+| `telemetry.retain_days` | 30 | Days to keep raw playback rows. `0` disables raw row writes and their pruning while preserving the existing client log lines. It does **not** disable network priors — see the note below |
+| `playback.network_priors` | off | Whether to accumulate per-network playback history and let it choose Auto's starting rung |
+
+`playback.network_priors` has no Settings control yet. The only way to change
+it is the API:
+
+```
+curl -X PUT http://server:8080/api/v1/settings \
+  -H 'Authorization: Bearer <admin token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"playback_network_priors": true}'
+```
+
+Off is the default and off is exactly today's behavior: nothing is stored, no
+response gains a field, and Auto starts where it always did. On, plurx keeps
+one row per `(user, client class, network fingerprint)` holding a sustained
+throughput estimate and the lowest ladder rung at which that network was seen
+to starve, and consults it when Auto picks a starting height. `/decision` and
+session-create then carry an additional `prior_kbps`; the fingerprint itself is
+never returned or logged.
+
+What it stores is deliberately coarse and bounded. The client class is a broad
+family (`chrome`, `safari`, `edge`, `firefox`, `apple`, `android`, `other`)
+derived from the request's `User-Agent`, and the network is an IPv4 `/24` —
+never a full address. IPv6 clients get no fingerprint at all and always start
+cold. Each user and client class keeps at most 64 networks, rows unused for 30
+days are pruned by the same daily pass as telemetry, and a starvation verdict
+stops being believed 7 days after the stall that recorded it, so one bad
+evening does not cap a link permanently.
+
+Priors are node-local. In a Hiqlite cluster they live in the voter's own
+sidecar and are not replicated, so a client that reaches a different node
+starts cold there. That is accepted, not a defect.
+
+The `/24` is taken from `Forwarded`, `X-Forwarded-For`, or `X-Real-IP` when
+present, and otherwise from the socket peer. plurx does not maintain a
+trusted-proxy list, so behind a reverse proxy that does not overwrite those
+headers an authenticated client can choose which of its own buckets it lands
+in. It cannot reach another user's rows — the user comes from the session, not
+the header — so the effect is bounded to that user churning their own 64.
+
+Note on `telemetry.retain_days = 0`: the two switches are independent on
+purpose, so an operator can keep the small aggregate prior without retaining
+raw playback rows. With priors enabled, `0` still folds each client report into
+its prior row and still schedules the daily prune pass for those rows; what it
+disables is raw playback-row writes and their retention.
 
 The scheduler runs one bounded prune pass daily and records its clock in
 `jobs.last_telemetry_prune`. Administrators can query newest-first rows with

@@ -813,10 +813,42 @@ pub struct NetworkPrior {
     pub network_fingerprint: String,
     /// Conservative sustained throughput estimate, in decimal kilobits/s.
     pub sustained_kbps: Option<u32>,
-    /// Lowest ladder height at which a supply/network stall was observed.
+    /// Lowest ladder height at which a supply/network stall was observed,
+    /// within the verdict's lifetime. Always written together with
+    /// [`NetworkPrior::starved_at_ms`].
     pub worst_rung_height: Option<i64>,
+    /// When the most recent starvation was observed. The verdict ages out
+    /// from this stamp, not from `updated_at_ms`, which every healthy
+    /// observation refreshes.
+    pub starved_at_ms: Option<i64>,
     pub sample_count: u32,
     pub updated_at_ms: i64,
+}
+
+/// How long a supply-starvation verdict is believed after the starvation that
+/// produced it.
+///
+/// Without a horizon the verdict is a monotonic `min` that nothing can raise:
+/// one transient stall — a roommate's download, a brief Wi-Fi dropout — caps
+/// that tuple one rung down for as long as the row lives, and because every
+/// observation refreshes `updated_at_ms`, an actively used row never reaches
+/// retention either. A week of stall-free operation is enough evidence that
+/// the network changed, so the verdict expires and the throughput estimate
+/// decides alone. A link that is genuinely still starving re-arms it on the
+/// next stall.
+pub const NETWORK_PRIOR_STARVED_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+impl NetworkPrior {
+    /// The starvation verdict if it is still recent enough to believe.
+    ///
+    /// A verdict with no stamp is treated as expired: the two are written
+    /// together, so the only way to see one is a row this build did not write,
+    /// and "forget it" is the recovering answer rather than the permanent one.
+    pub fn active_starved_rung(&self, now_ms: i64) -> Option<i64> {
+        let height = self.worst_rung_height.filter(|height| *height > 0)?;
+        let starved_at_ms = self.starved_at_ms?;
+        (now_ms.saturating_sub(starved_at_ms) <= NETWORK_PRIOR_STARVED_TTL_MS).then_some(height)
+    }
 }
 
 /// One telemetry-derived update to a [`NetworkPrior`].
