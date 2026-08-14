@@ -1442,6 +1442,17 @@ mod tests {
                 .offline
                 .prometheus()
                 .contains(&format!("reason=\"{metric}\"}} 1")));
+            let packages = fixture
+                .state
+                .store
+                .offline_package_stats("test-node", now_unix())
+                .await
+                .expect("offline package stats");
+            assert_eq!(
+                packages,
+                plurx_core::domain::OfflinePackageStats::default(),
+                "case {index} persisted work after a quota rejection"
+            );
         }
     }
 
@@ -1494,7 +1505,20 @@ mod tests {
     #[tokio::test]
     async fn package_status_renews_only_the_owning_users_intent() {
         let fixture = fixture().await;
-        let package = new_package(&fixture, "status", "none", None, fixture.file.id).await;
+        let package = ready_package(&fixture, "status", "none", None).await;
+        let token_hash = token_hash(&"1".repeat(64)).expect("lease hash");
+        let poll_started_at = now_unix();
+        let expired_at = poll_started_at.saturating_sub(1);
+        assert!(matches!(
+            fixture
+                .state
+                .store
+                .put_offline_lease(&package.id, fixture.user.id, &token_hash, expired_at,)
+                .await
+                .expect("seed expired lease"),
+            OfflineLeaseOutcome::Created(_)
+        ));
+
         let status = package_status(
             AuthUser(fixture.user.clone()),
             State(fixture.state.clone()),
@@ -1504,7 +1528,26 @@ mod tests {
         .expect("owned status")
         .0;
         assert_eq!(status.id, package.id);
-        assert_eq!(status.state, "queued");
+        assert_eq!(status.state, "ready");
+        let renewed = fixture
+            .state
+            .store
+            .offline_package_for_user(&package.id, fixture.user.id)
+            .await
+            .expect("renewed package lookup")
+            .expect("renewed package");
+        assert!(
+            renewed.expires_at >= poll_started_at.saturating_add(PACKAGE_TTL_SECS),
+            "status poll did not extend package expiry: {}",
+            renewed.expires_at
+        );
+        assert!(fixture
+            .state
+            .store
+            .offline_package_for_lease(&token_hash, poll_started_at, i64::MAX)
+            .await
+            .expect("renewed lease lookup")
+            .is_some());
 
         let stranger = fixture
             .state
@@ -1679,6 +1722,14 @@ mod tests {
         .await
         .expect("segment");
         assert_eq!(media_segment.headers()[header::CONTENT_TYPE], "video/mp2t");
+        let expected_transfer_bytes = crate::offline::master_playlist(&package).len()
+            + b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:90,\nseg00000.ts\n#EXT-X-ENDLIST\n"
+                .len()
+            + b"portable-video".len();
+        assert_eq!(
+            fixture.state.offline.transfer_bytes(&package.id),
+            Some(expected_transfer_bytes as u64)
+        );
 
         let subtitles = subtitle(
             State(fixture.state.clone()),
