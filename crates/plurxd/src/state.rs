@@ -2362,17 +2362,22 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         startup.await.expect("startup task");
 
-        for _ in 0..100 {
-            if jobs
-                .all_statuses()
-                .await
-                .get(&library.id)
-                .is_some_and(|status| !status.running)
-            {
-                break;
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if jobs
+                    .all_statuses()
+                    .await
+                    .get(&library.id)
+                    .is_some_and(|status| !status.running)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("startup scan finished");
         let status = jobs
             .all_statuses()
             .await
