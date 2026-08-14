@@ -85,12 +85,15 @@ Choose two unmistakable subtitle moments at least five minutes apart:
   and pause/resume.
 - **Cue B:** a cue later in the title, used as the long-seek target.
 
-Prefer a title with a second audio track for §5 because switching audio is a
-deterministic player-item replacement. Without one, the replacement row is
-runnable only when §4 reports `Remux · HLS` and a long seek visibly enters the
-stream-change spinner. A `Direct play` title with one audio track has no
-replacement trigger; record `Not run — Direct play with one audio track` rather
-than treating a successful seek as replacement evidence.
+To complete this iPad slice, the title must provide an observable player-item
+replacement in §5. A second audio track is the deterministic choice because
+switching audio always replaces the item. With one audio track, the fallback is
+a fresh `Remux · HLS` session whose long seek visibly enters the stream-change
+spinner. If §4 instead reports `Direct play`, stop and choose another qualifying
+HDR/PGS title with a second audio track; do not run the rest of the matrix and
+call its replacement row complete. If no such operator-owned title is available,
+record `Not run — no item-replacement trigger`; that is an honest incomplete
+result and leaves the physical milestone pending.
 
 ## 4. Establish the Off baseline, then select the overlay
 
@@ -195,8 +198,10 @@ before any release claim; do not rewrite the observation as a pass.
 
 Copy this table into the acceptance issue. Use `Yes`, `No`, or `Not run`; do not
 use “looks good.” Every row must be `Yes` to complete this iPad slice. A `No` or
-`Not run` keeps the physical Apple milestone pending; `Not run` records that an
-observation was unavailable rather than disguising it as a pass.
+`Not run` keeps the physical Apple milestone pending. If the replacement row is
+`Not run`, return to §3 and choose another qualifying title with a second audio
+track; the entry records the incomplete attempt rather than disguising it as a
+pass.
 
 | Evidence | Result |
 |---|---|

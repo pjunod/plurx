@@ -253,9 +253,10 @@ unchanged; neither silently starts a burn.
 codec check, the diagnostic strings, 100/150 ms timing bounds, item-replacement
 trigger or explicit `Not run`, and Yes/No PiP/AirPlay observations. A direct-
 play title with one audio track cannot satisfy the replacement row merely by
-seeking: without the visible stream-change spinner, no item replacement was
-observed. Until that physical matrix is recorded, the client remains staged
-behind the server's default-off gate.
+seeking: the operator must choose another qualifying title with a second audio
+track, because without the visible stream-change spinner no item replacement
+was observed and the iPad slice remains incomplete. Until that physical matrix
+is recorded, the client remains staged behind the server's default-off gate.
 
 #### What automatic subtitle selection is allowed to do
 
