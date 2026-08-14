@@ -2821,6 +2821,42 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    func testPGSOverlayMenuDistinguishesOverlayFromBurnIn() {
+        let overlay = SubtitleTrack(
+            index: 0,
+            codec: "hdmv_pgs_subtitle",
+            language: "eng",
+            title: "PGS",
+            default: false,
+            forced: false,
+            text: false,
+            native: false,
+            overlay: "pgs-v1"
+        )
+        let unknownOverlay = SubtitleTrack(
+            index: 1,
+            codec: "hdmv_pgs_subtitle",
+            language: "eng",
+            title: "PGS",
+            default: false,
+            forced: false,
+            text: false,
+            native: false,
+            overlay: "pgs-v2"
+        )
+
+        XCTAssertEqual(
+            PlayerView.subtitleLabel(overlay),
+            "PGS  English  HDMV_PGS_SUBTITLE  Overlay"
+        )
+        XCTAssertFalse(PlayerView.subtitleLabel(overlay).contains("Burn-in"))
+        XCTAssertEqual(
+            PlayerView.subtitleLabel(unknownOverlay),
+            "PGS  English  HDMV_PGS_SUBTITLE  Burn-in",
+            "an unknown overlay protocol must retain the established burn/refusal route"
+        )
+    }
+
     func testAppDeclaresBackgroundAudioForPictureInPicture() {
         let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
         XCTAssertTrue(modes.contains("audio"))
