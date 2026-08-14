@@ -56,19 +56,6 @@ The value is read at server startup. Setting it without a restart leaves the
 capability off. Changing the environment and restarting the operator's server
 are operator actions; this document does not authorize an agent to do either.
 
-After the server is healthy, reconnect build 58 and begin playback with
-subtitles Off. Open **Subtitles** and inspect the candidate PGS row:
-
-- A row ending in `HDMV_PGS_SUBTITLE  Overlay` or `PGSSUB  Overlay` proves the
-  current server advertised `pgs-v1` and build 58 recognized it.
-- A row ending in `Burn-in` means the overlay precondition failed: the gate is
-  off, the server or client is stale, or the server did not recognize that
-  track. Stop. A burn-in run cannot prove HDR/Dolby Vision preservation.
-
-The menu check is the end-to-end gate check. It reads the server's advertised
-capability through the production client instead of assuming that an edited
-environment file reached the running process.
-
 ## 3. Use a real HDR/Dolby Vision title with a real PGS track
 
 Use operator-owned media with both of these properties:
@@ -116,9 +103,25 @@ rows before selecting PGS:
 | `Dynamic range` | `Dolby Vision (rendering)` or `HDR10 (rendering)` |
 | `Source` | The expected HEVC/HDR source shape |
 
-Open **Subtitles**, capture the PGS row ending in `Overlay`, and select it. Video
-must continue; selecting the row must not replace the player or show a playback
-spinner. Open **Playback info** again:
+Now open **Subtitles** and inspect the codec-confirmed PGS row before selecting
+it:
+
+- A row ending in `HDMV_PGS_SUBTITLE  Overlay` or `PGSSUB  Overlay` proves the
+  current server advertised `pgs-v1` and build 58 recognized it.
+- A row ending in `Burn-in` means the overlay precondition failed: the gate is
+  off, the server or client is stale, or the server did not recognize the
+  confirmed PGS track. Stop. A burn-in run cannot prove HDR/Dolby Vision
+  preservation.
+
+This is the end-to-end gate check. It comes after `ffprobe` has proved the track
+is PGS, so `Burn-in` cannot be an ASS/SSA or VobSub choice masquerading as a gate
+failure. The check reads the server's advertised capability through the
+production client instead of assuming that an edited environment file reached
+the running process.
+
+Capture the row ending in `Overlay`, then select it. Video must continue;
+selecting the row must not replace the player or show a playback spinner. Open
+**Playback info** again:
 
 - while preparation is running, `Subtitles` may end in
   `PGS overlay · preparing`;
