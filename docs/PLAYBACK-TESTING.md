@@ -179,10 +179,13 @@ on one claim and closes on another, the balance can only fall by the net bytes
 claimed and rise by what the window earned, so `tokens(end) ≤ tokens(start) +
 window × rate − claimed`. `refill` caps every balance at 250 ms of rate, and
 `setRate` clamps it again when the cliff shrinks the bucket, so `tokens(start) ≤
-burst × rate` at the head of any stage. Reservations are serialized, so at most
-one claim is outstanding at any instant and every earlier one has already been
-granted with a non-negative balance; the closing claim can drive the balance no
-further than one slice into debt, so `tokens(end) ≥ −16 KiB`. Rearranged:
+burst × rate` at the head of any stage. Reservation attempts are serialized: a
+later attempt cannot begin until the preceding attempt has repaid its debt to a
+non-negative balance and returned. The next claim can therefore drive the
+balance no further than one slice into debt, so `tokens(end) ≥ −16 KiB`.
+Multiple granted claims may remain outstanding on separate downstream drains;
+they do not deepen the bucket debt because their pricing waits completed in
+sequence. Rearranged:
 
     claimed ≤ (burst + window) × rate + one 16 KiB slice
 
@@ -245,6 +248,17 @@ delivery. The two settlements are mutually exclusive and their sum may not
 exceed `evidence_pending_claim_bytes`, the bytes measured in flight at the seam.
 Those three artifact fields keep every adjustment re-checkable without the
 script; neither the nominal claim size nor the socket count can manufacture one.
+
+A post-window cancellation has the opposite shape. Its positive claim is in the
+retained admission ledger, but an idle bucket may have refilled to capacity and
+accept only part of the requested refund — or none of it. The uncredited part
+must stay in the bucket ledger because that is the token mutation that actually
+happened, yet it cannot authorize browser delivery because the claim settled
+without delivering. `undelivered_admitted_bytes` adds the exact remainder from
+each canceled claim, and the delivery gate subtracts that total from admitted
+bytes. An equal-size unreserved delivery therefore still returns `outcome:
+shaping`; it cannot hide behind a canceled reservation whose refund happened to
+be zero.
 
 A blanket `max_sockets × slice_bytes` ceiling was wrong here and was removed: at
 32 sockets it excused 512 KiB of delivery with no claim behind it anywhere in

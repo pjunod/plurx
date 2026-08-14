@@ -792,6 +792,55 @@ test("a pre-evidence claim refunded after the reset keeps the delivery proof bal
   await shaper.close();
 });
 
+test("a canceled post-evidence claim cannot authorize later unclaimed delivery", async () => {
+  const [shaper, clock] = deterministicShaper("8mbps-to-1.5mbps");
+  const slice = Buffer.alloc(16 * 1024, 0x61);
+  let closing = false;
+  shaper.beginEvidence();
+
+  // Claim a slice inside the evidence window and hold it before drain. By the
+  // time the player cancels, the idle bucket is full and accepts no refund, so
+  // its conservation ledger legitimately retains the whole positive claim.
+  const held = heldSink();
+  const abandoned = shaper.writeShaped(slice, held, true, () => closing).catch(() => null);
+  await settle();
+  assert.equal(shaper.pendingClaims.size, 1, "the post-window claim is still outstanding");
+  clock.now = 10_000;
+  closing = true;
+  held.destroyed = true;
+  held.emit("close");
+  await abandoned;
+  assert.equal(shaper.bucket.refund(slice.length, clock.now), 0,
+    "the full bucket has no room for any more cancellation credit");
+
+  // One ordinary post-cliff slice still has a matching admission. The canceled
+  // claim delivered nothing, so it must authorize no browser bytes even though
+  // its zero-credit refund leaves that admission in the conservation ledger.
+  shaper.applyCliff();
+  const free = heldSink();
+  free.holding = false;
+  await shaper.writeShaped(slice, free, true, () => false);
+  const clean = shaper.telemetry();
+  assert.equal(clean.undelivered_admitted_bytes, slice.length,
+    "the artifact names the stranded admission from the canceled claim");
+  assert.equal(lab.scoreRecovery(CRITERIA, observation({ shaping: clean })).outcome, "passed",
+    "a legitimate zero-credit cancellation remains clean");
+
+  // Reproduce the reviewer's counterexample through the real proxy: an equal
+  // unreserved delivery cannot spend the canceled claim's stranded admission.
+  shaper.record(slice.length, true);
+  const bypassed = shaper.telemetry();
+  assert.equal(
+    bypassed.stages.reduce((total, stage) => total + stage.bytes, 0),
+    bypassed.stages.reduce((total, stage) => total + stage.admitted_bytes, 0),
+    "the old aggregate comparison saw equal totals and returned a false pass",
+  );
+  const score = lab.scoreRecovery(CRITERIA, observation({ shaping: bypassed }));
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /canceled claims left 16384 B of admission without delivery/);
+  await shaper.close();
+});
+
 test("a refund is metered as the credit the bucket took, not the slice that was asked back", () => {
   const bucket = new lab.TokenBucket(1500, 0);
   bucket.refill(10_000);
@@ -982,6 +1031,7 @@ function observation(extra = {}) {
       evidence_pending_claim_bytes: 0,
       carried_over_bytes: 0,
       evidence_refunded_claim_bytes: 0,
+      undelivered_admitted_bytes: 0,
       stages: [
         shapedStage("before-cliff", 8000, { spanMs: 12_000, rate: 4100, mediaRate: 4000 }),
         shapedStage("after-cliff", 1500, { spanMs: 45_000, rate: 1480, mediaRate: 1400 }),

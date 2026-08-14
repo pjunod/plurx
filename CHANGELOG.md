@@ -93,16 +93,21 @@ bump may break compatibility and a **patch** bump never does.
   second that is the familiar 1.25× burst ceiling; over a whole stage the fixed
   terms amortize, so a 45-second stage is held to 1537.9 kb/s on a 1.5 Mb/s cap
   rather than the 1875 kb/s a flat tolerance allowed. Metering the claim rather
-  than the completion is what makes it a proof: reservations are serialized, so
-  exactly one claim is ever outstanding, while downstream drains are
-  deliberately per-connection, so separately priced slices can finish together
+  than the completion is what makes it a proof: reservation attempts are
+  serialized, so each attempt repays its debt before the next can begin, while
+  multiple granted claims may remain outstanding on downstream drains and
+  separately priced slices can therefore finish together
   and no delivered *rate* has a bound the design can state — three connections
   releasing at once deliver a whole stage in a single instant. Delivered rates
   are therefore reported, because they are what a viewer would have felt, but
   never scored; delivered *bytes* are gated as a total against admitted bytes,
   which is the one check the ledger cannot make about itself — that nothing
-  reached the browser without being claimed first. Neither gate carries a
-  tolerance multiplier, since a multiplier is an unproved band in which a real
+  reached the browser without being claimed first. A canceled post-evidence
+  claim that the refilled bucket cannot credit back remains in the conservation
+  ledger, but `undelivered_admitted_bytes` removes that exact stranded amount
+  from delivery authorization, so it cannot mask an equal unreserved delivery.
+  Neither gate carries a tolerance multiplier, since a multiplier is an
+  unproved band in which a real
   leak scores as healthy: the sustained gate compares exact byte counts and the
   burst gate compares its bound at the 0.1 kb/s quantum the peak is reported in,
   so one quantum past the ceiling already fails. Recovery criteria are

@@ -701,6 +701,10 @@ class ShapingProxy {
     this.evidencePendingBytes = 0;
     this.carriedOverBytes = 0;
     this.evidenceRefundedClaimBytes = 0;
+    // Admission the bucket still retains for claims canceled after the evidence
+    // reset. It remains part of the bucket-conservation proof, but it cannot
+    // authorize delivery because the named claim never reached the browser.
+    this.undeliveredAdmittedBytes = 0;
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -758,6 +762,7 @@ class ShapingProxy {
     this.evidencePendingBytes = 0;
     this.carriedOverBytes = 0;
     this.evidenceRefundedClaimBytes = 0;
+    this.undeliveredAdmittedBytes = 0;
     for (const claim of this.pendingClaims) {
       claim.crossedEvidenceSeam = true;
       this.evidencePendingBytes += claim.bytes;
@@ -826,13 +831,20 @@ class ShapingProxy {
    * the slice whenever the balance was already near capacity.
    */
   meterRefund(bytes, media, at = this.now(), claim = null) {
+    const credited = claim ? Math.max(0, Math.min(bytes, claim.bytes)) : 0;
     // `beginEvidence` discards the positive entry for an outstanding claim. If
     // that exact claim is canceled afterwards, its negative refund survives in
     // the new ledger and needs the same measured seam reconciliation as a
     // completion. Record only the credit the bucket actually accepted; this is
     // neither the claim's nominal size nor a blanket delivery allowance.
     if (claim?.crossedEvidenceSeam && this.pendingClaims.has(claim)) {
-      this.evidenceRefundedClaimBytes += Math.min(bytes, claim.bytes);
+      this.evidenceRefundedClaimBytes += credited;
+    } else if (claim && this.pendingClaims.has(claim)) {
+      // A post-reset claim is present in the retained admission ledger. If the
+      // bucket is already full, some or all of its canceled reservation cannot
+      // be credited back and therefore stays in that conservation series. Name
+      // exactly that remainder so it cannot authorize unrelated delivery.
+      this.undeliveredAdmittedBytes += claim.bytes - credited;
     }
     if (bytes <= 0) return;
     this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes: -bytes, media });
@@ -1074,6 +1086,11 @@ class ShapingProxy {
       evidence_pending_claim_bytes: this.evidencePendingBytes,
       carried_over_bytes: this.carriedOverBytes,
       evidence_refunded_claim_bytes: this.evidenceRefundedClaimBytes,
+      // A canceled post-evidence claim may receive only a partial refund (or no
+      // refund) when the bucket has refilled to capacity. Its uncredited bytes
+      // correctly remain in the conservation ledger, but this separate total
+      // removes them from the delivery authorization because they never landed.
+      undelivered_admitted_bytes: this.undeliveredAdmittedBytes,
       transport_errors: this.errors.slice(-10),
       stages: this.stages.map((stage) => {
         const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
@@ -1971,11 +1988,13 @@ function sustainedSecondsOf(criteria) {
  *
  * `refill` caps every balance at `SHAPER_BURST_MS` of rate, and `setRate`
  * clamps it again when the cliff shrinks the bucket, so
- * `tokens(start) <= burst * rate` at the head of any stage. Reservations are
- * serialized, so at most one claim is outstanding at any instant and every
- * earlier one has already been granted with a non-negative balance; the closing
- * claim can therefore drive the balance no further than one slice into debt,
- * giving `tokens(end) >= -SHAPER_SLICE_BYTES`. Rearranged, the bytes claimed
+ * `tokens(start) <= burst * rate` at the head of any stage. Reservation attempts
+ * are serialized: a later attempt cannot begin until the preceding attempt has
+ * repaid its debt to a non-negative balance and returned. The next claim can
+ * therefore drive the balance no further than one slice into debt, giving
+ * `tokens(end) >= -SHAPER_SLICE_BYTES`. Multiple granted claims may still wait
+ * on separate downstream drains; that does not deepen the bucket debt because
+ * their pricing waits completed sequentially. Rearranged, the bytes claimed
  * inside a window cannot exceed `(burst + window) * rate` plus one slice.
  *
  * That one slice is the whole in-flight term, and serialization is what proves
@@ -2082,6 +2101,11 @@ function scoreRecovery(criteria, observation) {
   // negative refund but not the discarded positive claim. The actual credit
   // the bucket accepted is therefore a separate seam adjustment; otherwise a
   // healthy replacement delivery appears unclaimed by exactly that refund.
+  // Conversely, a claim created after the reset can be canceled after the
+  // bucket has refilled and accepts no refund. Its positive admission correctly
+  // remains in the conservation ledger, but `undelivered_admitted_bytes`
+  // removes that stranded amount from delivery authorization: a claim that
+  // settled without delivery cannot fund unrelated bytes later in the run.
   // A blanket `max_sockets x slice_bytes` ceiling would instead excuse that
   // many unclaimed bytes from anywhere in the run — at 1.5 Mb/s, seconds of
   // link capacity with no provenance at all.
@@ -2090,8 +2114,9 @@ function scoreRecovery(criteria, observation) {
   const evidencePending = shaping.evidence_pending_claim_bytes ?? 0;
   const carriedOver = shaping.carried_over_bytes ?? 0;
   const evidenceRefunded = shaping.evidence_refunded_claim_bytes ?? 0;
+  const undeliveredAdmitted = shaping.undelivered_admitted_bytes ?? 0;
   const seamAdjustment = carriedOver + evidenceRefunded;
-  if (![evidencePending, carriedOver, evidenceRefunded]
+  if (![evidencePending, carriedOver, evidenceRefunded, undeliveredAdmitted]
     .every((value) => Number.isFinite(value) && value >= 0)
       || seamAdjustment > evidencePending) {
     return {
@@ -2103,11 +2128,13 @@ function scoreRecovery(criteria, observation) {
       metrics: { shaping },
     };
   }
-  if (delivered > admitted + seamAdjustment) {
+  const deliveryAuthorization = admitted - undeliveredAdmitted + seamAdjustment;
+  if (delivered > deliveryAuthorization) {
     return {
       outcome: "shaping",
       errors: [
         `the shaper leaked: the browser received ${delivered} B while the bucket released ${admitted} B`
+        + `; canceled claims left ${undeliveredAdmitted} B of admission without delivery`
         + ` (reconciling ${carriedOver} B delivered and ${evidenceRefunded} B refunded from claims`
         + ` pending before the evidence window)`,
       ],
