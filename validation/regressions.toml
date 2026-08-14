@@ -248,3 +248,9 @@ commits = ["65ecdbbc"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The paused-clock peer refresh test awaits one real replicated read/publish cycle, pins the literal two-second interval and stale-to-VBR convergence, and rejects removal of the production refresh call."
+
+[[coverage]]
+commits = ["f6e7492c"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained encoder subprocess tests keep the 100 ms wedged-probe deadline, the sub-two-second reaping bound, and the quality-refusal verdict; tracked executable fixtures remove the write-close-exec race that misread a spawn error as a refusal."
