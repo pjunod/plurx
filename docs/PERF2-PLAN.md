@@ -924,8 +924,8 @@ which is the rest of this milestone's work. Until the controller lands, a
 `stall-recovery` run is expected to fail with `outcome: recovery`, and
 that recorded failure is the baseline the controller must move. The
 base-versus-candidate normalized smoke equality and a green required gate are
-acceptance evidence to record before closing #143; source and helper tests do
-not substitute for either run. Shape:
+the acceptance evidence, recorded on #143 and PR #145; source and helper tests
+do not substitute for either run. Shape:
 `scripts/playback-lab run --suite stall-recovery
 --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json`,
 failing nonzero when recovery misses the criteria. On it: the 8 →
