@@ -287,6 +287,24 @@ pub fn normalize_sup_cancellable(
     process_sup(File::open(path)?, limits, true, Some(cancelled))
 }
 
+// Test-only seam for the one window a regression cannot otherwise reach: the
+// gap between the preflight digest and the parsing pass over the same pinned
+// handle. Production builds do not compile it, so the boundary it exercises is
+// the real one.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_between_passes_hook() {
+    let hook = BETWEEN_PASSES.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn process_sup(
     source: File,
     limits: &ParserLimits,
@@ -303,6 +321,8 @@ fn process_sup(
     let mut reader = BufReader::new(source);
     let preflight = preflight_sup(&mut reader, source_bytes, limits, cancelled)?;
     reader.seek(SeekFrom::Start(0))?;
+    #[cfg(test)]
+    run_between_passes_hook();
 
     let mut report = InspectionReport {
         adapter_profile: "bounded-sup-v2-stable-input",
@@ -1813,6 +1833,44 @@ mod tests {
         assert_eq!(
             track.compositions[1].pts_90khz,
             PTS_MODULUS + u64::from(after_wrap)
+        );
+    }
+
+    /// The pinned handle stops the path from being re-resolved, but it does not
+    /// stop the inode itself from being rewritten underneath both passes. This
+    /// pins the cross-pass digest that closes that half of the boundary.
+    #[test]
+    fn source_rewritten_under_the_pinned_handle_is_rejected() {
+        let original = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![]),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let replacement = display_set(vec![
+            pcs(2000, CompositionState::EpochStart, vec![]),
+            PgsSegment::end_segment(180_000, 0),
+        ]);
+        assert_eq!(
+            original.len(),
+            replacement.len(),
+            "equal length keeps the size guard out of this proof"
+        );
+        assert_ne!(original, replacement);
+
+        let file = write_sup(&original);
+        let path = file.path().to_path_buf();
+        BETWEEN_PASSES.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&path, &replacement).expect("rewrite the pinned inode in place");
+            }));
+        });
+
+        let error = normalize_sup(file.path(), &ParserLimits::default())
+            .expect_err("content rewritten between preflight and parsing");
+        assert!(
+            error
+                .to_string()
+                .contains("changed between preflight and parsing"),
+            "unexpected error: {error}"
         );
     }
 
