@@ -159,7 +159,7 @@ test_anchor = "testCompletedOfflineDownloadAcceptsPrivateVarLocationAlias"
 
 [[fixes]]
 id = "apple.episode-card-region-actions"
-commits = ["7b074b2"]
+commits = ["099a0ba"]
 source = "clients/apple/Sources/Components.swift"
 source_anchor = "func episodeCardAction("
 test = "clients/apple/Tests/AppleClientTests.swift"

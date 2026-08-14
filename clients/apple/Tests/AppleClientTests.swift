@@ -4150,6 +4150,32 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.focusStrokeWidth, 1)
     }
 
+    func testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate() {
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "show"), .poster)
+        XCTAssertEqual(DetailView.seriesChildStyle(for: "season"), .episode)
+        XCTAssertEqual(
+            episodeCardAction(for: .artwork, itemID: 72),
+            .play
+        )
+        XCTAssertEqual(
+            episodeCardAction(for: .copy, itemID: 72),
+            .navigate(.item(72))
+        )
+        XCTAssertEqual(tvEpisodeCardSelectionAction(), .play)
+
+        var item = Item(id: 72, kind: "episode", title: "The Target")
+        item.episodeNumber = 3
+        XCTAssertEqual(episodeCardPlayAccessibilityLabel(item), "Play 3. The Target")
+        XCTAssertEqual(
+            episodeCardDetailsAccessibilityLabel(item),
+            "View details for 3. The Target"
+        )
+        XCTAssertNotEqual(
+            episodeCardPlayAccessibilityLabel(item),
+            episodeCardDetailsAccessibilityLabel(item)
+        )
+    }
+
     #if os(tvOS)
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
@@ -4174,32 +4200,6 @@ final class AppleClientTests: XCTestCase {
             TVSeriesDetailMetrics.headerHeight + 320,
             900,
             "the first row must begin inside the usable area below the tvOS tab bar"
-        )
-        XCTAssertEqual(DetailView.seriesChildStyle(for: "show"), .poster)
-        XCTAssertEqual(DetailView.seriesChildStyle(for: "season"), .episode)
-    }
-
-    func testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate() {
-        XCTAssertEqual(
-            episodeCardAction(for: .artwork, itemID: 72),
-            .play
-        )
-        XCTAssertEqual(
-            episodeCardAction(for: .copy, itemID: 72),
-            .navigate(.item(72))
-        )
-        XCTAssertEqual(tvEpisodeCardSelectionAction(), .play)
-
-        var item = Item(id: 72, kind: "episode", title: "The Target")
-        item.episodeNumber = 3
-        XCTAssertEqual(episodeCardPlayAccessibilityLabel(item), "Play 3. The Target")
-        XCTAssertEqual(
-            episodeCardDetailsAccessibilityLabel(item),
-            "View details for 3. The Target"
-        )
-        XCTAssertNotEqual(
-            episodeCardPlayAccessibilityLabel(item),
-            episodeCardDetailsAccessibilityLabel(item)
         )
     }
 
