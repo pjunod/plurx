@@ -336,6 +336,65 @@ and Android READMEs, the Apple parity document, and the status page. Those
 claims must match `CURRENT_PROJECT_VERSION` and `versionCode`; advancing a
 client build without its user-facing status documents is red before a PR opens.
 
+The READMEs and the parity document each carry exactly one anchored `> Status:`
+line, so the gate reads a single declared current claim from them. `STATUS.html`
+has no such anchor — it is prose, and every Apple build number in it is treated
+as a current claim. That page also has to narrate history, and a sentence like
+"build 52 corrected the reported iPad mini failure" stays true after the next
+bump while a regex cannot see its tense. Mark such a mention explicitly:
+
+```html
+<span data-build-history>Apple build 52</span> corrects the reported iPad mini failure
+```
+
+Marking is the exception, never the default. An unmarked mention is still swept,
+so a status page that falls behind a build bump is red; the only way to exempt
+one is to write the marker around it, which is a reviewable edit. Use it only
+for mentions that are genuinely about a past build — rewording a true sentence
+to dodge the sweep degrades the page for its readers.
+
+The exemption is granted only by the marker itself: a bare `data-build-history`
+attribute — or one with an empty value, which is how a formatter serializes a
+boolean attribute — on a real `<span>` element that closes around its own
+sentence. The gate parses the page rather than pattern-matching its text, so the
+marker is recognized only at attribute-name position on a tag the HTML tokenizer
+actually produces. A name match alone also fires on markup that is not the
+marker, and these all read as ordinary mentions and stay swept:
+
+```html
+<span title="data-build-history">Apple build 52</span>   <!-- a value, not the marker -->
+<span data-build-history-note>Apple build 52</span>      <!-- a different attribute -->
+<span data-build-history="false">Apple build 52</span>   <!-- the marker takes no value -->
+<span data-build-history/>Apple build 52</span>          <!-- malformed opening tag -->
+```
+
+Marker-shaped characters that are not an element grant nothing either. A comment,
+another element's quoted attribute value, and `<script>` or `<style>` text can
+all spell an opening or closing tag without being one; the build number between
+them is still on the rendered page, so it is still a claim:
+
+```html
+<!-- <span data-build-history> --><p>Apple build 52</p><!-- </span> -->
+<div title="<span data-build-history>">Apple build 52</div>
+```
+
+Everything else fails closed the same way and returns the mention to the sweep:
+an unclosed marker span, the marker on any element other than `<span>`, and a
+marker that drifts across a nested `<span>` and so no longer wraps its own
+sentence. In the other direction, HTML's own insignificant variation is honored,
+so a formatter cannot turn a correctly marked sentence red: attribute order,
+attribute-name case, surrounding whitespace and line breaks, and a quoted
+attribute value containing `>` all still match. `tests/operations/test_mobile_build_claims.py`
+pins both lists.
+
+Android needs no equivalent. Its build claim is read only from the anchored
+`> Status:` line in `clients/android/README.md`, and no whole-file sweep runs
+against Android numbers anywhere, so a historical Android mention cannot break
+the gate. `STATUS.html`'s Android build numbers are consequently unvalidated —
+the opposite gap, and out of scope here; adding that coverage would mean
+adopting the same marker for the historical Android mentions the page already
+carries.
+
 ## Add a functionality point — define the behavior before its command
 
 Start with the promise and the code capable of violating it. Then attach the
