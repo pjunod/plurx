@@ -634,7 +634,6 @@ scripts/bench rate-control \
   --corpus scripts/perf2-rate-control-n1-corpus.json \
   --server-sha256-manifest out/nynuc-perf2.sha256 \
   --modes vbr,qvbr \
-  --quality 22 \
   --vmaf-ffmpeg /opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg \
   --vmaf-model vmaf_v0.6.1 \
   --vmaf-subsample 1 \
@@ -643,17 +642,39 @@ scripts/bench rate-control \
   --capture-timeout 180.0 \
   --idle-timeout 30.0 \
   --settings-settle 3.0 \
-  --json out/rate-control-full.json
+  --json out/rate-control-final-default.json
 ```
 
-The command above measures the explicit `q=22` calibration candidate only; it
-cannot ratify the currently provisional unset/default value. D5 requires a
-nynuc sweep, updating the selected family default to the winning measured
-value, and rerunning that exact default without `--quality`.
+The command above is the binding deployed-default run. During calibration,
+repeat it with explicit `--quality` candidates, select the highest passing
+value, update that family default, deploy it, and then run the command exactly
+as shown without `--quality`.
 
 Omitting `--quality` explicitly sends and verifies
 `transcode_quality: null` for both captures; it does not preserve a preexisting
 override. The original pair is still restored in the final cleanup path.
+
+The 2026-08-14 nynuc QSV acceptance used deployed build
+`v0.2.7-167-gb6aaed6` and selected default 22. The no-override run passed with
+these results:
+
+| Fixture | Mode | Bytes | VMAF | Speed p10 | Binding 10 s peak |
+|---|---:|---:|---:|---:|---:|
+| easy 1080p H.264 | VBR | 31,764,104 | 55.443244 | 14.434x | 8,555.504 kb/s |
+| easy 1080p H.264 | QVBR | 31,763,916 | 55.443244 | 15.392x | 8,555.354 kb/s |
+| hard 1080p grain | VBR | 31,119,452 | 49.597362 | 12.653x | 8,349.456 kb/s |
+| hard 1080p grain | QVBR | 31,284,516 | 49.617396 | 12.467x | 8,717.184 kb/s |
+
+The final JSON SHA-256 is
+`88e47f2bb20cf166d61f4470419f9ff7c3ea966a77b1f701b909b6952b60cbba`.
+It records `transcode_quality: null` for both modes, the exact measurement
+parameters above, the deployed build, and stable Intel QuickSync identity.
+The production log ring contained exactly four matching new-build argument
+lines: two legacy VBR and two QVBR with `-global_quality 22`. The isolated
+forced-fallback proof SHA-256 is
+`4b5efac48d77459cddf20894bbdc2318cda1dad88745e3d5a9e12c2216d715ab`.
+Afterward the node reported zero work with `bitrate` and a null quality
+override.
 
 Full comparison accepts exactly model `vmaf_v0.6.1`, `--vmaf-subsample 1`, a
 `10.0`-second served-segment window, `--poll 0.25`, and
