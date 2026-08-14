@@ -167,7 +167,7 @@ test_anchor = "testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate"
 
 [[fixes]]
 id = "apple.tv-series-child-shelf-focus"
-commits = ["b1b984e4"]
+commits = ["487e9152", "c62e22c1"]
 source = "clients/apple/Sources/Components.swift"
 source_anchor = "struct TVNavigationFocusSection<Content: View>: View"
 test = "clients/apple/Tests/AppleClientTests.swift"
