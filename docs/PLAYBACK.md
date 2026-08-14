@@ -329,9 +329,13 @@ The version 1 manifest is a source-time list of complete composition snapshots:
 
 Intervals are half-open (`start_ms <= t < end_ms`), sorted, and non-overlapping.
 Every cue is the complete active composition. Authored clears become gaps, not
-empty cues. Consecutive identical compositions and duplicate PNG content are
-coalesced by the producer. Canvas coordinates remain authored PGS coordinates;
-clients map that canvas into the current video rectangle.
+empty cues. If several display sets resolve to the same source millisecond, the
+producer processes them in file order and keeps the last complete state; the
+intermediate states have zero display duration and never become duplicate cue
+starts. Consecutive identical compositions and duplicate PNG content are also
+coalesced. Both clients therefore receive one unambiguous state at a boundary.
+Canvas coordinates remain authored PGS coordinates; clients map that canvas
+into the current video rectangle.
 
 Each `image` value is relative to the subtitle route and resolves to:
 
@@ -346,13 +350,20 @@ ordinary signed-in user. A generation is derived from file id, subtitle index,
 source size/mtime, extractor version, and schema version; a replaced source or
 protocol change therefore cannot serve the previous cache.
 
-The producer demuxes the selected stream to bounded raw SUP, normalizes PGS
-state into complete RGBA snapshots, content-addresses PNG objects, validates
-the finished manifest and every referenced object, then atomically renames the
-generation directory into view. Limits include a 4096×2160 canvas, 64 objects
-per composition, 250,000 display sets, 256 MiB normalized/output bytes per
-track, a 10-minute deadline, two concurrent producers, a two-minute negative
-failure memo, and a separate 2 GiB/128-generation LRU cache budget.
+The producer demuxes the selected stream to bounded raw SUP, opens that SUP
+once, and uses the same file identity for structural preflight and parsing. It
+also compares a content digest across both passes, so an in-place change is a
+failure rather than permission to parse bytes that were not preflighted. The
+owned raw-SUP/PCS adapter unwraps the 32-bit 90 kHz PTS clock, treats only a
+jump larger than half the clock range as wrap, and rejects ordinary backwards
+time. It recognizes `0xC0` Epoch Continue with the same cache reset FFmpeg
+applies to every non-normal state. The normalizer then emits complete RGBA
+snapshots, content-addresses PNG objects, validates the finished manifest and
+every referenced object, and atomically renames the generation directory into
+view. Limits include a 4096×2160 canvas, 64 objects per composition, 250,000
+display sets, 256 MiB normalized/output bytes per track, a 10-minute deadline,
+two concurrent producers, a two-minute negative failure memo, and a separate
+2 GiB/128-generation LRU cache budget.
 
 Route failures are stable: 404 for file/track/generation/object absence, 415
 for a non-PGS codec, 422 for malformed or over-limit PGS, 409 when the source

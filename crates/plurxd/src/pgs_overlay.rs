@@ -25,7 +25,7 @@ use crate::ffmpeg::ffmpeg_bin;
 
 pub const SCHEMA: u8 = 1;
 pub const PROTOCOL: &str = "pgs-v1";
-const EXTRACTOR_VERSION: &str = "plurx-pgs-overlay-v2-bt709-hd";
+const EXTRACTOR_VERSION: &str = "plurx-pgs-overlay-v3-stable-input-pts-wrap";
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(600);
 const NEGATIVE_TTL: Duration = Duration::from_secs(120);
 const MAX_NEGATIVE_ENTRIES: usize = 128;
@@ -602,6 +602,14 @@ struct Snapshot {
     objects: Vec<OverlayObject>,
 }
 
+impl Snapshot {
+    fn same_composition(&self, other: &Self) -> bool {
+        self.canvas_width == other.canvas_width
+            && self.canvas_height == other.canvas_height
+            && self.objects == other.objects
+    }
+}
+
 fn compile_generation(
     stage: &Path,
     file: &MediaFile,
@@ -658,17 +666,24 @@ fn compile_generation(
             canvas_height: composition.canvas_height,
             objects,
         };
-        if let Some(previous) = snapshots.last_mut() {
-            if previous.start_ms == snapshot.start_ms {
-                *previous = snapshot;
-                continue;
-            }
-            if previous.canvas_width == snapshot.canvas_width
-                && previous.canvas_height == snapshot.canvas_height
-                && previous.objects == snapshot.objects
+        if snapshots
+            .last()
+            .is_some_and(|previous| previous.start_ms == snapshot.start_ms)
+        {
+            let replacement_index = snapshots.len() - 1;
+            snapshots[replacement_index] = snapshot;
+            if replacement_index > 0
+                && snapshots[replacement_index - 1].same_composition(&snapshots[replacement_index])
             {
-                continue;
+                snapshots.pop();
             }
+            continue;
+        }
+        if snapshots
+            .last()
+            .is_some_and(|previous| previous.same_composition(&snapshot))
+        {
+            continue;
         }
         snapshots.push(snapshot);
     }
@@ -1033,6 +1048,8 @@ mod tests {
             content_display_sets: 2,
             clear_display_sets: 1,
             duplicate_timestamps: 0,
+            pts_wraps: 0,
+            epoch_continue_display_sets: 0,
             palette_definitions: 1,
             object_definitions: 1,
             max_canvas_width: 1920,
@@ -1152,10 +1169,149 @@ mod tests {
             (1000, 3000)
         );
         assert_eq!(
+            (
+                manifest.cues[0].canvas_width,
+                manifest.cues[0].canvas_height
+            ),
+            (1920, 1080),
+            "a 4K MediaFile retains its authored 1080p PGS canvas"
+        );
+        assert_eq!(
             std::fs::read_dir(dir.path().join("objects"))
                 .expect("objects")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn manifest_clamps_a_missing_final_clear_to_media_duration() {
+        let dir = tempfile::tempdir().expect("cache");
+        let mut file = file(dir.path().join("source.mkv"));
+        file.duration_ms = Some(10_000);
+        let generation = generation(&file, 0);
+        let track = NormalizedTrack {
+            report: report(),
+            compositions: vec![NormalizedComposition {
+                pts_90khz: 90_000,
+                start_ms: 1000.0,
+                canvas_width: 1920,
+                canvas_height: 1080,
+                objects: vec![object()],
+            }],
+        };
+
+        compile_generation(dir.path(), &file, 0, &generation, track, None).expect("compile");
+        let manifest: OverlayManifest = serde_json::from_slice(
+            &std::fs::read(dir.path().join("manifest.json")).expect("manifest"),
+        )
+        .expect("valid manifest");
+        assert_eq!(manifest.cues.len(), 1);
+        assert_eq!(
+            (manifest.cues[0].start_ms, manifest.cues[0].end_ms),
+            (1000, 10_000)
+        );
+    }
+
+    #[test]
+    fn identical_timestamps_keep_the_last_display_set_in_file_order() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = file(dir.path().join("source.mkv"));
+        let generation = generation(&file, 0);
+        let first = object();
+        let mut last = object();
+        last.x = 99;
+        let track = NormalizedTrack {
+            report: report(),
+            compositions: vec![
+                NormalizedComposition {
+                    pts_90khz: 90_000,
+                    start_ms: 1000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![first],
+                },
+                NormalizedComposition {
+                    pts_90khz: 90_000,
+                    start_ms: 1000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![last],
+                },
+                NormalizedComposition {
+                    pts_90khz: 180_000,
+                    start_ms: 2000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![],
+                },
+            ],
+        };
+
+        compile_generation(dir.path(), &file, 0, &generation, track, None).expect("compile");
+        let manifest: OverlayManifest = serde_json::from_slice(
+            &std::fs::read(dir.path().join("manifest.json")).expect("manifest"),
+        )
+        .expect("valid manifest");
+        assert_eq!(manifest.cues.len(), 1);
+        assert_eq!(manifest.cues[0].objects[0].x, 99);
+        assert_eq!(
+            (manifest.cues[0].start_ms, manifest.cues[0].end_ms),
+            (1000, 2000)
+        );
+    }
+
+    #[test]
+    fn same_timestamp_replacement_coalesces_with_the_preceding_state() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = file(dir.path().join("source.mkv"));
+        let generation = generation(&file, 0);
+        let mut transient = object();
+        transient.x = 99;
+        let track = NormalizedTrack {
+            report: report(),
+            compositions: vec![
+                NormalizedComposition {
+                    pts_90khz: 0,
+                    start_ms: 0.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![object()],
+                },
+                NormalizedComposition {
+                    pts_90khz: 90_000,
+                    start_ms: 1000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![transient],
+                },
+                NormalizedComposition {
+                    pts_90khz: 90_000,
+                    start_ms: 1000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![object()],
+                },
+                NormalizedComposition {
+                    pts_90khz: 180_000,
+                    start_ms: 2000.0,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                    objects: vec![],
+                },
+            ],
+        };
+
+        compile_generation(dir.path(), &file, 0, &generation, track, None).expect("compile");
+        let manifest: OverlayManifest = serde_json::from_slice(
+            &std::fs::read(dir.path().join("manifest.json")).expect("manifest"),
+        )
+        .expect("valid manifest");
+        assert_eq!(manifest.cues.len(), 1);
+        assert_eq!(manifest.cues[0].objects[0].x, 10);
+        assert_eq!(
+            (manifest.cues[0].start_ms, manifest.cues[0].end_ms),
+            (0, 2000)
         );
     }
 

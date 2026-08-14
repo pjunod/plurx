@@ -739,6 +739,159 @@ pub fn subtitle_playlist(duration_ms: i64) -> String {
 mod tests {
     use super::*;
 
+    use plurx_core::domain::{
+        ItemKind, LibraryKind, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
+        ProbeResult, SubtitleStream,
+    };
+    use plurx_core::store::SqliteStore;
+    use plurx_core::transcode::{EffectiveRateControl, EncoderCaps, Pipeline};
+
+    struct Fixture {
+        manager: Arc<OfflineManager>,
+        store: Arc<dyn Store>,
+        file: plurx_core::domain::MediaFile,
+        user_id: i64,
+        _root: tempfile::TempDir,
+    }
+
+    async fn seeded_fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("movie.mkv");
+        std::fs::write(&source, b"offline lifecycle fixture").expect("source");
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store
+            .create_user("traveller", "hash", false)
+            .await
+            .expect("user");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Offline".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![root.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Flight".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        let file_id = store
+            .upsert_file(
+                item,
+                &source.to_string_lossy(),
+                25,
+                7,
+                &ProbeResult {
+                    duration_ms: Some(90_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 4,
+                        codec: "subrip".into(),
+                        language: Some("eng".into()),
+                        ..Default::default()
+                    }],
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        let file = store
+            .get_file(file_id)
+            .await
+            .expect("file lookup")
+            .expect("file");
+        let transcode = Arc::new(TranscodeManager::new(
+            Arc::clone(&store),
+            root.path().join("transcode"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+        let manager = OfflineManager::new(Arc::clone(&store), transcode, "test-node".into());
+        Fixture {
+            manager,
+            store,
+            file,
+            user_id: user.id,
+            _root: root,
+        }
+    }
+
+    async fn claimed_package(
+        fixture: &Fixture,
+        id: &str,
+        subtitle_mode: &str,
+        subtitle_index: Option<i64>,
+    ) -> OfflinePackage {
+        let package = NewOfflinePackage {
+            id: id.into(),
+            request_id: format!("request-{id}"),
+            user_id: fixture.user_id,
+            file_id: fixture.file.id,
+            node_id: "test-node".into(),
+            source_path: fixture.file.path.to_string_lossy().into_owned(),
+            source_size: fixture.file.size,
+            source_mtime: fixture.file.mtime,
+            effective_rate_control: EffectiveRateControl::Vbr.snapshot_value(),
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index,
+            subtitle_language: subtitle_index.map(|_| "en".into()),
+            subtitle_mode: subtitle_mode.into(),
+            estimated_bytes: 100,
+            reserved_bytes: 120,
+            expires_at: i64::MAX,
+        };
+        assert!(matches!(
+            fixture
+                .store
+                .create_offline_package(&package, 10, 1_000, 2_000)
+                .await
+                .expect("create package"),
+            OfflineCreateOutcome::Created(_)
+        ));
+        fixture
+            .store
+            .claim_next_offline_package("test-node")
+            .await
+            .expect("claim package")
+            .expect("queued package")
+    }
+
+    async fn stored_package(fixture: &Fixture, id: &str) -> OfflinePackage {
+        fixture
+            .store
+            .offline_package_for_user(id, fixture.user_id)
+            .await
+            .expect("package lookup")
+            .expect("package")
+    }
+
+    fn produced(duration_ms: i64, bytes: i64) -> Produced {
+        Produced {
+            recipe: "recipe-under-test".into(),
+            bytes,
+            duration_ms,
+            segments: 2,
+            parts: 1,
+        }
+    }
+
     fn package(mode: &str, index: Option<i64>) -> OfflinePackage {
         OfflinePackage {
             id: "pkg".into(),
@@ -783,6 +936,18 @@ mod tests {
         assert!(master.contains("LANGUAGE=\"en\""), "{master}");
         assert!(master.contains("RESOLUTION=1280x720"), "{master}");
         assert!(!master.contains("CODECS="), "{master}");
+
+        let mut plain = package("none", None);
+        plain.target_height = 999;
+        plain.output_width = None;
+        plain.output_height = None;
+        let master = master_playlist(&plain);
+        assert!(
+            master.contains("BANDWIDTH=1,AVERAGE-BANDWIDTH=1"),
+            "{master}"
+        );
+        assert!(!master.contains("SUBTITLES="), "{master}");
+        assert!(!master.contains("RESOLUTION="), "{master}");
     }
 
     #[test]
@@ -805,6 +970,8 @@ mod tests {
             - 120;
         metrics.record_request(720);
         metrics.record_request(999); // An unadvertised height creates no label.
+        metrics.record_quota_rejection(OfflineQuota::Registry);
+        metrics.record_quota_rejection(OfflineQuota::UserBytes);
         metrics.record_quota_rejection(OfflineQuota::GlobalBytes);
         metrics.accumulate_work(&ready.id, Duration::from_millis(500));
         metrics.record_ready(&ready, 90_000, 400, Duration::from_millis(1_500));
@@ -816,6 +983,12 @@ mod tests {
         let mut cancelled = ready.clone();
         cancelled.state = "preparing".into();
         metrics.record_cancellation(&cancelled);
+        let mut completed = ready.clone();
+        completed.id = "completed-package".into();
+        completed.state = "ready".into();
+        metrics.record_cancellation(&completed);
+        metrics.accumulate_work("forgotten-package", Duration::from_millis(50));
+        metrics.forget_work("forgotten-package");
 
         assert_eq!(metrics.transfer_bytes(&ready.id), Some(123));
         let text = metrics.prometheus();
@@ -833,5 +1006,286 @@ mod tests {
 
         metrics.forget_transfer(&ready.id);
         assert_eq!(metrics.transfer_bytes(&ready.id), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_signals_one_or_every_active_preparation() {
+        let fixture = seeded_fixture().await;
+        let first = tokio_util::sync::CancellationToken::new();
+        let second = tokio_util::sync::CancellationToken::new();
+        fixture
+            .manager
+            .active
+            .lock()
+            .await
+            .insert("first".into(), first.clone());
+        fixture
+            .manager
+            .active
+            .lock()
+            .await
+            .insert("second".into(), second.clone());
+
+        fixture.manager.cancel("first").await;
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        fixture.manager.cancel("missing").await;
+
+        fixture.manager.cancel_all().await;
+        assert!(second.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_requeues_interrupted_work_even_while_offline_is_disabled() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "restart", "none", None).await;
+        assert_eq!(package.state, "preparing");
+        fixture
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "off")
+            .await
+            .expect("disable offline");
+
+        let task = tokio::spawn(Arc::clone(&fixture.manager).run());
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if stored_package(&fixture, "restart").await.state == "queued" {
+                break;
+            }
+        }
+        assert_eq!(stored_package(&fixture, "restart").await.state, "queued");
+        assert!(!fixture.manager.enabled().await);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_marks_a_changed_source_failed_and_keeps_the_typed_reason() {
+        let fixture = seeded_fixture().await;
+        let mut package = claimed_package(&fixture, "changed-source", "none", None).await;
+        assert!(fixture
+            .store
+            .requeue_offline_package(&package.id)
+            .await
+            .expect("requeue"));
+        package.source_mtime += 1;
+        fixture
+            .store
+            .delete_offline_package(&package.id, fixture.user_id)
+            .await
+            .expect("delete original package");
+        let replacement = NewOfflinePackage {
+            id: package.id.clone(),
+            request_id: package.request_id.clone(),
+            user_id: package.user_id,
+            file_id: package.file_id,
+            node_id: package.node_id.clone(),
+            source_path: package.source_path.clone(),
+            source_size: package.source_size,
+            source_mtime: package.source_mtime,
+            effective_rate_control: package.effective_rate_control.clone(),
+            target_height: package.target_height,
+            output_width: package.output_width,
+            output_height: package.output_height,
+            audio_index: package.audio_index,
+            audio_offset_ms: package.audio_offset_ms,
+            subtitle_index: package.subtitle_index,
+            subtitle_language: package.subtitle_language.clone(),
+            subtitle_mode: package.subtitle_mode.clone(),
+            estimated_bytes: package.estimated_bytes,
+            reserved_bytes: package.reserved_bytes,
+            expires_at: i64::MAX,
+        };
+        fixture
+            .store
+            .create_offline_package(&replacement, 10, 1_000, 2_000)
+            .await
+            .expect("replace package");
+
+        let task = tokio::spawn(Arc::clone(&fixture.manager).run());
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            if stored_package(&fixture, "changed-source").await.state == "failed" {
+                break;
+            }
+        }
+        let failed = stored_package(&fixture, "changed-source").await;
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.phase, "waiting_for_source");
+        assert_eq!(failed.error_code.as_deref(), Some("source_unavailable"));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_production_returns_to_the_durable_queue() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "yielded", "native", Some(4)).await;
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+
+        fixture.manager.prepare(package, &cancelled).await;
+
+        let queued = stored_package(&fixture, "yielded").await;
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.phase, "waiting_for_encoder");
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_selection_and_rate_control_fail_before_encoding() {
+        let fixture = seeded_fixture().await;
+        let invalid_track = claimed_package(&fixture, "invalid-track", "native", None).await;
+        fixture
+            .manager
+            .prepare(invalid_track, &tokio_util::sync::CancellationToken::new())
+            .await;
+        let invalid_track = stored_package(&fixture, "invalid-track").await;
+        assert_eq!(invalid_track.state, "failed");
+        assert_eq!(invalid_track.phase, "validating");
+        assert_eq!(invalid_track.error_code.as_deref(), Some("invalid_track"));
+
+        let fixture = seeded_fixture().await;
+        let mut invalid_rate = claimed_package(&fixture, "invalid-rate", "burned", Some(4)).await;
+        invalid_rate.effective_rate_control = "not-a-rate-control".into();
+        fixture
+            .manager
+            .prepare(invalid_rate, &tokio_util::sync::CancellationToken::new())
+            .await;
+        let invalid_rate = stored_package(&fixture, "invalid-rate").await;
+        assert_eq!(invalid_rate.state, "failed");
+        assert_eq!(
+            invalid_rate.error_code.as_deref(),
+            Some("invalid_rate_control")
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_setup_failure_is_a_typed_terminal_state() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "encoder-failure", "none", None).await;
+
+        fixture
+            .manager
+            .prepare(package, &tokio_util::sync::CancellationToken::new())
+            .await;
+
+        let failed = stored_package(&fixture, "encoder-failure").await;
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.phase, "transcoding");
+        assert_eq!(failed.error_code.as_deref(), Some("encoder_failed"));
+    }
+
+    #[tokio::test]
+    async fn complete_video_publication_moves_preparing_to_ready_with_verified_state() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "ready-video", "none", None).await;
+
+        fixture
+            .manager
+            .publish_ready(
+                &package,
+                &fixture.file,
+                produced(90_000, 400),
+                Instant::now(),
+            )
+            .await;
+
+        let ready = stored_package(&fixture, "ready-video").await;
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.phase, "ready");
+        assert_eq!(ready.recipe_hash.as_deref(), Some("recipe-under-test"));
+        assert_eq!(ready.duration_ms, Some(90_000));
+        assert_eq!(
+            ready.actual_bytes,
+            Some(400 + master_playlist(&package).len() as i64)
+        );
+        assert!(fixture
+            .manager
+            .prometheus()
+            .contains("plurx_offline_prepare_seconds_count{result=\"ok\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_missing_subtitle_publication_never_reports_ready() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "short-video", "none", None).await;
+        fixture
+            .manager
+            .publish_ready(
+                &package,
+                &fixture.file,
+                produced(70_000, 300),
+                Instant::now(),
+            )
+            .await;
+        let failed = stored_package(&fixture, "short-video").await;
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.phase, "publishing");
+
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "missing-index", "native", None).await;
+        fixture
+            .manager
+            .publish_ready(
+                &package,
+                &fixture.file,
+                produced(90_000, 300),
+                Instant::now(),
+            )
+            .await;
+        let failed = stored_package(&fixture, "missing-index").await;
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.phase, "extracting_subtitles");
+        assert_eq!(failed.error_code.as_deref(), Some("subtitle_failed"));
+
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "missing-sidecar", "native", Some(4)).await;
+        fixture
+            .manager
+            .publish_ready(
+                &package,
+                &fixture.file,
+                produced(90_000, 300),
+                Instant::now(),
+            )
+            .await;
+        let failed = stored_package(&fixture, "missing-sidecar").await;
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.phase, "extracting_subtitles");
+    }
+
+    #[tokio::test]
+    async fn native_subtitle_publication_counts_the_complete_rendition() {
+        let fixture = seeded_fixture().await;
+        let package = claimed_package(&fixture, "native-ready", "native", Some(4)).await;
+        let sidecar = crate::subtitles::vtt_path_for_identity(
+            fixture.manager.transcode.subtitle_cache_dir(),
+            package.file_id,
+            4,
+            package.source_size,
+            package.source_mtime,
+        );
+        tokio::fs::create_dir_all(sidecar.parent().expect("sidecar parent"))
+            .await
+            .expect("sidecar parent");
+        tokio::fs::write(&sidecar, b"WEBVTT\n\n")
+            .await
+            .expect("sidecar");
+
+        fixture
+            .manager
+            .publish_ready(
+                &package,
+                &fixture.file,
+                produced(90_000, 400),
+                Instant::now(),
+            )
+            .await;
+
+        let ready = stored_package(&fixture, "native-ready").await;
+        let expected = 400
+            + master_playlist(&package).len() as i64
+            + b"WEBVTT\n\n".len() as i64
+            + subtitle_playlist(90_000).len() as i64;
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.actual_bytes, Some(expected));
     }
 }

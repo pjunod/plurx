@@ -653,6 +653,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn access_keeps_live_and_transiently_stale_tokens() {
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
+            .await
+            .expect("live auth");
+        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let client = mgr.client().await.expect("client");
+        assert_eq!(mgr.access(&client, user).await.as_deref(), Some("acc"));
+
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 100))
+            .await
+            .expect("expiring auth");
+        let base = serve(fixed(503, json!({ "error": "temporary" }))).await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let client = mgr.client().await.expect("client");
+        assert_eq!(
+            mgr.access(&client, user).await.as_deref(),
+            Some("acc"),
+            "a transient refresh failure keeps the last token available"
+        );
+        assert!(mgr.access(&client, i64::MAX).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn episode_identity_requires_its_show_and_numbering() {
+        let (store, _) = store_with_creds().await;
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Shows".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(95_457),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("show id");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let episode = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "Good News About Hell".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("episode");
+        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        assert_eq!(
+            mgr.ident_for(episode).await,
+            Some(Ident::Episode {
+                show_tmdb: 95_457,
+                season: 1,
+                episode: 1,
+            })
+        );
+        assert!(mgr.ident_for(show).await.is_none());
+        assert!(mgr.ident_for(i64::MAX).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scrobble_session_starts_updates_and_stops_exactly_once() {
+        use axum::routing::post;
+        use axum::Json;
+        use std::sync::atomic::AtomicUsize;
+
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
+            .await
+            .expect("auth");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(949),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("movie id");
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let start_hits = Arc::clone(&starts);
+        let start_bodies = Arc::clone(&bodies);
+        let stop_hits = Arc::clone(&stops);
+        let stop_bodies = Arc::clone(&bodies);
+        let app = axum::Router::new()
+            .route(
+                "/scrobble/start",
+                post(move |Json(body): Json<Value>| {
+                    let hits = Arc::clone(&start_hits);
+                    let bodies = Arc::clone(&start_bodies);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().await.push(body);
+                        Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/scrobble/stop",
+                post(move |Json(body): Json<Value>| {
+                    let hits = Arc::clone(&stop_hits);
+                    let bodies = Arc::clone(&stop_bodies);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().await.push(body);
+                        Json(json!({}))
+                    }
+                }),
+            );
+        let base = serve(app).await;
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+
+        mgr.on_start(user, movie, 12.5);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while starts.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("start scrobble");
+        assert_eq!(
+            mgr.sessions
+                .lock()
+                .await
+                .get(&(user, movie))
+                .expect("session")
+                .pct,
+            12.5
+        );
+
+        mgr.on_progress(user, movie, 50.0, false);
+        tokio::task::yield_now().await;
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pct = mgr
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&(user, movie))
+                    .map(|session| session.pct);
+                if pct == Some(50.0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("progress update");
+
+        mgr.on_progress(user, movie, 70.0, true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stops.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop scrobble");
+        mgr.on_progress(user, movie, 99.0, true);
+        mgr.on_progress(user, i64::MAX, 99.0, true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "a watched session stops once"
+        );
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies[0]["movie"]["ids"]["tmdb"], 949);
+        assert_eq!(bodies[0]["progress"], 12.5);
+        assert_eq!(
+            bodies[1]["progress"], 95.0,
+            "plurx's watch threshold satisfies Trakt"
+        );
+    }
+
+    #[tokio::test]
+    async fn syncing_activity_and_unconfigured_link_are_explicit() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = Arc::new(TraktManager::new(store, "http://unused".into()));
+        let error = match mgr.link_start(1).await {
+            Ok(_) => panic!("an unconfigured manager started a link"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "add the Trakt client id + secret first");
+        assert!(mgr.activity().await.is_none());
+        mgr.syncing.store(true, Ordering::SeqCst);
+        assert_eq!(mgr.activity().await, Some(("Syncing Trakt".into(), None)));
+        assert!(
+            mgr.sync_user(1).await.is_ok(),
+            "a concurrent sync is coalesced"
+        );
+        mgr.syncing.store(false, Ordering::SeqCst);
+        assert_eq!(
+            mgr.sync_user(1).await.expect_err("not configured"),
+            "not configured"
+        );
+        assert!(!mgr.syncing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn status_unlink_and_ident() {
         let (store, user) = store_with_creds().await;
         // Seed a movie so ident_for has something to resolve.
@@ -765,6 +1028,131 @@ mod tests {
         // The pending attempt shows up in status + activity.
         assert!(mgr.status(user).await.pending.is_some());
         assert!(mgr.activity().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn approved_device_link_is_saved_and_clears_pending_state() {
+        use axum::routing::{get, post};
+        use axum::Json;
+
+        let (store, user) = store_with_creds().await;
+        let app = axum::Router::new()
+            .route(
+                "/oauth/device/code",
+                post(|| async {
+                    Json(json!({
+                        "device_code": "approved-code",
+                        "user_code": "WXYZ",
+                        "verification_url": "https://trakt.tv/activate",
+                        "expires_in": 60,
+                        "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/oauth/device/token",
+                post(|| async {
+                    Json(json!({
+                        "access_token": "linked-access",
+                        "refresh_token": "linked-refresh",
+                        "expires_in": 7200,
+                        "created_at": now_unix()
+                    }))
+                }),
+            )
+            .route(
+                "/users/settings",
+                get(|| async { Json(json!({ "user": { "username": "neo" } })) }),
+            );
+        let base = serve(app).await;
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+
+        mgr.link_start(user).await.expect("device link");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if store
+                    .get_trakt_auth(user)
+                    .await
+                    .expect("read auth")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approved link persisted");
+
+        let status = mgr.status(user).await;
+        let auth = status.auth.expect("linked auth");
+        assert_eq!(auth.access_token, "linked-access");
+        assert_eq!(auth.refresh_token, "linked-refresh");
+        assert_eq!(auth.trakt_username.as_deref(), Some("neo"));
+        assert!(status.pending.is_none());
+        assert_eq!(
+            status.note.as_deref(),
+            Some("linked as neo — first sync starting")
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_device_link_remains_visible_as_an_error() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Json;
+
+        let (store, user) = store_with_creds().await;
+        let app = axum::Router::new()
+            .route(
+                "/oauth/device/code",
+                post(|| async {
+                    Json(json!({
+                        "device_code": "denied-code",
+                        "user_code": "NOPE",
+                        "verification_url": "https://trakt.tv/activate",
+                        "expires_in": 60,
+                        "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/oauth/device/token",
+                post(|| async { StatusCode::IM_A_TEAPOT }),
+            );
+        let base = serve(app).await;
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+
+        mgr.link_start(user).await.expect("device link");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mgr
+                    .status(user)
+                    .await
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.error.as_deref())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("denial projected into pending status");
+
+        let status = mgr.status(user).await;
+        assert_eq!(
+            status.pending.and_then(|pending| pending.error),
+            Some("the code was denied on trakt.tv".into())
+        );
+        assert!(store
+            .get_trakt_auth(user)
+            .await
+            .expect("read auth")
+            .is_none());
+        assert!(mgr.activity().await.is_none());
     }
 
     #[tokio::test]
