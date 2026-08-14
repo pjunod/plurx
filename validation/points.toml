@@ -305,7 +305,7 @@ contract = "The single server binary exposes stable native endpoints and coordin
 paths = [
   "crates/plurxd/Cargo.toml",
   "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
-  "crates/plurxd/src/http/{dto,error,extract,mod,system}.rs",
+  "crates/plurxd/src/http/{dto,error,extract,mod,network,system}.rs",
   "plurx.example.toml",
 ]
 checks = ["rust-gate", "api-wire", "user-journey"]
@@ -379,7 +379,7 @@ paths = [
   "crates/plurx-pgs/**",
   "fuzz/**",
   "crates/plurxd/src/{admission,copyseg,delivery,ffmpeg,meter,pgs_overlay,pipeprobe,playstart,produce,progressive,subtitles,transcode}.rs",
-  "crates/plurxd/src/http/{hls,pgs_overlay,stream}.rs",
+  "crates/plurxd/src/http/{hls,network,pgs_overlay,stream}.rs",
   "crates/plurxd/src/web/playback-policy.js",
   "docs/PLAYBACK*.md",
   "docs/STUTTER-4K.md",

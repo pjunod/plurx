@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use plurx_core::auth;
 use plurx_core::domain::{PlaybackEvent, PlaybackEventQuery};
@@ -542,6 +542,8 @@ static CLIENT_LOG_LIMITER: std::sync::LazyLock<std::sync::Mutex<ClientLogLimiter
 pub async fn client_log(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
+    super::network::RemoteAddress(remote): super::network::RemoteAddress,
     Json(ev): Json<ClientLog>,
 ) -> StatusCode {
     let suppressed = match CLIENT_LOG_LIMITER.lock() {
@@ -565,6 +567,7 @@ pub async fn client_log(
     }
 
     let event = client_playback_event(&ev, user.id);
+    let network = super::network::identity(&headers, remote, ev.ua.as_deref());
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);
     tokio::spawn(async move {
@@ -573,7 +576,7 @@ pub async fn client_log(
             Some(session_id) => transcode.session_status(session_id).await,
             None => None,
         };
-        emit_client_playback_event(store, event, info.as_ref());
+        emit_client_playback_event(store, event, info.as_ref(), network);
     });
     StatusCode::NO_CONTENT
 }
@@ -598,11 +601,12 @@ fn emit_client_playback_event(
     store: Arc<dyn Store>,
     mut event: PlaybackEvent,
     info: Option<&crate::transcode::SessionInfo>,
+    network: Option<crate::telemetry::NetworkIdentity>,
 ) {
     if let Some(info) = info {
         join_session_truth(&mut event, info);
     }
-    crate::telemetry::emit(store, event);
+    crate::telemetry::emit_with_network(store, event, network);
 }
 
 fn client_playback_event(ev: &ClientLog, user_id: i64) -> PlaybackEvent {
@@ -854,6 +858,9 @@ pub struct SettingsDto {
     pub cache_used_bytes: i64,
     /// Node-local playback event retention. Default 30 days; 0 is fully off.
     pub telemetry_retain_days: i64,
+    /// Use coarse, node-local playback history to seed Auto quality.
+    /// Explicit opt-in; missing is false.
+    pub playback_network_priors: bool,
     /// App-managed offline preparation has a separate reservation budget from
     /// the opportunistic playback cache above.
     pub offline_enabled: bool,
@@ -997,6 +1004,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(keys::TELEMETRY_RETAIN_DEFAULT_DAYS)
         .max(0);
+    let playback_network_priors = state
+        .store
+        .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
+        .await?
+        .is_some_and(|value| value.trim() == "1");
     let offline_enabled = !matches!(
         state
             .store
@@ -1079,6 +1091,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         cache_max_gb,
         cache_used_bytes,
         telemetry_retain_days,
+        playback_network_priors,
         offline_enabled,
         offline_max_gb,
         offline_max_gb_per_user,
@@ -1140,6 +1153,7 @@ pub struct UpdateSettings {
     pub cache_produce_mins: Option<i64>,
     pub cache_max_gb: Option<i64>,
     pub telemetry_retain_days: Option<i64>,
+    pub playback_network_priors: Option<bool>,
     pub offline_enabled: Option<bool>,
     pub offline_max_gb: Option<i64>,
     pub offline_max_gb_per_user: Option<i64>,
@@ -1380,6 +1394,15 @@ pub async fn update_settings(
         state
             .store
             .put_setting(keys::TELEMETRY_RETAIN_DAYS, &days.to_string())
+            .await?;
+    }
+    if let Some(enabled) = req.playback_network_priors {
+        state
+            .store
+            .put_setting(
+                keys::PLAYBACK_NETWORK_PRIORS,
+                if enabled { "1" } else { "0" },
+            )
             .await?;
     }
     for (key, label, value) in [
@@ -2309,7 +2332,7 @@ mod tests {
             suspended: true,
             suspend_count: 1,
         };
-        emit_client_playback_event(Arc::clone(&store), event, Some(&info));
+        emit_client_playback_event(Arc::clone(&store), event, Some(&info), None);
         let row = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(row) = store

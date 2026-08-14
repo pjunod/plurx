@@ -2,9 +2,6 @@
 //! (on-the-fly fragmented MP4 via ffmpeg `-c copy`), and the execution plan
 //! that sends a transcode verdict to an HLS session.
 
-use std::path::Path;
-use std::process::Stdio;
-
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -14,6 +11,8 @@ use plurx_core::domain::{ItemKind, MediaFile};
 use plurx_core::playback::{self, Decision};
 use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::error::ApiError;
@@ -459,6 +458,11 @@ pub struct DecisionResponse {
     /// filtered to what the source can feed — so the client's quality menu and
     /// Auto controller stop hardcoding any of it.
     pub ladder: Vec<crate::transcode::Rung>,
+    /// Node-local sustained-throughput prior for this coarse client/network
+    /// tuple. Additive and absent while the opt-in feature is disabled or the
+    /// tuple has no history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_kbps: Option<u32>,
     /// Why this remux should be delivered as HLS segments rather than
     /// progressively (PERF-PLAN §4.3bis). `None` means the progressive path is
     /// fine, which is the common case.
@@ -705,7 +709,12 @@ pub async fn decision(
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<Caps>,
+    headers: HeaderMap,
+    super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<DecisionResponse>, ApiError> {
+    let identity = super::network::identity(&headers, remote, q.client.as_deref());
+    let network_prior =
+        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
     let mut file = load_file(&state, id).await?;
     // Older builds stored this against the file. A fresh playback must never
     // inherit that historical value; its client starts at zero and carries
@@ -801,6 +810,7 @@ pub async fn decision(
         audio_offset_ms: 0,
         declared_offset_ms: declared_av_offset(&state, id).await,
         ladder: crate::transcode::ladder(file.height),
+        prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         prefer_segmented,
     }))
 }

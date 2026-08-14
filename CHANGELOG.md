@@ -76,6 +76,19 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Performance II N4.2 adds privacy-bounded network memory for Auto quality.**
+  The default-off `playback.network_priors` setting lets N0 client telemetry
+  maintain a 25% sustained-throughput EWMA and lowest starved rung per user,
+  fixed client class, and IPv4 `/24`; full addresses never enter storage,
+  logs, or responses. SQLite v19 and each Hiqlite voter's node-local sidecar
+  retain the aggregate for 30 days and cap each user/client class at 64
+  networks, so another voter deliberately starts cold without a replicated
+  schema or protocol bump. Decision and session-create responses add optional
+  `prior_kbps`, and server-side Auto keeps its old answer without a prior,
+  starts below known starvation, or chooses the highest rung whose advertised
+  peak fits proven throughput. The web controller, normalized reopen contract,
+  and native client changes remain separate N4 work.
+
 - **TV episode lists and details now name the media they will open.** Season
   detail responses attach each episode's best-file resolution and HDR facts in
   one batched query, so the Apple season shelf can show a compact resolution +

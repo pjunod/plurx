@@ -17,6 +17,7 @@ mod images;
 mod items;
 mod keys;
 mod libraries;
+mod network;
 mod offline;
 mod pgs_overlay;
 mod photos;
@@ -2629,6 +2630,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_telemetry_updates_the_matching_network_prior() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let user = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("admin lookup")
+            .expect("admin user");
+        state
+            .store
+            .put_setting(plurx_core::store::keys::PLAYBACK_NETWORK_PRIORS, "1")
+            .await
+            .expect("enable priors");
+
+        let report =
+            |event: &'static str, bandwidth: i64, height: i64, detail: Option<&'static str>| {
+                let mut request = post(
+                    "/api/v1/client-log",
+                    Some(&admin),
+                    json!({
+                        "event": event,
+                        "bandwidth": bandwidth,
+                        "height": height,
+                        "detail": detail,
+                        "ua": "Safari"
+                    }),
+                );
+                request.headers_mut().insert(
+                    "x-forwarded-for",
+                    axum::http::HeaderValue::from_static("198.51.100.77"),
+                );
+                request
+            };
+        let prior = || {
+            state
+                .store
+                .network_prior(user.id, "safari", "198.51.100.0/24")
+        };
+
+        let (status, _) = call(&app, report("ttff", 8_000, 1080, None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        for _ in 0..100 {
+            if prior()
+                .await
+                .expect("first prior lookup")
+                .is_some_and(|prior| prior.sample_count == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            prior()
+                .await
+                .expect("first prior lookup")
+                .expect("first observation")
+                .sustained_kbps,
+            Some(8_000)
+        );
+
+        let (status, _) = call(&app, report("stall", 4_000, 720, Some("supply:empty"))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut updated = None;
+        for _ in 0..100 {
+            let current = prior().await.expect("updated prior lookup");
+            if current
+                .as_ref()
+                .is_some_and(|prior| prior.sample_count == 2)
+            {
+                updated = current;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let updated = updated.expect("second observation");
+        assert_eq!(updated.sustained_kbps, Some(7_000));
+        assert_eq!(updated.worst_rung_height, Some(720));
+    }
+
+    #[tokio::test]
     async fn plex_facade_requires_a_valid_token() {
         let app = test_app();
         let admin = setup_admin(&app).await;
@@ -4315,6 +4397,118 @@ mod tests {
             info.target_height, 900,
             "the source's own height is a promise"
         );
+    }
+
+    #[tokio::test]
+    async fn network_prior_is_opt_in_and_additive_on_decision_and_session_wires() {
+        use plurx_core::domain::NetworkPriorObservation;
+
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+        let request_with_network = |mut request: Request<Body>, ua: &'static str| {
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_static("192.0.2.143"),
+            );
+            request.headers_mut().insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(ua),
+            );
+            request
+        };
+        let decision_url = format!(
+            "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&client=apple",
+            s.file
+        );
+
+        let (status, cold) = call(
+            &app,
+            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cold}");
+        assert!(
+            cold.get("prior_kbps").is_none(),
+            "the default-off response must be byte-for-byte additive: {cold}"
+        );
+        let (status, cold_session) = call(
+            &app,
+            request_with_network(
+                post(
+                    &format!("/api/v1/files/{}/hls/sessions", s.file),
+                    Some(&admin),
+                    json!({ "playback_id": "network-prior-cold-wire", "copy": true }),
+                ),
+                "Apple AVPlayer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cold_session}");
+        assert!(
+            cold_session.get("prior_kbps").is_none(),
+            "the default-off session response must omit the additive key: {cold_session}"
+        );
+        if let Some(session_id) = cold_session["session_id"].as_str() {
+            state.transcode.stop_session(session_id, "test").await;
+        }
+
+        let (status, settings) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "playback_network_priors": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        assert_eq!(settings["playback_network_priors"], true);
+        let user = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("admin lookup")
+            .expect("admin user");
+        state
+            .store
+            .observe_network_prior(&NetworkPriorObservation {
+                user_id: user.id,
+                client_class: "apple".to_owned(),
+                network_fingerprint: "192.0.2.0/24".to_owned(),
+                throughput_kbps: Some(20_000),
+                observed_at_ms: 1_700_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("seed prior");
+
+        let (status, warm) = call(
+            &app,
+            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{warm}");
+        assert_eq!(warm["prior_kbps"], 20_000, "{warm}");
+
+        let (status, session) = call(
+            &app,
+            request_with_network(
+                post(
+                    &format!("/api/v1/files/{}/hls/sessions", s.file),
+                    Some(&admin),
+                    json!({ "playback_id": "network-prior-wire", "copy": true }),
+                ),
+                "Apple AVPlayer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["prior_kbps"], 20_000, "{session}");
+        if let Some(session_id) = session["session_id"].as_str() {
+            state.transcode.stop_session(session_id, "test").await;
+        }
     }
 
     #[tokio::test]

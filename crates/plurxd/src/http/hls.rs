@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,10 @@ pub struct StartResponse {
     /// menu and the Auto controller move between, so the client never
     /// hardcodes them (ADAPTIVE-QUALITY.md Phase 1).
     pub ladder: Vec<crate::transcode::Rung>,
+    /// Node-local sustained-throughput prior used for this Auto start.
+    /// Additive and absent while the opt-in feature is disabled or cold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_kbps: Option<u32>,
     /// What dynamic range the bytes of *this session* carry
     /// (`"dolby_vision" | "hdr10" | "hlg" | "sdr"`). It overrides the
     /// decision's answer the moment the session attaches, because a burn or
@@ -198,6 +202,8 @@ pub async fn create(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
+    headers: HeaderMap,
+    super::network::RemoteAddress(remote): super::network::RemoteAddress,
     Json(req): Json<CreateSession>,
 ) -> Result<Json<StartResponse>, ApiError> {
     if req.playback_id.trim().is_empty() {
@@ -214,11 +220,19 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
+    let identity = super::network::identity(&headers, remote, None);
+    let network_prior =
+        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately
         // transcodes at 900: no scaler in the chain at all).
-        None => state.transcode.auto_height(source_height).await,
+        None => {
+            state
+                .transcode
+                .auto_height(source_height, network_prior.as_ref())
+                .await
+        }
         // The source's own height is the Original/forced-burn promise
         // (see the player's sessionHeight): never snapped, never downgraded.
         Some(h) if Some(h) == source_height => h,
@@ -299,6 +313,7 @@ pub async fn create(
         encoder: info.encoder.to_owned(),
         vod: info.vod,
         ladder: crate::transcode::ladder(source_height),
+        prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         delivered_dynamic_range: delivered,
     }))
 }
@@ -333,6 +348,8 @@ pub async fn start(
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<StartQuery>,
+    headers: HeaderMap,
+    super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<StartResponse>, ApiError> {
     let legacy = CreateSession {
         playback_id: format!("legacy:{}:{id}", user.username),
@@ -348,7 +365,15 @@ pub async fn start(
         preserve_dolby_vision: Some(false),
         audio_offset_ms: None,
     };
-    create(AuthUser(user), State(state), AxPath(id), Json(legacy)).await
+    create(
+        AuthUser(user),
+        State(state),
+        AxPath(id),
+        headers,
+        super::network::RemoteAddress(remote),
+        Json(legacy),
+    )
+    .await
 }
 
 /// GET /api/v1/hls/:session/status — how the session is actually doing.

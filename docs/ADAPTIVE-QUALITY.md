@@ -71,17 +71,16 @@ localStorage persistence, forced decision modes, restart-at-position on
 change) and review R12 rightly called the drift. Phase 1 is now only the
 work that *remains*:
 
-*Server*: the rate-control half shipped 2026-07-28 — every family now
+*Server*: Phase 1 is complete. The rate-control half shipped 2026-07-28 — every family now
 carries `-maxrate` (1.5×) / `-bufsize` (2×), and the startup probe encodes
 with the production argument set so a driver that accepts the encoder and
 refuses its rate control is caught at boot rather than on a viewer's first
 press of play ([PERF-PLAN.md](PERF-PLAN.md) §4.6). Auto also became a real
 policy rather than a constant: `min(source, 1080)` on hardware, 720p on
 software, decided server-side because only the server knows which encoder won
-(§4.7). What remains: snap `height` to the nearest rung in session creation,
-and return the ladder (each rung's height + total kb/s, source-height
-filtered) in the session and decision responses so the client never hardcodes
-it. The advertised per-rung bandwidth covers the *measured* peak, not the
+(§4.7). Session creation now snaps stray heights, and decision/session
+responses return the source-filtered ladder with nominal and advertised-peak
+kb/s. The advertised per-rung bandwidth covers the *measured* peak, not the
 nominal target.
 
 *Client*: consume the server ladder instead of the hardcoded `QUALITIES`
@@ -91,6 +90,24 @@ are done.
 
 Effort: **small** — one sitting, still. Risk: low; every mechanism is
 already exercised elsewhere.
+
+## Network-prior groundwork — Auto can remember a coarse network
+
+The server-side half landed 2026-08-14 behind the default-off
+`playback.network_priors` setting. N0 client telemetry maintains one node-local
+row per user · fixed client class · IPv4 `/24`; no full address is stored or
+returned. Each row carries a 25% sustained-throughput EWMA and the lowest rung
+that reported a supply/network stall. It expires after 30 days, and each
+user/client class keeps at most 64 network rows.
+
+`/decision` and session-create responses expose only
+`prior_kbps: Option<u32>`. Without a matching prior, `auto_height` returns the
+same encoder/source-capped height it returned before this feature. With one, a
+known-starved client starts below its lowest failed rung; otherwise Auto picks
+the highest rung whose advertised peak fits the EWMA, including the existing
+cap on a proven-fast LAN. Rows stay off Raft by design, so another cluster
+voter starts cold. The future web controller still has to seed hls.js and pick
+its opening rung from this field; no client behavior changed in this slice.
 
 ## Phase 2 — Auto (the actual feature; controller revised per review R3)
 
@@ -139,8 +156,9 @@ always has an answer. A prepared-handoff variant (start the replacement,
 switch at a boundary) is Option B in the review record — build it only if
 the measured p95 misses the SLO.
 
-Server changes: none required beyond Phase 1 and the status endpoint that
-already exists.
+Server prerequisites are Phase 1, the status endpoint, and the default-off
+network-prior groundwork above. The remaining work in this phase is the web
+controller and its restart/recovery contract.
 
 Effort: **medium** — one focused session including tests. Risk: low-medium;
 the failure mode of a mistuned controller is a visible switch, not a broken
