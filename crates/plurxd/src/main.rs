@@ -974,6 +974,72 @@ async fn fetch_discovery_server_info(
         .context("decoding server identity")
 }
 
+/// The two `ServiceDaemon` calls a registration makes. Naming them is what lets
+/// a test decide a registration — and each way one fails — against a fake,
+/// instead of publishing a real Bonjour record on the local network.
+trait MdnsRegistrar {
+    /// The daemon's event stream. It ends when the daemon is gone.
+    fn monitor(&self) -> anyhow::Result<Box<dyn Iterator<Item = mdns_sd::DaemonEvent> + Send>>;
+
+    /// Publish one record.
+    fn register(&self, service: mdns_sd::ServiceInfo) -> anyhow::Result<()>;
+}
+
+impl MdnsRegistrar for mdns_sd::ServiceDaemon {
+    fn monitor(&self) -> anyhow::Result<Box<dyn Iterator<Item = mdns_sd::DaemonEvent> + Send>> {
+        let events = mdns_sd::ServiceDaemon::monitor(self).context("monitoring mDNS daemon")?;
+        Ok(Box::new(std::iter::from_fn(move || events.recv().ok())))
+    }
+
+    fn register(&self, service: mdns_sd::ServiceInfo) -> anyhow::Result<()> {
+        mdns_sd::ServiceDaemon::register(self, service).context("registering plurx Bonjour service")
+    }
+}
+
+/// Drain a daemon's events, logging the ones that report a failure.
+///
+/// This is where an unusable interface or a socket the kernel refused actually
+/// surfaces: `mdns-sd` opens its multicast sockets on the daemon thread, so
+/// `register` can return `Ok` for a record that never reaches the network.
+fn log_mdns_events(events: impl Iterator<Item = mdns_sd::DaemonEvent>) {
+    for event in events {
+        if let mdns_sd::DaemonEvent::Error(error) = event {
+            tracing::warn!(%error, "Bonjour discovery daemon error");
+        }
+    }
+}
+
+/// Put one record on a daemon and leave its error monitor draining.
+///
+/// Every decision `start_mdns_advertiser` makes is here: a daemon that cannot
+/// be monitored, a record that cannot be built, and a registration the daemon
+/// refuses are each an error the caller reports and carries on from. Monitoring
+/// is established before the record exists, so a failure the registration
+/// provokes cannot be missed.
+fn register_advertiser(
+    daemon: &impl MdnsRegistrar,
+    instance_id: &str,
+    name: &str,
+    bind: SocketAddr,
+    version: &str,
+) -> anyhow::Result<()> {
+    let monitor = daemon.monitor()?;
+    std::thread::Builder::new()
+        .name("plurx-mdns-monitor".to_owned())
+        .spawn(move || log_mdns_events(monitor))
+        .context("starting mDNS monitor")?;
+
+    let service = mdns_service_info(instance_id, name, bind, version)?;
+    daemon.register(service)?;
+    tracing::info!(
+        service = MDNS_SERVICE_TYPE,
+        server_name = name,
+        port = bind.port(),
+        "Bonjour discovery advertiser registered"
+    );
+    Ok(())
+}
+
 /// Start the local DNS-SD advertiser and keep its daemon handle alive for the
 /// lifetime of the HTTP server. Address auto-detection is correct for the
 /// default wildcard bind; an explicit bind advertises only that address.
@@ -984,28 +1050,7 @@ fn start_mdns_advertiser(
     version: &str,
 ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
     let daemon = mdns_sd::ServiceDaemon::new().context("starting mDNS daemon")?;
-    let monitor = daemon.monitor().context("monitoring mDNS daemon")?;
-    std::thread::Builder::new()
-        .name("plurx-mdns-monitor".to_owned())
-        .spawn(move || {
-            while let Ok(event) = monitor.recv() {
-                if let mdns_sd::DaemonEvent::Error(error) = event {
-                    tracing::warn!(%error, "Bonjour discovery daemon error");
-                }
-            }
-        })
-        .context("starting mDNS monitor")?;
-
-    let service = mdns_service_info(instance_id, name, bind, version)?;
-    daemon
-        .register(service)
-        .context("registering plurx Bonjour service")?;
-    tracing::info!(
-        service = MDNS_SERVICE_TYPE,
-        server_name = name,
-        port = bind.port(),
-        "Bonjour discovery advertiser registered"
-    );
+    register_advertiser(&daemon, instance_id, name, bind, version)?;
     Ok(daemon)
 }
 
@@ -1504,7 +1549,7 @@ mod startup_tests {
             .await
             .expect("bind");
 
-        let daemon = mdns_sd::ServiceDaemon::new().expect("mDNS daemon");
+        let daemon = daemon_off_the_mdns_port().expect("mDNS daemon");
         // Withdraw it first. Nothing was ever registered, so this puts no
         // record on the network at any point.
         daemon
@@ -1985,16 +2030,24 @@ mod startup_tests {
         anyhow::bail!("no mDNS daemon in this test")
     }
 
-    /// The succeeding counterpart. Creating a daemon publishes nothing — only
-    /// `register` puts a record on the network, and this never calls it — so
-    /// the success path is reachable without advertising to the LAN.
+    /// The succeeding counterpart, for the callers that need a live daemon
+    /// handle rather than a fake. It publishes nothing: only `register` puts a
+    /// record on the network and this never calls it, and the daemon is bound
+    /// off the mDNS port so it cannot answer for the standard group either.
     fn advertiser_without_a_record(
         _instance_id: &str,
         _name: &str,
         _bind: SocketAddr,
         _version: &str,
     ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
-        mdns_sd::ServiceDaemon::new().context("creating mDNS daemon")
+        daemon_off_the_mdns_port()
+    }
+
+    /// A `ServiceDaemon` on an ephemeral port instead of 5353. Tests need the
+    /// handle's shutdown behaviour, not its network reach, and the default port
+    /// would make the mandatory gate contend with the host's own responder.
+    fn daemon_off_the_mdns_port() -> anyhow::Result<mdns_sd::ServiceDaemon> {
+        mdns_sd::ServiceDaemon::new_with_port(0).context("creating mDNS daemon")
     }
 
     /// A loopback bind advertises nothing at all — neither protocol — because
@@ -2371,28 +2424,161 @@ mod startup_tests {
         assert!(mdns_advertising_enabled());
     }
 
-    /// Registering a Bonjour record puts a service on the local network for
-    /// the moment this test holds it, then withdraws it. What is asserted is
-    /// the contract every caller relies on: discovery is best-effort, so this
-    /// either registers or reports why, and never panics or blocks the boot.
-    ///
-    /// A machine with no usable multicast interface takes the second branch,
-    /// which is exactly the path `start_bonjour` logs and carries on from.
-    #[test]
-    fn registering_a_bonjour_record_either_works_or_says_why() {
-        match start_mdns_advertiser(
-            "plurxd-selftest-instance",
-            "plurxd selftest",
-            "127.0.0.1:32400".parse().expect("addr"),
-            crate::version::SEMVER,
-        ) {
-            Ok(daemon) => {
-                daemon.shutdown().expect("withdrawing the record must work");
+    /// A daemon that records what it was asked to publish and can be told to
+    /// refuse either call. Nothing here opens a socket, which is what keeps
+    /// the mandatory unit and coverage gates off the local network.
+    #[derive(Default)]
+    struct FakeDaemon {
+        monitor_refuses: bool,
+        register_refuses: bool,
+        events: std::sync::Mutex<Vec<mdns_sd::DaemonEvent>>,
+        registered: std::sync::Mutex<Vec<mdns_sd::ServiceInfo>>,
+    }
+
+    impl MdnsRegistrar for FakeDaemon {
+        fn monitor(&self) -> anyhow::Result<Box<dyn Iterator<Item = mdns_sd::DaemonEvent> + Send>> {
+            if self.monitor_refuses {
+                anyhow::bail!("monitoring mDNS daemon");
             }
-            // A machine with no usable multicast interface takes this
-            // branch — the same one `start_bonjour` logs and carries on from.
-            Err(error) => assert!(!format!("{error:#}").is_empty(), "silent failure"),
+            let events = std::mem::take(&mut *self.events.lock().expect("lock"));
+            Ok(Box::new(events.into_iter()))
         }
+
+        fn register(&self, service: mdns_sd::ServiceInfo) -> anyhow::Result<()> {
+            if self.register_refuses {
+                anyhow::bail!("registering plurx Bonjour service");
+            }
+            self.registered.lock().expect("lock").push(service);
+            Ok(())
+        }
+    }
+
+    /// The whole of what a successful registration publishes: the record every
+    /// client on the LAN discovers this server by. A wrong port or a missing
+    /// identity property here is a server nothing can connect to.
+    #[test]
+    fn a_registration_publishes_the_record_clients_discover() {
+        let daemon = FakeDaemon::default();
+        register_advertiser(
+            &daemon,
+            "plurxd-selftest-instance",
+            "Living Room",
+            "192.168.1.9:32400".parse().expect("addr"),
+            "0.2.0",
+        )
+        .expect("a daemon that accepts both calls registers");
+
+        let registered = daemon.registered.lock().expect("lock");
+        assert_eq!(registered.len(), 1, "exactly one record is published");
+        let service = &registered[0];
+        assert_eq!(service.get_type(), MDNS_SERVICE_TYPE);
+        assert_eq!(service.get_port(), 32400, "the bind's port, not a default");
+        assert!(
+            service.get_fullname().contains("Living Room"),
+            "{}",
+            service.get_fullname()
+        );
+    }
+
+    /// Monitoring is established before the record exists. A daemon that
+    /// cannot be monitored publishes nothing at all rather than putting a
+    /// record on the network no failure would ever be reported for.
+    #[test]
+    fn a_daemon_that_cannot_be_monitored_publishes_nothing() {
+        let daemon = FakeDaemon {
+            monitor_refuses: true,
+            ..Default::default()
+        };
+        let error = format!(
+            "{:#}",
+            register_advertiser(
+                &daemon,
+                "instance-1",
+                "Living Room",
+                "192.168.1.9:32400".parse().expect("addr"),
+                "0.2.0",
+            )
+            .expect_err("an unmonitorable daemon is an error")
+        );
+        assert!(error.contains("monitoring mDNS daemon"), "{error}");
+        assert!(
+            daemon.registered.lock().expect("lock").is_empty(),
+            "a record must not be published before its monitor exists"
+        );
+    }
+
+    /// A refused registration reports why. `start_bonjour` logs this and
+    /// carries on unadvertised — discovery is best-effort, so it must be an
+    /// error the caller can read, never a panic or a silent success.
+    #[test]
+    fn a_refused_registration_reports_why() {
+        let daemon = FakeDaemon {
+            register_refuses: true,
+            ..Default::default()
+        };
+        let error = format!(
+            "{:#}",
+            register_advertiser(
+                &daemon,
+                "instance-1",
+                "Living Room",
+                "192.168.1.9:32400".parse().expect("addr"),
+                "0.2.0",
+            )
+            .expect_err("a daemon that refuses the record is an error")
+        );
+        assert!(
+            error.contains("registering plurx Bonjour service"),
+            "{error}"
+        );
+    }
+
+    /// The monitor is the only place a discovery failure can surface, because
+    /// `mdns-sd` opens its sockets after `register` has returned. It logs the
+    /// errors, ignores the ordinary traffic, and ends when the daemon does.
+    #[test]
+    fn the_monitor_logs_daemon_errors_and_nothing_else() {
+        use tracing_subscriber::prelude::*;
+
+        let logs = Arc::new(logbuf::LogBuffer::new(16));
+        let subscriber =
+            tracing_subscriber::registry().with(logbuf::BufferLayer(Arc::clone(&logs)));
+        tracing::subscriber::with_default(subscriber, || {
+            log_mdns_events(
+                vec![
+                    mdns_sd::DaemonEvent::Announce(
+                        "plurx".to_owned(),
+                        "192.168.1.9:32400".to_owned(),
+                    ),
+                    mdns_sd::DaemonEvent::Error(mdns_sd::Error::Msg(
+                        "no usable multicast interface".to_owned(),
+                    )),
+                ]
+                .into_iter(),
+            );
+        });
+
+        let warned = logs.tail("warn", 16);
+        assert_eq!(warned.len(), 1, "an announce is not a failure: {warned:?}");
+        assert!(
+            warned[0].message.contains("no usable multicast interface"),
+            "the daemon's own reason must reach the operator: {}",
+            warned[0].message
+        );
+    }
+
+    /// A daemon whose events have run out ends the monitor thread rather than
+    /// leaving one parked for the life of the process.
+    #[test]
+    fn the_monitor_ends_when_the_daemon_does() {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            log_mdns_events(std::iter::empty());
+            let _ = done.send(());
+        });
+        ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an exhausted event stream must end the monitor, not park it");
     }
 
     /// SIGTERM is what `docker stop` sends, and it has to start the drain
