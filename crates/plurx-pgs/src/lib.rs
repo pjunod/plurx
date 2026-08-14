@@ -4,13 +4,14 @@
 //! preflight. Direct MKV/M2TS parsing remains outside the reviewed boundary:
 //! the server demuxes one subtitle stream and this crate owns all PGS state.
 
-use libpgs::pgs::{CompositionState, OdsData, PdsData, SegmentType, SequenceFlag};
-use libpgs::{ContainerFormat, Extractor};
+use libpgs::pgs::{
+    CompositionObject, CropInfo, OdsData, PdsData, PgsSegment, SegmentType, SequenceFlag,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
@@ -20,6 +21,8 @@ pub const REVIEWED_LIBPGS_VERSION: &str = "0.6.0";
 
 const PGS_HEADER_BYTES: usize = 13;
 const PGS_MAGIC: [u8; 2] = [0x50, 0x47];
+const PTS_MODULUS: u64 = u32::MAX as u64 + 1;
+const PTS_WRAP_THRESHOLD: u32 = 1 << 31;
 
 /// Review limits for the feasibility harness.
 ///
@@ -78,6 +81,8 @@ pub struct InspectionReport {
     pub content_display_sets: u64,
     pub clear_display_sets: u64,
     pub duplicate_timestamps: u64,
+    pub pts_wraps: u64,
+    pub epoch_continue_display_sets: u64,
     pub palette_definitions: u64,
     pub object_definitions: u64,
     pub max_canvas_width: u16,
@@ -147,9 +152,59 @@ pub enum AdapterError {
 #[derive(Debug)]
 struct PreflightReport {
     source_bytes: u64,
+    source_sha256: [u8; 32],
     segments: u64,
     display_sets: u64,
     duplicate_timestamps: u64,
+    pts_wraps: u64,
+    epoch_continue_display_sets: u64,
+}
+
+#[derive(Default)]
+struct PtsTimeline {
+    previous_raw: Option<u32>,
+    offset: u64,
+}
+
+impl PtsTimeline {
+    fn observe(&mut self, raw: u32) -> Result<(u64, bool, bool), AdapterError> {
+        let mut wrapped = false;
+        let duplicate = self.previous_raw == Some(raw);
+        if let Some(previous) = self.previous_raw {
+            if raw < previous {
+                let backwards = previous - raw;
+                if backwards > PTS_WRAP_THRESHOLD {
+                    self.offset = self.offset.checked_add(PTS_MODULUS).ok_or_else(|| {
+                        AdapterError::Limit("unwrapped PGS timestamp overflowed".into())
+                    })?;
+                    wrapped = true;
+                } else {
+                    return Err(AdapterError::Malformed(format!(
+                        "PCS timestamp moved backwards from {previous} to {raw}"
+                    )));
+                }
+            }
+        }
+        self.previous_raw = Some(raw);
+        let unwrapped = self
+            .offset
+            .checked_add(u64::from(raw))
+            .ok_or_else(|| AdapterError::Limit("unwrapped PGS timestamp overflowed".into()))?;
+        Ok((unwrapped, duplicate, wrapped))
+    }
+}
+
+struct RawDisplaySet {
+    pts_90khz: u64,
+    segments: Vec<PgsSegment>,
+}
+
+struct OwnedPcs {
+    video_width: u16,
+    video_height: u16,
+    palette_id: u8,
+    resets_cache: bool,
+    objects: Vec<CompositionObject>,
 }
 
 #[derive(Clone)]
@@ -192,14 +247,24 @@ struct NormalizerState {
 
 /// Inspect and normalize a raw SUP stream through the reviewed safety profile.
 ///
-/// The preflight bounds the parser's otherwise unbounded display-set assembly.
-/// The candidate parser is then run with history disabled, and every bitmap is
-/// decoded by the strict Plurx normalizer rather than `libpgs::decode_rle`.
+/// The input is opened once, so preflight and parsing cannot be redirected to
+/// different files by replacing the path. Plurx owns raw-SUP display-set and
+/// PCS parsing; the reviewed dependency supplies the remaining bounded segment
+/// decoders. Every bitmap uses the strict Plurx RLE normalizer rather than
+/// `libpgs::decode_rle`.
 pub fn inspect_sup(
     path: impl AsRef<Path>,
     limits: &ParserLimits,
 ) -> Result<InspectionReport, AdapterError> {
-    Ok(process_sup(path.as_ref(), limits, false, None)?.report)
+    inspect_sup_file(File::open(path)?, limits)
+}
+
+/// Inspect an already-open SUP file whose identity the caller has pinned.
+pub fn inspect_sup_file(
+    source: File,
+    limits: &ParserLimits,
+) -> Result<InspectionReport, AdapterError> {
+    Ok(process_sup(source, limits, false, None)?.report)
 }
 
 /// Normalize a raw SUP stream into complete, bounded RGBA compositions.
@@ -207,7 +272,7 @@ pub fn normalize_sup(
     path: impl AsRef<Path>,
     limits: &ParserLimits,
 ) -> Result<NormalizedTrack, AdapterError> {
-    process_sup(path.as_ref(), limits, true, None)
+    process_sup(File::open(path)?, limits, true, None)
 }
 
 /// The server form of [`normalize_sup`], with cooperative cancellation for
@@ -219,26 +284,48 @@ pub fn normalize_sup_cancellable(
     limits: &ParserLimits,
     cancelled: &AtomicBool,
 ) -> Result<NormalizedTrack, AdapterError> {
-    process_sup(path.as_ref(), limits, true, Some(cancelled))
+    process_sup(File::open(path)?, limits, true, Some(cancelled))
+}
+
+// Test-only seam for the one window a regression cannot otherwise reach: the
+// gap between the preflight digest and the parsing pass over the same pinned
+// handle. Production builds do not compile it, so the boundary it exercises is
+// the real one.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_between_passes_hook() {
+    let hook = BETWEEN_PASSES.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn process_sup(
-    path: &Path,
+    source: File,
     limits: &ParserLimits,
     retain_rgba: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<NormalizedTrack, AdapterError> {
-    let preflight = preflight_sup(path, limits, cancelled)?;
-
-    let mut extractor = Extractor::open(path)?.with_history(false);
-    if extractor.format() != ContainerFormat::Sup {
-        return Err(AdapterError::Malformed(
-            "the bounded adapter accepts raw SUP only".into(),
-        ));
+    let source_bytes = source.metadata()?.len();
+    if source_bytes > limits.max_sup_bytes {
+        return Err(AdapterError::Limit(format!(
+            "SUP size {source_bytes} exceeds {} bytes",
+            limits.max_sup_bytes
+        )));
     }
+    let mut reader = BufReader::new(source);
+    let preflight = preflight_sup(&mut reader, source_bytes, limits, cancelled)?;
+    reader.seek(SeekFrom::Start(0))?;
+    #[cfg(test)]
+    run_between_passes_hook();
 
     let mut report = InspectionReport {
-        adapter_profile: "bounded-sup-v1",
+        adapter_profile: "bounded-sup-v2-stable-input",
         libpgs_version: REVIEWED_LIBPGS_VERSION,
         source_bytes: preflight.source_bytes,
         parser_bytes_read: 0,
@@ -247,6 +334,8 @@ fn process_sup(
         content_display_sets: 0,
         clear_display_sets: 0,
         duplicate_timestamps: preflight.duplicate_timestamps,
+        pts_wraps: preflight.pts_wraps,
+        epoch_continue_display_sets: preflight.epoch_continue_display_sets,
         palette_definitions: 0,
         object_definitions: 0,
         max_canvas_width: 0,
@@ -261,31 +350,25 @@ fn process_sup(
     let mut state = NormalizerState::default();
     let mut compositions = Vec::new();
     let mut normalized_rgba_bytes = 0usize;
-
-    for parsed in extractor.by_ref() {
-        check_cancelled(cancelled)?;
-        let track = parsed?;
-        normalize_display_set(
-            &track.display_set,
-            limits,
-            &mut state,
-            &mut report,
-            retain_rgba.then_some(&mut compositions),
-            &mut normalized_rgba_bytes,
-            cancelled,
-        )?;
-    }
-    report.parser_bytes_read = extractor.stats().bytes_read;
+    let parser_sha256 = parse_display_sets(
+        &mut reader,
+        limits,
+        &mut state,
+        &mut report,
+        retain_rgba.then_some(&mut compositions),
+        &mut normalized_rgba_bytes,
+        cancelled,
+    )?;
 
     if report.display_sets != preflight.display_sets {
         return Err(AdapterError::Malformed(format!(
-            "preflight found {} display sets but the candidate parser yielded {}",
+            "preflight found {} display sets but the owned parser yielded {}",
             preflight.display_sets, report.display_sets
         )));
     }
-    if std::fs::metadata(path)?.len() != preflight.source_bytes {
+    if parser_sha256 != preflight.source_sha256 {
         return Err(AdapterError::Malformed(
-            "SUP source changed while it was being inspected".into(),
+            "SUP content changed between preflight and parsing".into(),
         ));
     }
 
@@ -304,30 +387,30 @@ fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), AdapterError> {
 }
 
 fn preflight_sup(
-    path: &Path,
+    reader: &mut BufReader<File>,
+    source_bytes: u64,
     limits: &ParserLimits,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreflightReport, AdapterError> {
-    let source_bytes = std::fs::metadata(path)?.len();
-    if source_bytes > limits.max_sup_bytes {
-        return Err(AdapterError::Limit(format!(
-            "SUP size {source_bytes} exceeds {} bytes",
-            limits.max_sup_bytes
-        )));
-    }
-
-    let mut reader = BufReader::new(File::open(path)?);
     let mut header = [0u8; PGS_HEADER_BYTES];
+    let mut source_hasher = Sha256::new();
+    let mut bytes_read = 0u64;
     let mut segments = 0u64;
     let mut display_sets = 0u64;
     let mut in_display_set = false;
     let mut set_segments = 0usize;
     let mut set_payload_bytes = 0usize;
-    let mut last_pcs_pts = None;
+    let mut pts_timeline = PtsTimeline::default();
     let mut duplicate_timestamps = 0u64;
+    let mut pts_wraps = 0u64;
+    let mut epoch_continue_display_sets = 0u64;
 
-    while read_header_or_eof(&mut reader, &mut header)? {
+    while read_header_or_eof(reader, &mut header)? {
         check_cancelled(cancelled)?;
+        source_hasher.update(header);
+        bytes_read = bytes_read
+            .checked_add(PGS_HEADER_BYTES as u64)
+            .ok_or_else(|| AdapterError::Limit("SUP byte counter overflowed".into()))?;
         if header[0..2] != PGS_MAGIC {
             return Err(AdapterError::Malformed(format!(
                 "bad segment magic at segment {}",
@@ -353,12 +436,19 @@ fn preflight_sup(
             reader.read_exact(&mut prefix).map_err(|_| {
                 AdapterError::Malformed("PCS payload is truncated before its state".into())
             })?;
+            source_hasher.update(prefix);
+            bytes_read = bytes_read
+                .checked_add(prefix.len() as u64)
+                .ok_or_else(|| AdapterError::Limit("SUP byte counter overflowed".into()))?;
             consumed_payload_bytes = prefix.len();
-            if !matches!(prefix[7], 0x00 | 0x40 | 0x80) {
+            if !matches!(prefix[7], 0x00 | 0x40 | 0x80 | 0xc0) {
                 return Err(AdapterError::Malformed(format!(
                     "unsupported PCS composition state 0x{:02x}",
                     prefix[7]
                 )));
+            }
+            if prefix[7] == 0xc0 {
+                epoch_continue_display_sets += 1;
             }
         }
 
@@ -372,18 +462,14 @@ fn preflight_sup(
                 in_display_set = true;
                 set_segments = 0;
                 set_payload_bytes = 0;
-                let pts = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as u64;
-                if let Some(previous) = last_pcs_pts {
-                    if pts < previous {
-                        return Err(AdapterError::Malformed(format!(
-                            "PCS timestamp moved backwards from {previous} to {pts}"
-                        )));
-                    }
-                    if pts == previous {
-                        duplicate_timestamps += 1;
-                    }
+                let pts = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+                let (_, duplicate, wrapped) = pts_timeline.observe(pts)?;
+                if duplicate {
+                    duplicate_timestamps += 1;
                 }
-                last_pcs_pts = Some(pts);
+                if wrapped {
+                    pts_wraps += 1;
+                }
             }
             0x80 if !in_display_set => {
                 return Err(AdapterError::Malformed(
@@ -419,7 +505,18 @@ fn preflight_sup(
                 limits.max_payload_bytes_per_display_set
             )));
         }
-        discard_exact(&mut reader, payload_bytes - consumed_payload_bytes)?;
+        discard_exact_hashed(
+            reader,
+            payload_bytes - consumed_payload_bytes,
+            &mut source_hasher,
+            &mut bytes_read,
+        )?;
+        if bytes_read > limits.max_sup_bytes {
+            return Err(AdapterError::Limit(format!(
+                "SUP grew beyond {} bytes during preflight",
+                limits.max_sup_bytes
+            )));
+        }
 
         if kind == 0x80 {
             display_sets += 1;
@@ -443,12 +540,20 @@ fn preflight_sup(
             "SUP contains no complete display sets".into(),
         ));
     }
+    if bytes_read != source_bytes {
+        return Err(AdapterError::Malformed(format!(
+            "SUP source changed size while it was being preflighted ({source_bytes} to {bytes_read} bytes)"
+        )));
+    }
 
     Ok(PreflightReport {
         source_bytes,
+        source_sha256: source_hasher.finalize().into(),
         segments,
         display_sets,
         duplicate_timestamps,
+        pts_wraps,
+        epoch_continue_display_sets,
     })
 }
 
@@ -466,7 +571,12 @@ fn read_header_or_eof(
     Ok(true)
 }
 
-fn discard_exact(reader: &mut impl Read, mut bytes: usize) -> Result<(), AdapterError> {
+fn discard_exact_hashed(
+    reader: &mut impl Read,
+    mut bytes: usize,
+    hasher: &mut Sha256,
+    bytes_read: &mut u64,
+) -> Result<(), AdapterError> {
     let mut scratch = [0u8; 8192];
     while bytes > 0 {
         let wanted = bytes.min(scratch.len());
@@ -476,13 +586,215 @@ fn discard_exact(reader: &mut impl Read, mut bytes: usize) -> Result<(), Adapter
                 "segment payload is truncated".into(),
             ));
         }
+        hasher.update(&scratch[..read]);
+        *bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| AdapterError::Limit("SUP byte counter overflowed".into()))?;
         bytes -= read;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn parse_display_sets(
+    reader: &mut BufReader<File>,
+    limits: &ParserLimits,
+    state: &mut NormalizerState,
+    report: &mut InspectionReport,
+    mut output: Option<&mut Vec<NormalizedComposition>>,
+    normalized_rgba_bytes: &mut usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<[u8; 32], AdapterError> {
+    let mut source_hasher = Sha256::new();
+    let mut header = [0u8; PGS_HEADER_BYTES];
+    let mut pts_timeline = PtsTimeline::default();
+    let mut current_segments = Vec::new();
+    let mut current_pts = None;
+    let mut current_payload_bytes = 0usize;
+    let mut display_sets = 0u64;
+    let mut bytes_read = 0u64;
+
+    while read_header_or_eof(reader, &mut header)? {
+        check_cancelled(cancelled)?;
+        source_hasher.update(header);
+        bytes_read = bytes_read
+            .checked_add(PGS_HEADER_BYTES as u64)
+            .ok_or_else(|| AdapterError::Limit("SUP byte counter overflowed".into()))?;
+        if header[0..2] != PGS_MAGIC {
+            return Err(AdapterError::Malformed(
+                "bad segment magic after preflight".into(),
+            ));
+        }
+        let segment_type = SegmentType::from_byte(header[10]).ok_or_else(|| {
+            AdapterError::Malformed(format!(
+                "unknown segment type 0x{:02x} after preflight",
+                header[10]
+            ))
+        })?;
+        let payload_bytes = u16::from_be_bytes([header[11], header[12]]) as usize;
+        let mut payload = vec![0u8; payload_bytes];
+        reader.read_exact(&mut payload).map_err(|_| {
+            AdapterError::Malformed("segment payload changed or truncated after preflight".into())
+        })?;
+        source_hasher.update(&payload);
+        bytes_read = bytes_read
+            .checked_add(payload_bytes as u64)
+            .ok_or_else(|| AdapterError::Limit("SUP byte counter overflowed".into()))?;
+        if bytes_read > limits.max_sup_bytes {
+            return Err(AdapterError::Limit(format!(
+                "SUP grew beyond {} bytes during parsing",
+                limits.max_sup_bytes
+            )));
+        }
+        let raw_pts = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+        let dts = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
+
+        match segment_type {
+            SegmentType::PresentationComposition => {
+                if !current_segments.is_empty() {
+                    return Err(AdapterError::Malformed(
+                        "a new PCS started before the preceding display set ended".into(),
+                    ));
+                }
+                current_pts = Some(pts_timeline.observe(raw_pts)?.0);
+                current_payload_bytes = 0;
+            }
+            SegmentType::EndOfDisplaySet if current_pts.is_none() => {
+                return Err(AdapterError::Malformed(
+                    "END appeared without an open display set".into(),
+                ));
+            }
+            _ if current_pts.is_none() => {
+                return Err(AdapterError::Malformed(
+                    "a PGS display set did not begin with PCS".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        current_segments.push(PgsSegment {
+            pts: u64::from(raw_pts),
+            dts: u64::from(dts),
+            segment_type,
+            payload,
+        });
+        current_payload_bytes = current_payload_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| AdapterError::Limit("display-set byte counter overflowed".into()))?;
+        if current_segments.len() > limits.max_segments_per_display_set {
+            return Err(AdapterError::Limit(format!(
+                "display set has more than {} segments after preflight",
+                limits.max_segments_per_display_set
+            )));
+        }
+        if current_payload_bytes > limits.max_payload_bytes_per_display_set {
+            return Err(AdapterError::Limit(format!(
+                "display set has more than {} payload bytes after preflight",
+                limits.max_payload_bytes_per_display_set
+            )));
+        }
+
+        if segment_type == SegmentType::EndOfDisplaySet {
+            display_sets = display_sets
+                .checked_add(1)
+                .ok_or_else(|| AdapterError::Limit("display-set counter overflowed".into()))?;
+            if display_sets > limits.max_display_sets {
+                return Err(AdapterError::Limit(format!(
+                    "track has more than {} display sets after preflight",
+                    limits.max_display_sets
+                )));
+            }
+            let display_set = RawDisplaySet {
+                pts_90khz: current_pts
+                    .take()
+                    .expect("END checked for an open display set"),
+                segments: std::mem::take(&mut current_segments),
+            };
+            normalize_display_set(
+                &display_set,
+                limits,
+                state,
+                report,
+                output.as_deref_mut(),
+                normalized_rgba_bytes,
+                cancelled,
+            )?;
+        }
+    }
+    if current_pts.is_some() || !current_segments.is_empty() {
+        return Err(AdapterError::Malformed(
+            "SUP ended before the final display set END segment".into(),
+        ));
+    }
+    report.parser_bytes_read = bytes_read;
+    Ok(source_hasher.finalize().into())
+}
+
+fn parse_pcs_owned(payload: &[u8]) -> Result<OwnedPcs, AdapterError> {
+    if payload.len() < 11 {
+        return Err(AdapterError::Malformed("PCS payload is malformed".into()));
+    }
+    let state = payload[7];
+    let resets_cache = match state {
+        0x00 => false,
+        0x40 | 0x80 | 0xc0 => true,
+        _ => {
+            return Err(AdapterError::Malformed(format!(
+                "unsupported PCS composition state 0x{state:02x}"
+            )))
+        }
+    };
+    let object_count = payload[10] as usize;
+    let mut objects = Vec::with_capacity(object_count);
+    let mut offset = 11usize;
+    for _ in 0..object_count {
+        let fixed = payload
+            .get(offset..offset + 8)
+            .ok_or_else(|| AdapterError::Malformed("PCS object is truncated".into()))?;
+        let object_id = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let window_id = fixed[2];
+        let cropped = fixed[3] & 0x80 != 0;
+        let x = u16::from_be_bytes([fixed[4], fixed[5]]);
+        let y = u16::from_be_bytes([fixed[6], fixed[7]]);
+        offset += 8;
+        let crop = if cropped {
+            let authored = payload
+                .get(offset..offset + 8)
+                .ok_or_else(|| AdapterError::Malformed("PCS crop is truncated".into()))?;
+            offset += 8;
+            Some(CropInfo {
+                x: u16::from_be_bytes([authored[0], authored[1]]),
+                y: u16::from_be_bytes([authored[2], authored[3]]),
+                width: u16::from_be_bytes([authored[4], authored[5]]),
+                height: u16::from_be_bytes([authored[6], authored[7]]),
+            })
+        } else {
+            None
+        };
+        objects.push(CompositionObject {
+            object_id,
+            window_id,
+            x,
+            y,
+            crop,
+        });
+    }
+    if offset != payload.len() {
+        return Err(AdapterError::Malformed(
+            "PCS payload contains trailing object data".into(),
+        ));
+    }
+    Ok(OwnedPcs {
+        video_width: u16::from_be_bytes([payload[0], payload[1]]),
+        video_height: u16::from_be_bytes([payload[2], payload[3]]),
+        palette_id: payload[9],
+        resets_cache,
+        objects,
+    })
+}
+
 fn normalize_display_set(
-    display_set: &libpgs::pgs::DisplaySet,
+    display_set: &RawDisplaySet,
     limits: &ParserLimits,
     state: &mut NormalizerState,
     report: &mut InspectionReport,
@@ -504,9 +816,7 @@ fn normalize_display_set(
             "display set must run from PCS through END".into(),
         ));
     }
-    let pcs = first
-        .parse_pcs()
-        .ok_or_else(|| AdapterError::Malformed("PCS payload is malformed".into()))?;
+    let pcs = parse_pcs_owned(&first.payload)?;
     let expected_pcs_bytes = 11
         + pcs
             .objects
@@ -539,7 +849,7 @@ fn normalize_display_set(
         )));
     }
 
-    if !matches!(display_set.composition_state, CompositionState::Normal) {
+    if pcs.resets_cache {
         state.palettes.clear();
         state.objects.clear();
         state.cached_pixel_bytes = 0;
@@ -703,15 +1013,15 @@ fn normalize_display_set(
     report.max_composition_objects = report.max_composition_objects.max(object_count);
     report.peak_cached_pixel_bytes = report.peak_cached_pixel_bytes.max(state.cached_pixel_bytes);
     report.compositions.push(CompositionFingerprint {
-        pts_90khz: display_set.pts,
-        start_ms: display_set.pts as f64 / 90.0,
+        pts_90khz: display_set.pts_90khz,
+        start_ms: display_set.pts_90khz as f64 / 90.0,
         object_count,
         sha256: hex::encode(composition_hasher.finalize()),
     });
     if let (Some(output), Some(objects)) = (output, normalized_objects) {
         output.push(NormalizedComposition {
-            pts_90khz: display_set.pts,
-            start_ms: display_set.pts as f64 / 90.0,
+            pts_90khz: display_set.pts_90khz,
+            start_ms: display_set.pts_90khz as f64 / 90.0,
             canvas_width: pcs.video_width,
             canvas_height: pcs.video_height,
             objects,
@@ -1135,8 +1445,8 @@ fn ycrcb_to_rgba(color: PaletteColor, matrix: ColorMatrix) -> [u8; 4] {
 mod tests {
     use super::*;
     use libpgs::pgs::{
-        encode_rle, CompositionObject, CropInfo, OdsData, PaletteEntry, PcsData, PdsData,
-        PgsSegment, SequenceFlag,
+        encode_rle, CompositionObject, CompositionState, CropInfo, OdsData, PaletteEntry, PcsData,
+        PdsData, PgsSegment, SequenceFlag,
     };
     use std::io::Write;
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1395,6 +1705,29 @@ mod tests {
     }
 
     #[test]
+    fn object_update_reuses_the_previous_palette() {
+        let first_rle = encode_rle(&[1, 1], 2, 1).expect("encode first fixture");
+        let second_rle = encode_rle(&[1, 0], 2, 1).expect("encode second fixture");
+        let mut bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(3)]),
+            palette(1000, 235, 128, 128),
+            object(1000, 3, 2, 1, first_rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        bytes.extend(display_set(vec![
+            pcs(2000, CompositionState::Normal, vec![placement(3)]),
+            object(2000, 3, 2, 1, second_rle),
+            PgsSegment::end_segment(180_000, 0),
+        ]));
+        let file = write_sup(&bytes);
+
+        let report = inspect_sup(file.path(), &ParserLimits::default()).expect("valid reuse");
+        assert_eq!(report.palette_definitions, 1);
+        assert_eq!(report.object_definitions, 2);
+        assert_ne!(report.compositions[0].sha256, report.compositions[1].sha256);
+    }
+
+    #[test]
     fn acquisition_point_does_not_reuse_the_previous_epoch_cache() {
         let rle = encode_rle(&[1, 1], 2, 1).expect("encode fixture");
         let mut bytes = display_set(vec![
@@ -1479,6 +1812,69 @@ mod tests {
     }
 
     #[test]
+    fn pts_wrap_is_unwrapped_without_accepting_an_ordinary_backwards_jump() {
+        let before_wrap = u32::MAX - 45_000;
+        let after_wrap = 45_000u32;
+        let mut first_pcs = pcs(0, CompositionState::EpochStart, vec![]);
+        first_pcs.pts = u64::from(before_wrap);
+        let mut first_end = PgsSegment::end_segment(0, 0);
+        first_end.pts = u64::from(before_wrap);
+        let mut second_pcs = pcs(0, CompositionState::Normal, vec![]);
+        second_pcs.pts = u64::from(after_wrap);
+        let mut second_end = PgsSegment::end_segment(0, 0);
+        second_end.pts = u64::from(after_wrap);
+        let mut bytes = display_set(vec![first_pcs, first_end]);
+        bytes.extend(display_set(vec![second_pcs, second_end]));
+        let file = write_sup(&bytes);
+
+        let track = normalize_sup(file.path(), &ParserLimits::default()).expect("PTS wrap");
+        assert_eq!(track.report.pts_wraps, 1);
+        assert_eq!(track.compositions[0].pts_90khz, u64::from(before_wrap));
+        assert_eq!(
+            track.compositions[1].pts_90khz,
+            PTS_MODULUS + u64::from(after_wrap)
+        );
+    }
+
+    /// The pinned handle stops the path from being re-resolved, but it does not
+    /// stop the inode itself from being rewritten underneath both passes. This
+    /// pins the cross-pass digest that closes that half of the boundary.
+    #[test]
+    fn source_rewritten_under_the_pinned_handle_is_rejected() {
+        let original = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![]),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let replacement = display_set(vec![
+            pcs(2000, CompositionState::EpochStart, vec![]),
+            PgsSegment::end_segment(180_000, 0),
+        ]);
+        assert_eq!(
+            original.len(),
+            replacement.len(),
+            "equal length keeps the size guard out of this proof"
+        );
+        assert_ne!(original, replacement);
+
+        let file = write_sup(&original);
+        let path = file.path().to_path_buf();
+        BETWEEN_PASSES.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&path, &replacement).expect("rewrite the pinned inode in place");
+            }));
+        });
+
+        let error = normalize_sup(file.path(), &ParserLimits::default())
+            .expect_err("content rewritten between preflight and parsing");
+        assert!(
+            error
+                .to_string()
+                .contains("changed between preflight and parsing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn preflight_bounds_segments_before_candidate_assembly() {
         let bytes = display_set(vec![
             pcs(1000, CompositionState::EpochStart, vec![]),
@@ -1556,17 +1952,43 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_multi_clip_composition_state_is_rejected_explicitly() {
-        let mut unsupported = pcs(1000, CompositionState::EpochStart, vec![]);
-        unsupported.payload[7] = 0xc0;
-        let bytes = display_set(vec![unsupported, PgsSegment::end_segment(90_000, 0)]);
+    fn epoch_continue_composition_state_is_owned_and_normalized() {
+        let rle = encode_rle(&[1, 1], 2, 1).expect("encode fixture");
+        let mut epoch_continue = pcs(1000, CompositionState::EpochStart, vec![placement(3)]);
+        epoch_continue.payload[7] = 0xc0;
+        let bytes = display_set(vec![
+            epoch_continue,
+            palette(1000, 235, 128, 128),
+            object(1000, 3, 2, 1, rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let file = write_sup(&bytes);
+
+        let report = inspect_sup(file.path(), &ParserLimits::default()).expect("owned 0xc0 PCS");
+        assert_eq!(report.epoch_continue_display_sets, 1);
+        assert_eq!(report.content_display_sets, 1);
+    }
+
+    #[test]
+    fn epoch_continue_does_not_reuse_the_previous_epoch_cache() {
+        let rle = encode_rle(&[1, 1], 2, 1).expect("encode fixture");
+        let mut bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(3)]),
+            palette(1000, 235, 128, 128),
+            object(1000, 3, 2, 1, rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let mut epoch_continue = pcs(2000, CompositionState::EpochStart, vec![placement(3)]);
+        epoch_continue.payload[7] = 0xc0;
+        bytes.extend(display_set(vec![
+            epoch_continue,
+            PgsSegment::end_segment(180_000, 0),
+        ]));
         let file = write_sup(&bytes);
 
         let error = inspect_sup(file.path(), &ParserLimits::default())
-            .expect_err("0xc0 is outside the reviewed candidate model");
-        assert!(error
-            .to_string()
-            .contains("unsupported PCS composition state 0xc0"));
+            .expect_err("epoch continue must carry fresh state");
+        assert!(error.to_string().contains("missing object 3"));
     }
 
     #[test]
