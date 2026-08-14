@@ -323,3 +323,349 @@ fn now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post as post_route;
+    use plurx_core::domain::{LibraryKind, MetadataPatch, NewItem, NewLibrary};
+    use plurx_core::store::SqliteStore;
+    use tokio::sync::Mutex;
+
+    async fn serve_webhook(
+        status: StatusCode,
+        received: Arc<Mutex<Vec<(String, String)>>>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api/v1/webhooks/plurx",
+            post_route(move |headers: HeaderMap, body: String| {
+                let received = Arc::clone(&received);
+                async move {
+                    received.lock().await.push((
+                        headers
+                            .get("X-Api-Key")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned(),
+                        body,
+                    ));
+                    status
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind webhook fake");
+        let addr = listener.local_addr().expect("webhook address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn seeded_notifier() -> (Arc<dyn Store>, Arc<WatchedNotifier>, i64, i64) {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store
+            .create_user("viewer", "hash", false)
+            .await
+            .expect("user");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    imdb_id: Some("tt0113277".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("movie ids");
+        let notifier = WatchedNotifier::new(Arc::clone(&store));
+        (store, notifier, user.id, movie)
+    }
+
+    #[tokio::test]
+    async fn events_use_movie_ids_and_the_parent_shows_episode_ids() {
+        let (store, notifier, user_id, movie) = seeded_notifier().await;
+
+        assert!(notifier
+            .build(user_id, i64::MAX)
+            .await
+            .expect("missing item")
+            .is_none());
+        assert!(notifier
+            .build(i64::MAX, movie)
+            .await
+            .expect("missing user")
+            .is_none());
+
+        let movie_event = notifier
+            .build(user_id, movie)
+            .await
+            .expect("movie event")
+            .expect("identified movie");
+        assert_eq!(movie_event.kind, "movie");
+        assert_eq!(movie_event.imdb.as_deref(), Some("tt0113277"));
+        assert_eq!(movie_event.tmdb, None);
+        assert_eq!(movie_event.user, "viewer");
+        assert!(movie_event.watched_at > 0);
+
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Shows".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("shows library");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(95_457),
+                    imdb_id: Some("tt11280740".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("show ids");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let episode = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "Good News About Hell".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("episode");
+
+        let event = notifier
+            .build(user_id, episode)
+            .await
+            .expect("episode event")
+            .expect("identified episode");
+        assert_eq!(
+            event,
+            WatchedEvent {
+                event: "watched".into(),
+                kind: "episode".into(),
+                tmdb: Some(95_457),
+                imdb: Some("tt11280740".into()),
+                season: Some(1),
+                episode: Some(1),
+                watched_at: event.watched_at,
+                user: "viewer".into(),
+            }
+        );
+        assert!(
+            notifier
+                .build(user_id, show)
+                .await
+                .expect("show is not a notification")
+                .is_none(),
+            "container rows are never sent to monarr"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_is_opt_in_and_serializes_an_actionable_event() {
+        let (store, notifier, user_id, movie) = seeded_notifier().await;
+        notifier
+            .enqueue(user_id, movie)
+            .await
+            .expect("disabled no-op");
+        assert_eq!(
+            store.watched_outbox_counts().await.expect("counts"),
+            (0, 0, 0)
+        );
+
+        store
+            .put_setting(keys::MONARR_WATCHED_SYNC, "1")
+            .await
+            .expect("enable watched sync");
+        notifier.enqueue(user_id, movie).await.expect("enqueue");
+        let due = store.due_watched(1).await.expect("due row");
+        let event: WatchedEvent = serde_json::from_str(&due[0].payload).expect("event json");
+        assert_eq!(event.event, "watched");
+        assert_eq!(event.imdb.as_deref(), Some("tt0113277"));
+    }
+
+    #[tokio::test]
+    async fn delivery_marks_success_and_client_faults_terminal() {
+        let (store, notifier, _, _) = seeded_notifier().await;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let base = serve_webhook(StatusCode::NO_CONTENT, Arc::clone(&received)).await;
+        store
+            .put_setting(keys::MONARR_URL, &base)
+            .await
+            .expect("url");
+        store
+            .put_setting(keys::MONARR_API_KEY, "secret")
+            .await
+            .expect("key");
+        store
+            .enqueue_watched(r#"{"event":"watched"}"#)
+            .await
+            .expect("enqueue");
+        notifier.deliver_due().await;
+        assert_eq!(
+            store.watched_outbox_counts().await.expect("success counts"),
+            (0, 1, 0)
+        );
+        let received = received.lock().await;
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, "secret");
+        assert_eq!(received[0].1, r#"{"event":"watched"}"#);
+        drop(received);
+
+        let bad = serve_webhook(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Arc::new(Mutex::new(vec![])),
+        )
+        .await;
+        store
+            .put_setting(keys::MONARR_URL, &bad)
+            .await
+            .expect("bad url");
+        store
+            .enqueue_watched("{}")
+            .await
+            .expect("enqueue bad payload");
+        notifier.deliver_due().await;
+        assert_eq!(
+            store.watched_outbox_counts().await.expect("client counts"),
+            (0, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_retries_server_faults_but_not_missing_configuration() {
+        let (store, notifier, _, _) = seeded_notifier().await;
+        store
+            .enqueue_watched("{}")
+            .await
+            .expect("enqueue unconfigured");
+        notifier.deliver_due().await;
+        assert_eq!(
+            store
+                .watched_outbox_counts()
+                .await
+                .expect("unconfigured counts"),
+            (0, 0, 1)
+        );
+
+        let retry_store: Arc<dyn Store> =
+            Arc::new(SqliteStore::open_in_memory().expect("retry store"));
+        let retry_notifier = WatchedNotifier::new(Arc::clone(&retry_store));
+        let unavailable = serve_webhook(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::new(Mutex::new(vec![])),
+        )
+        .await;
+        retry_store
+            .enqueue_watched("{}")
+            .await
+            .expect("enqueue retry");
+        let entry = retry_store
+            .due_watched(1)
+            .await
+            .expect("claim retry")
+            .pop()
+            .expect("retry row");
+        retry_notifier
+            .attempt(entry.clone(), &unavailable, "key")
+            .await;
+        assert_eq!(
+            retry_store
+                .watched_outbox_counts()
+                .await
+                .expect("retry counts"),
+            (1, 0, 0)
+        );
+
+        retry_store
+            .enqueue_watched("{}")
+            .await
+            .expect("enqueue exhausted retry");
+        let mut exhausted = retry_store
+            .due_watched(1)
+            .await
+            .expect("claim exhausted retry")
+            .pop()
+            .expect("exhausted retry row");
+        exhausted.attempts = BACKOFF.len() as i64;
+        retry_notifier.attempt(exhausted, &unavailable, "key").await;
+        assert_eq!(
+            retry_store
+                .watched_outbox_counts()
+                .await
+                .expect("exhausted counts"),
+            (1, 0, 1)
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve refused address");
+        let refused = format!("http://{}", listener.local_addr().expect("refused address"));
+        drop(listener);
+        let (message, permanent) = post(&refused, "key", "{}")
+            .await
+            .expect_err("connect fails");
+        assert!(!permanent);
+        assert!(message.contains("cannot reach monarr"));
+
+        let runner = tokio::spawn(Arc::clone(&retry_notifier).run());
+        tokio::task::yield_now().await;
+        runner.abort();
+        assert!(runner.await.expect_err("runner cancelled").is_cancelled());
+    }
+}
