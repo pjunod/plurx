@@ -165,15 +165,35 @@ first-to-last sample interval by the first delivered slice's cap-time, because
 the interval contains one fewer reservation wait than its byte count. That
 keeps browser preparation and player idle out without biasing a short stage
 high by `N/(N-1)`. A one-second rolling peak accompanies the whole-stage rate
-so later slow delivery cannot dilute a qualifying mid-stage burst. Its
-sensitivity is explicit: some window must carry more than
-`1.25 × cap × 1 s` of bytes to fail the gate. Shorter or smaller bursts can
-stay below that bound; the whole-stage rate and the post-cliff cap remain the
-other independent checks. The bucket's deliberate 250 ms credit consumes most
-of the 1.25 tolerance; slice quantization consumes the remainder. Scheduler
-delay lengthens the observed window and lowers the measured peak instead of
-spending additional headroom. The whole-stage estimator does not spend the
-tolerance on first-slice bias.
+so later slow delivery cannot dilute a qualifying mid-stage burst.
+
+The two rates are scored against two different bounds, because they answer two
+different questions.
+
+- The whole-stage rate is bounded by `cap × shaping_tolerance` (1.25 by
+  default). An average may sit below the cap when the player asked for less,
+  but it converges on the cap over a stage, because the bucket lets a
+  reservation go into debt and repays it with time. The whole-stage estimator
+  does not spend that tolerance on first-slice bias.
+- The rolling peak is bounded by the bucket's own designed worst case,
+  `cap × (1 + 250 ms / 1 s)` plus one 16 KiB slice, multiplied by
+  `shaping_peak_tolerance` (1.05 by default). A one-second window may
+  legitimately carry the bucket's whole 250 ms of stored credit plus a full
+  second of earned rate, and the sample that closes the window is counted whole
+  even though its slice began earning before the window opened.
+
+Scoring the peak against a flat `cap × 1.25` — as this harness first did —
+makes the bound *equal* the design's worst case, so the tolerance is spent
+entirely on designed burst and nothing is left for measurement jitter. A
+healthy 8 Mb/s stage measured 9937–9996 kb/s against that 10000 kb/s bound,
+clearing it by 0.04%. Because a trip yields `outcome: shaping`, meaning the run
+proves nothing about playback, that margin was a false-negative waiting to
+discard a good acceptance run and point the investigation at the shaper. The
+burst-aware bound keeps the same leak sensitivity — a window carrying 12000
+kb/s against an 8000 kb/s cap still fails — while restoring real headroom.
+
+Scheduler delay lengthens the observed window and lowers the measured peak
+instead of spending additional headroom.
 Only token reservations share the global scheduler; downstream socket drain
 remains per-connection, so one non-reading response cannot stop the rest of the
 shaped link. The proxy freezes one telemetry snapshot when the observation ends
@@ -202,7 +222,7 @@ describe adaptation. Every artifact therefore carries an `outcome`:
 | `outcome` | What it says |
 |---|---|
 | `passed` | The shaped link and baseline were trustworthy, and the session met every recovery criterion. |
-| `shaping` | The cliff never applied, the proxy reported a transport error, or the shaper delivered more than its cap. The run proves nothing about playback. |
+| `shaping` | The cliff never applied, the proxy reported a transport error, or the shaper delivered more than its cap allows — either a whole-stage average past `shaping_tolerance` or a one-second burst past the bucket's designed worst case. The run proves nothing about playback. |
 | `browser_playback` | The baseline was unhealthy, or the player reported a media failure. There is no trustworthy recovery verdict. |
 | `server_supply` | The link still had headroom and the player starved anyway — a producer problem, not an adaptation problem. |
 | `recovery` | The link was shaped, the baseline was healthy, and the session did not answer the cliff within its criteria. |

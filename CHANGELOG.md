@@ -87,7 +87,11 @@ bump may break compatibility and a **patch** bump never does.
   outcome — `passed`, `shaping`, `browser_playback`, `server_supply`,
   `recovery`, or `harness` — so a cliff that never applied, a proxy transport
   error, or a shaper that leaked can never be misread as a verdict about
-  playback; recovery criteria are reviewable in
+  playback. A leak is scored against two bounds rather than one: the
+  whole-stage average against `shaping_tolerance`, and the one-second rolling
+  peak against the bucket's own designed burst worst case, so the deliberate
+  250 ms of stored credit cannot be mistaken for leaked bytes. Recovery
+  criteria are reviewable in
   `tests/playback/cases.json`, and `playback-lab normalize` reduces a report to
   its behavioral shape with UUIDs, ports, wall-clock, and temporary paths
   removed. This is the harness Performance II N4 requires before its Auto

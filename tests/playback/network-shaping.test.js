@@ -551,6 +551,41 @@ test("a shaper that leaked more than its cap fails as a shaping fault", () => {
   assert.match(score.errors[0], /leaked/);
 });
 
+// The bucket stores 250 ms of credit, so its designed one-second burst is
+// already 1.25x the cap — the exact old flat `cap * shaping_tolerance` bound.
+// Scoring the rolling peak against the flat cap therefore spent the whole
+// tolerance on designed burst, and a healthy run cleared it by 0.04%.
+test("a rolling peak at the bucket's own designed burst ceiling is not a leak", () => {
+  const designed = observation();
+  const bound = lab.shaperBurstBoundKbps(8000);
+  assert.ok(bound > 8000 * CRITERIA.shaping_tolerance,
+    "the designed burst must exceed the flat cap * tolerance bound, or this proves nothing");
+  designed.shaping.stages[0].peak_kbps = Number(bound.toFixed(1));
+  const score = lab.scoreRecovery(CRITERIA, designed);
+  assert.deepEqual(score.errors, []);
+  assert.equal(score.outcome, "passed");
+});
+
+test("a rolling peak past the designed burst and its jitter slack is a leak", () => {
+  const leaked = observation();
+  leaked.shaping.stages[0].peak_kbps = 12_000;
+  const score = lab.scoreRecovery(CRITERIA, leaked);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /1s burst rate of 12000 kb\/s over a 8000 kb\/s cap/);
+});
+
+test("the burst allowance does not loosen the whole-stage average gate", () => {
+  const leaked = observation();
+  // Inside the after-cliff burst bound, past the sustained bound of 1875 kb/s.
+  leaked.shaping.stages[1].measured_kbps = 1900;
+  leaked.shaping.stages[1].peak_kbps = 1900;
+  assert.ok(1900 < lab.shaperBurstBoundKbps(1500),
+    "this rate must clear the burst gate, or it does not isolate the sustained gate");
+  const score = lab.scoreRecovery(CRITERIA, leaked);
+  assert.equal(score.outcome, "shaping");
+  assert.match(score.errors[0], /sustained rate of 1900 kb\/s/);
+});
+
 test("a stage with no delivery samples invalidates shaping evidence", () => {
   const missing = observation();
   missing.shaping.stages[1].measured_kbps = null;

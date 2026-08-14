@@ -1781,12 +1781,37 @@ function sustainedSecondsOf(criteria) {
   return criteria.sustained_seconds ?? 10;
 }
 
+/**
+ * The largest rolling-window rate the bucket is *designed* to allow, which is
+ * strictly above the cap and must not be mistaken for a leak.
+ *
+ * A window of `SHAPER_TELEMETRY_WINDOW_MS` may legitimately carry the bucket's
+ * whole `SHAPER_BURST_MS` of stored credit plus a full window of earned rate,
+ * and the sample that closes the window is counted whole even though its slice
+ * began earning before the window opened. At the default 250 ms burst that is
+ * already 1.25x the cap — exactly the old flat `cap * shaping_tolerance` bound,
+ * which therefore spent the entire tolerance on designed burst and left nothing
+ * for measurement jitter. Scoring the rolling peak against this bound instead
+ * makes the peak tolerance measure leakage.
+ */
+function shaperBurstBoundKbps(capKbps) {
+  const earned = capKbps * (1 + SHAPER_BURST_MS / SHAPER_TELEMETRY_WINDOW_MS);
+  const sliceQuantum = (SHAPER_SLICE_BYTES * 8) / SHAPER_TELEMETRY_WINDOW_MS;
+  return earned + sliceQuantum;
+}
+
 function scoreRecovery(criteria, observation) {
   const errors = [];
   const shaping = observation.shaping;
   const after = shaping.stages[1];
   const before = shaping.stages[0];
+  // Two different questions, so two different bounds. `shaping_tolerance`
+  // bounds the whole-stage average, which converges on the cap because the
+  // bucket repays debt with time. `shaping_peak_tolerance` bounds the rolling
+  // peak, whose designed worst case already sits above the cap, so it needs
+  // only enough slack for measurement jitter.
   const tolerance = criteria.shaping_tolerance ?? 1.25;
+  const peakTolerance = criteria.shaping_peak_tolerance ?? 1.05;
 
   if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
     return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
@@ -1799,20 +1824,25 @@ function scoreRecovery(criteria, observation) {
     };
   }
   for (const stage of [before, after]) {
-    const observedRates = [stage.measured_kbps, stage.peak_kbps]
-      .filter((rate) => Number.isFinite(rate));
-    if (!observedRates.length) {
+    const gates = [
+      { rate: stage.measured_kbps, bound: stage.kbps * tolerance, kind: "sustained" },
+      { rate: stage.peak_kbps, bound: shaperBurstBoundKbps(stage.kbps) * peakTolerance, kind: "1s burst" },
+    ].filter((gate) => Number.isFinite(gate.rate));
+    if (!gates.length) {
       return {
         outcome: "shaping",
         errors: [`the shaper recorded no delivery samples for ${stage.label}`],
         metrics: { shaping },
       };
     }
-    const observedRate = Math.max(...observedRates);
-    if (observedRate > stage.kbps * tolerance) {
+    const leak = gates.find((gate) => gate.rate > gate.bound);
+    if (leak) {
       return {
         outcome: "shaping",
-        errors: [`the shaper leaked: ${stage.label} delivered ${observedRate} kb/s over a ${stage.kbps} kb/s cap`],
+        errors: [
+          `the shaper leaked: ${stage.label} delivered a ${leak.kind} rate of ${leak.rate} kb/s`
+          + ` over a ${stage.kbps} kb/s cap, past its ${Number(leak.bound.toFixed(1))} kb/s bound`,
+        ],
         metrics: { shaping },
       };
     }
@@ -2415,6 +2445,7 @@ module.exports = {
   peakUpgradeRate,
   rungHistory,
   scoreRecovery,
+  shaperBurstBoundKbps,
   timeToSustained,
   writeFatalRunReport,
 };
