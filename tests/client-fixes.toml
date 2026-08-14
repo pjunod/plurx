@@ -180,3 +180,11 @@ source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = "enum TVPlayerRemoteRouting"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testTVProgressOnlySeeksAfterTheViewerEngagesIt"
+
+[[fixes]]
+id = "apple.pgs-overlay-menu-diagnostic"
+commits = ["462a2b8"]
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "static func subtitleLabel(_ track: SubtitleTrack) -> String"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPGSOverlayMenuDistinguishesOverlayFromBurnIn"
