@@ -17,9 +17,12 @@ bump may break compatibility and a **patch** bump never does.
   after the next bump. Such a mention is now exempted explicitly with a
   `<span data-build-history>` marker rather than by rewording the sentence
   until it slips past the regex. Marking stays the exception, and only the real
-  marker grants it: the gate parses the opening tag's attributes, so markup that
-  merely contains the name — `title="data-build-history"`, a longer attribute
-  name, a marker carrying a value, a malformed tag — is still swept, as is an
+  marker grants it: the gate parses the page, so the marker counts only at
+  attribute-name position on a real `<span>`. Markup that merely contains the
+  name — `title="data-build-history"`, a longer attribute name, a marker
+  carrying a value, a malformed tag — is still swept, as are marker-shaped
+  characters that are not an element at all, inside a comment, another
+  element's attribute value, or `<script>`/`<style>` text, and so are an
   unmarked or unclosed mention and a marker that drifts across a nested `<span>`.
   Attribute order, case, whitespace, and a quoted value containing `>` are
   honored, so reformatting a marked sentence cannot turn the gate red.

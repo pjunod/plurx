@@ -355,16 +355,27 @@ to dodge the sweep degrades the page for its readers.
 
 The exemption is granted only by the marker itself: a bare `data-build-history`
 attribute — or one with an empty value, which is how a formatter serializes a
-boolean attribute — on a `<span>` that closes around its own sentence. The gate
-parses the opening tag's attributes rather than looking for the marker's name in
-the tag text, because a name match also fires on markup that is not the marker.
-These all read as ordinary mentions and stay swept:
+boolean attribute — on a real `<span>` element that closes around its own
+sentence. The gate parses the page rather than pattern-matching its text, so the
+marker is recognized only at attribute-name position on a tag the HTML tokenizer
+actually produces. A name match alone also fires on markup that is not the
+marker, and these all read as ordinary mentions and stay swept:
 
 ```html
 <span title="data-build-history">Apple build 52</span>   <!-- a value, not the marker -->
 <span data-build-history-note>Apple build 52</span>      <!-- a different attribute -->
 <span data-build-history="false">Apple build 52</span>   <!-- the marker takes no value -->
 <span data-build-history/>Apple build 52</span>          <!-- malformed opening tag -->
+```
+
+Marker-shaped characters that are not an element grant nothing either. A comment,
+another element's quoted attribute value, and `<script>` or `<style>` text can
+all spell an opening or closing tag without being one; the build number between
+them is still on the rendered page, so it is still a claim:
+
+```html
+<!-- <span data-build-history> --><p>Apple build 52</p><!-- </span> -->
+<div title="<span data-build-history>">Apple build 52</div>
 ```
 
 Everything else fails closed the same way and returns the mention to the sweep:

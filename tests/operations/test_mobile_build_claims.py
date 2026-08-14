@@ -191,6 +191,68 @@ class StatusHistoricalBuildMentionCase(unittest.TestCase):
             with self.subTest(description):
                 self.assertEqual(self._status_errors(self._page_with(opening_tag)), ())
 
+    # Marker-shaped characters that are not an element at all. The tokenizer
+    # never produces a tag here, so a human reading the diff sees a comment, an
+    # attribute value, or script text — nothing that looks like an opt-out —
+    # while the raw-text pattern this replaced accepted all three and deleted
+    # the visible prose between them.
+    NON_ELEMENTS = {
+        "an HTML comment": (
+            "<!-- <span data-build-history> --><p>Apple build 52 stale</p>"
+            "<!-- </span> -->"
+        ),
+        "another element's attribute value": (
+            '<div title="<span data-build-history>">Apple build 52 stale</span></div>'
+        ),
+        "script text": (
+            '<script>var s = "<span data-build-history>";</script>'
+            "<p>Apple build 52 stale</p></span>"
+        ),
+        "style text": (
+            '<style>/* <span data-build-history> */</style>'
+            "<p>Apple build 52 stale</p></span>"
+        ),
+    }
+
+    def test_marker_shaped_text_outside_element_context_never_exempts(self) -> None:
+        """The marker must be a real start tag, not characters that spell one.
+
+        Each fragment leaves `Apple build 52` visible on the rendered page, so
+        exempting it would hide a stale current claim behind markup that reads
+        as ordinary to both a browser and a reviewer.
+        """
+        for description, fragment in self.NON_ELEMENTS.items():
+            with self.subTest(description):
+                status = (
+                    f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+                    f"{fragment}"
+                )
+
+                errors = self._status_errors(status)
+
+                self.assertTrue(errors, f"{description} must not exempt build 52")
+                self.assertIn("52", errors[0])
+
+    def test_the_exemption_ends_at_the_real_closing_tag(self) -> None:
+        """A commented-out `</span>` neither closes the span nor extends it.
+
+        The mirror of the case above: end-tag-shaped text must not end the
+        exemption early, and the exemption must still stop at the author's own
+        closing tag rather than running on into later prose.
+        """
+        status = (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            "<p><span data-build-history>Apple build 52 <!-- </span> --></span>"
+            " corrected the iPad mini failure.</p>"
+            "<p>Apple build 51 stale</p>"
+        )
+
+        errors = self._status_errors(status)
+
+        self.assertTrue(errors, "prose after the marked span is still swept")
+        self.assertIn("51", errors[0])
+        self.assertNotIn("52", errors[0])
+
     def test_the_shipped_status_page_uses_the_exemption_for_its_history(self) -> None:
         """Guards the real page, not just synthetic fixtures.
 
