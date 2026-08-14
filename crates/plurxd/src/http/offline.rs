@@ -1101,22 +1101,24 @@ mod tests {
             .expect("unprobed file")
     }
 
-    async fn new_package(
+    async fn new_package_with_source_snapshot(
         fixture: &Fixture,
         id: &str,
         subtitle_mode: &str,
         subtitle_index: Option<i64>,
         file_id: i64,
+        source_snapshot: (String, i64, i64),
     ) -> OfflinePackage {
+        let (source_path, source_size, source_mtime) = source_snapshot;
         let package = NewOfflinePackage {
             id: id.into(),
             request_id: format!("request-{id}"),
             user_id: fixture.user.id,
             file_id,
             node_id: "test-node".into(),
-            source_path: fixture.file.path.to_string_lossy().into_owned(),
-            source_size: fixture.file.size,
-            source_mtime: fixture.file.mtime,
+            source_path,
+            source_size,
+            source_mtime,
             effective_rate_control: EffectiveRateControl::Vbr.snapshot_value(),
             target_height: 720,
             output_width: Some(1280),
@@ -1140,6 +1142,28 @@ mod tests {
             panic!("new package was not created: {created:?}");
         };
         package
+    }
+
+    async fn new_package(
+        fixture: &Fixture,
+        id: &str,
+        subtitle_mode: &str,
+        subtitle_index: Option<i64>,
+        file_id: i64,
+    ) -> OfflinePackage {
+        new_package_with_source_snapshot(
+            fixture,
+            id,
+            subtitle_mode,
+            subtitle_index,
+            file_id,
+            (
+                fixture.file.path.to_string_lossy().into_owned(),
+                fixture.file.size,
+                fixture.file.mtime,
+            ),
+        )
+        .await
     }
 
     async fn ready_package(
@@ -1208,6 +1232,93 @@ mod tests {
             .await,
         )
         .await
+    }
+
+    async fn ready_subtitle_lease(fixture: &Fixture, package_id: &str) -> String {
+        fixture
+            .state
+            .store
+            .claim_next_offline_package("test-node")
+            .await
+            .expect("claim")
+            .expect("package");
+        assert!(fixture
+            .state
+            .store
+            .mark_offline_package_ready(package_id, "unused", 10, 90_000)
+            .await
+            .expect("mark ready"));
+        let token = "1".repeat(64);
+        assert_eq!(
+            lease(fixture, package_id, &token).await.0,
+            StatusCode::CREATED
+        );
+        token
+    }
+
+    async fn replace_subtitle_streams(fixture: &Fixture, streams: Vec<SubtitleStream>) {
+        let file_id = fixture
+            .state
+            .store
+            .upsert_file(
+                fixture.file.item_id,
+                &fixture.file.path.to_string_lossy(),
+                fixture.file.size,
+                fixture.file.mtime,
+                &ProbeResult {
+                    duration_ms: fixture.file.duration_ms,
+                    subtitle_streams: streams,
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("replace subtitle streams");
+        assert_eq!(file_id, fixture.file.id);
+    }
+
+    async fn assert_changed_subtitle_source(
+        fixture: &Fixture,
+        package_id: &str,
+        token: String,
+        index: i64,
+    ) {
+        let package = fixture
+            .state
+            .store
+            .offline_package_for_user(package_id, fixture.user.id)
+            .await
+            .expect("package lookup")
+            .expect("package");
+        let sidecar = crate::subtitles::vtt_path_for_identity(
+            &fixture.state.subs_dir,
+            package.file_id,
+            index,
+            package.source_size,
+            package.source_mtime,
+        );
+        assert!(
+            !tokio::fs::try_exists(&sidecar)
+                .await
+                .expect("sidecar lookup"),
+            "the recovery guard must be exercised after the sidecar is pruned"
+        );
+
+        let (code, body) = error_response(
+            subtitle(
+                State(fixture.state.clone()),
+                AxPath((token, index, "seg00000.vtt".into())),
+            )
+            .await
+            .expect_err("changed subtitle source"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::GONE);
+        assert_eq!(body["code"], "source_changed");
+        assert_eq!(
+            body["message"],
+            "The source for this offline subtitle has changed."
+        );
     }
 
     #[test]
@@ -1924,27 +2035,255 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_subtitle_source_is_a_typed_gone_response() {
+    async fn pruned_subtitle_rejects_a_changed_source_path() {
+        let fixture = fixture().await;
+        new_package_with_source_snapshot(
+            &fixture,
+            "changed-path",
+            "native",
+            Some(4),
+            fixture.file.id,
+            (
+                fixture
+                    .file
+                    .path
+                    .with_file_name("movie-before-rescan.mkv")
+                    .to_string_lossy()
+                    .into_owned(),
+                fixture.file.size,
+                fixture.file.mtime,
+            ),
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "changed-path").await;
+
+        assert_changed_subtitle_source(&fixture, "changed-path", token, 4).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_subtitle_rejects_a_changed_source_size() {
+        let fixture = fixture().await;
+        new_package_with_source_snapshot(
+            &fixture,
+            "changed-size",
+            "native",
+            Some(4),
+            fixture.file.id,
+            (
+                fixture.file.path.to_string_lossy().into_owned(),
+                fixture.file.size + 1,
+                fixture.file.mtime,
+            ),
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "changed-size").await;
+
+        assert_changed_subtitle_source(&fixture, "changed-size", token, 4).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_subtitle_rejects_a_changed_source_mtime() {
+        let fixture = fixture().await;
+        new_package_with_source_snapshot(
+            &fixture,
+            "changed-mtime",
+            "native",
+            Some(4),
+            fixture.file.id,
+            (
+                fixture.file.path.to_string_lossy().into_owned(),
+                fixture.file.size,
+                fixture.file.mtime + 1,
+            ),
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "changed-mtime").await;
+
+        assert_changed_subtitle_source(&fixture, "changed-mtime", token, 4).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_subtitle_rejects_a_removed_source_stream() {
+        let fixture = fixture().await;
+        new_package(
+            &fixture,
+            "removed-stream",
+            "native",
+            Some(4),
+            fixture.file.id,
+        )
+        .await;
+        replace_subtitle_streams(
+            &fixture,
+            vec![SubtitleStream {
+                index: 5,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            }],
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "removed-stream").await;
+
+        assert_changed_subtitle_source(&fixture, "removed-stream", token, 4).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_subtitle_rejects_a_source_stream_that_is_no_longer_native_text() {
+        let fixture = fixture().await;
+        new_package(
+            &fixture,
+            "changed-stream-codec",
+            "native",
+            Some(4),
+            fixture.file.id,
+        )
+        .await;
+        replace_subtitle_streams(
+            &fixture,
+            vec![SubtitleStream {
+                index: 4,
+                codec: "ass".into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            }],
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "changed-stream-codec").await;
+
+        assert_changed_subtitle_source(&fixture, "changed-stream-codec", token, 4).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_subtitle_recovers_from_an_unchanged_source() {
+        crate::transcode::require_ffmpeg();
+        let mut fixture = fixture().await;
+        let subtitle_input = fixture.file.path.with_extension("srt");
+        tokio::fs::write(
+            &subtitle_input,
+            b"1\n00:00:00,000 --> 00:00:01,000\nRecovered offline subtitle\n",
+        )
+        .await
+        .expect("subtitle fixture");
+        let output = tokio::process::Command::new(crate::ffmpeg::ffmpeg_bin())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "srt",
+                "-i",
+            ])
+            .arg(&subtitle_input)
+            .args(["-c:s", "srt"])
+            .arg(&fixture.file.path)
+            .output()
+            .await
+            .expect("build subtitle source");
+        assert!(
+            output.status.success(),
+            "building subtitle source failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata = tokio::fs::metadata(&fixture.file.path)
+            .await
+            .expect("source metadata");
+        let source_size = i64::try_from(metadata.len()).expect("source size");
+        let source_mtime = i64::try_from(
+            metadata
+                .modified()
+                .expect("source mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("source after epoch")
+                .as_secs(),
+        )
+        .expect("mtime fits i64");
+        let file_id = fixture
+            .state
+            .store
+            .upsert_file(
+                fixture.file.item_id,
+                &fixture.file.path.to_string_lossy(),
+                source_size,
+                source_mtime,
+                &ProbeResult {
+                    duration_ms: Some(1_000),
+                    container: Some("matroska".into()),
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "subrip".into(),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("record recoverable source");
+        assert_eq!(file_id, fixture.file.id);
+        fixture.file = fixture
+            .state
+            .store
+            .get_file(file_id)
+            .await
+            .expect("file lookup")
+            .expect("file");
+        new_package(
+            &fixture,
+            "unchanged-source",
+            "native",
+            Some(0),
+            fixture.file.id,
+        )
+        .await;
+        let token = ready_subtitle_lease(&fixture, "unchanged-source").await;
+        let sidecar = crate::subtitles::vtt_path_for_identity(
+            &fixture.state.subs_dir,
+            fixture.file.id,
+            0,
+            fixture.file.size,
+            fixture.file.mtime,
+        );
+        assert!(
+            !tokio::fs::try_exists(&sidecar)
+                .await
+                .expect("sidecar lookup"),
+            "the happy path must begin with a pruned sidecar"
+        );
+
+        let response = subtitle(
+            State(fixture.state.clone()),
+            AxPath((token, 0, "seg00000.vtt".into())),
+        )
+        .await
+        .expect("recover subtitle");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("subtitle response")
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("Recovered offline subtitle"),
+            "recovered response did not contain the source subtitle"
+        );
+        assert!(
+            tokio::fs::try_exists(&sidecar)
+                .await
+                .expect("sidecar lookup"),
+            "unchanged-source recovery did not republish the pruned sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_subtitle_source_is_a_distinct_typed_gone_response() {
         let fixture = fixture().await;
         new_package(&fixture, "missing-source", "native", Some(4), 999_999).await;
-        fixture
-            .state
-            .store
-            .claim_next_offline_package("test-node")
-            .await
-            .expect("claim")
-            .expect("package");
-        assert!(fixture
-            .state
-            .store
-            .mark_offline_package_ready("missing-source", "unused", 10, 90_000)
-            .await
-            .expect("mark ready"));
-        let token = "1".repeat(64);
-        assert_eq!(
-            lease(&fixture, "missing-source", &token).await.0,
-            StatusCode::CREATED
-        );
+        let token = ready_subtitle_lease(&fixture, "missing-source").await;
 
         let (code, body) = error_response(
             subtitle(
@@ -1957,5 +2296,9 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::GONE);
         assert_eq!(body["code"], "source_changed");
+        assert_eq!(
+            body["message"],
+            "The source for this offline subtitle is no longer available."
+        );
     }
 }
