@@ -164,3 +164,11 @@ source = "clients/apple/Sources/Components.swift"
 source_anchor = "func episodeCardAction("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testEpisodeCardRegionsKeepPlayAndDetailActionsSeparate"
+
+[[fixes]]
+id = "apple.tv-series-child-shelf-focus"
+commits = ["b1b984e4"]
+source = "clients/apple/Sources/Components.swift"
+source_anchor = "enum TVMediaRowFocusPolicy"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testTVSeriesAndSeasonShelvesAcceptDirectionalFocusFromTheirHeaders"
