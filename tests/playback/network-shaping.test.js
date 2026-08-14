@@ -131,10 +131,18 @@ test("proxy diagnostics strip bearer-token query strings", () => {
 
 // ------------------------------------------------------------- the shaper
 
-async function withOrigin(bytes, run) {
+async function withOrigin(bytes, run, { firstResponseDelayMs = 0 } = {}) {
+  let requests = 0;
   const origin = http.createServer((request, response) => {
-    response.writeHead(200, { "content-type": "application/octet-stream" });
-    response.end(Buffer.alloc(bytes, 0x61));
+    const reply = () => {
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.end(Buffer.alloc(request.url === "/healthz" ? 1 : bytes, 0x61));
+    };
+    if (requests++ === 0 && firstResponseDelayMs > 0) {
+      setTimeout(reply, firstResponseDelayMs);
+    } else {
+      reply();
+    }
   });
   await new Promise((resolve) => origin.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${origin.address().port}`;
@@ -155,6 +163,14 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
     const shaper = new lab.ShapingProxy(profile, origin);
     const base = await shaper.start();
     try {
+      // Make both timed transfers pay equivalent connection/JIT costs. The
+      // injected first-response delay makes this fail deterministically if the
+      // warmup is removed, modeling the compounded cold-fetch and scheduling
+      // skew seen under CPU load.
+      const warmup = await fetch(`${base}/healthz`);
+      await warmup.arrayBuffer();
+      shaper.beginEvidence();
+
       const before = Date.now();
       const first = await fetch(`${base}/api/v1/files/1/direct`);
       await first.arrayBuffer();
@@ -190,7 +206,7 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
       /fetch failed|aborted/i,
       "closing the shaper releases its listening socket",
     );
-  });
+  }, { firstResponseDelayMs: 750 });
 });
 
 test("concurrent reservations are rescheduled at the cliff instead of bursting", async () => {

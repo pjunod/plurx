@@ -720,6 +720,10 @@ class ShapingProxy {
   }
 
   record(bytes, media) {
+    // Reservations are priced against the stage current when they are claimed,
+    // while a completed write is billed to the stage current here. At a cliff,
+    // that can move only the already-in-flight slices across the boundary; the
+    // fixed slice size bounds the resulting conservative (false-leak) bias.
     const stage = this.stages[this.stageIndex];
     const at = this.now() - this.startedAt;
     if (stage.first_byte_at_ms === null) stage.first_byte_at_ms = at;
