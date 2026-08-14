@@ -254,3 +254,15 @@ commits = ["f6e7492c"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained encoder subprocess tests keep the 100 ms wedged-probe deadline, the sub-two-second reaping bound, and the quality-refusal verdict; tracked executable fixtures remove the write-close-exec race that misread a spawn error as a refusal."
+
+[[coverage]]
+commits = ["f7649b72", "2421854b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained parser and server regressions unwrap the 32-bit PTS clock boundary without accepting an ordinary backwards jump, keep the 0xC0 Epoch Continue display set through the owned PCS adapter instead of dropping it, and hold one staged SUP identity across preflight and parse when the path is replaced under an already-open input."
+
+[[coverage]]
+commits = ["4a700cc"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained server manifest regression proves a same-millisecond last-state replacement is re-coalesced against the preceding effective composition, preventing adjacent duplicate cues after A@0, B@1000, A@1000."

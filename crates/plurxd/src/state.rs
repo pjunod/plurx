@@ -2113,6 +2113,435 @@ mod tests {
         episodes
     }
 
+    fn scan_request_fixture(id: impl Into<String>, library_id: i64) -> ScanRequest {
+        ScanRequest {
+            id: id.into(),
+            library_id,
+            path: PathBuf::from("/missing/target"),
+            ids: None,
+            correlation_id: Some("correlation".into()),
+            source: Some("test".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_lifecycle_helpers_publish_progress_and_clear_every_guard() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(Arc::clone(&store), artwork.path());
+
+        assert!(
+            !jobs.stop_producing(),
+            "an idle producer has nothing to stop"
+        );
+        jobs.producing.store(true, Ordering::Relaxed);
+        jobs.set_producing(Some(ProducingNow {
+            title: "Heat".into(),
+            reason: crate::produce::REASON_RECENT,
+            index: 1,
+            total: 2,
+        }))
+        .await;
+        assert!(jobs.stop_producing());
+        assert_eq!(jobs.producing_now().await.expect("activity").title, "Heat");
+        drop(ProducingGuard(Arc::clone(&jobs)));
+        assert!(!jobs.producing.load(Ordering::Relaxed));
+        assert!(!jobs.stop_producing.load(Ordering::Relaxed));
+        assert!(jobs.producing_now().await.is_none());
+
+        jobs.backfilling_genres.store(true, Ordering::Relaxed);
+        drop(GenreBackfillGuard(Arc::clone(&jobs)));
+        assert!(!jobs.backfilling_genres.load(Ordering::Relaxed));
+        jobs.retrying_artwork.store(true, Ordering::Relaxed);
+        drop(ArtworkRetryGuard(Arc::clone(&jobs)));
+        assert!(!jobs.retrying_artwork.load(Ordering::Relaxed));
+
+        let progress = Arc::new(ScanProgress::default());
+        progress.found.store(5, Ordering::Relaxed);
+        progress.processed.store(3, Ordering::Relaxed);
+        progress.changed.store(2, Ordering::Relaxed);
+        jobs.statuses.lock().await.insert(
+            7,
+            ScanStatus {
+                running: true,
+                ..Default::default()
+            },
+        );
+        jobs.live.lock().await.insert(7, Arc::clone(&progress));
+        let status = jobs.all_statuses().await.remove(&7).expect("live status");
+        let snapshot = status.progress.expect("sampled progress");
+        assert_eq!(
+            (snapshot.found, snapshot.processed, snapshot.changed),
+            (5, 3, 2)
+        );
+
+        jobs.finish(7, ScanStatus::default()).await;
+        let finished = jobs
+            .all_statuses()
+            .await
+            .remove(&7)
+            .expect("finished status");
+        assert!(!finished.running);
+        assert!(finished.finished_at.is_some());
+        assert!(finished.progress.is_none());
+        let failed = error_status("disk unavailable");
+        assert_eq!(failed.error.as_deref(), Some("disk unavailable"));
+        assert!(failed.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn job_settings_are_bounded_and_stamps_round_trip() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(Arc::clone(&store), artwork.path());
+
+        assert_eq!(jobs.job_interval("missing").await, 0);
+        assert_eq!(jobs.job_interval_or("missing", 17).await, 17);
+        store
+            .put_setting("job.test", " -3 ")
+            .await
+            .expect("negative");
+        assert_eq!(jobs.job_interval("job.test").await, 0);
+        store
+            .put_setting("job.test", " 42 ")
+            .await
+            .expect("interval");
+        assert_eq!(jobs.job_interval("job.test").await, 42);
+        assert_eq!(jobs.job_stamp("job.test").await, Some(42));
+        store
+            .put_setting("job.test", "invalid")
+            .await
+            .expect("invalid");
+        assert_eq!(jobs.job_stamp("job.test").await, None);
+
+        jobs.stamp("job.stamped").await;
+        let stamped = jobs.job_stamp("job.stamped").await.expect("stamp");
+        assert!((now() - stamped).abs() <= 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_request_failures_queue_coalesce_and_stay_bounded() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(Arc::clone(&store), artwork.path());
+
+        let missing = scan_request_fixture("missing", 404);
+        assert!(jobs.request_scan(missing).await.is_err());
+        let failed = jobs.scan_request("missing").await.expect("failed record");
+        assert_eq!(failed.status, "failed");
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not under any root")));
+
+        jobs.statuses.lock().await.insert(
+            405,
+            ScanStatus {
+                running: true,
+                ..Default::default()
+            },
+        );
+        assert!(jobs
+            .request_scan(scan_request_fixture("queued-1", 405))
+            .await
+            .expect("queue first")
+            .is_none());
+        assert!(jobs
+            .request_scan(scan_request_fixture("queued-2", 405))
+            .await
+            .expect("coalesce duplicate")
+            .is_none());
+        assert_eq!(
+            jobs.pending.lock().await.get(&405).expect("pending").len(),
+            1
+        );
+        assert_eq!(
+            jobs.scan_request("queued-1")
+                .await
+                .expect("queued record")
+                .status,
+            "queued"
+        );
+        assert_eq!(
+            jobs.scan_request("queued-2")
+                .await
+                .expect("coalesced record")
+                .status,
+            "queued"
+        );
+        jobs.drain_pending(405).await;
+        assert_eq!(
+            jobs.scan_request("queued-1")
+                .await
+                .expect("drained record")
+                .status,
+            "failed"
+        );
+
+        for index in 0..=MAX_REQUESTS {
+            let request = scan_request_fixture(format!("ring-{index}"), 1);
+            jobs.record_request(&request, "queued", None, None).await;
+        }
+        let records = jobs.scan_requests().await;
+        assert_eq!(records.len(), MAX_REQUESTS);
+        assert!(
+            jobs.scan_request("ring-0").await.is_none(),
+            "oldest record was evicted"
+        );
+        let newest = scan_request_fixture(format!("ring-{MAX_REQUESTS}"), 1);
+        jobs.record_request(&newest, "done", None, None).await;
+        assert_eq!(
+            jobs.scan_request(&format!("ring-{MAX_REQUESTS}"))
+                .await
+                .expect("updated newest")
+                .status,
+            "done"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_of_a_missing_library_finishes_with_an_error() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(store, artwork.path());
+        assert!(jobs.trigger_refresh_as(999, ScanTrigger::Scheduled).await);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = jobs.all_statuses().await.remove(&999);
+                if status.as_ref().is_some_and(|status| !status.running) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing library scan finished");
+        let status = jobs.all_statuses().await.remove(&999).expect("status");
+        assert_eq!(status.error.as_deref(), Some("library not found"));
+        let (counts, _) = jobs.metrics().snapshot();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(trigger, _)| *trigger == "scheduled")
+                .map(|(_, count)| count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_scan_is_opt_in_and_runs_each_library_after_settling() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let jobs = manager(store.clone(), artwork.path());
+
+        jobs.scan_on_startup().await;
+        assert!(
+            jobs.all_statuses().await.is_empty(),
+            "startup scan is opt in"
+        );
+
+        store
+            .put_setting(keys::JOB_SCAN_ON_STARTUP, "1")
+            .await
+            .expect("enable startup scan");
+        let startup = tokio::spawn({
+            let jobs = Arc::clone(&jobs);
+            async move { jobs.scan_on_startup().await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        startup.await.expect("startup task");
+
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if jobs
+                    .all_statuses()
+                    .await
+                    .get(&library.id)
+                    .is_some_and(|status| !status.running)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup scan finished");
+        let status = jobs
+            .all_statuses()
+            .await
+            .remove(&library.id)
+            .expect("startup scan status");
+        assert!(!status.running);
+        assert!(status.last_scan.is_some());
+        let (counts, _) = jobs.metrics().snapshot();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(trigger, _)| *trigger == "startup")
+                .map(|(_, count)| count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_loop_dispatches_a_due_library_scan() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let transcode = tempfile::tempdir().expect("transcode");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        store
+            .set_library_schedule(library.id, 1, 0)
+            .await
+            .expect("schedule scan");
+        let jobs = manager(store.clone(), artwork.path());
+        let transcode = Arc::new(TranscodeManager::new(
+            store.clone(),
+            transcode.path().join("work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+
+        let scheduler = tokio::spawn(Arc::clone(&jobs).schedule_loop(transcode));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if jobs
+                    .all_statuses()
+                    .await
+                    .get(&library.id)
+                    .is_some_and(|status| !status.running)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduled scan finished");
+        scheduler.abort();
+        assert!(scheduler
+            .await
+            .expect_err("scheduler keeps ticking")
+            .is_cancelled());
+
+        let status = jobs
+            .all_statuses()
+            .await
+            .remove(&library.id)
+            .expect("scheduled scan status");
+        assert!(status.last_scan.is_some());
+        assert!(status.error.is_none());
+        let (counts, _) = jobs.metrics().snapshot();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(trigger, _)| *trigger == "scheduled")
+                .map(|(_, count)| count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn due_jobs_dispatches_a_scheduled_metadata_refresh() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let transcode = tempfile::tempdir().expect("transcode");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        store
+            .set_library_schedule(library.id, 0, 1)
+            .await
+            .expect("schedule refresh");
+        let jobs = manager(store.clone(), artwork.path());
+        let transcode = Arc::new(TranscodeManager::new(
+            store.clone(),
+            transcode.path().join("work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+
+        jobs.run_due_jobs(&transcode).await.expect("scheduler tick");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if jobs
+                    .all_statuses()
+                    .await
+                    .get(&library.id)
+                    .is_some_and(|status| !status.running)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduled refresh finished");
+
+        let refreshed = store
+            .get_library(library.id)
+            .await
+            .expect("read library")
+            .expect("library remains");
+        assert!(refreshed.last_refresh_at.is_some());
+        let status = jobs
+            .all_statuses()
+            .await
+            .remove(&library.id)
+            .expect("scheduled refresh status");
+        assert!(status.last_scan.is_some());
+        assert!(status.error.is_none());
+        let (counts, _) = jobs.metrics().snapshot();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(trigger, _)| *trigger == "scheduled")
+                .map(|(_, count)| count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_missing_item_artwork_is_an_empty_success() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(store, artwork.path());
+
+        let outcome = jobs
+            .refresh_item_artwork(i64::MAX)
+            .await
+            .expect("missing item is not a store failure");
+        assert!(outcome.enrich.is_none());
+        assert!(outcome.local_art.is_none());
+    }
+
     /// The bug this whole change exists for, in one test.
     ///
     /// monarr POSTs `/api/v1/scan` the moment an import finishes and waits for

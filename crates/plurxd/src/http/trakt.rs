@@ -103,3 +103,103 @@ pub async fn sync_now(
     state.trakt.request_sync();
     Ok(Json(status_dto(&state, user.id).await))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Dirs, SystemInfo};
+    use crate::trakt::TraktManager;
+    use plurx_core::domain::TraktAuth;
+    use plurx_core::store::{keys, SqliteStore, Store};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    async fn serve_device_code() -> String {
+        let app = axum::Router::new().fallback(|| async {
+            Json(json!({
+                "device_code": "device-code",
+                "user_code": "ABCD",
+                "verification_url": "https://trakt.tv/activate",
+                "expires_in": 600,
+                "interval": 600
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Trakt fake");
+        let addr = listener.local_addr().expect("Trakt fake address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn status_projection_preserves_link_and_pending_details() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store
+            .create_user("admin", "hash", true)
+            .await
+            .expect("user");
+        store
+            .put_setting(keys::TRAKT_CLIENT_ID, "client")
+            .await
+            .expect("client id");
+        store
+            .put_setting(keys::TRAKT_CLIENT_SECRET, "secret")
+            .await
+            .expect("client secret");
+        store
+            .put_trakt_auth(&TraktAuth {
+                user_id: user.id,
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now_unix() + 3600,
+                trakt_username: Some("neo".into()),
+                connected_at: 123,
+                last_sync_at: 456,
+                last_activities: None,
+            })
+            .await
+            .expect("linked auth");
+
+        let temp = tempfile::tempdir().expect("state directory");
+        let dirs = Dirs {
+            artwork: temp.path().join("artwork"),
+            transcode: temp.path().join("transcode"),
+            cache: temp.path().join("cache"),
+            subs: temp.path().join("subs"),
+        };
+        let mut state = AppState::new(
+            "test".into(),
+            Arc::clone(&store),
+            dirs,
+            "test-node".into(),
+            Default::default(),
+            SystemInfo::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(8)),
+        );
+        state.trakt = Arc::new(TraktManager::new(
+            Arc::clone(&store),
+            serve_device_code().await,
+        ));
+
+        let linked = status_dto(&state, user.id).await;
+        assert!(linked.configured);
+        assert!(linked.linked);
+        assert_eq!(linked.trakt_username.as_deref(), Some("neo"));
+        assert_eq!(linked.connected_at, Some(123));
+        assert_eq!(linked.last_sync_at, Some(456));
+        assert!(linked.pending.is_none());
+
+        state.trakt.unlink(user.id).await.expect("unlink");
+        let Json(linked) = link(AdminUser(user), State(state.clone()))
+            .await
+            .expect("begin device link");
+        let pending = linked.pending.expect("pending projection");
+        assert_eq!(pending.user_code, "ABCD");
+        assert_eq!(pending.verification_url, "https://trakt.tv/activate");
+        assert!((599..=600).contains(&pending.expires_in));
+        assert!(pending.error.is_none());
+    }
+}
