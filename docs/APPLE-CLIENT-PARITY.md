@@ -251,8 +251,11 @@ unchanged; neither silently starts a burn.
 [APPLE-PGS-OVERLAY-ACCEPTANCE.md](APPLE-PGS-OVERLAY-ACCEPTANCE.md) names build
 58, the operator-owned server gate/restart and TestFlight upload, the exact PGS
 codec check, the diagnostic strings, 100/150 ms timing bounds, item-replacement
-trigger, and Yes/No PiP/AirPlay observations. Until that physical matrix is
-recorded, the client remains staged behind the server's default-off gate.
+trigger or explicit `Not run`, and Yes/No PiP/AirPlay observations. A direct-
+play title with one audio track cannot satisfy the replacement row merely by
+seeking: without the visible stream-change spinner, no item replacement was
+observed. Until that physical matrix is recorded, the client remains staged
+behind the server's default-off gate.
 
 #### What automatic subtitle selection is allowed to do
 

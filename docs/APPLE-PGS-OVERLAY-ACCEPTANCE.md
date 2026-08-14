@@ -98,8 +98,12 @@ Choose two unmistakable subtitle moments at least five minutes apart:
   and pause/resume.
 - **Cue B:** a cue later in the title, used as the long-seek target.
 
-Use a second audio track for §5 when the title has one. Otherwise the long seek
-itself supplies the player-item replacement.
+Prefer a title with a second audio track for §5 because switching audio is a
+deterministic player-item replacement. Without one, the replacement row is
+runnable only when §4 reports `Remux · HLS` and a long seek visibly enters the
+stream-change spinner. A `Direct play` title with one audio track has no
+replacement trigger; record `Not run — Direct play with one audio track` rather
+than treating a successful seek as replacement evidence.
 
 ## 4. Establish the Off baseline, then select the overlay
 
@@ -144,14 +148,18 @@ Run these cases with the PGS overlay selected:
 | Steady cue | Play through Cue A without touching controls | Onset and clear are within six recorded frames (100 ms) of the authored picture/dialogue event; no stale object remains after clear |
 | Seek away/back | Seek away from Cue A, then back into its middle | The correct complete cue is present within nine frames (150 ms) or one source-video frame after the first stable target frame; the cue from the old position is absent |
 | Rate 1×→0×→1× | Pause in the middle of Cue A for five wall-clock seconds, then resume | Video and overlay freeze together; the cue neither clears nor advances while paused, and resumes against source time rather than the five seconds of wall time |
-| Item replacement | Within 30 seconds of a fresh remux session, seek at least five minutes forward to Cue B; if the title has another audio track, switch to it and back as the deterministic replacement | Cue B appears on the replacement item within nine frames/one source frame, no Cue A object survives, `Method` returns to the same copy/direct video class, and `Dynamic range` still matches the Off baseline |
+| Item replacement | If another audio track exists, switch to it and back. Otherwise, only from a fresh `Remux · HLS` session, seek at least five minutes forward to Cue B within 30 seconds and require the stream-change spinner. If the baseline is `Direct play` or no spinner appears, record `Not run` with that reason | After the observed replacement, Cue B appears within nine frames/one source frame, no Cue A object survives, `Method` returns to the same copy/direct video class, and `Dynamic range` still matches the Off baseline |
 
 The pause/resume row is the rate transition the shipping player exposes: 1× to
 0× and back to 1×. Do not claim an untested 1.5× path; build 58 has no playback-
-speed selector. A long forward seek early in a growing HLS session lands beyond
-its published window and therefore replaces the `AVPlayerItem`. An audio-track
-switch also replaces it and is preferred when available because its trigger is
-deterministic even if the server already holds a completed cache entry.
+speed selector. A direct-play seek uses the current item's file timeline and
+does not replace the `AVPlayerItem`. A long forward seek can replace the item
+only when a growing remux session has not published that target; the visible
+stream-change spinner is the operator's confirmation that this route ran. An
+audio-track switch also replaces the item and is preferred because its trigger
+is deterministic even if the server already holds a completed cache entry. No
+spinner means no replacement evidence, so do not infer a pass from correct Cue
+B playback alone.
 
 ## 6. Confirm the documented PiP and AirPlay limitations
 
@@ -183,8 +191,9 @@ before any release claim; do not rewrite the observation as a pass.
 ## 7. Record one result without private library data
 
 Copy this table into the acceptance issue. Use `Yes`, `No`, or `Not run`; do not
-use “looks good.” A single `No` means the physical Apple milestone remains
-pending.
+use “looks good.” Every row must be `Yes` to complete this iPad slice. A `No` or
+`Not run` keeps the physical Apple milestone pending; `Not run` records that an
+observation was unavailable rather than disguising it as a pass.
 
 | Evidence | Result |
 |---|---|
@@ -200,14 +209,14 @@ pending.
 | Steady onset/clear within 100 ms | |
 | Seek reconciliation within 150 ms or one source frame | |
 | Pause/resume keeps overlay on source time | |
-| Replacement item has only the correct target cue | |
+| Replacement item has only the correct target cue, or `Not run` with the missing-trigger reason | |
 | PiP is blocked with the documented notice and no burn fallback | |
 | AirPlay selection is refused with the documented notice and no burn fallback | |
 
-Also record the pre/post `Method`, `Dynamic range`, and `Subtitles` strings and
-whether the replacement was triggered by audio switch or long seek. The
-recording may remain private; the issue needs the measured frame counts, not a
-copy of operator-owned media.
+Also record the pre/post `Method`, `Dynamic range`, and `Subtitles` strings,
+whether the replacement was triggered by audio switch or long seek, and whether
+the stream-change spinner appeared. The recording may remain private; the issue
+needs the measured frame counts, not a copy of operator-owned media.
 
 ## 8. What this run cannot claim
 
