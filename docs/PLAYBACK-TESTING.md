@@ -236,11 +236,15 @@ mid-stage: a slice the bucket priced before the first presented frame can be
 delivered after it with its claim in the discarded ledger. The exemption is
 **measured, not assumed**. The shaper holds every priced-but-undelivered claim
 by identity, marks exactly those outstanding when the evidence window opens, and
-counts a byte as exempt only when the completion names one of them. A claim that
-is refunded instead of delivered never becomes allowance. The artifact records
-both quantities — `evidence_pending_claim_bytes`, what was in flight at the
-seam, and `carried_over_bytes`, how much of it actually crossed — so the
-provenance of every excused byte is re-checkable without the script.
+settles each one by the path it actually took. A delivered claim contributes to
+`carried_over_bytes`. A canceled claim contributes no delivery allowance, but
+its actual credited refund contributes to `evidence_refunded_claim_bytes`: the
+new ledger retained that negative refund after discarding the matching positive
+claim, so the total proof must reconcile it before judging later ordinary
+delivery. The two settlements are mutually exclusive and their sum may not
+exceed `evidence_pending_claim_bytes`, the bytes measured in flight at the seam.
+Those three artifact fields keep every adjustment re-checkable without the
+script; neither the nominal claim size nor the socket count can manufacture one.
 
 A blanket `max_sockets × slice_bytes` ceiling was wrong here and was removed: at
 32 sockets it excused 512 KiB of delivery with no claim behind it anywhere in

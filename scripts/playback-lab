@@ -700,6 +700,7 @@ class ShapingProxy {
     this.pendingClaims = new Set();
     this.evidencePendingBytes = 0;
     this.carriedOverBytes = 0;
+    this.evidenceRefundedClaimBytes = 0;
     this.stages = profile.stages.map((stage) => ({
       index: stage.index,
       label: stage.label,
@@ -756,6 +757,7 @@ class ShapingProxy {
     // ceiling — keeps an unclaimed byte unexempt even when it is the only one.
     this.evidencePendingBytes = 0;
     this.carriedOverBytes = 0;
+    this.evidenceRefundedClaimBytes = 0;
     for (const claim of this.pendingClaims) {
       claim.crossedEvidenceSeam = true;
       this.evidencePendingBytes += claim.bytes;
@@ -823,7 +825,15 @@ class ShapingProxy {
    * released. `bytes` is what the bucket actually took back, which is less than
    * the slice whenever the balance was already near capacity.
    */
-  meterRefund(bytes, media, at = this.now()) {
+  meterRefund(bytes, media, at = this.now(), claim = null) {
+    // `beginEvidence` discards the positive entry for an outstanding claim. If
+    // that exact claim is canceled afterwards, its negative refund survives in
+    // the new ledger and needs the same measured seam reconciliation as a
+    // completion. Record only the credit the bucket actually accepted; this is
+    // neither the claim's nominal size nor a blanket delivery allowance.
+    if (claim?.crossedEvidenceSeam && this.pendingClaims.has(claim)) {
+      this.evidenceRefundedClaimBytes += Math.min(bytes, claim.bytes);
+    }
     if (bytes <= 0) return;
     this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes: -bytes, media });
   }
@@ -944,12 +954,12 @@ class ShapingProxy {
       // reservation was waiting. `committed` is set at the write, so this path
       // can only be reached by a reservation that never reached the socket.
       if (admission && !committed) {
-        this.settleClaim(admission);
         if (!this.closed) {
           const at = this.now();
-          this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at);
+          this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at, admission);
           this.wakeLimiter();
         }
+        this.settleClaim(admission);
       }
     }
   }
@@ -975,12 +985,12 @@ class ShapingProxy {
       return admission;
     } catch (error) {
       if (admission) {
-        this.settleClaim(admission);
         if (!this.closed) {
           const at = this.now();
-          this.meterRefund(this.bucket.refund(bytes, at), admission.media, at);
+          this.meterRefund(this.bucket.refund(bytes, at), admission.media, at, admission);
           this.wakeLimiter();
         }
+        this.settleClaim(admission);
       }
       throw error;
     }
@@ -1056,10 +1066,14 @@ class ShapingProxy {
       // The measured evidence seam. `evidence_pending_claim_bytes` is what the
       // bucket had priced but not yet delivered when `beginEvidence` discarded
       // the ledger; `carried_over_bytes` is how much of that was actually
-      // delivered afterwards. Only the latter is exempt from the delivery gate,
-      // so an artifact records the provenance of every byte it excuses.
+      // delivered afterwards. A marked claim refunded after the reset instead
+      // contributes the actual credit accepted by the bucket to
+      // `evidence_refunded_claim_bytes`, reconciling the retained negative
+      // ledger entry with its discarded positive entry. The two settlements
+      // are mutually exclusive and retain the provenance of every adjustment.
       evidence_pending_claim_bytes: this.evidencePendingBytes,
       carried_over_bytes: this.carriedOverBytes,
+      evidence_refunded_claim_bytes: this.evidenceRefundedClaimBytes,
       transport_errors: this.errors.slice(-10),
       stages: this.stages.map((stage) => {
         const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
@@ -2064,18 +2078,38 @@ function scoreRecovery(criteria, observation) {
   // bucket priced before the first frame can be delivered after it with its
   // claim in the discarded ledger. The shaper marks exactly those outstanding
   // claims and counts a byte here only when the completion names one of them.
+  // If one of those claims is canceled, the surviving ledger contains its
+  // negative refund but not the discarded positive claim. The actual credit
+  // the bucket accepted is therefore a separate seam adjustment; otherwise a
+  // healthy replacement delivery appears unclaimed by exactly that refund.
   // A blanket `max_sockets x slice_bytes` ceiling would instead excuse that
   // many unclaimed bytes from anywhere in the run — at 1.5 Mb/s, seconds of
   // link capacity with no provenance at all.
   const delivered = shaping.stages.reduce((total, stage) => total + (stage.bytes || 0), 0);
   const admitted = shaping.stages.reduce((total, stage) => total + (stage.admitted_bytes || 0), 0);
+  const evidencePending = shaping.evidence_pending_claim_bytes ?? 0;
   const carriedOver = shaping.carried_over_bytes ?? 0;
-  if (delivered > admitted + carriedOver) {
+  const evidenceRefunded = shaping.evidence_refunded_claim_bytes ?? 0;
+  const seamAdjustment = carriedOver + evidenceRefunded;
+  if (![evidencePending, carriedOver, evidenceRefunded]
+    .every((value) => Number.isFinite(value) && value >= 0)
+      || seamAdjustment > evidencePending) {
+    return {
+      outcome: "shaping",
+      errors: [
+        `the shaper recorded invalid evidence-seam provenance: ${carriedOver} B delivered and `
+        + `${evidenceRefunded} B refunded from ${evidencePending} B pending`,
+      ],
+      metrics: { shaping },
+    };
+  }
+  if (delivered > admitted + seamAdjustment) {
     return {
       outcome: "shaping",
       errors: [
         `the shaper leaked: the browser received ${delivered} B while the bucket released ${admitted} B`
-        + ` (exempting ${carriedOver} B claimed before the evidence window and delivered inside it)`,
+        + ` (reconciling ${carriedOver} B delivered and ${evidenceRefunded} B refunded from claims`
+        + ` pending before the evidence window)`,
       ],
       metrics: { shaping },
     };
