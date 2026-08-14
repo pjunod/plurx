@@ -16,9 +16,13 @@ bump may break compatibility and a **patch** bump never does.
   history, and a true sentence about the build that carried a fix stays true
   after the next bump. Such a mention is now exempted explicitly with a
   `<span data-build-history>` marker rather than by rewording the sentence
-  until it slips past the regex. Marking stays the exception: an unmarked
-  mention is still swept, and a marker that drifts across a nested `<span>`
-  stops exempting, so both failure modes fail closed.
+  until it slips past the regex. Marking stays the exception, and only the real
+  marker grants it: the gate parses the opening tag's attributes, so markup that
+  merely contains the name — `title="data-build-history"`, a longer attribute
+  name, a marker carrying a value, a malformed tag — is still swept, as is an
+  unmarked or unclosed mention and a marker that drifts across a nested `<span>`.
+  Attribute order, case, whitespace, and a quoted value containing `>` are
+  honored, so reformatting a marked sentence cannot turn the gate red.
 
 - **Audiobook resume and multipart progress now stay on one book timeline.**
   SQLite and Hiqlite clamp audiobook progress against the sum of its parts,

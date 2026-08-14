@@ -115,6 +115,82 @@ class StatusHistoricalBuildMentionCase(unittest.TestCase):
         self.assertTrue(errors, "a marker spanning a nested <span> must not exempt")
         self.assertIn("52", errors[0])
 
+    # Markup that is *not* the marker, and so must never earn the exemption.
+    # The first three silently exempted a stale claim before the opening tag was
+    # parsed as attributes rather than scanned as raw text: `data-build-history`
+    # appearing anywhere in the tag was enough, including inside another
+    # attribute's value or as the prefix of a different attribute's name.
+    IMPOSTORS = {
+        "the marker as another attribute's value": '<span title="data-build-history">',
+        "the marker inside a longer value": '<span title="see data-build-history">',
+        "an attribute name that merely starts with it": "<span data-build-history-note>",
+        "an attribute name that merely ends with it": "<span x-data-build-history>",
+        "a self-closing tag": "<span data-build-history/>",
+        "a marker carrying a value": '<span data-build-history="false">',
+        "the marker on a different element": "<div data-build-history>",
+        "no marker at all": '<span class="t">',
+    }
+
+    # Markup that *is* the marker. Attribute order, an empty boolean value,
+    # attribute-name case, and whitespace are all insignificant in HTML, and a
+    # quoted value may legally contain `>` — which the raw-text pattern used to
+    # choke on, rejecting a correctly marked sentence.
+    MARKER_FORMS = {
+        "bare": "<span data-build-history>",
+        'empty value ""': '<span data-build-history="">',
+        "empty value ''": "<span data-build-history=''>",
+        "after another attribute": '<span class="t" data-build-history>',
+        "before another attribute": '<span data-build-history class="t">',
+        "beside a value containing >": '<span title="a>b" data-build-history>',
+        "uppercase": "<SPAN DATA-BUILD-HISTORY>",
+        "extra whitespace": "<span   data-build-history   >",
+        "wrapped across lines": "<span\n  data-build-history\n>",
+    }
+
+    def _page_with(self, opening_tag: str) -> str:
+        closing = "</div>" if opening_tag.startswith("<div") else "</span>"
+        return (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            f"<p>{opening_tag}Apple build 52{closing} corrected the reported "
+            "iPad mini failure.</p>"
+        )
+
+    def test_only_the_real_marker_grants_the_exemption(self) -> None:
+        """Markup that resembles the marker must not exempt a build mention.
+
+        Each of these reads as an ordinary mention to a human, so treating one
+        as an opt-out would let a stale current claim through the gate while
+        looking like a deliberate history note in review.
+        """
+        for description, opening_tag in self.IMPOSTORS.items():
+            with self.subTest(description):
+                errors = self._status_errors(self._page_with(opening_tag))
+
+                self.assertTrue(errors, f"{opening_tag} must not exempt build 52")
+                self.assertIn("52", errors[0])
+
+    def test_an_unclosed_marker_span_fails_closed(self) -> None:
+        status = (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            "<p><span data-build-history>Apple build 52 corrected the failure.</p>"
+        )
+
+        errors = self._status_errors(status)
+
+        self.assertTrue(errors, "a marker with no closing tag must not exempt")
+        self.assertIn("52", errors[0])
+
+    def test_the_marker_is_honored_in_every_equivalent_html_form(self) -> None:
+        """Attribute order, case, and whitespace are insignificant in HTML.
+
+        A correctly marked sentence must not turn the gate red because a
+        formatter rewrote the tag, since the only remedy left to that author is
+        to reword true prose — exactly the failure this issue exists to remove.
+        """
+        for description, opening_tag in self.MARKER_FORMS.items():
+            with self.subTest(description):
+                self.assertEqual(self._status_errors(self._page_with(opening_tag)), ())
+
     def test_the_shipped_status_page_uses_the_exemption_for_its_history(self) -> None:
         """Guards the real page, not just synthetic fixtures.
 

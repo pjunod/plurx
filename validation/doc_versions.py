@@ -25,14 +25,27 @@ def _one(contents: str, pattern: str, label: str) -> int:
 #
 #     <span data-build-history>Apple build 52</span> corrects the reported ...
 #
-# Marking is deliberately the exception, not the rule. An unmarked mention is
-# still swept, so a stale current claim cannot slip through by accident — only
-# by someone writing the marker around it, which is a reviewable edit. The
-# pattern also refuses to span a nested <span>, so a marker that drifts off its
-# sentence stops matching and the mention goes back to being checked. Every way
-# this can go wrong fails closed.
+# Marking is deliberately the exception, not the rule, so the exemption is
+# granted only by the real marker: a bare `data-build-history` attribute (or one
+# with an empty value, which is how HTML formatters serialize a boolean
+# attribute) on a `<span>`. Recognizing it demands parsing the whole opening tag
+# rather than scanning the raw text for the marker's name, because a substring
+# match also fires on things that are not the marker — `title="data-build-history"`
+# carries it as an attribute *value*, `data-build-history-note` is a different
+# attribute that merely starts with it — and each of those would silently exempt
+# a stale claim. Everything else fails closed and returns the mention to the
+# sweep: an unmarked mention, a marker on a malformed or self-closing tag, a
+# marker with a value, an unclosed span, and a marker that drifts across a
+# nested `<span>` and so no longer wraps its own sentence.
+#
+# HTML attribute names are ASCII case-insensitive, so `DATA-BUILD-HISTORY` is
+# the same marker; `re.IGNORECASE` matches the language rather than relaxing the
+# rule.
+_ATTRIBUTE = r"""[^\s"'>/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'`=<>]+))?"""
+_MARKER_ATTRIBUTE = r"""data-build-history(?:\s*=\s*(?:""|''))?"""
 _HISTORICAL_BUILD_SPAN = re.compile(
-    r"<span[^>]*\bdata-build-history\b[^>]*>(?:(?!</?span\b).)*</span>",
+    rf"<span(?:\s+{_ATTRIBUTE})*\s+{_MARKER_ATTRIBUTE}(?:\s+{_ATTRIBUTE})*\s*>"
+    r"(?:(?!</?span\b).)*</span\s*>",
     re.DOTALL | re.IGNORECASE,
 )
 
