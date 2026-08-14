@@ -9,14 +9,16 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-14): source is v0.2.7, Apple build 56. Native text
+> Status (2026-08-14): source is v0.2.7, Apple build 57. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 56 restores bidirectional tvOS focus between show/season header
-> actions and their non-empty child shelves. Build 53 gives season episode
-> artwork a direct Play action while the copy remains Details on iPhone/iPad;
-> tvOS keeps one lifted card whose Select action plays. Build 52 preserves
-> completed offline asset locations across the
+> landed. Build 57 requires Select to engage tvOS progress scrubbing, leaving
+> left/right free to cross the transport row without a seek. Build 56 restores
+> bidirectional tvOS focus between show/season header actions and their non-empty
+> child shelves. Build 53 gives season episode artwork a direct Play action
+> while the copy remains Details on iPhone/iPad; tvOS keeps one lifted card
+> whose Select action plays. Build 52 preserves completed offline asset
+> locations across the
 > equivalent `/private/var` and `/var` container spellings returned by the
 > system. Build 51 divides long final audio tails into bounded HLS segments,
 > completes repeated boundaries in the final 5% at their actual media position,
@@ -37,7 +39,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 56 has not reached
+> resolved status. Repository evidence still says build 57 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.

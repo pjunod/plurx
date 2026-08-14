@@ -12,10 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `56` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `57` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 56 restores bidirectional tvOS focus between
+> same regression suite. Build 57 makes the tvOS progress bar an ordinary focus
+> stop until Select engages scrubbing, so left/right can cross the transport row
+> without seeking. Build 56 restores bidirectional tvOS focus between
 > show/season header actions and their non-empty child shelves. Build 53 splits
 > season episode cards into Play artwork and Details copy on iPhone/iPad; tvOS
 > keeps one lifted card whose Select action plays. Build 52 preserves completed
