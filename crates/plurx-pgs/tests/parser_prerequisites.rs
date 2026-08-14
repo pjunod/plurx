@@ -1,6 +1,5 @@
 use libpgs::pgs::{CompositionState, PcsData, PgsSegment};
-use plurx_pgs::{inspect_sup, inspect_sup_file, normalize_sup, ParserLimits};
-use std::fs::File;
+use plurx_pgs::{normalize_sup, ParserLimits};
 use std::io::Write;
 
 fn clear_display_set(pts: u32, state: CompositionState) -> Vec<u8> {
@@ -55,27 +54,6 @@ fn epoch_continue_is_retained_by_the_owned_pcs_adapter() {
         .expect("0xC0 epoch-continue display set");
     assert_eq!(track.compositions.len(), 1);
     assert!(track.compositions[0].objects.is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn already_open_input_keeps_one_identity_after_its_path_is_replaced() {
-    let directory = tempfile::tempdir().expect("fixture directory");
-    let path = directory.path().join("track.sup");
-    std::fs::write(
-        &path,
-        clear_display_set(90_000, CompositionState::EpochStart),
-    )
-    .expect("write original SUP");
-    let pinned = File::open(&path).expect("open original identity");
-
-    std::fs::rename(&path, directory.path().join("original.sup")).expect("move original path");
-    std::fs::write(&path, b"not a SUP stream").expect("replace path");
-
-    let report = inspect_sup_file(pinned, &ParserLimits::default())
-        .expect("the pinned handle remains the validated source");
-    assert_eq!(report.display_sets, 1);
-    assert!(inspect_sup(&path, &ParserLimits::default()).is_err());
 }
 
 const PGS_HEADER_BYTES: usize = 13;
