@@ -35,5 +35,113 @@ class MobileBuildClaimCase(unittest.TestCase):
         self.assertTrue(any("STATUS.html" in error for error in errors), errors)
 
 
+class StatusHistoricalBuildMentionCase(unittest.TestCase):
+    """docs/STATUS.html must be able to narrate past builds.
+
+    The page carries sentences like "build 52 corrected the iPad mini failure"
+    that are true when written and stay true after the next bump. Tense is
+    invisible to the claim sweep, so a historical mention opts out explicitly
+    with a `data-build-history` span. These cases pin both directions: the
+    exemption works, and it is the only thing that grants it.
+    """
+
+    APPLE_BUILD = 60
+
+    def _read(self, status_html: str):
+        def read(path: str) -> str:
+            if path == "docs/STATUS.html":
+                return status_html
+            contents = (ROOT / path).read_text(encoding="utf-8")
+            if path == "clients/apple/project.yml":
+                current = re.search(
+                    r'CURRENT_PROJECT_VERSION: "(\d+)"', contents
+                ).group(1)
+                return contents.replace(
+                    f'CURRENT_PROJECT_VERSION: "{current}"',
+                    f'CURRENT_PROJECT_VERSION: "{self.APPLE_BUILD}"',
+                )
+            return contents
+
+        return read
+
+    def _status_errors(self, status_html: str) -> tuple[str, ...]:
+        return tuple(
+            error
+            for error in validate_documented_builds(self._read(status_html))
+            if "STATUS.html" in error
+        )
+
+    def test_a_marked_historical_mention_does_not_contradict_a_current_claim(
+        self,
+    ) -> None:
+        status = (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            "<p><span data-build-history>Apple build 52</span> corrected the "
+            "reported iPad mini failure.</p>"
+        )
+
+        self.assertEqual(self._status_errors(status), ())
+
+    def test_a_stale_current_claim_still_fails(self) -> None:
+        status = f"<p>Apple build {self.APPLE_BUILD - 1} source, not yet uploaded</p>"
+
+        errors = self._status_errors(status)
+
+        self.assertTrue(errors, "a status page behind project.yml must be red")
+        self.assertIn(str(self.APPLE_BUILD - 1), errors[0])
+
+    def test_an_unmarked_historical_mention_is_still_swept(self) -> None:
+        """The exemption is opt-in; prose alone never earns it."""
+        status = (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            "<p>Apple build 52 corrected the reported iPad mini failure.</p>"
+        )
+
+        errors = self._status_errors(status)
+
+        self.assertTrue(errors, "an unmarked past build must still be checked")
+        self.assertIn("52", errors[0])
+
+    def test_a_marker_that_drifts_across_a_nested_span_fails_closed(self) -> None:
+        """A marker that no longer wraps its sentence must not silently exempt."""
+        status = (
+            f"<p>Apple build {self.APPLE_BUILD} source, not yet uploaded</p>"
+            "<p><span data-build-history><span class='t'>Apple build 52</span>"
+            " corrected the iPad mini failure.</span></p>"
+        )
+
+        errors = self._status_errors(status)
+
+        self.assertTrue(errors, "a marker spanning a nested <span> must not exempt")
+        self.assertIn("52", errors[0])
+
+    def test_the_shipped_status_page_uses_the_exemption_for_its_history(self) -> None:
+        """Guards the real page, not just synthetic fixtures.
+
+        The shipped `docs/STATUS.html` narrates the build that carried the
+        offline-location fix. Bumping the counter must leave that sentence
+        alone rather than forcing it to be reworded.
+        """
+        shipped = (ROOT / "docs/STATUS.html").read_text(encoding="utf-8")
+        marked = re.findall(
+            r"<span data-build-history>.*?</span>", shipped, re.DOTALL
+        )
+        self.assertTrue(marked, "the shipped page must mark its historical build")
+
+        # Bump every *current* claim the way a real build bump would, leaving
+        # the marked historical sentences exactly as written.
+        bumped = shipped
+        for index, span in enumerate(marked):
+            bumped = bumped.replace(span, f"@@history-{index}@@")
+        bumped = re.sub(
+            r"Apple build [1-9]\d*", f"Apple build {self.APPLE_BUILD}", bumped
+        )
+        for index, span in enumerate(marked):
+            bumped = bumped.replace(f"@@history-{index}@@", span)
+
+        self.assertIn("Apple build 52", bumped, "history survived the bump verbatim")
+        self.assertEqual(self._status_errors(bumped), ())
+
+
 if __name__ == "__main__":
     unittest.main()

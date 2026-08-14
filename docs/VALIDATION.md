@@ -336,6 +336,33 @@ and Android READMEs, the Apple parity document, and the status page. Those
 claims must match `CURRENT_PROJECT_VERSION` and `versionCode`; advancing a
 client build without its user-facing status documents is red before a PR opens.
 
+The READMEs and the parity document each carry exactly one anchored `> Status:`
+line, so the gate reads a single declared current claim from them. `STATUS.html`
+has no such anchor — it is prose, and every Apple build number in it is treated
+as a current claim. That page also has to narrate history, and a sentence like
+"build 52 corrected the reported iPad mini failure" stays true after the next
+bump while a regex cannot see its tense. Mark such a mention explicitly:
+
+```html
+<span data-build-history>Apple build 52</span> corrects the reported iPad mini failure
+```
+
+Marking is the exception, never the default. An unmarked mention is still swept,
+so a status page that falls behind a build bump is red; the only way to exempt
+one is to write the marker around it, which is a reviewable edit. A marker that
+drifts across a nested `<span>` stops matching and its mention goes back to
+being checked, so every way this can be got wrong fails closed. Use it only for
+mentions that are genuinely about a past build — rewording a true sentence to
+dodge the sweep degrades the page for its readers.
+
+Android needs no equivalent. Its build claim is read only from the anchored
+`> Status:` line in `clients/android/README.md`, and no whole-file sweep runs
+against Android numbers anywhere, so a historical Android mention cannot break
+the gate. `STATUS.html`'s Android build numbers are consequently unvalidated —
+the opposite gap, and out of scope here; adding that coverage would mean
+adopting the same marker for the historical Android mentions the page already
+carries.
+
 ## Add a functionality point — define the behavior before its command
 
 Start with the promise and the code capable of violating it. Then attach the

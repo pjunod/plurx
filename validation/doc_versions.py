@@ -16,6 +16,32 @@ def _one(contents: str, pattern: str, label: str) -> int:
     return int(matches[0])
 
 
+# A build number in docs/STATUS.html is a *current* claim by default: the sweep
+# in `validate_documented_builds` requires every mention to match project.yml,
+# so a status page that quietly falls behind a build bump is red before a PR
+# opens. But the page also has to narrate history — "build 52 corrected the
+# reported iPad mini failure" is true and stays true after the bump — and tense
+# is invisible to a regex. A historical mention therefore opts out explicitly:
+#
+#     <span data-build-history>Apple build 52</span> corrects the reported ...
+#
+# Marking is deliberately the exception, not the rule. An unmarked mention is
+# still swept, so a stale current claim cannot slip through by accident — only
+# by someone writing the marker around it, which is a reviewable edit. The
+# pattern also refuses to span a nested <span>, so a marker that drifts off its
+# sentence stops matching and the mention goes back to being checked. Every way
+# this can go wrong fails closed.
+_HISTORICAL_BUILD_SPAN = re.compile(
+    r"<span[^>]*\bdata-build-history\b[^>]*>(?:(?!</?span\b).)*</span>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _current_claims_only(contents: str) -> str:
+    """`contents` with every explicitly historical build span removed."""
+    return _HISTORICAL_BUILD_SPAN.sub(" ", contents)
+
+
 def validate_documented_builds(read: Callable[[str], str]) -> tuple[str, ...]:
     versions = read_versions(read)
     claims = {
@@ -52,7 +78,9 @@ def validate_documented_builds(read: Callable[[str], str]) -> tuple[str, ...]:
     status_claims = {
         int(value)
         for value in re.findall(
-            r"Apple build ([1-9]\d*)", read("docs/STATUS.html"), re.IGNORECASE
+            r"Apple build ([1-9]\d*)",
+            _current_claims_only(read("docs/STATUS.html")),
+            re.IGNORECASE,
         )
     }
     if not status_claims:

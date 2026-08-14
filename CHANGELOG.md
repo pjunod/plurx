@@ -10,6 +10,16 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **The mobile-build-claims gate no longer reads a historical build mention as
+  a stale current claim.** `docs/STATUS.html` is prose, so every Apple build
+  number in it is checked against `project.yml` — but the page also narrates
+  history, and a true sentence about the build that carried a fix stays true
+  after the next bump. Such a mention is now exempted explicitly with a
+  `<span data-build-history>` marker rather than by rewording the sentence
+  until it slips past the regex. Marking stays the exception: an unmarked
+  mention is still swept, and a marker that drifts across a nested `<span>`
+  stops exempting, so both failure modes fail closed.
+
 - **Audiobook resume and multipart progress now stay on one book timeline.**
   SQLite and Hiqlite clamp audiobook progress against the sum of its parts,
   natural part ordering keeps `Part 2` before `Part 10`, and author/title
