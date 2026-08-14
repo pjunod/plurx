@@ -884,6 +884,332 @@ pub async fn subtitle(
 mod tests {
     use super::*;
 
+    use http_body_util::BodyExt;
+    use plurx_core::domain::{
+        AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, OfflineCreateOutcome, ProbeResult,
+        SubtitleStream, User,
+    };
+    use plurx_core::store::{SqliteStore, Store};
+    use plurx_core::transcode::EffectiveRateControl;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        user: User,
+        file: plurx_core::domain::MediaFile,
+        library_id: i64,
+        _root: tempfile::TempDir,
+    }
+
+    async fn fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("movie.mkv");
+        std::fs::write(&source, b"offline HTTP fixture").expect("source");
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store
+            .create_user("traveller", "hash", false)
+            .await
+            .expect("user");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Offline".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![root.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Flight".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        let file_id = store
+            .upsert_file(
+                item,
+                &source.to_string_lossy(),
+                20,
+                7,
+                &ProbeResult {
+                    duration_ms: Some(90_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "aac".into(),
+                            channels: Some(2),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "aac".into(),
+                            channels: Some(2),
+                            language: Some("jpn".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    subtitle_streams: vec![
+                        SubtitleStream {
+                            index: 4,
+                            codec: "subrip".into(),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        SubtitleStream {
+                            index: 5,
+                            codec: "hdmv_pgs_subtitle".into(),
+                            language: Some("eng".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        let dirs = crate::state::Dirs {
+            artwork: root.path().join("artwork"),
+            transcode: root.path().join("transcode"),
+            cache: root.path().join("cache"),
+            subs: root.path().join("subs"),
+        };
+        for dir in [&dirs.artwork, &dirs.transcode, &dirs.cache, &dirs.subs] {
+            std::fs::create_dir_all(dir).expect("state directory");
+        }
+        let state = AppState::new(
+            "test".into(),
+            Arc::clone(&store),
+            dirs,
+            "test-node".into(),
+            Default::default(),
+            Default::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(16)),
+        );
+        let file = state
+            .store
+            .get_file(file_id)
+            .await
+            .expect("file lookup")
+            .expect("file");
+        Fixture {
+            state,
+            user,
+            file,
+            library_id: library.id,
+            _root: root,
+        }
+    }
+
+    async fn json_response(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("JSON response")
+        };
+        (status, body)
+    }
+
+    async fn result_response<T: IntoResponse>(result: Result<T, ApiError>) -> (StatusCode, Value) {
+        match result {
+            Ok(value) => json_response(value.into_response()).await,
+            Err(error) => json_response(error.into_response()).await,
+        }
+    }
+
+    async fn error_response(error: ApiError) -> (StatusCode, Value) {
+        json_response(error.into_response()).await
+    }
+
+    fn request(request_id: &str) -> CreatePackage {
+        CreatePackage {
+            request_id: request_id.into(),
+            height: 720,
+            audio_index: Some(0),
+            subtitle_index: Some(4),
+        }
+    }
+
+    async fn create_response(
+        fixture: &Fixture,
+        file_id: i64,
+        request: CreatePackage,
+    ) -> (StatusCode, Value) {
+        result_response(
+            create(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath(file_id),
+                Json(request),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn insert_unprobed(fixture: &Fixture, duration_ms: Option<i64>) -> i64 {
+        let item = fixture
+            .state
+            .store
+            .insert_item(&NewItem {
+                library_id: fixture.library_id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Unprobed".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("unprobed item");
+        fixture
+            .state
+            .store
+            .upsert_file(
+                item,
+                &format!("/missing/unprobed-{item}.mkv"),
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms,
+                    raw_json: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unprobed file")
+    }
+
+    async fn new_package(
+        fixture: &Fixture,
+        id: &str,
+        subtitle_mode: &str,
+        subtitle_index: Option<i64>,
+        file_id: i64,
+    ) -> OfflinePackage {
+        let package = NewOfflinePackage {
+            id: id.into(),
+            request_id: format!("request-{id}"),
+            user_id: fixture.user.id,
+            file_id,
+            node_id: "test-node".into(),
+            source_path: fixture.file.path.to_string_lossy().into_owned(),
+            source_size: fixture.file.size,
+            source_mtime: fixture.file.mtime,
+            effective_rate_control: EffectiveRateControl::Vbr.snapshot_value(),
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: Some(0),
+            audio_offset_ms: 0,
+            subtitle_index,
+            subtitle_language: subtitle_index.map(|_| "en".into()),
+            subtitle_mode: subtitle_mode.into(),
+            estimated_bytes: 100,
+            reserved_bytes: 120,
+            expires_at: i64::MAX,
+        };
+        let created = fixture
+            .state
+            .store
+            .create_offline_package(&package, 20, 10_000, 20_000)
+            .await
+            .expect("create package");
+        let OfflineCreateOutcome::Created(package) = created else {
+            panic!("new package was not created: {created:?}");
+        };
+        package
+    }
+
+    async fn ready_package(
+        fixture: &Fixture,
+        id: &str,
+        subtitle_mode: &str,
+        subtitle_index: Option<i64>,
+    ) -> OfflinePackage {
+        new_package(fixture, id, subtitle_mode, subtitle_index, fixture.file.id).await;
+        fixture
+            .state
+            .store
+            .claim_next_offline_package("test-node")
+            .await
+            .expect("claim")
+            .expect("package");
+        let relative = format!("ready/{id}");
+        let dir = fixture.state.cache_dir.join(&relative);
+        tokio::fs::create_dir_all(&dir).await.expect("cache dir");
+        tokio::fs::write(
+            dir.join("index.m3u8"),
+            b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:90,\nseg00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .await
+        .expect("playlist");
+        tokio::fs::write(dir.join("seg00000.ts"), b"portable-video")
+            .await
+            .expect("segment");
+        fixture
+            .state
+            .store
+            .claim_cache_entry(id, fixture.file.id, 7, "test-node", &relative)
+            .await
+            .expect("cache claim");
+        fixture
+            .state
+            .store
+            .complete_cache_entry(id, "test-node", 100)
+            .await
+            .expect("complete cache");
+        assert!(fixture
+            .state
+            .store
+            .mark_offline_package_ready(id, id, 100, 90_000)
+            .await
+            .expect("mark ready"));
+        fixture
+            .state
+            .store
+            .offline_package_for_user(id, fixture.user.id)
+            .await
+            .expect("ready lookup")
+            .expect("ready package")
+    }
+
+    async fn lease(fixture: &Fixture, package_id: &str, token: &str) -> (StatusCode, Value) {
+        result_response(
+            put_lease(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath(package_id.into()),
+                Json(PutLease {
+                    token: token.into(),
+                }),
+            )
+            .await,
+        )
+        .await
+    }
+
     #[test]
     fn lease_tokens_are_exact_lowercase_hex() {
         assert!(token_hash(&"a".repeat(64)).is_ok());
@@ -906,5 +1232,676 @@ mod tests {
         assert_eq!(offline_language_tag(Some("eng")), "en");
         assert_eq!(offline_language_tag(Some("pt-BR")), "pt-BR");
         assert_eq!(offline_language_tag(Some("en\"\n#EXT-X-KEY")), "und");
+    }
+
+    #[tokio::test]
+    async fn options_follow_the_shared_track_policy_and_refuse_unusable_sources() {
+        let fixture = fixture().await;
+        let available = options(
+            AuthUser(fixture.user.clone()),
+            State(fixture.state.clone()),
+            AxPath(fixture.file.id),
+            Query(OptionsQuery {
+                audio_lang: Some("jpn".into()),
+                subtitle_lang: Some("eng".into()),
+                subtitle_mode: Some("always".into()),
+            }),
+        )
+        .await
+        .expect("options")
+        .0;
+        assert_eq!(available.file_id, fixture.file.id);
+        assert_eq!(available.recommended_audio_index, Some(1));
+        assert_eq!(available.recommended_subtitle_index, Some(4));
+        assert_eq!(available.qualities.len(), 4);
+        assert_eq!(available.qualities[0].height, 1080);
+        assert_eq!(available.qualities[0].label, "High");
+        assert!(available.qualities[0].reserved_bytes > available.qualities[0].estimated_bytes);
+        assert_eq!(available.audio.len(), 2);
+        assert_eq!(available.subtitles[0].offline_mode, "native");
+        assert_eq!(available.subtitles[1].offline_mode, "unavailable");
+
+        fixture
+            .state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "false")
+            .await
+            .expect("disable offline");
+        let (code, body) = error_response(
+            options(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath(fixture.file.id),
+                Query(OptionsQuery {
+                    audio_lang: None,
+                    subtitle_lang: None,
+                    subtitle_mode: None,
+                }),
+            )
+            .await
+            .expect_err("disabled options"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "offline_disabled");
+        fixture
+            .state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "1")
+            .await
+            .expect("enable offline");
+
+        let unprobed = insert_unprobed(&fixture, None).await;
+        let (code, body) = error_response(
+            options(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath(unprobed),
+                Query(OptionsQuery {
+                    audio_lang: None,
+                    subtitle_lang: None,
+                    subtitle_mode: None,
+                }),
+            )
+            .await
+            .expect_err("unprobed options"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "source_unavailable");
+    }
+
+    #[tokio::test]
+    async fn create_validates_every_client_control_before_persisting_work() {
+        let fixture = fixture().await;
+        fixture
+            .state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "no")
+            .await
+            .expect("disable offline");
+        let (code, body) = create_response(
+            &fixture,
+            fixture.file.id,
+            request(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "offline_disabled");
+        fixture
+            .state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "1")
+            .await
+            .expect("enable offline");
+
+        let (code, body) = create_response(&fixture, fixture.file.id, request("not-a-uuid")).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request_id");
+
+        let (code, body) = create_response(
+            &fixture,
+            999_999,
+            request(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "file not found");
+
+        for duration in [None, Some(90_000)] {
+            let file_id = insert_unprobed(&fixture, duration).await;
+            let (code, body) = create_response(
+                &fixture,
+                file_id,
+                request(&uuid::Uuid::new_v4().to_string()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "source_unavailable");
+        }
+
+        let mut invalid_quality = request(&uuid::Uuid::new_v4().to_string());
+        invalid_quality.height = 999;
+        let (code, body) = create_response(&fixture, fixture.file.id, invalid_quality).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_quality");
+
+        let mut invalid_audio = request(&uuid::Uuid::new_v4().to_string());
+        invalid_audio.audio_index = Some(99);
+        let (code, body) = create_response(&fixture, fixture.file.id, invalid_audio).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_track");
+
+        let mut missing_subtitle = request(&uuid::Uuid::new_v4().to_string());
+        missing_subtitle.subtitle_index = Some(99);
+        let (code, body) = create_response(&fixture, fixture.file.id, missing_subtitle).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_track");
+
+        let mut bitmap_subtitle = request(&uuid::Uuid::new_v4().to_string());
+        bitmap_subtitle.subtitle_index = Some(5);
+        let (code, body) = create_response(&fixture, fixture.file.id, bitmap_subtitle).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "invalid_track");
+        assert!(body["message"].as_str().unwrap().contains("one-tap"));
+    }
+
+    #[tokio::test]
+    async fn create_reports_each_bounded_quota_without_creating_a_package() {
+        let fixture = fixture().await;
+        let cases = [
+            (
+                keys::OFFLINE_MAX_ROWS_PER_USER,
+                "0",
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota_exceeded",
+                "registry",
+            ),
+            (
+                keys::OFFLINE_MAX_GB_PER_USER,
+                "-1",
+                StatusCode::INSUFFICIENT_STORAGE,
+                "quota_exceeded",
+                "user_bytes",
+            ),
+            (
+                keys::OFFLINE_MAX_GB,
+                "0",
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_storage",
+                "global_bytes",
+            ),
+        ];
+        for (index, (key, value, expected_status, expected_code, metric)) in
+            cases.into_iter().enumerate()
+        {
+            fixture
+                .state
+                .store
+                .put_settings(&[
+                    (keys::OFFLINE_MAX_ROWS_PER_USER, "50"),
+                    (keys::OFFLINE_MAX_GB_PER_USER, "15"),
+                    (keys::OFFLINE_MAX_GB, "25"),
+                    (key, value),
+                ])
+                .await
+                .expect("quota setting");
+            let (code, body) = create_response(
+                &fixture,
+                fixture.file.id,
+                request(&uuid::Uuid::new_v4().to_string()),
+            )
+            .await;
+            assert_eq!(code, expected_status, "case {index}: {body}");
+            assert_eq!(body["code"], expected_code);
+            assert!(fixture
+                .state
+                .offline
+                .prometheus()
+                .contains(&format!("reason=\"{metric}\"}} 1")));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idempotent_create_returns_the_original_ready_state() {
+        let fixture = fixture().await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (code, first) = create_response(&fixture, fixture.file.id, request(&request_id)).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{first}");
+        assert_eq!(first["state"], "queued");
+        assert_eq!(first["progress"], Value::Null);
+        let package_id = first["id"].as_str().expect("package id");
+        fixture
+            .state
+            .store
+            .claim_next_offline_package("test-node")
+            .await
+            .expect("claim")
+            .expect("package");
+        assert!(fixture
+            .state
+            .store
+            .mark_offline_package_ready(package_id, "ready-recipe", 456, 90_000)
+            .await
+            .expect("ready"));
+
+        let (code, retry) = create_response(&fixture, fixture.file.id, request(&request_id)).await;
+        assert_eq!(code, StatusCode::OK, "{retry}");
+        assert_eq!(retry["id"], package_id);
+        assert_eq!(retry["state"], "ready");
+        assert_eq!(retry["bytes_ready"], 456);
+        assert_eq!(retry["duration_ms"], 90_000);
+
+        let package = fixture
+            .state
+            .store
+            .offline_package_for_user(package_id, fixture.user.id)
+            .await
+            .expect("package")
+            .expect("package");
+        let mut failed = package.clone();
+        failed.progress_millis = 1_500;
+        failed.error_code = Some("encoder_failed".into());
+        failed.error_message = Some("Preparation failed".into());
+        let status = status(failed);
+        assert_eq!(status.progress, Some(1.0));
+        assert_eq!(status.error.expect("typed error").code, "encoder_failed");
+    }
+
+    #[tokio::test]
+    async fn package_status_renews_only_the_owning_users_intent() {
+        let fixture = fixture().await;
+        let package = new_package(&fixture, "status", "none", None, fixture.file.id).await;
+        let status = package_status(
+            AuthUser(fixture.user.clone()),
+            State(fixture.state.clone()),
+            AxPath(package.id.clone()),
+        )
+        .await
+        .expect("owned status")
+        .0;
+        assert_eq!(status.id, package.id);
+        assert_eq!(status.state, "queued");
+
+        let stranger = fixture
+            .state
+            .store
+            .create_user("stranger", "hash", false)
+            .await
+            .expect("stranger");
+        let (code, body) = error_response(
+            package_status(
+                AuthUser(stranger),
+                State(fixture.state.clone()),
+                AxPath(package.id),
+            )
+            .await
+            .expect_err("cross-user status"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "offline package not found");
+    }
+
+    #[tokio::test]
+    async fn lease_creation_is_stable_renewable_and_refuses_rotation() {
+        let fixture = fixture().await;
+        ready_package(&fixture, "stable-lease", "none", None).await;
+        let token = "a".repeat(64);
+        let (code, first) = lease(&fixture, "stable-lease", &token).await;
+        assert_eq!(code, StatusCode::CREATED, "{first}");
+        assert_eq!(
+            first["manifest_url"],
+            format!("/api/v1/offline/media/{token}/master.m3u8")
+        );
+        assert_eq!(first["bytes"], 100);
+        assert_eq!(first["duration_ms"], 90_000);
+
+        let (code, renewed) = lease(&fixture, "stable-lease", &token).await;
+        assert_eq!(code, StatusCode::OK, "{renewed}");
+        assert_eq!(renewed["manifest_url"], first["manifest_url"]);
+        assert!(renewed["expires_at"].as_i64() >= first["expires_at"].as_i64());
+
+        let (code, conflict) = lease(&fixture, "stable-lease", &"b".repeat(64)).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["code"], "lease_conflict");
+    }
+
+    #[tokio::test]
+    async fn completed_device_download_releases_server_state_without_counting_cancellation() {
+        let fixture = fixture().await;
+        ready_package(&fixture, "completed", "none", None).await;
+        let token = "c".repeat(64);
+        assert_eq!(
+            lease(&fixture, "completed", &token).await.0,
+            StatusCode::CREATED
+        );
+        fixture.state.offline.record_transfer("completed", 10);
+
+        let code = complete_package(
+            AuthUser(fixture.user.clone()),
+            State(fixture.state.clone()),
+            AxPath("completed".into()),
+        )
+        .await
+        .expect("complete package");
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(fixture
+            .state
+            .store
+            .offline_package_for_user("completed", fixture.user.id)
+            .await
+            .expect("package lookup")
+            .is_none());
+        assert!(fixture
+            .state
+            .store
+            .offline_package_for_lease(&token_hash(&token).expect("hash"), now_unix(), i64::MAX)
+            .await
+            .expect("lease lookup")
+            .is_none());
+        assert_eq!(fixture.state.offline.transfer_bytes("completed"), None);
+        assert!(fixture
+            .state
+            .offline
+            .prometheus()
+            .contains("plurx_offline_cancellations_total 0"));
+
+        assert_eq!(
+            complete_package(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath("completed".into()),
+            )
+            .await
+            .expect("idempotent completion"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_deletes_only_owned_intent_and_records_the_terminal_result() {
+        let fixture = fixture().await;
+        let package = new_package(&fixture, "cancelled", "none", None, fixture.file.id).await;
+        fixture.state.offline.record_transfer(&package.id, 5);
+
+        assert_eq!(
+            delete_package(
+                AuthUser(fixture.user.clone()),
+                State(fixture.state.clone()),
+                AxPath(package.id.clone()),
+            )
+            .await
+            .expect("cancel package"),
+            StatusCode::NO_CONTENT
+        );
+        assert!(fixture
+            .state
+            .store
+            .offline_package_for_user(&package.id, fixture.user.id)
+            .await
+            .expect("package lookup")
+            .is_none());
+        assert_eq!(fixture.state.offline.transfer_bytes(&package.id), None);
+        let metrics = fixture.state.offline.prometheus();
+        assert!(metrics.contains("plurx_offline_cancellations_total 1"));
+        assert!(metrics.contains("plurx_offline_prepare_seconds_count{result=\"cancelled\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn leased_media_is_immutable_typed_and_scoped_to_the_selected_package() {
+        let fixture = fixture().await;
+        let package = ready_package(&fixture, "media", "native", Some(4)).await;
+        let sidecar = crate::subtitles::vtt_path_for_identity(
+            &fixture.state.subs_dir,
+            package.file_id,
+            4,
+            package.source_size,
+            package.source_mtime,
+        );
+        tokio::fs::create_dir_all(sidecar.parent().expect("sidecar parent"))
+            .await
+            .expect("sidecar parent");
+        tokio::fs::write(&sidecar, b"WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n")
+            .await
+            .expect("sidecar");
+        let token = "d".repeat(64);
+        assert_eq!(
+            lease(&fixture, &package.id, &token).await.0,
+            StatusCode::CREATED
+        );
+
+        let master = master(State(fixture.state.clone()), AxPath(token.clone()))
+            .await
+            .expect("master");
+        assert_eq!(master.status(), StatusCode::OK);
+        assert_eq!(
+            master.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(
+            master.headers()[header::CACHE_CONTROL],
+            "private, max-age=604800, immutable"
+        );
+
+        let media_playlist = playlist(State(fixture.state.clone()), AxPath(token.clone()))
+            .await
+            .expect("playlist");
+        assert_eq!(media_playlist.status(), StatusCode::OK);
+
+        let media_segment = segment(
+            State(fixture.state.clone()),
+            AxPath((token.clone(), "seg00000.ts".into())),
+        )
+        .await
+        .expect("segment");
+        assert_eq!(media_segment.headers()[header::CONTENT_TYPE], "video/mp2t");
+
+        let subtitles = subtitle(
+            State(fixture.state.clone()),
+            AxPath((token.clone(), 4, "index.m3u8".into())),
+        )
+        .await
+        .expect("subtitle playlist");
+        assert_eq!(subtitles.status(), StatusCode::OK);
+        let subtitles = subtitle(
+            State(fixture.state.clone()),
+            AxPath((token.clone(), 4, "seg00000.vtt".into())),
+        )
+        .await
+        .expect("subtitle segment");
+        assert_eq!(
+            subtitles.headers()[header::CONTENT_TYPE],
+            "text/vtt; charset=utf-8"
+        );
+
+        for path in [
+            (token.clone(), 5, "seg00000.vtt".into()),
+            (token.clone(), 4, "seg00001.vtt".into()),
+        ] {
+            let (code, _) = error_response(
+                subtitle(State(fixture.state.clone()), AxPath(path))
+                    .await
+                    .expect_err("unselected subtitle resource"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::NOT_FOUND);
+        }
+        let (code, _) = error_response(
+            segment(
+                State(fixture.state.clone()),
+                AxPath((token.clone(), "../seg00000.ts".into())),
+            )
+            .await
+            .expect_err("unsafe segment"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, _) = error_response(
+            segment(
+                State(fixture.state.clone()),
+                AxPath((token.clone(), "seg99999.ts".into())),
+            )
+            .await
+            .expect_err("missing segment"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        let dir = fixture.state.cache_dir.join("ready/media");
+        tokio::fs::write(dir.join("index.m3u8"), b"#EXTM3U\n")
+            .await
+            .expect("replace playlist");
+        let (code, body) = error_response(
+            playlist(State(fixture.state.clone()), AxPath(token))
+                .await
+                .expect_err("unfinished playlist"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal server error");
+    }
+
+    #[tokio::test]
+    async fn package_directory_refuses_wrong_nodes_missing_rows_and_unsafe_cache_paths() {
+        let fixture = fixture().await;
+        let package = ready_package(&fixture, "directory", "none", None).await;
+
+        let mut wrong_node = package.clone();
+        wrong_node.node_id = "other-node".into();
+        assert_eq!(
+            error_response(
+                package_dir(&fixture.state, &wrong_node)
+                    .await
+                    .err()
+                    .expect("wrong node"),
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+
+        let mut unpublished = package.clone();
+        unpublished.recipe_hash = None;
+        assert_eq!(
+            error_response(
+                package_dir(&fixture.state, &unpublished)
+                    .await
+                    .err()
+                    .expect("unpublished package"),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+
+        let mut missing = package.clone();
+        missing.recipe_hash = Some("missing-cache-row".into());
+        let (code, body) = error_response(
+            package_dir(&fixture.state, &missing)
+                .await
+                .err()
+                .expect("missing cache row"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::GONE);
+        assert_eq!(body["code"], "package_evicted");
+
+        fixture
+            .state
+            .store
+            .claim_cache_entry(
+                "unsafe-cache-row",
+                fixture.file.id,
+                7,
+                "test-node",
+                "../escape",
+            )
+            .await
+            .expect("unsafe cache claim");
+        fixture
+            .state
+            .store
+            .complete_cache_entry("unsafe-cache-row", "test-node", 1)
+            .await
+            .expect("unsafe cache completion");
+        let mut unsafe_path = package;
+        unsafe_path.recipe_hash = Some("unsafe-cache-row".into());
+        assert_eq!(
+            error_response(
+                package_dir(&fixture.state, &unsafe_path)
+                    .await
+                    .err()
+                    .expect("unsafe cache path"),
+            )
+            .await
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_disabled_and_unknown_leases_cannot_read_package_state() {
+        let fixture = fixture().await;
+        ready_package(&fixture, "expired", "none", None).await;
+        let token = "e".repeat(64);
+        let hash = token_hash(&token).expect("hash");
+        assert!(matches!(
+            fixture
+                .state
+                .store
+                .put_offline_lease("expired", fixture.user.id, &hash, now_unix() - 1)
+                .await
+                .expect("expired lease"),
+            OfflineLeaseOutcome::Created(_)
+        ));
+        let (code, body) = error_response(
+            authorized_package(&fixture.state, &token)
+                .await
+                .expect_err("expired capability"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "package_expired");
+
+        let (code, body) = error_response(
+            authorized_package(&fixture.state, &"f".repeat(64))
+                .await
+                .expect_err("unknown capability"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "package_expired");
+
+        fixture
+            .state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, "0")
+            .await
+            .expect("disable offline");
+        let (code, body) = error_response(
+            authorized_package(&fixture.state, &token)
+                .await
+                .expect_err("disabled media"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "offline_disabled");
+    }
+
+    #[tokio::test]
+    async fn missing_subtitle_source_is_a_typed_gone_response() {
+        let fixture = fixture().await;
+        new_package(&fixture, "missing-source", "native", Some(4), 999_999).await;
+        fixture
+            .state
+            .store
+            .claim_next_offline_package("test-node")
+            .await
+            .expect("claim")
+            .expect("package");
+        assert!(fixture
+            .state
+            .store
+            .mark_offline_package_ready("missing-source", "unused", 10, 90_000)
+            .await
+            .expect("mark ready"));
+        let token = "1".repeat(64);
+        assert_eq!(
+            lease(&fixture, "missing-source", &token).await.0,
+            StatusCode::CREATED
+        );
+
+        let (code, body) = error_response(
+            subtitle(
+                State(fixture.state.clone()),
+                AxPath((token, 4, "seg00000.vtt".into())),
+            )
+            .await
+            .expect_err("missing source"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::GONE);
+        assert_eq!(body["code"], "source_changed");
     }
 }
