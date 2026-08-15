@@ -4941,8 +4941,11 @@ function rememberAutoRung(height){
 function playerPixelHeight(video){
   if(!video) return Infinity;
   try{
-    const h=video.getBoundingClientRect().height||video.clientHeight||video.videoHeight;
-    return h>0?Math.round(h):Infinity;
+    const layoutHeight=video.getBoundingClientRect().height||video.clientHeight;
+    return PlaybackPolicy.playerPixelHeight({
+      layoutHeight,devicePixelRatio:window.devicePixelRatio,
+      intrinsicHeight:video.videoHeight
+    });
   }catch(e){ return Infinity; }
 }
 function qualityForce(){

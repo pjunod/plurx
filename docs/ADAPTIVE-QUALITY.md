@@ -169,7 +169,11 @@ it unit-tests without a video element:
   while the buffer is still draining.
 - **Up** one rung when the estimate exceeds 1.8× the *next* rung's bitrate
   for 45 s with no stall in the last 60 s — and never above the player's
-  actual pixel height (a 1080p encode into a 700-px window is waste).
+  actual backing-pixel height (the CSS layout height multiplied by the
+  browser's device-pixel ratio; a 1080p encode into a 700-pixel target is
+  waste). The cap governs starts and upgrades only: it never removes the
+  ladder floor or prevents pressure from downgrading a session already above
+  the cap.
 - **Start** at the persisted last-good rung when one exists; a fresh browser
   with no network prior omits height and preserves the server's existing
   encoder-aware Auto choice. **Seed the replacement Hls instance's
