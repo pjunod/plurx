@@ -8201,6 +8201,20 @@ async function remeasureStorage(btn){
     renderSettings();
   }catch(e){ toast(e.message); btn.disabled=false; btn.textContent=was; }
 }
+// Watch-state durability in operator language. SQLite is deliberately not
+// labelled "synced": with no peer, there is nowhere for a pause to carry over
+// to. This returns text only so adding the status does not invent a second
+// Settings card or membership surface; M3 owns those controls.
+function replicationText(r){
+  if(!r) return "status unavailable";
+  const sqlite=r.backend==="sqlite";
+  const degraded=r.health==="degraded";
+  const label=sqlite?"SQLite single-node":degraded?"Replicated DEGRADED":r.clustered?"Replicated in sync":"Replicated one node";
+  const point=r.last_applied_index==null?"":` · applied term ${r.last_applied_term??"?"}, index ${r.last_applied_index}`;
+  const lag=r.behind_by?` · ${r.behind_by} change${r.behind_by===1?'':'s'} behind`:"";
+  const converged=r.last_converged_at?` · last observed in sync ${fmtAgo(r.last_converged_at)}`:"";
+  return esc(`${label}${point}${lag} — ${r.explanation||""}${converged}`);
+}
 function playbackSummaryCard(events){
   const rows=Array.isArray(events)?events:[];
   const starts={};
@@ -8230,7 +8244,7 @@ function systemPanel(sys,playbackEvents){
         <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
         <dt>HDR tone-map</dt><dd>${toneMapHtml(sys.tone_map)}</dd>
         <dt>Storage</dt><dd>${storageHtml(sys.storage)}</dd>
-        <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
+        <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'} · Watch state: ${replicationText(sys.replication)}</dd>
       </dl></div>
     ${playbackSummaryCard(playbackEvents)}
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>

@@ -282,10 +282,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     let serving = async {
         let store = Arc::clone(&selected.store);
+        let replication = selected.replication_monitor();
         let dirs = create_dirs(&config.storage.data_dir)?;
         let (encoder_caps, system) = probe_system(&config, &store, &dirs.transcode).await?;
         let parts = Boot {
             store,
+            replication,
             identity: selected.identity.clone(),
             credential_key: Arc::clone(&selected.credential_key),
             dirs,
@@ -306,6 +308,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 /// What a measured node hands to the server it is about to become.
 struct Boot {
     store: Arc<dyn plurx_core::store::Store>,
+    replication: plurx_core::cluster::migration::status::ReplicationMonitor,
     identity: plurx_core::cluster::ClusterIdentity,
     /// Resolved before the store is handed on, so a node that cannot open its
     /// existing Trakt rows fails here rather than at the first sync.
@@ -331,6 +334,7 @@ async fn boot(
 ) -> anyhow::Result<()> {
     let Boot {
         store,
+        replication,
         identity,
         credential_key,
         dirs,
@@ -345,6 +349,7 @@ async fn boot(
         &config,
         identity.node_id,
         credential_key,
+        replication,
         store,
         dirs,
         encoder_caps,
@@ -634,6 +639,7 @@ fn build_state(
     config: &Config,
     node_id: String,
     credential_key: Arc<plurx_core::secrets::CredentialKey>,
+    replication: plurx_core::cluster::migration::status::ReplicationMonitor,
     store: Arc<dyn plurx_core::store::Store>,
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
@@ -646,6 +652,7 @@ fn build_state(
             node_id,
             scan_prune_percent: config.storage.scan_prune_percent,
             credential_key,
+            replication,
         },
         store,
         dirs,
@@ -2083,6 +2090,7 @@ mod startup_tests {
             &config,
             "test-node".to_owned(),
             Arc::new(plurx_core::secrets::CredentialKey::generate()),
+            plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
             store_in(dir),
             create_dirs(dir).expect("dirs"),
             Default::default(),
@@ -2357,6 +2365,7 @@ mod startup_tests {
             config.clone(),
             Boot {
                 store: handle.store,
+                replication: plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
                 identity: handle.identity,
                 credential_key: handle.credential_key,
                 dirs: create_dirs(tmp.path()).expect("dirs"),

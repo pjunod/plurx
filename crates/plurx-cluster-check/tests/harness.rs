@@ -225,6 +225,7 @@ async fn a_one_voter_cluster_proves_the_whole_request_protocol() {
             1,
             Request::PostLossWrite {
                 target: "follower".to_owned(),
+                position_ms: 60_000,
             },
         )
         .await
@@ -700,10 +701,17 @@ fn the_request_and_response_encoding_is_stable() {
     );
 
     let decoded: Request =
-        serde_json::from_str(r#"{"PostLossWrite":{"target":"leader"}}"#).expect("decode");
+        serde_json::from_str(r#"{"PostLossWrite":{"target":"leader","position_ms":60000}}"#)
+            .expect("decode");
     assert!(
-        matches!(decoded, Request::PostLossWrite { ref target } if target == "leader"),
-        "the post-loss target must survive the wire"
+        matches!(
+            decoded,
+            Request::PostLossWrite {
+                ref target,
+                position_ms: 60_000,
+            } if target == "leader"
+        ),
+        "the post-loss target and watch position must survive the wire"
     );
     assert!(
         serde_json::from_str::<Request>(r#""Nonsense""#).is_err(),

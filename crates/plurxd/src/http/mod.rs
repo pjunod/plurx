@@ -2374,6 +2374,35 @@ mod tests {
             body["encoders"]["quality_rc"].is_object(),
             "the fleet census must expose each family's behavioral quality-mode verdict: {body}"
         );
+        assert_eq!(body["replication"]["backend"], "sqlite");
+        assert_eq!(body["replication"]["health"], "single_node");
+        assert_eq!(body["replication"]["clustered"], false);
+        assert!(
+            body["replication"]["explanation"]
+                .as_str()
+                .is_some_and(|text| text.contains("stored only on this server")),
+            "SQLite must not be presented as synced: {body}"
+        );
+        let replication = body["replication"].as_object().expect("status object");
+        assert_eq!(
+            replication
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "backend",
+                "checked_at",
+                "clustered",
+                "explanation",
+                "health",
+                "last_applied_index",
+                "last_applied_term",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            "the status payload must not grow user, media, path, token, or membership data"
+        );
         assert_eq!(body["users"], 1);
     }
 

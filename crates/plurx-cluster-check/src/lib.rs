@@ -23,6 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
+use plurx_core::cluster::migration::status::{
+    ReplicationHealth, ReplicationMonitor, ReplicationStatus,
+};
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
     OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
@@ -584,6 +587,18 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .require_ok()?;
     }
     cluster.wait_for_voters(&[1, 2, 3]).await?;
+    for node_id in 1..=3 {
+        let status = cluster
+            .wait_for_replication_health(node_id, ReplicationHealth::InSync)
+            .await?;
+        if !status.clustered
+            || status.last_applied_term.is_none()
+            || status.last_applied_index.is_none()
+            || status.last_converged_at.is_none()
+        {
+            bail!("voter {node_id} in-sync status omitted its convergence point: {status:?}");
+        }
+    }
     prove_local_telemetry_sidecars(&mut cluster).await?;
 
     // Every voter exercises an immediate cache read after its acknowledged
@@ -614,6 +629,7 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .find(|node_id| *node_id != leader)
             .context("choose follower")?,
     };
+    let failure_name = format!("{target:?}").to_ascii_lowercase();
     cluster.kill(target_id).await?;
 
     let survivor = (1..=3)
@@ -628,13 +644,80 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         .request(
             survivor,
             Request::PostLossWrite {
-                target: format!("{target:?}").to_ascii_lowercase(),
+                target: failure_name.clone(),
+                position_ms: 60_000,
             },
         )
         .await?
         .require_ok()?;
+    let current_leader = cluster.leader().await?;
+    let first_degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    let first_lag = first_degraded
+        .behind_by
+        .filter(|lag| *lag > 0)
+        .context("first degraded status omitted its known lag")?;
+    let converged_at = first_degraded
+        .last_converged_at
+        .context("first degraded status omitted its prior convergence")?;
+
+    let repeated_degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    if repeated_degraded
+        .behind_by
+        .is_none_or(|lag| lag < first_lag)
+        || repeated_degraded.last_converged_at != Some(converged_at)
+    {
+        bail!(
+            "repeated degraded sample forgot known lag or prior convergence: first={first_degraded:?}, repeated={repeated_degraded:?}"
+        );
+    }
+
+    cluster
+        .request(
+            survivor,
+            Request::PostLossWrite {
+                target: format!("{failure_name}-later"),
+                position_ms: 90_000,
+            },
+        )
+        .await?
+        .require_ok()?;
+    let current_leader = cluster.leader().await?;
+    let advanced_degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    if advanced_degraded
+        .behind_by
+        .is_none_or(|lag| lag <= first_lag)
+        || advanced_degraded.last_converged_at != Some(converged_at)
+    {
+        bail!(
+            "degraded status did not grow its lag after another acknowledged watch write: first={first_degraded:?}, advanced={advanced_degraded:?}"
+        );
+    }
     cluster.wait_for_equal_dumps().await?;
-    let post_loss_key = format!("post_loss.{}", format!("{target:?}").to_ascii_lowercase());
+    let current_leader = cluster.leader().await?;
+    let follower = cluster
+        .node_ids()
+        .into_iter()
+        .find(|node_id| *node_id != current_leader)
+        .context("choose surviving follower for replication status")?;
+    let follower_status = cluster
+        .wait_for_replication_health(follower, ReplicationHealth::InSync)
+        .await?;
+    if !follower_status
+        .explanation
+        .contains("other nodes is visible on the leader")
+        || follower_status.explanation.contains("every reporting peer")
+    {
+        bail!(
+            "follower replication status claimed peer visibility it does not have: {follower_status:?}"
+        );
+    }
+    let post_loss_key = format!("post_loss.{failure_name}");
     let post_loss_dump = match cluster.request(survivor, Request::Dump).await? {
         Response::Dump { digest, dump } => {
             if digest != hex::encode(Sha256::digest(dump.as_bytes())) {
@@ -717,12 +800,13 @@ pub enum Request {
     RecordLocalTelemetry { marker: String },
     CountLocalTelemetry { marker: String },
     Exercise { ordinal: u64 },
-    PostLossWrite { target: String },
+    PostLossWrite { target: String, position_ms: i64 },
     VerifyProof,
     Dump,
     CatalogView,
     RebuildSearch,
     Metrics,
+    ReplicationStatus,
     Ping,
     ReadWithoutQuorum,
     WriteWithoutQuorum,
@@ -747,6 +831,9 @@ pub enum Response {
     Metrics {
         leader: Option<u64>,
         voters: Vec<u64>,
+    },
+    ReplicationStatus {
+        status: ReplicationStatus,
     },
     Error {
         message: String,
@@ -1114,6 +1201,28 @@ impl ClusterProcesses {
         }
     }
 
+    /// Wait for the exact production status projection on one voter.
+    pub async fn wait_for_replication_health(
+        &mut self,
+        node_id: u64,
+        expected: ReplicationHealth,
+    ) -> Result<ReplicationStatus> {
+        let deadline = Instant::now() + self.convergence_timeout;
+        loop {
+            if let Ok(Response::ReplicationStatus { status }) =
+                self.request(node_id, Request::ReplicationStatus).await
+            {
+                if status.health == expected {
+                    return Ok(status);
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("voter {node_id} did not report replication health {expected:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn wait_for_equal_dumps(&mut self) -> Result<()> {
         let deadline = Instant::now() + self.convergence_timeout;
         loop {
@@ -1353,6 +1462,7 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .context("voter health timed out")?;
+    let replication = ReplicationMonitor::replicated(client.clone());
 
     write_response(&Response::Ready {
         node_id: launch.node_id,
@@ -1368,7 +1478,9 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     let mut input = BufReader::new(stdin).lines();
     while let Some(line) = input.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, &client, &telemetry_path, &mut store).await,
+            Ok(request) => {
+                handle_request(request, &client, &replication, &telemetry_path, &mut store).await
+            }
             Err(error) => Err(error.into()),
         };
         match response {
@@ -1387,6 +1499,7 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
 async fn handle_request(
     request: Request,
     client: &Client,
+    replication: &ReplicationMonitor,
     telemetry_path: &Path,
     store: &mut Option<HiqliteAuthStore>,
 ) -> Result<Response> {
@@ -1438,7 +1551,10 @@ async fn handle_request(
             exercise(store_ref(store)?, ordinal).await?;
             Ok(Response::Ok)
         }
-        Request::PostLossWrite { target } => {
+        Request::PostLossWrite {
+            target,
+            position_ms,
+        } => {
             let store = store_ref(store)?;
             store
                 .put_setting(&format!("post_loss.{target}"), "acknowledged")
@@ -1450,6 +1566,24 @@ async fn handle_request(
                 != Some("acknowledged")
             {
                 bail!("post-loss acknowledged write was not readable");
+            }
+            // The lag signal must be driven by the user-visible state this
+            // feature describes, not by an unrelated synthetic Raft entry.
+            let user = store
+                .get_user_by_username("survivor-1")
+                .await?
+                .context("post-loss watch user is missing")?;
+            let movie = store
+                .search_items("Replicated Catalog Proof 1", 10)
+                .await?
+                .into_iter()
+                .find(|item| item.item.title == "Replicated Catalog Proof 1")
+                .context("post-loss watch item is missing")?;
+            let watch = store
+                .put_progress(user.id, movie.item.id, position_ms, Some(120_000))
+                .await?;
+            if watch.position_ms != position_ms {
+                bail!("post-loss watch progress was not acknowledged");
             }
             Ok(Response::Ok)
         }
@@ -1480,6 +1614,9 @@ async fn handle_request(
                 voters,
             })
         }
+        Request::ReplicationStatus => Ok(Response::ReplicationStatus {
+            status: replication.status().await,
+        }),
         Request::Ping => {
             store_ref(store)?.ping().await?;
             Ok(Response::Ok)
