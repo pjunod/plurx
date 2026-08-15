@@ -2138,9 +2138,9 @@ mod tests {
 
     #[test]
     fn native_is_not_the_same_question_as_text() {
-        fn sub(codec: &str) -> plurx_core::domain::SubtitleStream {
+        fn sub(index: i64, codec: &str) -> plurx_core::domain::SubtitleStream {
             plurx_core::domain::SubtitleStream {
-                index: 0,
+                index,
                 codec: codec.into(),
                 ..Default::default()
             }
@@ -2163,11 +2163,11 @@ mod tests {
             bitrate: Some(1_000),
             audio_streams: vec![],
             subtitle_streams: vec![
-                sub("subrip"),
-                sub("ass"),
-                sub("ssa"),
-                sub("hdmv_pgs_subtitle"),
-                sub("webvtt"),
+                sub(0, "subrip"),
+                sub(1, "ass"),
+                sub(2, "ssa"),
+                sub(3, "hdmv_pgs_subtitle"),
+                sub(4, "webvtt"),
             ],
             scanned_at: 0,
             audio_offset_ms: 0,
