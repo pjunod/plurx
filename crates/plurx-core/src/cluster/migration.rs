@@ -1614,7 +1614,7 @@ pub mod status {
         /// Raft term/index of the last entry applied to this node.
         pub last_applied_term: Option<u64>,
         pub last_applied_index: Option<u64>,
-        /// Largest known applied-index gap, whether local or on a reporting peer.
+        /// Largest observed gap, or a conservative upper bound for a missing peer.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub behind_by: Option<u64>,
         /// Unix seconds when this process last positively observed convergence.
@@ -1776,10 +1776,10 @@ pub mod status {
             }
         }
 
-        // Once every voter was positively converged, a now-unreported peer is
-        // known to be at least as far behind as the local applied-index advance.
-        // This turns the common "voter disappeared, then a write committed"
-        // case into a useful lower bound without inventing an exact peer index.
+        // Once every voter was positively converged, the local applied-index
+        // advance bounds how far behind a now-unreported peer could be. The peer
+        // may have received unseen entries before disappearing, so this is a
+        // conservative upper bound rather than a proven or exact peer index.
         let inferred_peer_lag = if unknown_peer {
             previous
                 .and_then(|status| status.last_converged_index)
@@ -1807,8 +1807,11 @@ pub mod status {
         } else {
             observation.last_applied_index
         };
-        let explanation = if !degraded && clustered {
+        let explanation = if !degraded && clustered && observation.peer_matched_indexes.is_some() {
             "Watch progress is replicated; this node has applied the latest known change and every reporting peer has received it."
+                .to_owned()
+        } else if !degraded && clustered {
+            "Watch progress is replicated; this node has applied every change sent by the leader. Replication status for the other nodes is visible on the leader."
                 .to_owned()
         } else if !degraded {
             "Replicated storage is active, but this is currently a one-node cluster; there is no second node to sync with."
@@ -1952,7 +1955,7 @@ pub mod status {
         }
 
         #[test]
-        fn a_missing_peer_after_a_committed_write_has_a_known_minimum_lag() {
+        fn a_missing_peer_after_a_committed_write_has_a_conservative_lag_bound() {
             let prior = classify_replicated(&converged(3), None, 100);
             let status = classify_replicated(
                 &ReplicationObservation {
@@ -1967,6 +1970,28 @@ pub mod status {
             assert_eq!(status.health, ReplicationHealth::Degraded);
             assert_eq!(status.behind_by, Some(3));
             assert_eq!(status.last_converged_at, Some(100));
+        }
+
+        #[test]
+        fn a_caught_up_follower_claims_only_the_visibility_it_has() {
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    peer_matched_indexes: None,
+                    ..converged(3)
+                },
+                None,
+                100,
+            );
+
+            assert_eq!(status.health, ReplicationHealth::InSync);
+            assert!(status.clustered);
+            assert!(status
+                .explanation
+                .contains("every change sent by the leader"));
+            assert!(status
+                .explanation
+                .contains("other nodes is visible on the leader"));
+            assert!(!status.explanation.contains("every reporting peer"));
         }
 
         #[test]

@@ -363,3 +363,9 @@ commits = ["72dc2699"]
 points = ["persistence.upgrades", "server.api"]
 checks = ["rust-gate"]
 reason = "The retained shipped-binary regression `m2_ignores_explicit_non_loopback_cluster_listener_hosts` proves that explicit future-M3 host settings cannot expose either one-voter M2 listener; the helper regression also preserves IPv4 and IPv6 address-family selection."
+
+[[coverage]]
+commits = ["99a29eef"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained classifier and three-voter failure regressions pin the last converged applied index as process-local state, so a missing voter's conservative worst-case lag survives a repeated status read and grows after a later acknowledged watch write; reverting only the production correction makes the second degraded sample drop the lag."

@@ -699,6 +699,24 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         );
     }
     cluster.wait_for_equal_dumps().await?;
+    let current_leader = cluster.leader().await?;
+    let follower = cluster
+        .node_ids()
+        .into_iter()
+        .find(|node_id| *node_id != current_leader)
+        .context("choose surviving follower for replication status")?;
+    let follower_status = cluster
+        .wait_for_replication_health(follower, ReplicationHealth::InSync)
+        .await?;
+    if !follower_status
+        .explanation
+        .contains("other nodes is visible on the leader")
+        || follower_status.explanation.contains("every reporting peer")
+    {
+        bail!(
+            "follower replication status claimed peer visibility it does not have: {follower_status:?}"
+        );
+    }
     let post_loss_key = format!("post_loss.{failure_name}");
     let post_loss_dump = match cluster.request(survivor, Request::Dump).await? {
         Response::Dump { digest, dump } => {
