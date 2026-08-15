@@ -333,3 +333,9 @@ commits = ["299d41bb"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained watchdog-first copy-fallback regressions prove that a terminal Stall leaves no successor, while a predecessor Done re-arms lifetime coverage before publishing its successor; reverting only the production correction restores the late failed-or-unmonitored producer race."
+
+[[coverage]]
+commits = ["3a387052"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained stop-versus-copy-fallback regression pauses an Unsupported replacement while retirement begins, requires teardown to kill the published successor, and refuses any later replacement even with stale scratch; reverting only the production correction lets a live untracked producer survive the stop."
