@@ -5221,13 +5221,24 @@ impl TranscodeManager {
 
     /// Share a producer's terminal startup verdict with every playlist reader.
     ///
-    /// `false` means the producer is still running, exited cleanly, or does
-    /// not exist because this is a cache hit. Only a known non-zero exit is a
-    /// failure, and callers invoke this only after finding no usable playlist.
-    async fn playlist_producer_failed(session: &Session, session_id: &str) -> bool {
-        let unsuccessful_exit = if session.cached {
-            None
-        } else {
+    /// `false` means the producer is still running, exited cleanly, belongs to
+    /// a retired session, or does not exist because this is a cache hit. Only
+    /// a known non-zero exit from the session still registered under this id
+    /// is a failure, and callers invoke this only after finding no usable
+    /// playlist. Holding the manager guard through the verdict closes the
+    /// remove-before-kill teardown interval without shortening live startup.
+    async fn playlist_producer_failed(&self, session: &Arc<Session>, session_id: &str) -> bool {
+        if session.cached {
+            return false;
+        }
+        let sessions = self.sessions.lock().await;
+        if !sessions
+            .get(session_id)
+            .is_some_and(|active| Arc::ptr_eq(active, session))
+        {
+            return false;
+        }
+        let unsuccessful_exit = {
             let mut child = session.child.lock().await;
             child.as_mut().and_then(|child| match child.try_wait() {
                 Ok(Some(status)) if !status.success() => Some(status),
@@ -5279,7 +5290,7 @@ impl TranscodeManager {
                     // the publication store below stays on the old fast path.
                     if !session.playlist_published.load(Relaxed) {
                         if !transcode_first_playlist_ready(&bytes) {
-                            if Self::playlist_producer_failed(&session, session_id).await {
+                            if self.playlist_producer_failed(&session, session_id).await {
                                 return None;
                             }
                             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
@@ -5335,7 +5346,7 @@ impl TranscodeManager {
             // startup grace, so it cannot surface a process that has already
             // told us startup is impossible. This request polls much sooner
             // and knows that no usable playlist was present above.
-            if Self::playlist_producer_failed(&session, session_id).await {
+            if self.playlist_producer_failed(&session, session_id).await {
                 return None;
             }
             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
@@ -7804,6 +7815,75 @@ mod tests {
             !session.failed.load(Relaxed),
             "the killed predecessor must not poison its replacement"
         );
+    }
+
+    /// Teardown removes a session from the manager before it kills the child.
+    /// A playlist request that already holds the session must not turn an exit
+    /// observed in that interval into a terminal failure or operator error.
+    #[tokio::test]
+    async fn playlist_ignores_a_producer_exit_after_the_session_is_retired() {
+        use plurx_core::store::SqliteStore;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read _; exit 1"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn gated failure");
+        let mut release_child = child.stdin.take().expect("child stdin");
+        let session = watchdog_session(dir.path(), Some(child), false);
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = Arc::new(TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+        mgr.sessions
+            .lock()
+            .await
+            .insert("retired-session".into(), Arc::clone(&session));
+
+        let mut playlist = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.playlist("retired-session").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if session.last_request.lock().await.kind == "playlist" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playlist request must acquire the live session");
+        assert!(mgr
+            .sessions
+            .lock()
+            .await
+            .remove("retired-session")
+            .is_some());
+        release_child
+            .write_all(b"exit\n")
+            .await
+            .expect("release failed child");
+        drop(release_child);
+
+        let waiting = tokio::time::timeout(Duration::from_millis(500), &mut playlist).await;
+        assert!(
+            waiting.is_err(),
+            "a retired producer exit must not become a terminal playlist verdict"
+        );
+        assert!(
+            !session.failed.load(Relaxed),
+            "routine teardown must not mark the retired session failed"
+        );
+
+        playlist.abort();
+        session.kill_child().await;
     }
 
     /// Re-evaluating an unchanged running session must be a no-op. Without the
