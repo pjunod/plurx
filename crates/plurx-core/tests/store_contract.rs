@@ -998,7 +998,9 @@ async fn network_prior_contract_runs_through_dyn_store() {
             })
             .await
             .unwrap_or_else(|error| panic!("{backend}: observe prior: {error}"));
-        assert_eq!(prior.sustained_kbps, Some(8_000), "{backend}");
+        assert_eq!(prior.sustained_kbps, None, "{backend}");
+        assert_eq!(prior.worst_rung_height, Some(1080), "{backend}");
+        assert_eq!(prior.sample_count, 0, "{backend}");
         let loaded = store
             .network_prior(71, "chrome", &key)
             .await
@@ -1139,7 +1141,7 @@ async fn user_contract_runs_through_dyn_store() {
                 .expect("delete user tokens"),
             1
         );
-        assert!(store.delete_user(admin.id).await.expect("delete user"));
+        assert!(store.delete_user(admin.id).await.expect("delete admin"));
     })
     .await;
 }

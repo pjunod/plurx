@@ -17,7 +17,7 @@ mod images;
 mod items;
 mod keys;
 mod libraries;
-mod network;
+pub(crate) mod network;
 mod offline;
 mod pgs_overlay;
 mod photos;
@@ -2696,18 +2696,36 @@ mod tests {
         let mut updated = None;
         for _ in 0..100 {
             let current = prior().await.expect("updated prior lookup");
-            if current
-                .as_ref()
-                .is_some_and(|prior| prior.sample_count == 2)
-            {
+            if current.as_ref().is_some_and(|prior| {
+                prior.sustained_kbps.is_none() && prior.worst_rung_height == Some(720)
+            }) {
                 updated = current;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let updated = updated.expect("second observation");
-        assert_eq!(updated.sustained_kbps, Some(7_000));
-        assert_eq!(updated.worst_rung_height, Some(720));
+        let starved = updated.expect("starvation observation");
+        assert_eq!(starved.sustained_kbps, None);
+        assert_eq!(starved.worst_rung_height, Some(720));
+        assert_eq!(starved.sample_count, 1);
+
+        let (status, _) = call(&app, report("ttff", 16_000, 720, None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut recovered = None;
+        for _ in 0..100 {
+            let current = prior().await.expect("recovered prior lookup");
+            if current
+                .as_ref()
+                .is_some_and(|prior| prior.sample_count == 2)
+            {
+                recovered = current;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let recovered = recovered.expect("later healthy observation");
+        assert_eq!(recovered.sustained_kbps, Some(16_000));
+        assert_eq!(recovered.worst_rung_height, Some(720));
     }
 
     #[tokio::test]
@@ -4401,8 +4419,6 @@ mod tests {
 
     #[tokio::test]
     async fn network_prior_is_opt_in_and_additive_on_decision_and_session_wires() {
-        use plurx_core::domain::NetworkPriorObservation;
-
         crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
@@ -4418,14 +4434,14 @@ mod tests {
             );
             request
         };
-        let decision_url = format!(
+        let cold_decision_url = format!(
             "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&client=apple",
             s.file
         );
 
         let (status, cold) = call(
             &app,
-            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
+            request_with_network(get(&cold_decision_url, Some(&admin)), "Apple AVPlayer"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{cold}");
@@ -4471,43 +4487,108 @@ mod tests {
             .await
             .expect("admin lookup")
             .expect("admin user");
-        state
-            .store
-            .observe_network_prior(&NetworkPriorObservation {
-                user_id: user.id,
-                client_class: "apple".to_owned(),
-                network_fingerprint: "192.0.2.0/24".to_owned(),
-                throughput_kbps: Some(20_000),
-                observed_at_ms: 1_700_000_000_000,
-                ..NetworkPriorObservation::default()
-            })
-            .await
-            .expect("seed prior");
 
-        let (status, warm) = call(
-            &app,
-            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{warm}");
-        assert_eq!(warm["prior_kbps"], 20_000, "{warm}");
-
-        let (status, session) = call(
-            &app,
-            request_with_network(
-                post(
-                    &format!("/api/v1/files/{}/hls/sessions", s.file),
-                    Some(&admin),
-                    json!({ "playback_id": "network-prior-wire", "copy": true }),
-                ),
-                "Apple AVPlayer",
+        let browsers = [
+            (
+                "Chrome",
+                "chrome",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+                20_000,
             ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{session}");
-        assert_eq!(session["prior_kbps"], 20_000, "{session}");
-        if let Some(session_id) = session["session_id"].as_str() {
-            state.transcode.stop_session(session_id, "test").await;
+            (
+                "Safari",
+                "safari",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 \
+                 Safari/605.1.15",
+                19_000,
+            ),
+            (
+                "Edge",
+                "edge",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 \
+                 Edg/140.0.3485.54",
+                18_000,
+            ),
+            (
+                "Firefox",
+                "firefox",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) \
+                 Gecko/20100101 Firefox/141.0",
+                17_000,
+            ),
+        ];
+        let browser_decision_url = format!(
+            "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0",
+            s.file
+        );
+        for (label, class, ua, throughput_kbps) in browsers {
+            let report = request_with_network(
+                post(
+                    "/api/v1/client-log",
+                    Some(&admin),
+                    json!({
+                        "event": "ttff",
+                        "message": "network-prior browser identity proof",
+                        "bandwidth": throughput_kbps,
+                        "height": 1080,
+                        "ua": label,
+                    }),
+                ),
+                ua,
+            );
+            let (status, _) = call(&app, report).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{class} report");
+
+            let mut prior = None;
+            for _ in 0..100 {
+                prior = state
+                    .store
+                    .network_prior(user.id, class, "192.0.2.0/24")
+                    .await
+                    .expect("browser prior lookup");
+                if prior.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                prior
+                    .expect("client-log must write the browser-class prior")
+                    .sustained_kbps,
+                Some(throughput_kbps)
+            );
+
+            let (status, warm) = call(
+                &app,
+                request_with_network(get(&browser_decision_url, Some(&admin)), ua),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{class} decision: {warm}");
+            assert_eq!(warm["prior_kbps"], throughput_kbps, "{class}: {warm}");
+
+            let (status, session) = call(
+                &app,
+                request_with_network(
+                    post(
+                        &format!("/api/v1/files/{}/hls/sessions", s.file),
+                        Some(&admin),
+                        json!({
+                            "playback_id": format!("network-prior-{class}"),
+                            "copy": true
+                        }),
+                    ),
+                    ua,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{class} session: {session}");
+            assert_eq!(session["prior_kbps"], throughput_kbps, "{class}: {session}");
+            if let Some(session_id) = session["session_id"].as_str() {
+                state.transcode.stop_session(session_id, "test").await;
+            }
         }
     }
 

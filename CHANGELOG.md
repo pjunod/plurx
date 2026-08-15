@@ -83,11 +83,25 @@ bump may break compatibility and a **patch** bump never does.
   logs, or responses. SQLite v19 and each Hiqlite voter's node-local sidecar
   retain the aggregate for 30 days and cap each user/client class at 64
   networks, so another voter deliberately starts cold without a replicated
-  schema or protocol bump. Decision and session-create responses add optional
+  schema or protocol bump. The bounded daily prior prune continues after
+  collection is turned off, preventing retained network rows from becoming
+  immortal when raw telemetry retention is also disabled. Decision and
+  session-create responses add optional
   `prior_kbps`, and server-side Auto keeps its old answer without a prior,
   starts below known starvation, or chooses the highest rung whose advertised
-  peak fits proven throughput. The web controller, normalized reopen contract,
-  and native client changes remain separate N4 work.
+  peak fits proven throughput. Real Chrome, Safari, Edge, and Firefox user
+  agents now resolve to the same fixed class on telemetry, decision, and
+  session-create requests instead of collapsing into Apple; a starved-rung
+  verdict also yields once the conservative EWMA proves the current rung's
+  advertised peak safe, so one transient stall is not a permanent cap. The web
+  toggle is shared through a two-second hot-path snapshot, and production
+  socket peers cannot be replaced by untrusted forwarding headers. Sidecar
+  schema creation and version stamping are now one crash-atomic transaction,
+  including recovery of the old partial-migration state. Activation remains
+  blocked on a reviewed user-generation key: numeric user ids can be reused
+  after deletion, and silently transferring an old node-local prior to a
+  replacement account is forbidden. The web controller, normalized reopen
+  contract, and native client changes remain separate N4 work.
 
 - **TV episode lists and details now name the media they will open.** Season
   detail responses attach each episode's best-file resolution and HDR facts in
@@ -127,7 +141,8 @@ bump may break compatibility and a **patch** bump never does.
   v5 is the fresh
   bootstrap/import schema; existing v4 clusters remain refused rather than
   being auto-migrated without the clustering upgrade protocol. The replicated
-  protocol remains v4, and N3's planned SQLite migration moves to v19.
+  protocol remains v4, and N3's planned SQLite migration moves to v20 because
+  N4.2's node-local priors take v19.
   `scripts/bench rate-control` now opens uncached HLS sessions on the deployed
   plurxd, captures the segments that its production Jellyfin FFmpeg actually
   served, and only after each encode ends scores those bytes offline with an

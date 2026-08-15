@@ -120,7 +120,9 @@ pub mod keys {
     pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
     pub const JOB_LAST_ARTWORK_RETRY: &str = "jobs.last_artwork_retry";
     /// Node-local playback telemetry retention, in days. Missing means
-    /// [`TELEMETRY_RETAIN_DEFAULT_DAYS`]; `0` disables both writes and pruning.
+    /// [`TELEMETRY_RETAIN_DEFAULT_DAYS`]; `0` disables raw playback-event
+    /// writes and pruning. Network-prior aggregation and its fixed retention
+    /// are governed separately by [`PLAYBACK_NETWORK_PRIORS`].
     /// This is deliberately on by default: it is bounded local bookkeeping and
     /// the measurement referee for every Performance II milestone.
     pub const TELEMETRY_RETAIN_DAYS: &str = "telemetry.retain_days";

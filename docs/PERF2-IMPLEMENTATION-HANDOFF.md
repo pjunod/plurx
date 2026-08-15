@@ -431,7 +431,7 @@ decision).
 
 **The spike is not optional.** N3.0 proves the continuation protocol on
 fixtures (every enabled encoder family) with the §6.4 packet gates as
-its exit; only then does the v19 schema, producer `kind=prefix`, or any
+its exit; only then does the v20 schema, producer `kind=prefix`, or any
 serving change land. The serving contract is the plan's, verbatim:
 server-owned served playlist, `-output_ts_offset` + `-start_number`,
 fresh source `stat` equality before publish, artifact manifest
@@ -446,10 +446,11 @@ prefixes are wanted before N5.1's container work (forbidden — plan
 
 ### N4 — sustained smoothness (plan §7; review R5)
 
-Shaping harness for playback-lab first. Then the web controller
-(consuming the served ladder; `decideRung` pure + table-tested), priors
-(server tables + `prior_kbps` in decision/session responses +
-`auto_height` consult), and the reopen contract: `previous_session_id`
+N4.2's default-off server groundwork may land independently and is judged by
+its store/API contracts. The shaping harness must land before the web
+controller and reopen behavior it judges. Then the web controller (consuming
+the served ladder; `decideRung` pure + table-tested) and the reopen contract:
+`previous_session_id`
 + typed `reopen_reason`, target persisted under `request_id` via
 `claim_request` **before** supersede; Apple queue carries the typed
 cause; Android gets its first stall watchdog + reopen. The five R5 test
@@ -457,11 +458,17 @@ cases are required, not suggested.
 
 The N4.2 server groundwork landed separately: the default-off setting, v19
 node-local table, bounded 25% throughput EWMA, lowest-starved-rung verdict,
-optional decision/session `prior_kbps`, and server-side Auto consult. Do not
-mistake that groundwork for the web controller, normalized reopen contract, or
-native way-down work named above; those remain in the focused N4 slice.
+optional decision/session `prior_kbps`, and server-side Auto consult. A
+starvation verdict binds until the conservative EWMA again covers the current
+rung's advertised peak; that explicit recovery rule prevents one transient
+stall from becoming a permanent cap. Do not mistake that groundwork for the
+web controller, normalized reopen contract, or native way-down work named
+above; those remain in the focused N4 slice.
 *Stop-and-flag if:* anything wants to change ahead-window policy or
 release thresholds (out of scope — evidence first, per plan §7.4); or
+node-local prior isolation across deleted/recreated accounts needs a durable
+user-generation field or other schema identity (the numeric id can be reused;
+do not improvise that contract or activate priors without ratification); or
 the fingerprint/idempotency extension wants to weaken the 409-on-
 mismatch contract.
 

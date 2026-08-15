@@ -570,13 +570,20 @@ pub async fn client_log(
     let network = super::network::identity(&headers, remote, ev.ua.as_deref());
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);
+    let network_prior_toggle = Arc::clone(&state.network_prior_toggle);
     tokio::spawn(async move {
         let session_id = event.session_id.clone();
         let info = match session_id.as_deref() {
             Some(session_id) => transcode.session_status(session_id).await,
             None => None,
         };
-        emit_client_playback_event(store, event, info.as_ref(), network);
+        emit_client_playback_event(
+            store,
+            event,
+            info.as_ref(),
+            network,
+            Some(network_prior_toggle),
+        );
     });
     StatusCode::NO_CONTENT
 }
@@ -602,11 +609,12 @@ fn emit_client_playback_event(
     mut event: PlaybackEvent,
     info: Option<&crate::transcode::SessionInfo>,
     network: Option<crate::telemetry::NetworkIdentity>,
+    network_prior_toggle: Option<Arc<super::network::NetworkPriorToggle>>,
 ) {
     if let Some(info) = info {
         join_session_truth(&mut event, info);
     }
-    crate::telemetry::emit_with_network(store, event, network);
+    crate::telemetry::emit_with_network(store, event, network, network_prior_toggle);
 }
 
 fn client_playback_event(ev: &ClientLog, user_id: i64) -> PlaybackEvent {
@@ -1404,6 +1412,7 @@ pub async fn update_settings(
                 if enabled { "1" } else { "0" },
             )
             .await?;
+        state.network_prior_toggle.publish(enabled);
     }
     for (key, label, value) in [
         (keys::OFFLINE_MAX_GB, "offline_max_gb", req.offline_max_gb),
@@ -2332,7 +2341,7 @@ mod tests {
             suspended: true,
             suspend_count: 1,
         };
-        emit_client_playback_event(Arc::clone(&store), event, Some(&info), None);
+        emit_client_playback_event(Arc::clone(&store), event, Some(&info), None, None);
         let row = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(row) = store

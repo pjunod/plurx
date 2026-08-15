@@ -837,8 +837,12 @@ since adds:
 
 ### 7.2 Network priors — the CS2P-lite memory
 
-**Implementation status (2026-08-14):** the server groundwork is implemented.
-`playback.network_priors` defaults off. When enabled, N0 client telemetry folds
+**Implementation status (2026-08-14):** the server groundwork is implemented,
+but activation is blocked. Numeric user ids can be reused after account
+deletion, so a reviewed generation component must join the node-local key
+before an old account's prior can safely outlive it; D9 did not select that
+identity. `playback.network_priors` defaults off and must remain off until the
+schema contract is ratified. Once enabled, N0 client telemetry folds
 the conservative minimum of its client estimate and joined server delivery
 rate into a 25% EWMA. A supply/network stall records the lowest height known to
 starve. Rows are node-local, retained for 30 days, and capped at 64 networks per
@@ -848,9 +852,11 @@ IPv4 `/24`, never a full address.
 
 `/decision` and session-create responses now return the optional derived
 `prior_kbps`. Server-side Auto preserves its previous answer exactly without a
-matching prior; with one, it starts below the lowest starved rung or selects the
-highest rung whose advertised peak fits the EWMA. The web controller does not
-consume the field yet; that remains in the N4 controller slice.
+matching prior; with one, it starts below the lowest starved rung until the
+conservative EWMA again covers the current rung's advertised peak, or selects
+the highest rung whose advertised peak fits the EWMA when no starvation verdict
+binds. The web controller does not consume the field yet; that remains in the
+N4 controller slice.
 
 The evidence for remembering networks is strong
 ([CS2P](https://users.ece.cmu.edu/~vsekar/assets/pdf/sigcomm16_cs2p.pdf):
@@ -1392,6 +1398,10 @@ settings and may be amended without changing the contracts below.
    v5 and protocol stays v4. A client routed to another voter loses its prior
    and starts cold; that is the accepted cost of keeping coarse network
    observations off Raft.
+   **Open amendment:** the key also needs an opaque user-generation component
+   because numeric ids can be reused after deletion. D9 did not select its
+   source or representation; keep the default-off setting disabled and stop
+   for owner ratification rather than transferring history across accounts.
 
 ---
 

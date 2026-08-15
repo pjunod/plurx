@@ -48,7 +48,10 @@ pub struct GlobalSchedule {
     pub transcode_cleanup_mins: i64,
     pub last_transcode_cleanup: Option<i64>,
     pub telemetry_retain_days: i64,
-    pub network_priors: bool,
+    /// The setting key exists, even when its current value is off. Once priors
+    /// have ever been enabled, their 30-day retention must keep running after
+    /// collection is disabled.
+    pub network_priors_configured: bool,
     pub last_telemetry_prune: Option<i64>,
     pub cache_produce_mins: i64,
     pub last_cache_produce: Option<i64>,
@@ -99,7 +102,7 @@ pub fn due_jobs(now: i64, libraries: &[Library], global: GlobalSchedule) -> Vec<
     ) {
         jobs.push(DueJob::CleanupTranscode);
     }
-    if (global.telemetry_retain_days > 0 || global.network_priors)
+    if (global.telemetry_retain_days > 0 || global.network_priors_configured)
         && due(now, global.last_telemetry_prune, 24 * 60)
     {
         jobs.push(DueJob::PruneTelemetry);
@@ -242,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_retention_arms_a_daily_trailing_prune() {
+    fn telemetry_and_ever_configured_priors_arm_a_daily_trailing_prune() {
         let global = GlobalSchedule {
             telemetry_retain_days: 30,
             last_telemetry_prune: None,
@@ -261,11 +264,15 @@ mod tests {
         };
         assert!(due_jobs(NOW, &[], disabled).is_empty());
 
-        let priors_only = GlobalSchedule {
-            network_priors: true,
+        let disabled_after_prior_use = GlobalSchedule {
+            network_priors_configured: true,
             ..disabled
         };
-        assert_eq!(due_jobs(NOW, &[], priors_only), [DueJob::PruneTelemetry]);
+        assert_eq!(
+            due_jobs(NOW, &[], disabled_after_prior_use),
+            [DueJob::PruneTelemetry],
+            "turning collection off must not strand retained /24 rows forever"
+        );
     }
 
     #[test]

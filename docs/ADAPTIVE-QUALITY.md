@@ -103,11 +103,21 @@ user/client class keeps at most 64 network rows.
 `/decision` and session-create responses expose only
 `prior_kbps: Option<u32>`. Without a matching prior, `auto_height` returns the
 same encoder/source-capped height it returned before this feature. With one, a
-known-starved client starts below its lowest failed rung; otherwise Auto picks
-the highest rung whose advertised peak fits the EWMA, including the existing
-cap on a proven-fast LAN. Rows stay off Raft by design, so another cluster
-voter starts cold. The future web controller still has to seed hls.js and pick
-its opening rung from this field; no client behavior changed in this slice.
+known-starved client starts below its lowest failed rung until the conservative
+EWMA again covers the current rung's advertised peak. That is the recovery
+rule: one transient stall is not a permanent cap, but ordinary healthy samples
+cannot erase it before the aggregate proves the old rung safe. Otherwise Auto
+picks the highest rung whose advertised peak fits the EWMA, including the
+existing cap on a proven-fast LAN. Rows stay off Raft by design, so another
+cluster voter starts cold. The future web controller still has to seed hls.js
+and pick its opening rung from this field; no client behavior changed in this
+slice.
+The rollout toggle is a process-wide two-second in-memory snapshot shared by
+telemetry ingestion, decision, and session creation. Requests inside a fresh
+window reuse the same value, concurrent refreshes collapse to one replicated
+read, and a generation
+prevents an older in-flight read from overwriting an admin publish. Requests
+that straddle expiry may each refresh; this is not a play-scoped guarantee.
 
 ## Phase 2 — Auto (the actual feature; controller revised per review R3)
 

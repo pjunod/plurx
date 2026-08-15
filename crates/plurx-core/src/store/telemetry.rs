@@ -59,6 +59,56 @@ CREATE INDEX network_priors_by_updated
     ON network_priors(updated_at_ms, user_id, client_class);";
 
 #[cfg(any(test, feature = "hiqlite-store"))]
+const PLAYBACK_EVENTS_SIDECAR_MIGRATION: &str = "
+CREATE TABLE IF NOT EXISTS playback_events (
+    id             INTEGER PRIMARY KEY,
+    at_unix_ms     INTEGER NOT NULL,
+    user_id        INTEGER,
+    session_id     TEXT,
+    file_id        INTEGER,
+    event          TEXT NOT NULL,
+    level          TEXT,
+    method         TEXT,
+    encoder        TEXT,
+    height         INTEGER,
+    ms             INTEGER,
+    runway_ds      INTEGER,
+    bandwidth_kbps INTEGER,
+    speed_recent   REAL,
+    ahead_seconds  INTEGER,
+    suspended      INTEGER,
+    hold_reason    TEXT,
+    delivered_bps  INTEGER,
+    readrate        REAL,
+    detail         TEXT,
+    attempt        TEXT,
+    reason         TEXT,
+    ua             TEXT,
+    extra          TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS playback_events_by_event ON playback_events(event, at_unix_ms);
+CREATE INDEX IF NOT EXISTS playback_events_by_file ON playback_events(file_id, at_unix_ms);";
+
+// Sidecar v1->v2 recovery must tolerate the precise crash state left by the
+// old two-transaction migration: the table exists but user_version is still 1.
+// Keep this idempotent spelling separate from the append-only SQLite v17/v19
+// migration strings above.
+#[cfg(any(test, feature = "hiqlite-store"))]
+const NETWORK_PRIORS_SIDECAR_MIGRATION: &str = "
+CREATE TABLE IF NOT EXISTS network_priors (
+    user_id             INTEGER NOT NULL,
+    client_class        TEXT NOT NULL,
+    network_fingerprint TEXT NOT NULL,
+    sustained_kbps      INTEGER,
+    worst_rung_height   INTEGER,
+    sample_count        INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (user_id, client_class, network_fingerprint)
+) STRICT;
+CREATE INDEX IF NOT EXISTS network_priors_by_updated
+    ON network_priors(updated_at_ms, user_id, client_class);";
+
+#[cfg(any(test, feature = "hiqlite-store"))]
 const SIDECAR_SCHEMA_VERSION: i64 = 2;
 const MAX_QUERY_ROWS: i64 = 2_000;
 const MAX_PRUNE_ROWS: i64 = 10_000;
@@ -203,9 +253,16 @@ pub(crate) fn observe_prior(
         "INSERT INTO network_priors (
              user_id, client_class, network_fingerprint, sustained_kbps,
              worst_rung_height, sample_count, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END, ?6)
+         ) VALUES (
+             ?1, ?2, ?3,
+             CASE WHEN ?5 IS NULL THEN ?4 ELSE NULL END,
+             ?5,
+             CASE WHEN ?5 IS NULL AND ?4 IS NOT NULL THEN 1 ELSE 0 END,
+             ?6
+         )
          ON CONFLICT(user_id, client_class, network_fingerprint) DO UPDATE SET
              sustained_kbps = CASE
+                 WHEN excluded.worst_rung_height IS NOT NULL THEN NULL
                  WHEN excluded.sustained_kbps IS NULL THEN network_priors.sustained_kbps
                  WHEN network_priors.sustained_kbps IS NULL THEN excluded.sustained_kbps
                  ELSE (network_priors.sustained_kbps * 3 + excluded.sustained_kbps + 2) / 4
@@ -329,13 +386,20 @@ impl NodeLocalTelemetry {
             )));
         }
         if current == 0 {
-            conn.execute_batch(&format!(
-                "BEGIN;\n{PLAYBACK_EVENTS_SCHEMA}\n{NETWORK_PRIORS_SCHEMA}\nCOMMIT;"
-            ))?;
-            conn.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute_batch(PLAYBACK_EVENTS_SIDECAR_MIGRATION)?;
+            transaction.execute_batch(NETWORK_PRIORS_SIDECAR_MIGRATION)?;
+            verify_sidecar_schema(&transaction)?;
+            transaction.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
+            transaction.commit()?;
         } else if current == 1 {
-            conn.execute_batch(&format!("BEGIN;\n{NETWORK_PRIORS_SCHEMA}\nCOMMIT;"))?;
-            conn.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute_batch(NETWORK_PRIORS_SIDECAR_MIGRATION)?;
+            verify_sidecar_schema(&transaction)?;
+            transaction.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        } else {
+            verify_sidecar_schema(&conn)?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -408,6 +472,42 @@ impl NodeLocalTelemetry {
     }
 }
 
+#[cfg(any(test, feature = "hiqlite-store"))]
+fn verify_sidecar_schema(conn: &Connection) -> Result<(), StoreError> {
+    fn objects(conn: &Connection) -> Result<Vec<(String, String, String)>, StoreError> {
+        let mut statement = conn.prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name IN (
+                 'playback_events', 'playback_events_by_event',
+                 'playback_events_by_file', 'network_priors',
+                 'network_priors_by_updated'
+             )
+             ORDER BY type, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let sql: String = row.get(2)?;
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+                .replace(" if not exists", "");
+            Ok((row.get(0)?, row.get(1)?, normalized))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(PLAYBACK_EVENTS_SCHEMA)?;
+    expected.execute_batch(NETWORK_PRIORS_SCHEMA)?;
+    if objects(conn)? != objects(&expected)? {
+        return Err(StoreError::Migration(
+            "telemetry sidecar schema does not match the expected v2 contract".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,24 +551,31 @@ mod tests {
             &observation("192.0.2.0/24", Some(8_000), Some(1080), 100),
         )
         .expect("first observation");
-        assert_eq!(first.sustained_kbps, Some(8_000));
+        assert_eq!(first.sustained_kbps, None);
         assert_eq!(first.worst_rung_height, Some(1080));
+        assert_eq!(first.sample_count, 0);
 
-        let second = observe_prior(
+        let second = observe_prior(&conn, &observation("192.0.2.0/24", Some(4_000), None, 200))
+            .expect("second observation");
+        assert_eq!(second.sustained_kbps, Some(4_000));
+        assert_eq!(second.worst_rung_height, Some(1080));
+        assert_eq!(second.sample_count, 1);
+
+        let third = observe_prior(
             &conn,
-            &observation("192.0.2.0/24", Some(4_000), Some(720), 200),
+            &observation("192.0.2.0/24", Some(8_000), Some(720), 300),
         )
-        .expect("second observation");
-        assert_eq!(second.sustained_kbps, Some(7_000));
-        assert_eq!(second.worst_rung_height, Some(720));
-        assert_eq!(second.sample_count, 2);
+        .expect("new starvation clears the recovered aggregate");
+        assert_eq!(third.sustained_kbps, None);
+        assert_eq!(third.worst_rung_height, Some(720));
+        assert_eq!(third.sample_count, 1);
 
         let stale = observe_prior(
             &conn,
             &observation("192.0.2.0/24", Some(100), Some(360), 99),
         )
         .expect("stale observation returns current row");
-        assert_eq!(stale, second, "late telemetry must not rewrite the prior");
+        assert_eq!(stale, third, "late telemetry must not rewrite the prior");
     }
 
     #[test]
@@ -538,6 +645,74 @@ mod tests {
             .err()
             .expect("future sidecar schema must be refused");
         assert!(error.to_string().contains("only knows v2"), "{error}");
+    }
+
+    #[test]
+    fn sidecar_recovers_a_v1_to_v2_schema_created_before_the_version_stamp() {
+        let directory = tempfile::tempdir().expect("sidecar directory");
+        let path = directory.path().join("telemetry.db");
+        let conn = Connection::open(&path).expect("seed sidecar");
+        conn.execute_batch(PLAYBACK_EVENTS_SCHEMA)
+            .expect("seed v1 events schema");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("seed v1 version");
+        // This is the exact state left if the old two-transaction migration
+        // created the new table and crashed before stamping user_version=2.
+        conn.execute_batch(NETWORK_PRIORS_SCHEMA)
+            .expect("seed partial v2 schema");
+        drop(conn);
+
+        let sidecar = NodeLocalTelemetry::open(&path).expect("recover partial migration");
+        drop(sidecar);
+        let reopened = Connection::open(&path).expect("reopen recovered sidecar");
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            SIDECAR_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn sidecar_recovers_a_v0_to_v1_schema_created_before_the_version_stamp() {
+        let directory = tempfile::tempdir().expect("sidecar directory");
+        let path = directory.path().join("telemetry.db");
+        let conn = Connection::open(&path).expect("seed sidecar");
+        // Base v0->v1 created this schema in one transaction and stamped the
+        // version afterward, so a crash could leave exactly this state.
+        conn.execute_batch(PLAYBACK_EVENTS_SCHEMA)
+            .expect("seed partial v1 schema");
+        drop(conn);
+
+        let sidecar = NodeLocalTelemetry::open(&path).expect("recover partial migration");
+        drop(sidecar);
+        let reopened = Connection::open(&path).expect("reopen recovered sidecar");
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            SIDECAR_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn sidecar_refuses_a_malformed_preexisting_table() {
+        let directory = tempfile::tempdir().expect("sidecar directory");
+        let path = directory.path().join("telemetry.db");
+        let conn = Connection::open(&path).expect("seed sidecar");
+        conn.execute_batch(&PLAYBACK_EVENTS_SCHEMA.replace(
+            "event          TEXT NOT NULL",
+            "event          INTEGER NOT NULL",
+        ))
+        .expect("seed malformed table");
+        drop(conn);
+        let error = NodeLocalTelemetry::open(&path)
+            .err()
+            .expect("malformed sidecar must be refused");
+        assert!(
+            error.to_string().contains("expected v2 contract"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -135,6 +135,9 @@ pub struct AppState {
     /// lifetimes, so this holds only what would otherwise be invisible; see
     /// [`crate::delivery`].
     pub direct_plays: Arc<crate::delivery::DirectPlays>,
+    /// TTL-bounded view of the replicated N4.2 rollout switch. Shared by
+    /// decision and session creation so the default-off path stays local.
+    pub network_prior_toggle: Arc<crate::http::network::NetworkPriorToggle>,
     pub started_at: Instant,
 }
 
@@ -241,6 +244,7 @@ impl AppState {
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),
             direct_plays: crate::delivery::DirectPlays::new(),
+            network_prior_toggle: Arc::new(Default::default()),
             started_at: Instant::now(),
         }
     }
@@ -1314,11 +1318,11 @@ impl JobManager {
                     keys::TELEMETRY_RETAIN_DEFAULT_DAYS,
                 )
                 .await,
-            network_priors: self
+            network_priors_configured: self
                 .store
                 .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
                 .await?
-                .is_some_and(|value| value.trim() == "1"),
+                .is_some(),
             last_telemetry_prune: self.job_stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await,
             cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
             last_cache_produce: self.job_stamp(keys::JOB_LAST_CACHE_PRODUCE).await,

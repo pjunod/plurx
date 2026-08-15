@@ -241,7 +241,7 @@ pub(crate) struct NetworkIdentity {
 /// retention setting is read inside the task so setting `0` makes this a true
 /// no-op while HTTP ingest can still return its existing 204 immediately.
 pub fn emit(store: Arc<dyn Store>, event: PlaybackEvent) {
-    emit_with_network(store, event, None);
+    emit_with_network(store, event, None, None);
 }
 
 /// Persist the N0 event and, independently when opted in, fold its bounded
@@ -252,6 +252,7 @@ pub(crate) fn emit_with_network(
     store: Arc<dyn Store>,
     event: PlaybackEvent,
     network: Option<NetworkIdentity>,
+    network_prior_toggle: Option<Arc<crate::http::network::NetworkPriorToggle>>,
 ) {
     tokio::spawn(async move {
         let telemetry_enabled = store
@@ -262,15 +263,9 @@ pub(crate) fn emit_with_network(
             .and_then(|value| value.trim().parse::<i64>().ok())
             .unwrap_or(keys::TELEMETRY_RETAIN_DEFAULT_DAYS)
             > 0;
-        let priors_enabled = if network.is_some() {
-            store
-                .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|value| value.trim() == "1")
-        } else {
-            false
+        let priors_enabled = match (network.as_ref(), network_prior_toggle) {
+            (Some(_), Some(toggle)) => toggle.enabled(store.as_ref()).await.unwrap_or(false),
+            _ => false,
         };
 
         if telemetry_enabled {
@@ -304,7 +299,7 @@ fn prior_observation(
         .delivered_bps
         .filter(|value| *value > 0)
         .map(|value| u32::try_from(value / 1_000).unwrap_or(u32::MAX));
-    let throughput_kbps = match (client_kbps, delivered_kbps) {
+    let measured_throughput_kbps = match (client_kbps, delivered_kbps) {
         (Some(client), Some(delivered)) => Some(client.min(delivered)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
@@ -321,6 +316,10 @@ fn prior_observation(
     } else {
         None
     };
+    // A starvation verdict invalidates throughput accumulated before or on
+    // that event. Recovery requires a later healthy observation; otherwise a
+    // large pre-stall estimate could erase the failure in the same update.
+    let throughput_kbps = (!starved).then_some(measured_throughput_kbps).flatten();
     (throughput_kbps.is_some() || starved_rung_height.is_some()).then(|| NetworkPriorObservation {
         user_id,
         client_class: network.client_class.clone(),
@@ -403,13 +402,21 @@ mod tests {
             ..PlaybackEvent::default()
         };
         let observation = prior_observation(&event, Some(&network)).expect("observation");
-        assert_eq!(observation.throughput_kbps, Some(5_000));
+        assert_eq!(observation.throughput_kbps, None);
         assert_eq!(observation.starved_rung_height, Some(720));
         assert_eq!(observation.observed_at_ms, 123);
+
+        let mut no_height = event.clone();
+        no_height.height = None;
+        assert!(
+            prior_observation(&no_height, Some(&network)).is_none(),
+            "a supply stall without a rung is not healthy throughput evidence"
+        );
 
         let mut decode = event;
         decode.detail = Some("decode:late_frames".to_owned());
         let observation = prior_observation(&decode, Some(&network)).expect("throughput remains");
+        assert_eq!(observation.throughput_kbps, Some(5_000));
         assert_eq!(observation.starved_rung_height, None);
 
         decode.height = None;

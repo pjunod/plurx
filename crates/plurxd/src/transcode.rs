@@ -5843,8 +5843,24 @@ fn auto_height_from_prior(
         return current;
     };
 
+    let current_peak =
+        bitrate_for_height(current) * 3 / 2 + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT;
+
+    // Starvation is stronger than an ordinary healthy sample, but not
+    // permanent. The conservative EWMA must recover far enough to cover the
+    // current rung's advertised peak before it can outvote the old failure.
+    // This uses the existing aggregate and avoids another network-identity
+    // field solely for recovery bookkeeping.
+    if prior
+        .sustained_kbps
+        .is_some_and(|sustained_kbps| sustained_kbps >= current_peak)
+    {
+        return current;
+    }
+
     // A known supply failure is stronger evidence than an EWMA collected
-    // during healthy playback. Start below the lowest rung known to starve.
+    // during ordinary playback. Start below the lowest rung known to starve
+    // until the conservative EWMA proves the current rung peak-safe again.
     if let Some(starved) = prior.worst_rung_height.filter(|height| *height > 0) {
         let below = LADDER_HEIGHTS
             .iter()
@@ -5858,8 +5874,6 @@ fn auto_height_from_prior(
     let Some(sustained_kbps) = prior.sustained_kbps else {
         return current;
     };
-    let current_peak =
-        bitrate_for_height(current) * 3 / 2 + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT;
     if sustained_kbps >= current_peak {
         return current;
     }
@@ -6629,14 +6643,14 @@ mod tests {
             (
                 1080,
                 Some(prior(Some(20_000), Some(1080))),
-                720,
-                "a starved cap starts one rung below it",
+                1080,
+                "a peak-safe conservative EWMA recovers from old starvation",
             ),
             (
                 1080,
-                Some(prior(Some(20_000), Some(720))),
+                Some(prior(Some(11_000), Some(720))),
                 480,
-                "the lowest starved rung is the binding verdict",
+                "starvation binds until the EWMA covers the current peak",
             ),
             (
                 480,

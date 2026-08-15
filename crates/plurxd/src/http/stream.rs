@@ -713,8 +713,7 @@ pub async fn decision(
     super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<DecisionResponse>, ApiError> {
     let identity = super::network::identity(&headers, remote, q.client.as_deref());
-    let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+    let network_prior = super::network::stored_prior(&state, user.id, identity.as_ref()).await?;
     let mut file = load_file(&state, id).await?;
     // Older builds stored this against the file. A fresh playback must never
     // inherit that historical value; its client starts at zero and carries

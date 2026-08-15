@@ -221,8 +221,7 @@ pub async fn create(
     }
     let source_height = source.as_ref().and_then(|f| f.height);
     let identity = super::network::identity(&headers, remote, None);
-    let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+    let network_prior = super::network::stored_prior(&state, user.id, identity.as_ref()).await?;
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately

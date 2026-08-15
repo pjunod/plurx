@@ -423,7 +423,67 @@ they live in that voter's own SQLite sidecar and never pass through Raft.
 
 | Runtime setting | Default | Meaning |
 |---|---:|---|
-| `telemetry.retain_days` | 30 | Days to keep playback rows. `0` disables row writes and pruning while preserving the existing client log lines |
+| `telemetry.retain_days` | 30 | Days to keep raw playback rows. `0` disables those row writes and their prune; if network priors are enabled, reports still update the bounded aggregate and its separate daily prune still runs |
+| `playback.network_priors` | off | Opt-in node-local memory for Auto. It stores a 25% throughput EWMA and lowest starved rung for at most 30 days and 64 IPv4 `/24` networks per user/client class. Off means observations are neither added nor consulted; existing rows may still age out during the shared daily prune, and another Hiqlite voter always starts cold |
+
+The following is the eventual activation command, not a rollout step for this
+revision. Run it only after the user-generation key named below is ratified and
+implemented; the response must then confirm the requested value:
+
+```bash
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"playback_network_priors":true}' \
+  http://nynuc:32400/api/v1/settings \
+  | jq -e '.playback_network_priors == true'
+```
+
+Disable collection and consultation with the symmetric verified request:
+
+```bash
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"playback_network_priors":false}' \
+  http://nynuc:32400/api/v1/settings \
+  | jq -e '.playback_network_priors == false'
+```
+
+The production key uses the authenticated request's socket peer. Forwarding
+headers do not override that address, because this release has no trusted-proxy
+configuration and accepting them from a direct client would let it choose an
+arbitrary bucket. A reverse-proxied deployment therefore remembers the proxy's
+coarse `/24` until an explicit trusted-proxy contract lands. The authenticated
+user id still prevents one user from reading or writing another user's prior.
+Do not enable this setting yet. Numeric user ids can be reused after account
+deletion, while a node-local prior can outlive that account. The user-generation
+component of the prior key is an unresolved schema contract; transferring an
+old prior to a replacement account is forbidden, so activation stops here until
+that key is reviewed and ratified.
+
+Telemetry ingestion, decision, and session creation share a process-wide
+two-second in-memory snapshot of the default-off switch. Requests inside a
+fresh window reuse the same answer, and concurrent refreshes collapse to one
+replicated read. An admin write
+publishes locally at once and cannot be overwritten by an older in-flight read;
+a peer write becomes visible after the bounded TTL. Requests that straddle an
+expiry may each refresh, so this is a bounded cache rather than a play-scoped
+guarantee.
+
+**Rollout and rollback.** N4.2 appends SQLite v19 and moves the node-local
+Hiqlite telemetry sidecar from schema v1 to v2. Collection stays off after the
+upgrade; do not use the activation command above until the user-generation
+blocker is closed. Deploy the server through
+`scripts/ship`, which takes the closed main-database snapshot described in
+[Rolling back a deploy](#rolling-back-a-deploy). An older binary refuses the
+newer main database and a v2 telemetry sidecar, so a rollback is never
+code-only: restore the matching pre-deploy `plurx.db` snapshot before starting
+the old binary. A Hiqlite voter must also receive its matching pre-deploy copy
+of the explicitly configured telemetry sidecar; if no copy was retained,
+remove that sidecar while the voter is stopped and let the old binary create a
+cold v1 sidecar. That deletion loses only node-local playback aggregates, not
+Raft catalogue or account state. Never point the old binary at the v2 file.
 
 The scheduler runs one bounded prune pass daily and records its clock in
 `jobs.last_telemetry_prune`. Administrators can query newest-first rows with
@@ -519,7 +579,8 @@ or `qvbr:<q>` when it is created and reuses that value after every yield or
 restart; it never reads the current global pair on resume. SQLite v18 adds the
 non-null column and backfills existing packages to `vbr`. Replicated schema v5
 has the same column while retaining protocol v4. N3's cache-artifact migration
-therefore moves to SQLite v19. Production still opens the SQLite backend; the
+therefore moves to SQLite v20 because N4.2's node-local priors take v19.
+Production still opens the SQLite backend; the
 replicated v5 definition is for fresh bootstrap/import. N1 does not invent the
 cluster rolling-migration protocol: an existing replicated v4 cluster remains
 incompatible and must not be pointed at this binary.
