@@ -36,7 +36,8 @@ use plurx_core::secrets::CredentialKey;
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, MediaStore, PlaybackTelemetryStore, UserStore, WatchStore,
+    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, TraktStore, UserStore,
+    WatchStore,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -488,11 +489,6 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              INSERT INTO watch_state
                  (user_id, item_id, position_ms, duration_ms, watched, updated_at)
                  VALUES (7, 10, 120000, 3600000, 0, 117);
-             INSERT INTO trakt_auth
-                 (user_id, access_token, refresh_token, expires_at, trakt_username,
-                  connected_at, last_sync_at, last_activities)
-                 VALUES (7, 'fixture-access', 'fixture-refresh', 999999,
-                         'fixture-user', 118, 119, '{\"movies\":1}');
              INSERT INTO watched_outbox
                  (id, payload, attempts, last_error, status, next_at, created_at,
                   updated_at, claim_until)
@@ -524,6 +520,11 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
                  VALUES (131000, 7, 30, 'fixture-local-only', 'must not replicate');",
         )
         .expect("populate SQLite import fixture");
+    // Sealed, not cleartext: this fixture stands in for a real install that has
+    // booted this build, and such an install has no cleartext bearer column
+    // left. Seeding cleartext here would make the import gate below untestable
+    // by making the happy path itself the thing that must be refused.
+    seed_sealed_trakt_fixture_row(&connection, &fixture_credential_key());
     for ordinal in 0..70 {
         connection
             .execute(
@@ -556,6 +557,69 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     }
     drop(connection);
     path
+}
+
+/// The key the import fixtures seal under.
+///
+/// Fixed bytes rather than `generate()` so a fixture built in one test can be
+/// opened in another, and so an envelope in a failure message is reproducible.
+/// It guards nothing real — the values it seals are the string `fixture-access`.
+#[cfg(feature = "hiqlite-store")]
+fn fixture_credential_key() -> CredentialKey {
+    CredentialKey::from_bytes([0x2b; 32])
+}
+
+#[cfg(feature = "hiqlite-store")]
+const FIXTURE_TRAKT_USER: i64 = 7;
+#[cfg(feature = "hiqlite-store")]
+const FIXTURE_TRAKT_ACCESS: &str = "fixture-access";
+#[cfg(feature = "hiqlite-store")]
+const FIXTURE_TRAKT_REFRESH: &str = "fixture-refresh";
+
+#[cfg(feature = "hiqlite-store")]
+fn seed_sealed_trakt_fixture_row(connection: &rusqlite::Connection, key: &CredentialKey) {
+    let access = key
+        .seal_trakt(FIXTURE_TRAKT_USER, FIXTURE_TRAKT_ACCESS)
+        .expect("seal fixture access token");
+    let refresh = key
+        .seal_trakt(FIXTURE_TRAKT_USER, FIXTURE_TRAKT_REFRESH)
+        .expect("seal fixture refresh token");
+    connection
+        .execute(
+            "INSERT INTO trakt_auth
+                 (user_id, access_token, refresh_token, expires_at, trakt_username,
+                  connected_at, last_sync_at, last_activities)
+             VALUES (?1, ?2, ?3, 999999, 'fixture-user', 118, 119, '{\"movies\":1}')
+             ON CONFLICT(user_id) DO UPDATE SET
+                 access_token = excluded.access_token,
+                 refresh_token = excluded.refresh_token",
+            rusqlite::params![
+                FIXTURE_TRAKT_USER,
+                access.as_stored(),
+                refresh.as_stored(),
+            ],
+        )
+        .expect("seed sealed Trakt fixture row");
+}
+
+/// Rewrite the fixture's Trakt row the way a pre-encryption build wrote it.
+///
+/// Raw SQL on purpose: `put_trakt_auth` now refuses an unsealed credential, so
+/// the only honest way to produce a legacy backup is to go around the boundary
+/// that did not exist when those rows were written.
+#[cfg(feature = "hiqlite-store")]
+fn make_trakt_fixture_row_cleartext(path: &std::path::Path) {
+    rusqlite::Connection::open(path)
+        .expect("open fixture to downgrade its Trakt row")
+        .execute(
+            "UPDATE trakt_auth SET access_token = ?1, refresh_token = ?2 WHERE user_id = ?3",
+            rusqlite::params![
+                FIXTURE_TRAKT_ACCESS,
+                FIXTURE_TRAKT_REFRESH,
+                FIXTURE_TRAKT_USER,
+            ],
+        )
+        .expect("write legacy cleartext Trakt row");
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -783,6 +847,104 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
             .expect("read node-local telemetry")
             .is_empty(),
         "source playback telemetry must never enter the Hiqlite sidecar"
+    );
+}
+
+/// A legacy backup whose Trakt row is still cleartext must be refused, and
+/// refused before anything at all is committed to Raft.
+///
+/// This is the one production path that does not go through a durable writer:
+/// import copies source columns straight into the target, so the write-time
+/// `persistable_credential` gate never sees them. Without the source audit a
+/// pre-encryption backup would fan a usable bearer token out to every voter,
+/// into committed log entries that deleting the row cannot reach.
+///
+/// The second half is the part that gives this teeth. Asserting only that the
+/// import errored would still pass if the refusal happened after the rows were
+/// submitted, which is the failure that matters here.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated cleartext-import target");
+
+    let source = tempfile::tempdir().expect("cleartext import fixture directory");
+    let fixture_path = populated_current_import_fixture(source.path());
+    make_trakt_fixture_row_cleartext(&fixture_path);
+    let prepared = prepare_sqlite_import(source.path()).expect("prepare cleartext import backup");
+
+    let refusal = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect_err("a cleartext Trakt row must not be importable into replicated state");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("trakt_auth") && refusal.contains("not sealed"),
+        "refusal must name the table and the reason: {refusal}"
+    );
+    assert!(
+        !refusal.contains(FIXTURE_TRAKT_ACCESS) && !refusal.contains(FIXTURE_TRAKT_REFRESH),
+        "a refusal must not quote the credential it refused"
+    );
+
+    assert!(
+        store
+            .list_trakt_auth()
+            .await
+            .expect("read replicated Trakt rows after refusal")
+            .is_empty(),
+        "the refused cleartext credential must not be in replicated state"
+    );
+    assert!(
+        store
+            .list_libraries()
+            .await
+            .expect("read replicated libraries after refusal")
+            .is_empty(),
+        "refusal must precede the first table import, not clean up after it"
+    );
+
+    // Sealing the source is the documented remedy, and it must actually work:
+    // an operator who boots this build on the SQLite install gets rows this
+    // accepts, without having to reconnect the account.
+    seed_sealed_trakt_fixture_row(
+        &rusqlite::Connection::open(&fixture_path).expect("reopen fixture to seal its Trakt row"),
+        &fixture_credential_key(),
+    );
+    let resealed = prepare_sqlite_import(source.path()).expect("prepare resealed import backup");
+    store
+        .import_sqlite_backup(
+            &resealed.backup_path,
+            &resealed.backup_sha256,
+            resealed.schema_version,
+        )
+        .await
+        .expect("a sealed source must import");
+
+    let imported = store
+        .get_trakt_auth(FIXTURE_TRAKT_USER)
+        .await
+        .expect("read imported Trakt row")
+        .expect("imported Trakt row");
+    assert!(
+        imported.access_token.is_wrapped() && imported.refresh_token.is_wrapped(),
+        "the replicated row must hold envelopes"
+    );
+    assert_eq!(
+        fixture_credential_key()
+            .open_trakt(FIXTURE_TRAKT_USER, &imported.access_token)
+            .expect("open imported access token")
+            .expose(),
+        FIXTURE_TRAKT_ACCESS,
+        "import must preserve a working credential, not just an opaque string"
     );
 }
 

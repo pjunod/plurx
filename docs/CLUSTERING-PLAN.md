@@ -145,8 +145,11 @@ the `Store`: `TraktAuth` carries `SealedSecret`, not `String`, and outside
 `plurx-core` sealing with the key is the only way to make one. Because the
 upgrade path must still be able to read a pre-encryption row, the durable write
 also refuses a value that is not an envelope, so the guarantee does not rest on
-the type alone. Only ciphertext, key id, and non-secret metadata enter raft, and
-a copied voter disk is not sufficient to use a household's Trakt account.
+the type alone. The SQLite→Hiqlite importer does not go through that write, so
+it audits its source's credential columns up front and refuses a pre-encryption
+backup rather than replicating one. Only ciphertext, key id, and non-secret
+metadata enter raft, and a copied voter disk is not sufficient to use a
+household's Trakt account.
 
 ```toml
 [cluster]
@@ -625,8 +628,12 @@ reach the `Store` (§3.2), an existing cleartext install is migrated forward on
 upgrade, and a boot that finds sealed rows it cannot open refuses to start
 rather than falling back to cleartext — whether the key file is missing, is a
 replaced key that opens none of those rows, or is readable by more than its
-owner. The importer needs no change: it copies `trakt_auth` as text, and that
-text is now ciphertext.
+owner. The importer does need a change, and has it. Copying `trakt_auth` as
+text is only safe when the source install has already been sealed, and a
+backup taken from a pre-encryption install has not: import is the one
+production path that bypasses the durable write, so it audits the backup's
+credential columns and refuses one carrying cleartext before submitting any
+row to raft.
 
 With the growth record and credential encryption both closed, no §6.6
 activation blocker remains outstanding.

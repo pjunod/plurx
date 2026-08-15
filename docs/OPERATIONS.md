@@ -94,6 +94,13 @@ the direction that matters: the older binary reads the envelope as if it were
 the token, Trakt rejects it, and the link is dropped and must be reconnected.
 It does not expose the credential, and it does not corrupt the row.
 
+**A SQLite→Hiqlite import refuses a backup taken before credential
+encryption.** The message names `trakt_auth` and how many rows are unsealed,
+and the fix is one boot: start this build on the SQLite install, which seals
+those rows in place, then take the backup again and re-run the import. Nobody
+has to reconnect the Trakt account. The refusal happens before any row is
+submitted, so a refused import leaves no partial replicated state to clean up.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.

@@ -119,6 +119,7 @@ voter disk is not enough to use a household's Trakt account.
 | Unwrapping | Only at the point of an outbound call, via `TraktAuth::reveal_access_token`. The cleartext is a `Secret`: `Debug`/`Display` redact, there is no `Serialize`, and it is zeroized on drop |
 | Upgrade | A boot with cleartext rows seals them in place and logs the row count and key id — never the credential. Columns are sealed one at a time, so a boot killed mid-migration is finished by the next one instead of double-wrapping what already made it |
 | Durable write | **Refusal.** Every backend funnels its bearer columns through one check that the value really is an envelope, so "a durable Trakt row holds ciphertext" is enforced at the write rather than assumed of each caller |
+| SQLite→Hiqlite import | **Refusal.** Import is the one production path that does not go through a durable writer — it copies source columns straight into the target — so it audits the backup's credential columns *before* submitting any row, and refuses a backup whose bearer pair is not an openable envelope. Checked up front because a half-imported database can be discarded and a committed raft entry on three voters cannot. The remedy is the upgrade path: boot this build on the SQLite install so it seals the rows, then take a fresh backup. A damaged envelope is refused with the cleartext, since replicating a credential nobody can open makes the source install's problem permanent rather than fixing it |
 | Missing key | **Refusal.** A key file that is absent while sealed rows exist stops startup with the path it wants. Minting a replacement would lock the household out of Trakt with no error to search for; reading the rows as cleartext would undo the encryption. There is no third path — `open_trakt` returns an error for an unwrapped value, it never returns the value |
 | Wrong key | **Refusal.** Startup compares the key ids the sealed rows name against the key it loaded, and stops naming both when they disagree — a database restored beside a replaced key file does not boot. A key that opens nothing is the missing-key failure in a disguise: it would reach `listening`, fail every Trakt call as "not linked", and leave no error to search for. Key ids are one-way functions of their keys, so the message names which key is wanted without narrowing a search for it. A row too damaged to name any key id is one bad row, not a verdict on the key file, so it fails at use instead of stopping the server |
 | Key file mode | **Refusal.** A key file that is group- or world-readable is rejected on every load with `chmod 600` as the fix — including a key restored from a backup, copied to a second voter, or written by hand, which are exactly the ones that arrive mode `0644`. A key anyone on the box can read is not the node-local key this table promises |
@@ -130,9 +131,12 @@ Kept honest by `plurx-core cluster::tests` —
 `a_wrong_but_present_key_refuses_to_start_instead_of_opening_nothing`, and
 `a_group_or_world_readable_key_file_refuses_to_start` — by the `secrets` unit
 tests covering tamper, wrong key, cross-user reuse, and key-file permissions, by
-`a_store_call_cannot_persist_an_unsealed_credential`, and by the shared
+`a_store_call_cannot_persist_an_unsealed_credential`, by the shared
 `store_contract` assertion that neither backend's durable row holds a cleartext
-bearer credential.
+bearer credential, and by `store_contract`'s
+`a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft`, which imports a
+legacy backup through three real voters and asserts both that it is refused and
+that no table was committed before the refusal.
 
 Two limits stated plainly. The key sits beside the database, so this protects a
 copied voter disk, a snapshot, and a backup — not an attacker who already has
