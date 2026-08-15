@@ -7,6 +7,7 @@
 
 mod auth;
 mod browse;
+mod cluster;
 pub mod comingsoon;
 pub use comingsoon::ComingSoonCache;
 mod dto;
@@ -90,6 +91,13 @@ pub fn router(state: AppState) -> Router {
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
         .route("/system/playback-events", get(system::playback_events))
+        // Membership control is admin-only. The two join routes below are the
+        // exception: their single-use token is its own narrow credential.
+        .route("/cluster/join-tokens", post(cluster::issue_join_token))
+        .route("/cluster/nodes", get(cluster::nodes))
+        .route("/cluster/nodes/{node_id}", delete(cluster::remove_node))
+        .route("/cluster/join/redeem", post(cluster::redeem_join))
+        .route("/cluster/join/finalize", post(cluster::finalize_join))
         // What the libraries hold, in transcoder terms — the census PERF-PLAN
         // §5 needs to say whether the GPU tone-map reaches a real library.
         .route("/system/library-shape", get(system::library_shape))
@@ -2404,6 +2412,30 @@ mod tests {
             "the status payload must not grow user, media, path, token, or membership data"
         );
         assert_eq!(body["users"], 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_membership_controls_are_admin_only_and_sqlite_is_explicit() {
+        let app = test_app();
+        let (status, _) = call(&app, get("/api/v1/cluster/nodes", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        let (status, body) = call(&app, get("/api/v1/cluster/nodes", Some(&admin))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "membership_unavailable");
+
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/cluster/join-tokens",
+                Some(&admin),
+                json!({ "expires_in_seconds": 600 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "membership_unavailable");
     }
 
     /// The storage numbers have to reach `/system`, and an unmeasured server
