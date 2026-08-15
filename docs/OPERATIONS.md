@@ -36,6 +36,19 @@ paths you type in the UI are **container-side** paths under Docker (e.g.
 
 ### Rolling back a deploy
 
+The SQLite snapshot procedure below applies to a node that has not activated
+Hiqlite, including the one SQLite recovery boot after an interrupted import.
+When activation fails before atomic rename, run `plurxd run`: it removes the
+partial incoming target, leaves `plurx.db` unchanged, and reports the same
+command in its error. Once `<PLURX_DATA>/hiqlite/activation.json` exists, the
+replicated target is authoritative; do not replace `plurx.db` and assume you
+have restored current state.
+
+M6 owns the quorum-aware replicated backup, restore, and older-binary rollback
+runbook. Until that work lands, a post-activation rollback means roll forward
+with an M2-capable binary against the retained active target. The commands
+below are only for the pre-activation SQLite case.
+
 Every Ansible redeploy stops the Plurx Compose stack long enough to copy the
 closed SQLite database. The three newest copies stay on each node under
 `<PLURX_DATA>/backups/`, named
@@ -586,9 +599,10 @@ or `qvbr:<q>` when it is created and reuses that value after every yield or
 restart; it never reads the current global pair on resume. SQLite v18 adds the
 non-null column and backfills existing packages to `vbr`. Replicated schema v5
 has the same column while retaining protocol v4. N3's cache-artifact migration
-therefore moves to SQLite v19. Production still opens the SQLite backend; the
-replicated v5 definition is for fresh bootstrap/import. N1 does not invent the
-cluster rolling-migration protocol: an existing replicated v4 cluster remains
+therefore moves to SQLite v19. Production opens the activated one-voter
+Hiqlite backend after fresh bootstrap/import; retained SQLite is only the
+pre-membership rollback source. N1 does not invent the cluster
+rolling-migration protocol: an existing replicated v4 cluster remains
 incompatible and must not be pointed at this binary.
 
 The effective value is server policy, not a client request option. The first

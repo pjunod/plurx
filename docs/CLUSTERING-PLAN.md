@@ -569,9 +569,9 @@ content hashes and full parity behavior; kill each import step and prove the
 next boot either resumes from the completed atomic target or deletes incoming
 state and starts SQLite unchanged.
 
-**Source preparation and row import delivered 2026-08-09; activation remains
-open.** `prepare_sqlite_import` refuses a future schema before mutation,
-removes an abandoned incoming directory, and publishes a fsynced,
+**M2 delivered 2026-08-14.** `prepare_sqlite_import` refuses a future schema
+before mutation, removes an abandoned incoming directory, and publishes a
+fsynced,
 content-addressed SQLite online backup with committed WAL pages included. The
 backup uses canonical delete journaling, so later verification never creates
 an untracked WAL sidecar beside immutable source material.
@@ -611,32 +611,38 @@ telemetry exclusion, and runtime multi-column keyset progress. Unit tests pin
 the keyset SQL shape and prove async-executor responsiveness while SQLite is
 blocked.
 
-This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
-and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
-fsynced completion marker, atomic activation, failure injection at each step,
-and fallback to unchanged SQLite. The post-coalescer blocker is closed by the
-2026-08-14 `make cluster-growth` record: 4,441,360 compacted bytes for 10,000
-incoming beats at five-second logical cadence (444.136 bytes/beat), 5,040
-physical commits for 80 streams, and a raw 10,000-write control that violates
-both the commit and byte budgets. Bounded target parity and blocking-worker
-source reads are now in place; the next boundary is the activation coordinator,
-not another importer expansion.
+`plurxd run` now completes steps 2, 5, 8, and 9 before probes, background
+producers, or HTTP bind. It creates a fresh one-voter target under
+`hiqlite.incoming`, imports and verifies it, writes a fsynced marker carrying
+the source checksum, schema, cluster id, row count, and table hashes, then
+renames it to `hiqlite` and fsyncs the data directory. The source database and
+content-addressed backup remain unchanged.
+
+Four process-exit failpoints cover quiescence, incoming startup, marker
+publication, and rename. Before rename, the next boot removes partial incoming
+state and consumes one SQLite recovery boot; after rename, the completed marker
+makes the replicated target authoritative. `reset-password` and
+`refresh-metadata` never import: they refuse an unmigrated directory and use an
+authenticated client to the running voter after activation.
 
 **Trakt credential encryption is no longer a blocker (2026-08-14).** Both
 bearer columns are envelope-encrypted under a node-local key file before they
-reach the `Store` (§3.2), an existing cleartext install is migrated forward on
-upgrade, and a boot that finds sealed rows it cannot open refuses to start
-rather than falling back to cleartext — whether the key file is missing, is a
-replaced key that opens none of those rows, or is readable by more than its
-owner. The importer does need a change, and has it. Copying `trakt_auth` as
-text is only safe when the source install has already been sealed, and a
-backup taken from a pre-encryption install has not: import is the one
-production path that bypasses the durable write, so it audits the backup's
-credential columns and refuses one carrying cleartext before submitting any
-row to raft.
+reach the `Store` (§3.2), and a direct upgrade seals a legacy cleartext row
+while startup is still quiescent and before publishing the immutable import
+backup. The importer independently audits that backup and refuses cleartext
+before submitting any application row to Raft. A boot whose key is missing,
+replaced, or too broadly readable refuses instead of falling back to cleartext.
 
-With the growth record and credential encryption both closed, no §6.6
-activation blocker remains outstanding.
+The post-coalescer blocker is also closed by the 2026-08-14
+`make cluster-growth` record: 4,441,360 compacted bytes for 10,000 incoming
+beats at five-second logical cadence (444.136 bytes/beat), 5,040 physical
+commits for 80 streams, and a raw 10,000-write control that violates both the
+commit and byte budgets. No §6.6 activation blocker remains outstanding.
+
+Before M3 introduces peers, the one-voter Raft listener is loopback-only; no
+replication traffic exists to expose. The authenticated API retains automatic
+TLS and may use its configured bind so maintenance commands can reach the
+running voter without opening a second store process.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -731,17 +737,16 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M2 can verify rows, not activate them
+## 8. Handoff checkpoint — M2 activates one voter; M3 owns membership
 
-M0 through M1d and M2's source-backup plus row-import slices are on `main`;
-the importer can now prove the 17 shared durable tables without unbounded
-leader responses or blocking the async executor. It still does not select the
-target in `plurxd`. Keep SQLite as the daemon's selected store until
-incoming-cluster orchestration, credential encryption, node removal, and the
-remaining activation gates are ready. Post-coalescer compacted growth is now
-recorded and gated; the next implementation boundary is the fsynced completion
-marker plus failure-injected one-voter activation. That coordinator must delete
-partial incoming state and keep SQLite active on every failure.
+M0 through M2 provide the complete one-voter path: exact import parity, a
+durable activation marker, atomic target selection, failure-injected SQLite
+recovery, and replicated daemon startup. The post-coalescer compacted-growth
+record is closed; credential encryption is M2's remaining production-selection
+merge gate. Node removal is not a one-voter activation gate: it belongs to M3,
+where a survivor exists and offline work can otherwise be stranded or re-homed
+incorrectly. The next implementation boundary is membership, health, and
+singleton fencing in §6.7.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline

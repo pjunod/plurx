@@ -12,6 +12,8 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(feature = "hiqlite-store")]
 use std::net::TcpListener;
+#[cfg(all(feature = "hiqlite-store", unix))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 #[cfg(feature = "hiqlite-store")]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -25,7 +27,12 @@ use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::{Client, Node, NodeConfig};
 #[cfg(feature = "hiqlite-store")]
-use plurx_core::cluster::migration::prepare_sqlite_import;
+use plurx_core::cluster::migration::{
+    connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
+    SelectedBackend, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
+};
+#[cfg(feature = "hiqlite-store")]
+use plurx_core::config::Config;
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
     NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
@@ -942,6 +949,335 @@ async fn a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft() {
         FIXTURE_TRAKT_ACCESS,
         "import must preserve a working credential, not just an opaque string"
     );
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn one_voter_config(data_dir: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.storage.data_dir = data_dir.to_owned();
+    config.cluster.raft_bind = format!("0.0.0.0:{}", contract_free_port())
+        .parse()
+        .expect("raft bind");
+    config.cluster.api_bind = format!("0.0.0.0:{}", contract_free_port())
+        .parse()
+        .expect("api bind");
+    config.cluster.advertise_host = "127.0.0.1".to_owned();
+    config
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ActivationNodeLaunch {
+    data_dir: PathBuf,
+    raft_bind: String,
+    api_bind: String,
+    source_version: i64,
+    first_boot: bool,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationNodeLaunch {
+    fn config(&self) -> Config {
+        let mut config = Config::default();
+        config.storage.data_dir = self.data_dir.clone();
+        config.cluster.raft_bind = self.raft_bind.parse().expect("raft bind");
+        config.cluster.api_bind = self.api_bind.parse().expect("api bind");
+        config.cluster.advertise_host = "127.0.0.1".to_owned();
+        config
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+struct ActivationNodeProcess {
+    child: Child,
+    input: ChildStdin,
+    _output: ChildStdout,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationNodeProcess {
+    fn start(launch: &ActivationNodeLaunch) -> Self {
+        let executable = std::env::current_exe().expect("activation test executable");
+        let mut child = Command::new(executable)
+            .arg("hiqlite_activation_node_process")
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(
+                "PLURX_ACTIVATION_NODE_LAUNCH",
+                serde_json::to_string(launch).expect("serialize activation launch"),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn activation voter");
+        let input = child.stdin.take().expect("activation voter stdin");
+        let output = child.stdout.take().expect("activation voter stdout");
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader
+                .read_line(&mut line)
+                .expect("read activation voter startup");
+            assert!(bytes > 0, "activation voter exited before ready");
+            if line.trim() == "PLURX_ACTIVATION_NODE_READY" {
+                break;
+            }
+        }
+        Self {
+            child,
+            input,
+            _output: reader.into_inner(),
+        }
+    }
+
+    fn stop(self) {
+        drop(self.input);
+        let status = self
+            .child
+            .wait_with_output()
+            .expect("wait activation voter");
+        assert!(
+            status.status.success(),
+            "activation voter failed: {status:?}"
+        );
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn run_injected_activation(launch: &ActivationNodeLaunch, failpoint: &str) {
+    let executable = std::env::current_exe().expect("activation test executable");
+    let output = Command::new(executable)
+        .arg("hiqlite_activation_node_process")
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(
+            "PLURX_ACTIVATION_NODE_LAUNCH",
+            serde_json::to_string(launch).expect("serialize activation launch"),
+        )
+        .env("PLURX_CLUSTER_ACTIVATION_FAILPOINT", failpoint)
+        .output()
+        .expect("run injected activation voter");
+    assert_eq!(output.status.code(), Some(86), "injected process status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rollback command: plurxd run"),
+        "injected failure must name rollback command: {stderr}"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn assert_one_voter_activation(data_dir: &std::path::Path, source_version: i64) {
+    let config = one_voter_config(data_dir);
+    let launch = ActivationNodeLaunch {
+        data_dir: data_dir.to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version,
+        first_boot: true,
+    };
+    let first = ActivationNodeProcess::start(&launch);
+
+    let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    let marker: ActivationMarker = serde_json::from_slice(
+        &std::fs::read(active.join(ACTIVATION_MARKER_FILENAME)).expect("activation marker"),
+    )
+    .expect("decode activation marker");
+    assert_eq!(marker.cluster_id, CONTRACT_INSTANCE_ID);
+    assert_eq!(marker.source_schema_version, source_version);
+    assert!(!marker.table_hashes.is_empty());
+    assert!(data_dir.join("plurx.db").exists(), "legacy source retained");
+    #[cfg(unix)]
+    for private in [
+        data_dir.join("secret_raft"),
+        data_dir.join("secret_api"),
+        active.join(ACTIVATION_MARKER_FILENAME),
+    ] {
+        let mode = std::fs::metadata(&private)
+            .unwrap_or_else(|error| panic!("metadata for {}: {error}", private.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "{} must be owner-only", private.display());
+    }
+    assert!(
+        std::fs::read_dir(data_dir.join("migration"))
+            .expect("migration backups")
+            .any(|entry| entry
+                .expect("migration entry")
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "db")),
+        "immutable SQLite backup retained"
+    );
+
+    let second = connect_activated_store(&config)
+        .await
+        .expect("second replicated reader");
+    assert_eq!(
+        second
+            .watch_state(7, 10)
+            .await
+            .expect("read watch state through second client")
+            .expect("replicated watch state")
+            .position_ms,
+        321_000
+    );
+    drop(second);
+    first.stop();
+
+    let reopened = ActivationNodeProcess::start(&ActivationNodeLaunch {
+        first_boot: false,
+        ..launch
+    });
+    let second = connect_activated_store(&config)
+        .await
+        .expect("second reader after subsequent run");
+    assert_eq!(
+        second
+            .watch_state(7, 10)
+            .await
+            .expect("read reopened watch state")
+            .expect("reopened watch state")
+            .position_ms,
+        321_000
+    );
+    drop(second);
+    reopened.stop();
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn populated_v14_and_current_sources_activate_once_and_reopen_replicated() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let v14 = tempfile::tempdir().expect("v14 activation fixture");
+    populated_v14_import_fixture(v14.path());
+    assert_one_voter_activation(v14.path(), 14).await;
+
+    let current = tempfile::tempdir().expect("current activation fixture");
+    populated_current_import_fixture(current.path());
+    assert_one_voter_activation(current.path(), plurx_core::store::SQLITE_SCHEMA_VERSION).await;
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_activation_boundaries_recover_sqlite_or_completed_target() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    for failpoint in ["after-quiescence", "after-incoming", "after-marker"] {
+        let fixture = tempfile::tempdir().expect("interrupted activation fixture");
+        populated_current_import_fixture(fixture.path());
+        let config = one_voter_config(fixture.path());
+        let launch = ActivationNodeLaunch {
+            data_dir: fixture.path().to_owned(),
+            raft_bind: config.cluster.raft_bind.to_string(),
+            api_bind: config.cluster.api_bind.to_string(),
+            source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+            first_boot: true,
+        };
+        run_injected_activation(&launch, failpoint);
+
+        let recovered = select_daemon_store(&config)
+            .await
+            .unwrap_or_else(|error| panic!("recover {failpoint}: {error}"));
+        assert_eq!(recovered.backend, SelectedBackend::SqliteRecovery);
+        assert_eq!(
+            recovered
+                .store
+                .watch_state(7, 10)
+                .await
+                .expect("read unchanged SQLite watch state")
+                .expect("SQLite watch state")
+                .position_ms,
+            120_000
+        );
+        assert!(!fixture.path().join("hiqlite.incoming").exists());
+        assert!(!fixture.path().join("hiqlite").exists());
+    }
+
+    let fixture = tempfile::tempdir().expect("post-rename activation fixture");
+    populated_current_import_fixture(fixture.path());
+    let config = one_voter_config(fixture.path());
+    let launch = ActivationNodeLaunch {
+        data_dir: fixture.path().to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+        first_boot: true,
+    };
+    run_injected_activation(&launch, "after-rename");
+    assert!(fixture.path().join(HIQLITE_ACTIVE_DIRNAME).is_dir());
+    assert!(!fixture.path().join("hiqlite.incoming").exists());
+
+    let resumed = ActivationNodeProcess::start(&launch);
+    let second = connect_activated_store(&config)
+        .await
+        .expect("read completed target after rename crash");
+    assert_eq!(second.count_users().await.expect("user count"), 1);
+    drop(second);
+    resumed.stop();
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawned by the one-voter activation contract"]
+async fn hiqlite_activation_node_process() {
+    install_contract_crypto_provider();
+    let launch: ActivationNodeLaunch = serde_json::from_str(
+        &std::env::var("PLURX_ACTIVATION_NODE_LAUNCH").expect("activation launch"),
+    )
+    .expect("decode activation launch");
+    let selected = select_daemon_store(&launch.config())
+        .await
+        .expect("select one-voter store");
+    assert_eq!(selected.backend, SelectedBackend::Replicated);
+    assert_eq!(selected.identity.cluster_id, CONTRACT_INSTANCE_ID);
+    assert_eq!(selected.store.count_users().await.expect("user count"), 1);
+    if launch.first_boot {
+        selected
+            .store
+            .put_progress(7, 10, 321_000, Some(3_600_000))
+            .await
+            .expect("write watch progress through primary client");
+    } else {
+        assert_eq!(
+            selected
+                .store
+                .watch_state(7, 10)
+                .await
+                .expect("read reopened watch state")
+                .expect("reopened watch state")
+                .position_ms,
+            321_000
+        );
+    }
+    let marker: ActivationMarker = serde_json::from_slice(
+        &std::fs::read(
+            launch
+                .data_dir
+                .join(HIQLITE_ACTIVE_DIRNAME)
+                .join(ACTIVATION_MARKER_FILENAME),
+        )
+        .expect("activation marker"),
+    )
+    .expect("decode marker");
+    assert_eq!(marker.source_schema_version, launch.source_version);
+    println!("PLURX_ACTIVATION_NODE_READY");
+    std::io::stdout()
+        .flush()
+        .expect("flush activation readiness");
+    let mut sink = Vec::new();
+    tokio::io::stdin()
+        .read_to_end(&mut sink)
+        .await
+        .expect("wait for activation parent");
+    selected.shutdown().await.expect("stop activation voter");
 }
 
 #[cfg(feature = "hiqlite-store")]

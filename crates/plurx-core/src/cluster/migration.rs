@@ -1,15 +1,23 @@
 //! Crash-safe preparation for the one-time SQLite-to-Hiqlite import.
 //!
-//! This module deliberately stops before it creates or selects a Hiqlite
-//! store. It establishes the source-side invariants M2's row importer relies
-//! on: reject future schemas without changing the data directory, discard an
-//! abandoned incoming target, and publish a durable, content-addressed SQLite
-//! backup that includes committed WAL contents.
+//! The coordinator keeps SQLite authoritative until a fully imported one-voter
+//! target has a durable completion marker. It then stops that voter, renames
+//! the target atomically, fsyncs the data directory, and reopens the active
+//! target before the daemon may start producers or bind HTTP.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(feature = "hiqlite-store")]
+use std::borrow::Cow;
+#[cfg(feature = "hiqlite-store")]
+use std::collections::BTreeSet;
+#[cfg(feature = "hiqlite-store")]
+use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "hiqlite-store")]
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -21,9 +29,45 @@ use sha2::{Digest, Sha256};
 use crate::error::StoreError;
 use crate::store::SQLITE_SCHEMA_VERSION;
 
+#[cfg(feature = "hiqlite-store")]
+use crate::config::Config;
+#[cfg(feature = "hiqlite-store")]
+use crate::secrets::{self, CredentialKey, SealedRowCensus};
+#[cfg(feature = "hiqlite-store")]
+use crate::store::{
+    HiqliteAuthStore, SettingsStore, SqliteImportReport, SqliteImportTableDigest, SqliteStore,
+    Store, AUTH_SCHEMA_VERSION,
+};
+#[cfg(feature = "hiqlite-store")]
+use hiqlite::tls::ServerTlsConfig;
+#[cfg(feature = "hiqlite-store")]
+use hiqlite::{Client, Node, NodeConfig};
+#[cfg(feature = "hiqlite-store")]
+use serde::{Deserialize, Serialize};
+
 pub const SQLITE_FILENAME: &str = "plurx.db";
 pub const MIGRATION_DIRNAME: &str = "migration";
 pub const HIQLITE_INCOMING_DIRNAME: &str = "hiqlite.incoming";
+pub const HIQLITE_ACTIVE_DIRNAME: &str = "hiqlite";
+pub const ACTIVATION_MARKER_FILENAME: &str = "activation.json";
+#[cfg(feature = "hiqlite-store")]
+const ACTIVATION_ATTEMPT_FILENAME: &str = "hiqlite-activation.in-progress";
+#[cfg(feature = "hiqlite-store")]
+const RAFT_SECRET_FILENAME: &str = "secret_raft";
+#[cfg(feature = "hiqlite-store")]
+const API_SECRET_FILENAME: &str = "secret_api";
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_DATABASE_FILENAME: &str = "plurx.db";
+#[cfg(feature = "hiqlite-store")]
+const DAEMON_LOCK_FILENAME: &str = ".plurxd.lock";
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_START_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(feature = "hiqlite-store")]
+const ACTIVATION_MARKER_VERSION: u32 = 1;
+#[cfg(feature = "hiqlite-store")]
+const ACTIVATION_FAILPOINT_ENV: &str = "PLURX_CLUSTER_ACTIVATION_FAILPOINT";
+#[cfg(feature = "hiqlite-store")]
+const ACTIVATION_CRASH_EXIT: i32 = 86;
 
 /// Immutable source material for the row-import and parity phases.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +76,849 @@ pub struct PreparedSqliteImport {
     pub backup_path: PathBuf,
     pub backup_sha256: String,
     pub schema_version: i64,
+    pub cluster_id: String,
+}
+
+/// The durable proof that the incoming target passed the complete import gate.
+///
+/// This file is fsynced before the directory becomes active. Startup never
+/// treats the presence of Hiqlite files alone as activation: a missing,
+/// malformed, or identity-mismatched marker is an ambiguous target and fails
+/// closed instead of silently falling back to stale SQLite state.
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationMarker {
+    pub marker_version: u32,
+    pub cluster_id: String,
+    pub source_backup_sha256: String,
+    pub source_schema_version: i64,
+    pub replicated_schema_version: i64,
+    pub imported_rows: u64,
+    pub table_hashes: Vec<SqliteImportTableDigest>,
+}
+
+/// Which durable backend the daemon selected for this boot.
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedBackend {
+    Replicated,
+    /// One recovery boot after an interrupted activation. The attempt marker
+    /// is consumed before this value is returned, so a later restart may retry.
+    SqliteRecovery,
+}
+
+/// Store selection returned before daemon producers and listeners are built.
+#[cfg(feature = "hiqlite-store")]
+pub struct SelectedStore {
+    pub store: Arc<dyn Store>,
+    pub identity: super::ClusterIdentity,
+    /// Node-local key used only by outbound credential consumers.
+    pub credential_key: Arc<CredentialKey>,
+    pub backend: SelectedBackend,
+    local_client: Option<Client>,
+    _daemon_lock: File,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl SelectedStore {
+    /// Flush and stop the selected local voter before the Tokio runtime exits.
+    pub async fn shutdown(&self) -> Result<(), StoreError> {
+        if let Some(client) = &self.local_client {
+            client.shutdown().await.map_err(|error| {
+                StoreError::Database(format!("stopping one-voter Hiqlite: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationFailpoint {
+    Quiescence,
+    Incoming,
+    Marker,
+    Rename,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationFailpoint {
+    fn configured() -> Result<Option<Self>, StoreError> {
+        let Some(value) = std::env::var(ACTIVATION_FAILPOINT_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let point = match value.as_str() {
+            "after-quiescence" => Self::Quiescence,
+            "after-incoming" => Self::Incoming,
+            "after-marker" => Self::Marker,
+            "after-rename" => Self::Rename,
+            _ => {
+                return Err(StoreError::Migration(format!(
+                    "invalid {ACTIVATION_FAILPOINT_ENV} value {value:?}; expected one of \
+                     after-quiescence, after-incoming, after-marker, after-rename"
+                )));
+            }
+        };
+        Ok(Some(point))
+    }
+
+    fn crash_if(configured: Option<Self>, point: Self) {
+        if configured == Some(point) {
+            eprintln!(
+                "injected cluster activation crash at {point:?}; SQLite and its migration \
+                 backup remain unchanged; rollback command: plurxd run"
+            );
+            std::process::exit(ACTIVATION_CRASH_EXIT);
+        }
+    }
+}
+
+/// Select the daemon's one-voter replicated store before any producer or HTTP
+/// listener exists.
+///
+/// A prior interrupted attempt consumes exactly one SQLite recovery boot: its
+/// incoming target is removed, the attempt marker is fsynced away, and the
+/// unchanged legacy store is returned. A completed atomic target always wins.
+#[cfg(feature = "hiqlite-store")]
+pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, StoreError> {
+    let failpoint = ActivationFailpoint::configured()?;
+    std::fs::create_dir_all(&config.storage.data_dir)
+        .map_err(|error| migration_io("creating", &config.storage.data_dir, error))?;
+    let daemon_lock = acquire_daemon_lock(&config.storage.data_dir)?;
+
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    if path_exists(&active)? {
+        let selected = open_active_store(config, daemon_lock).await?;
+        // A crash immediately after rename may expose the target before its
+        // parent-directory entry is durable. Observing it on recovery lets us
+        // finish that durability boundary before clearing attempt artifacts.
+        sync_directory(&config.storage.data_dir)?;
+        remove_abandoned_incoming(&config.storage.data_dir)?;
+        remove_activation_attempt(&config.storage.data_dir)?;
+        return Ok(selected);
+    }
+
+    ensure_sqlite_source(&config.storage.data_dir)?;
+    // Future-schema refusal must precede cleanup or attempt-marker writes.
+    inspect_sqlite_source(&config.storage.data_dir.join(SQLITE_FILENAME))?;
+
+    let incoming = config.storage.data_dir.join(HIQLITE_INCOMING_DIRNAME);
+    let interrupted =
+        path_exists(&activation_attempt_path(&config.storage.data_dir))? || path_exists(&incoming)?;
+    if interrupted {
+        remove_abandoned_incoming(&config.storage.data_dir)?;
+        remove_activation_attempt(&config.storage.data_dir)?;
+        let legacy = super::open_store(config).await?;
+        return Ok(SelectedStore {
+            store: legacy.store,
+            identity: legacy.identity,
+            credential_key: legacy.credential_key,
+            backend: SelectedBackend::SqliteRecovery,
+            local_client: None,
+            _daemon_lock: daemon_lock,
+        });
+    }
+
+    // Reuse the ordinary SQLite startup upgrade before the immutable backup is
+    // published. This is the one permitted source mutation: a pre-encryption
+    // Trakt row must be sealed under the node-local key before the importer can
+    // audit it, and no cleartext application row may ever be submitted to Raft.
+    // Opening here is still quiescent and happens after the future-schema
+    // refusal above. Drop the source connection before the online backup.
+    let legacy = super::open_store(config).await?;
+    let identity = legacy.identity;
+    let credential_key = legacy.credential_key;
+    drop(legacy.store);
+
+    match activate_fresh_store(
+        config,
+        failpoint,
+        daemon_lock,
+        identity,
+        credential_key,
+    )
+    .await
+    {
+        Ok(store) => Ok(store),
+        Err(error) => Err(activation_failure(&config.storage.data_dir, error)),
+    }
+}
+
+/// Connect a maintenance command to an already-running activated voter.
+///
+/// This path never imports and never starts a second local voter. It is safe
+/// beside `plurxd run`; an unmigrated directory is refused before creating any
+/// replicated state.
+#[cfg(feature = "hiqlite-store")]
+pub async fn connect_activated_store(config: &Config) -> Result<Arc<dyn Store>, StoreError> {
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    if !path_exists(&active)? {
+        return Err(StoreError::Migration(format!(
+            "{} is not activated; only `plurxd run` may import SQLite into Hiqlite",
+            config.storage.data_dir.display()
+        )));
+    }
+    let marker = read_activation_marker(&active)?;
+    let identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    if identity.cluster_id != marker.cluster_id {
+        return Err(StoreError::Identity(
+            "activation marker and local cluster identity disagree".to_owned(),
+        ));
+    }
+    let secret_api = read_secret(&config.storage.data_dir.join(API_SECRET_FILENAME))?;
+    let address = local_client_address(config.cluster.api_bind).to_string();
+    let client = Client::remote(vec![address], true, true, secret_api, true, None)
+        .await
+        .map_err(|error| {
+            StoreError::Database(format!(
+                "connecting to the running one-voter Hiqlite store: {error}"
+            ))
+        })?;
+    let store = HiqliteAuthStore::open(client, &active.join("telemetry.db")).await?;
+    verify_store_identity(&store, &marker.cluster_id).await?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn activate_fresh_store(
+    config: &Config,
+    failpoint: Option<ActivationFailpoint>,
+    daemon_lock: File,
+    identity: super::ClusterIdentity,
+    credential_key: Arc<CredentialKey>,
+) -> Result<SelectedStore, StoreError> {
+    write_activation_attempt(&config.storage.data_dir)?;
+    ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Quiescence);
+
+    let prepared = prepare_sqlite_import(&config.storage.data_dir)?;
+    if identity.cluster_id != prepared.cluster_id {
+        return Err(StoreError::Identity(format!(
+            "SQLite instance.id changed while preparing activation: opened {}, backup contains {}",
+            identity.cluster_id, prepared.cluster_id
+        )));
+    }
+    verify_legacy_ownership(&prepared.backup_path, &identity)?;
+    let secrets = load_or_create_secrets(&config.storage.data_dir)?;
+    let incoming = config.storage.data_dir.join(HIQLITE_INCOMING_DIRNAME);
+    std::fs::create_dir(&incoming).map_err(|error| migration_io("creating", &incoming, error))?;
+    if let Err(error) = sync_directory(&config.storage.data_dir) {
+        return Err(cleanup_incoming_failure(&incoming, error));
+    }
+
+    // The staging voter is process-local and never accepts a peer. Running it
+    // without TLS lets Hiqlite's graceful shutdown close both listeners before
+    // rename; the active voter below uses TLS for its exposed API transport.
+    let client = match start_local_voter(config, &incoming, &secrets, false).await {
+        Ok(client) => client,
+        Err(error) => {
+            remove_abandoned_incoming(&config.storage.data_dir)?;
+            return Err(error);
+        }
+    };
+    let store = match HiqliteAuthStore::bootstrap(
+        client.clone(),
+        &prepared.cluster_id,
+        &incoming.join("telemetry.db"),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => return abort_incoming(client, &incoming, error).await,
+    };
+    ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Incoming);
+
+    let report = match store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            drop(store);
+            return abort_incoming(client, &incoming, error).await;
+        }
+    };
+    let marker = ActivationMarker::from_report(&prepared.cluster_id, report);
+    if let Err(error) = write_activation_marker(&incoming, &marker) {
+        drop(store);
+        return abort_incoming(client, &incoming, error).await;
+    }
+    ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Marker);
+
+    drop(store);
+    if let Err(error) = client.shutdown().await {
+        drop(client);
+        return Err(cleanup_incoming_failure(
+            &incoming,
+            StoreError::Database(format!("stopping incoming Hiqlite voter: {error}")),
+        ));
+    }
+    drop(client);
+    if let Err(error) = sync_directory(&incoming) {
+        return Err(cleanup_incoming_failure(&incoming, error));
+    }
+
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    if let Err(error) = std::fs::rename(&incoming, &active) {
+        return Err(cleanup_incoming_failure(
+            &incoming,
+            migration_io("activating", &active, error),
+        ));
+    }
+    ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Rename);
+    sync_directory(&config.storage.data_dir)?;
+    remove_activation_attempt(&config.storage.data_dir)?;
+
+    open_active_store_with_key(config, daemon_lock, Some(credential_key)).await
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationMarker {
+    fn from_report(cluster_id: &str, report: SqliteImportReport) -> Self {
+        Self {
+            marker_version: ACTIVATION_MARKER_VERSION,
+            cluster_id: cluster_id.to_owned(),
+            source_backup_sha256: report.backup_sha256,
+            source_schema_version: report.source_schema_version,
+            replicated_schema_version: AUTH_SCHEMA_VERSION,
+            imported_rows: report.imported_rows,
+            table_hashes: report.tables,
+        }
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.marker_version != ACTIVATION_MARKER_VERSION {
+            return Err(StoreError::Migration(format!(
+                "unsupported Hiqlite activation marker version {}",
+                self.marker_version
+            )));
+        }
+        if self.cluster_id.trim().is_empty()
+            || self.source_schema_version <= 0
+            || self.replicated_schema_version != AUTH_SCHEMA_VERSION
+            || !is_sha256(&self.source_backup_sha256)
+            || self.table_hashes.is_empty()
+        {
+            return Err(StoreError::Migration(
+                "Hiqlite activation marker is incomplete".to_owned(),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for table in &self.table_hashes {
+            if table.table.is_empty()
+                || !names.insert(table.table.as_str())
+                || !is_sha256(&table.sha256)
+            {
+                return Err(StoreError::Migration(
+                    "Hiqlite activation marker has invalid table hashes".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn open_active_store(
+    config: &Config,
+    daemon_lock: File,
+) -> Result<SelectedStore, StoreError> {
+    open_active_store_with_key(config, daemon_lock, None).await
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn open_active_store_with_key(
+    config: &Config,
+    daemon_lock: File,
+    credential_key: Option<Arc<CredentialKey>>,
+) -> Result<SelectedStore, StoreError> {
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    require_real_directory(&active)?;
+    let marker = read_activation_marker(&active)?;
+    let identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    let secrets = read_existing_secrets(&config.storage.data_dir)?;
+    let client = start_local_voter(config, &active, &secrets, true).await?;
+    let store = match HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await {
+        Ok(store) => store,
+        Err(error) => {
+            let shutdown = client.shutdown().await.err();
+            return Err(with_shutdown_error(error, shutdown));
+        }
+    };
+    if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
+        drop(store);
+        let shutdown = client.shutdown().await.err();
+        return Err(with_shutdown_error(error, shutdown));
+    }
+    let credential_key = match credential_key {
+        Some(key) => key,
+        None => match open_active_credential_key(config, &store).await {
+            Ok(key) => key,
+            Err(error) => {
+                drop(store);
+                let shutdown = client.shutdown().await.err();
+                return Err(with_shutdown_error(error, shutdown));
+            }
+        },
+    };
+    Ok(SelectedStore {
+        store: Arc::new(store),
+        identity,
+        credential_key,
+        backend: SelectedBackend::Replicated,
+        local_client: Some(client),
+        _daemon_lock: daemon_lock,
+    })
+}
+
+/// Resolve the key against the authoritative replicated rows on every reopen.
+///
+/// The retained SQLite source cannot provide this census after activation: a
+/// household may link Trakt later, and a lost or replaced key must refuse at
+/// startup rather than surface as an unrelated outbound-sync failure.
+#[cfg(feature = "hiqlite-store")]
+async fn open_active_credential_key(
+    config: &Config,
+    store: &HiqliteAuthStore,
+) -> Result<Arc<CredentialKey>, StoreError> {
+    let mut census = SealedRowCensus::default();
+    for auth in store.list_trakt_auth().await? {
+        census.observe_row(&auth.access_token, &auth.refresh_token);
+    }
+    let path = config
+        .cluster
+        .credential_key_path(&config.storage.data_dir);
+    let key = secrets::open_credential_key(&path, &census)
+        .map_err(|error| StoreError::Identity(error.to_string()))?;
+    tracing::debug!(
+        key_id = %key.id(),
+        wrapped_rows = census.sealed_rows(),
+        "opened the node-local credential key for the replicated store"
+    );
+    Ok(Arc::new(key))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn with_shutdown_error(error: StoreError, shutdown: Option<hiqlite::Error>) -> StoreError {
+    match shutdown {
+        Some(shutdown) => StoreError::Database(format!(
+            "{error}; additionally failed to stop one-voter Hiqlite: {shutdown}"
+        )),
+        None => error,
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn acquire_daemon_lock(data_dir: &Path) -> Result<File, StoreError> {
+    let path = data_dir.join(DAEMON_LOCK_FILENAME);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| migration_io("opening", &path, error))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Migration(format!(
+            "another plurxd process already owns the data directory {}",
+            data_dir.display()
+        ))),
+        Err(std::fs::TryLockError::Error(error)) => Err(migration_io("locking", &path, error)),
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn verify_store_identity(store: &HiqliteAuthStore, expected: &str) -> Result<(), StoreError> {
+    let actual = store.instance_id().await?;
+    if actual != expected {
+        return Err(StoreError::Identity(format!(
+            "active Hiqlite instance.id is {actual}, activation marker expects {expected}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+struct ClusterSecrets {
+    raft: String,
+    api: String,
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn load_or_create_secrets(data_dir: &Path) -> Result<ClusterSecrets, StoreError> {
+    Ok(ClusterSecrets {
+        raft: load_or_create_secret(data_dir, RAFT_SECRET_FILENAME)?,
+        api: load_or_create_secret(data_dir, API_SECRET_FILENAME)?,
+    })
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn start_local_voter(
+    config: &Config,
+    target: &Path,
+    secrets: &ClusterSecrets,
+    active_transport: bool,
+) -> Result<Client, StoreError> {
+    let raft_address = local_client_address(config.cluster.raft_bind);
+    let api_address = if active_transport {
+        advertised_address(&config.cluster.advertise_host, config.cluster.api_bind)
+    } else {
+        local_client_address(config.cluster.api_bind).to_string()
+    };
+    let api_listen_ip = if active_transport {
+        config.cluster.api_bind.ip()
+    } else {
+        local_client_address(config.cluster.api_bind).ip()
+    };
+    let node = Node {
+        id: super::SINGLE_VOTER_RAFT_ID,
+        // M2 has no peer, so Raft stays loopback-only. Besides removing an
+        // unnecessary exposed port, Hiqlite's plain listener receives its
+        // graceful-shutdown signal; M3 will replace this address when it adds
+        // authenticated membership.
+        addr_raft: raft_address.to_string(),
+        addr_api: api_address,
+    };
+    let node_config = NodeConfig {
+        node_id: super::SINGLE_VOTER_RAFT_ID,
+        nodes: vec![node],
+        listen_addr_api: Cow::Owned(api_listen_ip.to_string()),
+        listen_addr_raft: Cow::Owned(raft_address.ip().to_string()),
+        data_dir: Cow::Owned(target.to_string_lossy().into_owned()),
+        filename_db: Cow::Borrowed(HIQLITE_DATABASE_FILENAME),
+        secret_raft: secrets.raft.clone(),
+        secret_api: secrets.api.clone(),
+        tls_raft: None,
+        tls_api: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
+        health_check_delay_secs: 0,
+        wal_size: 2 * 1024 * 1024,
+        raft_config: NodeConfig::default_raft_config(10_000),
+        ..Default::default()
+    };
+    let client = hiqlite::start_node(node_config)
+        .await
+        .map_err(|error| StoreError::Database(format!("starting one-voter Hiqlite: {error}")))?;
+    if tokio::time::timeout(HIQLITE_START_TIMEOUT, client.wait_until_healthy_db())
+        .await
+        .is_err()
+    {
+        let _ = client.shutdown().await;
+        return Err(StoreError::Database(format!(
+            "one-voter Hiqlite did not become healthy within {HIQLITE_START_TIMEOUT:?}"
+        )));
+    }
+    Ok(client)
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn abort_incoming(
+    client: Client,
+    incoming: &Path,
+    error: StoreError,
+) -> Result<SelectedStore, StoreError> {
+    let shutdown = client.shutdown().await.err();
+    drop(client);
+    let mut message = error.to_string();
+    if let Some(shutdown) = shutdown {
+        message.push_str(&format!(
+            "; additionally failed to stop incoming voter: {shutdown}"
+        ));
+    }
+    Err(cleanup_incoming_failure(
+        incoming,
+        StoreError::Migration(message),
+    ))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn cleanup_incoming_failure(incoming: &Path, error: StoreError) -> StoreError {
+    let mut message = error.to_string();
+    if let Err(cleanup) = remove_abandoned_incoming(
+        incoming
+            .parent()
+            .expect("the incoming directory always has a data-dir parent"),
+    ) {
+        message.push_str(&format!(
+            "; additionally failed to remove incoming target: {cleanup}"
+        ));
+    }
+    StoreError::Migration(message)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn activation_failure(data_dir: &Path, error: StoreError) -> StoreError {
+    StoreError::Migration(format!(
+        "{error}; SQLite source {} remains available; rollback command: plurxd run",
+        data_dir.join(SQLITE_FILENAME).display()
+    ))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn ensure_sqlite_source(data_dir: &Path) -> Result<(), StoreError> {
+    let source = data_dir.join(SQLITE_FILENAME);
+    if !source.exists() {
+        drop(SqliteStore::open(&source)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn verify_legacy_ownership(
+    backup: &Path,
+    identity: &super::ClusterIdentity,
+) -> Result<(), StoreError> {
+    if identity.node_id == identity.cluster_id {
+        return Ok(());
+    }
+    let connection = open_source(backup)?;
+    let count: i64 = connection
+        .query_row(
+            "SELECT \
+                (SELECT COUNT(*) FROM transcode_cache_locations WHERE node_id = ?1) + \
+                (SELECT COUNT(*) FROM offline_packages WHERE node_id = ?1)",
+            [&identity.cluster_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            StoreError::Migration(format!("checking legacy byte ownership: {error}"))
+        })?;
+    if count > 0 {
+        return Err(StoreError::Identity(format!(
+            "node.id {} differs from instance.id {}, but {count} cache or offline row(s) still \
+             use instance.id; refusing to strand owned bytes",
+            identity.node_id, identity.cluster_id
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn inspect_sqlite_source(path: &Path) -> Result<(i64, String), StoreError> {
+    let source = open_source(path)?;
+    let schema_version = read_schema_version(&source)?;
+    if schema_version > SQLITE_SCHEMA_VERSION {
+        return Err(StoreError::Migration(format!(
+            "source database schema is v{schema_version}, but this binary only knows \
+             v{SQLITE_SCHEMA_VERSION}; refusing clustering import without changing {}",
+            path.parent().unwrap_or_else(|| Path::new(".")).display()
+        )));
+    }
+    let cluster_id = read_cluster_id(&source)?;
+    Ok((schema_version, cluster_id))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn advertised_address(host: &str, bind: SocketAddr) -> String {
+    let host = host.trim();
+    if host.is_empty() {
+        return local_client_address(bind).to_string();
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return SocketAddr::new(ip, bind.port()).to_string();
+    }
+    format!("{host}:{}", bind.port())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn local_client_address(bind: SocketAddr) -> SocketAddr {
+    let ip = if bind.ip().is_unspecified() {
+        match bind.ip() {
+            IpAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        }
+    } else {
+        bind.ip()
+    };
+    SocketAddr::new(ip, bind.port())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn load_or_create_secret(data_dir: &Path, filename: &str) -> Result<String, StoreError> {
+    let path = data_dir.join(filename);
+    if path_exists(&path)? {
+        return read_secret(&path);
+    }
+
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| StoreError::Migration(format!("generating {filename}: {error}")))?;
+    let secret = hex::encode(bytes);
+    let temporary = data_dir.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    write_private_file(&temporary, format!("{secret}\n").as_bytes())?;
+    match std::fs::hard_link(&temporary, &path) {
+        Ok(()) => sync_directory(data_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            publish_secret_with_rename(data_dir, &temporary, &path)?;
+        }
+        Err(error) => return Err(migration_io("publishing", &path, error)),
+    }
+    remove_file_if_present(&temporary)?;
+    read_secret(&path)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_existing_secrets(data_dir: &Path) -> Result<ClusterSecrets, StoreError> {
+    Ok(ClusterSecrets {
+        raft: read_secret(&data_dir.join(RAFT_SECRET_FILENAME))?,
+        api: read_secret(&data_dir.join(API_SECRET_FILENAME))?,
+    })
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn publish_secret_with_rename(
+    data_dir: &Path,
+    temporary: &Path,
+    destination: &Path,
+) -> Result<(), StoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(destination) {
+        Ok(placeholder) => {
+            drop(placeholder);
+            std::fs::rename(temporary, destination)
+                .map_err(|error| migration_io("publishing", destination, error))?;
+            sync_directory(data_dir)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(migration_io("reserving", destination, error)),
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_secret(path: &Path) -> Result<String, StoreError> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|error| migration_io("reading", path, error))?;
+    let secret = raw.trim();
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StoreError::Migration(format!(
+            "cluster secret {} is malformed",
+            path.display()
+        )));
+    }
+    Ok(secret.to_owned())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|error| migration_io("creating", path, error))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| migration_io("writing", path, error))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_activation_attempt(data_dir: &Path) -> Result<(), StoreError> {
+    let migration_dir = data_dir.join(MIGRATION_DIRNAME);
+    std::fs::create_dir_all(&migration_dir)
+        .map_err(|error| migration_io("creating", &migration_dir, error))?;
+    sync_directory(data_dir)?;
+    write_atomic_private(
+        &migration_dir,
+        ACTIVATION_ATTEMPT_FILENAME,
+        b"one-voter activation in progress\n",
+    )
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn activation_attempt_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(MIGRATION_DIRNAME)
+        .join(ACTIVATION_ATTEMPT_FILENAME)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn remove_activation_attempt(data_dir: &Path) -> Result<(), StoreError> {
+    let path = activation_attempt_path(data_dir);
+    let existed = path_exists(&path)?;
+    remove_file_if_present(&path)?;
+    if existed {
+        sync_directory(&data_dir.join(MIGRATION_DIRNAME))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_activation_marker(target: &Path, marker: &ActivationMarker) -> Result<(), StoreError> {
+    marker.validate()?;
+    let mut bytes = serde_json::to_vec_pretty(marker).map_err(|error| {
+        StoreError::Migration(format!("serializing Hiqlite activation marker: {error}"))
+    })?;
+    bytes.push(b'\n');
+    write_atomic_private(target, ACTIVATION_MARKER_FILENAME, &bytes)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_activation_marker(target: &Path) -> Result<ActivationMarker, StoreError> {
+    let path = target.join(ACTIVATION_MARKER_FILENAME);
+    let bytes = std::fs::read(&path).map_err(|error| migration_io("reading", &path, error))?;
+    let marker: ActivationMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::Migration(format!(
+            "decoding Hiqlite activation marker {}: {error}",
+            path.display()
+        ))
+    })?;
+    marker.validate()?;
+    Ok(marker)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_atomic_private(directory: &Path, filename: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    let destination = directory.join(filename);
+    let temporary = directory.join(format!(".{filename}.{}.incoming", uuid::Uuid::new_v4()));
+    write_private_file(&temporary, bytes)?;
+    if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = remove_file_if_present(&temporary);
+        return Err(migration_io("publishing", &destination, error));
+    }
+    sync_directory(directory)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn path_exists(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(migration_io("inspecting", path, error)),
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn require_real_directory(path: &Path) -> Result<(), StoreError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| migration_io("inspecting", path, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::Migration(format!(
+            "active Hiqlite target {} is not a real directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Validate and durably snapshot the legacy SQLite source.
@@ -52,6 +939,7 @@ pub fn prepare_sqlite_import(data_dir: &Path) -> Result<PreparedSqliteImport, St
             data_dir.display()
         )));
     }
+    let cluster_id = read_cluster_id(&source)?;
 
     remove_abandoned_incoming(data_dir)?;
 
@@ -69,6 +957,7 @@ pub fn prepare_sqlite_import(data_dir: &Path) -> Result<PreparedSqliteImport, St
         &source,
         &source_path,
         schema_version,
+        &cluster_id,
         &migration_dir,
         &temporary_path,
     );
@@ -102,6 +991,25 @@ fn read_schema_version(connection: &Connection) -> Result<i64, StoreError> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| StoreError::Migration(format!("reading source schema version: {error}")))
+}
+
+fn read_cluster_id(connection: &Connection) -> Result<String, StoreError> {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'instance.id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| StoreError::Migration(format!("reading source instance.id: {error}")))
+        .and_then(|cluster_id| {
+            if cluster_id.trim().is_empty() {
+                Err(StoreError::Migration(
+                    "source instance.id is empty".to_owned(),
+                ))
+            } else {
+                Ok(cluster_id)
+            }
+        })
 }
 
 fn remove_abandoned_incoming(data_dir: &Path) -> Result<(), StoreError> {
@@ -164,6 +1072,7 @@ fn create_backup(
     source: &Connection,
     source_path: &Path,
     schema_version: i64,
+    cluster_id: &str,
     migration_dir: &Path,
     temporary_path: &Path,
 ) -> Result<PreparedSqliteImport, StoreError> {
@@ -243,6 +1152,7 @@ fn create_backup(
         backup_path,
         backup_sha256,
         schema_version,
+        cluster_id: cluster_id.to_owned(),
     })
 }
 
