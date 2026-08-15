@@ -1303,8 +1303,11 @@ fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
 impl Session {
     /// Stop the encoder, if there is one. A cache hit has no process; a
     /// session whose ffmpeg already exited has one that is already reaped.
+    /// Remove it from the live slot before waiting so playlist startup cannot
+    /// mistake a deliberately killed predecessor for its replacement's
+    /// terminal verdict.
     async fn kill_child(&self) {
-        if let Some(child) = self.child.lock().await.as_mut() {
+        if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.kill().await;
         }
     }
@@ -7762,6 +7765,44 @@ mod tests {
         assert!(
             !session.failed.load(Relaxed),
             "clean EOF must not poison the session"
+        );
+    }
+
+    /// A watchdog or copy-segmenter fallback deliberately kills one producer
+    /// before installing its replacement. That gap is not a terminal exit:
+    /// playlist startup must keep waiting instead of poisoning the successor.
+    #[tokio::test]
+    async fn playlist_waits_while_a_killed_producer_is_being_replaced() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = tokio::process::Command::new("false")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn false");
+        let session = watchdog_session(dir.path(), Some(child), false);
+        session.kill_child().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.sessions
+            .lock()
+            .await
+            .insert("replacement-gap".into(), Arc::clone(&session));
+
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(250), mgr.playlist("replacement-gap")).await;
+        assert!(
+            waiting.is_err(),
+            "an intentional replacement gap keeps the publication window open"
+        );
+        assert!(
+            !session.failed.load(Relaxed),
+            "the killed predecessor must not poison its replacement"
         );
     }
 
