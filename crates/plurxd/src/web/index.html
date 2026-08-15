@@ -5039,27 +5039,40 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   setLoading(true,"Reading media…","checking the file on the server");
   let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   let retestDecodeLimit=false;
-  // A device that measured itself out of decode headroom on this codec and
-  // resolution (see maybeDecodeRescue) routes straight to a transcode on Auto
-  // instead of stuttering for twenty seconds and rescuing mid-scene. Only
-  // Auto: an explicit Original is the viewer overriding this, which is also
-  // how the limit gets re-tested and cleared after a hardware upgrade.
-  if(qualityForce()==='auto' && decision
-     && (decision.method==='remux'||decision.method==='direct_play')){
-    const lim=decodeLimitFor(decision.source||{});
+  let learnedLimitView=null;
+  // A device that measured this exact media load as unstable routes straight
+  // to a transcode on Auto instead of stuttering mid-scene. The pure policy
+  // rejects legacy codec/height entries and sibling HDR/bitrate identities;
+  // Original is an explicit bypass, not another branch that can accidentally
+  // inherit the remembered verdict.
+  if(decision && (decision.method==='remux'||decision.method==='direct_play')){
+    const learned=PlaybackPolicy.learnedDecodeLimitAction({
+      quality:playQuality(),source:decision.source||{},limits:decodeLimits(),
+      nowMs:Date.now(),ttlMs:DECODE_LIMIT_TTL_MS,retestMs:DECODE_LIMIT_RETEST_MS
+    });
+    const lim=learned.limit;
     // Past its re-test date: let this one session play the source and find
     // out, rather than trusting a week-old verdict forever.
-    if(decodeLimitDue(lim)){
+    if(learned.action==='retest'){
       retestDecodeLimit=true;
+      learnedLimitView=PlaybackPolicy.learnedDecodeLimitView({
+        source:decision.source||{},limit:lim,
+        ordinaryRange:decision.delivered_dynamic_range,
+        deliveredRange:decision.delivered_dynamic_range
+      });
       clientLog({level:"info",event:"decode_limit_retest",
-        message:`re-testing ${decodeLimitKey(decision.source||{})} on Auto — `+
+        message:`re-testing ${decodeLimitLabel(decision.source||{})} on Auto — `+
                 `the remembered measurement is over a week old`});
-    } else if(lim){
+    } else if(learned.action==='apply'){
       try{
+        const ordinaryRange=decision.delivered_dynamic_range;
         const d2=await api(`/files/${fileId}/decision?${CAPS_Q}&force=transcode`);
-        d2.reasons=[`this browser measured no decode slack on `+
-          `${decodeLimitKey(decision.source||{})} (${lim.decode_ms}ms/frame against `+
-          `${lim.budget_ms}ms) — transcoding (Quality → Original overrides)`].concat(d2.reasons||[]);
+        learnedLimitView=PlaybackPolicy.learnedDecodeLimitView({
+          source:decision.source||{},limit:lim,ordinaryRange,
+          deliveredRange:d2.delivered_dynamic_range
+        });
+        d2.reasons=[`${learnedLimitView.reason} `+
+          `(Quality → Original bypasses this measurement)`].concat(d2.reasons||[]);
         decision=d2;
       }catch(e){ /* the limit is advice; the original decision still plays */ }
     }
@@ -5100,6 +5113,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     refusedOriginal:false,
     aoffset:sessionAudioOffset, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
+    learnedLimit:learnedLimitView,
     bookOffset:book?(meta.part_offset_ms||0):0,
     bookDuration:book?(meta.book_duration_ms||0):0,
     bookParts:book?(meta.book_parts||[]):null,
@@ -5739,12 +5753,12 @@ function decodeMarginVerdict(h, playedSecs){
     minimumLost:MARGIN_MIN_LOST
   });
 }
-// What this DEVICE cannot decode with margin, remembered per codec+height so
-// the next Auto playback routes straight to a transcode instead of stuttering
-// for twenty seconds first. Explicitly chosen Original always wins — the
-// limit only steers Auto — and an explicit-Original session that measures
-// comfortable margin for a minute clears its entry, so a GPU upgrade is
-// noticed rather than distrusted forever.
+// What this DEVICE could not present smoothly, remembered against a versioned
+// media-load identity: codec/profile, resolution, bit depth, dynamic range,
+// rich HDR shape, and a 10 Mb/s bitrate bucket. One demanding DV encode must
+// never condemn every 4K HEVC title. Explicitly chosen Original always wins —
+// the limit only steers Auto — and a clean remeasurement clears only this
+// exact identity, so a sibling stream keeps its own evidence.
 // How long a measured limit is believed.
 //
 // It is evidence about one device, one browser build and one stream at one
@@ -5755,7 +5769,7 @@ function decodeMarginVerdict(h, playedSecs){
 // is a belief. Thirty days is long enough that a viewer who watches the same
 // film every week never re-measures, and short enough that nobody is stuck
 // with a verdict from a machine they have since replaced.
-const DECODE_LIMIT_TTL_MS=30*24*3600*1000;
+const DECODE_LIMIT_TTL_MS=PlaybackPolicy.DECODE_LIMIT_DEFAULTS.ttlMs;
 // How long before Auto re-tests a limit by itself.
 //
 // The limit is only ever re-measured on an explicit Quality → Original, which
@@ -5772,9 +5786,9 @@ const DECODE_LIMIT_TTL_MS=30*24*3600*1000;
 // stamps a fresh date, pushing the next re-test out another week — so the
 // worst case is ~20 seconds of hitches once a week, against the alternative
 // of never getting the source back at all.
-const DECODE_LIMIT_RETEST_MS=7*24*3600*1000;
-function decodeLimitDue(lim){ return !!lim && (Date.now()-(lim.at||0))>DECODE_LIMIT_RETEST_MS; }
-function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}@${src.height||0}` : null; }
+const DECODE_LIMIT_RETEST_MS=PlaybackPolicy.DECODE_LIMIT_DEFAULTS.retestMs;
+function decodeLimitKey(src){ return PlaybackPolicy.decodeLimitIdentity(src); }
+function decodeLimitLabel(src){ return PlaybackPolicy.mediaLoadLabel(src); }
 // Reads and prunes. Anything past its shelf life is dropped on the way out,
 // so an expired verdict cannot steer a decision even once — and so is anything
 // written before the trigger stopped believing the decode figure. Those
@@ -5784,14 +5798,14 @@ function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}
 // anything. Dropping them re-measures whatever was real, and spares the
 // viewer having to find a button to undo a verdict they were never told about.
 function decodeLimits(){
-  let l; try{ l=JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }catch(e){ return {}; }
-  const now=Date.now(); let dropped=false;
-  for(const k of Object.keys(l)){
-    const at=l[k]&&l[k].at;
-    if(!at || now-at>DECODE_LIMIT_TTL_MS || l[k].rate==null){ delete l[k]; dropped=true; }
+  let raw;
+  try{ raw=JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }
+  catch(e){ try{ localStorage.removeItem("plurx_decode_limits"); }catch(_){} return {}; }
+  const result=PlaybackPolicy.pruneDecodeLimits(raw,{nowMs:Date.now(),ttlMs:DECODE_LIMIT_TTL_MS});
+  if(result.changed){
+    try{ localStorage.setItem("plurx_decode_limits",JSON.stringify(result.limits)); }catch(e){}
   }
-  if(dropped){ try{ localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){} }
-  return l;
+  return result.limits;
 }
 // Forget everything measured on this browser.
 //
@@ -5829,7 +5843,8 @@ function rememberDecodeLimit(src, v){
   const k=decodeLimitKey(src); if(!k||!v) return;
   try{ const l=decodeLimits();
        l[k]={lost:v.lost, rate:v.rate, secs:v.secs,
-             decode_ms:v.decodeMs, budget_ms:v.budgetMs, at:Date.now()};
+             decode_ms:v.decodeMs, budget_ms:v.budgetMs,
+             label:decodeLimitLabel(src), at:Date.now()};
        localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){}
 }
 // What an entry says it measured. `decodeLimits()` drops anything without a
@@ -5838,9 +5853,9 @@ function decodeLimitWhy(lim){
   return lim&&lim.rate!=null ? `lost ${lim.lost} frames in ${lim.secs}s (${lim.rate}/min)` : "";
 }
 function clearDecodeLimit(src){
-  const k=decodeLimitKey(src); if(!k) return false;
-  try{ const l=decodeLimits(); if(!(k in l)) return false;
-       delete l[k]; localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); return true;
+  try{ const result=PlaybackPolicy.withoutLearnedDecodeLimit(decodeLimits(),src);
+       if(!result.removed) return false;
+       localStorage.setItem("plurx_decode_limits",JSON.stringify(result.limits)); return true;
   }catch(e){ return false; }
 }
 // What Settings shows about the limits this browser is carrying: the entries
@@ -5849,7 +5864,7 @@ function clearDecodeLimit(src){
 function decodeLimitsSummary(){
   const l=decodeLimits(), keys=Object.keys(l);
   if(!keys.length) return `<span class="muted" style="font-size:13px">Nothing measured on this browser.</span>`;
-  const items=keys.map(k=>`<span class="pill">${esc(k)} · ${l[k].rate} lost/min · ${
+  const items=keys.map(k=>`<span class="pill">${esc(l[k].label||k)} · ${l[k].rate} lost/min · ${
     esc(agoLabel(Math.round(l[k].at/1000)))}</span>`).join(" ");
   return `${items} <button class="ghost sm" onclick="forgetDecodeLimitsUI()">Forget ${keys.length===1?"it":"them all"}</button>`;
 }
@@ -6178,7 +6193,7 @@ function maybeDecodeRescue(){
     if(secs>=MARGIN_CLEAR_SECS && x && x.rate<MARGIN_LOST_PER_MIN && clearDecodeLimit(p.source)){
       p.decodeRetest=false;
       clientLog(Object.assign({level:"info",event:"decode_limit_cleared",
-        message:`this device played ${decodeLimitKey(p.source)} for ${Math.round(secs)}s `+
+        message:`this device played ${decodeLimitLabel(p.source)} for ${Math.round(secs)}s `+
                 `losing ${x.lost} frame(s), ${x.rate}/min — Auto may use Original again`},
         playbackContext()));
       toast("This browser handles the original now — Auto will use it");
@@ -6193,10 +6208,10 @@ function maybeDecodeRescue(){
   p.decodeRescued=true;
   // A session the browser refused data on has an explanation for its hitches
   // that is not the decoder, and a decode limit is the wrong thing to learn
-  // from it: it is per-device and per-codec, it steers every future Auto
-  // playback of anything that shape, and the actual constraint was the size of
-  // this stream against this browser's buffer quota — which a transcode fixes
-  // by being smaller, and which says nothing about what the GPU can decode.
+  // from it. Even the narrowed media-load identity is evidence about client
+  // presentation, while the actual constraint was the size of this stream
+  // against this browser's buffer quota — which a transcode fixes by being
+  // smaller, and which says nothing about what the GPU can decode.
   // Getting this wrong is how Chrome taught itself that an M3 Max cannot play
   // HEVC 2160p. Fall back, because falling back genuinely helps; just do not
   // remember it as something it wasn't.
@@ -6214,11 +6229,11 @@ function maybeDecodeRescue(){
     detail:`lost=${verdict.lost} rate=${verdict.rate}/min secs=${verdict.secs} `+
            `decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms quota=${quota}`,
     message:quota
-      ? `this browser refused buffer ${quota}x on ${decodeLimitKey(p.source)||'this stream'} `+
+      ? `this browser refused buffer ${quota}x on ${decodeLimitLabel(p.source)||'this stream'} `+
         `and lost ${verdict.lost} frames with it — switching to transcode, but not `+
         `remembering a decode limit: the constraint was buffer quota, not the decoder`
       : `this browser lost ${verdict.lost} frames in ${verdict.secs}s (${verdict.rate}/min) `+
-        `playing ${decodeLimitKey(p.source)||'this stream'} — switching to transcode`},
+        `playing ${decodeLimitLabel(p.source)||'this stream'} — switching to transcode`},
     playbackContext()));
   toast("This browser can't hold Original smoothly — switching to optimized");
   startTranscodeFallback("decode-rescue");
@@ -7027,11 +7042,19 @@ function toggleMenu(kind,low){
     // saying nothing.
     const limWhat=(PLAYER&&PLAYER.decodeRetest)
       ? `Auto is re-testing it right now — if this plays cleanly it clears itself.`
-      : `Auto transcodes it; Original overrides.`;
-    const limNote=lim?`<div class="amsec">Measured on this device</div>
-      <div class="menunote">On ${esc(decodeLimitKey(PLAYER.source||{})||"this stream")} this browser
+      : `Auto transcodes it; Original bypasses the learned limit.`;
+    const limView=lim?((PLAYER&&PLAYER.learnedLimit)||PlaybackPolicy.learnedDecodeLimitView({
+      source:(PLAYER&&PLAYER.source)||{},limit:lim,
+      ordinaryRange:PLAYER&&PLAYER.deliveredRange,
+      deliveredRange:PLAYER&&PLAYER.deliveredRange
+    })):null;
+    const rangeNote=limView&&limView.rangeConsequence
+      ? ` <b>${esc(limView.rangeConsequence)}</b>: the learned client-performance limit replaces the ordinary HDR route with SDR.`
+      : "";
+    const limNote=lim?`<div class="amsec">Learned client-performance limit</div>
+      <div class="menunote">On ${esc(limView.loadLabel)} this browser
         ${esc(decodeLimitWhy(lim))}, ${esc(agoLabel(Math.round(lim.at/1000)))}.
-        ${limWhat}</div>
+        ${limWhat}${rangeNote}</div>
       <button onclick="forgetDecodeLimitHere()">Forget this measurement</button>`:"";
     m.innerHTML=`<div class="amsec">Quality</div>`+qualityOptions().map(([v,l])=>{
       const note=v==="auto"?" — automatic":v==="original"?" — max, no transcode":"";
@@ -8262,10 +8285,11 @@ function playbackPanel(settings){
       </div>
       <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="autonext" ${autoNextOn()?'checked':''} onchange="setAutoNext(this.checked)" style="width:auto;margin-right:9px"> Auto-play the next episode when one finishes <span class="muted" style="font-size:12px;margin-left:6px">· saved on this browser</span></label>
       <h2 class="section">Measured playback limits</h2>
-      <p class="muted" style="margin-top:0">When a stream plays with visible faults and no decode headroom, this browser
-        remembers the combination and lets <b>Auto</b> transcode it next time instead of stuttering first. The measurement
-        expires by itself after 30 days, and an explicit <b>Quality → Original</b> always overrides it — but if a player is
-        giving you a soft picture on a file you know this machine can handle, forget them and it will measure again.
+      <p class="muted" style="margin-top:0">When an original stream loses visible frames, this browser remembers that
+        exact media load — codec/profile, resolution, bit depth, dynamic range, and a 10 Mb/s bitrate band — and lets
+        <b>Auto</b> transcode it next time instead of stuttering first. A different HDR shape or bitrate gets its own
+        measurement. The measurement expires after 30 days, and <b>Quality → Original</b> always bypasses it; if Auto
+        sacrifices HDR, the Quality menu names the learned client-performance limit and the range change.
         Saved on this browser only; nothing here affects anyone else.</p>
       <div class="row" id="dlrow">${decodeLimitsSummary()}</div>
       <h2 class="section">Delivery speed</h2>

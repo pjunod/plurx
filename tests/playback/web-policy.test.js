@@ -170,6 +170,30 @@ const serverLadder = [
   { height: 360, total_kbps: 1360, peak_kbps: 1960 },
 ];
 
+const demandingDolbyVision = {
+  container: "mkv",
+  video_codec: "hevc",
+  video_profile: "Main 10",
+  width: 3840,
+  height: 2160,
+  bit_depth: 10,
+  hdr: "dolby_vision",
+  hdr_format: "Dolby Vision \u00b7 Profile 7 (HDR10-compatible)",
+  bitrate: 90_892_368,
+};
+
+const playableHdr10 = {
+  container: "mkv",
+  video_codec: "hevc",
+  video_profile: "Main 10",
+  width: 3840,
+  height: 2160,
+  bit_depth: 10,
+  hdr: "hdr10",
+  hdr_format: "HDR10",
+  bitrate: 42_000_000,
+};
+
 test("Auto starts from the server ladder, prior, and persisted last-good rung", () => {
   assert.deepEqual(
     policy.normalizedLadder(serverLadder, 700).map((rung) => rung.height),
@@ -232,6 +256,129 @@ test("an outgoing hls.js estimate survives a restart and outranks the cold prior
   );
   assert.equal(policy.bandwidthSeedBps({ priorKbps: 1500 }), 1_500_000);
   assert.equal(policy.bandwidthSeedBps({}), null);
+});
+
+test("learned decode identity is versioned, deterministic, and bitrate-bucketed", () => {
+  const reordered = {
+    bitrate: demandingDolbyVision.bitrate,
+    hdr_format: demandingDolbyVision.hdr_format,
+    height: demandingDolbyVision.height,
+    width: demandingDolbyVision.width,
+    video_profile: "  MAIN   10 ",
+    video_codec: " HEVC ",
+    bit_depth: demandingDolbyVision.bit_depth,
+    hdr: " DOLBY_VISION ",
+    ignored_future_field: "does not change v2",
+  };
+  const dolbyKey = policy.decodeLimitIdentity(demandingDolbyVision);
+  assert.match(dolbyKey, /^decode-v2:/);
+  assert.equal(policy.decodeLimitIdentity(reordered), dolbyKey);
+  assert.notEqual(policy.decodeLimitIdentity(playableHdr10), dolbyKey);
+  assert.equal(policy.decodeLimitIdentity({}), policy.decodeLimitIdentity({}));
+
+  assert.equal(policy.bitrateBucket(9_999_999).index, 0);
+  assert.equal(policy.bitrateBucket(10_000_000).index, 1);
+  assert.equal(policy.bitrateBucket(19_999_999).index, 1);
+  assert.equal(policy.bitrateBucket(20_000_000).index, 2);
+  assert.equal(policy.bitrateBucket(null), null);
+});
+
+test("a learned limit applies only to the exact media load and Auto", () => {
+  const nowMs = 2_000_000_000_000;
+  const dolbyKey = policy.decodeLimitIdentity(demandingDolbyVision);
+  const limits = {
+    "hevc@2160": { lost: 20, rate: 8, secs: 150, at: nowMs - 1_000 },
+    "decode-v2:not-json": { lost: 20, rate: 8, secs: 150, at: nowMs - 1_000 },
+    [dolbyKey]: { lost: 20, rate: 8, secs: 150, at: nowMs - 1_000 },
+  };
+  const pruned = policy.pruneDecodeLimits(limits, { nowMs });
+  assert.equal(pruned.changed, true);
+  assert.deepEqual(Object.keys(pruned.limits), [dolbyKey]);
+
+  assert.equal(
+    policy.learnedDecodeLimitAction({
+      quality: "auto",
+      source: demandingDolbyVision,
+      limits,
+      nowMs,
+    }).action,
+    "apply",
+  );
+  assert.equal(
+    policy.learnedDecodeLimitAction({
+      quality: "auto",
+      source: playableHdr10,
+      limits,
+      nowMs,
+    }).action,
+    "none",
+  );
+  for (const quality of ["original", "nomse", "1080"]) {
+    assert.equal(
+      policy.learnedDecodeLimitAction({
+        quality,
+        source: demandingDolbyVision,
+        limits,
+        nowMs,
+      }).action,
+      "bypass",
+      quality,
+    );
+  }
+});
+
+test("clearing an exact learned limit restores the ordinary HDR remux", () => {
+  const nowMs = 2_000_000_000_000;
+  const dolbyKey = policy.decodeLimitIdentity(demandingDolbyVision);
+  const hdrKey = policy.decodeLimitIdentity(playableHdr10);
+  const limits = {
+    [dolbyKey]: { lost: 20, rate: 8, secs: 150, at: nowMs - 8 * 86_400_000 },
+    [hdrKey]: { lost: 16, rate: 6.4, secs: 150, at: nowMs - 1_000 },
+  };
+  assert.equal(
+    policy.learnedDecodeLimitAction({
+      quality: "auto",
+      source: demandingDolbyVision,
+      limits,
+      nowMs,
+    }).action,
+    "retest",
+  );
+
+  const cleared = policy.withoutLearnedDecodeLimit(
+    limits,
+    demandingDolbyVision,
+  );
+  assert.equal(cleared.removed, true);
+  assert.equal(cleared.limits[dolbyKey], undefined);
+  assert.deepEqual(cleared.limits[hdrKey], limits[hdrKey]);
+  assert.equal(
+    policy.learnedDecodeLimitAction({
+      quality: "auto",
+      source: demandingDolbyVision,
+      limits: cleared.limits,
+      nowMs,
+    }).action,
+    "none",
+  );
+  assert.equal(
+    policy.initialRoute({ method: "remux", nativeHls: true }),
+    "copy_hls",
+    "without the exact learned verdict, the ordinary HDR10 remux route wins",
+  );
+});
+
+test("learned HDR fallback names client performance and the range loss", () => {
+  const view = policy.learnedDecodeLimitView({
+    source: demandingDolbyVision,
+    limit: { lost: 20, rate: 8, secs: 150 },
+    ordinaryRange: "hdr10",
+    deliveredRange: "sdr",
+  });
+  assert.match(view.loadLabel, /Dolby Vision .* Profile 7/);
+  assert.equal(view.rangeConsequence, "HDR10 \u2192 SDR");
+  assert.match(view.reason, /learned client-performance limit/);
+  assert.match(view.reason, /HDR10 \u2192 SDR/);
 });
 
 test("a bandwidth cliff drops from 1080p to the sustainable rung in one move", () => {

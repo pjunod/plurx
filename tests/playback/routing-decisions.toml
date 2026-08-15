@@ -176,6 +176,13 @@ test = "tests/playback/web-policy.test.js"
 test_anchor = "decode rescue uses lost frames over a long window, not pipeline latency"
 
 [[decisions]]
+id = "web.learned-decode-limit"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function learnedDecodeLimitAction("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "clearing an exact learned limit restores the ordinary HDR remux"
+
+[[decisions]]
 id = "web.supply-rescue"
 source = "crates/plurxd/src/web/playback-policy.js"
 source_anchor = "function decideRung("
