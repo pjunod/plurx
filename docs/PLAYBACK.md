@@ -561,6 +561,10 @@ the transition ends. Playlist startup and the watchdog likewise re-confirm
 terminal child observations inside the boundary, so an old producer can neither
 poison the new producer nor leave it unmonitored. The boundary is per session;
 a slow replacement does not block another viewer's playlist or status work.
+Session retirement owns that same transition before removing the manager entry
+and keeps it through producer kill and scratch deletion. A replacement that won
+first is therefore published and then killed by teardown; a retirement that won
+first leaves a monotonic lifetime verdict that refuses any later replacement.
 
 ## Persistent stalls — one bounded recovery, with an outcome
 

@@ -1252,6 +1252,11 @@ struct Session {
     /// with another inside this same session. The predecessor's non-zero kill
     /// status is neither a terminal playlist verdict nor a watchdog exit.
     replacing_child: AtomicBool,
+    /// Monotonic lifetime verdict set while teardown owns `child_transition`,
+    /// before the session leaves the manager. A fallback that reaches the
+    /// same gate later must not publish into this retired session even while
+    /// its scratch directory still exists.
+    retired: AtomicBool,
     #[cfg(test)]
     replacement_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Test-only seam after a watchdog has chosen `Done` or `Stall`, before it
@@ -1264,6 +1269,10 @@ struct Session {
     /// has decided to replace but reaches the gate after the watchdog.
     #[cfg(test)]
     watchdog_transition_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Test-only proof that teardown reached the shared transition before a
+    /// paused replacement is released.
+    #[cfg(test)]
+    retirement_started: AtomicBool,
     /// Served from the pre-transcode cache.
     ///
     /// Two things follow, and the second is the dangerous one. A cached
@@ -1475,13 +1484,19 @@ impl Session {
     ///
     /// The copy reader decides `Unsupported` outside this gate. In between
     /// that decision and acquiring it, the lifetime watchdog may win, observe
-    /// `Done` or `Stall`, and end. Re-checking the directory and failure flag
-    /// under the gate prevents a failed or retired session from receiving a
-    /// successor. An exited child is still replaceable: the caller re-arms a
-    /// watchdog synchronously when it publishes that successor.
+    /// `Done` or `Stall`, and end. Re-checking the lifetime and failure
+    /// verdicts under the gate prevents a failed or retired session from
+    /// receiving a successor. Directory existence is only a scratch fact,
+    /// not session liveness: teardown can remove the manager entry before its
+    /// asynchronous deletion completes. An exited child is still replaceable:
+    /// the caller re-arms a watchdog synchronously when it publishes that
+    /// successor.
     async fn begin_copy_child_replacement(&self) -> Option<ChildReplacement<'_>> {
         let replacement = self.begin_child_replacement().await;
-        if self.failed.load(Relaxed) || tokio::fs::metadata(&self.dir).await.is_err() {
+        if self.retired.load(Acquire)
+            || self.failed.load(Relaxed)
+            || tokio::fs::metadata(&self.dir).await.is_err()
+        {
             return None;
         }
         {
@@ -3013,12 +3028,15 @@ impl TranscodeManager {
             child_transition: Mutex::new(()),
             watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_transition_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retirement_started: AtomicBool::new(false),
             cached: true,
             _cache_reader: Some(cache_reader),
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -4318,24 +4336,20 @@ impl TranscodeManager {
     /// the time and never anyone else's, which is exactly the scope wanted.
     async fn reap_superseded(&self, playback_id: &str) {
         let doomed: Vec<(String, Arc<Session>)> = {
-            let mut sessions = self.sessions.lock().await;
-            let ids: Vec<String> = sessions
+            let sessions = self.sessions.lock().await;
+            sessions
                 .iter()
                 .filter(|(_, s)| s.playback_id == playback_id)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| sessions.remove(&id).map(|s| (id, s)))
+                .map(|(id, session)| (id.clone(), Arc::clone(session)))
                 .collect()
         };
         for (session_id, session) in doomed {
-            // Before the kill, and before the caller goes on to ask for a slot
-            // of its own: a player replacing its own session must not have to
-            // queue behind the session it just replaced — on either pool.
-            session.release_hardware();
-            session.release_software();
-            session.kill_child().await;
-            session.discard_dir().await;
+            // Retirement releases both admission pools before the caller goes
+            // on to ask for a slot of its own. A player replacing its own
+            // session must not queue behind the session it just replaced.
+            if !self.retire_session(&session_id, &session).await {
+                continue;
+            }
             self.emit_session_event(
                 &session_id,
                 &session,
@@ -4625,12 +4639,15 @@ impl TranscodeManager {
             child_transition: Mutex::new(()),
             watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_transition_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retirement_started: AtomicBool::new(false),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -5117,12 +5134,15 @@ impl TranscodeManager {
             child_transition: Mutex::new(()),
             watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_transition_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retirement_started: AtomicBool::new(false),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -5213,10 +5233,13 @@ impl TranscodeManager {
                         // the SOURCE for what was a viewer pressing stop,
                         // which is how a good path gets a bad reputation.
                         //
-                        // The session directory is the test, because every
-                        // teardown path removes it (`Session::discard_dir`)
-                        // and `failed` is set by none of them.
-                        if session.failed.load(Relaxed) || tokio::fs::metadata(&dir).await.is_err()
+                        // This is only the cheap preflight. The lifetime
+                        // verdict is rechecked after acquiring the shared
+                        // transition below, because scratch deletion trails
+                        // manager retirement and cannot prove liveness.
+                        if session.retired.load(Acquire)
+                            || session.failed.load(Relaxed)
+                            || tokio::fs::metadata(&dir).await.is_err()
                         {
                             return;
                         }
@@ -5414,6 +5437,38 @@ impl TranscodeManager {
         );
     }
 
+    /// Linearize manager retirement with producer replacement.
+    ///
+    /// Replacement holds `child_transition` until a successor is published.
+    /// Teardown takes the same gate before removing the manager entry and
+    /// keeps it through process kill and scratch deletion. Whichever wins is
+    /// therefore complete before the other can act: a late replacement sees
+    /// `retired`, while a late retirement kills the published successor.
+    async fn retire_session(&self, session_id: &str, session: &Arc<Session>) -> bool {
+        #[cfg(test)]
+        session.retirement_started.store(true, Release);
+        let _transition = session.child_transition.lock().await;
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let still_live = sessions
+                .get(session_id)
+                .is_some_and(|active| Arc::ptr_eq(active, session));
+            if still_live {
+                session.retired.store(true, Release);
+                sessions.remove(session_id);
+            }
+            still_live
+        };
+        if !removed {
+            return false;
+        }
+        session.release_hardware();
+        session.release_software();
+        session.kill_child().await;
+        session.discard_dir().await;
+        true
+    }
+
     /// End one session now. True if it existed.
     ///
     /// `reason` distinguishes the two callers in the log, because they mean
@@ -5421,13 +5476,12 @@ impl TranscodeManager {
     /// routine, and an admin killing one from the activity page is somebody
     /// intervening.
     pub async fn stop_session(&self, session_id: &str, reason: &'static str) -> bool {
-        let Some(session) = self.sessions.lock().await.remove(session_id) else {
+        let Some(session) = self.sessions.lock().await.get(session_id).cloned() else {
             return false;
         };
-        session.release_hardware();
-        session.release_software();
-        session.kill_child().await;
-        session.discard_dir().await;
+        if !self.retire_session(session_id, &session).await {
+            return false;
+        }
         let event_reason = if reason.contains("released") {
             "client_released"
         } else if reason.contains("admin") {
@@ -5956,13 +6010,11 @@ impl TranscodeManager {
                 }
             }
             for (id, session, idle_seconds, last_request) in expired {
-                self.sessions.lock().await.remove(&id);
-                session.release_hardware();
-                session.release_software();
                 // Kills a suspended child too — SIGKILL is not blockable and
                 // does not need the process scheduled to take effect.
-                session.kill_child().await;
-                session.discard_dir().await;
+                if !self.retire_session(&id, &session).await {
+                    continue;
+                }
                 let end_reason = if session.failed.load(Relaxed) {
                     "failed"
                 } else {
@@ -7879,12 +7931,15 @@ mod tests {
             child_transition: Mutex::new(()),
             watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_transition_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retirement_started: AtomicBool::new(false),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -9069,12 +9124,15 @@ mod tests {
             child_transition: Mutex::new(()),
             watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_transition_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retirement_started: AtomicBool::new(false),
             cached,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -9454,6 +9512,96 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn winning_done_watchdog_rearms_for_a_late_copy_replacement() {
         assert_watchdog_first_copy_replacement(WatchNext::Done).await;
+    }
+
+    /// The copy reader can decide `Unsupported` immediately before a viewer
+    /// stops the session. If replacement already owns `child_transition`,
+    /// teardown must wait for successor publication and then kill that
+    /// successor; removing the manager entry independently lets an untracked
+    /// encoder survive the stop.
+    #[tokio::test]
+    async fn stop_waits_for_copy_replacement_and_kills_its_successor() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let session = watchdog_session(dir.path(), Some(long_running_child()), false);
+        let pause = Arc::new(tokio::sync::Barrier::new(2));
+        *session
+            .replacement_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let manager = Arc::new(TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert("retirement-race".into(), Arc::clone(&session));
+
+        let replacement = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                let replacement = session
+                    .begin_copy_child_replacement()
+                    .await
+                    .expect("the live copy session may begin fallback");
+                *session.child.lock().await = Some(long_running_child());
+                drop(replacement);
+            }
+        });
+        pause.wait().await;
+
+        let stop = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                assert!(manager.stop_session("retirement-race", "test").await);
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !session.retirement_started.load(Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop must reach the shared transition");
+        pause.wait().await;
+
+        replacement.await.expect("copy fallback task");
+        stop.await.expect("stop task");
+        assert!(
+            manager
+                .sessions
+                .lock()
+                .await
+                .get("retirement-race")
+                .is_none(),
+            "the stopped session must stay retired"
+        );
+        assert!(
+            session
+                .child
+                .lock()
+                .await
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_)))),
+            "no replacement producer may survive session retirement"
+        );
+
+        // Scratch is not the lifetime oracle. Even if a stale directory is
+        // present again after teardown, the monotonic retirement verdict must
+        // refuse an already-decided `Unsupported` fallback.
+        tokio::fs::create_dir_all(&session.dir)
+            .await
+            .expect("recreate stale scratch");
+        assert!(
+            session.begin_copy_child_replacement().await.is_none(),
+            "a retired session must never publish another producer"
+        );
     }
 
     /// Flow control SIGSTOPs a session that has run far enough ahead; that is
