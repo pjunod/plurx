@@ -1,7 +1,30 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const policy = require("../../crates/plurxd/src/web/playback-policy.js");
+
+// The pure policy module is only half of the Auto counter: index.html decides
+// which instant identifies a stall episode before it ever reaches
+// `recordStallEpisode`. Calling the policy helper directly cannot see that
+// wiring, so the counter regressions below run the shipped UI's own function.
+const SHIPPED_UI = fs.readFileSync(
+  path.join(__dirname, "../../crates/plurxd/src/web/index.html"),
+  "utf8",
+);
+
+// Every function these tests borrow is declared at column zero in one inline
+// <script>, so the next top-level `function` is a reliable terminator and no
+// brace/string parsing is needed. A rename fails loudly rather than silently
+// testing nothing.
+function shippedSource(name) {
+  const start = SHIPPED_UI.indexOf(`\nfunction ${name}(`);
+  assert.notEqual(start, -1, `index.html no longer declares ${name}`);
+  const rest = SHIPPED_UI.slice(start + 1);
+  const end = rest.indexOf("\nfunction ");
+  return (end === -1 ? rest : rest.slice(0, end)).trimEnd();
+}
 
 function test(name, run) {
   try {
@@ -532,6 +555,75 @@ test("two long supply-stall episodes do not satisfy the three-stall rescue", () 
     nowMs: 48_000,
   });
   assert.equal(events.length, 3, "a third real episode reaches the threshold");
+});
+
+test("the shipped counter records one event per pause reported at both edges", () => {
+  let nowMs = 0;
+  const noteAutoStall = new Function(
+    "PlaybackPolicy",
+    "performance",
+    `${shippedSource("noteAutoStall")}\nreturn noteAutoStall;`,
+  )(policy, { now: () => nowMs });
+
+  const player = { abr: { stallEvents: { supply: [], decode: [] } } };
+  // Two real supply pauses. hls.js raises bufferStalledError just after each
+  // one begins; the video element reports the same pause at its end, three
+  // seconds later. Keying on the report instant instead of the wait's start
+  // turns these two pauses into four events and fires the three-stall rescue.
+  for (const startedAt of [5_000, 25_000]) {
+    player.waitAt = startedAt;
+    nowMs = startedAt + 100;
+    noteAutoStall(player, "supply", player.waitAt);
+    nowMs = startedAt + 3_000;
+    noteAutoStall(player, "supply", startedAt);
+    player.waitAt = null;
+  }
+
+  const supplyStalls = player.abr.stallEvents.supply.length;
+  assert.equal(supplyStalls, 2, "two pauses must not become four stall events");
+  assert.equal(
+    policy.decideRung({
+      ladder: serverLadder,
+      currentHeight: 720,
+      estimateKbps: 7000,
+      supplyStalls,
+    }).emergency,
+    false,
+    "two supply pauses must not reach the three-episode rescue",
+  );
+
+  // A third distinct pause still reaches it, so the correction narrows the
+  // counter without disarming the rescue.
+  player.waitAt = 45_000;
+  nowMs = 45_100;
+  noteAutoStall(player, "supply", player.waitAt);
+  assert.equal(player.abr.stallEvents.supply.length, 3);
+  assert.equal(
+    policy.decideRung({
+      ladder: serverLadder,
+      currentHeight: 720,
+      estimateKbps: 7000,
+      supplyStalls: player.abr.stallEvents.supply.length,
+    }).emergency,
+    true,
+  );
+});
+
+test("every shipped stall report carries the wait's start as its identity", () => {
+  // The counter above is only correct if its callers hand it the episode
+  // instant. These are the three reporting paths review finding 1 named.
+  assert.match(
+    SHIPPED_UI,
+    /noteAutoStall\(p,[^;]*p\.waitAt\)/,
+    "the hls.js bufferStalledError report must key on the open wait",
+  );
+  for (const caller of ["endWait", "persistentWait"]) {
+    assert.match(
+      shippedSource(caller),
+      /recordWaitStall\(p,kind,ms,runway,[^;]*,began\)/,
+      `${caller} must report the stall against the instant the wait began`,
+    );
+  }
 });
 
 test("mild pressure needs two samples plus cooldown, dwell, and switch gain", () => {
