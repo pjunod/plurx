@@ -332,6 +332,20 @@ pub(crate) fn prune_priors(
     u64::try_from(changed).map_err(|error| StoreError::Task(error.to_string()))
 }
 
+/// Whether `name` is already a table in this sidecar.
+///
+/// The sidecar migration uses this to stay re-runnable against a database an
+/// earlier build left half-upgraded.
+#[cfg(any(test, feature = "hiqlite-store"))]
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, StoreError> {
+    let found: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(found > 0)
+}
+
 /// One hiqlite voter's explicitly node-local telemetry database.
 #[derive(Clone)]
 #[cfg(any(test, feature = "hiqlite-store"))]
@@ -356,14 +370,35 @@ impl NodeLocalTelemetry {
                  v{SIDECAR_SCHEMA_VERSION}"
             )));
         }
-        if current == 0 {
-            conn.execute_batch(&format!(
-                "BEGIN;\n{PLAYBACK_EVENTS_SCHEMA}\n{NETWORK_PRIORS_SCHEMA}\nCOMMIT;"
-            ))?;
-            conn.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
-        } else if current == 1 {
-            conn.execute_batch(&format!("BEGIN;\n{NETWORK_PRIORS_SCHEMA}\nCOMMIT;"))?;
-            conn.pragma_update(None, "user_version", SIDECAR_SCHEMA_VERSION)?;
+        // The schema and the `user_version` that describes it have to commit
+        // together. `PRAGMA user_version` writes the database header through
+        // the pager, so it rolls back with the DDL when it shares the
+        // transaction; stamping it after a separate COMMIT leaves a window
+        // where a kill strands a v1 sidecar that already owns `network_priors`,
+        // and the next startup re-runs the CREATE and refuses to open at all.
+        //
+        // Each CREATE is also skipped when its table is already there, so a
+        // sidecar torn by a build that predates this stays recoverable instead
+        // of failing every restart forever.
+        if current < SIDECAR_SCHEMA_VERSION {
+            let mut migration = String::from("BEGIN;\n");
+            if !table_exists(&conn, "playback_events")? {
+                migration.push_str(PLAYBACK_EVENTS_SCHEMA);
+                migration.push('\n');
+            }
+            if !table_exists(&conn, "network_priors")? {
+                migration.push_str(NETWORK_PRIORS_SCHEMA);
+                migration.push('\n');
+            }
+            migration.push_str(&format!(
+                "PRAGMA user_version = {SIDECAR_SCHEMA_VERSION};\nCOMMIT;"
+            ));
+            conn.execute_batch(&migration).map_err(|error| {
+                StoreError::Migration(format!(
+                    "migrating telemetry sidecar from v{current} to \
+                     v{SIDECAR_SCHEMA_VERSION}: {error}"
+                ))
+            })?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -753,5 +788,64 @@ mod tests {
                 .expect("prune migrated prior"),
             1
         );
+    }
+
+    /// A sidecar killed between the v1→v2 DDL commit and its `user_version`
+    /// stamp must still open. Before the migration became one transaction that
+    /// skips a table it already has, this state made every subsequent startup
+    /// fail with `table network_priors already exists` — a voter that could
+    /// never boot again.
+    #[tokio::test]
+    async fn sidecar_recovers_from_an_interrupted_v1_migration() {
+        let directory = tempfile::tempdir().expect("sidecar directory");
+        let path = directory.path().join("telemetry.db");
+        let conn = Connection::open(&path).expect("seed sidecar");
+        conn.execute_batch(PLAYBACK_EVENTS_SCHEMA)
+            .expect("v1 telemetry schema");
+        conn.execute(
+            "INSERT INTO playback_events (at_unix_ms, event) VALUES (10, 'ttff')",
+            [],
+        )
+        .expect("seed event");
+        // The interrupted upgrade: the new table is committed, the version is
+        // not.
+        conn.execute_batch(NETWORK_PRIORS_SCHEMA)
+            .expect("committed v2 table");
+        observe_prior(
+            &conn,
+            &observation("192.0.2.0/24", Some(4_000), Some(720), 15),
+        )
+        .expect("seed prior");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("stale v1 marker");
+        drop(conn);
+
+        let sidecar = NodeLocalTelemetry::open(&path).expect("repair interrupted migration");
+        assert_eq!(
+            sidecar
+                .events(PlaybackEventQuery {
+                    limit: 10,
+                    ..PlaybackEventQuery::default()
+                })
+                .await
+                .expect("preserved events")
+                .len(),
+            1
+        );
+        let prior = sidecar
+            .prior(7, "safari".to_owned(), "192.0.2.0/24".to_owned())
+            .await
+            .expect("read preserved prior")
+            .expect("the committed prior survives the repair");
+        assert_eq!(prior.sustained_kbps, Some(4_000));
+        assert_eq!(prior.worst_rung_height, Some(720));
+
+        // The repair finished the upgrade rather than leaving it to be retried
+        // on every restart.
+        let stamped = Connection::open(&path).expect("reopen sidecar");
+        let version: i64 = stamped
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("stamped version");
+        assert_eq!(version, SIDECAR_SCHEMA_VERSION);
     }
 }
