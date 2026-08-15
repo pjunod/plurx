@@ -158,6 +158,17 @@ fn lang_is(code: &Option<String>, targets: &[&str]) -> bool {
     }
 }
 
+/// Whether the shared cold-start policy should prefer original-language audio.
+///
+/// Today that policy is the dual-audio anime rule: a Japanese track alongside
+/// at least one alternative selects Japanese and pairs it with subtitles. Keep
+/// the predicate beside [`select_tracks`] so detail responses, `/decision`, and
+/// delivery endpoints cannot grow subtly different definitions of "anime
+/// original".
+pub fn prefers_original_audio(audio: &[AudioStream]) -> bool {
+    audio.len() > 1 && audio.iter().any(|track| lang_is(&track.language, JAPANESE))
+}
+
 /// True for image-based subtitle formats that must be burned in (can't be
 /// rendered as text by clients).
 pub fn is_bitmap_subtitle(codec: &str) -> bool {
@@ -334,6 +345,20 @@ mod tests {
         let sel = select_tracks(&a, &s, true, &LangPrefs::default());
         assert_eq!(sel.audio_index, Some(1)); // Japanese, not the default dub
         assert_eq!(sel.subtitle_index, Some(0)); // full English subs, not forced
+    }
+
+    #[test]
+    fn original_audio_rule_requires_japanese_plus_an_alternative() {
+        assert!(!prefers_original_audio(&[]));
+        assert!(!prefers_original_audio(&[audio(0, "jpn", true)]));
+        assert!(!prefers_original_audio(&[
+            audio(0, "eng", true),
+            audio(1, "fre", false),
+        ]));
+        assert!(prefers_original_audio(&[
+            audio(0, "eng", true),
+            audio(1, "ja", false),
+        ]));
     }
 
     #[test]

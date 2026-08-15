@@ -230,6 +230,16 @@ the physical Apple/Android device matrix remains a release acceptance step.
   HDR), overview, and a labeled spec block per version (Video / Audio / File).
   Book details instead label Ebook versus Audiobook, show audio parts and
   chapters where applicable, and expose the correct Open or Play action.
+- **Track facts are ready before playback.** Every file in the native item-detail
+  response carries its complete audio/subtitle lists plus `playback_defaults`:
+  the exact audio and subtitle indices the shared server policy would select,
+  the configured preferred language for each, and whether that language was
+  selected · is available but not selected · is missing · is unknown because
+  a stream lacks a language tag · or the file has no tracks of that kind.
+  Clients can therefore say "no English subtitles" only when the stored facts
+  prove it, without reading admin settings, probing media, or opening a
+  playback session. Detail rendering in the first-party clients lands in the
+  client-specific follow-ups.
 - **Search** across the library (SQLite FTS5), debounced from the header on every
   page.
 - **Progress + watched indicators** on posters: a glowing progress bar for
@@ -283,6 +293,17 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   English/English/Auto out of the box. The same rule flags default tracks at
   `/decision` and picks the transcode burn-in, so every path agrees; 2- and
   3-letter language tags match each other (`de` = `ger` = `deu`).
+- **Selection-aware preflight:** `/decision` accepts a request-local audio index
+  and subtitle index (`-1` means Off). The selected audio codec participates in
+  direct/remux/transcode compatibility, and the response echoes the effective
+  indices plus whether the selected subtitle needs burn-in. A decodable default
+  track can no longer hide the cost of an incompatible alternative. The returned
+  delivery plan carries the choice too — the remux URL names the track and the
+  session plans repeat it — so following the plan plays the track the viewer
+  picked; selecting a track the raw file cannot present alone is reported as a
+  remux instead of a direct play that would quietly deliver a different
+  language. Omitting both selections keeps the existing policy-default decision;
+  neither form writes Playback defaults or starts a stream.
 - **Audio-sync correction (per file):** the player's **⇄ Sync** menu nudges
   audio ±50/±250 ms and persists the offset to the file (`PUT
   /files/{id}/audio-offset`), so a badly-muxed release stays fixed for

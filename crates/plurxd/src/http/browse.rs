@@ -328,6 +328,12 @@ pub async fn item_detail(
     // wrong container mount) instead of opening a dead player. One stat per
     // file — cheap for the handful a movie/episode has. Admins also get the
     // full path back so they can see what to fix.
+    //
+    // Track defaults are independent of that availability check: they use the
+    // stored stream rows plus one settings snapshot, never a playback decision
+    // or a media probe. Missing/unmounted files can therefore still explain
+    // which tracks they contain and which policy choice would apply.
+    let playback_prefs = state.transcode.lang_prefs().await;
     let mut file_dtos: Vec<FileDto> = Vec::with_capacity(files.len());
     let mut part_offset_ms = 0_i64;
     for f in files {
@@ -335,7 +341,7 @@ pub async fn item_detail(
         let available = tokio::fs::metadata(&path).await.is_ok();
         let raw_probe = state.store.get_file_probe_json(f.id).await?;
         let duration_ms = f.duration_ms.unwrap_or(0).max(0);
-        let mut dto = FileDto::from(f);
+        let mut dto = FileDto::from_media_file(f, &playback_prefs);
         dto.available = available;
         dto.part_offset_ms = part_offset_ms;
         dto.chapters = chapters_from_probe_json(raw_probe.as_deref());
