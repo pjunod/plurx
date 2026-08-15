@@ -282,14 +282,7 @@ pub async fn create(
         .await
         // A reused request id asking for a different stream is the client's
         // mistake, not the server's; say which it is.
-        .map_err(|e| {
-            if e.contains("already used") {
-                ApiError::Conflict(e)
-            } else {
-                tracing::warn!(file = id, "session create failed: {e}");
-                ApiError::Internal(e)
-            }
-        })?;
+        .map_err(|error| session_start_error(id, error))?;
     let playlist_url = if native_subtitles {
         // Give the multivariant playlist its own path. AVPlayer caches HLS
         // resources by URL and can otherwise conflate `index.m3u8?native=1`
@@ -316,6 +309,18 @@ pub async fn create(
         prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         delivered_dynamic_range: delivered,
     }))
+}
+
+fn session_start_error(file_id: i64, error: String) -> ApiError {
+    if error.contains("already used") {
+        return ApiError::Conflict(error);
+    }
+    tracing::warn!(file = file_id, "session create failed: {error}");
+    if crate::transcode::is_retryable_capacity_error(&error) {
+        ApiError::ServiceUnavailable(error)
+    } else {
+        ApiError::Internal(error)
+    }
 }
 
 /// DELETE /api/v1/hls/:session — the player is done with this stream.
@@ -1543,6 +1548,18 @@ fn segment_content_type(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_admission_failure_is_a_retryable_503() {
+        let capacity =
+            "transcode capacity is temporarily unavailable: background encoding did not yield";
+        let response = session_start_error(42, capacity.into()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(
+            session_start_error(42, "ffmpeg failed".into()),
+            ApiError::Internal(_)
+        ));
+    }
 
     #[test]
     fn fmp4_media_segments_use_the_iso_segment_mime_type() {
