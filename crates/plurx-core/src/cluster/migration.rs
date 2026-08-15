@@ -143,6 +143,18 @@ pub struct SelectedStore {
 
 #[cfg(feature = "hiqlite-store")]
 impl SelectedStore {
+    /// Read-only watch-state replication projection for the server API.
+    #[must_use]
+    pub fn replication_monitor(&self) -> status::ReplicationMonitor {
+        match (&self.backend, &self.local_client) {
+            (SelectedBackend::Replicated, Some(client)) => {
+                status::ReplicationMonitor::replicated(client.clone())
+            }
+            (SelectedBackend::SqliteRecovery, None) => status::ReplicationMonitor::sqlite(),
+            _ => unreachable!("selected backend and local client must agree"),
+        }
+    }
+
     /// Flush and stop the selected local voter before the Tokio runtime exits.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
         if let Some(client) = &self.local_client {
@@ -1549,5 +1561,413 @@ mod tests {
                 .contains("does not match its content-addressed name"),
             "unexpected error: {error}"
         );
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+pub mod status {
+    //! User-facing replication status derived from the selected durable backend.
+    //!
+    //! This is deliberately a read-only projection. Membership changes belong to
+    //! M3; this module only turns the backend and Raft metrics the daemon already
+    //! has into an honest answer about watch-state convergence.
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Serialize};
+
+    #[cfg(feature = "hiqlite-store")]
+    use hiqlite::Client;
+    #[cfg(feature = "hiqlite-store")]
+    use std::sync::{Arc, Mutex};
+
+    /// The durable backend serving this daemon process.
+    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ReplicationBackend {
+        Sqlite,
+        Replicated,
+    }
+
+    /// The conclusion an operator should act on, not a raw Raft server state.
+    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ReplicationHealth {
+        /// SQLite has no replication peer and must not be labelled "synced".
+        SingleNode,
+        InSync,
+        Degraded,
+    }
+
+    /// Safe, user-visible watch-state replication status.
+    ///
+    /// It carries no node address, media path, account, token, or library data.
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub struct ReplicationStatus {
+        pub backend: ReplicationBackend,
+        pub health: ReplicationHealth,
+        /// More than one voter is present. The membership roster belongs to M3.
+        pub clustered: bool,
+        /// Raft term/index of the last entry applied to this node.
+        pub last_applied_term: Option<u64>,
+        pub last_applied_index: Option<u64>,
+        /// Largest known applied-index gap, whether local or on a reporting peer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub behind_by: Option<u64>,
+        /// Unix seconds when this process last positively observed convergence.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub last_converged_at: Option<i64>,
+        /// Unix seconds when this projection was sampled.
+        pub checked_at: i64,
+        /// Plain-language interpretation for clients that do not speak Raft.
+        pub explanation: String,
+    }
+
+    /// Backend-neutral facts needed to classify one replicated-store sample.
+    ///
+    /// The cluster harness constructs this from real three-voter metrics too, so
+    /// the degraded contract exercises this production classifier rather than a
+    /// test-only imitation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ReplicationObservation {
+        pub running: bool,
+        pub leader_known: bool,
+        pub voter_count: usize,
+        pub last_log_index: Option<u64>,
+        pub last_applied_term: Option<u64>,
+        pub last_applied_index: Option<u64>,
+        /// Leader-known match index for every other voter. `None` means the leader
+        /// has not observed that voter at any index yet. Followers have no map.
+        pub peer_matched_indexes: Option<Vec<Option<u64>>>,
+    }
+
+    /// Live status reader kept beside the selected store in daemon state.
+    #[derive(Clone)]
+    pub struct ReplicationMonitor {
+        backend: ReplicationBackend,
+        #[cfg(feature = "hiqlite-store")]
+        client: Option<Client>,
+        #[cfg(feature = "hiqlite-store")]
+        previous: Arc<Mutex<Option<ReplicationStatus>>>,
+    }
+
+    impl ReplicationMonitor {
+        /// A local SQLite install: truthful single-node status, never "synced".
+        #[must_use]
+        pub fn sqlite() -> Self {
+            Self {
+                backend: ReplicationBackend::Sqlite,
+                #[cfg(feature = "hiqlite-store")]
+                client: None,
+                #[cfg(feature = "hiqlite-store")]
+                previous: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Monitor a local Hiqlite voter through the same client the Store uses.
+        #[cfg(feature = "hiqlite-store")]
+        #[must_use]
+        pub fn replicated(client: Client) -> Self {
+            Self {
+                backend: ReplicationBackend::Replicated,
+                client: Some(client),
+                previous: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Read the current projection without changing membership or durable data.
+        pub async fn status(&self) -> ReplicationStatus {
+            let checked_at = unix_seconds();
+            if self.backend == ReplicationBackend::Sqlite {
+                return ReplicationStatus {
+                    backend: self.backend,
+                    health: ReplicationHealth::SingleNode,
+                    clustered: false,
+                    last_applied_term: None,
+                    last_applied_index: None,
+                    behind_by: None,
+                    last_converged_at: None,
+                    checked_at,
+                    explanation: "Watch progress is stored only on this server; this SQLite node is not clustered."
+                        .to_owned(),
+                };
+            }
+
+            #[cfg(feature = "hiqlite-store")]
+            {
+                let previous = self.previous();
+                let client = self
+                    .client
+                    .as_ref()
+                    .expect("replicated monitor must carry a client");
+                let status = match client.metrics_db().await {
+                    Ok(metrics) => {
+                        let peer_matched_indexes =
+                            metrics.replication.as_ref().map(|replication| {
+                                replication
+                                    .iter()
+                                    .filter(|(node_id, _)| **node_id != metrics.id)
+                                    .map(|(_, applied)| applied.as_ref().map(|log| log.index))
+                                    .collect()
+                            });
+                        let observation = ReplicationObservation {
+                            running: metrics.running_state.is_ok(),
+                            leader_known: metrics.current_leader.is_some(),
+                            voter_count: metrics.membership_config.voter_ids().count(),
+                            last_log_index: metrics.last_log_index,
+                            last_applied_term: metrics
+                                .last_applied
+                                .as_ref()
+                                .map(|log| log.leader_id.term),
+                            last_applied_index: metrics.last_applied.as_ref().map(|log| log.index),
+                            peer_matched_indexes,
+                        };
+                        classify_replicated(&observation, previous.as_ref(), checked_at)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "reading replicated-store status failed");
+                        unavailable(previous.as_ref(), checked_at)
+                    }
+                };
+                self.remember(status.clone());
+                status
+            }
+
+            #[cfg(not(feature = "hiqlite-store"))]
+            unreachable!("replicated backend requires the hiqlite-store feature")
+        }
+
+        #[cfg(feature = "hiqlite-store")]
+        fn previous(&self) -> Option<ReplicationStatus> {
+            self.previous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        #[cfg(feature = "hiqlite-store")]
+        fn remember(&self, status: ReplicationStatus) {
+            *self
+                .previous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status);
+        }
+    }
+
+    #[cfg(any(feature = "hiqlite-store", test))]
+    fn classify_replicated(
+        observation: &ReplicationObservation,
+        previous: Option<&ReplicationStatus>,
+        checked_at: i64,
+    ) -> ReplicationStatus {
+        let clustered = observation.voter_count > 1;
+        let local_lag = match (observation.last_log_index, observation.last_applied_index) {
+            (Some(log), Some(applied)) => log.saturating_sub(applied),
+            (Some(log), None) => log,
+            _ => 0,
+        };
+
+        let expected_peers = observation.voter_count.saturating_sub(1);
+        let mut unknown_peer = false;
+        let mut peer_lag = 0_u64;
+        if let Some(peers) = &observation.peer_matched_indexes {
+            unknown_peer = peers.len() < expected_peers;
+            if let Some(target) = observation.last_applied_index {
+                for applied in peers {
+                    match applied {
+                        Some(index) => peer_lag = peer_lag.max(target.saturating_sub(*index)),
+                        None => unknown_peer = true,
+                    }
+                }
+            }
+        }
+
+        // Once every voter was positively converged, a now-unreported peer is
+        // known to be at least as far behind as the local applied-index advance.
+        // This turns the common "voter disappeared, then a write committed"
+        // case into a useful lower bound without inventing an exact peer index.
+        let inferred_peer_lag = if unknown_peer {
+            previous
+                .filter(|status| status.health == ReplicationHealth::InSync)
+                .and_then(|status| status.last_applied_index)
+                .zip(observation.last_applied_index)
+                .map_or(0, |(previous_index, current_index)| {
+                    current_index.saturating_sub(previous_index)
+                })
+        } else {
+            0
+        };
+
+        let degraded = !observation.running
+            || !observation.leader_known
+            || local_lag > 0
+            || peer_lag > 0
+            || (observation.peer_matched_indexes.is_some() && unknown_peer);
+        let behind_by = local_lag.max(peer_lag).max(inferred_peer_lag);
+        let last_converged_at = if degraded {
+            previous.and_then(|status| status.last_converged_at)
+        } else {
+            Some(checked_at)
+        };
+        let explanation = if !degraded && clustered {
+            "Watch progress is replicated; this node has applied the latest known change and every reporting peer has received it."
+                .to_owned()
+        } else if !degraded {
+            "Replicated storage is active, but this is currently a one-node cluster; there is no second node to sync with."
+                .to_owned()
+        } else if local_lag > 0 {
+            "Watch progress replication is behind on this node. Keep it running while it catches up."
+                .to_owned()
+        } else if peer_lag > 0 || unknown_peer {
+            "Watch progress replication is behind on one or more nodes. Keep the cluster online while it catches up."
+                .to_owned()
+        } else {
+            "Replication status cannot be confirmed, so watch progress may not yet appear on every node."
+                .to_owned()
+        };
+
+        ReplicationStatus {
+            backend: ReplicationBackend::Replicated,
+            health: if degraded {
+                ReplicationHealth::Degraded
+            } else {
+                ReplicationHealth::InSync
+            },
+            clustered,
+            last_applied_term: observation.last_applied_term,
+            last_applied_index: observation.last_applied_index,
+            behind_by: (behind_by > 0).then_some(behind_by),
+            last_converged_at,
+            checked_at,
+            explanation,
+        }
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    fn unavailable(previous: Option<&ReplicationStatus>, checked_at: i64) -> ReplicationStatus {
+        ReplicationStatus {
+            backend: ReplicationBackend::Replicated,
+            health: ReplicationHealth::Degraded,
+            clustered: previous.is_some_and(|status| status.clustered),
+            last_applied_term: previous.and_then(|status| status.last_applied_term),
+            last_applied_index: previous.and_then(|status| status.last_applied_index),
+            behind_by: previous.and_then(|status| status.behind_by),
+            last_converged_at: previous.and_then(|status| status.last_converged_at),
+            checked_at,
+            explanation:
+                "Replication status cannot be confirmed, so watch progress may not yet appear on every node."
+                    .to_owned(),
+        }
+    }
+
+    fn unix_seconds() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs() as i64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn converged(voters: usize) -> ReplicationObservation {
+            ReplicationObservation {
+                running: true,
+                leader_known: true,
+                voter_count: voters,
+                last_log_index: Some(42),
+                last_applied_term: Some(7),
+                last_applied_index: Some(42),
+                peer_matched_indexes: (voters > 1).then(|| vec![Some(42); voters - 1]),
+            }
+        }
+
+        #[tokio::test]
+        async fn sqlite_is_single_node_instead_of_misleadingly_synced() {
+            let status = ReplicationMonitor::sqlite().status().await;
+            assert_eq!(status.backend, ReplicationBackend::Sqlite);
+            assert_eq!(status.health, ReplicationHealth::SingleNode);
+            assert!(!status.clustered);
+            assert_eq!(status.last_converged_at, None);
+            assert!(status.explanation.contains("stored only on this server"));
+        }
+
+        #[test]
+        fn one_voter_replicated_store_is_in_sync_but_not_clustered() {
+            let status = classify_replicated(&converged(1), None, 100);
+            assert_eq!(status.health, ReplicationHealth::InSync);
+            assert!(!status.clustered);
+            assert_eq!(status.last_applied_term, Some(7));
+            assert_eq!(status.last_applied_index, Some(42));
+            assert_eq!(status.last_converged_at, Some(100));
+            assert!(status.explanation.contains("one-node cluster"));
+        }
+
+        #[test]
+        fn local_apply_lag_is_degraded_and_keeps_the_last_convergence() {
+            let prior = classify_replicated(&converged(3), None, 100);
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    last_log_index: Some(47),
+                    last_applied_index: Some(42),
+                    peer_matched_indexes: None,
+                    ..converged(3)
+                },
+                Some(&prior),
+                200,
+            );
+            assert_eq!(status.health, ReplicationHealth::Degraded);
+            assert_eq!(status.behind_by, Some(5));
+            assert_eq!(status.last_converged_at, Some(100));
+            assert!(status.explanation.contains("on this node"));
+        }
+
+        #[test]
+        fn a_lagging_peer_degrades_the_cluster_surface() {
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    peer_matched_indexes: Some(vec![Some(42), Some(37)]),
+                    ..converged(3)
+                },
+                None,
+                200,
+            );
+            assert_eq!(status.health, ReplicationHealth::Degraded);
+            assert_eq!(status.behind_by, Some(5));
+            assert!(status.clustered);
+            assert!(status.explanation.contains("one or more nodes"));
+        }
+
+        #[test]
+        fn an_unknown_peer_is_degraded_instead_of_silently_healthy() {
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    peer_matched_indexes: Some(vec![Some(42)]),
+                    ..converged(3)
+                },
+                None,
+                200,
+            );
+            assert_eq!(status.health, ReplicationHealth::Degraded);
+            assert_eq!(status.behind_by, None);
+        }
+
+        #[test]
+        fn a_missing_peer_after_a_committed_write_has_a_known_minimum_lag() {
+            let prior = classify_replicated(&converged(3), None, 100);
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    last_log_index: Some(45),
+                    last_applied_index: Some(45),
+                    peer_matched_indexes: Some(vec![Some(45)]),
+                    ..converged(3)
+                },
+                Some(&prior),
+                200,
+            );
+            assert_eq!(status.health, ReplicationHealth::Degraded);
+            assert_eq!(status.behind_by, Some(3));
+            assert_eq!(status.last_converged_at, Some(100));
+        }
     }
 }

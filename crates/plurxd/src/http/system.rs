@@ -102,6 +102,8 @@ pub struct SystemDto {
     pub users: i64,
     pub libraries: usize,
     pub active_transcodes: usize,
+    /// Backend and watch-state convergence, projected without membership data.
+    pub replication: plurx_core::cluster::migration::status::ReplicationStatus,
     /// Hardware encoder slots in use, and the cap
     /// (`transcode.max_hw_sessions`). Reported as a pair because either number
     /// alone is unreadable: a start refused while this says 0 of 2 is a very
@@ -158,6 +160,7 @@ pub async fn system_info(
     let last = requests.last();
     let (by_trigger, notifications) = state.jobs.metrics().snapshot();
     let (hw_in_use, hw_max) = state.transcode.hardware_slots().await;
+    let replication = state.replication.status().await;
     Ok(Json(SystemDto {
         name: state.server_name.clone(),
         version: crate::version::SEMVER,
@@ -168,6 +171,7 @@ pub async fn system_info(
         users: state.store.count_users().await?,
         libraries: state.store.list_libraries().await?.len(),
         active_transcodes: state.transcode.active_sessions().await,
+        replication,
         hw_slots_in_use: hw_in_use,
         hw_slots_max: hw_max,
         scan_requests: requests.clone(),

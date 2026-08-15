@@ -23,6 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
+use plurx_core::cluster::migration::status::{
+    ReplicationHealth, ReplicationMonitor, ReplicationStatus,
+};
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
     OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
@@ -584,6 +587,18 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .require_ok()?;
     }
     cluster.wait_for_voters(&[1, 2, 3]).await?;
+    for node_id in 1..=3 {
+        let status = cluster
+            .wait_for_replication_health(node_id, ReplicationHealth::InSync)
+            .await?;
+        if !status.clustered
+            || status.last_applied_term.is_none()
+            || status.last_applied_index.is_none()
+            || status.last_converged_at.is_none()
+        {
+            bail!("voter {node_id} in-sync status omitted its convergence point: {status:?}");
+        }
+    }
     prove_local_telemetry_sidecars(&mut cluster).await?;
 
     // Every voter exercises an immediate cache read after its acknowledged
@@ -633,6 +648,13 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         )
         .await?
         .require_ok()?;
+    let current_leader = cluster.leader().await?;
+    let degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    if degraded.behind_by.is_none_or(|lag| lag == 0) || degraded.last_converged_at.is_none() {
+        bail!("degraded status omitted known lag or prior convergence: {degraded:?}");
+    }
     cluster.wait_for_equal_dumps().await?;
     let post_loss_key = format!("post_loss.{}", format!("{target:?}").to_ascii_lowercase());
     let post_loss_dump = match cluster.request(survivor, Request::Dump).await? {
@@ -723,6 +745,7 @@ pub enum Request {
     CatalogView,
     RebuildSearch,
     Metrics,
+    ReplicationStatus,
     Ping,
     ReadWithoutQuorum,
     WriteWithoutQuorum,
@@ -747,6 +770,9 @@ pub enum Response {
     Metrics {
         leader: Option<u64>,
         voters: Vec<u64>,
+    },
+    ReplicationStatus {
+        status: ReplicationStatus,
     },
     Error {
         message: String,
@@ -1114,6 +1140,28 @@ impl ClusterProcesses {
         }
     }
 
+    /// Wait for the exact production status projection on one voter.
+    pub async fn wait_for_replication_health(
+        &mut self,
+        node_id: u64,
+        expected: ReplicationHealth,
+    ) -> Result<ReplicationStatus> {
+        let deadline = Instant::now() + self.convergence_timeout;
+        loop {
+            if let Ok(Response::ReplicationStatus { status }) =
+                self.request(node_id, Request::ReplicationStatus).await
+            {
+                if status.health == expected {
+                    return Ok(status);
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("voter {node_id} did not report replication health {expected:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn wait_for_equal_dumps(&mut self) -> Result<()> {
         let deadline = Instant::now() + self.convergence_timeout;
         loop {
@@ -1353,6 +1401,7 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .context("voter health timed out")?;
+    let replication = ReplicationMonitor::replicated(client.clone());
 
     write_response(&Response::Ready {
         node_id: launch.node_id,
@@ -1368,7 +1417,9 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     let mut input = BufReader::new(stdin).lines();
     while let Some(line) = input.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, &client, &telemetry_path, &mut store).await,
+            Ok(request) => {
+                handle_request(request, &client, &replication, &telemetry_path, &mut store).await
+            }
             Err(error) => Err(error.into()),
         };
         match response {
@@ -1387,6 +1438,7 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
 async fn handle_request(
     request: Request,
     client: &Client,
+    replication: &ReplicationMonitor,
     telemetry_path: &Path,
     store: &mut Option<HiqliteAuthStore>,
 ) -> Result<Response> {
@@ -1451,6 +1503,24 @@ async fn handle_request(
             {
                 bail!("post-loss acknowledged write was not readable");
             }
+            // The lag signal must be driven by the user-visible state this
+            // feature describes, not by an unrelated synthetic Raft entry.
+            let user = store
+                .get_user_by_username("survivor-1")
+                .await?
+                .context("post-loss watch user is missing")?;
+            let movie = store
+                .search_items("Replicated Catalog Proof 1", 10)
+                .await?
+                .into_iter()
+                .find(|item| item.item.title == "Replicated Catalog Proof 1")
+                .context("post-loss watch item is missing")?;
+            let watch = store
+                .put_progress(user.id, movie.item.id, 60_000, Some(120_000))
+                .await?;
+            if watch.position_ms != 60_000 {
+                bail!("post-loss watch progress was not acknowledged");
+            }
             Ok(Response::Ok)
         }
         Request::VerifyProof => {
@@ -1480,6 +1550,9 @@ async fn handle_request(
                 voters,
             })
         }
+        Request::ReplicationStatus => Ok(Response::ReplicationStatus {
+            status: replication.status().await,
+        }),
         Request::Ping => {
             store_ref(store)?.ping().await?;
             Ok(Response::Ok)

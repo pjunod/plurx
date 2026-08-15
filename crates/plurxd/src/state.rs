@@ -87,6 +87,8 @@ pub struct Dirs {
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    /// Read-only projection of the selected backend's watch-state convergence.
+    pub replication: plurx_core::cluster::migration::status::ReplicationMonitor,
     pub server_name: String,
     /// Stable identity of the node that owns local transcode/offline bytes.
     pub node_id: String,
@@ -162,6 +164,7 @@ impl AppState {
                 // data directory to resolve it from, so nothing sealed under
                 // it is expected to outlive the process.
                 credential_key: Arc::new(CredentialKey::generate()),
+                replication: plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
             },
             store,
             dirs,
@@ -184,6 +187,7 @@ impl AppState {
             node_id,
             scan_prune_percent,
             credential_key,
+            replication,
         } = config;
         let Dirs {
             artwork: artwork_dir,
@@ -227,6 +231,7 @@ impl AppState {
             OfflineManager::new(Arc::clone(&store), Arc::clone(&transcode), node_id.clone());
         AppState {
             store,
+            replication,
             server_name,
             node_id,
             artwork_dir,
@@ -265,6 +270,8 @@ pub struct AppConfig {
     /// verifies. Resolved by `open_store` so a boot that cannot open the
     /// existing Trakt rows fails before any subsystem starts.
     pub credential_key: Arc<CredentialKey>,
+    /// Actual backend selected before HTTP starts; tests default to SQLite.
+    pub replication: plurx_core::cluster::migration::status::ReplicationMonitor,
 }
 
 /// Status of the most recent (or in-flight) scan for one library.
