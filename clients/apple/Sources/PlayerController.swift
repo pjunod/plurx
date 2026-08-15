@@ -916,7 +916,7 @@ final class PlayerController: ObservableObject {
         if activeBurnedSubtitle != nil { return "Transcode · subtitle burn-in" }
         if selectedHeight != nil { return "Transcode · \(selectedHeight!)p" }
         let mode = decision.map(Self.playbackMode) ?? "transcode"
-        let overlay = pgsOverlayTrackIndex == selectedSubtitle ? " · PGS overlay" : ""
+        let overlay = pgsOverlayIsActive ? " · PGS overlay" : ""
         switch mode {
         case "direct": return "Direct play\(overlay)"
         case "remux": return "Remux · HLS\(overlay)"
@@ -928,7 +928,20 @@ final class PlayerController: ObservableObject {
         isDirectPlayback ? "direct_play" : (encoder == "copy" ? "remux" : "transcode")
     }
 
-    var pgsOverlayIsActive: Bool { pgsOverlayTrackIndex == selectedSubtitle }
+    nonisolated static func isPGSOverlayActive(
+        overlayTrackIndex: Int?,
+        selectedSubtitle: Int?
+    ) -> Bool {
+        guard let overlayTrackIndex else { return false }
+        return overlayTrackIndex == selectedSubtitle
+    }
+
+    var pgsOverlayIsActive: Bool {
+        Self.isPGSOverlayActive(
+            overlayTrackIndex: pgsOverlayTrackIndex,
+            selectedSubtitle: selectedSubtitle
+        )
+    }
 
     var observedBitrate: Double? {
         player.currentItem?.accessLog()?.events.last?.observedBitrate

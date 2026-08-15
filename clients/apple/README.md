@@ -12,10 +12,16 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `59` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `60` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 59 keeps the iOS Picture in Picture control
+> same regression suite. Build 60 requires a concrete PGS overlay track before
+> treating a subtitle as an active overlay, so ordinary playback with no
+> selected subtitle keeps its AVKit PiP controller attached. A physical H.264/
+> AAC baseline on iPhone Air (iOS 26.6) and iPad Pro 13-inch (M4, iPadOS 26.6)
+> reached active PiP and returned or stopped cleanly; the separate in-app PGS
+> refusal still needs physical acceptance. Build 59 keeps the iOS Picture in
+> Picture control
 > reachable when AVKit cannot start yet or an in-app PGS overlay blocks system
 > output, bounds the not-ready explanation to five seconds, and rejects stale
 > availability from a detached PiP controller instead of sending a start
