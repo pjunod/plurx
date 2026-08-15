@@ -31,11 +31,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use plurx_core::cluster::{open_store, StoreHandle};
+use plurx_core::cluster::migration::{
+    connect_activated_store, select_daemon_store, SelectedBackend,
+};
 use plurx_core::config::Config;
 use plurx_core::domain::LibraryKind;
 use plurx_core::metadata::{self, AniListClient, TmdbClient};
-use plurx_core::store::{keys, LibraryStore, SettingsStore, SqliteStore, UserStore};
+#[cfg(test)]
+use plurx_core::store::SqliteStore;
+use plurx_core::store::{keys, Store};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
@@ -79,10 +83,11 @@ enum Command {
         )]
         server: String,
     },
-    /// Reset a user's password directly in the database — the recovery path
+    /// Reset a user's password in the activated store — the recovery path
     /// when an admin password is forgotten (admins reset *other* users in
-    /// the web UI). Safe while the server runs (WAL); revokes the user's
-    /// sessions. In Docker: docker exec -it plurxd plurxd reset-password NAME
+    /// the web UI). Requires the server running, because it shares that
+    /// daemon's voter; revokes the user's sessions. In Docker:
+    /// docker exec -it plurxd plurxd reset-password NAME
     ResetPassword {
         /// Username whose password to reset.
         username: String,
@@ -91,8 +96,9 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
-    /// Force provider metadata and artwork back into the local cache. Useful
-    /// after an artwork-quality upgrade; safe beside the running server.
+    /// Force provider metadata and artwork through the activated store. Useful
+    /// after an artwork-quality upgrade; runs beside the server and requires
+    /// it running, because it shares that daemon's voter.
     RefreshMetadata {
         /// Refresh one library id instead of every provider-backed library.
         #[arg(long)]
@@ -128,16 +134,26 @@ async fn dispatch(command: Command, config: Config) -> anyhow::Result<()> {
     }
 }
 
-/// Re-fetch provider-backed metadata without requiring an HTTP admin token.
-/// SQLite WAL permits this maintenance process beside the daemon, and artwork
-/// writes replace the same cache files the ordinary refresh path owns.
+/// Re-fetch provider-backed metadata through the activated replicated store.
+/// The command refuses a legacy-only data directory because only `run` owns
+/// the one-time import and activation sequence.
 async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&config.storage.data_dir)?;
+    let store = connect_activated_store(config).await.context(
+        "connecting to the activated store: an unmigrated data directory needs \
+             `plurxd run` to import it once, and an activated one needs that daemon \
+             running because maintenance commands share its voter rather than \
+             opening a second store",
+    )?;
     let artwork_dir = config.storage.data_dir.join("artwork");
     std::fs::create_dir_all(&artwork_dir)?;
-    let db_path = config.storage.data_dir.join("plurx.db");
-    let store = SqliteStore::open(&db_path)
-        .with_context(|| format!("opening database {}", db_path.display()))?;
+    refresh_metadata_with_store(store, &artwork_dir, library_id).await
+}
+
+async fn refresh_metadata_with_store(
+    store: Arc<dyn Store>,
+    artwork_dir: &std::path::Path,
+    library_id: Option<i64>,
+) -> anyhow::Result<()> {
     let libraries = store.list_libraries().await?;
 
     if let Some(id) = library_id {
@@ -158,9 +174,9 @@ async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::R
             }
             LibraryKind::Shows if library.anime => {
                 let report = metadata::enrich_anime_library(
-                    &store,
+                    store.as_ref(),
                     &AniListClient::new(),
-                    &artwork_dir,
+                    artwork_dir,
                     library.id,
                     true,
                     None,
@@ -174,9 +190,9 @@ async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::R
                     .filter(|key| !key.is_empty())
                     .context("TMDB API key is not configured")?;
                 let report = metadata::enrich_library(
-                    &store,
+                    store.as_ref(),
                     &TmdbClient::new(key),
-                    &artwork_dir,
+                    artwork_dir,
                     Some(library.id),
                     true,
                     None,
@@ -190,7 +206,7 @@ async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::R
 }
 
 /// Console recovery path: rewrite one user's password hash and revoke their
-/// sessions. WAL + busy_timeout make this safe beside a running server.
+/// sessions through the activated replicated store.
 async fn reset_password(
     config: &Config,
     username: &str,
@@ -208,15 +224,26 @@ async fn reset_password(
         "password must be at least 8 characters"
     );
 
-    let db_path = config.storage.data_dir.join("plurx.db");
-    let store =
-        SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    let store = connect_activated_store(config).await.context(
+        "connecting to the activated store: an unmigrated data directory needs \
+             `plurxd run` to import it once, and an activated one needs that daemon \
+             running because maintenance commands share its voter rather than \
+             opening a second store",
+    )?;
+    reset_password_in_store(store.as_ref(), username, &password).await
+}
+
+async fn reset_password_in_store(
+    store: &dyn Store,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
     let user = store
         .get_user_by_username(username)
         .await?
         .with_context(|| format!("no user named `{username}`"))?;
     let hash =
-        plurx_core::auth::hash_password(&password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        plurx_core::auth::hash_password(password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     store.set_password(user.id, &hash).await?;
     let revoked = store.delete_tokens_for_user(user.id).await?;
     println!("password reset for `{username}`; {revoked} session(s) revoked");
@@ -237,26 +264,43 @@ fn read_password(input: &mut impl std::io::BufRead) -> std::io::Result<String> {
 async fn run(config: Config) -> anyhow::Result<()> {
     let logs = init_logging();
 
-    let StoreHandle {
-        store,
-        identity,
-        credential_key,
-    } = open_store(&config)
+    let selected = select_daemon_store(&config)
         .await
-        .with_context(|| format!("opening store in {}", config.storage.data_dir.display()))?;
-
-    let dirs = create_dirs(&config.storage.data_dir)?;
-    let (encoder_caps, system) = probe_system(&config, &store, &dirs.transcode).await?;
-    let parts = Boot {
-        store,
-        identity,
-        credential_key,
-        dirs,
-        encoder_caps,
-        system,
-        logs,
+        .with_context(|| format!("selecting store in {}", config.storage.data_dir.display()))?;
+    // Which backend is serving is not otherwise observable. A recovery boot
+    // binds and serves normally on unreplicated SQLite, so a persistently
+    // failing activation otherwise looks only like a flapping container, with
+    // nothing saying which boots were replicated and which were not.
+    match selected.backend {
+        SelectedBackend::Replicated => {
+            tracing::info!("durable state: one-voter replicated store");
+        }
+        SelectedBackend::SqliteRecovery => tracing::warn!(
+            "durable state: unreplicated SQLite, recovering from an interrupted activation; \
+             this boot is not replicated and the next restart retries the import"
+        ),
+    }
+    let serving = async {
+        let store = Arc::clone(&selected.store);
+        let dirs = create_dirs(&config.storage.data_dir)?;
+        let (encoder_caps, system) = probe_system(&config, &store, &dirs.transcode).await?;
+        let parts = Boot {
+            store,
+            identity: selected.identity.clone(),
+            credential_key: Arc::clone(&selected.credential_key),
+            dirs,
+            encoder_caps,
+            system,
+            logs,
+        };
+        boot(config, parts, start_mdns_advertiser, shutdown_signal()).await
     };
-    boot(config, parts, start_mdns_advertiser, shutdown_signal()).await
+    let result = serving.await;
+    let shutdown = selected
+        .shutdown()
+        .await
+        .context("stopping local Hiqlite voter");
+    result.and(shutdown)
 }
 
 /// What a measured node hands to the server it is about to become.
@@ -1818,7 +1862,6 @@ mod startup_tests {
     #[tokio::test]
     async fn resetting_a_password_revokes_the_sessions_it_replaces() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = config_in(tmp.path());
         let store = store_in(tmp.path());
         let hash = plurx_core::auth::hash_password("original-password").expect("hash");
         let user = store
@@ -1829,19 +1872,10 @@ mod startup_tests {
             .create_token("session-token", user.id, None)
             .await
             .expect("token");
-        drop(store);
+        reset_password_in_store(store.as_ref(), "owner", "a-new-password")
+            .await
+            .expect("reset");
 
-        dispatch(
-            Command::ResetPassword {
-                username: "owner".to_owned(),
-                password: Some("a-new-password".to_owned()),
-            },
-            config.clone(),
-        )
-        .await
-        .expect("reset");
-
-        let store = store_in(tmp.path());
         let after = store
             .get_user_by_username("owner")
             .await
@@ -1885,15 +1919,59 @@ mod startup_tests {
         );
         assert!(error.contains("at least 8 characters"), "{error}");
 
+        let store = store_in(tmp.path());
         let error = format!(
             "{:#}",
-            reset_password(&config, "ghost", Some("a-new-password".to_owned()))
+            reset_password_in_store(store.as_ref(), "ghost", "a-new-password")
                 .await
                 .expect_err("no such user")
         );
         assert!(error.contains("no user named `ghost`"), "{error}");
 
         // And the real account's password is untouched by either failure.
+        let user = store
+            .get_user_by_username("owner")
+            .await
+            .expect("lookup")
+            .expect("user");
+        assert!(plurx_core::auth::verify_password(
+            "original-password",
+            &user.password_hash
+        ));
+    }
+
+    /// Maintenance commands must not become a second migration coordinator.
+    /// Until `run` has activated Hiqlite they fail without creating an
+    /// incoming or active target and leave the legacy database untouched.
+    #[tokio::test]
+    async fn maintenance_commands_refuse_an_unmigrated_data_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_in(tmp.path());
+        let store = store_in(tmp.path());
+        let hash = plurx_core::auth::hash_password("original-password").expect("hash");
+        store
+            .create_user("owner", &hash, true)
+            .await
+            .expect("create user");
+        drop(store);
+
+        for error in [
+            reset_password(&config, "owner", Some("a-new-password".to_owned()))
+                .await
+                .expect_err("reset must refuse legacy SQLite"),
+            refresh_metadata(&config, None)
+                .await
+                .expect_err("refresh must refuse legacy SQLite"),
+        ] {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("only `plurxd run` may import"),
+                "{message}"
+            );
+        }
+        assert!(!tmp.path().join("hiqlite.incoming").exists());
+        assert!(!tmp.path().join("hiqlite").exists());
+
         let store = store_in(tmp.path());
         let user = store
             .get_user_by_username("owner")
@@ -1929,13 +2007,11 @@ mod startup_tests {
     #[tokio::test]
     async fn a_refresh_skips_the_libraries_that_have_no_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = config_in(tmp.path());
         let store = store_in(tmp.path());
         add_library(&store, "Books", LibraryKind::Books, false).await;
         add_library(&store, "Home", LibraryKind::Home, false).await;
-        drop(store);
-
-        dispatch(Command::RefreshMetadata { library: None }, config)
+        let artwork = tmp.path().join("artwork");
+        refresh_metadata_with_store(store, &artwork, None)
             .await
             .expect("a provider-less refresh must succeed");
     }
@@ -1945,14 +2021,13 @@ mod startup_tests {
     #[tokio::test]
     async fn a_refresh_of_an_unknown_library_fails_rather_than_doing_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = config_in(tmp.path());
         let store = store_in(tmp.path());
         add_library(&store, "Movies", LibraryKind::Movies, false).await;
-        drop(store);
+        let artwork = tmp.path().join("artwork");
 
         let error = format!(
             "{:#}",
-            refresh_metadata(&config, Some(4242))
+            refresh_metadata_with_store(store, &artwork, Some(4242))
                 .await
                 .expect_err("no such library")
         );
@@ -1964,14 +2039,13 @@ mod startup_tests {
     #[tokio::test]
     async fn a_provider_refresh_without_a_key_says_so() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = config_in(tmp.path());
         let store = store_in(tmp.path());
         add_library(&store, "Movies", LibraryKind::Movies, false).await;
-        drop(store);
+        let artwork = tmp.path().join("artwork");
 
         let error = format!(
             "{:#}",
-            refresh_metadata(&config, None)
+            refresh_metadata_with_store(store, &artwork, None)
                 .await
                 .expect_err("no TMDB key")
         );
@@ -1984,7 +2058,6 @@ mod startup_tests {
     #[tokio::test]
     async fn an_empty_provider_library_refreshes_to_an_empty_report() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = config_in(tmp.path());
         let store = store_in(tmp.path());
         store
             .put_setting(keys::TMDB_API_KEY, "not-a-real-key")
@@ -1993,12 +2066,12 @@ mod startup_tests {
         let movies = add_library(&store, "Movies", LibraryKind::Movies, false).await;
         let anime = add_library(&store, "Anime", LibraryKind::Shows, true).await;
         assert!(anime.anime, "the anime flag must be stored");
-        drop(store);
+        let artwork = tmp.path().join("artwork");
 
-        refresh_metadata(&config, Some(movies.id))
+        refresh_metadata_with_store(Arc::clone(&store), &artwork, Some(movies.id))
             .await
             .expect("empty TMDB refresh");
-        refresh_metadata(&config, Some(anime.id))
+        refresh_metadata_with_store(store, &artwork, Some(anime.id))
             .await
             .expect("empty AniList refresh");
     }

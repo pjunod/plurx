@@ -166,6 +166,21 @@ FROZEN_EPOCH = calendar.timegm(time.strptime("2025-06-15T12:00:00", "%Y-%m-%dT%H
 SEED_USER = "baseline"
 SEED_PASSWORD = "baseline-password"
 
+# The M2 activation seam this harness has to cross rather than avoid. A clean
+# `plurxd run` imports SQLite into a one-voter Hiqlite target and selects it;
+# afterwards `<data>/plurx.db` is only the rollback source, so freezing it would
+# rewrite rows nothing renders. `after-quiescence` aborts an activation attempt
+# after its marker is fsynced and before any incoming target exists, which buys
+# the one SQLite recovery boot `seed()` and `freeze_database()` need. See
+# docs/CLUSTERING-PLAN.md §4 and `select_daemon_store`.
+ACTIVATION_FAILPOINT_ENV = "PLURX_CLUSTER_ACTIVATION_FAILPOINT"
+ACTIVATION_FAILPOINT = "after-quiescence"
+# `ActivationFailpoint::crash_if` exits with this. Requiring it is what keeps a
+# renamed or deleted failpoint loud: without the check the deliberate boot would
+# quietly become an ordinary activating boot and the drift would resurface as an
+# unexplained golden diff rather than as a harness failure.
+ACTIVATION_CRASH_EXIT = 86
+
 # The fixture corpus. Tiny on purpose: nothing on screen cares how big the
 # picture is, and CI pays for every encode. Durations differ per title so the
 # runtime column and the resume arithmetic have something real to show.
@@ -629,7 +644,12 @@ class SelfHost:
             [str(self.server_bin()), "--config", str(self.config), "run"],
             cwd=ROOT, stdout=handle, stderr=handle, stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env={**os.environ, "PLURX_LOG": "info", "TZ": "UTC"},
+            # The failpoint is cleared explicitly rather than merely left unset:
+            # `ActivationFailpoint::configured` treats empty as absent, and an
+            # operator who exported it in their own shell would otherwise abort
+            # every boot here — including the capture boot, which must activate.
+            env={**os.environ, "PLURX_LOG": "info", "TZ": "UTC",
+                 ACTIVATION_FAILPOINT_ENV: ""},
         )
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -666,6 +686,13 @@ class SelfHost:
             f'[server]\nname = "plurx"\nbind = "127.0.0.1:{self.port}"\n\n'
             f'[storage]\ndata_dir = "{self.data_dir}"\n'
         )
+        # Three boots, not two, and the extra one is deliberate. Boot 1 aborts an
+        # activation attempt on purpose; boot 2 is the single SQLite recovery
+        # boot that attempt buys, and is the one that seeds and gets frozen;
+        # boot 3 finds a clean directory, imports the frozen fixture into a fresh
+        # one-voter target and serves the captures from it. So the browser
+        # photographs the app *after* a real M2 activation rather than beside it.
+        self.spend_activation_recovery_boot()
         self.spawn()
         self.seed()
         # Restart *after* seeding, and after the timestamps are rewritten. The
@@ -677,6 +704,54 @@ class SelfHost:
         self.freeze_database()
         self.spawn()
         self.discover()
+
+    def spend_activation_recovery_boot(self):
+        """Abort one activation attempt so the next boot stays on SQLite.
+
+        `select_daemon_store` writes an fsynced attempt marker before it creates
+        any incoming target; the `after-quiescence` failpoint exits immediately
+        after that write. The next ordinary boot sees the marker, clears it, and
+        returns the unchanged legacy store — exactly one recovery boot, which is
+        the boot `seed()` and `freeze_database()` require.
+
+        This is the code's own documented recovery path rather than a bypass:
+        nothing here forges directory state, and no boot is exempted from
+        activation. Boot 3 finds the directory clean and activates for real.
+        """
+        print(f"BOOT    deliberate {ACTIVATION_FAILPOINT} abort "
+              "(buys the SQLite recovery boot that seeds and freezes)", flush=True)
+        try:
+            with open(self.log, "a") as handle:
+                result = subprocess.run(
+                    [str(self.server_bin()), "--config", str(self.config), "run"],
+                    cwd=ROOT, stdout=handle, stderr=handle, stdin=subprocess.DEVNULL,
+                    env={**os.environ, "PLURX_LOG": "info", "TZ": "UTC",
+                         ACTIVATION_FAILPOINT_ENV: ACTIVATION_FAILPOINT},
+                    timeout=300,
+                )
+        except subprocess.TimeoutExpired:
+            # It served instead of aborting, so the failpoint is gone rather
+            # than renamed — a renamed one is rejected and exits non-zero. Same
+            # cause as the exit-code branch below, different symptom.
+            raise Fail(
+                f"the deliberate {ACTIVATION_FAILPOINT} abort never exited: the daemon "
+                f"served instead, so {ACTIVATION_FAILPOINT_ENV} no longer aborts "
+                f"activation and this harness has no SQLite recovery boot to seed. "
+                f"See {self.log}"
+            )
+        # Loud on purpose. If the failpoint is renamed or removed this boot
+        # becomes an ordinary activating one, the seed lands in Hiqlite,
+        # freeze_database() rewrites a file nothing reads, and the run comes back
+        # as a pile of unexplained golden differences that look like a UI
+        # regression. Failing here names the actual cause instead.
+        if result.returncode != ACTIVATION_CRASH_EXIT:
+            raise Fail(
+                f"the deliberate {ACTIVATION_FAILPOINT} abort exited "
+                f"{result.returncode}, expected {ACTIVATION_CRASH_EXIT}: this harness "
+                f"needs one SQLite recovery boot to seed and freeze. If "
+                f"{ACTIVATION_FAILPOINT_ENV} or its exit code changed, update this "
+                f"sequence — do not regenerate the golden. See {self.log}"
+            )
 
     def seed(self):
         self.token = api(self.base_url, "/setup", method="POST",
@@ -740,8 +815,24 @@ class SelfHost:
         filesystem property, and a tie in added_at would let two runs sort
         "Recently added" differently.
         """
-        db = sqlite3.connect(self.data_dir / "plurx.db")
+        source = self.data_dir / "plurx.db"
+        db = sqlite3.connect(source)
         try:
+            # The one check that catches this class of bug directly, and it
+            # depends on neither log text nor the failpoint's name: if the seed
+            # boot activated instead of recovering, the seeded rows went to the
+            # replicated target and this file is the empty schema `plurx.db`
+            # ensure_sqlite_source() created. Freezing it would then succeed
+            # silently while pinning nothing the browser renders.
+            seeded = db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            if not seeded:
+                raise Fail(
+                    f"{source} holds no items after seeding: the seed boot wrote to an "
+                    "activated replicated store rather than the SQLite recovery store, "
+                    "so freezing it would rewrite rows nothing renders. Check that the "
+                    f"deliberate {ACTIVATION_FAILPOINT} abort still consumes exactly one "
+                    f"recovery boot; see {self.log}"
+                )
             base = FROZEN_EPOCH - 3 * 86400
             rows = list(db.execute(
                 "SELECT id FROM items ORDER BY title, season_number, episode_number, id"))

@@ -12,6 +12,8 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(feature = "hiqlite-store")]
 use std::net::TcpListener;
+#[cfg(all(feature = "hiqlite-store", unix))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 #[cfg(feature = "hiqlite-store")]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -25,7 +27,12 @@ use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::{Client, Node, NodeConfig};
 #[cfg(feature = "hiqlite-store")]
-use plurx_core::cluster::migration::prepare_sqlite_import;
+use plurx_core::cluster::migration::{
+    connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
+    SelectedBackend, ACTIVATED_SOURCE_FILENAME, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
+};
+#[cfg(feature = "hiqlite-store")]
+use plurx_core::config::Config;
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
     NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
@@ -622,9 +629,10 @@ fn make_trakt_fixture_row_cleartext(path: &std::path::Path) {
 fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     let path = populated_current_import_fixture(data_dir);
     let connection = rusqlite::Connection::open(&path).expect("open current SQLite fixture");
-    // Recreate the exact two schema differences between v14 and current.
-    // The v15 tables and v17 node-local telemetry did not exist; v16 had not
-    // added the recoverable outbox claim deadline yet.
+    // Recreate the exact v15-v19 schema differences so this is also a valid
+    // input to ordinary SQLite startup migration, not merely a current-schema
+    // database carrying an older user_version. The activation coordinator now
+    // runs that ordinary upgrade before publishing its immutable backup.
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -633,6 +641,8 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE scan_reconcile_guards;
              DROP TABLE library_roots;
              DROP TABLE playback_events;
+             DROP TABLE network_priors;
+             ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
              CREATE TABLE watched_outbox (
@@ -942,6 +952,586 @@ async fn a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft() {
         FIXTURE_TRAKT_ACCESS,
         "import must preserve a working credential, not just an opaque string"
     );
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn one_voter_config(data_dir: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.storage.data_dir = data_dir.to_owned();
+    config.cluster.raft_bind = format!("0.0.0.0:{}", contract_free_port())
+        .parse()
+        .expect("raft bind");
+    config.cluster.api_bind = format!("0.0.0.0:{}", contract_free_port())
+        .parse()
+        .expect("api bind");
+    config.cluster.advertise_host = "127.0.0.1".to_owned();
+    config
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ActivationNodeLaunch {
+    data_dir: PathBuf,
+    raft_bind: String,
+    api_bind: String,
+    source_version: i64,
+    first_boot: bool,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationNodeLaunch {
+    fn config(&self) -> Config {
+        let mut config = Config::default();
+        config.storage.data_dir = self.data_dir.clone();
+        config.cluster.raft_bind = self.raft_bind.parse().expect("raft bind");
+        config.cluster.api_bind = self.api_bind.parse().expect("api bind");
+        config.cluster.advertise_host = "127.0.0.1".to_owned();
+        config
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+struct ActivationNodeProcess {
+    child: Child,
+    input: ChildStdin,
+    _output: ChildStdout,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl ActivationNodeProcess {
+    fn start(launch: &ActivationNodeLaunch) -> Self {
+        let executable = std::env::current_exe().expect("activation test executable");
+        let mut child = Command::new(executable)
+            .arg("hiqlite_activation_node_process")
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(
+                "PLURX_ACTIVATION_NODE_LAUNCH",
+                serde_json::to_string(launch).expect("serialize activation launch"),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn activation voter");
+        let input = child.stdin.take().expect("activation voter stdin");
+        let output = child.stdout.take().expect("activation voter stdout");
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader
+                .read_line(&mut line)
+                .expect("read activation voter startup");
+            assert!(bytes > 0, "activation voter exited before ready");
+            if line.trim() == "PLURX_ACTIVATION_NODE_READY" {
+                break;
+            }
+        }
+        Self {
+            child,
+            input,
+            _output: reader.into_inner(),
+        }
+    }
+
+    fn stop(self) {
+        drop(self.input);
+        let status = self
+            .child
+            .wait_with_output()
+            .expect("wait activation voter");
+        assert!(
+            status.status.success(),
+            "activation voter failed: {status:?}"
+        );
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn run_injected_activation(launch: &ActivationNodeLaunch, failpoint: &str) {
+    let executable = std::env::current_exe().expect("activation test executable");
+    let output = Command::new(executable)
+        .arg("hiqlite_activation_node_process")
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(
+            "PLURX_ACTIVATION_NODE_LAUNCH",
+            serde_json::to_string(launch).expect("serialize activation launch"),
+        )
+        .env("PLURX_CLUSTER_ACTIVATION_FAILPOINT", failpoint)
+        .output()
+        .expect("run injected activation voter");
+    assert_eq!(output.status.code(), Some(86), "injected process status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rollback command: plurxd run"),
+        "injected failure must name rollback command: {stderr}"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn assert_one_voter_activation(data_dir: &std::path::Path, source_version: i64) {
+    // The raw importer fixture is pre-sealed to test that boundary in
+    // isolation. A real legacy activation starts before credential encryption,
+    // so put this source back in that shape and require the coordinator to run
+    // the ordinary one-time sealing upgrade before it publishes the backup.
+    make_trakt_fixture_row_cleartext(&data_dir.join("plurx.db"));
+    let config = one_voter_config(data_dir);
+    let launch = ActivationNodeLaunch {
+        data_dir: data_dir.to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version,
+        first_boot: true,
+    };
+    let first = ActivationNodeProcess::start(&launch);
+
+    let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    let marker: ActivationMarker = serde_json::from_slice(
+        &std::fs::read(active.join(ACTIVATION_MARKER_FILENAME)).expect("activation marker"),
+    )
+    .expect("decode activation marker");
+    assert_eq!(marker.cluster_id, CONTRACT_INSTANCE_ID);
+    assert_eq!(marker.source_schema_version, source_version);
+    assert!(!marker.table_hashes.is_empty());
+    assert!(data_dir.join("plurx.db").exists(), "legacy source retained");
+    #[cfg(unix)]
+    for private in [
+        data_dir.join("secret_raft"),
+        data_dir.join("secret_api"),
+        active.join(ACTIVATION_MARKER_FILENAME),
+    ] {
+        let mode = std::fs::metadata(&private)
+            .unwrap_or_else(|error| panic!("metadata for {}: {error}", private.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "{} must be owner-only", private.display());
+    }
+    assert!(
+        std::fs::read_dir(data_dir.join("migration"))
+            .expect("migration backups")
+            .any(|entry| entry
+                .expect("migration entry")
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "db")),
+        "immutable SQLite backup retained"
+    );
+
+    let second = connect_activated_store(&config)
+        .await
+        .expect("second replicated reader");
+    assert_eq!(
+        second
+            .watch_state(7, 10)
+            .await
+            .expect("read watch state through second client")
+            .expect("replicated watch state")
+            .position_ms,
+        321_000
+    );
+    drop(second);
+    first.stop();
+
+    let reopened = ActivationNodeProcess::start(&ActivationNodeLaunch {
+        first_boot: false,
+        ..launch
+    });
+    let second = connect_activated_store(&config)
+        .await
+        .expect("second reader after subsequent run");
+    assert_eq!(
+        second
+            .watch_state(7, 10)
+            .await
+            .expect("read reopened watch state")
+            .expect("reopened watch state")
+            .position_ms,
+        321_000
+    );
+    drop(second);
+    reopened.stop();
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn populated_v14_and_current_sources_activate_once_and_reopen_replicated() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let v14 = tempfile::tempdir().expect("v14 activation fixture");
+    populated_v14_import_fixture(v14.path());
+    assert_one_voter_activation(v14.path(), plurx_core::store::SQLITE_SCHEMA_VERSION).await;
+
+    let current = tempfile::tempdir().expect("current activation fixture");
+    populated_current_import_fixture(current.path());
+    assert_one_voter_activation(current.path(), plurx_core::store::SQLITE_SCHEMA_VERSION).await;
+}
+
+/// A direct pre-encryption upgrade seals Trakt before publishing its backup.
+///
+/// The importer correctly refuses cleartext, but that refusal would turn every
+/// linked legacy install into a dead end unless the activation coordinator ran
+/// the ordinary SQLite credential upgrade first. This covers both halves: a
+/// key-resolution refusal leaves no incoming target, then the same directory
+/// activates and its replicated envelope still opens under the node-local key.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_upgrade_seals_legacy_trakt_before_any_import_state_exists() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let fixture = tempfile::tempdir().expect("legacy Trakt activation fixture");
+    let source_path = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source_path);
+    let config = one_voter_config(fixture.path());
+
+    // A directory at the configured key path is an explicit key-resolution
+    // failure. It occurs before the coordinator writes its attempt marker or
+    // creates the incoming target, so the legacy source remains recoverable.
+    let key_path = config.cluster.credential_key_path(&config.storage.data_dir);
+    std::fs::create_dir(&key_path).expect("block credential-key loading");
+    let refusal = select_daemon_store(&config)
+        .await
+        .err()
+        .expect("an unusable credential-key path must refuse activation")
+        .to_string();
+    assert!(refusal.contains("credential key"), "{refusal}");
+    assert!(
+        !refusal.contains(FIXTURE_TRAKT_ACCESS) && !refusal.contains(FIXTURE_TRAKT_REFRESH),
+        "the refusal must not quote either bearer credential: {refusal}"
+    );
+    assert!(
+        !fixture.path().join("hiqlite.incoming").exists(),
+        "a pre-import refusal must leave no partial incoming target"
+    );
+    assert!(
+        !fixture.path().join(HIQLITE_ACTIVE_DIRNAME).exists(),
+        "a pre-import refusal must not publish an active target"
+    );
+    std::fs::remove_dir(&key_path).expect("unblock credential-key loading");
+
+    let selected = select_daemon_store(&config)
+        .await
+        .expect("direct legacy upgrade must activate after key recovery");
+    assert_eq!(selected.backend, SelectedBackend::Replicated);
+    let imported = selected
+        .store
+        .get_trakt_auth(FIXTURE_TRAKT_USER)
+        .await
+        .expect("read imported Trakt row")
+        .expect("linked Trakt row survives activation");
+    assert!(
+        imported.access_token.is_wrapped() && imported.refresh_token.is_wrapped(),
+        "replicated durable state must contain envelopes"
+    );
+    assert_eq!(
+        selected
+            .credential_key
+            .open_trakt(FIXTURE_TRAKT_USER, &imported.access_token)
+            .expect("open imported access token")
+            .expose(),
+        FIXTURE_TRAKT_ACCESS
+    );
+    assert_eq!(
+        selected
+            .credential_key
+            .open_trakt(FIXTURE_TRAKT_USER, &imported.refresh_token)
+            .expect("open imported refresh token")
+            .expose(),
+        FIXTURE_TRAKT_REFRESH
+    );
+
+    let (source_access, source_refresh): (String, String) =
+        rusqlite::Connection::open(&source_path)
+            .expect("reopen sealed rollback source")
+            .query_row(
+                "SELECT access_token, refresh_token FROM trakt_auth WHERE user_id = ?1",
+                [FIXTURE_TRAKT_USER],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read sealed rollback row");
+    for (label, stored, expected) in [
+        ("access", source_access, FIXTURE_TRAKT_ACCESS),
+        ("refresh", source_refresh, FIXTURE_TRAKT_REFRESH),
+    ] {
+        assert_ne!(stored, expected, "{label} token remained cleartext");
+        assert!(
+            stored.starts_with("plxenc:v1:"),
+            "{label} token is not a v1 envelope"
+        );
+    }
+    selected.shutdown().await.expect("stop activated voter");
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_activation_boundaries_recover_sqlite_or_completed_target() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    for failpoint in ["after-quiescence", "after-incoming", "after-marker"] {
+        let fixture = tempfile::tempdir().expect("interrupted activation fixture");
+        let source = populated_current_import_fixture(fixture.path());
+        make_trakt_fixture_row_cleartext(&source);
+        let config = one_voter_config(fixture.path());
+        let launch = ActivationNodeLaunch {
+            data_dir: fixture.path().to_owned(),
+            raft_bind: config.cluster.raft_bind.to_string(),
+            api_bind: config.cluster.api_bind.to_string(),
+            source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+            first_boot: true,
+        };
+        run_injected_activation(&launch, failpoint);
+
+        let recovered = select_daemon_store(&config)
+            .await
+            .unwrap_or_else(|error| panic!("recover {failpoint}: {error}"));
+        assert_eq!(recovered.backend, SelectedBackend::SqliteRecovery);
+        assert_eq!(
+            recovered
+                .store
+                .watch_state(7, 10)
+                .await
+                .expect("read unchanged SQLite watch state")
+                .expect("SQLite watch state")
+                .position_ms,
+            120_000
+        );
+        assert!(!fixture.path().join("hiqlite.incoming").exists());
+        assert!(!fixture.path().join("hiqlite").exists());
+    }
+
+    let fixture = tempfile::tempdir().expect("post-rename activation fixture");
+    let source = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source);
+    let config = one_voter_config(fixture.path());
+    let launch = ActivationNodeLaunch {
+        data_dir: fixture.path().to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+        first_boot: true,
+    };
+    run_injected_activation(&launch, "after-rename");
+    assert!(fixture.path().join(HIQLITE_ACTIVE_DIRNAME).is_dir());
+    assert!(!fixture.path().join("hiqlite.incoming").exists());
+
+    let resumed = ActivationNodeProcess::start(&launch);
+    let second = connect_activated_store(&config)
+        .await
+        .expect("read completed target after rename crash");
+    assert_eq!(second.count_users().await.expect("user count"), 1);
+    drop(second);
+    resumed.stop();
+}
+
+/// An ambiguous active target must fail closed, never fall back to SQLite.
+///
+/// This is the property whose regression is worst: silently preferring the
+/// retained source would boot the daemon on pre-activation state while the
+/// replicated target sat right there. Every case here is reached before a voter
+/// starts, so the refusal is the only thing under test.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_active_target_refuses_rather_than_reverting_to_sqlite() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let valid_marker = |data_dir: &std::path::Path| -> ActivationMarker {
+        let prepared = prepare_sqlite_import(data_dir).expect("prepare source");
+        ActivationMarker {
+            marker_version: 1,
+            cluster_id: prepared.cluster_id.clone(),
+            source_backup_sha256: prepared.backup_sha256.clone(),
+            source_schema_version: prepared.schema_version,
+            replicated_schema_version: 5,
+            imported_rows: 1,
+            table_hashes: Vec::new(),
+        }
+    };
+
+    /// How one case makes the target ambiguous.
+    type Corrupt = Box<dyn Fn(&std::path::Path)>;
+
+    // Each case: how the target is made ambiguous, and what the operator reads.
+    let cases: Vec<(&str, Corrupt)> = vec![
+        (
+            "activation marker",
+            Box::new(|data_dir: &std::path::Path| {
+                let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+                std::fs::create_dir_all(&active).expect("active target");
+                std::fs::write(active.join(ACTIVATION_MARKER_FILENAME), b"{ not json")
+                    .expect("corrupt marker");
+            }),
+        ),
+        (
+            ACTIVATION_MARKER_FILENAME,
+            Box::new(|data_dir: &std::path::Path| {
+                std::fs::create_dir_all(data_dir.join(HIQLITE_ACTIVE_DIRNAME))
+                    .expect("active target without a marker");
+            }),
+        ),
+        (
+            "Hiqlite activation marker",
+            Box::new(move |data_dir: &std::path::Path| {
+                let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+                std::fs::create_dir_all(&active).expect("active target");
+                let mut marker = valid_marker(data_dir);
+                // Structurally sound, semantically impossible.
+                marker.marker_version = 99;
+                std::fs::write(
+                    active.join(ACTIVATION_MARKER_FILENAME),
+                    serde_json::to_vec(&marker).expect("serialize marker"),
+                )
+                .expect("write marker");
+            }),
+        ),
+        (
+            "directory",
+            Box::new(|data_dir: &std::path::Path| {
+                std::fs::write(data_dir.join(HIQLITE_ACTIVE_DIRNAME), b"not a target")
+                    .expect("active path that is not a directory");
+            }),
+        ),
+    ];
+
+    for (expected, corrupt) in cases {
+        let fixture = tempfile::tempdir().expect("ambiguous target fixture");
+        populated_current_import_fixture(fixture.path());
+        corrupt(fixture.path());
+
+        let error = select_daemon_store(&one_voter_config(fixture.path()))
+            .await
+            .err()
+            .expect("an ambiguous active target must not open");
+        let error = error.to_string();
+        assert!(
+            error.contains(expected),
+            "refusal must name what is wrong ({expected}): {error}"
+        );
+        assert!(
+            !fixture.path().join("hiqlite.incoming").exists(),
+            "a refusal must not stage a new import: {error}"
+        );
+    }
+}
+
+/// Losing the replicated target must not silently re-import the stale source.
+///
+/// After activation `plurx.db` is a rollback source, not a current one. A data
+/// directory that lost `hiqlite/` is byte-indistinguishable from one that never
+/// activated, so without the breadcrumb the next boot would quietly discard
+/// every write since activation — the failure an operator would never see.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_replicated_target_refuses_to_reimport_the_retained_source() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let fixture = tempfile::tempdir().expect("activated source fixture");
+    let source = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source);
+    let config = one_voter_config(fixture.path());
+    let launch = ActivationNodeLaunch {
+        data_dir: fixture.path().to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+        first_boot: true,
+    };
+    ActivationNodeProcess::start(&launch).stop();
+
+    let breadcrumb = fixture.path().join(ACTIVATED_SOURCE_FILENAME);
+    assert!(
+        breadcrumb.is_file(),
+        "activation must record that this source handed over authority"
+    );
+    std::fs::remove_dir_all(fixture.path().join(HIQLITE_ACTIVE_DIRNAME)).expect("lose the target");
+
+    let error = select_daemon_store(&config)
+        .await
+        .err()
+        .expect("a lost target must not silently re-import")
+        .to_string();
+    assert!(error.contains("already activated"), "{error}");
+    // The refusal is only useful if it names both what it protected and the
+    // exact way out; an operator who cannot act on it will delete something.
+    assert!(error.contains("plurx.db"), "{error}");
+    assert!(
+        error.contains(&breadcrumb.display().to_string()),
+        "refusal must name the file to delete to accept the rollback: {error}"
+    );
+    assert!(
+        !fixture.path().join("hiqlite.incoming").exists(),
+        "the refusal must not stage an import"
+    );
+
+    // And the documented way out actually works: with the breadcrumb gone the
+    // directory activates again rather than staying permanently wedged. The
+    // failpoint stops that attempt as soon as it proves the guard is passed.
+    std::fs::remove_file(&breadcrumb).expect("accept the rollback");
+    run_injected_activation(&launch, "after-quiescence");
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawned by the one-voter activation contract"]
+async fn hiqlite_activation_node_process() {
+    install_contract_crypto_provider();
+    let launch: ActivationNodeLaunch = serde_json::from_str(
+        &std::env::var("PLURX_ACTIVATION_NODE_LAUNCH").expect("activation launch"),
+    )
+    .expect("decode activation launch");
+    let selected = select_daemon_store(&launch.config())
+        .await
+        .expect("select one-voter store");
+    assert_eq!(selected.backend, SelectedBackend::Replicated);
+    assert_eq!(selected.identity.cluster_id, CONTRACT_INSTANCE_ID);
+    assert_eq!(selected.store.count_users().await.expect("user count"), 1);
+    if launch.first_boot {
+        selected
+            .store
+            .put_progress(7, 10, 321_000, Some(3_600_000))
+            .await
+            .expect("write watch progress through primary client");
+    } else {
+        assert_eq!(
+            selected
+                .store
+                .watch_state(7, 10)
+                .await
+                .expect("read reopened watch state")
+                .expect("reopened watch state")
+                .position_ms,
+            321_000
+        );
+    }
+    let marker: ActivationMarker = serde_json::from_slice(
+        &std::fs::read(
+            launch
+                .data_dir
+                .join(HIQLITE_ACTIVE_DIRNAME)
+                .join(ACTIVATION_MARKER_FILENAME),
+        )
+        .expect("activation marker"),
+    )
+    .expect("decode marker");
+    assert_eq!(marker.source_schema_version, launch.source_version);
+    println!("PLURX_ACTIVATION_NODE_READY");
+    std::io::stdout()
+        .flush()
+        .expect("flush activation readiness");
+    let mut sink = Vec::new();
+    tokio::io::stdin()
+        .read_to_end(&mut sink)
+        .await
+        .expect("wait for activation parent");
+    selected.shutdown().await.expect("stop activation voter");
 }
 
 #[cfg(feature = "hiqlite-store")]

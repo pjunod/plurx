@@ -125,11 +125,11 @@ The executable handoff is
 logical server first, then brings up the one-voter replicated store before
 membership, singleton jobs, session takeover, and failure drills.
 
-M0–M1d and M2's source-backup plus row-import slices are merged: identity, the
-one-/three-voter Hiqlite proofs, replicated auth/catalogue/media/search
-contracts, the complete 120-method Store backend, and bounded exact import
-parity are in-tree. M2 activation is next; SQLite remains the production
-default until daemon selection lands.
+M0–M2 are merged: identity, the one-/three-voter Hiqlite proofs, replicated
+auth/catalogue/media/search contracts, the complete 120-method Store backend,
+bounded exact import parity, and failure-injected one-voter activation are
+in-tree. SQLite remains intact as the pre-membership rollback source; normal
+daemon boots select the activated replicated store.
 
 - ✅ **M0 complete 2026-08-07:** local node identity, rollback-tolerant
   cluster configuration, Hiqlite decision/cost record, deterministic-SQL guard,
@@ -150,13 +150,13 @@ default until daemon selection lands.
   bytes/beat) of growth after production-threshold compaction against a
   512-byte/beat budget. `make cluster-growth` reproduces the measurement; its
   uncoalesced 10,000-write control violates both the commit and byte limits.
-- ✅ **M2 import complete 2026-08-09:** content-addressed backup and fresh-target
-  import preserve v14 through current durable rows, rebuild derived FTS, and
-  prove exact parity with bounded keyset pages, an incremental digest, and
-  source reads isolated on one blocking worker.
-- ○ **M2–M3 next:** activate one-voter Hiqlite, envelope-encrypt Trakt
-  bearer credentials, then add join/remove/health and singleton job fencing.
-  Removing a node must explicitly fail or safely re-home its offline work.
+- ✅ **M2 complete 2026-08-14:** content-addressed backup and fresh-target
+  import preserve v14 through current durable rows, rebuild derived FTS, prove
+  exact parity, then publish a fsynced marker and atomically activate one-voter
+  Hiqlite. Four killed boundaries prove the next boot chooses either unchanged
+  SQLite or the completed replicated target.
+- ○ **M3 next:** add join/remove/health and singleton job fencing. Removing a
+  node must explicitly fail or safely re-home its offline work.
 - ○ **M4–M7 remain:** replicated session takeover, client node-list retry,
   VIP/Kubernetes deployment patterns, rolling upgrades, the cluster admin UI,
   and the physical failure-drill corpus.

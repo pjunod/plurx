@@ -1,10 +1,10 @@
 //! Cluster identity compatibility for the Phase 4 transition.
 //!
-//! M0 deliberately keeps SQLite in production. Its job is to stop using the
-//! logical server id as an implicit machine id without changing the ownership
-//! key of any bytes already on disk. The first node therefore seeds
-//! `<data_dir>/node.id` from the existing `instance.id`; future join work may
-//! create a distinct local id before opening the replicated store.
+//! M0 introduced this seam while SQLite was the production store. Its job is
+//! to stop using the logical server id as an implicit machine id without
+//! changing the ownership key of any bytes already on disk. The first node
+//! therefore seeds `<data_dir>/node.id` from the existing `instance.id`;
+//! future join work may create a distinct local id.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -22,7 +22,7 @@ use crate::store::{SettingsStore, SqliteStore, Store};
 pub mod migration;
 
 pub const NODE_ID_FILENAME: &str = "node.id";
-/// M0 runs the existing local store as the first and only voter.
+/// The M0/M2 path starts with one voter; later membership assigns other ids.
 pub const SINGLE_VOTER_RAFT_ID: u64 = 1;
 
 /// The three identities that must not collapse into one value once clustering
@@ -37,9 +37,7 @@ pub struct ClusterIdentity {
     pub raft_id: u64,
 }
 
-/// Production-store opening result. The coordinator joins this handle when
-/// the first replicated slice lands; M0 exposes the identity seam while still
-/// returning the existing SQLite-backed trait object.
+/// Legacy SQLite opening result retained for recovery and identity tests.
 pub struct StoreHandle {
     pub store: Arc<dyn Store>,
     pub identity: ClusterIdentity,
@@ -50,8 +48,10 @@ pub struct StoreHandle {
     pub credential_key: Arc<CredentialKey>,
 }
 
-/// Open the unchanged SQLite production store and initialize the node-local
-/// identity before any cache/offline cleanup or background work can start.
+/// Open the legacy SQLite store and initialize the node-local identity.
+///
+/// The activation coordinator uses this only for the recovery boot after an
+/// interrupted import; ordinary daemon startup selects the replicated store.
 pub async fn open_store(config: &Config) -> Result<StoreHandle, StoreError> {
     std::fs::create_dir_all(&config.storage.data_dir).map_err(|error| {
         StoreError::Identity(format!(

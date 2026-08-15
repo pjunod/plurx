@@ -26,10 +26,10 @@ tower-http = { version = "0.6", features = ["trace"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process", "io-util", "fs"] }
 async-trait = "0.1"
-# Storage. The Hiqlite Store surface is complete; SQLite remains the production
-# default until M2's staged import, encryption, and activation gates pass.
+# Storage. M2 selects one-voter Hiqlite after a verified SQLite import; the
+# retained SQLite database is the pre-membership rollback source.
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
-hiqlite = { version = "=0.14.0", default-features = false, features = ["macros", "sqlite"] }
+hiqlite = { version = "=0.14.0", default-features = false, features = ["auto-heal", "macros", "sqlite"] }
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

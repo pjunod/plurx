@@ -363,3 +363,21 @@ commits = ["859be5c0"]
 points = ["web.experience", "playback.pipeline"]
 checks = ["web-static"]
 reason = "The retained web policy unit pins severe-pressure selection against fresh completed-fragment throughput and proves a duplicate supply signal cannot trigger a second restart at the ladder floor; restoring only the pre-correction controller ignores the fresh cliff sample and walks through an intermediate rung."
+
+[[coverage]]
+commits = ["4745dd7"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate"]
+reason = "The retained process regression `activated_one_voter_rebuilds_current_state_after_sigkill` proves that an acknowledged post-activation write survives SIGKILL and restart through Hiqlite auto-heal."
+
+[[coverage]]
+commits = ["4798b49"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained workspace/process and three-voter activation contracts pin maintenance TLS, lost/ambiguous-target refusal, loopback listener selection, bounded backup retention, occupied-port refusal, and explicit SQLite-recovery selection."
+
+[[coverage]]
+commits = ["72dc2699"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate"]
+reason = "The retained shipped-binary regression `m2_ignores_explicit_non_loopback_cluster_listener_hosts` proves that explicit future-M3 host settings cannot expose either one-voter M2 listener; the helper regression also preserves IPv4 and IPv6 address-family selection."

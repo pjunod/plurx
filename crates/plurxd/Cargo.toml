@@ -10,7 +10,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
-plurx-core = { path = "../plurx-core" }
+plurx-core = { path = "../plurx-core", features = ["hiqlite-store"] }
 plurx-compat-plex = { path = "../plurx-compat-plex" }
 plurx-pgs = { path = "../plurx-pgs" }
 serde = { workspace = true }

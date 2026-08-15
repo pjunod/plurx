@@ -17,11 +17,12 @@ data_dir = "./data"
 scan_prune_percent = 10
 
 # [cluster]
-# Reserved in M0 so configs written by later clustering releases remain
-# forward-compatible. Keep this dormant section commented during M0 so the
-# same file can still be read by the immediately preceding release.
+# M2 uses both ports for the one-voter store but pins their listener hosts to
+# loopback, regardless of the addresses below. M3 membership will make the
+# hosts reachable and use the remaining peer/join settings.
 # raft_bind = "0.0.0.0:32401"
 # api_bind = "0.0.0.0:32402"
+# Reserved for M3 membership:
 # advertise_host = ""
 # join_token_file = ""
 # trusted_network = ""

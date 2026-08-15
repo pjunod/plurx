@@ -13,11 +13,19 @@ fixtures = []
 # The workspace cluster harness enables the replicated backend, so feature
 # unification also runs these core unit tests during workspace checks. M2
 # enables the same backend on plurxd when the complete store becomes selectable.
-hiqlite-store = ["dep:hiqlite"]
+hiqlite-store = ["dep:hiqlite", "dep:rustls"]
 
 [dependencies]
 async-trait = { workspace = true }
 hiqlite = { workspace = true, optional = true }
+# Only to install the process-level provider before a TLS Hiqlite client is
+# built. rustls panics instead of erroring when a process reaches TLS without
+# one, and `hiqlite::start_node` installs it only on the server side — which the
+# maintenance commands never reach. See `install_default_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+], optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
