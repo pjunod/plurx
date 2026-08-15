@@ -441,3 +441,9 @@ commits = ["93e68029"]
 points = ["server.api", "playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."
+
+[[coverage]]
+commits = ["058797551e8e14c2e3b3e485ca2f9e185e6ac73b"]
+points = ["persistence.upgrades", "cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted."
