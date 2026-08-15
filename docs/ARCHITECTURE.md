@@ -37,7 +37,7 @@ streams, and transcodes.
         │      │                                            │               │
         │      │                                     ffmpeg (child proc)    │
         │      ├──▶ scanner + metadata agents                               │
-        │      └──▶ Store trait ──▶ SQLite (1 node)  |  hiqlite raft (3+)   │
+        │      └──▶ Store trait ──▶ Hiqlite: 1 voter (M2) · 3+ future (M3) │
         └───────────────┬───────────────────────────────┬──────────────────┘
                         │ read-only                      │ HTTPS
                         ▼                                ▼

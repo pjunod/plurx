@@ -15,10 +15,10 @@ are both supported.
 
 > **Self-hosted and pre-1.0.** plurx runs on your LAN with no cloud dependency and
 > never phones home. It mounts your media **read-only** and never writes, renames,
-> or deletes a file. Today it runs as a **single node** — replicated Store
-> backends and staged SQLite-to-Hiqlite import/parity machinery are merged, but
-> import activation is still Phase 4 work. Treat it
-> as a capable daily driver, not a backup of your only copy.
+> or deletes a file. Today it runs as a **single one-voter node** on the
+> replicated Store after a verified, reversible SQLite import. Membership and
+> failover are still Phase 4 work. Treat it as a capable daily driver, not a
+> backup of your only copy.
 
 ![The plurx home screen — continue watching, next up, and recently added](docs/img/home.png)
 
@@ -293,10 +293,10 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.
-- [~] **Phase 4 — HA for real.** Clustering M0–M1d and M2's staged source
-  backup plus deterministic table importer are merged behind the unchanged
-  `Store` trait; single-node SQLite remains the production default while
-  import orchestration, activation, replicated sessions, and failover proceed.
+- [~] **Phase 4 — HA for real.** Clustering M0–M2 is merged behind the
+  unchanged `Store` trait: `plurxd run` verifies and atomically activates a
+  one-voter replicated store while retaining SQLite for pre-membership
+  rollback. Membership, replicated sessions, and failover remain open.
 - [~] **Phase 5 — Native clients.** Android/Google TV and Apple iOS/tvOS clients
   are working; Tizen/webOS and Roku have not started.
 

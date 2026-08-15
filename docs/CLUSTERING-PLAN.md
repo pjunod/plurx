@@ -1,11 +1,11 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 through M1d and M2's source backup, table import,
-bounded parity verification, and post-coalescer compacted-growth gate are
-complete; import orchestration and daemon activation remain pending
+**Status:** executing — M0 through M2 are complete; one-voter Hiqlite activates
+after verified import, while M3 membership, health, and singleton fencing are
+next
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-14
+2026-08-15
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -59,12 +59,12 @@ M0 now provides tolerated cluster configuration and local node identity; M1a
 provides the full backend-neutral parity inventory; M1b provides the first
 hiqlite auth/settings backend; M1c adds libraries, media, watch state,
 node-local FTS, and bounded root-aware reconciliation; and M1d completes the
-120-method store plus the progress write-rate gate. M2 now provides the
-content-addressed source backup and the inert fresh-target row importer with
-per-table parity evidence. The daemon still opens the complete SQLite store.
-Import orchestration, membership/join, full-store activation,
+120-method store plus the progress write-rate gate. M2 adds the
+content-addressed source backup, fresh-target import with per-table parity,
+fsynced completion marker, and atomic one-voter activation; after that verified
+import, the daemon selects Hiqlite instead of SQLite. Membership/join,
 lease-fenced publication, replicated session ownership, serving self-fencing,
-and client failover do not exist yet.
+and client failover remain open.
 
 ## 3. Contracts — safety lives in signatures and transactions
 
@@ -569,9 +569,9 @@ content hashes and full parity behavior; kill each import step and prove the
 next boot either resumes from the completed atomic target or deletes incoming
 state and starts SQLite unchanged.
 
-**Source preparation and row import delivered 2026-08-09; activation remains
-open.** `prepare_sqlite_import` refuses a future schema before mutation,
-removes an abandoned incoming directory, and publishes a fsynced,
+**M2 delivered 2026-08-14.** `prepare_sqlite_import` refuses a future schema
+before mutation, removes an abandoned incoming directory, and publishes a
+fsynced,
 content-addressed SQLite online backup with committed WAL pages included. The
 backup uses canonical delete journaling, so later verification never creates
 an untracked WAL sidecar beside immutable source material.
@@ -611,32 +611,64 @@ telemetry exclusion, and runtime multi-column keyset progress. Unit tests pin
 the keyset SQL shape and prove async-executor responsiveness while SQLite is
 blocked.
 
-This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
-and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
-fsynced completion marker, atomic activation, failure injection at each step,
-and fallback to unchanged SQLite. The post-coalescer blocker is closed by the
-2026-08-14 `make cluster-growth` record: 4,441,360 compacted bytes for 10,000
-incoming beats at five-second logical cadence (444.136 bytes/beat), 5,040
-physical commits for 80 streams, and a raw 10,000-write control that violates
-both the commit and byte budgets. Bounded target parity and blocking-worker
-source reads are now in place; the next boundary is the activation coordinator,
-not another importer expansion.
+`plurxd run` now completes steps 2, 5, 8, and 9 before probes, background
+producers, or HTTP bind. It creates a fresh one-voter target under
+`hiqlite.incoming`, imports and verifies it, writes a fsynced marker carrying
+the source checksum, schema, cluster id, row count, and table hashes, then
+renames it to `hiqlite` and fsyncs the data directory. The source database and
+content-addressed backup remain unchanged.
+
+Four process-exit failpoints cover quiescence, incoming startup, marker
+publication, and rename. Before rename, the next boot removes partial incoming
+state and consumes one SQLite recovery boot; after rename, the completed marker
+makes the replicated target authoritative. `reset-password` and
+`refresh-metadata` never import: they refuse an unmigrated directory and use an
+authenticated client to the running voter after activation, so both require a
+running daemon rather than opening a second store beside it.
+
+An ambiguous active target fails closed rather than reverting to SQLite: a
+missing, malformed, unsupported, or identity-mismatched marker, or a `hiqlite`
+path that is not a directory, refuses the boot. The scope of that check is the
+marker's own shape and the recorded cluster identity. It deliberately does
+**not** re-verify the recorded table hashes against live target contents on
+every boot — parity is an import-time property, proven once before the rename,
+and re-hashing every table at startup would put a full scan in front of every
+restart. Detecting later corruption *within* an activated target is M6's
+backup-and-restore work, not M2's.
+
+Activation is one-way per data directory. Because the retained `plurx.db` is a
+rollback source rather than a current one, a directory that has activated
+records `hiqlite-activated.json` beside it, and a boot that finds that record
+without its target refuses instead of re-importing stale rows. Deleting that
+file is the deliberate way to accept a rollback and the data loss it implies.
+`migration/` keeps only the three newest source backups, so a repeatedly failing
+activation cannot fill the data volume with database copies.
+
+Both cluster listeners bind loopback only, and a port already in use is reported
+by name before the voter starts rather than surfacing as a start timeout.
 
 **Trakt credential encryption is no longer a blocker (2026-08-14).** Both
 bearer columns are envelope-encrypted under a node-local key file before they
-reach the `Store` (§3.2), an existing cleartext install is migrated forward on
-upgrade, and a boot that finds sealed rows it cannot open refuses to start
-rather than falling back to cleartext — whether the key file is missing, is a
-replaced key that opens none of those rows, or is readable by more than its
-owner. The importer does need a change, and has it. Copying `trakt_auth` as
-text is only safe when the source install has already been sealed, and a
-backup taken from a pre-encryption install has not: import is the one
-production path that bypasses the durable write, so it audits the backup's
-credential columns and refuses one carrying cleartext before submitting any
-row to raft.
+reach the `Store` (§3.2), and a direct upgrade seals a legacy cleartext row
+while startup is still quiescent and before publishing the immutable import
+backup. The importer independently audits that backup and refuses cleartext
+before submitting any application row to Raft. A boot whose key is missing,
+replaced, or too broadly readable refuses instead of falling back to cleartext.
 
-With the growth record and credential encryption both closed, no §6.6
-activation blocker remains outstanding.
+The post-coalescer blocker is also closed by the 2026-08-14
+`make cluster-growth` record: 4,441,360 compacted bytes for 10,000 incoming
+beats at five-second logical cadence (444.136 bytes/beat), 5,040 physical
+commits for 80 streams, and a raw 10,000-write control that violates both the
+commit and byte budgets. No §6.6 activation blocker remains outstanding.
+
+Before M3 introduces peers, both cluster listeners are loopback-only; no
+replication traffic exists to expose and no remote consumer exists to serve.
+The API listener keeps automatic TLS and its authenticating secret, but it
+ignores a non-loopback `api_bind` and `advertise_host`: its only consumer is a
+maintenance command on the same machine, so honouring the `0.0.0.0` default
+would open a LAN port on every single-node install at upgrade with nothing on
+the other end. M3 opens it deliberately, with membership, when a peer exists to
+talk to.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -731,17 +763,16 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M2 can verify rows, not activate them
+## 8. Handoff checkpoint — M2 activates one voter; M3 owns membership
 
-M0 through M1d and M2's source-backup plus row-import slices are on `main`;
-the importer can now prove the 17 shared durable tables without unbounded
-leader responses or blocking the async executor. It still does not select the
-target in `plurxd`. Keep SQLite as the daemon's selected store until
-incoming-cluster orchestration, credential encryption, node removal, and the
-remaining activation gates are ready. Post-coalescer compacted growth is now
-recorded and gated; the next implementation boundary is the fsynced completion
-marker plus failure-injected one-voter activation. That coordinator must delete
-partial incoming state and keep SQLite active on every failure.
+M0 through M2 provide the complete one-voter path: exact import parity, a
+durable activation marker, atomic target selection, failure-injected SQLite
+recovery, replicated daemon startup, and credential sealing before the immutable
+source backup is published. The post-coalescer compacted-growth and credential
+encryption gates are closed. Node removal is not a one-voter activation gate: it
+belongs to M3, where a survivor exists and offline work can otherwise be stranded
+or re-homed incorrectly. The next implementation boundary is membership, health,
+and singleton fencing in §6.7.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline

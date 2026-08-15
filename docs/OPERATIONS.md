@@ -36,11 +36,40 @@ paths you type in the UI are **container-side** paths under Docker (e.g.
 
 ### Rolling back a deploy
 
+The SQLite snapshot procedure below applies to a node that has not activated
+Hiqlite, including the one SQLite recovery boot after an interrupted import.
+When activation fails before atomic rename, run `plurxd run`: it removes the
+partial incoming target, leaves `plurx.db` unchanged, and reports the same
+command in its error. Once `<PLURX_DATA>/hiqlite/activation.json` exists, the
+replicated target is authoritative; do not replace `plurx.db` and assume you
+have restored current state.
+
+M6 owns the quorum-aware replicated backup, restore, and older-binary rollback
+runbook. Until that work lands, a post-activation rollback means roll forward
+with an M2-capable binary against the retained active target. The commands
+below are only for the pre-activation SQLite case.
+
 Every Ansible redeploy stops the Plurx Compose stack long enough to copy the
 closed SQLite database. The three newest copies stay on each node under
 `<PLURX_DATA>/backups/`, named
 `plurx.db.predeploy-<UTC>-<last-good-sha>.bak`. The SHA in the filename names
 the code that was running when the snapshot was taken.
+
+**On an activated node those snapshots are not restore points.** The deploy
+still copies `plurx.db`, but after activation that file is frozen at the moment
+of import, so each new snapshot is another copy of the same pre-activation
+state — the redeploy captures nothing written since. Restoring one does not
+roll the node back; it only makes a stale database sit beside the authoritative
+target, and `plurxd` refuses to import it precisely so that mistake cannot pass
+silently (see the refusal below). Capturing current replicated state is M6's
+quorum-aware backup work and does not exist yet; until it does, treat
+`<PLURX_DATA>/hiqlite/` itself as the thing to copy while the daemon is stopped.
+
+`plurxd` records `<PLURX_DATA>/hiqlite-activated.json` when it activates. If the
+replicated target is missing while that file is present, startup refuses rather
+than re-importing `plurx.db`, and names both the file and the loss accepting it
+would cause. Deleting that file is the deliberate way to accept a rollback to
+the pre-activation database, discarding everything written since activation.
 
 An older binary deliberately refuses a database migrated by a newer binary.
 Rolling back code alone therefore leaves the service crash-looping. Restore
@@ -101,6 +130,38 @@ those rows in place, then take the backup again and re-run the import. Nobody
 has to reconnect the Trakt account. The refusal happens before any row is
 submitted, so a refused import leaves no partial replicated state to clean up.
 
+### M2 activation and crash recovery
+
+The first `plurxd run` against a legacy data directory imports into
+`hiqlite.incoming`, verifies every durable table, publishes the fsynced marker,
+and atomically renames that directory to `hiqlite`. Producers and the public
+HTTP listener do not exist until this sequence finishes.
+
+`PLURX_CLUSTER_ACTIVATION_FAILPOINT` is the process-exit test surface for those
+durability boundaries:
+
+| Value | Boundary after which the process exits |
+|---|---|
+| `after-quiescence` | No producer or listener has started |
+| `after-incoming` | The fresh incoming voter exists |
+| `after-marker` | The verified completion marker is fsynced |
+| `after-rename` | The completed target has been atomically renamed |
+
+Each injection exits with code `86`. Before rename, the next `plurxd run`
+removes incoming state and consumes one unchanged-SQLite recovery boot; the
+following restart retries activation. After rename, the completed target wins.
+The variable is evaluated only while activation is pending, so a stale value
+cannot take an already-activated node offline.
+
+After activation, an ungraceful death may leave Hiqlite's state-machine lock.
+The next boot automatically discards and rebuilds that derived state machine
+from the one voter's retained local Raft log and snapshot, including
+acknowledged state newer than the frozen SQLite source. Never delete the lock:
+unlinking it skips the reconstruction that makes recovery safe. If the active
+target itself is missing, startup follows the lost-target refusal in
+[Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
+SQLite.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.
@@ -108,7 +169,8 @@ Settings you edit at runtime (TMDB key, libraries, users) live in the database,
 not here — this surface is only what's needed before the database opens.
 
 The TOML file is looked for at `./plurx.toml` then `/etc/plurx/plurx.toml` (or the
-path in `PLURX_CONFIG`). Every key has an env override:
+path in `PLURX_CONFIG`). Environment-backed keys are named below; the two M2
+cluster listener ports are file-only until M3 owns their network surface:
 
 | Env var | TOML | Default | What it does |
 |---|---|---|---|
@@ -117,6 +179,8 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
+| — | `cluster.raft_bind` | `0.0.0.0:32401` | M2 uses the port but pins the listener host to loopback; M3 membership will make the host configurable |
+| — | `cluster.api_bind` | `0.0.0.0:32402` | M2 maintenance-client TLS port, pinned to loopback until M3 membership |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |
@@ -128,6 +192,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_MDNS_ADVERTISE` | — | `true` | Run Bonjour inside the server process; Compose sets this to `false` because its host-network companion advertises instead |
 | `PLURX_DISCOVERY_SERVER_URL` | — | `http://127.0.0.1:32400` | Server URL read by `plurxd advertise`; normally only the Compose companion uses it |
 | `PLURX_LOG` | — | `info` | Log filter (`tracing` EnvFilter syntax, e.g. `plurxd=debug`) |
+| `PLURX_CLUSTER_ACTIVATION_FAILPOINT` | — | — | Test-only activation exit: `after-quiescence` · `after-incoming` · `after-marker` · `after-rename`; each exits `86` |
 | `PLURX_HLS_CLOSED_CAPTIONS_NONE` | — | off | **Experiment.** Adds `CLOSED-CAPTIONS=NONE` to the HLS variant. Set `1` to enable |
 | `PLURX_HLS_FORCED_AUTOSELECT` | — | off | **Experiment.** Puts `AUTOSELECT=YES` on forced subtitle renditions. Set `1` to enable |
 | `PLURX_PGS_OVERLAY` | — | off | **Staged feature.** Advertises and serves the authenticated `pgs-v1` overlay producer. Keep off until native-client and physical HDR/DV acceptance is complete |
@@ -166,6 +231,8 @@ untested, and turn it back off if the device does not visibly improve.
 | Port | Proto | Purpose |
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
+| 32401 | TCP, loopback | One-voter Raft listener; M2 ignores the configured host until M3 membership |
+| 32402 | TCP, loopback + TLS | One-voter maintenance client API; M2 ignores the configured host until M3 membership |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
 | 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native clients |
 
@@ -586,9 +653,10 @@ or `qvbr:<q>` when it is created and reuses that value after every yield or
 restart; it never reads the current global pair on resume. SQLite v18 adds the
 non-null column and backfills existing packages to `vbr`. Replicated schema v5
 has the same column while retaining protocol v4. N3's cache-artifact migration
-therefore moves to SQLite v19. Production still opens the SQLite backend; the
-replicated v5 definition is for fresh bootstrap/import. N1 does not invent the
-cluster rolling-migration protocol: an existing replicated v4 cluster remains
+therefore moves to SQLite v19. Production opens the activated one-voter
+Hiqlite backend after fresh bootstrap/import; retained SQLite is only the
+pre-membership rollback source. N1 does not invent the cluster
+rolling-migration protocol: an existing replicated v4 cluster remains
 incompatible and must not be pointed at this binary.
 
 The effective value is server policy, not a client request option. The first
