@@ -109,6 +109,23 @@ pub struct CreateSession {
     /// which encoder wins, and the player only learns that from the response
     /// to this request (see `TranscodeManager::auto_height`).
     pub height: Option<i64>,
+    /// Whether the VIEWER chose Auto quality. This is what decides stall
+    /// stickiness, and it is not the same question as "did this body carry a
+    /// `height`".
+    ///
+    /// A client sends a height for reasons unrelated to the quality menu: a
+    /// subtitle burn and Quality = Original both send the source's own height
+    /// as a promise about the output. Android's `sessionHeight` answers the
+    /// burn case *before* it consults quality, so an Auto viewer watching with
+    /// a burned subtitle posts a height and would otherwise be permanently
+    /// ineligible for the stall step-down — while the same viewer on Apple,
+    /// which never names a height, would be eligible. Same intent, opposite
+    /// recovery, decided by a field neither of them meant as a quality answer.
+    ///
+    /// Omitted keeps the old inference (`height` absent means Auto), so every
+    /// shipped client behaves exactly as before. A client that can state the
+    /// viewer's choice should send it, and then it is authoritative.
+    pub quality_auto: Option<bool>,
     /// Subtitle stream to burn into the picture. Only for the ones a client
     /// cannot render itself — a bitmap track (PGS/VobSub) has no text to send,
     /// so the only way to show it is to draw it into the frames.
@@ -142,7 +159,10 @@ impl CreateSession {
     /// from the predecessor's resolved rung and persists it before supersede.
     fn into_request(self, file_id: i64, height: i64) -> crate::transcode::SessionRequest {
         use crate::transcode::SessionKind;
-        let automatic = self.height.is_none();
+        // Viewer intent when the client states it; otherwise the old
+        // wire-presence inference, which is right for every client that has
+        // no separate quality answer to give.
+        let automatic = self.quality_auto.unwrap_or(self.height.is_none());
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
                 aac: self.aac == Some(true),
@@ -384,6 +404,9 @@ pub async fn start(
         previous_session_id: None,
         reopen_reason: None,
         height: q.height,
+        // The GET bridge has no quality-intent parameter, so it keeps the
+        // wire-presence inference it has always had.
+        quality_auto: None,
         subtitle_burn: None, // the deprecated GET bridge never offered a burn
         native_subtitles: None,
         subtitle: None,
@@ -1617,6 +1640,53 @@ mod tests {
         ));
     }
 
+    /// §7.3 requirement 3 is about VIEWER intent, not wire presence. Android's
+    /// `sessionHeight` answers a subtitle burn with the source height before it
+    /// consults quality, so an Auto viewer with a burned subtitle posts a
+    /// height; inferring stickiness from that field alone makes the heaviest
+    /// session type there is permanently unsteppable on Android while the
+    /// identical Apple session steps. `quality_auto` is the intent itself.
+    #[test]
+    fn stall_stickiness_follows_stated_quality_intent_not_a_posted_height() {
+        let burn_under_auto = serde_json::json!({
+            "playback_id": "android-player",
+            // The Original/forced-burn source-height promise, not a rung pick.
+            "height": 2160,
+            "subtitle_burn": 3,
+            "quality_auto": true,
+        });
+        let create: CreateSession = serde_json::from_value(burn_under_auto).expect("create body");
+        let request = create.into_request(17, 2160);
+        assert!(
+            request.automatic,
+            "a burn's source-height promise is not a manual quality pick"
+        );
+        assert_eq!(
+            request.kind,
+            crate::transcode::SessionKind::Transcode { height: 2160 }
+        );
+
+        // The other direction is just as explicit: a viewer who picked a rung
+        // stays on it even though the body would otherwise read as Auto.
+        let manual_without_height = serde_json::json!({
+            "playback_id": "android-player",
+            "quality_auto": false,
+        });
+        let create: CreateSession =
+            serde_json::from_value(manual_without_height).expect("create body");
+        assert!(!create.into_request(17, 720).automatic);
+
+        // Every shipped client omits the field, so the old inference has to
+        // survive untouched in both of its arms.
+        let silent_auto = serde_json::json!({ "playback_id": "apple-player" });
+        let create: CreateSession = serde_json::from_value(silent_auto).expect("create body");
+        assert!(create.into_request(17, 720).automatic);
+
+        let silent_manual = serde_json::json!({ "playback_id": "apple-player", "height": 480 });
+        let create: CreateSession = serde_json::from_value(silent_manual).expect("create body");
+        assert!(!create.into_request(17, 480).automatic);
+    }
+
     #[test]
     fn a_typed_stall_reopen_reaches_the_claim_unchanged() {
         let body = serde_json::json!({
@@ -1834,6 +1904,7 @@ mod tests {
             previous_session_id: None,
             reopen_reason: None,
             height: None,
+            quality_auto: None,
             subtitle_burn: None,
             native_subtitles: None,
             subtitle: None,
@@ -1858,6 +1929,7 @@ mod tests {
             previous_session_id: None,
             reopen_reason: None,
             height: Some(2160),
+            quality_auto: None,
             subtitle_burn: Some(5),
             native_subtitles: Some(true),
             subtitle: None,

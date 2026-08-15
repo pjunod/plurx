@@ -61,7 +61,7 @@ for that viewer and keeps server administration out of the comparison.
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
 | Audio/subtitle choice | Embedded tracks are native; tracks the server marks `native` arrive as HLS renditions, and everything else burns on a session |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
-| Bound stall downgrade | Server contract available: one `request_id` can name its predecessor and typed stall cause, with the normalized height replayed. Android does not yet reopen from its passive stall detector. |
+| Bound stall downgrade | Server contract available: one `request_id` can name its predecessor and typed stall cause, with the normalized height replayed. Android does not yet reopen from its passive stall detector. Adopting it requires sending `quality_auto` — `sessionHeight` posts the source height for any burn before it consults quality, so an Auto viewer with a burned subtitle is otherwise read as a sticky manual pick — plus a client-side retry budget, which the server deliberately does not bound at the ladder floor. |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |

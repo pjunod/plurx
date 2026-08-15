@@ -897,6 +897,22 @@ claim stores that answer before it can supersede the predecessor. Apple and
 Android still need their separately owned watchdog/reopen work; this server
 slice does not claim native recovery by itself.
 
+Two requirements the server half deliberately pushed to those client children,
+recorded here so they are not lost between issues:
+
+1. **The floor's retry count is the client's.** The server answers the floor
+   rung every time and raises no terminal error of its own; bounding it
+   server-side would need per-playback retry state, the parallel store this
+   section's clean-list forbids. The "one same-rung retry, then the existing
+   terminal surface" below is therefore satisfied *only* once each client
+   enforces the count in its own recovery budget.
+2. **Auto must be stated, not inferred.** Stickiness follows the viewer's
+   quality choice, so a client that posts a promise height (a burn, or
+   Original) while the viewer is on Auto must send `quality_auto: true`.
+   Android's `sessionHeight` posts the source height for any burn before it
+   consults quality, so without this its Auto-plus-burn sessions are
+   permanently unsteppable while Apple's identical sessions step.
+
 A bare `reopen_reason=stall` flag is not enough to make "one rung
 down" deterministic: the create body carries no prior-session binding,
 a transport retry re-normalizes against different state once the first

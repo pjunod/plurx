@@ -240,8 +240,31 @@ stall sends one `request_id` with the exact `previous_session_id` and typed
 `playback_id`, and file, reads that predecessor's resolved rung once, and
 stores the next-lower target in the existing request claim before replacement.
 `StartResponse.height` is the authoritative answer. Replaying the same request
-returns the same session and height; the 360p floor repeats once under the
-client's existing recovery budget, and a manual height is never stepped.
+returns the same session and height, and a manual height is never stepped.
+
+**The floor, and who bounds it.** A session already at or below the ladder
+floor is answered with the rung it is on, every time. The server counts
+nothing and never refuses: bounding the retries server-side would mean
+inventing per-playback retry state, which is exactly the parallel store this
+contract forbids, and a new terminal path §7.3 rules out. The retry budget is
+therefore **the client's**, and no client in this repository implements one
+yet — until the Apple and Android halves carry it, a client that keeps
+reopening at the floor will keep being answered at the floor. Those halves own
+the bound; this document does not claim it exists.
+
+The floor is the predecessor's own rung, not 360. Auto is not
+ladder-constrained below 360 — a sub-360 source resolves there, and a starved
+network prior deliberately settles at `MIN_HEIGHT` — so a way *down* must never
+answer such a session with a higher rung.
+
+**Stepping follows the viewer's quality choice, not the presence of `height`.**
+The two are different questions: a subtitle burn and Quality = Original both
+post the source's own height as a promise about the output, with no opinion
+about the quality menu. Create bodies may therefore send `quality_auto`, and
+when present it decides stickiness on its own. A client that omits it keeps the
+old inference — an absent `height` means Auto — so existing clients are
+unaffected. Any client that sends a promise-height while the viewer is on Auto
+must send `quality_auto: true`, or that session can never be stepped down.
 
 Omitting either bound field, naming a stale or foreign session, or sending an
 unknown reason is a client error. Ordinary seeks and track changes omit both

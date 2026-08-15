@@ -2294,9 +2294,12 @@ pub struct SessionRequest {
     pub playback_id: String,
     /// Optional idempotency key for one creation attempt.
     pub request_id: Option<String>,
-    /// True when the client omitted `height` and left the rung to server Auto
-    /// policy. The resolved numeric height alone cannot distinguish Auto from
-    /// a viewer's sticky manual pick.
+    /// True when the VIEWER chose Auto and left the rung to server policy.
+    /// The resolved numeric height alone cannot distinguish Auto from a
+    /// viewer's sticky manual pick, and neither can the presence of `height`
+    /// on the wire — a subtitle burn sends the source height as a promise
+    /// about the output, not as a quality answer. `CreateSession::quality_auto`
+    /// carries the real intent; wire presence is only the fallback.
     pub automatic: bool,
     /// The exact predecessor a recovery is bound to. Present only with a
     /// typed [`ReopenReason`].
@@ -2361,34 +2364,14 @@ struct SessionOwner<'a> {
 }
 
 impl SessionRequest {
-    /// A stable description of the output this request would produce. Start
-    /// position is included: two creates at different offsets are different
-    /// streams, and answering the second with the first would silently seek
-    /// the viewer somewhere they didn't ask to be.
-    #[cfg(test)]
-    fn fingerprint(&self) -> String {
-        let kind = match self.kind {
-            SessionKind::Transcode { height } => format!("t{height}"),
-            SessionKind::Copy {
-                aac,
-                preserve_dolby_vision,
-            } => format!("c{}d{}", u8::from(aac), u8::from(preserve_dolby_vision)),
-        };
-        format!(
-            "{}:{}:{}:{kind}:{:.3}:{}:{}:{}:{}:{}",
-            self.file_id,
-            self.playback_id,
-            u8::from(self.automatic),
-            self.start_seconds,
-            self.audio_index.unwrap_or(-1),
-            self.subtitle_burn.unwrap_or(-1),
-            self.audio_offset_ms,
-            self.previous_session_id.as_deref().unwrap_or(""),
-            self.reopen_reason.map(ReopenReason::as_str).unwrap_or("")
-        )
-    }
-
     /// The client's request intent before server-owned Auto normalization.
+    /// This is the only idempotency identity: it is what `claim_request`
+    /// compares when a `request_id` is replayed, so every field that changes
+    /// the output bytes has to be in here. Start position is included — two
+    /// creates at different offsets are different streams, and answering the
+    /// second with the first would silently seek the viewer somewhere they
+    /// didn't ask to be.
+    ///
     /// For an Auto transcode the numeric height is excluded on purpose: a
     /// network-prior refresh between transport attempts may recompute it, but
     /// the same `request_id` must still recover the first persisted answer.
@@ -2476,6 +2459,17 @@ impl RequestClaim<'_> {
         });
         if let Some(entry) = requests.get_mut(&key) {
             entry.state = RequestState::Ready(session_id.to_owned());
+        } else {
+            // Unreachable as written: our own entry is `InFlight`, so the
+            // retain above keeps it. If it ever is missing, the create
+            // persists no `Ready` record and the next replay of this
+            // `request_id` spawns a duplicate encoder — too quiet a failure
+            // to leave unsaid.
+            debug_assert!(false, "completed claim lost its own reservation");
+            tracing::warn!(
+                session = session_id,
+                "request claim vanished before completion; a replay may duplicate this session"
+            );
         }
     }
 }
@@ -6978,16 +6972,30 @@ fn bitrate_for_height(height: i64) -> u32 {
 pub const LADDER_HEIGHTS: [i64; 4] = [360, 480, 720, 1080];
 
 /// Resolve exactly one step below a session's already-normalized height.
-/// Heights between published rungs land on the next lower rung; the 360p
-/// floor repeats 360p so the native client's existing one-retry budget owns
-/// the terminal outcome rather than a new server error path.
+/// Heights between published rungs land on the next lower rung; a session
+/// already at or below the ladder floor repeats the rung it is on, so the
+/// native client's own recovery budget owns the terminal outcome rather than
+/// a new server error path.
+///
+/// The floor is `current`, never `LADDER_HEIGHTS[0]`. An Auto session's
+/// resolved rung is not ladder-constrained below 360: `auto_height` follows a
+/// sub-360 source, and `auto_height_from_prior` settles at [`MIN_HEIGHT`] on
+/// exactly the starved links that stall and reopen. Answering those with 360
+/// would step the viewer *up* — onto a rung the server's own stored verdict
+/// recorded as starving — and would promise a rung a sub-360 source cannot
+/// feed, which is the advertised-vs-delivered defect `auto_height` already
+/// fixed once.
 fn one_rung_below(current: i64) -> i64 {
     LADDER_HEIGHTS
         .iter()
         .rev()
         .copied()
         .find(|height| *height < current)
-        .unwrap_or(LADDER_HEIGHTS[0])
+        .unwrap_or(current)
+        // The same lower bound every other height in the system takes. A
+        // predecessor recorded at 0 — a remux of an unprobed source — must
+        // not normalize into a zero-height transcode.
+        .max(MIN_HEIGHT)
 }
 
 /// One advertised rung of the ladder.
@@ -12269,14 +12277,34 @@ mod tests {
             audio_offset_ms: 0,
         };
 
+        // The idempotency identity is `intent_fingerprint`, so that is what
+        // these guards have to name. Asserting against anything else lets a
+        // field silently leave the real key while the test stays green.
         let shifted = SessionRequest {
             audio_offset_ms: 250,
             ..request.clone()
         };
         assert_ne!(
-            shifted.fingerprint(),
-            request.fingerprint(),
+            shifted.intent_fingerprint("paul"),
+            request.intent_fingerprint("paul"),
             "session-scoped audio sync must identify different output bytes"
+        );
+        // `user_name` and `playback_id` are in the key too: one `request_id`
+        // reused by two viewers, or by two players on one account, must not
+        // recover each other's session.
+        assert_ne!(
+            request.intent_fingerprint("someone-else"),
+            request.intent_fingerprint("paul"),
+            "one request id reused by two users must not collide"
+        );
+        let other_player = SessionRequest {
+            playback_id: "pb-2".into(),
+            ..request.clone()
+        };
+        assert_ne!(
+            other_player.intent_fingerprint("paul"),
+            request.intent_fingerprint("paul"),
+            "one request id reused by two players must not collide"
         );
 
         let first = mgr.create_session(&request, "paul").await.expect("create");
@@ -12616,10 +12644,13 @@ mod tests {
     }
 
     /// The ladder floor is a same-rung result, not a fifth hidden rung and not
-    /// a new server terminal error. The client's existing recovery budget owns
-    /// the one retry and the eventual visible failure.
+    /// a new server terminal error. The server repeats the rung every time and
+    /// bounds nothing: the client's own recovery budget owns the retry count
+    /// and the eventual visible failure. Nothing here asserts "once", because
+    /// no code in this repo implements a "once" — the reopens below prove the
+    /// repeat is unconditional.
     #[tokio::test]
-    async fn a_stall_at_the_floor_retries_the_same_rung_once() {
+    async fn a_stall_at_the_floor_repeats_the_same_rung() {
         use plurx_core::store::SqliteStore;
 
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
@@ -12645,24 +12676,106 @@ mod tests {
             },
         )
         .await;
-        let request = reopen_request(63, "floor-player", "floor-retry", "floor-session");
-        let Claimed::Mine(claim, normalized) = mgr
-            .claim_request("floor-retry", &request, "paul")
-            .await
-            .expect("floor claim")
-        else {
-            panic!("new request owns its claim")
-        };
-        assert_eq!(normalized.kind, SessionKind::Transcode { height: 360 });
-        assert_eq!(
-            mgr.requests
-                .lock()
-                .expect("requests")
-                .get("floor-retry")
-                .and_then(|entry| entry.target_height),
-            Some(360)
+        // Three separate attempts, each with its own request id: the server
+        // answers 360 every time and never produces a terminal refusal of its
+        // own. That is the whole server half of "one retry, then the existing
+        // terminal surface" — the count lives in the client.
+        for attempt in ["floor-retry-1", "floor-retry-2", "floor-retry-3"] {
+            let request = reopen_request(63, "floor-player", attempt, "floor-session");
+            let Claimed::Mine(claim, normalized) = mgr
+                .claim_request(attempt, &request, "paul")
+                .await
+                .expect("floor claim")
+            else {
+                panic!("new request owns its claim")
+            };
+            assert_eq!(normalized.kind, SessionKind::Transcode { height: 360 });
+            assert_eq!(
+                mgr.requests
+                    .lock()
+                    .expect("requests")
+                    .get(attempt)
+                    .and_then(|entry| entry.target_height),
+                Some(360)
+            );
+            drop(claim);
+        }
+    }
+
+    /// An Auto session's resolved rung is NOT ladder-constrained below 360:
+    /// `auto_height` follows a sub-360 source, and `auto_height_from_prior`
+    /// settles at `MIN_HEIGHT` on a starved link — which is exactly the
+    /// population that stalls and reopens. The way down must never hand such a
+    /// session a HIGHER rung. Reverting `one_rung_below`'s `unwrap_or(current)`
+    /// to `unwrap_or(LADDER_HEIGHTS[0])` fails every case here.
+    #[tokio::test]
+    async fn a_stall_below_the_ladder_floor_never_steps_up() {
+        use plurx_core::store::SqliteStore;
+
+        // The unit the defect lived in, across the whole sub-floor range.
+        assert_eq!(one_rung_below(MIN_HEIGHT), MIN_HEIGHT);
+        assert_eq!(one_rung_below(240), 240);
+        assert_eq!(one_rung_below(288), 288);
+        assert_eq!(one_rung_below(360), 360);
+        assert_eq!(one_rung_below(480), 360, "an on-ladder step still steps");
+        // A remux of an unprobed source records target_height 0; normalizing
+        // that must not produce a zero-height transcode.
+        assert_eq!(one_rung_below(0), MIN_HEIGHT);
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
         );
-        drop(claim);
+
+        // 144 is where a starved-rung prior puts a client; 240 is a 240p
+        // source's honest Auto answer. Both used to normalize to 360.
+        for (index, height) in [MIN_HEIGHT, 240].into_iter().enumerate() {
+            let session_id = format!("sub-floor-{height}");
+            let playback_id = format!("sub-floor-player-{height}");
+            let dir = tempfile::tempdir().expect("previous session");
+            insert_reopen_fixture(
+                &mgr,
+                ReopenFixture {
+                    session_id: &session_id,
+                    dir: dir.path().to_path_buf(),
+                    user_name: "paul",
+                    playback_id: &playback_id,
+                    file_id: 64 + index as i64,
+                    target_height: height,
+                    automatic: true,
+                    kind: SessionKind::Transcode { height },
+                },
+            )
+            .await;
+            let attempt = format!("sub-floor-retry-{height}");
+            let request = reopen_request(64 + index as i64, &playback_id, &attempt, &session_id);
+            let Claimed::Mine(claim, normalized) = mgr
+                .claim_request(&attempt, &request, "paul")
+                .await
+                .expect("sub-floor claim")
+            else {
+                panic!("new request owns its claim")
+            };
+            assert_eq!(
+                normalized.kind,
+                SessionKind::Transcode { height },
+                "a {height}p Auto stall reopen must repeat {height}p, not step up to a ladder rung"
+            );
+            assert_eq!(
+                mgr.requests
+                    .lock()
+                    .expect("requests")
+                    .get(&attempt)
+                    .and_then(|entry| entry.target_height),
+                Some(height),
+                "the persisted target must match the answer the client gets"
+            );
+            drop(claim);
+        }
     }
 
     /// `playback_id` is a supersession key, not sufficient identity for a
