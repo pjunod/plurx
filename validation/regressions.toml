@@ -381,3 +381,9 @@ commits = ["72dc2699"]
 points = ["persistence.upgrades", "server.api"]
 checks = ["rust-gate"]
 reason = "The retained shipped-binary regression `m2_ignores_explicit_non_loopback_cluster_listener_hosts` proves that explicit future-M3 host settings cannot expose either one-voter M2 listener; the helper regression also preserves IPv4 and IPv6 address-family selection."
+
+[[coverage]]
+commits = ["09d540c0"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained episode-counter unit pins one Auto supply event per browser pause even when hls.js reports at the start and the video element reports at the end; restoring only the prior wall-clock coalescing lets two long pauses reach the three-stall rescue threshold."
