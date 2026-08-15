@@ -59,12 +59,12 @@ M0 now provides tolerated cluster configuration and local node identity; M1a
 provides the full backend-neutral parity inventory; M1b provides the first
 hiqlite auth/settings backend; M1c adds libraries, media, watch state,
 node-local FTS, and bounded root-aware reconciliation; and M1d completes the
-120-method store plus the progress write-rate gate. M2 now provides the
-content-addressed source backup and the inert fresh-target row importer with
-per-table parity evidence. The daemon still opens the complete SQLite store.
-Import orchestration, membership/join, full-store activation,
+120-method store plus the progress write-rate gate. M2 adds the
+content-addressed source backup, fresh-target import with per-table parity,
+fsynced completion marker, and atomic one-voter activation; after that verified
+import, the daemon selects Hiqlite instead of SQLite. Membership/join,
 lease-fenced publication, replicated session ownership, serving self-fencing,
-and client failover do not exist yet.
+and client failover remain open.
 
 ## 3. Contracts — safety lives in signatures and transactions
 
