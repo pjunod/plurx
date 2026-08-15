@@ -2862,6 +2862,25 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(pictureInPicture.errorMessage, "AVKit failed to start PiP")
     }
 
+    func testPGSOverlayRequiresConcreteMatchingTrack() {
+        XCTAssertFalse(PlayerController.isPGSOverlayActive(
+            overlayTrackIndex: nil,
+            selectedSubtitle: nil
+        ))
+        XCTAssertFalse(PlayerController.isPGSOverlayActive(
+            overlayTrackIndex: 4,
+            selectedSubtitle: nil
+        ))
+        XCTAssertFalse(PlayerController.isPGSOverlayActive(
+            overlayTrackIndex: 4,
+            selectedSubtitle: 5
+        ))
+        XCTAssertTrue(PlayerController.isPGSOverlayActive(
+            overlayTrackIndex: 4,
+            selectedSubtitle: 4
+        ))
+    }
+
     func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
         XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
             isTearingDown: false,

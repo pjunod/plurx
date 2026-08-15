@@ -190,6 +190,14 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPGSOverlayMenuDistinguishesOverlayFromBurnIn"
 
 [[fixes]]
+id = "apple.pgs-overlay-requires-concrete-track"
+commits = ["7c9df11"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "nonisolated static func isPGSOverlayActive("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPGSOverlayRequiresConcreteMatchingTrack"
+
+[[fixes]]
 id = "apple.pip-unavailable-paths-reachable"
 commits = ["0faab85", "abe102d"]
 source = "clients/apple/Sources/PlayerView.swift"
