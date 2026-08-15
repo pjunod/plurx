@@ -37,7 +37,15 @@ English dub, and every platform must tell the same story.
 
 A pre-play choice goes back to `/decision` as `audio=<index>` and
 `subtitle=<index>` (`-1` is Off). The client executes the returned delivery
-plan. For bitmap tracks it reads `selection.subtitle_requires_burn_in` before
+plan **as given** — it does not add the selected audio index itself. The plan
+already carries it: a remux plan's `url` ends in `?audio=<index>`, and remux
+and transcode plans repeat it in `delivery.audio` for the HLS session-create
+body. A client that reuses a bare `/stream.mp4` instead gets the server's
+language default, not the viewer's choice. Selecting a track other than the
+container's own default also means the plan will not be `direct` — the raw
+file has no audio selector — so a client must not assume its verdict is stable
+across a track change. For bitmap tracks it reads
+`selection.subtitle_requires_burn_in` before
 presenting the cost; text tracks still use the existing `native` flag because
 ASS/SSA and `mov_text` require a burn on native HLS even though the server can
 extract them as sidecars. A true

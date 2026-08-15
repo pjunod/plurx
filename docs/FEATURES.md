@@ -297,9 +297,13 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   and subtitle index (`-1` means Off). The selected audio codec participates in
   direct/remux/transcode compatibility, and the response echoes the effective
   indices plus whether the selected subtitle needs burn-in. A decodable default
-  track can no longer hide the cost of an incompatible alternative. Omitting
-  both selections keeps the existing policy-default decision; neither form
-  writes Playback defaults or starts a stream.
+  track can no longer hide the cost of an incompatible alternative. The returned
+  delivery plan carries the choice too — the remux URL names the track and the
+  session plans repeat it — so following the plan plays the track the viewer
+  picked; selecting a track the raw file cannot present alone is reported as a
+  remux instead of a direct play that would quietly deliver a different
+  language. Omitting both selections keeps the existing policy-default decision;
+  neither form writes Playback defaults or starts a stream.
 - **Audio-sync correction (per file):** the player's **⇄ Sync** menu nudges
   audio ±50/±250 ms and persists the offset to the file (`PUT
   /files/{id}/audio-offset`), so a badly-muxed release stays fixed for

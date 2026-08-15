@@ -4301,6 +4301,15 @@ mod tests {
         assert_eq!(selected["delivery"]["mode"], "remux", "{selected}");
         assert_eq!(selected["delivery"]["aac"], true, "{selected}");
         assert_eq!(selected["selection"]["audio_index"], 1, "{selected}");
+        assert_eq!(
+            selected["delivery"]["url"],
+            format!("/api/v1/files/{file}/stream.mp4?audio=1"),
+            "the plan must carry the selection it was decided for: {selected}"
+        );
+        assert_eq!(
+            selected["delivery"]["audio"], selected["selection"]["audio_index"],
+            "{selected}"
+        );
         assert!(
             selected["reasons"]
                 .as_array()
@@ -4322,6 +4331,145 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
         assert_eq!(invalid["error"], "unknown audio track", "{invalid}");
+
+        assert_eq!(
+            state
+                .store
+                .get_setting(plurx_core::store::keys::AUDIO_LANG)
+                .await
+                .expect("audio setting"),
+            None,
+            "request-local selection must not create or change a setting"
+        );
+    }
+
+    /// A verdict a client cannot execute is worse than no verdict: it plays
+    /// the wrong language and nothing says so. Direct play hands over the raw
+    /// file, whose audio track the browser picks from the container flags, so
+    /// selecting any other track has to change the *plan* — and the plan URL
+    /// has to carry the selection, because a bare `stream.mp4` re-derives the
+    /// language policy instead. Retained regression for #265 review finding 1.
+    #[tokio::test]
+    async fn the_delivery_plan_carries_a_selected_non_default_audio_track() {
+        use plurx_core::domain::{AudioStream, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let dir = std::env::temp_dir().join(format!("plurx-plan-audio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("media dir");
+        let path = dir.join("Dual Language.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("media file");
+        // Both tracks decode on this client and the container is native, so
+        // nothing but the selection can move the verdict off direct play.
+        let file = state
+            .store
+            .upsert_file(
+                seeded.movie,
+                &path.to_string_lossy(),
+                25,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(60_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "aac".into(),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "aac".into(),
+                            language: Some("fre".into()),
+                            default: false,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        let caps = "vcodec=h264&acodec=aac&container=mp4&hdr=0";
+
+        // The container default: direct play is genuinely executable, and the
+        // plan stays the raw file.
+        let (status, container_default) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}&audio=0"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{container_default}");
+        assert_eq!(
+            container_default["method"], "direct_play",
+            "{container_default}"
+        );
+        assert_eq!(
+            container_default["delivery"]["url"],
+            format!("/api/v1/files/{file}/direct"),
+            "{container_default}"
+        );
+
+        // The second track: decodable, but unreachable through the raw file.
+        let (status, selected) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}&audio=1"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected["selection"]["audio_index"], 1, "{selected}");
+        assert_ne!(
+            selected["method"], "direct_play",
+            "direct play cannot map a non-container-default track: {selected}"
+        );
+        assert_eq!(selected["method"], "remux", "{selected}");
+        assert_eq!(selected["delivery"]["mode"], "remux", "{selected}");
+        assert_eq!(
+            selected["delivery"]["aac"], false,
+            "the selected track decodes on this client, so only the mapping changed: {selected}"
+        );
+        assert!(
+            selected["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("not the container default")))),
+            "the downgrade has to say why: {selected}"
+        );
+
+        // The plan is executable: its URL names the selection, and following
+        // it reaches the remux endpoint rather than a rejected query.
+        let plan_url = selected["delivery"]["url"]
+            .as_str()
+            .expect("a remux plan has a URL")
+            .to_owned();
+        assert_eq!(
+            plan_url,
+            format!("/api/v1/files/{file}/stream.mp4?audio=1"),
+            "{selected}"
+        );
+        assert_eq!(
+            selected["delivery"]["audio"], selected["selection"]["audio_index"],
+            "the HLS transport takes the selection in its session body: {selected}"
+        );
+        assert_eq!(selected["play_url"], plan_url, "{selected}");
+        assert_eq!(
+            status_of(&app, get(&plan_url, Some(&admin))).await,
+            StatusCode::OK,
+            "the server must serve the plan URL it just handed out"
+        );
 
         assert_eq!(
             state

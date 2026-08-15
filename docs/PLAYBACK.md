@@ -31,11 +31,16 @@ and the player says so out loud in `/decision`.
       │    `delivery` is the server-owned EXECUTION PLAN for the verdict, so a
       │    client acts on it instead of re-deriving policy from `method`:
       ├─ { mode: direct,    url: /files/{id}/direct }                  (HTTP range)
-      ├─ { mode: remux,     url: /files/{id}/stream.mp4,               (progressive fMP4)
-      │                     sessions_url, aac }        (or POST sessions_url with copy:true
+      ├─ { mode: remux,     url: /files/{id}/stream.mp4?audio=<index>, (progressive fMP4)
+      │                     sessions_url, aac, audio } (or POST sessions_url with copy:true
       │                                                 for players that need HLS transport)
-      └─ { mode: transcode, sessions_url }             (POST it, omitting `height`: Auto is
+      └─ { mode: transcode, sessions_url, audio }      (POST it, omitting `height`: Auto is
       │                                                 the server's rung to pick)
+      │
+      │    `audio` appears in the plan only when the caller sent `audio=`, and
+      │    is already applied to the remux URL; the HLS transports take it in
+      │    the session-create body. A direct plan never carries one — see
+      │    "Selecting a track" below.
       ▼
  client picks the transport its browser can actually play  (see "Delivery")
       │
@@ -81,7 +86,7 @@ one.
 | `server.verdict` | Direct vs remux vs transcode | Video codec, height, bitrate, or HDR failure means transcode. Container, audio, or A/V correction alone means remux. No failures means direct. Unknown container is not permission to direct-play it. | Table-driven Rust unit in `playback/mod.rs` |
 | `server.dolby-vision` | Preserve vs strip vs re-encode DV | A client-approved profile is preserved. An unsupported profile with a compatible base and `dovi_rpu` becomes a strip remux. Without both, re-encode. Apple-supported DV profiles still request a normalized copy-HLS envelope. | DV profile matrix in `playback/mod.rs` |
 | `server.manual-quality` | Auto vs Original vs a rung | Auto uses the ordinary verdict. Original never re-encodes video; it may direct or remux and lets the client rescue a rejection. Any numbered rung forces transcode. Unknown force values degrade to Auto. | Force matrix in `playback/mod.rs` |
-| `server.execution-plan` | Verdict to API action | Direct owns `/direct`; remux owns `/stream.mp4` plus a copy-session URL and flags; transcode owns the HLS-session URL. Clients execute this plan instead of rebuilding it from `method`. | Exhaustive `DeliveryPlan` Rust unit |
+| `server.execution-plan` | Verdict to API action | Direct owns `/direct`; remux owns `/stream.mp4` plus a copy-session URL and flags; transcode owns the HLS-session URL. A caller's `audio=` selection travels in the plan — applied to the remux URL and repeated as `audio` for the session body — and a selection the container's own default cannot deliver reports remux instead of an unexecutable direct plan. Clients execute this plan instead of rebuilding it from `method`. | Exhaustive `DeliveryPlan` Rust unit plus a follow-the-plan selection regression |
 | `server.selected-audio-compatibility` | Selected track to remux audio recipe | Audio compatibility follows the track selected by language policy or the viewer, not the container's scan-time default. An unsupported preferred TrueHD track is converted to AAC while the HDR video remains copied. | Mixed E-AC-3/TrueHD Dolby Vision Rust regression |
 | `server.apple-high-tier-master` | High-tier Apple HLS playlist envelope | HDR HEVC High-tier sessions without native text renditions serve their media playlist directly, avoiding AVPlayer's multivariant eligibility rejection without changing video samples. | High/Main-tier, HDR/SDR, and subtitle-gate Rust matrix |
 | `server.apple-high-tier-init` | High-tier Apple HLS initialization record | The generated initialization segment clears only its HEVC High-tier declaration for the same narrowly gated HDR sessions, allowing VideoToolbox to inspect otherwise decodable picture data. | Synthetic High-tier `hvcC` Rust regression |
@@ -213,7 +218,24 @@ response then adds:
 
 The audio choice replaces the policy default before codec compatibility is
 evaluated, so `method`, `reasons`, `transcode_audio`, and `delivery` all describe
-the selected codec. An audio-only request may echo the policy-default subtitle
+the selected codec.
+
+The plan is also what *carries* the choice, not merely what it was decided
+against. A remux plan's `url` is `/stream.mp4?audio=<index>`, because a bare
+`/stream.mp4` re-derives the language policy and would answer a French request
+with the English track the server had just decided against; remux and transcode
+plans repeat the index in `audio` for the HLS session-create body. Direct play
+is the one delivery that cannot carry a choice at all: the client receives the
+original file and plays whatever the container flags, with no audio selector to
+override it. So selecting any track other than the container's own default
+(its `default`-flagged stream, else its first) reports **remux** rather than
+direct play, with the reason naming the track — the same "only ffmpeg can apply
+this, so remux at minimum" rule an A/V sync correction already follows. A
+selection equal to the container default keeps direct play, and a request that
+sends no `audio=` at all keeps its previous verdict byte-for-byte, including
+the case where the *policy* default differs from the container default.
+
+An audio-only request may echo the policy-default subtitle
 in `selection`, but only an explicit `subtitle=` choice can let that subtitle
 change delivery. On SDR, selecting a bitmap subtitle with no enabled PGS
 overlay changes the plan to transcode and names the burn-in reason.
