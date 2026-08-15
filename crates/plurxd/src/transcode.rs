@@ -8771,13 +8771,10 @@ mod tests {
             session.failed.load(Relaxed),
             "a mid-stream wedge must fail the session even though a segment was published"
         );
-        let killed = session
-            .child
-            .lock()
-            .await
-            .as_mut()
-            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
-        assert!(killed, "and the wedged process must be gone");
+        assert!(
+            session.child.lock().await.is_none(),
+            "and the wedged process must be killed, reaped, and removed"
+        );
     }
 
     /// Flow control SIGSTOPs a session that has run far enough ahead; that is
