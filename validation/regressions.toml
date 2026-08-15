@@ -446,4 +446,4 @@ reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects
 commits = ["058797551e8e14c2e3b3e485ca2f9e185e6ac73b"]
 points = ["persistence.upgrades", "cluster.auth"]
 checks = ["cluster-auth"]
-reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted."
+reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
