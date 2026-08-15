@@ -406,3 +406,15 @@ commits = ["99a29eef"]
 points = ["cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The retained classifier and three-voter failure regressions pin the last converged applied index as process-local state, so a missing voter's conservative worst-case lag survives a repeated status read and grows after a later acknowledged watch write; reverting only the production correction makes the second degraded sample drop the lag."
+
+[[coverage]]
+commits = ["64a24854"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "The retained budget contract pins the playlist wait strictly above FIRST_SEGMENT_GRACE + SOFTWARE_GRACE plus the recovery's own polling cadence, so restoring only the independently chosen 30 s fails while a stalled hardware start is still being rescued; the retained deadline, terminal-verdict, refusal-mapping, burn-preflight and overlay units prove each cause is answered immediately with its own status and named reason, that an unreadable filter listing refuses nothing, and that a still-starting stream is reported as retryable rather than as a permanent failure."
+
+[[coverage]]
+commits = ["4fae12ab"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "The retained retirement regression begins a playlist wait with a 30-second budget, retires it through the production path, and requires prompt session_gone without a false producer failure; the shipped-web regressions drive the real api-to-openSession-to-burnSub rejection path into the persistent overlay and prove that only a matching successful level retry clears its earlier 503 while terminal refusals remain readable."

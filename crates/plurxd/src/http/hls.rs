@@ -25,6 +25,7 @@ use plurx_core::tracks::is_native_text_subtitle;
 use super::error::ApiError;
 use super::extract::AuthUser;
 use crate::state::AppState;
+use crate::transcode::PlaylistError;
 
 #[derive(Deserialize)]
 pub struct StartQuery {
@@ -317,10 +318,17 @@ fn session_start_error(file_id: i64, error: String) -> ApiError {
     }
     tracing::warn!(file = file_id, "session create failed: {error}");
     if crate::transcode::is_retryable_capacity_error(&error) {
-        ApiError::ServiceUnavailable(error)
-    } else {
-        ApiError::Internal(error)
+        return ApiError::ServiceUnavailable(error);
     }
+    // A build that lacks a filter is not a server fault to be swallowed as
+    // "internal server error" — it is a fact about this install that the
+    // person pressing play can act on (pick a different subtitle track, or
+    // tell whoever runs the box to install a full ffmpeg). 501, because the
+    // request is well-formed and this server simply cannot implement it.
+    if let Some(reason) = crate::transcode::unsupported_build_reason(&error) {
+        return ApiError::typed(StatusCode::NOT_IMPLEMENTED, "unsupported_build", reason);
+    }
+    ApiError::Internal(error)
 }
 
 /// DELETE /api/v1/hls/:session — the player is done with this stream.
@@ -530,6 +538,38 @@ pub async fn master_playlist_response(
     ))
 }
 
+/// Translate a session's own verdict into the response the client acts on.
+///
+/// Every one of these used to be `ApiError::NotFound("transcode session")` — a
+/// bare 404 that hls.js escalates to a fatal `levelLoadError` whatever caused
+/// it, so a session still inside the server's startup recovery was reported to
+/// the viewer as permanently broken and a session that had genuinely failed
+/// was reported as nothing at all. The status separates the three cases the
+/// client can actually act on differently, and the typed body carries the
+/// reason a person can read.
+///
+/// - 404: the session is gone. Re-open, or accept that it is over.
+/// - 503: still starting. **Retryable**, and hls.js's own level-load retry is
+///   the right response — the stream is being built right now.
+/// - 502: the producer or the session failed. Terminal; report it.
+fn playlist_error(session: &str, err: PlaylistError) -> ApiError {
+    let status = match &err {
+        PlaylistError::SessionGone => StatusCode::NOT_FOUND,
+        PlaylistError::StartupTimedOut(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PlaylistError::ProducerExited(_) | PlaylistError::SessionFailed(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+    };
+    tracing::warn!(
+        session = %session,
+        code = err.code(),
+        retryable = err.retryable(),
+        "HLS playlist request refused: {}",
+        err.message()
+    );
+    ApiError::typed(status, err.code(), err.message())
+}
+
 /// The video rendition referenced by the native-subtitle HLS master.
 pub async fn video_playlist(
     State(state): State<AppState>,
@@ -539,7 +579,7 @@ pub async fn video_playlist(
         .transcode
         .playlist(&session)
         .await
-        .ok_or(ApiError::NotFound("transcode session"))?;
+        .map_err(|err| playlist_error(&session, err))?;
     Ok(playlist_response(bytes))
 }
 
@@ -565,7 +605,7 @@ pub async fn subtitle_playlist(
         .transcode
         .playlist(&session)
         .await
-        .ok_or(ApiError::NotFound("transcode session"))?;
+        .map_err(|err| playlist_error(&session, err))?;
     Ok(playlist_response(
         subtitle_media_playlist(&video).into_bytes(),
     ))
@@ -1559,6 +1599,87 @@ mod tests {
             session_start_error(42, "ffmpeg failed".into()),
             ApiError::Internal(_)
         ));
+    }
+
+    /// A build that cannot burn is a fact the viewer can act on, not an
+    /// "internal server error" whose message is deliberately dropped.
+    #[test]
+    fn a_build_that_cannot_burn_says_so_instead_of_hiding_behind_a_500() {
+        let error = "this server's media tools cannot do that: this server's ffmpeg build has no \
+             subtitles filter, which burning text subtitles into the picture requires";
+        match session_start_error(42, error.into()) {
+            ApiError::Typed {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(code, "unsupported_build");
+                assert!(
+                    message.contains("subtitles filter") && !message.contains("cannot do that:"),
+                    "the viewer reads the reason, not the classification: {message}"
+                );
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    /// Every playlist refusal, from the session's verdict to the wire.
+    ///
+    /// All four used to be `ApiError::NotFound("transcode session")` — one
+    /// anonymous 404 that hls.js escalates to a fatal `levelLoadError`
+    /// whatever caused it. The status now separates what the client can do
+    /// about it, and the typed body carries the sentence a person reads.
+    #[tokio::test]
+    async fn each_playlist_refusal_reaches_the_client_as_itself() {
+        use axum::body::to_bytes;
+
+        let rows = [
+            (
+                PlaylistError::SessionGone,
+                StatusCode::NOT_FOUND,
+                "session_gone",
+                "no longer running",
+            ),
+            (
+                PlaylistError::ProducerExited("exit status: 1".into()),
+                StatusCode::BAD_GATEWAY,
+                "producer_failed",
+                "exit status: 1",
+            ),
+            (
+                PlaylistError::SessionFailed("the encoder never produced any video".into()),
+                StatusCode::BAD_GATEWAY,
+                "session_failed",
+                "never produced any video",
+            ),
+            (
+                // The #263 case: still inside the server's own recovery.
+                // 503, not 404, and hls.js's level-load retry is the right
+                // response to it.
+                PlaylistError::StartupTimedOut(std::time::Duration::from_secs(45)),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "startup_timeout",
+                "still preparing",
+            ),
+        ];
+        for (err, status, code, fragment) in rows {
+            let response = playlist_error("sess-1", err.clone()).into_response();
+            assert_eq!(response.status(), status, "{code}");
+            let body = to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(json["code"], code);
+            let message = json["message"].as_str().expect("message");
+            assert!(
+                message.to_lowercase().contains(fragment),
+                "{code}: \"{message}\" should contain \"{fragment}\""
+            );
+            // The sentence the old overlay showed sent people to a log file on
+            // a box they were not sitting at. Nothing here may do that.
+            assert!(!message.contains("Settings"), "{code}: {message}");
+        }
     }
 
     #[test]

@@ -1126,6 +1126,318 @@ test("decode rescue uses lost frames over a long window, not pipeline latency", 
   });
 });
 
+// Every reason the server can refuse a stream with, from the wire body it
+// actually sends to the two lines the overlay shows. The generic sentence
+// these replace — "the server couldn't build this stream — see Settings →
+// Logs" — was shown for all of them alike, including for a session the server
+// was still successfully starting.
+test("each refusal the server names reaches the overlay as itself", () => {
+  const rows = [
+    // (status, body, expected title, expected fragment of the detail line)
+    [
+      404,
+      { code: "session_gone", message: "this stream is no longer running" },
+      "Playback failed to start.",
+      "no longer running",
+    ],
+    [
+      502,
+      {
+        code: "producer_failed",
+        message: "the server's encoder exited before it produced any video (exit status: 1)",
+      },
+      "Playback failed to start.",
+      "exit status: 1",
+    ],
+    [
+      502,
+      {
+        code: "session_failed",
+        message: "the server could not build this stream: the encoder never produced any video",
+      },
+      "Playback failed to start.",
+      "never produced any video",
+    ],
+    [
+      501,
+      {
+        code: "unsupported_build",
+        message: "this server's ffmpeg build has no subtitles filter",
+      },
+      "Playback failed to start.",
+      "no subtitles filter",
+    ],
+    // The one that is NOT a failure: the server is still inside its own
+    // hardware->software recovery and said so.
+    [
+      503,
+      {
+        code: "startup_timeout",
+        message: "the server is still preparing this stream after 45s",
+      },
+      "Still preparing this stream…",
+      "still preparing",
+    ],
+  ];
+  for (const [status, body, title, fragment] of rows) {
+    const failure = policy.parseStreamFailure({
+      status,
+      body: JSON.stringify(body),
+    });
+    assert.deepEqual(
+      failure,
+      { status, code: body.code, message: body.message },
+      body.code,
+    );
+    const overlay = policy.streamFailureOverlay(failure);
+    assert.equal(overlay.title, title, body.code);
+    assert.ok(
+      overlay.detail.toLowerCase().includes(fragment.toLowerCase()),
+      `${body.code}: "${overlay.detail}" should contain "${fragment}"`,
+    );
+    assert.equal(overlay.retryable, body.code === "startup_timeout", body.code);
+  }
+});
+
+// Only a startup that ran out of budget is retryable, and it is retryable on
+// either signal — a server that has not yet migrated the code still says 503.
+test("a still-starting stream is never reported as a permanent failure", () => {
+  for (const failure of [
+    { status: 503, code: "startup_timeout", message: "still preparing" },
+    { status: 503, code: null, message: "still preparing" },
+    { status: 500, code: "startup_timeout", message: "still preparing" },
+  ]) {
+    const overlay = policy.streamFailureOverlay(failure);
+    assert.equal(overlay.retryable, true, JSON.stringify(failure));
+    assert.equal(overlay.title, "Still preparing this stream…");
+  }
+});
+
+// A guess is worse than the generic sentence: it explains the wrong failure
+// with complete confidence. Anything unreadable falls back rather than invents.
+test("an illegible refusal explains nothing rather than guessing", () => {
+  const nothing = [
+    { status: 502, body: "<html>502 Bad Gateway</html>" },
+    { status: 502, body: "" },
+    { status: 502, body: "null" },
+    { status: 502, body: JSON.stringify({ code: "producer_failed" }) },
+    { status: 502, body: JSON.stringify({ message: "   " }) },
+    // A 200 is not a refusal at all.
+    { status: 200, body: JSON.stringify({ message: "fine" }) },
+  ];
+  for (const input of nothing) {
+    assert.equal(policy.parseStreamFailure(input), null, JSON.stringify(input));
+  }
+  assert.equal(policy.streamFailureOverlay(null), null);
+  assert.equal(policy.streamFailureOverlay({ status: 502 }), null);
+});
+
+// The legacy `{error}` body several routes still use carries a readable
+// sentence too, and dropping it would silently un-explain those routes.
+test("the legacy error body is still read", () => {
+  assert.deepEqual(
+    policy.parseStreamFailure({
+      status: 404,
+      body: JSON.stringify({ error: "transcode session not found" }),
+    }),
+    { status: 404, code: null, message: "transcode session not found" },
+  );
+});
+
+// The stale-reason trap, in its new clothes. A segment refused early in a film
+// must not be produced as the confident explanation for a fatal error forty
+// minutes later; the generic sentence is the honest answer there.
+test("a refusal only explains a failure it is contemporary with", () => {
+  const failure = {
+    status: 502,
+    code: "producer_failed",
+    message: "the server's encoder exited before it produced any video",
+    at: 1_000_000,
+  };
+  assert.ok(policy.streamFailureOverlay(failure, 1_000_000 + 60_000));
+  assert.equal(policy.streamFailureOverlay(failure, 1_000_000 + 600_000), null);
+  // An unstamped failure, or a caller that does not stamp, is still read —
+  // the check may not silently discard the only reason there is.
+  assert.ok(policy.streamFailureOverlay(failure));
+  assert.ok(
+    policy.streamFailureOverlay({ ...failure, at: undefined }, 9_999_999),
+  );
+});
+
+// A 503 belongs to the playlist request that received it. hls.js may retry
+// inside the same instance; once that retry loads a level, the refusal is
+// stale immediately. This runs the shipped state helpers and also pins the
+// LEVEL_LOADED wiring that calls them, so a later fatal cannot inherit the
+// earlier "Still preparing" explanation.
+test("a successful playlist retry immediately clears its 503 explanation", () => {
+  const player = { hls: {} };
+  let now = 1_000_000;
+  const build = new Function(
+    "PlaybackPolicy",
+    "PLAYER",
+    "Date",
+    [
+      "let STREAM_FAILURE=null;",
+      shippedSource("clearStreamFailure"),
+      shippedSource("noteStreamFailure"),
+      shippedSource("clearStreamFailureFor"),
+      shippedSource("currentStreamFailureOverlay"),
+      "return {noteStreamFailure, clearStreamFailureFor, currentStreamFailureOverlay};",
+    ].join("\n"),
+  );
+  const shipped = build(policy, player, { now: () => now });
+  shipped.noteStreamFailure(
+    503,
+    JSON.stringify({
+      code: "startup_timeout",
+      message: "the server is still preparing this stream after 55s",
+    }),
+  );
+  assert.equal(
+    shipped.currentStreamFailureOverlay().title,
+    "Still preparing this stream…",
+  );
+
+  // A destroyed predecessor's late success is not authority over this stream.
+  shipped.clearStreamFailureFor({});
+  assert.ok(shipped.currentStreamFailureOverlay());
+
+  // The matching retry succeeded. A later fatal now has no stale refusal to
+  // display, even though the old 90-second freshness window is still open.
+  now += 1_000;
+  shipped.clearStreamFailureFor(player.hls);
+  assert.equal(shipped.currentStreamFailureOverlay(), null);
+
+  // LEVEL_LOADED proves only that a retryable playlist request recovered. It
+  // must not erase a terminal refusal captured from another HLS request.
+  shipped.noteStreamFailure(
+    502,
+    JSON.stringify({
+      code: "producer_failed",
+      message: "the encoder exited before it produced video",
+    }),
+  );
+  shipped.clearStreamFailureFor(player.hls);
+  assert.equal(
+    shipped.currentStreamFailureOverlay().detail,
+    "the encoder exited before it produced video",
+  );
+  assert.match(
+    shippedSource("attachHls"),
+    /Hls\.Events\.LEVEL_LOADED[\s\S]*?clearStreamFailureFor\(hls\)/,
+    "the shipped successful-level event must invalidate its own refusal",
+  );
+});
+
+// `unsupported_build` is returned by the session-creation POST, before hls.js
+// exists. Exercise the shipped api -> openSession -> burnSub catch path rather
+// than composing policy helpers: the typed body must survive the rejected
+// promise and become the persistent player overlay, not a 2.2-second toast.
+asyncTest("a burn session-open refusal reaches the persistent overlay", async () => {
+  const loading = [];
+  const toasts = [];
+  let request = null;
+  const player = {
+    fileId: 7,
+    offset: 0,
+    audio: [{ index: 0 }],
+    curAudio: 0,
+    subs: [{ index: 2, language: "eng" }],
+    curSub: -1,
+    burnedSub: null,
+  };
+  const video = { currentTime: 12 };
+  const build = new Function(
+    "PlaybackPolicy",
+    "fetch",
+    "document",
+    "PLAYER",
+    "endWait",
+    "streamGeneration",
+    "newAttempt",
+    "teardownHls",
+    "clearSubs",
+    "pbSyncSubIcon",
+    "setLoading",
+    "subLabelFor",
+    "transcodeOpts",
+    "toast",
+    "clientLog",
+    "playbackContext",
+    "armStall",
+    "attachSession",
+    "qualityForce",
+    "sessionHeight",
+    "newRequestId",
+    "logout",
+    [
+      'const API="/api/v1"; let TOKEN="token";',
+      'const PLAYBACK_ID="playback-1"; let STREAM_FAILURE=null;',
+      shippedSource("api"),
+      shippedSource("openSession"),
+      shippedSource("currentStreamFailureOverlay"),
+      shippedSource("showSessionOpenFailure"),
+      shippedSource("burnSub"),
+      "return {burnSub};",
+    ].join("\n"),
+  );
+  const shipped = build(
+    policy,
+    async (url, init) => {
+      request = { url, init };
+      return {
+        status: 501,
+        ok: false,
+        text: async () =>
+          JSON.stringify({
+            code: "unsupported_build",
+            message: "this server's ffmpeg build has no overlay filter",
+          }),
+      };
+    },
+    { getElementById: (id) => (id === "video" ? video : null) },
+    player,
+    () => {},
+    () => ({ me: player, live: () => true }),
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    (...args) => loading.push(args),
+    () => "English bitmap",
+    (start, audio) => ({
+      start,
+      audio,
+      subtitle_burn: player.burnedSub,
+    }),
+    (message) => toasts.push(message),
+    () => {},
+    () => ({}),
+    () => {},
+    () => {},
+    () => "auto",
+    () => null,
+    () => "request-1",
+    () => {},
+  );
+
+  await shipped.burnSub(2);
+  assert.equal(request.url, "/api/v1/files/7/hls/sessions");
+  assert.equal(request.init.method, "POST");
+  assert.equal(JSON.parse(request.init.body).subtitle_burn, 2);
+  assert.deepEqual(loading.at(-1), [
+    true,
+    "Playback failed to start.",
+    "this server's ffmpeg build has no overlay filter",
+  ]);
+  assert.equal(
+    loading.some(([on]) => on === false),
+    false,
+    "the persistent refusal must not be hidden after the rejected session open",
+  );
+  assert.equal(toasts.at(-1), "Playback failed");
+});
+
 // Drained last, in registration order, after every synchronous case has run.
 (async () => {
   for (const [name, run] of ASYNC_TESTS) {
