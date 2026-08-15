@@ -33,3 +33,4 @@ perf-report-*.txt
 # along in bundles for a week before anyone looked.
 __pycache__/
 *.py[cod]
+.swarm/
