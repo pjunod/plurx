@@ -87,6 +87,17 @@ pub struct ClusterConfig {
     pub join_token_file: PathBuf,
     /// Required network boundary when inter-node transport is not using TLS.
     pub trusted_network: String,
+    /// Node-local key that wraps durable credentials plurx must replay rather
+    /// than verify — today only the Trakt bearer pair. Empty means
+    /// `<data_dir>/credentials.key`.
+    ///
+    /// This lives in `[cluster]` rather than `[storage]` for the reason §3.2
+    /// gives: the cluster section tolerates unknown keys, so an operator who
+    /// sets it and then rolls back to an older binary still gets a config that
+    /// loads. It applies to the single-node SQLite backend too — the key is
+    /// what makes a replicated row safe to write, so it has to exist before
+    /// replication is switched on, not with it.
+    pub credential_key_file: PathBuf,
 }
 
 impl Default for ClusterConfig {
@@ -97,6 +108,18 @@ impl Default for ClusterConfig {
             advertise_host: String::new(),
             join_token_file: PathBuf::new(),
             trusted_network: String::new(),
+            credential_key_file: PathBuf::new(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Where this node's credential-wrapping key lives.
+    pub fn credential_key_path(&self, data_dir: &Path) -> PathBuf {
+        if self.credential_key_file.as_os_str().is_empty() {
+            data_dir.join(crate::secrets::CREDENTIAL_KEY_FILENAME)
+        } else {
+            self.credential_key_file.clone()
         }
     }
 }
@@ -152,6 +175,9 @@ impl Config {
         }
         if let Some(dir) = env_var("PLURX_DATA_DIR") {
             self.storage.data_dir = PathBuf::from(dir);
+        }
+        if let Some(path) = env_var("PLURX_CREDENTIAL_KEY_FILE") {
+            self.cluster.credential_key_file = PathBuf::from(path);
         }
         if let Some(value) = env_var("PLURX_SCAN_PRUNE_PERCENT") {
             self.storage.scan_prune_percent = value.parse().map_err(|_| ConfigError::Env {

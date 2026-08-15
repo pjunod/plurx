@@ -1413,7 +1413,9 @@ mod tests {
 
         // Upgrade through the real M0 path, then run both startup cleanup
         // behaviors against the newly initialized node-local id.
-        let StoreHandle { store, identity } = open_store(&config).await.expect("M0 open");
+        let StoreHandle {
+            store, identity, ..
+        } = open_store(&config).await.expect("M0 open");
         assert_eq!(identity.cluster_id, cluster_id);
         assert_eq!(identity.node_id, cluster_id);
         assert_eq!(

@@ -19,6 +19,13 @@ pub enum StoreError {
 
     #[error("cluster identity error: {0}")]
     Identity(String),
+
+    /// A durable write was handed credential material it may not persist.
+    /// Separate from `Database` because nothing is wrong with the database:
+    /// the store refused the value on purpose. See `secrets` and
+    /// CLUSTERING-PLAN.md §3.2.
+    #[error("credential error: {0}")]
+    Credential(String),
 }
 
 impl From<rusqlite::Error> for StoreError {

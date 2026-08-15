@@ -215,6 +215,15 @@ missing = "fail"
 timeout_seconds = 600
 
 [[checks]]
+id = "credential-encryption"
+title = "Trakt bearer credential sealed at rest, migrated on upgrade, refused without its key"
+command = "cargo test -p plurx-core secrets:: -- --nocapture && cargo test -p plurx-core cluster::tests -- --nocapture && cargo test -p plurx-core store::sqlite::trakt -- --nocapture"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 300
+
+[[checks]]
 id = "security-boundaries"
 title = "Authentication, administration, and scoped-key boundaries"
 command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact"
@@ -372,12 +381,13 @@ title = "Accounts, tokens, and authorization boundaries"
 contract = "Only authenticated users can cross protected API and media boundaries, with admin operations kept separate."
 paths = [
   "crates/plurx-core/src/auth.rs",
+  "crates/plurx-core/src/secrets.rs",
   "crates/plurx-core/src/store/sqlite/{apikeys,users}.rs",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurxd/src/http/{auth,keys,users}.rs",
   "docs/SECURITY.md",
 ]
-checks = ["rust-gate", "security-boundaries"]
+checks = ["rust-gate", "security-boundaries", "credential-encryption"]
 depends_on = ["core.media", "server.api"]
 
 [[points]]

@@ -293,6 +293,12 @@ checks = ["cluster-auth"]
 reason = "The cluster growth gate drives the production coalescer at a deterministic five-second playback cadence, asserts the ten-second commit ratio with bounded headroom, and requires an uncoalesced replicated-write control to violate both the commit and compacted-byte budgets."
 
 [[coverage]]
+commits = ["71aed1840d236d6dbd84f9107de5b42060827d29"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained three-voter `a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft` regression proves that a legacy bearer credential is refused before the first application row is submitted to Raft."
+
+[[coverage]]
 commits = ["5f7ad8a8"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]

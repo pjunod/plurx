@@ -14,6 +14,7 @@ use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
+use plurx_core::secrets::CredentialKey;
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
@@ -156,6 +157,11 @@ impl AppState {
                 server_name,
                 node_id,
                 scan_prune_percent: plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+                // Process-lifetime key. Production resolves one from disk in
+                // `open_store`; this constructor is for callers that have no
+                // data directory to resolve it from, so nothing sealed under
+                // it is expected to outlive the process.
+                credential_key: Arc::new(CredentialKey::generate()),
             },
             store,
             dirs,
@@ -177,6 +183,7 @@ impl AppState {
             server_name,
             node_id,
             scan_prune_percent,
+            credential_key,
         } = config;
         let Dirs {
             artwork: artwork_dir,
@@ -211,7 +218,11 @@ impl AppState {
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| plurx_core::trakt::DEFAULT_BASE.to_owned());
-        let trakt = Arc::new(TraktManager::new(Arc::clone(&store), trakt_base));
+        let trakt = Arc::new(TraktManager::new(
+            Arc::clone(&store),
+            credential_key,
+            trakt_base,
+        ));
         let offline =
             OfflineManager::new(Arc::clone(&store), Arc::clone(&transcode), node_id.clone());
         AppState {
@@ -250,6 +261,10 @@ pub struct AppConfig {
     pub server_name: String,
     pub node_id: String,
     pub scan_prune_percent: u8,
+    /// Node-local key for durable credentials plurx replays rather than
+    /// verifies. Resolved by `open_store` so a boot that cannot open the
+    /// existing Trakt rows fails before any subsystem starts.
+    pub credential_key: Arc<CredentialKey>,
 }
 
 /// Status of the most recent (or in-flight) scan for one library.

@@ -80,6 +80,27 @@ forward fix may need data written after the snapshot. Return the node to its
 normal protected branch only after the fixing PR is merged, then redeploy it
 through Ansible so the next pre-deploy snapshot is taken normally.
 
+**`credentials.key` is not in the snapshot.** It lives beside `plurx.db` and is
+what decrypts the stored Trakt credential, so back up the two together and
+never restore a database onto a node whose key file has been replaced —
+startup refuses that combination rather than silently losing the link, naming
+both the key it holds and the key the rows want. Restore the file **mode `0600`
+and owned by the plurx user**: a group- or world-readable key file is refused on
+every boot, not only the one that minted it, because a key anyone on the box can
+read is not the node-local key the encryption assumes. `chmod 600` is the whole
+fix, and neither refusal touches the database or the key. Rolling
+back the *code* to a revision that predates credential encryption is safe in
+the direction that matters: the older binary reads the envelope as if it were
+the token, Trakt rejects it, and the link is dropped and must be reconnected.
+It does not expose the credential, and it does not corrupt the row.
+
+**A SQLite→Hiqlite import refuses a backup taken before credential
+encryption.** The message names `trakt_auth` and how many rows are unsealed,
+and the fix is one boot: start this build on the SQLite install, which seals
+those rows in place, then take the backup again and re-run the import. Nobody
+has to reconnect the Trakt account. The refusal happens before any row is
+submitted, so a refused import leaves no partial replicated state to clean up.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.
@@ -95,6 +116,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
+| `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |

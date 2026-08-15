@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::hiqlite::{database_error, HiqliteAuthStore};
 use super::{keys, MediaStore, SettingsStore, SQLITE_SCHEMA_VERSION};
 use crate::error::StoreError;
+use crate::secrets::SealedSecret;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
 const IMPORT_CHUNK_ROWS: i64 = 64;
@@ -50,6 +51,14 @@ struct TablePlan {
     order_by: &'static str,
     minimum_schema: i64,
     import_filter: Option<ImportFilter>,
+    /// Columns holding a sealed credential, which import refuses to carry in
+    /// the clear.
+    ///
+    /// Declared per table rather than checked by name at the one call site so
+    /// that a future table with a credential column cannot quietly skip the
+    /// gate: adding a `TablePlan` does not compile until this is answered.
+    /// Empty for every table whose columns are ordinary catalogue data.
+    sealed_columns: &'static [&'static str],
     parent_first: bool,
 }
 
@@ -134,6 +143,10 @@ enum SourceRequest {
         schema_version: i64,
         reply: oneshot::Sender<Result<OrderedRowsDigest, StoreError>>,
     },
+    UnsealedCredentialRows {
+        table: TablePlan,
+        reply: oneshot::Sender<Result<u64, StoreError>>,
+    },
     #[cfg(test)]
     Pause {
         duration: std::time::Duration,
@@ -212,6 +225,9 @@ impl SourceReader {
                     } => {
                         let _ = reply.send(source_digest(&source, schema_version, table));
                     }
+                    SourceRequest::UnsealedCredentialRows { table, reply } => {
+                        let _ = reply.send(unsealed_credential_rows(&source, table));
+                    }
                     #[cfg(test)]
                     SourceRequest::Pause { duration, reply } => {
                         std::thread::sleep(duration);
@@ -277,6 +293,13 @@ impl SourceReader {
         receive_source(response).await
     }
 
+    async fn unsealed_credential_rows(&self, table: TablePlan) -> Result<u64, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::UnsealedCredentialRows { table, reply })
+            .await?;
+        receive_source(response).await
+    }
+
     async fn send(&self, request: SourceRequest) -> Result<(), StoreError> {
         self.requests
             .send(request)
@@ -309,6 +332,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "key",
         minimum_schema: 1,
         import_filter: Some(ImportFilter::ExcludeInstanceId),
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -317,6 +341,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 2,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -331,6 +356,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "token_hash",
         minimum_schema: 2,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -347,6 +373,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 8,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -366,6 +393,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 7,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -400,6 +428,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 13,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: true,
     },
     TablePlan {
@@ -429,6 +458,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 5,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -444,6 +474,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "user_id, item_id",
         minimum_schema: 2,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -461,6 +492,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "user_id",
         minimum_schema: 5,
         import_filter: None,
+        sealed_columns: &["access_token", "refresh_token"],
         parent_first: false,
     },
     TablePlan {
@@ -479,6 +511,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 10,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -487,6 +520,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "recipe_hash",
         minimum_schema: 11,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -504,6 +538,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "recipe_hash, node_id, storage_class",
         minimum_schema: 11,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -544,6 +579,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "id",
         minimum_schema: 14,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -558,6 +594,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "token_hash",
         minimum_schema: 14,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -566,6 +603,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "library_id",
         minimum_schema: 15,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -574,6 +612,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "library_id",
         minimum_schema: 15,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
     TablePlan {
@@ -582,6 +621,7 @@ const TABLES: &[TablePlan] = &[
         order_by: "library_id, item_id",
         minimum_schema: 15,
         import_filter: None,
+        sealed_columns: &[],
         parent_first: false,
     },
 ];
@@ -633,6 +673,8 @@ impl HiqliteAuthStore {
         let (source, metadata) =
             SourceReader::open(backup_path, expected_sha256, expected_schema_version).await?;
         let schema_version = metadata.schema_version;
+        self.refuse_unsealed_source_credentials(&source, schema_version)
+            .await?;
         self.verify_empty_import_target().await?;
         self.import_instance_setting(&metadata).await?;
 
@@ -694,6 +736,44 @@ impl HiqliteAuthStore {
             search_rows,
             tables,
         })
+    }
+
+    /// Refuse a backup carrying a credential this build would replicate in the
+    /// clear, before a single row is submitted to Raft.
+    ///
+    /// The check is up front rather than per chunk because Raft is the thing
+    /// being protected. Every durable backend write already refuses an unsealed
+    /// credential, but import does not go through those writers — it copies
+    /// source columns straight into the target — so without this the one path
+    /// that bypasses the write-time gate is also the one that fans the value
+    /// out to every voter. Discarding a half-imported target recovers the
+    /// database; it does not recover a bearer token from committed log entries
+    /// on three machines.
+    ///
+    /// The remedy named in the error is real: `open_store` seals cleartext rows
+    /// on boot, so starting this build on the SQLite install and taking a fresh
+    /// backup produces a source this accepts.
+    async fn refuse_unsealed_source_credentials(
+        &self,
+        source: &SourceReader,
+        schema_version: i64,
+    ) -> Result<(), StoreError> {
+        for table in TABLES {
+            if table.sealed_columns.is_empty() || schema_version < table.minimum_schema {
+                continue;
+            }
+            let unsealed = source.unsealed_credential_rows(*table).await?;
+            if unsealed != 0 {
+                return Err(import_error(format!(
+                    "SQLite backup has {unsealed} {} row(s) whose credential columns are not \
+                     sealed envelopes; importing them would replicate a usable credential to \
+                     every voter. Start this build on the SQLite install so it seals those rows, \
+                     then take a fresh backup",
+                    table.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn verify_empty_import_target(&self) -> Result<(), StoreError> {
@@ -1055,6 +1135,62 @@ fn source_count(
     source
         .query_row(&sql, [], |row| row.get(0))
         .map_err(|error| import_error(format!("counting source table {}: {error}", table.name)))
+}
+
+/// Count the source rows whose sealed columns are not envelopes this build can
+/// parse.
+///
+/// The test is [`SealedSecret::is_wrapped`], not the laxer
+/// [`looks_wrapped`](SealedSecret::looks_wrapped) the SQLite upgrade pass uses.
+/// The upgrade pass is deciding whether re-sealing would destroy a credential,
+/// so a damaged envelope belongs on its refusal path. Import is deciding what
+/// may enter a replicated log that never forgets, and a damaged envelope is a
+/// credential nobody can open — copying it into every voter fixes nothing and
+/// makes the source install's problem permanent.
+///
+/// Only the count leaves this function. The values are exactly what must not
+/// reach an error string or a log line.
+fn unsealed_credential_rows(source: &Connection, table: TablePlan) -> Result<u64, StoreError> {
+    if table.sealed_columns.is_empty() {
+        return Ok(0);
+    }
+    let projection = table.sealed_columns.join(", ");
+    let mut statement = source
+        .prepare(&format!("SELECT {projection} FROM {}", table.name))
+        .map_err(|error| {
+            import_error(format!(
+                "reading sealed columns of source table {}: {error}",
+                table.name
+            ))
+        })?;
+    let mut rows = statement.query([]).map_err(|error| {
+        import_error(format!(
+            "reading sealed columns of source table {}: {error}",
+            table.name
+        ))
+    })?;
+
+    let mut unsealed = 0_u64;
+    while let Some(row) = rows.next().map_err(|error| {
+        import_error(format!(
+            "reading sealed columns of source table {}: {error}",
+            table.name
+        ))
+    })? {
+        // A NULL or non-text value in a credential column is not an envelope
+        // either, so it fails closed with everything else rather than reading
+        // as "nothing to check here".
+        let sealed = (0..table.sealed_columns.len()).all(|index| {
+            row.get::<_, String>(index)
+                .is_ok_and(|value| SealedSecret::from_stored(value).is_wrapped())
+        });
+        if !sealed {
+            unsealed = unsealed
+                .checked_add(1)
+                .ok_or_else(|| import_error("unsealed credential row count overflow"))?;
+        }
+    }
+    Ok(unsealed)
 }
 
 fn import_select_sql(table: TablePlan, schema_version: i64) -> String {

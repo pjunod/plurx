@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::secrets::{CredentialKey, SealedSecret, Secret, SecretError};
+
 // ---------------------------------------------------------------------------
 // Libraries
 // ---------------------------------------------------------------------------
@@ -863,11 +865,18 @@ pub struct NetworkPriorObservation {
 }
 
 /// A user's linked Trakt account (tokens + sync bookkeeping).
+///
+/// The two bearer credentials are [`SealedSecret`]s, not strings, because this
+/// struct is exactly what crosses the `Store` boundary into a durable — and,
+/// once M2 activates, replicated — row. A store implementation therefore has
+/// no cleartext to write even by accident; recovering one costs a call to
+/// [`reveal_access_token`](TraktAuth::reveal_access_token) with the node-local
+/// key. See `secrets` and CLUSTERING-PLAN.md §3.2.
 #[derive(Debug, Clone)]
 pub struct TraktAuth {
     pub user_id: i64,
-    pub access_token: String,
-    pub refresh_token: String,
+    pub access_token: SealedSecret,
+    pub refresh_token: SealedSecret,
     /// Unix seconds when the access token expires (refresh happens earlier).
     pub expires_at: i64,
     pub trakt_username: Option<String>,
@@ -877,6 +886,27 @@ pub struct TraktAuth {
     /// Raw `/sync/last_activities` JSON from the last run — an opaque change
     /// gate: identical JSON and nothing local to push means the pull can skip.
     pub last_activities: Option<String>,
+}
+
+impl TraktAuth {
+    /// Recover the access token for an outbound Trakt call.
+    ///
+    /// The user id is authenticated with the ciphertext, so this cannot be
+    /// tricked into opening another user's credential by rewriting a row's
+    /// `user_id`.
+    pub fn reveal_access_token(&self, key: &CredentialKey) -> Result<Secret, SecretError> {
+        key.open_trakt(self.user_id, &self.access_token)
+    }
+
+    /// Recover the refresh token for an outbound rotation.
+    pub fn reveal_refresh_token(&self, key: &CredentialKey) -> Result<Secret, SecretError> {
+        key.open_trakt(self.user_id, &self.refresh_token)
+    }
+
+    /// True once both bearer columns are envelopes rather than cleartext.
+    pub fn is_wrapped(&self) -> bool {
+        self.access_token.is_wrapped() && self.refresh_token.is_wrapped()
+    }
 }
 
 #[cfg(test)]
