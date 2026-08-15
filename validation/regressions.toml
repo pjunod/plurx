@@ -281,6 +281,12 @@ checks = ["rust-gate"]
 reason = "The retained sidecar test seeds the exact interrupted-migration state — network_priors committed, user_version still 1 — and requires NodeLocalTelemetry::open to reopen it, keep the recorded event and prior, and finish the version stamp; restoring only the pre-fix initialize reproduces the permanent `table network_priors already exists` startup failure."
 
 [[coverage]]
+commits = ["616a3673"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained playlist regression pins that startup fails promptly when the child exits unsuccessfully before publishing usable output; reverting only the production correction restores the full poll-window hang."
+
+[[coverage]]
 commits = ["bb16e82a2639468da01ecd768e2a0941abde8056"]
 points = ["cluster.auth"]
 checks = ["cluster-auth"]
@@ -291,3 +297,45 @@ commits = ["71aed1840d236d6dbd84f9107de5b42060827d29"]
 points = ["cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The retained three-voter `a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft` regression proves that a legacy bearer credential is refused before the first application row is submitted to Raft."
+
+[[coverage]]
+commits = ["5f7ad8a8"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained replacement-gap regression pins that watchdog and copy-segmenter restarts remove the killed predecessor before the next playlist poll; reverting only the production correction permanently fails the replacement session."
+
+[[coverage]]
+commits = ["89c86ef"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained retired-session regression pins that an in-flight playlist ignores a producer exit after teardown removes the session; reverting only the production correction marks routine teardown failed and returns an error."
+
+[[coverage]]
+commits = ["415db12"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog and production-fallback regressions pin that a routine kill ends without a false stall while a deliberately killed predecessor cannot poison its replacement; reverting only the production correction restores the false teardown verdict."
+
+[[coverage]]
+commits = ["70084d1"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained unrelated-session regression pins that playlist producer inspection releases the global session map before waiting on a child lock; reverting only the production correction makes an unrelated status request time out behind that lock."
+
+[[coverage]]
+commits = ["a37f3f5"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog replacement-race regressions pause after stale Done and Stall observations, require the replacement to survive with coverage intact, then require a later successor stall to fail; reverting only the production correction either kills the successor or abandons its watchdog."
+
+[[coverage]]
+commits = ["299d41bb"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog-first copy-fallback regressions prove that a terminal Stall leaves no successor, while a predecessor Done re-arms lifetime coverage before publishing its successor; reverting only the production correction restores the late failed-or-unmonitored producer race."
+
+[[coverage]]
+commits = ["3a387052"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained stop-versus-copy-fallback regression pauses an Unsupported replacement while retirement begins, requires teardown to kill the published successor, and refuses any later replacement even with stale scratch; reverting only the production correction lets a live untracked producer survive the stop."

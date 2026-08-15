@@ -543,6 +543,29 @@ requested start, and cached whole-title sessions report zero. New clients use
 this integer origin for timeline mapping and old clients continue to fall back
 to `start_seconds`.
 
+**Playlist startup distinguishes slow work from finished failure.** While the
+producer is alive, the first playlist request keeps the full 30-second window:
+the copy publish gate can legitimately take double-digit seconds on a NAS-bound
+4K remux. If that producer exits unsuccessfully before a usable playlist
+exists, the next 100 ms poll marks the session failed and ends the request, so
+the HTTP error names a server-side startup failure promptly instead of becoming
+a minute-long client `manifestLoadTimeOut`. A successful exit remains ordinary
+EOF because a short file may have completed cleanly, and a cached VOD has no
+producer to judge and is never marked failed.
+
+A fallback replacement owns one session-scoped transition from its final live
+session check through successor publication. If the lifetime watchdog wins that
+transition first, a failed stall prevents the replacement; a predecessor exit
+may still fall back, but the successor claims a fresh lifetime watchdog before
+the transition ends. Playlist startup and the watchdog likewise re-confirm
+terminal child observations inside the boundary, so an old producer can neither
+poison the new producer nor leave it unmonitored. The boundary is per session;
+a slow replacement does not block another viewer's playlist or status work.
+Session retirement owns that same transition before removing the manager entry
+and keeps it through producer kill and scratch deletion. A replacement that won
+first is therefore published and then killed by teardown; a retirement that won
+first leaves a monotonic lifetime verdict that refuses any later replacement.
+
 ## Persistent stalls — one bounded recovery, with an outcome
 
 The startup watchdog diagnoses a stream that never starts. Mid-playback was
