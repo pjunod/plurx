@@ -23,7 +23,24 @@ use crate::error::StoreError;
 use crate::secrets::SealedSecret;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
+/// Rows per import `txn`, bounded by the production WAL rather than throughput.
+///
+/// One chunk becomes one Raft transaction, and `hiqlite` panics when a single
+/// transaction exceeds the WAL payload capacity: 2,097,118 bytes under the
+/// production `wal_size: 2 * 1024 * 1024`
+/// (`crates/plurx-core/src/cluster/migration.rs`). `files.probe_json` holds
+/// whole ffprobe documents, so a row-count bound is not a byte bound — 64 rows
+/// of a real library serialized to 3,137,236 bytes and crashed activation into
+/// unreplicated SQLite recovery.
+///
+/// 16 keeps the worst observed library (~55 KB/row) well inside that cap, but
+/// the bound is still only a row count: 16 adjacent rows averaging more than
+/// ~131,069 bytes each still overflow. Raising this for import throughput
+/// re-opens that crash; a byte-measured chunk builder is the real fix.
 const IMPORT_CHUNK_ROWS: i64 = 16;
+/// Rows per read-only parity page. Independent of [`IMPORT_CHUNK_ROWS`]: these
+/// pages are consistent reads that never enter a Raft transaction, so the WAL
+/// payload cap does not apply to them.
 const PARITY_PAGE_ROWS: i64 = 64;
 
 /// Ordered evidence that one durable SQLite table exactly matches Hiqlite.
@@ -156,8 +173,9 @@ enum SourceRequest {
 
 /// One blocking worker owns the immutable SQLite connection for the import.
 ///
-/// Reopening the backup for every 64-row chunk would avoid blocking Tokio but
-/// turn a large catalogue into thousands of connection setups. This actor
+/// Reopening the backup for every [`IMPORT_CHUNK_ROWS`] chunk would avoid
+/// blocking Tokio but turn a large catalogue into thousands of connection
+/// setups. This actor
 /// keeps one read-only connection and sends row data back in bounded chunks.
 /// The one deliberate O(items) reply is the parent-first id ordering used to
 /// avoid rebuilding and sorting the full item tree for every chunk.

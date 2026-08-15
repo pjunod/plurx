@@ -416,6 +416,10 @@ async fn hiqlite_contract_node_process() {
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
+        // Production tuning, duplicated from `crates/plurx-core/src/cluster/migration.rs`
+        // (`start_one_voter`). The import chunk bound is sized against this WAL
+        // payload capacity, so a retune there must be mirrored here or the
+        // retained large-probe regression stops testing the production bound.
         wal_size: 2 * 1024 * 1024,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
