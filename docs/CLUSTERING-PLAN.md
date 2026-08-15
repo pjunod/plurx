@@ -623,7 +623,29 @@ publication, and rename. Before rename, the next boot removes partial incoming
 state and consumes one SQLite recovery boot; after rename, the completed marker
 makes the replicated target authoritative. `reset-password` and
 `refresh-metadata` never import: they refuse an unmigrated directory and use an
-authenticated client to the running voter after activation.
+authenticated client to the running voter after activation, so both require a
+running daemon rather than opening a second store beside it.
+
+An ambiguous active target fails closed rather than reverting to SQLite: a
+missing, malformed, unsupported, or identity-mismatched marker, or a `hiqlite`
+path that is not a directory, refuses the boot. The scope of that check is the
+marker's own shape and the recorded cluster identity. It deliberately does
+**not** re-verify the recorded table hashes against live target contents on
+every boot — parity is an import-time property, proven once before the rename,
+and re-hashing every table at startup would put a full scan in front of every
+restart. Detecting later corruption *within* an activated target is M6's
+backup-and-restore work, not M2's.
+
+Activation is one-way per data directory. Because the retained `plurx.db` is a
+rollback source rather than a current one, a directory that has activated
+records `hiqlite-activated.json` beside it, and a boot that finds that record
+without its target refuses instead of re-importing stale rows. Deleting that
+file is the deliberate way to accept a rollback and the data loss it implies.
+`migration/` keeps only the three newest source backups, so a repeatedly failing
+activation cannot fill the data volume with database copies.
+
+Both cluster listeners bind loopback only, and a port already in use is reported
+by name before the voter starts rather than surfacing as a start timeout.
 
 **Trakt credential encryption is no longer a blocker (2026-08-14).** Both
 bearer columns are envelope-encrypted under a node-local key file before they
@@ -639,10 +661,14 @@ beats at five-second logical cadence (444.136 bytes/beat), 5,040 physical
 commits for 80 streams, and a raw 10,000-write control that violates both the
 commit and byte budgets. No §6.6 activation blocker remains outstanding.
 
-Before M3 introduces peers, the one-voter Raft listener is loopback-only; no
-replication traffic exists to expose. The authenticated API retains automatic
-TLS and may use its configured bind so maintenance commands can reach the
-running voter without opening a second store process.
+Before M3 introduces peers, both cluster listeners are loopback-only; no
+replication traffic exists to expose and no remote consumer exists to serve.
+The API listener keeps automatic TLS and its authenticating secret, but it
+ignores a non-loopback `api_bind` and `advertise_host`: its only consumer is a
+maintenance command on the same machine, so honouring the `0.0.0.0` default
+would open a LAN port on every single-node install at upgrade with nothing on
+the other end. M3 opens it deliberately, with membership, when a peer exists to
+talk to.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 

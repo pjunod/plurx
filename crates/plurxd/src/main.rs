@@ -31,7 +31,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use plurx_core::cluster::migration::{connect_activated_store, select_daemon_store};
+use plurx_core::cluster::migration::{
+    connect_activated_store, select_daemon_store, SelectedBackend,
+};
 use plurx_core::config::Config;
 use plurx_core::domain::LibraryKind;
 use plurx_core::metadata::{self, AniListClient, TmdbClient};
@@ -83,8 +85,9 @@ enum Command {
     },
     /// Reset a user's password in the activated store — the recovery path
     /// when an admin password is forgotten (admins reset *other* users in
-    /// the web UI). Safe while the server runs; revokes the user's
-    /// sessions. In Docker: docker exec -it plurxd plurxd reset-password NAME
+    /// the web UI). Requires the server running, because it shares that
+    /// daemon's voter; revokes the user's sessions. In Docker:
+    /// docker exec -it plurxd plurxd reset-password NAME
     ResetPassword {
         /// Username whose password to reset.
         username: String,
@@ -94,7 +97,8 @@ enum Command {
         password: Option<String>,
     },
     /// Force provider metadata and artwork through the activated store. Useful
-    /// after an artwork-quality upgrade; safe beside the running server.
+    /// after an artwork-quality upgrade; runs beside the server and requires
+    /// it running, because it shares that daemon's voter.
     RefreshMetadata {
         /// Refresh one library id instead of every provider-backed library.
         #[arg(long)]
@@ -134,9 +138,12 @@ async fn dispatch(command: Command, config: Config) -> anyhow::Result<()> {
 /// The command refuses a legacy-only data directory because only `run` owns
 /// the one-time import and activation sequence.
 async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::Result<()> {
-    let store = connect_activated_store(config)
-        .await
-        .context("connecting to the activated store; run `plurxd run` to migrate first")?;
+    let store = connect_activated_store(config).await.context(
+        "connecting to the activated store: an unmigrated data directory needs \
+             `plurxd run` to import it once, and an activated one needs that daemon \
+             running because maintenance commands share its voter rather than \
+             opening a second store",
+    )?;
     let artwork_dir = config.storage.data_dir.join("artwork");
     std::fs::create_dir_all(&artwork_dir)?;
     refresh_metadata_with_store(store, &artwork_dir, library_id).await
@@ -217,9 +224,12 @@ async fn reset_password(
         "password must be at least 8 characters"
     );
 
-    let store = connect_activated_store(config)
-        .await
-        .context("connecting to the activated store; run `plurxd run` to migrate first")?;
+    let store = connect_activated_store(config).await.context(
+        "connecting to the activated store: an unmigrated data directory needs \
+             `plurxd run` to import it once, and an activated one needs that daemon \
+             running because maintenance commands share its voter rather than \
+             opening a second store",
+    )?;
     reset_password_in_store(store.as_ref(), username, &password).await
 }
 
@@ -257,6 +267,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let selected = select_daemon_store(&config)
         .await
         .with_context(|| format!("selecting store in {}", config.storage.data_dir.display()))?;
+    // Which backend is serving is not otherwise observable. A recovery boot
+    // binds and serves normally on unreplicated SQLite, so a persistently
+    // failing activation otherwise looks only like a flapping container, with
+    // nothing saying which boots were replicated and which were not.
+    match selected.backend {
+        SelectedBackend::Replicated => {
+            tracing::info!("durable state: one-voter replicated store");
+        }
+        SelectedBackend::SqliteRecovery => tracing::warn!(
+            "durable state: unreplicated SQLite, recovering from an interrupted activation; \
+             this boot is not replicated and the next restart retries the import"
+        ),
+    }
     let serving = async {
         let store = Arc::clone(&selected.store);
         let dirs = create_dirs(&config.storage.data_dir)?;

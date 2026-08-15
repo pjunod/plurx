@@ -55,6 +55,22 @@ closed SQLite database. The three newest copies stay on each node under
 `plurx.db.predeploy-<UTC>-<last-good-sha>.bak`. The SHA in the filename names
 the code that was running when the snapshot was taken.
 
+**On an activated node those snapshots are not restore points.** The deploy
+still copies `plurx.db`, but after activation that file is frozen at the moment
+of import, so each new snapshot is another copy of the same pre-activation
+state — the redeploy captures nothing written since. Restoring one does not
+roll the node back; it only makes a stale database sit beside the authoritative
+target, and `plurxd` refuses to import it precisely so that mistake cannot pass
+silently (see the refusal below). Capturing current replicated state is M6's
+quorum-aware backup work and does not exist yet; until it does, treat
+`<PLURX_DATA>/hiqlite/` itself as the thing to copy while the daemon is stopped.
+
+`plurxd` records `<PLURX_DATA>/hiqlite-activated.json` when it activates. If the
+replicated target is missing while that file is present, startup refuses rather
+than re-importing `plurx.db`, and names both the file and the loss accepting it
+would cause. Deleting that file is the deliberate way to accept a rollback to
+the pre-activation database, discarding everything written since activation.
+
 An older binary deliberately refuses a database migrated by a newer binary.
 Rolling back code alone therefore leaves the service crash-looping. Restore
 the matching pre-deploy database before rebuilding the older revision:

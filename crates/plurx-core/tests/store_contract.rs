@@ -29,7 +29,7 @@ use hiqlite::{Client, Node, NodeConfig};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::{
     connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
-    SelectedBackend, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
+    SelectedBackend, ACTIVATED_SOURCE_FILENAME, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
 };
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
@@ -1222,6 +1222,153 @@ async fn killed_activation_boundaries_recover_sqlite_or_completed_target() {
     assert_eq!(second.count_users().await.expect("user count"), 1);
     drop(second);
     resumed.stop();
+}
+
+/// An ambiguous active target must fail closed, never fall back to SQLite.
+///
+/// This is the property whose regression is worst: silently preferring the
+/// retained source would boot the daemon on pre-activation state while the
+/// replicated target sat right there. Every case here is reached before a voter
+/// starts, so the refusal is the only thing under test.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_active_target_refuses_rather_than_reverting_to_sqlite() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let valid_marker = |data_dir: &std::path::Path| -> ActivationMarker {
+        let prepared = prepare_sqlite_import(data_dir).expect("prepare source");
+        ActivationMarker {
+            marker_version: 1,
+            cluster_id: prepared.cluster_id.clone(),
+            source_backup_sha256: prepared.backup_sha256.clone(),
+            source_schema_version: prepared.schema_version,
+            replicated_schema_version: 5,
+            imported_rows: 1,
+            table_hashes: Vec::new(),
+        }
+    };
+
+    /// How one case makes the target ambiguous.
+    type Corrupt = Box<dyn Fn(&std::path::Path)>;
+
+    // Each case: how the target is made ambiguous, and what the operator reads.
+    let cases: Vec<(&str, Corrupt)> = vec![
+        (
+            "activation marker",
+            Box::new(|data_dir: &std::path::Path| {
+                let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+                std::fs::create_dir_all(&active).expect("active target");
+                std::fs::write(active.join(ACTIVATION_MARKER_FILENAME), b"{ not json")
+                    .expect("corrupt marker");
+            }),
+        ),
+        (
+            ACTIVATION_MARKER_FILENAME,
+            Box::new(|data_dir: &std::path::Path| {
+                std::fs::create_dir_all(data_dir.join(HIQLITE_ACTIVE_DIRNAME))
+                    .expect("active target without a marker");
+            }),
+        ),
+        (
+            "Hiqlite activation marker",
+            Box::new(move |data_dir: &std::path::Path| {
+                let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+                std::fs::create_dir_all(&active).expect("active target");
+                let mut marker = valid_marker(data_dir);
+                // Structurally sound, semantically impossible.
+                marker.marker_version = 99;
+                std::fs::write(
+                    active.join(ACTIVATION_MARKER_FILENAME),
+                    serde_json::to_vec(&marker).expect("serialize marker"),
+                )
+                .expect("write marker");
+            }),
+        ),
+        (
+            "directory",
+            Box::new(|data_dir: &std::path::Path| {
+                std::fs::write(data_dir.join(HIQLITE_ACTIVE_DIRNAME), b"not a target")
+                    .expect("active path that is not a directory");
+            }),
+        ),
+    ];
+
+    for (expected, corrupt) in cases {
+        let fixture = tempfile::tempdir().expect("ambiguous target fixture");
+        populated_current_import_fixture(fixture.path());
+        corrupt(fixture.path());
+
+        let error = select_daemon_store(&one_voter_config(fixture.path()))
+            .await
+            .err()
+            .expect("an ambiguous active target must not open");
+        let error = error.to_string();
+        assert!(
+            error.contains(expected),
+            "refusal must name what is wrong ({expected}): {error}"
+        );
+        assert!(
+            !fixture.path().join("hiqlite.incoming").exists(),
+            "a refusal must not stage a new import: {error}"
+        );
+    }
+}
+
+/// Losing the replicated target must not silently re-import the stale source.
+///
+/// After activation `plurx.db` is a rollback source, not a current one. A data
+/// directory that lost `hiqlite/` is byte-indistinguishable from one that never
+/// activated, so without the breadcrumb the next boot would quietly discard
+/// every write since activation — the failure an operator would never see.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_replicated_target_refuses_to_reimport_the_retained_source() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let fixture = tempfile::tempdir().expect("activated source fixture");
+    populated_current_import_fixture(fixture.path());
+    let config = one_voter_config(fixture.path());
+    let launch = ActivationNodeLaunch {
+        data_dir: fixture.path().to_owned(),
+        raft_bind: config.cluster.raft_bind.to_string(),
+        api_bind: config.cluster.api_bind.to_string(),
+        source_version: plurx_core::store::SQLITE_SCHEMA_VERSION,
+        first_boot: true,
+    };
+    ActivationNodeProcess::start(&launch).stop();
+
+    let breadcrumb = fixture.path().join(ACTIVATED_SOURCE_FILENAME);
+    assert!(
+        breadcrumb.is_file(),
+        "activation must record that this source handed over authority"
+    );
+    std::fs::remove_dir_all(fixture.path().join(HIQLITE_ACTIVE_DIRNAME)).expect("lose the target");
+
+    let error = select_daemon_store(&config)
+        .await
+        .err()
+        .expect("a lost target must not silently re-import")
+        .to_string();
+    assert!(error.contains("already activated"), "{error}");
+    // The refusal is only useful if it names both what it protected and the
+    // exact way out; an operator who cannot act on it will delete something.
+    assert!(error.contains("plurx.db"), "{error}");
+    assert!(
+        error.contains(&breadcrumb.display().to_string()),
+        "refusal must name the file to delete to accept the rollback: {error}"
+    );
+    assert!(
+        !fixture.path().join("hiqlite.incoming").exists(),
+        "the refusal must not stage an import"
+    );
+
+    // And the documented way out actually works: with the breadcrumb gone the
+    // directory activates again rather than staying permanently wedged. The
+    // failpoint stops that attempt as soon as it proves the guard is passed.
+    std::fs::remove_file(&breadcrumb).expect("accept the rollback");
+    run_injected_activation(&launch, "after-quiescence");
 }
 
 #[cfg(feature = "hiqlite-store")]

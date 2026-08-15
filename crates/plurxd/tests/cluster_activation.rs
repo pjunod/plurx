@@ -121,6 +121,89 @@ fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
     drop(listener);
 }
 
+/// The maintenance commands must reach TLS through the real binary.
+///
+/// `rustls` panics rather than erroring when a process reaches TLS with no
+/// process-level provider, and `plurxd run` only ever got one as a side effect
+/// of `hiqlite::start_node`, which these commands never call. So both aborted on
+/// every activated node while the library-level contract test passed, because
+/// that harness installs a provider of its own. Only the shipped binary can tell
+/// the two apart, which is why this drives `CARGO_BIN_EXE_plurxd`.
+///
+/// Asserting on the *absence* of the panic rather than on success keeps the test
+/// about the regression: reaching a reported error means TLS was negotiated.
+#[test]
+fn maintenance_commands_reach_tls_on_an_activated_node() {
+    let root = tempfile::tempdir().expect("maintenance TLS fixture");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("data directory");
+    drop(SqliteStore::open(&data.join("plurx.db")).expect("legacy SQLite source"));
+
+    let config_path = root.path().join("plurx.toml");
+    let server_port = free_port();
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\n\
+             bind = \"127.0.0.1:{server_port}\"\n\
+             [storage]\n\
+             data_dir = \"{}\"\n\
+             [cluster]\n\
+             raft_bind = \"127.0.0.1:{}\"\n\
+             api_bind = \"127.0.0.1:{}\"\n\
+             advertise_host = \"127.0.0.1\"\n",
+            toml_string(&data),
+            free_port(),
+            free_port(),
+        ),
+    )
+    .expect("maintenance config");
+
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_plurxd"))
+            .args([
+                "--config",
+                config_path.to_str().expect("config path"),
+                "run",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start daemon"),
+    );
+    wait_for_bind(&mut daemon, server_port);
+    assert!(data.join("hiqlite/activation.json").is_file());
+
+    for args in [
+        vec!["reset-password", "owner", "--password", "a-new-password"],
+        vec!["refresh-metadata"],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_plurxd"));
+        command.args(["--config", config_path.to_str().expect("config path")]);
+        command.args(&args);
+        let output = command.output().expect("run maintenance command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("CryptoProvider"),
+            "{args:?} aborted before TLS instead of using the activated voter: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "{args:?} panicked against an activated node: {stderr}"
+        );
+        // The directory *is* activated, so nothing may tell the operator to
+        // migrate it. `owner` does not exist, so a reported miss proves the
+        // command read through the replicated store rather than failing earlier.
+        assert!(
+            !stderr.contains("is not activated"),
+            "{args:?} refused an activated directory: {stderr}"
+        );
+    }
+
+    daemon.stop();
+}
+
 #[test]
 fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
     let root = tempfile::tempdir().expect("daemon activation fixture");

@@ -50,6 +50,11 @@ pub const MIGRATION_DIRNAME: &str = "migration";
 pub const HIQLITE_INCOMING_DIRNAME: &str = "hiqlite.incoming";
 pub const HIQLITE_ACTIVE_DIRNAME: &str = "hiqlite";
 pub const ACTIVATION_MARKER_FILENAME: &str = "activation.json";
+/// Breadcrumb proving this data directory already handed authority to Hiqlite.
+///
+/// It lives beside `plurx.db` rather than inside the target, because its whole
+/// job is to survive the target's disappearance.
+pub const ACTIVATED_SOURCE_FILENAME: &str = "hiqlite-activated.json";
 #[cfg(feature = "hiqlite-store")]
 const ACTIVATION_ATTEMPT_FILENAME: &str = "hiqlite-activation.in-progress";
 #[cfg(feature = "hiqlite-store")]
@@ -68,6 +73,8 @@ const ACTIVATION_MARKER_VERSION: u32 = 1;
 const ACTIVATION_FAILPOINT_ENV: &str = "PLURX_CLUSTER_ACTIVATION_FAILPOINT";
 #[cfg(feature = "hiqlite-store")]
 const ACTIVATION_CRASH_EXIT: i32 = 86;
+/// How many source backups `migration/` keeps, newest first.
+const MIGRATION_BACKUP_RETENTION: usize = 3;
 
 /// Immutable source material for the row-import and parity phases.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +102,21 @@ pub struct ActivationMarker {
     pub replicated_schema_version: i64,
     pub imported_rows: u64,
     pub table_hashes: Vec<SqliteImportTableDigest>,
+}
+
+/// Record that this data directory already activated, kept outside the target.
+///
+/// The retained `plurx.db` is a rollback source, not a current one, and nothing
+/// else can tell the two apart: a data directory that lost `hiqlite/` looks
+/// exactly like one that never activated. Without this breadcrumb the next boot
+/// would re-import the stale source and silently discard every write since
+/// activation. It is written after the rename that made the target authoritative
+/// and re-asserted on every later boot that opens one.
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivatedSourceRecord {
+    pub cluster_id: String,
+    pub source_backup_sha256: String,
 }
 
 /// Which durable backend the daemon selected for this boot.
@@ -184,6 +206,7 @@ impl ActivationFailpoint {
 /// unchanged legacy store is returned. A completed atomic target always wins.
 #[cfg(feature = "hiqlite-store")]
 pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, StoreError> {
+    install_default_crypto_provider();
     let failpoint = ActivationFailpoint::configured()?;
     std::fs::create_dir_all(&config.storage.data_dir)
         .map_err(|error| migration_io("creating", &config.storage.data_dir, error))?;
@@ -199,6 +222,28 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
         remove_abandoned_incoming(&config.storage.data_dir)?;
         remove_activation_attempt(&config.storage.data_dir)?;
         return Ok(selected);
+    }
+
+    // No active target, but this directory has already handed authority over.
+    // Re-importing the retained source here would look like a clean first boot
+    // and silently discard everything written since activation, so refuse
+    // before any cleanup, attempt marker, or import can start.
+    if let Some(record) = read_activated_source_record(&config.storage.data_dir)? {
+        return Err(StoreError::Migration(format!(
+            "{} was already activated as cluster {} but {} is missing: refusing to \
+             re-import {}, which is the pre-activation rollback source and would \
+             discard every change since. Restore the replicated target from a copy, \
+             or delete {} to deliberately accept that rollback and its data loss",
+            config.storage.data_dir.display(),
+            record.cluster_id,
+            active.display(),
+            config.storage.data_dir.join(SQLITE_FILENAME).display(),
+            config
+                .storage
+                .data_dir
+                .join(ACTIVATED_SOURCE_FILENAME)
+                .display(),
+        )));
     }
 
     ensure_sqlite_source(&config.storage.data_dir)?;
@@ -254,6 +299,7 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
 /// replicated state.
 #[cfg(feature = "hiqlite-store")]
 pub async fn connect_activated_store(config: &Config) -> Result<Arc<dyn Store>, StoreError> {
+    install_default_crypto_provider();
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     if !path_exists(&active)? {
         return Err(StoreError::Migration(format!(
@@ -424,6 +470,23 @@ impl ActivationMarker {
     }
 }
 
+/// Install the process-level rustls provider every TLS path here depends on.
+///
+/// `rustls` panics rather than erroring when a process reaches TLS with no
+/// default provider, and the crate is built with more than one provider feature
+/// reachable, so it will not choose for us. `plurxd run` used to be covered only
+/// by accident: `hiqlite::start_node` installs one on the server side, which the
+/// maintenance commands never call, so `reset-password` and `refresh-metadata`
+/// aborted on every activated node. Installing here rather than in one binary's
+/// entry point keeps a future caller from reintroducing that gap.
+///
+/// Idempotent: a losing race or an already-installed provider returns `Err`,
+/// which is the same end state as winning.
+#[cfg(feature = "hiqlite-store")]
+fn install_default_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(feature = "hiqlite-store")]
 async fn open_active_store(
     config: &Config,
@@ -452,6 +515,14 @@ async fn open_active_store_with_key(
         }
     };
     if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
+        drop(store);
+        let shutdown = client.shutdown().await.err();
+        return Err(with_shutdown_error(error, shutdown));
+    }
+    // Written here rather than beside the rename so a crash in between still
+    // converges: any boot that successfully opens an active target re-asserts
+    // it, and this is the only place that can be reached without one.
+    if let Err(error) = ensure_activated_source_record(&config.storage.data_dir, &marker) {
         drop(store);
         let shutdown = client.shutdown().await.err();
         return Err(with_shutdown_error(error, shutdown));
@@ -567,29 +638,39 @@ async fn start_local_voter(
     active_transport: bool,
 ) -> Result<Client, StoreError> {
     let raft_address = local_client_address(config.cluster.raft_bind);
-    let api_address = if active_transport {
-        advertised_address(&config.cluster.advertise_host, config.cluster.api_bind)
-    } else {
-        local_client_address(config.cluster.api_bind).to_string()
-    };
-    let api_listen_ip = if active_transport {
-        config.cluster.api_bind.ip()
-    } else {
-        local_client_address(config.cluster.api_bind).ip()
-    };
+    // Both listeners stay loopback-only for the same reason: M2 has no peer.
+    // The API listener's only consumer is `connect_activated_store` on this
+    // machine, which dials `local_client_address(api_bind)`, so binding the
+    // configured `0.0.0.0` default would open a LAN port on every existing
+    // single-node install at upgrade with nothing on the other end of it. M3
+    // opens it deliberately when membership gives it a peer to talk to.
+    let api_address = local_client_address(config.cluster.api_bind);
     let node = Node {
         id: super::SINGLE_VOTER_RAFT_ID,
-        // M2 has no peer, so Raft stays loopback-only. Besides removing an
-        // unnecessary exposed port, Hiqlite's plain listener receives its
-        // graceful-shutdown signal; M3 will replace this address when it adds
-        // authenticated membership.
+        // Besides removing an unnecessary exposed port, Hiqlite's plain
+        // listener receives its graceful-shutdown signal; M3 will replace both
+        // addresses when it adds authenticated membership.
         addr_raft: raft_address.to_string(),
-        addr_api: api_address,
+        addr_api: api_address.to_string(),
     };
+    // The daemon lock guards one data directory, but these ports are host-wide
+    // and default to fixed values, so two data directories on one host collide.
+    // Without this check the node does not report a bind conflict: it reaches a
+    // foreign voter's listener, retries the handshake for the full start
+    // timeout, and then blames the migration. Check first and say which port.
+    for (role, address) in [("raft", raft_address), ("cluster API", api_address)] {
+        if let Err(error) = std::net::TcpListener::bind(address) {
+            return Err(StoreError::Migration(format!(
+                "the {role} port {address} is not available: {error}. Another plurxd on \
+                 this host is using it — cluster ports are host-wide, so a second data \
+                 directory needs its own raft_bind and api_bind"
+            )));
+        }
+    }
     let node_config = NodeConfig {
         node_id: super::SINGLE_VOTER_RAFT_ID,
         nodes: vec![node],
-        listen_addr_api: Cow::Owned(api_listen_ip.to_string()),
+        listen_addr_api: Cow::Owned(api_address.ip().to_string()),
         listen_addr_raft: Cow::Owned(raft_address.ip().to_string()),
         data_dir: Cow::Owned(target.to_string_lossy().into_owned()),
         filename_db: Cow::Borrowed(HIQLITE_DATABASE_FILENAME),
@@ -714,18 +795,10 @@ fn inspect_sqlite_source(path: &Path) -> Result<(i64, String), StoreError> {
     Ok((schema_version, cluster_id))
 }
 
-#[cfg(feature = "hiqlite-store")]
-fn advertised_address(host: &str, bind: SocketAddr) -> String {
-    let host = host.trim();
-    if host.is_empty() {
-        return local_client_address(bind).to_string();
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return SocketAddr::new(ip, bind.port()).to_string();
-    }
-    format!("{host}:{}", bind.port())
-}
-
+// `config.cluster.advertise_host` has no reader while both listeners are
+// loopback-only: there is no peer to advertise an address to. M3 reintroduces
+// the resolution helper alongside the membership that needs it, rather than
+// keeping an unreachable one here.
 #[cfg(feature = "hiqlite-store")]
 fn local_client_address(bind: SocketAddr) -> SocketAddr {
     let ip = if bind.ip().is_unspecified() {
@@ -868,6 +941,56 @@ fn write_activation_marker(target: &Path, marker: &ActivationMarker) -> Result<(
     write_atomic_private(target, ACTIVATION_MARKER_FILENAME, &bytes)
 }
 
+/// Write the already-activated breadcrumb unless it is already correct.
+///
+/// Fsynced through the same atomic path as the marker: a torn breadcrumb would
+/// fail closed on the next boot and demand an operator decision for a directory
+/// that is actually fine.
+#[cfg(feature = "hiqlite-store")]
+fn ensure_activated_source_record(
+    data_dir: &Path,
+    marker: &ActivationMarker,
+) -> Result<(), StoreError> {
+    let record = ActivatedSourceRecord {
+        cluster_id: marker.cluster_id.clone(),
+        source_backup_sha256: marker.source_backup_sha256.clone(),
+    };
+    if read_activated_source_record(data_dir)?.as_ref() == Some(&record) {
+        return Ok(());
+    }
+    let mut bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        StoreError::Migration(format!("serializing the activated-source record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    write_atomic_private(data_dir, ACTIVATED_SOURCE_FILENAME, &bytes)
+}
+
+/// Read the already-activated breadcrumb; `None` means this directory never has.
+///
+/// A present but undecodable record is an error rather than a `None`: treating
+/// it as absent would re-import the stale source, which is the exact loss the
+/// record exists to prevent.
+#[cfg(feature = "hiqlite-store")]
+fn read_activated_source_record(
+    data_dir: &Path,
+) -> Result<Option<ActivatedSourceRecord>, StoreError> {
+    let path = data_dir.join(ACTIVATED_SOURCE_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(migration_io("reading", &path, error)),
+    };
+    let record: ActivatedSourceRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::Migration(format!(
+            "decoding the activated-source record {}: {error}. It records that this \
+             directory already handed authority to Hiqlite; repair or remove it \
+             deliberately rather than letting a re-import discard replicated state",
+            path.display()
+        ))
+    })?;
+    Ok(Some(record))
+}
+
 #[cfg(feature = "hiqlite-store")]
 fn read_activation_marker(target: &Path) -> Result<ActivationMarker, StoreError> {
     let path = target.join(ACTIVATION_MARKER_FILENAME);
@@ -969,7 +1092,47 @@ pub fn prepare_sqlite_import(data_dir: &Path) -> Result<PreparedSqliteImport, St
             ))),
         };
     }
-    prepared
+    let prepared = prepared?;
+    prune_migration_backups(&migration_dir, &prepared.backup_path)?;
+    Ok(prepared)
+}
+
+/// Keep the newest few source backups and delete the rest.
+///
+/// Backups are content-addressed, so a repeated attempt against an unchanged
+/// source reuses one file. But a failed activation leaves a recovery boot that
+/// serves traffic and mutates `plurx.db`, so the next retry addresses different
+/// content and writes another full-size copy. Unbounded, a persistently failing
+/// activation fills the media server's data volume with complete database
+/// copies. Retention is by modification time and never removes the backup this
+/// attempt is about to import.
+fn prune_migration_backups(migration_dir: &Path, keep: &Path) -> Result<(), StoreError> {
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(migration_dir)
+        .map_err(|error| migration_io("reading", migration_dir, error))?
+    {
+        let entry = entry.map_err(|error| migration_io("reading", migration_dir, error))?;
+        let path = entry.path();
+        if path == keep || path.extension().is_none_or(|ext| ext != "db") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|error| migration_io("reading", &path, error))?;
+        backups.push((modified, path));
+    }
+    if backups.len() < MIGRATION_BACKUP_RETENTION {
+        return Ok(());
+    }
+    // Newest first, so the tail past the retained window is what goes. `keep`
+    // is excluded above rather than counted, so retention is "this attempt's
+    // backup plus the previous MIGRATION_BACKUP_RETENTION - 1".
+    backups.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in backups.drain(MIGRATION_BACKUP_RETENTION - 1..) {
+        remove_file_if_present(&path)?;
+    }
+    sync_directory(migration_dir)
 }
 
 fn open_source(path: &Path) -> Result<Connection, StoreError> {
@@ -1313,6 +1476,55 @@ mod tests {
                 }),
             "no temporary backup remains"
         );
+    }
+
+    /// A failing activation must not fill the data volume with database copies.
+    ///
+    /// Content addressing alone does not bound this: each failed attempt leaves
+    /// a recovery boot that serves traffic and mutates the source, so the next
+    /// retry addresses different content and writes another full-size copy.
+    #[tokio::test]
+    async fn repeated_activation_attempts_bound_retained_source_backups() {
+        let data = tempfile::tempdir().expect("data dir");
+        let source_path = data.path().join(SQLITE_FILENAME);
+        let store = SqliteStore::open(&source_path).expect("source store");
+
+        let mut published = Vec::new();
+        // Comfortably past the retention window, each with different content,
+        // standing in for the mutation a recovery boot makes between retries.
+        for attempt in 0..MIGRATION_BACKUP_RETENTION + 3 {
+            store
+                .put_setting("migration.attempt", &attempt.to_string())
+                .await
+                .expect("change source between attempts");
+            published.push(
+                prepare_sqlite_import(data.path())
+                    .expect("attempt backup")
+                    .backup_path,
+            );
+        }
+
+        let retained: Vec<_> = std::fs::read_dir(data.path().join(MIGRATION_DIRNAME))
+            .expect("migration dir")
+            .map(|entry| entry.expect("migration entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "db"))
+            .collect();
+        assert_eq!(
+            retained.len(),
+            MIGRATION_BACKUP_RETENTION,
+            "retained backups: {retained:?}"
+        );
+        // The window keeps the newest, and above all the one this attempt is
+        // about to import — deleting that would break the activation it serves.
+        for recent in published.iter().rev().take(MIGRATION_BACKUP_RETENTION) {
+            assert!(retained.contains(recent), "{recent:?} must be retained");
+        }
+        for old in published
+            .iter()
+            .take(published.len() - MIGRATION_BACKUP_RETENTION)
+        {
+            assert!(!old.exists(), "{old:?} must have been pruned");
+        }
     }
 
     #[test]
