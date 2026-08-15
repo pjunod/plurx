@@ -2441,7 +2441,23 @@ async function api(path, {method="GET", body=null, raw=false}={}){
   // migrate to as their client contracts need a machine-readable cause. Read
   // both, or a typed refusal — "this server's ffmpeg has no subtitles filter"
   // — reaches the viewer as the useless "request failed".
-  if(!res.ok){ let m="request failed"; try{const b=await res.json(); m=b.error||b.message||m}catch(e){} throw new Error(m); }
+  if(!res.ok){
+    let m="request failed", responseBody="";
+    try{
+      responseBody=await res.text();
+      const b=JSON.parse(responseBody);
+      m=b.error||b.message||m;
+    }catch(e){}
+    const error=new Error(m);
+    // Preserve the wire refusal on the Error. Session creation can fail
+    // before hls.js exists, so the XHR hook below will never see this body;
+    // without carrying it through the rejected `openSession` promise the
+    // persistent player overlay cannot name an unsupported ffmpeg build.
+    error.streamFailure=PlaybackPolicy.parseStreamFailure({
+      status:res.status, body:responseBody
+    });
+    throw error;
+  }
   return raw?res:res.json();
 }
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
@@ -4524,6 +4540,36 @@ function noteStreamFailure(status, body){
   const parsed=PlaybackPolicy.parseStreamFailure({status:status, body:body});
   if(parsed){ parsed.at=Date.now(); STREAM_FAILURE=parsed; }
 }
+// A successful reload belongs to one hls.js instance. Only that instance may
+// clear its retryable playlist refusal: a late success event from a destroyed
+// predecessor must not erase the current stream's explanation, and a level
+// reload is not evidence that some terminal segment refusal recovered.
+function clearStreamFailureFor(hls){
+  const retryable=STREAM_FAILURE &&
+    (STREAM_FAILURE.code==="startup_timeout" || STREAM_FAILURE.status===503);
+  if(retryable && PLAYER && PLAYER.hls===hls) clearStreamFailure();
+}
+function currentStreamFailureOverlay(){
+  return PlaybackPolicy.streamFailureOverlay(STREAM_FAILURE,Date.now());
+}
+// Session creation fails before `attachHls`, so render its preserved typed
+// refusal here. Returning false lets callers keep their legacy handling for
+// an unstructured network/server error; true means the persistent overlay now
+// owns the verdict and must not be hidden by `setLoading(false)` or a toast.
+function showSessionOpenFailure(error){
+  const failure=error&&error.streamFailure;
+  if(!failure) return false;
+  failure.at=Date.now();
+  STREAM_FAILURE=failure;
+  const explained=currentStreamFailureOverlay();
+  if(!explained) return false;
+  if(PLAYER) clientLog(Object.assign({level:"error",event:"stream_refused",
+    detail:failure.code||String(failure.status), message:explained.detail},
+    playbackContext()));
+  setLoading(true,explained.title,explained.detail);
+  toast(explained.retryable?"Still starting…":"Playback failed");
+  return true;
+}
 // One place that attaches an HLS playlist to the video element (used by start,
 // seek-restart, and audio-switch). Worker off: a wallet extension's injected
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
@@ -4624,6 +4670,10 @@ function attachHls(video, playlistUrl, startAt){
     // down. TARGETDURATION tracks the longest segment published so far, so a
     // session that later cuts a longer one re-tunes again.
     if(Hls.Events.LEVEL_LOADED) hls.on(Hls.Events.LEVEL_LOADED,(_,d)=>{
+      // A retry that loaded the playlist succeeded. Its earlier 503 is stale
+      // now, not after an arbitrary wall-clock TTL; otherwise an unrelated
+      // later fatal is confidently mislabeled "Still preparing".
+      clearStreamFailureFor(hls);
       const t=d&&d.details&&d.details.targetduration;
       if(t>0) retuneBuffer(t);
       // Feed the reload keeper below: when the playlist last arrived, and
@@ -4782,7 +4832,7 @@ function attachHls(video, playlistUrl, startAt){
       // still successfully starting. The refusal body names which; the
       // overlay is only useful if it repeats that instead of sending someone
       // to a log file on a headless box.
-      const explained=PlaybackPolicy.streamFailureOverlay(STREAM_FAILURE,Date.now());
+      const explained=currentStreamFailureOverlay();
       if(explained){
         clientLog(Object.assign({level:"error",event:"stream_refused",
           detail:STREAM_FAILURE.code||String(STREAM_FAILURE.status),
@@ -7455,7 +7505,10 @@ async function burnSub(index){
   let info;
   try{
     info=await openSession(me.fileId,transcodeOpts(pos,aidx));
-  }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  }catch(e){
+    if(live() && !showSessionOpenFailure(e)){ setLoading(false); toast(e.message); }
+    return;
+  }
   if(!live()) return;
   me.method='transcode'; me.copyHls=false;
   // The overlay's Reason row otherwise keeps quoting the /decision verdict —

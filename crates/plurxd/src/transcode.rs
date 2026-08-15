@@ -5865,6 +5865,15 @@ impl TranscodeManager {
         let budget = self.playlist_wait();
         let deadline = Instant::now() + budget;
         loop {
+            // `touch` resolves the Arc once, but retirement is allowed to
+            // remove that session while this request is waiting. The Arc
+            // keeps the scratch state alive; it does not keep the session
+            // addressable. Re-check the monotonic retirement verdict before
+            // reading or serving so a superseded stream is reported as gone
+            // promptly rather than held until the startup budget expires.
+            if session.retired.load(Acquire) {
+                return Err(PlaylistError::SessionGone);
+            }
             if session.failed.load(Relaxed) {
                 return Err(session.failure_reason());
             }
@@ -5894,6 +5903,9 @@ impl TranscodeManager {
                     // The playlist just told us what is published — the one
                     // moment the segment index can be refreshed for free.
                     self.flow_control(&session, session_id).await;
+                    if session.retired.load(Acquire) {
+                        return Err(PlaylistError::SessionGone);
+                    }
                     if session.cached {
                         return Ok(bytes);
                     }
@@ -5928,6 +5940,9 @@ impl TranscodeManager {
                             .await;
                         }
                     }
+                    if session.retired.load(Acquire) {
+                        return Err(PlaylistError::SessionGone);
+                    }
                     return Ok(served_live_playlist(
                         bytes,
                         first_retained,
@@ -5941,6 +5956,9 @@ impl TranscodeManager {
             // and knows that no usable playlist was present above.
             if self.playlist_producer_failed(&session, session_id).await {
                 return Err(session.failure_reason());
+            }
+            if session.retired.load(Acquire) {
+                return Err(PlaylistError::SessionGone);
             }
             // Checked after the terminal verdicts, never before them: a
             // session that has already lost must not be reported as one that
@@ -8722,23 +8740,15 @@ mod tests {
         session.kill_child().await;
     }
 
-    /// Teardown removes a session from the manager before it kills the child.
-    /// A playlist request that already holds the session must not turn an exit
-    /// observed in that interval into a terminal failure or operator error.
+    /// A playlist request that already resolved the session Arc still observes
+    /// retirement promptly. The Arc keeps the object alive; it does not make a
+    /// superseded session an addressable stream until the startup budget ends.
     #[tokio::test]
-    async fn playlist_ignores_a_producer_exit_after_the_session_is_retired() {
+    async fn a_waiting_playlist_returns_session_gone_when_the_session_is_retired() {
         use plurx_core::store::SqliteStore;
-        use tokio::io::AsyncWriteExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "read _; exit 1"])
-            .stdin(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn gated failure");
-        let mut release_child = child.stdin.take().expect("child stdin");
-        let session = watchdog_session(dir.path(), Some(child), false);
+        let session = watchdog_session(dir.path(), None, false);
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let mgr = Arc::new(TranscodeManager::new(
             store,
@@ -8746,6 +8756,7 @@ mod tests {
             EncoderCaps::default(),
             Pipeline::Cpu,
         ));
+        mgr.playlist_wait_override_ms.store(30_000, Relaxed);
         mgr.sessions
             .lock()
             .await
@@ -8765,30 +8776,20 @@ mod tests {
         })
         .await
         .expect("playlist request must acquire the live session");
-        assert!(mgr
-            .sessions
-            .lock()
-            .await
-            .remove("retired-session")
-            .is_some());
-        release_child
-            .write_all(b"exit\n")
-            .await
-            .expect("release failed child");
-        drop(release_child);
-
-        let waiting = tokio::time::timeout(Duration::from_millis(500), &mut playlist).await;
         assert!(
-            waiting.is_err(),
-            "a retired producer exit must not become a terminal playlist verdict"
+            mgr.retire_session("retired-session", &session).await,
+            "the production retirement path must own this live session"
         );
+
+        let refused = tokio::time::timeout(Duration::from_secs(1), &mut playlist)
+            .await
+            .expect("retirement must beat the 30-second startup budget")
+            .expect("playlist task");
+        assert_eq!(refused, Err(PlaylistError::SessionGone));
         assert!(
             !session.failed.load(Relaxed),
-            "routine teardown must not mark the retired session failed"
+            "routine retirement is gone/superseded, not a producer failure"
         );
-
-        playlist.abort();
-        session.kill_child().await;
     }
 
     /// Inspecting one producer may wait behind a slow kill that holds its

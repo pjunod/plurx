@@ -672,7 +672,11 @@ non-zero `-ss`, with no direct-play or remux escape.
 
 **Changing either grace moves this bound with it.** A terminal verdict is still
 answered immediately: the budget is only ever spent on a session that is
-genuinely still starting.
+genuinely still starting. A request that began before the same playback seeks,
+stops, or otherwise supersedes its session also re-checks the session's
+monotonic retirement verdict while it waits. It returns `session_gone`
+promptly; keeping an `Arc` to retired scratch state alive is not permission to
+spend the rest of the startup budget or serve that detached stream.
 
 ### Every refusal names its cause
 
@@ -701,7 +705,19 @@ listener) because hls.js's `ERROR` event carries only the response line —
 `{code: status, text: statusText}` — and drops the body. `PlaybackPolicy`
 `parseStreamFailure` / `streamFailureOverlay` turn it into the overlay's two
 lines, and a `startup_timeout` is shown as **"Still preparing this stream…"**
-rather than as a failure.
+rather than as a failure. That explanation belongs to the failed request, not
+to the hls.js instance forever: when an in-instance retry emits
+`LEVEL_LOADED`, the matching instance clears its stored retryable refusal
+immediately. An unrelated later fatal can therefore never inherit a 503 that
+playback already recovered from; a successful level reload does not erase a
+terminal refusal from some other request.
+
+A burn preflight is earlier than that transport. Its 501 comes from the
+session-creation `POST`, before `attachHls` creates an XHR, so the shared API
+helper preserves the typed refusal on the rejected `openSession` promise. The
+burn handler renders the same two lines in the persistent player overlay. A
+2.2-second toast is not the contract for a stream that has already been torn
+down and cannot be built.
 
 ### Burn-in is preflighted against the ffmpeg build
 
