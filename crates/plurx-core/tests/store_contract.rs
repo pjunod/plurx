@@ -566,6 +566,57 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     path
 }
 
+#[cfg(feature = "hiqlite-store")]
+const LARGE_PROBE_FILE_COUNT: i64 = 64;
+#[cfg(feature = "hiqlite-store")]
+const LARGE_PROBE_PADDING_BYTES: usize = 48 * 1024;
+
+#[cfg(feature = "hiqlite-store")]
+fn large_probe_json(ordinal: i64) -> String {
+    serde_json::json!({
+        "format": {
+            "filename": format!("/fixture/shows/large-probe-{ordinal:03}.mkv"),
+            "tags": {
+                "comment": "x".repeat(LARGE_PROBE_PADDING_BYTES),
+            },
+        },
+        "ordinal": ordinal,
+    })
+    .to_string()
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn seed_large_probe_files(path: &std::path::Path) {
+    let mut connection = rusqlite::Connection::open(path).expect("open large-probe fixture");
+    let transaction = connection
+        .transaction()
+        .expect("begin large-probe fixture transaction");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO files
+                     (id, item_id, path, size, mtime, probe_json, scanned_at)
+                 VALUES (?1, 10, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .expect("prepare large-probe file insert");
+        for ordinal in 0..LARGE_PROBE_FILE_COUNT {
+            insert
+                .execute(rusqlite::params![
+                    1_000 + ordinal,
+                    format!("/fixture/shows/large-probe-{ordinal:03}.mkv"),
+                    10_000 + ordinal,
+                    500 + ordinal,
+                    large_probe_json(ordinal),
+                    600 + ordinal,
+                ])
+                .expect("insert large-probe file");
+        }
+    }
+    transaction
+        .commit()
+        .expect("commit large-probe fixture transaction");
+}
+
 /// The key the import fixtures seal under.
 ///
 /// Fixed bytes rather than `generate()` so a fixture built in one test can be
@@ -854,6 +905,54 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
             .is_empty(),
         "source playback telemetry must never enter the Hiqlite sidecar"
     );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_probe_json_import_respects_the_production_wal_limit() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated large-probe import target");
+
+    let source = tempfile::tempdir().expect("large-probe SQLite fixture directory");
+    let fixture_path = populated_current_import_fixture(source.path());
+    seed_large_probe_files(&fixture_path);
+    let prepared = prepare_sqlite_import(source.path()).expect("prepare large-probe import backup");
+
+    let report = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect("large probe_json rows must fit the production 2 MiB WAL");
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "files")
+            .expect("files digest")
+            .row_count,
+        LARGE_PROBE_FILE_COUNT as u64 + 1,
+        "exact file parity must include the existing fixture row and all large probes"
+    );
+
+    for ordinal in 0..LARGE_PROBE_FILE_COUNT {
+        let expected = large_probe_json(ordinal);
+        assert_eq!(
+            store
+                .get_file_probe_json(1_000 + ordinal)
+                .await
+                .expect("read imported large probe")
+                .as_deref(),
+            Some(expected.as_str()),
+            "large probe_json row {ordinal} must retain exact bytes"
+        );
+    }
 }
 
 /// A legacy backup whose Trakt row is still cleartext must be refused, and

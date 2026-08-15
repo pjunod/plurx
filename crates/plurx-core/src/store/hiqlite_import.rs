@@ -23,7 +23,7 @@ use crate::error::StoreError;
 use crate::secrets::SealedSecret;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
-const IMPORT_CHUNK_ROWS: i64 = 64;
+const IMPORT_CHUNK_ROWS: i64 = 16;
 const PARITY_PAGE_ROWS: i64 = 64;
 
 /// Ordered evidence that one durable SQLite table exactly matches Hiqlite.
