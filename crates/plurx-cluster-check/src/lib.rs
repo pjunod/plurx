@@ -1,4 +1,4 @@
-//! Separate-process M1b/M1c/M1d cluster validation.
+//! Separate-process M1b/M1c/M1d/M3a cluster validation.
 //!
 //! hiqlite owns process-global listener and shutdown state, so an in-process
 //! three-client test cannot prove process loss. The controller starts this
@@ -23,9 +23,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
+use plurx_core::cluster::membership::{
+    ClusterAvailability, ClusterPeer, FinalizeJoinRequest, IssuedJoinToken, JoinSecrets,
+    MembershipManager, MembershipStatus, RedeemJoinRequest,
+};
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
 };
+use plurx_core::cluster::migration::ActivationMarker;
+use plurx_core::cluster::ClusterIdentity;
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
     OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
@@ -152,6 +158,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             run_growth_subprocess().await?;
             controller().await
         }
+        Some("membership") => run_membership_lifecycle_case().await,
         Some("growth") => compacted_growth_gate(args.get(2).map(PathBuf::from)).await,
         Some("node") => {
             let launch: NodeLaunch =
@@ -196,12 +203,230 @@ async fn run_growth_subprocess() -> Result<()> {
 }
 
 async fn controller() -> Result<()> {
+    println!("cluster-check: membership lifecycle 1 -> 3 -> 2");
+    run_membership_lifecycle_case().await?;
     println!("cluster-check: follower loss and incompatible-voter guard");
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
     run_failure_case(FailureTarget::Leader).await?;
-    println!("cluster-check: all M1b/M1c/M1d failure contracts passed");
+    println!("cluster-check: all M1b/M1c/M1d/M3a failure contracts passed");
     Ok(())
+}
+
+async fn run_membership_lifecycle_case() -> Result<()> {
+    let executable = harness_executable()?;
+    let root = tempfile::tempdir().context("membership lifecycle data root")?;
+    let specs = allocate_nodes(3)?;
+    let first = specs[0].clone();
+    let mut cluster = ClusterProcesses::start(&executable, root.path(), vec![first]).await?;
+    cluster.request(1, Request::Bootstrap).await?.require_ok()?;
+
+    let initial_dump = match cluster.request(1, Request::Dump).await? {
+        Response::Dump { dump, .. } => dump,
+        response => bail!("unexpected initial membership dump: {response:?}"),
+    };
+    require_dump_setting(&initial_dump, "instance.id", INSTANCE_ID)?;
+
+    let mut first_redeemed = None;
+    for node_id in 2..=3 {
+        let issued = match cluster
+            .request(1, Request::IssueJoinToken { ttl_ms: 120_000 })
+            .await?
+        {
+            Response::IssuedJoinToken { token } => token,
+            response => bail!("unexpected join-token response: {response:?}"),
+        };
+        if issued.raft_id != node_id {
+            bail!(
+                "join token assigned raft id {}, expected {node_id}",
+                issued.raft_id
+            );
+        }
+        let spec = specs[(node_id - 1) as usize].clone();
+        let request = RedeemJoinRequest {
+            token: issued.token.clone(),
+            node_id: format!("node-{node_id}"),
+            raft_address: spec.raft,
+            api_address: spec.api,
+            schema_version: AUTH_SCHEMA_VERSION,
+            protocol_version: AUTH_PROTOCOL_VERSION,
+        };
+        cluster
+            .request(
+                1,
+                Request::RedeemJoin {
+                    request: request.clone(),
+                },
+            )
+            .await?
+            .require_ok()?;
+        cluster
+            .spawn_node(
+                &executable,
+                NodeLaunch {
+                    node_id,
+                    root: root.path().to_path_buf(),
+                    nodes: specs[..node_id as usize].to_vec(),
+                },
+            )
+            .await?;
+        cluster
+            .request(node_id, Request::Open)
+            .await?
+            .require_ok()?;
+        cluster
+            .wait_for_voters(&(1..=node_id).collect::<Vec<_>>())
+            .await?;
+        cluster
+            .request(
+                1,
+                Request::FinalizeJoin {
+                    request: FinalizeJoinRequest {
+                        token: issued.token.clone(),
+                        node_id: request.node_id.clone(),
+                    },
+                },
+            )
+            .await?
+            .require_ok()?;
+        if node_id == 2 {
+            first_redeemed = Some(request);
+        }
+    }
+
+    let request = first_redeemed.context("missing first redeemed token")?;
+    let redeemed_token = request.token.clone();
+    require_membership_error(
+        cluster.request(1, Request::RedeemJoin { request }).await?,
+        "join_token_reused",
+    )?;
+    let expired = match cluster
+        .request(1, Request::IssueJoinToken { ttl_ms: 1 })
+        .await?
+    {
+        Response::IssuedJoinToken { token } => token,
+        response => bail!("unexpected expired-token issue response: {response:?}"),
+    };
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    require_membership_error(
+        cluster
+            .request(
+                1,
+                Request::RedeemJoin {
+                    request: RedeemJoinRequest {
+                        token: expired.token,
+                        node_id: "expired-candidate".to_owned(),
+                        raft_address: "127.0.0.1:1".to_owned(),
+                        api_address: "127.0.0.1:2".to_owned(),
+                        schema_version: AUTH_SCHEMA_VERSION,
+                        protocol_version: AUTH_PROTOCOL_VERSION,
+                    },
+                },
+            )
+            .await?,
+        "join_token_expired",
+    )?;
+    let status = match cluster.request(1, Request::MembershipStatus).await? {
+        Response::MembershipStatus { status } => status,
+        response => bail!("unexpected three-voter membership status: {response:?}"),
+    };
+    if status.availability != ClusterAvailability::HighAvailability
+        || status.nodes.len() != 3
+        || status.nodes.iter().any(|node| !node.reachable)
+        || status.replication.health != ReplicationHealth::InSync
+    {
+        bail!("three-voter membership status was not healthy: {status:?}");
+    }
+    let public_status = serde_json::to_string(&status)?;
+    if public_status.contains(&redeemed_token) || public_status.contains("127.0.0.1") {
+        bail!("public node records exposed token or address material");
+    }
+
+    let leader = cluster.leader().await?;
+    let target = (2..=3)
+        .find(|node_id| *node_id != leader)
+        .context("choose a removable follower")?;
+    cluster
+        .request(
+            target,
+            Request::SeedOfflineWork {
+                node_id: format!("node-{target}"),
+            },
+        )
+        .await?
+        .require_ok()?;
+    require_membership_error(
+        cluster
+            .request(
+                1,
+                Request::RemoveVoter {
+                    node_id: format!("node-{target}"),
+                },
+            )
+            .await?,
+        "node_owns_offline_work",
+    )?;
+    cluster
+        .request(1, Request::ResetContractState)
+        .await?
+        .require_ok()?;
+    cluster
+        .request(
+            1,
+            Request::RemoveVoter {
+                node_id: format!("node-{target}"),
+            },
+        )
+        .await?
+        .require_ok()?;
+    let remaining = (1..=3)
+        .filter(|node_id| *node_id != target)
+        .collect::<Vec<_>>();
+    cluster.wait_for_voters(&remaining).await?;
+    cluster.kill(target).await?;
+
+    let status = match cluster.request(1, Request::MembershipStatus).await? {
+        Response::MembershipStatus { status } => status,
+        response => bail!("unexpected two-voter membership status: {response:?}"),
+    };
+    if status.availability != ClusterAvailability::DegradedReconfiguration
+        || status.nodes.len() != 2
+        || status.replication.health != ReplicationHealth::Degraded
+    {
+        bail!("two-voter membership status did not advertise degradation: {status:?}");
+    }
+
+    let leader = cluster.leader().await?;
+    let quorum_target = remaining
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != leader)
+        .context("choose non-leader for quorum-loss refusal")?;
+    require_membership_error(
+        cluster
+            .request(
+                1,
+                Request::RemoveVoter {
+                    node_id: format!("node-{quorum_target}"),
+                },
+            )
+            .await?,
+        "removal_would_lose_quorum",
+    )?;
+    let final_dump = match cluster.request(1, Request::Dump).await? {
+        Response::Dump { dump, .. } => dump,
+        response => bail!("unexpected final membership dump: {response:?}"),
+    };
+    require_dump_setting(&final_dump, "instance.id", INSTANCE_ID)?;
+    cluster.shutdown_all().await?;
+    Ok(())
+}
+
+fn require_membership_error(response: Response, expected: &str) -> Result<()> {
+    match response {
+        Response::MembershipError { code, .. } if code == expected => Ok(()),
+        response => bail!("expected membership error {expected}, got {response:?}"),
+    }
 }
 
 async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
@@ -797,6 +1022,13 @@ pub enum Request {
     Bootstrap,
     RejectIdentityDrift,
     Open,
+    IssueJoinToken { ttl_ms: u64 },
+    RedeemJoin { request: RedeemJoinRequest },
+    FinalizeJoin { request: FinalizeJoinRequest },
+    MembershipStatus,
+    RemoveVoter { node_id: String },
+    SeedOfflineWork { node_id: String },
+    ResetContractState,
     RecordLocalTelemetry { marker: String },
     CountLocalTelemetry { marker: String },
     Exercise { ordinal: u64 },
@@ -834,6 +1066,16 @@ pub enum Response {
     },
     ReplicationStatus {
         status: ReplicationStatus,
+    },
+    IssuedJoinToken {
+        token: IssuedJoinToken,
+    },
+    MembershipStatus {
+        status: MembershipStatus,
+    },
+    MembershipError {
+        code: String,
+        message: String,
     },
     Error {
         message: String,
@@ -1095,6 +1337,24 @@ impl ClusterProcesses {
 
     pub async fn request(&mut self, node_id: u64, request: Request) -> Result<Response> {
         self.node_mut(node_id)?.request(&request).await
+    }
+
+    /// Add one real voter process to an already-running cluster.
+    pub async fn spawn_node(&mut self, executable: &Path, launch: NodeLaunch) -> Result<()> {
+        if launch.root != self.root {
+            bail!("dynamic voter root did not match the running cluster");
+        }
+        let index = usize::try_from(launch.node_id.saturating_sub(1))?;
+        if self.nodes.len() <= index {
+            self.nodes.resize_with(index + 1, || None);
+        }
+        if self.nodes[index].is_some() {
+            bail!("voter {} is already running", launch.node_id);
+        }
+        let mut process = NodeProcess::spawn(executable, &launch)?;
+        process.wait_ready().await?;
+        self.nodes[index] = Some(process);
+        Ok(())
     }
 
     pub async fn kill(&mut self, node_id: u64) -> Result<()> {
@@ -1473,13 +1733,23 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
         .root
         .join(format!("node-{}", launch.node_id))
         .join("telemetry.db");
-    let mut store: Option<HiqliteAuthStore> = None;
+    let mut store: Option<Arc<HiqliteAuthStore>> = None;
+    let mut membership: Option<MembershipManager> = None;
     let stdin = tokio::io::stdin();
     let mut input = BufReader::new(stdin).lines();
     while let Some(line) = input.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
-                handle_request(request, &client, &replication, &telemetry_path, &mut store).await
+                handle_request(
+                    request,
+                    &client,
+                    &replication,
+                    &launch,
+                    &telemetry_path,
+                    &mut store,
+                    &mut membership,
+                )
+                .await
             }
             Err(error) => Err(error.into()),
         };
@@ -1500,14 +1770,18 @@ async fn handle_request(
     request: Request,
     client: &Client,
     replication: &ReplicationMonitor,
+    launch: &NodeLaunch,
     telemetry_path: &Path,
-    store: &mut Option<HiqliteAuthStore>,
+    store: &mut Option<Arc<HiqliteAuthStore>>,
+    membership: &mut Option<MembershipManager>,
 ) -> Result<Response> {
     match request {
         Request::Bootstrap => {
-            *store = Some(
+            let opened = Arc::new(
                 HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID, telemetry_path).await?,
             );
+            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            *store = Some(opened);
             Ok(Response::Ok)
         }
         Request::RejectIdentityDrift => {
@@ -1520,7 +1794,42 @@ async fn handle_request(
             }
         }
         Request::Open => {
-            *store = Some(HiqliteAuthStore::open(client.clone(), telemetry_path).await?);
+            let opened = Arc::new(HiqliteAuthStore::open(client.clone(), telemetry_path).await?);
+            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            *store = Some(opened);
+            Ok(Response::Ok)
+        }
+        Request::IssueJoinToken { ttl_ms } => membership_ref(membership)?
+            .issue_token(Duration::from_millis(ttl_ms))
+            .await
+            .map(|token| Response::IssuedJoinToken { token })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::RedeemJoin { request } => membership_ref(membership)?
+            .redeem(&request)
+            .await
+            .map(|()| Response::Ok)
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::FinalizeJoin { request } => membership_ref(membership)?
+            .finalize(&request)
+            .await
+            .map(|()| Response::Ok)
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::MembershipStatus => membership_ref(membership)?
+            .status()
+            .await
+            .map(|status| Response::MembershipStatus { status })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::RemoveVoter { node_id } => membership_ref(membership)?
+            .remove_voter(&node_id)
+            .await
+            .map(|_| Response::Ok)
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::SeedOfflineWork { node_id } => {
+            seed_offline_work(store_ref(store)?, &node_id).await?;
+            Ok(Response::Ok)
+        }
+        Request::ResetContractState => {
+            store_ref(store)?.validation_reset_contract_state().await?;
             Ok(Response::Ok)
         }
         Request::RecordLocalTelemetry { marker } => {
@@ -1634,8 +1943,130 @@ async fn handle_request(
     }
 }
 
-fn store_ref(store: &Option<HiqliteAuthStore>) -> Result<&HiqliteAuthStore> {
-    store.as_ref().context("auth store has not been opened")
+fn store_ref(store: &Option<Arc<HiqliteAuthStore>>) -> Result<&HiqliteAuthStore> {
+    store.as_deref().context("auth store has not been opened")
+}
+
+fn membership_ref(membership: &Option<MembershipManager>) -> Result<&MembershipManager> {
+    membership
+        .as_ref()
+        .context("membership manager has not been opened")
+}
+
+fn membership_error_response(error: plurx_core::cluster::membership::MembershipError) -> Response {
+    Response::MembershipError {
+        code: error.code().to_owned(),
+        message: error.to_string(),
+    }
+}
+
+async fn membership_manager(
+    client: &Client,
+    store: Arc<HiqliteAuthStore>,
+    launch: &NodeLaunch,
+) -> Result<MembershipManager> {
+    let local = launch
+        .nodes
+        .iter()
+        .find(|node| node.id == launch.node_id)
+        .with_context(|| format!("voter {} has no local node spec", launch.node_id))?;
+    MembershipManager::replicated(
+        client.clone(),
+        store,
+        ClusterIdentity {
+            cluster_id: INSTANCE_ID.to_owned(),
+            node_id: format!("node-{}", launch.node_id),
+            raft_id: launch.node_id,
+        },
+        ClusterPeer {
+            raft_id: local.id,
+            raft_address: local.raft.clone(),
+            api_address: local.api.clone(),
+        },
+        "https://127.0.0.1:1".to_owned(),
+        JoinSecrets {
+            raft: RAFT_SECRET.to_owned(),
+            api: API_SECRET.to_owned(),
+            credential_key: "00".repeat(32),
+        },
+        ActivationMarker {
+            marker_version: 1,
+            cluster_id: INSTANCE_ID.to_owned(),
+            source_backup_sha256: "00".repeat(32),
+            source_schema_version: AUTH_SCHEMA_VERSION,
+            replicated_schema_version: AUTH_SCHEMA_VERSION,
+            imported_rows: 0,
+            table_hashes: Vec::new(),
+        },
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()> {
+    let user = store
+        .create_user(&format!("membership-offline-{node_id}"), "hash", false)
+        .await?;
+    let library = store
+        .create_library(&NewLibrary {
+            name: format!("Membership Offline {node_id}"),
+            kind: LibraryKind::Movies,
+            paths: vec![PathBuf::from(format!("/cluster/membership/{node_id}"))],
+            anime: false,
+        })
+        .await?;
+    let item = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Membership Offline {node_id}"),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let source_path = format!("/cluster/membership/{node_id}/offline.mkv");
+    let file = store
+        .upsert_file(
+            item,
+            &source_path,
+            1_000,
+            1_700_000_000,
+            &ProbeResult::default(),
+        )
+        .await?;
+    let package = NewOfflinePackage {
+        id: format!("membership-offline-{node_id}"),
+        request_id: format!("membership-offline-request-{node_id}"),
+        user_id: user.id,
+        file_id: file,
+        node_id: node_id.to_owned(),
+        source_path,
+        source_size: 1_000,
+        source_mtime: 1_700_000_000,
+        effective_rate_control: "vbr".to_owned(),
+        target_height: 720,
+        output_width: Some(1280),
+        output_height: Some(720),
+        audio_index: None,
+        audio_offset_ms: 0,
+        subtitle_index: None,
+        subtitle_language: None,
+        subtitle_mode: "none".to_owned(),
+        estimated_bytes: 700,
+        reserved_bytes: 900,
+        expires_at: unix_now()?.saturating_add(3_600),
+    };
+    if !matches!(
+        store
+            .create_offline_package(&package, 10, 100_000, 1_000_000)
+            .await?,
+        OfflineCreateOutcome::Created(_)
+    ) {
+        bail!("membership offline fixture was not admitted");
+    }
+    Ok(())
 }
 
 async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {

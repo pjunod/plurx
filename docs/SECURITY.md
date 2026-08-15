@@ -15,7 +15,7 @@ internet, read [Non-goals](#non-goals--what-plurx-does-not-defend-against)
 first: several protections you'd expect at that boundary are the proxy's job,
 not plurx's, by design.
 
-Audited 2026-08-08. Where a claim below is exhaustive, the test that keeps it
+Audited 2026-08-15. Where a claim below is exhaustive, the test that keeps it
 honest is named inline.
 
 ## Authentication — one token bar, no anonymous back doors
@@ -144,6 +144,42 @@ read access to the whole data directory as the plurx user. And every voter that
 must open a credential needs the same key, distributed out of band exactly like
 `secret_raft` and `secret_api`; raft never carries it.
 
+## Cluster admission — one bearer, one voter, one use
+
+`POST /api/v1/cluster/join-tokens` requires an admin login token and returns a
+join token once. The join token is then the only credential accepted by the
+narrow redeem/finalize endpoints: requiring a user login there would make a
+fresh node impossible to admit, while accepting an admin token as a node
+credential would give it much broader authority than it needs.
+
+The token is `plxjoin:v1:<key>:<nonce+ciphertext+tag>`. XChaCha20-Poly1305
+authenticates and hides cluster id · assigned Raft id · bootstrap addresses ·
+expiry · schema/protocol versions · activation proof · Raft/API secrets · the
+credential-wrapping key. The self-contained key makes this an opaque bearer,
+not protection from its holder: anyone who steals the complete token can use
+its authority until redemption or expiry. Encryption prevents casual payload
+disclosure and tampering; single-use state and a short lifetime limit replay.
+
+| Boundary | Rule and reason |
+|---|---|
+| Issuance | Admin-only, 10 minutes by default, clamped to 60–3,600 seconds. A typo must not mint a near-permanent cluster credential |
+| Replicated record | SHA-256 token digest · expiry · assigned Raft id · state · admitted node id. The token and cluster secrets never enter replicated SQL |
+| Redemption | The digest changes atomically from `issued` to `redeeming` and is reserved to one generated `node.id`. Another node gets `join_token_reserved` rather than sharing authority |
+| Finalization | Only after Hiqlite reports the assigned Raft id as a voter does state become `redeemed`. Later redemption gets `join_token_reused`; an expired token gets `join_token_expired` |
+| Local material | Put the token in an owner-only file named by `cluster.join_token_file`, never in TOML or a command transcript. Successful finalization deletes that file; interrupted startup retains it only to resume the same staged identity |
+| Public status | Node id · Raft id · role · reachability · last-seen and the existing replication projection. It omits token material, peer addresses, media paths, and library data |
+
+A joining data directory must be fresh: the presence of `plurx.db` refuses the
+join instead of overwriting an installation. Schema and auth-protocol versions
+are checked against the existing cluster before the process enters membership.
+The join path is LAN-only and contacts only addresses carried by the token; it
+has no discovery service or cloud dependency.
+
+Removal is also fail-closed. It refuses the current leader, a change that would
+leave fewer than two voters, and any target owning offline work. A replicated
+path does not prove another node mounts the same bytes, so silently moving a
+package would turn a membership operation into data loss.
+
 ## API keys — a credential for machines, not a token for robots
 
 A login token **is a user**: it carries that user's privileges wholesale, and
@@ -264,18 +300,19 @@ silently did nothing. `JSON.stringify` had escaped for the JS layer but not the
 HTML layer, and `esc()` did not yet cover `'`. The lesson is baked into the
 rule above: a string in an inline handler needs both layers, always.
 
-## Transport — public HTTP, loopback cluster TLS
+## Transport — public HTTP, internal cluster TLS
 
 plurx's public HTTP/API listener remains **plain HTTP**. It does not terminate
 public HTTPS, because on a home LAN the certificate story is pure friction and
 the design target is "works on `http://192.168.x.x:32400` out of the box." The
 Android client even sets `usesCleartextTraffic` for the same reason.
 
-M2 also runs Hiqlite's internal cluster API with automatic rustls TLS. That
-listener is pinned to loopback while the cluster has one voter; its only client
-is a maintenance command on the same machine. This internal listener does not
-make the public API HTTPS and is not the M3 peer-trust or certificate-management
-design.
+Hiqlite's Raft and internal cluster-API listeners use automatic rustls TLS and
+their separate shared secrets. They may bind a reachable LAN address for voter
+membership; startup refuses any public cleartext form of either listener. Those
+internal listeners do not make the public API or the join redemption URL HTTPS.
+Peer addresses are internal membership data and are omitted from the public
+node-status payload.
 
 The consequence is explicit: **anything past a network you fully trust belongs
 behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik). Over plain
@@ -291,7 +328,7 @@ the protections above believable. plurx does **not**:
 
 - **Terminate public TLS.** No HTTPS on the public HTTP/API listener; front it
   with a reverse proxy for any exposure beyond a trusted LAN (see above). The
-  loopback-only Hiqlite API uses internal automatic TLS, not operator-facing
+  Hiqlite Raft/API listeners use internal automatic TLS, not operator-facing
   HTTPS.
 - **Rate-limit login.** There is no per-IP throttle or lockout on
   `/auth/login`; brute-force resistance rests on Argon2id's cost and 256-bit
@@ -325,6 +362,11 @@ knows the guarantee is checked, not asserted:
   the HLS segment allow-list.
 - **Credential handling** — the `auth` tests (`plurx-core/src/auth.rs`) assert
   passwords hash as Argon2id and tokens hash stably to a stored form.
+- **Cluster admission** — `cluster::membership::tests` pins opaque token
+  round-trip, tamper rejection, and stable error codes;
+  `plurx-cluster-check membership` drives expiry, reuse, 1→3 voter growth,
+  offline-work refusal, 3→2 removal, and quorum-loss refusal through real
+  processes.
 
 Per the project rule, **security-relevant behavior and this doc change in the
 same commit** — a change that alters who can reach what and doesn't update this

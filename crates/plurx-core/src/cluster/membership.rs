@@ -154,21 +154,21 @@ pub struct FinalizeJoinRequest {
     pub node_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedJoinToken {
     pub token: String,
     pub expires_at: i64,
     pub raft_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRole {
     Voter,
     Learner,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterNodeRecord {
     pub node_id: String,
     pub raft_id: u64,
@@ -177,7 +177,7 @@ pub struct ClusterNodeRecord {
     pub last_seen_at: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterAvailability {
     SingleNode,
@@ -185,7 +185,7 @@ pub enum ClusterAvailability {
     HighAvailability,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipStatus {
     pub availability: ClusterAvailability,
     pub nodes: Vec<ClusterNodeRecord>,

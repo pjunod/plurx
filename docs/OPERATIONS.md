@@ -174,6 +174,7 @@ Raft progress facts, never users, titles, media paths, tokens, or library data.
 | `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
 | `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
 | `Replicated in sync` | This node has applied its latest known entry. On the leader, every reporting peer has matched that point; on a follower, only this node's catch-up is confirmed and the explanation points you to the leader for peer status. | No action. Read the plain-language explanation before treating a follower's local catch-up as a cluster-wide all-clear. |
+| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter. Do not stop either voter until three are present and in sync. |
 | `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
 
 **How to read the numbers:** `applied term T, index I` is this node's latest
@@ -191,10 +192,94 @@ endpoint observes an in-sync sample. The Settings page samples this when you
 open it; the timestamp does not claim that an unseen convergence happened
 between visits.
 
-This row is status, not membership control. It deliberately does not list,
-join, add, or remove voters; the M3 admin membership surface in
-[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md) §6.7 owns those actions and will
-consume this projection rather than create a second answer for lag.
+This row is status, not membership control. The admin-only cluster endpoints
+below list, join, and remove voters. Their `replication` member is this exact
+projection rather than a second answer for lag.
+
+### Joining and removing voters
+
+Use one, three, or more voters. Two voters are useful only while adding or
+removing a node: they require both processes for every write and survive no
+failure.
+
+**Prepare the existing voter.** Give each node reachable, unique Raft and
+cluster-API addresses. `advertise_host` is a host or IP, not a URL. Set
+`join_url` when the public API is reached through a different hostname, port,
+or HTTPS reverse proxy; this is the URL embedded in a token for redemption.
+
+```toml
+[cluster]
+raft_bind = "0.0.0.0:32401"
+api_bind = "0.0.0.0:32402"
+advertise_host = "plurx-a.lan"
+join_url = "http://plurx-a.lan:32400"
+```
+
+Raft and the internal cluster API use automatic TLS. Startup refuses a public
+cleartext form of either listener; the public `join_url` still follows the
+plain-HTTP/reverse-proxy boundary in [SECURITY.md](SECURITY.md).
+
+**Mint one token into a protected file.** The default lifetime is 10 minutes;
+the API clamps requests to 60–3,600 seconds. It returns the token once, so do
+not paste the response into a shell transcript, log, issue, or TOML file.
+
+```bash
+export PLURX=http://plurx-a.lan:32400       # an existing voter
+export JOIN_TOKEN_FILE=/secure/plurx.join   # local path copied to the new node
+umask 077                                   # new files are owner-only
+install -m 600 /dev/null "$JOIN_TOKEN_FILE"
+curl -fsS -X POST "$PLURX/api/v1/cluster/join-tokens" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"expires_in_seconds":600}' \
+  | jq -er .token > "$JOIN_TOKEN_FILE"
+```
+
+**Start a fresh joining node.** Its data directory must not contain
+`plurx.db`; joining never overwrites an installation. Copy the protected token
+file there, configure this node's own reachable addresses, and start `plurxd`.
+It checks schema/protocol compatibility before admission, creates a distinct
+`node.id`, catches up as a learner, becomes a voter, verifies the unchanged
+replicated `instance.id`, and deletes the token file only after finalization.
+An interrupted join reuses its staged identity instead of minting another one.
+
+```toml
+[storage]
+data_dir = "/var/lib/plurx"
+
+[cluster]
+raft_bind = "0.0.0.0:32401"
+api_bind = "0.0.0.0:32402"
+advertise_host = "plurx-b.lan"
+join_token_file = "/secure/plurx.join"
+```
+
+**Read the roster.** `availability` is `single_node`,
+`degraded_reconfiguration`, or `high_availability`. Node rows deliberately
+contain only node id · Raft id · role · reachable · last-seen; addresses and
+token material never enter this payload. `last_seen_at` is Unix milliseconds;
+read the nested `replication` object for lag using the meanings above.
+
+```bash
+curl -fsS "$PLURX/api/v1/cluster/nodes" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
+```
+
+**Remove a follower from three or more voters.** Use the node id from the
+roster, not its Raft id. The request refuses the current leader, any change
+that would leave fewer than two voters, and any node with queued, preparing,
+ready, or failed offline packages. That last refusal is conservative: a
+replicated source path does not prove another node mounts the same bytes.
+
+```bash
+curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
+```
+
+`cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
+`node_owns_offline_work` are operator-facing refusal codes. After a successful
+3→2 removal, keep both survivors online and add a third voter; the status must
+remain `degraded_reconfiguration` until then.
 
 ## Configuration surface
 
@@ -203,8 +288,8 @@ Settings you edit at runtime (TMDB key, libraries, users) live in the database,
 not here — this surface is only what's needed before the database opens.
 
 The TOML file is looked for at `./plurx.toml` then `/etc/plurx/plurx.toml` (or the
-path in `PLURX_CONFIG`). Environment-backed keys are named below; the two M2
-cluster listener ports are file-only until M3 owns their network surface:
+path in `PLURX_CONFIG`). Environment-backed keys are named below; cluster
+membership addresses and token-file paths are intentionally file-only:
 
 | Env var | TOML | Default | What it does |
 |---|---|---|---|
@@ -213,8 +298,11 @@ cluster listener ports are file-only until M3 owns their network surface:
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
-| — | `cluster.raft_bind` | `0.0.0.0:32401` | M2 uses the port but pins the listener host to loopback; M3 membership will make the host configurable |
-| — | `cluster.api_bind` | `0.0.0.0:32402` | M2 maintenance-client TLS port, pinned to loopback until M3 membership |
+| — | `cluster.raft_bind` | `0.0.0.0:32401` | Raft listener for this voter. Remote traffic uses automatic TLS; every node needs a unique reachable address |
+| — | `cluster.api_bind` | `0.0.0.0:32402` | Authenticated Hiqlite cluster API with automatic TLS |
+| — | `cluster.advertise_host` | derived bind IP, otherwise `127.0.0.1` | Host or IP placed in peer records. Set it explicitly when binding `0.0.0.0`; loopback cannot admit another machine |
+| — | `cluster.join_url` | `http://<advertise_host>:<server port>` | Public plurxd base URL a fresh node uses to redeem/finalize its one-time token. Set the HTTPS proxy URL when applicable |
+| — | `cluster.join_token_file` | empty | Owner-only file containing one token on a fresh joining node. Empty bootstraps or reopens; a successful join deletes it |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |
@@ -265,8 +353,8 @@ untested, and turn it back off if the device does not visibly improve.
 | Port | Proto | Purpose |
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
-| 32401 | TCP, loopback | One-voter Raft listener; M2 ignores the configured host until M3 membership |
-| 32402 | TCP, loopback + TLS | One-voter maintenance client API; M2 ignores the configured host until M3 membership |
+| 32401 | TCP + TLS | Raft replication between voters; never expose it as public cleartext |
+| 32402 | TCP + TLS | Authenticated internal cluster API; never expose it as public cleartext |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
 | 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native clients |
 
