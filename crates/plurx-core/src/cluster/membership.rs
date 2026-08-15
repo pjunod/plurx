@@ -379,11 +379,21 @@ impl MembershipManager {
         }
 
         for _ in 0..8 {
+            // Allocate above durable node records *and* the ids that live
+            // tokens are currently holding, so a second token can be minted
+            // while the first is still outstanding. Expired and redeemed rows
+            // are excluded, so an abandoned token stops reserving its id once
+            // it lapses rather than consuming the id space permanently.
             let rows = inner
                 .client
                 .query_consistent_map::<MaxRaftIdRow, _>(
-                    "SELECT MAX(raft_id) AS max_raft_id FROM cluster_nodes",
-                    params!(),
+                    "SELECT MAX(raft_id) AS max_raft_id FROM (\
+                       SELECT raft_id FROM cluster_nodes \
+                       UNION ALL \
+                       SELECT raft_id FROM cluster_join_tokens \
+                       WHERE state IN ('issued', 'redeeming') AND expires_at > $1\
+                     )",
+                    params!(now),
                 )
                 .await?;
             let raft_id = rows

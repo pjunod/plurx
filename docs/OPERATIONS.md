@@ -212,9 +212,15 @@ single-node network surface even though the configured bind defaults are
 `0.0.0.0`. On an already-activated sole voter, the first restart with
 `advertise_host` set takes a metadata-reset Hiqlite snapshot, proves the same
 `instance.id`, and replaces only the one-node Raft history so the committed
-peer address becomes reachable. The old target remains beside the replacement
-until that replacement opens successfully; startup refuses this transition
-once any learner or second voter exists.
+peer address becomes reachable. That repair runs only while the committed
+address actually differs from the configured one, so it settles after one
+restart and later boots are ordinary; a loopback-literal `advertise_host` -
+two daemons on one host - is a valid configuration that never triggers it.
+The old target remains beside the replacement until that replacement opens
+successfully. Startup refuses the transition once any learner or second voter
+exists, decided from the replicated node records rather than from this node's
+`membership.json`, so a coordinator that has already admitted a peer refuses
+even on its first restart after the address change.
 
 ```toml
 [cluster]
@@ -234,6 +240,10 @@ the redemption or finalization request.
 **Mint one token into a protected file.** The default lifetime is 10 minutes;
 the API clamps requests to 60–3,600 seconds. It returns the token once, so do
 not paste the response into a shell transcript, log, issue, or TOML file.
+Several tokens may be outstanding at once — stage two machines together, or
+replace a token you lost, without waiting out the first one's lifetime. Each
+reserves its own Raft id until it is redeemed or expires; an unused token stops
+reserving anything once it lapses.
 
 ```bash
 export PLURX=http://plurx-a.lan:32400       # an existing voter
@@ -326,7 +336,7 @@ membership addresses and token-file paths are intentionally file-only:
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
 | — | `cluster.raft_bind` | `0.0.0.0:32401` | Raft listener for this voter. A never-joined node still binds loopback until `advertise_host` opts into membership. Remote traffic uses automatic TLS; every node needs a unique reachable address |
 | — | `cluster.api_bind` | `0.0.0.0:32402` | Authenticated Hiqlite cluster API with automatic TLS. It follows the same loopback-until-opt-in rule |
-| — | `cluster.advertise_host` | empty | Host or IP placed in committed peer records and the explicit membership-listener opt-in. Leave empty for an ordinary one-voter install; set it on every joining node. A sole loopback voter performs one crash-recoverable local metadata readdress on restart. Once any peer or remote membership exists, changing the advertised host or either listener port is refused until an online membership-reconfiguration path exists |
+| — | `cluster.advertise_host` | empty | Host or IP placed in committed peer records and the explicit membership-listener opt-in. Leave empty for an ordinary one-voter install; set it on every joining node. A sole voter whose committed address differs from this value performs one crash-recoverable local metadata readdress on restart, then settles. Once any peer or remote membership exists, changing the advertised host or either listener port is refused until an online membership-reconfiguration path exists |
 | — | `cluster.join_url` | `http://<advertise_host>:<server port>` | Public plurxd base URL a fresh node uses to redeem/finalize its one-time token. Set the HTTPS proxy URL when applicable |
 | — | `cluster.join_token_file` | empty | Owner-only file containing one token on a fresh joining node. Empty bootstraps or reopens; a successful join deletes it |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
