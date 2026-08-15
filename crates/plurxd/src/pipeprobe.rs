@@ -175,10 +175,9 @@ trait Tools {
 enum Stdout {
     Discard,
     Inherit,
-    /// Read it back. Production never needs ffmpeg's stdout — both runs here
-    /// write a file — but the capability guard in this module's tests asks
-    /// through the same spawn rather than keeping a second copy of it.
-    #[cfg(test)]
+    /// Read it back. The two encodes write a file and their stdout is noise,
+    /// but a capability query's stdout *is* the answer — so the filter probe
+    /// asks through the same spawn rather than keeping a second copy of it.
     Capture,
 }
 
@@ -197,7 +196,6 @@ impl Tools for Spawn {
             .stdout(match stdout {
                 Stdout::Discard => std::process::Stdio::null(),
                 Stdout::Inherit => std::process::Stdio::inherit(),
-                #[cfg(test)]
                 Stdout::Capture => std::process::Stdio::piped(),
             })
             .stderr(std::process::Stdio::piped())
@@ -213,6 +211,137 @@ impl Tools for Spawn {
             .await
             .map_err(|e| format!("could not run ffprobe: {e}"))
     }
+}
+
+/// Which filters a subtitle burn-in needs, and whether this build has them.
+///
+/// A burn is the most expensive session the server can open, and on a thin
+/// ffmpeg it cannot run at all: the graph is rejected at spawn with
+/// `No such filter`, the producer exits non-zero seconds later, and the viewer
+/// is told the stream failed with no way to learn that the build is simply
+/// missing a filter. (Homebrew's ffmpeg 8.1.2 ships without `subtitles`
+/// entirely; that is not an exotic configuration.) Asked once per process,
+/// like every other question about this binary.
+///
+/// `sub2video` is deliberately not here. It is ffmpeg's own CLI-level
+/// conversion of a subtitle stream into video frames for a filter graph, not a
+/// row in `-filters`, so there is nothing to look for — the bitmap composite's
+/// two checkable filters are `overlay` and `scale`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct BurnFilters {
+    /// `overlay` — composites the subtitle plane onto the picture.
+    pub overlay: bool,
+    /// `scale` — puts a PGS canvas (very often 1080p under a 4K video) back
+    /// onto the output frame before the composite.
+    pub scale: bool,
+    /// `subtitles` — libass, which renders text and styled ASS/SSA.
+    pub subtitles: bool,
+    /// Whether the listing was read at all. A build that could not be asked
+    /// is *not* treated as a build that answered "no": refusing a session on
+    /// no evidence would be a new outage, so an unreadable listing lets the
+    /// burn proceed exactly as it did before this probe existed.
+    pub probed: bool,
+}
+
+/// Does this build carry every named filter?
+///
+/// Matched on the filter *column* of `ffmpeg -filters`, whose rows read
+/// `.S zscale V->V ...`. A substring search over the listing would report
+/// `zscale` for any build that merely mentions it in another filter's
+/// description, and the graph would then fail at session start. This lived
+/// under `#[cfg(test)]`, which is exactly why production never checked.
+pub fn declares_filters(listing: &str, names: &[&str]) -> bool {
+    names.iter().all(|n| {
+        listing
+            .lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(n))
+    })
+}
+
+/// Read a `-filters` listing into the burn capabilities.
+///
+/// A listing that names none of the three is treated as unread rather than as
+/// a build without them: every ffmpeg has `scale`, so an answer that lacks it
+/// is a parse or a spawn that went wrong, not a capability report.
+fn burn_filters_from_listing(listing: &str) -> BurnFilters {
+    let caps = BurnFilters {
+        overlay: declares_filters(listing, &["overlay"]),
+        scale: declares_filters(listing, &["scale"]),
+        subtitles: declares_filters(listing, &["subtitles"]),
+        probed: true,
+    };
+    if !caps.overlay && !caps.scale && !caps.subtitles {
+        return BurnFilters::default();
+    }
+    caps
+}
+
+impl BurnFilters {
+    /// Why this build cannot burn the requested subtitle, or `None` when it
+    /// can. The sentence is the one the viewer is shown, so it names the
+    /// missing filter and what to do about it.
+    pub fn refusal(&self, bitmap: bool) -> Option<String> {
+        if !self.probed {
+            return None;
+        }
+        let needed: &[(&str, bool)] = if bitmap {
+            &[("overlay", self.overlay), ("scale", self.scale)]
+        } else {
+            &[("subtitles", self.subtitles)]
+        };
+        let missing: Vec<&str> = needed
+            .iter()
+            .filter(|(_, present)| !present)
+            .map(|(name, _)| *name)
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "this server's ffmpeg build has no {} filter, which burning {} \
+             subtitles into the picture requires — install a full ffmpeg (the \
+             jellyfin-ffmpeg builds carry it) or choose a different subtitle track",
+            missing.join(" or "),
+            if bitmap { "bitmap" } else { "text" }
+        ))
+    }
+}
+
+static BURN_FILTERS: tokio::sync::OnceCell<BurnFilters> = tokio::sync::OnceCell::const_new();
+
+/// What this build can burn. Probed once per process, through the same spawn
+/// seam the tone-map probe uses.
+pub async fn burn_filters() -> BurnFilters {
+    *BURN_FILTERS
+        .get_or_init(|| async { burn_filters_with(&Spawn).await })
+        .await
+}
+
+async fn burn_filters_with<T: Tools>(tools: &T) -> BurnFilters {
+    let args = vec!["-hide_banner".to_owned(), "-filters".to_owned()];
+    let Ok(out) = tools.ffmpeg(args, Stdout::Capture).await else {
+        tracing::warn!(
+            "could not ask ffmpeg for its filter list; subtitle burn-in will be attempted \
+             without a preflight, exactly as it was before"
+        );
+        return BurnFilters::default();
+    };
+    // Listings go to stdout on modern builds and stderr on older ones.
+    let mut listing = String::from_utf8_lossy(&out.stdout).into_owned();
+    listing.push_str(&String::from_utf8_lossy(&out.stderr));
+    let caps = burn_filters_from_listing(&listing);
+    if !caps.probed {
+        tracing::warn!("ffmpeg -filters returned nothing recognisable; skipping burn preflight");
+    } else if !caps.subtitles || !caps.overlay || !caps.scale {
+        tracing::warn!(
+            overlay = caps.overlay,
+            scale = caps.scale,
+            subtitles = caps.subtitles,
+            "this ffmpeg is missing a filter subtitle burn-in needs; those sessions will be \
+             refused with that reason instead of failing at spawn"
+        );
+    }
+    caps
 }
 
 async fn probe_with<T: Tools>(tools: &T, work_dir: &Path, encoder: Encoder) -> PipelineReport {
@@ -688,24 +817,10 @@ mod tests {
     /// needs `zscale` (libzimg) and `tonemap`, and a stock Homebrew ffmpeg
     /// ships without zscale — so the guard passed and the graph then failed
     /// with `No such filter: 'zscale'`, which reads as a broken repo rather
-    /// than a thin ffmpeg.
-    /// Does this build carry every named filter?
-    ///
-    /// Matched on the filter *column* of `ffmpeg -filters`, whose rows read
-    /// `.S zscale V->V ...`. A substring search over the listing would report
-    /// `zscale` for any build that merely mentions it in another filter's
-    /// description, and the graph would then fail at session start.
-    fn declares_filters(listing: &str, names: &[&str]) -> bool {
-        names.iter().all(|n| {
-            listing
-                .lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(n))
-        })
-    }
-
+    /// than a thin ffmpeg. Now asked through the production
+    /// [`declares_filters`] rather than a private copy of it, so the parse a
+    /// burn preflight refuses a session on is the parse this guard proves.
     async fn has_filters(names: &[&str]) -> bool {
-        // Through the production seam, so the guard exercises the same spawn
-        // every probe run uses rather than a second copy of it.
         let args = vec!["-hide_banner".to_owned(), "-filters".to_owned()];
         let Ok(out) = Spawn.ffmpeg(args, Stdout::Capture).await else {
             return false;
@@ -999,6 +1114,98 @@ mod tests {
             &["zscale"]
         ));
         assert!(!declares_filters("", &["zscale"]));
+    }
+
+    /// Real rows from `ffmpeg -filters`, in the two shapes that matter: a
+    /// build that can burn, and Homebrew's ffmpeg 8.1.2, which has `overlay`
+    /// and `scale` but no `subtitles` at all and fails a text burn at spawn
+    /// with `No such filter: 'subtitles'`.
+    const FULL_FILTERS: &str = " TS overlay           VV->V      Overlay a video source on top of the input.\n \
+                                 .. scale             V->V       Scale the input video size.\n \
+                                 ..C subtitles        V->V       Render text subtitles onto input video.\n";
+    const NO_LIBASS_FILTERS: &str = " TS overlay           VV->V      Overlay a video source on top of the input.\n \
+                                      .. scale             V->V       Scale the input video size.\n \
+                                      .S tonemap           V->V       Conversion to/from different dynamic ranges.\n";
+
+    /// A build that has the filters refuses nothing; one that is missing a
+    /// filter refuses that burn *by name*, before an ffmpeg is spawned to die
+    /// of it. This check used to exist only under `#[cfg(test)]`, so
+    /// production never asked and the viewer got an anonymous failure a
+    /// minute later.
+    #[test]
+    fn a_burn_is_refused_by_name_only_on_a_build_that_cannot_do_it() {
+        let full = burn_filters_from_listing(FULL_FILTERS);
+        assert!(full.probed && full.overlay && full.scale && full.subtitles);
+        assert_eq!(full.refusal(true), None, "a full build burns bitmaps");
+        assert_eq!(full.refusal(false), None, "and text");
+
+        let thin = burn_filters_from_listing(NO_LIBASS_FILTERS);
+        assert!(thin.probed && thin.overlay && thin.scale && !thin.subtitles);
+        // A bitmap burn needs overlay + scale, which this build has. Refusing
+        // it would break the web player's only burn path for no reason.
+        assert_eq!(
+            thin.refusal(true),
+            None,
+            "a missing libass says nothing about the bitmap composite"
+        );
+        let refusal = thin.refusal(false).expect("a text burn cannot run here");
+        assert!(
+            refusal.contains("subtitles"),
+            "the refusal must name the missing filter: {refusal}"
+        );
+        assert!(
+            refusal.contains("ffmpeg"),
+            "and what to do about it: {refusal}"
+        );
+
+        // And the bitmap side, on a build with no overlay.
+        let no_overlay = burn_filters_from_listing(
+            " .. scale             V->V       Scale the input video size.\n\
+              ..C subtitles        V->V       Render text subtitles onto input video.\n",
+        );
+        let refusal = no_overlay
+            .refusal(true)
+            .expect("no overlay, no bitmap composite");
+        assert!(refusal.contains("overlay"), "{refusal}");
+        assert_eq!(no_overlay.refusal(false), None);
+    }
+
+    /// A listing that could not be read is not a build that answered "no".
+    /// Refusing every burn because one capability query failed would be a new
+    /// outage; the burn proceeds exactly as it did before this probe existed.
+    #[test]
+    fn an_unreadable_filter_listing_refuses_nothing() {
+        for listing in ["", "ffmpeg: command not found", "\n\n"] {
+            let caps = burn_filters_from_listing(listing);
+            assert!(!caps.probed, "{listing:?} is not a capability report");
+            assert_eq!(caps.refusal(true), None, "{listing:?}");
+            assert_eq!(caps.refusal(false), None, "{listing:?}");
+        }
+        // Including the case where the spawn itself failed.
+        assert_eq!(BurnFilters::default().refusal(true), None);
+    }
+
+    /// Through the same spawn seam the tone-map probe uses, so the preflight
+    /// reads a real `-filters` invocation rather than a second copy of one.
+    #[tokio::test]
+    async fn the_burn_preflight_asks_ffmpeg_for_its_filter_list() {
+        let tools = Recorded {
+            ffmpeg: vec![ok_output(NO_LIBASS_FILTERS)],
+            ..Recorded::default()
+        };
+        let caps = burn_filters_with(&tools).await;
+        assert_eq!(
+            tools.ffmpeg_args.borrow()[0],
+            vec!["-hide_banner".to_owned(), "-filters".to_owned()]
+        );
+        assert!(caps.probed && !caps.subtitles);
+
+        // A spawn that never happened answers "unprobed", not "unsupported".
+        let broken = Recorded {
+            ffmpeg: vec![Err("could not run ffmpeg: ENOENT".to_owned())],
+            ..Recorded::default()
+        };
+        assert!(!burn_filters_with(&broken).await.probed);
     }
 
     #[tokio::test]

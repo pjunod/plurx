@@ -1126,6 +1126,144 @@ test("decode rescue uses lost frames over a long window, not pipeline latency", 
   });
 });
 
+// Every reason the server can refuse a stream with, from the wire body it
+// actually sends to the two lines the overlay shows. The generic sentence
+// these replace — "the server couldn't build this stream — see Settings →
+// Logs" — was shown for all of them alike, including for a session the server
+// was still successfully starting.
+test("each refusal the server names reaches the overlay as itself", () => {
+  const rows = [
+    // (status, body, expected title, expected fragment of the detail line)
+    [
+      404,
+      { code: "session_gone", message: "this stream is no longer running" },
+      "Playback failed to start.",
+      "no longer running",
+    ],
+    [
+      502,
+      {
+        code: "producer_failed",
+        message: "the server's encoder exited before it produced any video (exit status: 1)",
+      },
+      "Playback failed to start.",
+      "exit status: 1",
+    ],
+    [
+      502,
+      {
+        code: "session_failed",
+        message: "the server could not build this stream: the encoder never produced any video",
+      },
+      "Playback failed to start.",
+      "never produced any video",
+    ],
+    [
+      501,
+      {
+        code: "unsupported_build",
+        message: "this server's ffmpeg build has no subtitles filter",
+      },
+      "Playback failed to start.",
+      "no subtitles filter",
+    ],
+    // The one that is NOT a failure: the server is still inside its own
+    // hardware->software recovery and said so.
+    [
+      503,
+      {
+        code: "startup_timeout",
+        message: "the server is still preparing this stream after 45s",
+      },
+      "Still preparing this stream…",
+      "still preparing",
+    ],
+  ];
+  for (const [status, body, title, fragment] of rows) {
+    const failure = policy.parseStreamFailure({
+      status,
+      body: JSON.stringify(body),
+    });
+    assert.deepEqual(
+      failure,
+      { status, code: body.code, message: body.message },
+      body.code,
+    );
+    const overlay = policy.streamFailureOverlay(failure);
+    assert.equal(overlay.title, title, body.code);
+    assert.ok(
+      overlay.detail.toLowerCase().includes(fragment.toLowerCase()),
+      `${body.code}: "${overlay.detail}" should contain "${fragment}"`,
+    );
+    assert.equal(overlay.retryable, body.code === "startup_timeout", body.code);
+  }
+});
+
+// Only a startup that ran out of budget is retryable, and it is retryable on
+// either signal — a server that has not yet migrated the code still says 503.
+test("a still-starting stream is never reported as a permanent failure", () => {
+  for (const failure of [
+    { status: 503, code: "startup_timeout", message: "still preparing" },
+    { status: 503, code: null, message: "still preparing" },
+    { status: 500, code: "startup_timeout", message: "still preparing" },
+  ]) {
+    const overlay = policy.streamFailureOverlay(failure);
+    assert.equal(overlay.retryable, true, JSON.stringify(failure));
+    assert.equal(overlay.title, "Still preparing this stream…");
+  }
+});
+
+// A guess is worse than the generic sentence: it explains the wrong failure
+// with complete confidence. Anything unreadable falls back rather than invents.
+test("an illegible refusal explains nothing rather than guessing", () => {
+  const nothing = [
+    { status: 502, body: "<html>502 Bad Gateway</html>" },
+    { status: 502, body: "" },
+    { status: 502, body: "null" },
+    { status: 502, body: JSON.stringify({ code: "producer_failed" }) },
+    { status: 502, body: JSON.stringify({ message: "   " }) },
+    // A 200 is not a refusal at all.
+    { status: 200, body: JSON.stringify({ message: "fine" }) },
+  ];
+  for (const input of nothing) {
+    assert.equal(policy.parseStreamFailure(input), null, JSON.stringify(input));
+  }
+  assert.equal(policy.streamFailureOverlay(null), null);
+  assert.equal(policy.streamFailureOverlay({ status: 502 }), null);
+});
+
+// The legacy `{error}` body several routes still use carries a readable
+// sentence too, and dropping it would silently un-explain those routes.
+test("the legacy error body is still read", () => {
+  assert.deepEqual(
+    policy.parseStreamFailure({
+      status: 404,
+      body: JSON.stringify({ error: "transcode session not found" }),
+    }),
+    { status: 404, code: null, message: "transcode session not found" },
+  );
+});
+
+// The stale-reason trap, in its new clothes. A segment refused early in a film
+// must not be produced as the confident explanation for a fatal error forty
+// minutes later; the generic sentence is the honest answer there.
+test("a refusal only explains a failure it is contemporary with", () => {
+  const failure = {
+    status: 502,
+    code: "producer_failed",
+    message: "the server's encoder exited before it produced any video",
+    at: 1_000_000,
+  };
+  assert.ok(policy.streamFailureOverlay(failure, 1_000_000 + 60_000));
+  assert.equal(policy.streamFailureOverlay(failure, 1_000_000 + 600_000), null);
+  // An unstamped failure, or a caller that does not stamp, is still read —
+  // the check may not silently discard the only reason there is.
+  assert.ok(policy.streamFailureOverlay(failure));
+  assert.ok(
+    policy.streamFailureOverlay({ ...failure, at: undefined }, 9_999_999),
+  );
+});
+
 // Drained last, in registration order, after every synchronous case has run.
 (async () => {
   for (const [name, run] of ASYNC_TESTS) {

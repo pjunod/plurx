@@ -516,6 +516,77 @@
     return ["stall-recovery", "stall-manual", "auto-supply"].includes(reason);
   }
 
+  // Read a refused stream response into the cause the server named.
+  //
+  // hls.js's ERROR event carries only the response *line* — `{code: status,
+  // text: statusText}` — and drops the body on the floor, so every refusal
+  // reached the viewer as the same "Playback failed to start
+  // (levelLoadError)". The playlist and session routes now answer with
+  // `{code, message}` naming what actually happened; the player captures that
+  // body from the XHR and hands it here.
+  //
+  // `null` for anything that is not a legible refusal. Guessing would explain
+  // the wrong failure with complete confidence, which is worse than the
+  // generic sentence this replaces.
+  function parseStreamFailure({ status, body }) {
+    if (!(status >= 400)) return null;
+    let parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch (e) {
+      return null;
+    }
+    if (!parsed || typeof parsed !== "object") return null;
+    // `{code, message}` is the typed shape; `{error}` is the legacy body
+    // several routes still use, and it carries a readable sentence too.
+    const message =
+      typeof parsed.message === "string" && parsed.message.trim()
+        ? parsed.message.trim()
+        : typeof parsed.error === "string" && parsed.error.trim()
+          ? parsed.error.trim()
+          : null;
+    if (!message) return null;
+    return {
+      status,
+      code: typeof parsed.code === "string" ? parsed.code : null,
+      message,
+    };
+  }
+
+  // The two overlay lines for a failure the server explained.
+  //
+  // A still-starting session is deliberately not called a failure: the server
+  // holds a playlist request for its whole hardware→software recovery budget,
+  // and what comes back after that is "not yet", not "never". Telling someone
+  // their stream permanently failed while the server is still building it is
+  // the defect this pair of functions exists to close.
+  //
+  // A refusal older than this explains some earlier request, not the failure
+  // in front of the viewer. Generous, because the whole point is that a
+  // startup can legitimately take the better part of a minute — but bounded,
+  // because this file's other confident-and-wrong explanation (the
+  // stale-reason trap, PLAYBACK.md) is exactly the mistake to avoid repeating.
+  const FAILURE_FRESH_MS = 90_000;
+
+  // `null` means nothing better than the caller's generic sentence is known.
+  // `now` is optional: a caller that does not stamp its failures gets no
+  // freshness check rather than a silently discarded reason.
+  function streamFailureOverlay(failure, now = null) {
+    if (!failure || !failure.message) return null;
+    if (now != null && failure.at != null && now - failure.at > FAILURE_FRESH_MS) {
+      return null;
+    }
+    const retryable =
+      failure.code === "startup_timeout" || failure.status === 503;
+    return {
+      title: retryable
+        ? "Still preparing this stream…"
+        : "Playback failed to start.",
+      detail: failure.message,
+      retryable,
+    };
+  }
+
   function waitingOverlayAction({ started = false, stallPrompt = false }) {
     if (!started) return "ignore";
     return stallPrompt ? "preserve_prompt" : "buffer";
@@ -799,6 +870,8 @@
     fallbackAction,
     stallRecoveryAction,
     fallbackResetBeforeOpen,
+    parseStreamFailure,
+    streamFailureOverlay,
     waitingOverlayAction,
     subtitleBurnAction,
     seekDeltaSeconds,

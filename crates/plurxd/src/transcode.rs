@@ -46,6 +46,25 @@ fn capacity_error(message: impl AsRef<str>) -> String {
 pub(crate) fn is_retryable_capacity_error(error: &str) -> bool {
     error.starts_with(RETRYABLE_CAPACITY_PREFIX)
 }
+
+/// Stable classification for a start this ffmpeg build cannot perform at all.
+///
+/// Separate from a capacity error because the answers differ: capacity says
+/// "try again", this says "this will never work here, and here is what is
+/// missing". Both exist because the alternative — an unclassified `String` —
+/// reaches the client as `ApiError::Internal`, which deliberately drops its
+/// message. A refusal nobody can read is the anonymous failure this change
+/// exists to remove.
+const UNSUPPORTED_BUILD_PREFIX: &str = "this server's media tools cannot do that: ";
+
+fn unsupported_build_error(message: impl AsRef<str>) -> String {
+    format!("{UNSUPPORTED_BUILD_PREFIX}{}", message.as_ref())
+}
+
+/// Strip the classification, leaving the sentence a viewer should read.
+pub(crate) fn unsupported_build_reason(error: &str) -> Option<&str> {
+    error.strip_prefix(UNSUPPORTED_BUILD_PREFIX)
+}
 /// What "Auto" resolves to — see [`TranscodeManager::auto_height`].
 const AUTO_SOFTWARE_HEIGHT: i64 = 720;
 const AUTO_HARDWARE_MAX_HEIGHT: i64 = 1080;
@@ -70,11 +89,10 @@ const SEGMENT_WAIT: Duration = Duration::from_secs(20);
 /// recreating the same live-edge race. Finished short titles escape through
 /// `ENDLIST` rather than waiting for media that can never exist.
 const TRANSCODE_START_CUSHION_MS: i64 = transcode::SEGMENT_SECONDS as i64 * 2 * 1_000;
-/// The initial playlist request was already bounded to 30 seconds. Naming the
-/// cadence keeps the new cushion inside that same failure/cancellation surface:
-/// no detached task survives a dropped HTTP request and a failed session still
-/// exits immediately.
-const PLAYLIST_WAIT_POLLS: usize = 300;
+/// How often a held playlist request re-asks. Naming the cadence keeps the
+/// start cushion inside the same failure/cancellation surface: no detached task
+/// survives a dropped HTTP request and a failed session still exits
+/// immediately.
 const PLAYLIST_WAIT_POLL: Duration = Duration::from_millis(100);
 /// Grace period for a hardware transcode to list its first segment before we
 /// assume it stalled (GPU contention, or a decode the GPU can't do) and fall
@@ -95,6 +113,37 @@ const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
 const PROGRESS_STALL: Duration = Duration::from_secs(10);
 /// How often the stall watchdog re-asks, once past its initial grace.
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
+/// Slack on top of the startup-recovery graces, covering the cadence at which
+/// each stage actually renders its verdict: the first-segment watch re-asks
+/// every `WATCHDOG_POLL`, the downgrade respawns an ffmpeg, and the lifetime
+/// watchdog polls on the same cadence after its own grace. Two polls plus a
+/// respawn's worth, so the budget lands *after* the last verdict rather than
+/// in the gap before it.
+const PLAYLIST_WAIT_SLACK: Duration = Duration::from_secs(2 * 5 + 3);
+/// How long a playlist request holds a still-starting session before giving up.
+///
+/// **Derived from the server's own startup-recovery budget, not chosen.** This
+/// used to be an independent 30 s, sized against the copy path's publish gate
+/// (`COPY_PUBLISH_GATE_SECS`) and never against the recovery it now has to
+/// outlive. A hardware start that stalls gets `FIRST_SEGMENT_GRACE` before it
+/// is downgraded and then `SOFTWARE_GRACE` for the software fallback to
+/// produce real output — 42 s of *legitimate, still-working* startup, all of
+/// it past a 30 s wait. So a session the watchdog was in the middle of
+/// rescuing had its playlist 404'd, and hls.js escalated that to a fatal
+/// `levelLoadError`: the viewer was told the stream had permanently failed
+/// while the server was still successfully starting it. A mid-film bitmap
+/// subtitle burn is the likeliest session to need exactly that fallback — a
+/// full re-encode plus a subtitle composite from a non-zero `-ss`, with no
+/// direct-play or remux escape.
+///
+/// Holding rather than erroring is safe because the client's patience is
+/// asymmetric (see [`TranscodeManager::playlist`]), and it costs nothing that
+/// a *failed* session would pay: every terminal verdict still returns
+/// immediately, so this bound is only ever spent on a session that is
+/// genuinely still starting.
+const PLAYLIST_WAIT_BUDGET: Duration = Duration::from_secs(
+    FIRST_SEGMENT_GRACE.as_secs() + SOFTWARE_GRACE.as_secs() + PLAYLIST_WAIT_SLACK.as_secs(),
+);
 /// How far behind the *download frontier* media is kept on disk, and why that
 /// is not the same as "behind the playhead".
 ///
@@ -1152,7 +1201,18 @@ async fn watch_for_stall_claimed(session: Arc<Session>, dir: PathBuf, sid: Strin
                     }
                 );
                 session.kill_child().await;
-                session.failed.store(true, Relaxed);
+                // The two halves of the log line above are two different
+                // things to a viewer — one lost a stream that was playing,
+                // the other never had one — so the client is told which.
+                session.fail(PlaylistError::SessionFailed(
+                    if produced {
+                        "the encoder stopped part-way through this stream"
+                    } else {
+                        "the encoder never produced any video — this build of ffmpeg \
+                         most likely cannot decode this source"
+                    }
+                    .into(),
+                ));
                 return;
             }
         }
@@ -1347,6 +1407,16 @@ struct Session {
     /// both failed to emit a first segment). Playlist/segment reads then fail
     /// fast so the player shows an error instead of waiting on a gray screen.
     failed: AtomicBool,
+    /// *Why* [`Self::failed`] was set, recorded at the moment of the verdict.
+    ///
+    /// The flag alone is what made every terminal cause anonymous downstream:
+    /// whoever failed the session knew the exit status or the stall detail,
+    /// and the next playlist reader had only a bool. Written under the same
+    /// action that sets the flag, so a later reader reports the first — and
+    /// therefore the real — cause rather than whichever one it can still
+    /// observe. A `std::sync::Mutex` because it is a one-line store read on a
+    /// path that never awaits while holding it.
+    failure: std::sync::Mutex<Option<PlaylistError>>,
     /// True once the first playlist response is allowed out. Cached assets and
     /// copy sessions start true: VOD is already complete, and the copy
     /// segmenter owns its separate 12-second publication gate. A live
@@ -1465,6 +1535,36 @@ fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
 }
 
 impl Session {
+    /// Fail this session *and say why*, in one step.
+    ///
+    /// The pairing is the point: a bare `failed.store(true)` is how a cause
+    /// that was known at the verdict became an anonymous 404 three layers
+    /// later. First writer wins — the initial verdict is the real one, and a
+    /// later reader that merely notices the flag must not overwrite it with a
+    /// vaguer restatement.
+    fn fail(&self, reason: PlaylistError) {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(reason);
+        self.failed.store(true, Relaxed);
+    }
+
+    /// The recorded cause, for a reader that has already seen `failed`.
+    ///
+    /// Falls back to an unnamed verdict rather than to "no failure": the flag
+    /// is the authority on *whether* the session is dead, and a store this
+    /// path cannot see is still a dead session.
+    fn failure_reason(&self) -> PlaylistError {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| {
+                PlaylistError::SessionFailed("the transcode stopped before it could start".into())
+            })
+    }
+
     async fn begin_child_replacement(&self) -> ChildReplacement<'_> {
         let transition = self.child_transition.lock().await;
         self.replacing_child.store(true, Release);
@@ -1738,6 +1838,83 @@ pub struct HlsContext {
     /// Maximum video frame rate from the source probe. Apple requires this on
     /// every video variant in a multivariant playlist.
     pub frame_rate: Option<f64>,
+}
+
+/// Why a session could not hand back a media playlist.
+///
+/// This used to be the `None` half of an `Option`, which collapsed every
+/// terminal cause into one anonymous 404: a producer that exited non-zero, a
+/// watchdog stall verdict, a session superseded by the same viewer's next
+/// seek, and a startup that simply ran out of budget all read identically to
+/// the client. The operator behind #263 was told "the server couldn't build
+/// this stream — see Settings → Logs" for a failure the server had already
+/// classified and logged, on a headless box they were not sitting at. The
+/// cause is known at the moment it is decided; it is carried from there.
+///
+/// [`Self::code`] is the stable machine-readable half and [`Self::message`] is
+/// the sentence a viewer reads, so a client that wants to choose a recovery
+/// action never has to parse prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistError {
+    /// No session is registered under this id: its window expired, the same
+    /// viewer's next seek superseded it, or it never existed.
+    SessionGone,
+    /// The producer exited non-zero before publishing a usable playlist. The
+    /// string is ffmpeg's rendered exit status — the one fact that separates
+    /// "this build refused the source" from "something killed it".
+    ProducerExited(String),
+    /// The session was failed after it started: the stall watchdog's verdict,
+    /// or a fallback that could not spawn. Carries the operator-facing detail
+    /// recorded at the moment of the verdict.
+    SessionFailed(String),
+    /// Still starting when [`PLAYLIST_WAIT_BUDGET`] ran out. Not terminal —
+    /// the session may yet publish — so clients are told to retry rather than
+    /// to give up.
+    StartupTimedOut(Duration),
+}
+
+impl PlaylistError {
+    /// Stable machine-readable cause. Clients branch on this, never on the
+    /// message.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PlaylistError::SessionGone => "session_gone",
+            PlaylistError::ProducerExited(_) => "producer_failed",
+            PlaylistError::SessionFailed(_) => "session_failed",
+            PlaylistError::StartupTimedOut(_) => "startup_timeout",
+        }
+    }
+
+    /// One sentence naming what went wrong, written for the person watching
+    /// rather than the person reading the log.
+    pub fn message(&self) -> String {
+        match self {
+            PlaylistError::SessionGone => {
+                "this stream is no longer running — it expired, or another play \
+                 replaced it"
+                    .to_owned()
+            }
+            PlaylistError::ProducerExited(status) => format!(
+                "the server's encoder exited before it produced any video ({status}) — \
+                 this build of ffmpeg could not handle this source, audio track or \
+                 subtitle burn-in"
+            ),
+            PlaylistError::SessionFailed(detail) => {
+                format!("the server could not build this stream: {detail}")
+            }
+            PlaylistError::StartupTimedOut(waited) => format!(
+                "the server is still preparing this stream after {}s — a subtitle \
+                 burn-in or 4K re-encode can take this long to start",
+                waited.as_secs()
+            ),
+        }
+    }
+
+    /// Terminal causes are worth reporting once; a startup that merely ran out
+    /// of budget is the client's cue to ask again.
+    pub fn retryable(&self) -> bool {
+        matches!(self, PlaylistError::StartupTimedOut(_))
+    }
 }
 
 /// How long a media-origin probe may take before the session gives up on it.
@@ -2572,6 +2749,11 @@ pub struct TranscodeManager {
     /// with no UI knob, so a two-second staleness bound is invisible to an
     /// operator and removes the reads from the path entirely.
     cached_limits: std::sync::RwLock<Option<(Instant, AheadLimits)>>,
+    /// Shortens [`PLAYLIST_WAIT_BUDGET`] for tests that need the deadline to
+    /// actually elapse. Zero (always, in production) means the real budget —
+    /// see [`TranscodeManager::playlist_wait`].
+    #[cfg(test)]
+    playlist_wait_override_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TranscodeManager {
@@ -2617,6 +2799,8 @@ impl TranscodeManager {
             offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
             cached_limits: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            playlist_wait_override_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -3082,6 +3266,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             playlist_published: AtomicBool::new(true),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
@@ -4595,6 +4780,25 @@ impl TranscodeManager {
         {
             return Ok(info);
         }
+        // Can this ffmpeg build actually burn? Asked here — after the cache
+        // lookup, which needs no ffmpeg at all, and before any slot, process
+        // or session exists — because the alternative is spawning a graph that
+        // dies at once with `No such filter` and reporting that to the viewer
+        // as an anonymous stream failure a minute later. A build without the
+        // filter will never grow one mid-session; refusing at the door names
+        // the reason while the request is still in front of the person who
+        // made it.
+        if let Some(burn) = subtitle_burn.as_ref() {
+            if let Some(reason) = crate::pipeprobe::burn_filters().await.refusal(burn.bitmap) {
+                tracing::warn!(
+                    file = file_id,
+                    subtitle = burn.subtitle_index,
+                    bitmap = burn.bitmap,
+                    "refusing a subtitle burn this ffmpeg build cannot run: {reason}"
+                );
+                return Err(unsupported_build_error(reason));
+            }
+        }
         self.ensure_text_subtitle(&file, subtitle_burn.as_ref())
             .await?;
 
@@ -4711,6 +4915,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
@@ -4985,7 +5190,9 @@ impl TranscodeManager {
             }
             Err(e) => {
                 tracing::error!(session = %sid, "fallback transcode failed: {e}");
-                session.failed.store(true, Relaxed);
+                session.fail(PlaylistError::SessionFailed(
+                    "the fallback encoder could not be started".into(),
+                ));
             }
         }
         retry_opts.effective_rate_control
@@ -5204,6 +5411,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             playlist_published: AtomicBool::new(true),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
@@ -5342,7 +5550,9 @@ impl TranscodeManager {
                             }
                             Err(e) => {
                                 tracing::error!(session = %sid, "fallback copy failed: {e}");
-                                session.failed.store(true, Relaxed);
+                                session.fail(PlaylistError::SessionFailed(
+                                    "the fallback remux could not be started".into(),
+                                ));
                             }
                         }
                     }
@@ -5621,29 +5831,42 @@ impl TranscodeManager {
             "HLS producer exited unsuccessfully before publishing a usable playlist; \
              failing the session"
         );
-        session.failed.store(true, Relaxed);
+        // The exit status is the one fact that separates "this build refused
+        // the source" from "something killed it", and it is already in hand
+        // here. Record it so every later reader reports the same cause.
+        session.fail(PlaylistError::ProducerExited(status.to_string()));
         true
     }
 
     /// Read the current media playlist for a session.
-    pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
-        let session = self.touch(session_id, "playlist").await?;
+    ///
+    /// Every terminal cause is named rather than collapsed — see
+    /// [`PlaylistError`] for why an anonymous `None` was not survivable
+    /// downstream.
+    pub async fn playlist(&self, session_id: &str) -> Result<Vec<u8>, PlaylistError> {
+        let Some(session) = self.touch(session_id, "playlist").await else {
+            return Err(PlaylistError::SessionGone);
+        };
         let path = session.dir.join("index.m3u8");
         // Hold the request until the playlist exists. On the transcode path
         // that is a beat after ffmpeg starts; on the copy path it is the
         // publish gate filling (COPY_PUBLISH_GATE_SECS), which on a
-        // NAS-bound 4K remux is production time in the double-digit seconds —
-        // so the window is 30 s, not a beat. Holding beats 404ing because the
-        // client's patience is asymmetric, verified against the vendored
-        // hls.js: a slow first byte is waited on indefinitely
-        // (manifestLoadPolicy.maxTimeToFirstByteMs: Infinity, 20 s per
-        // attempt, two timeout retries), while a 404 spends one of a single
-        // error retry. A failed session still returns None immediately → 404
-        // → the player reports an error rather than polling a segment-less
-        // playlist on a gray screen forever.
-        for _ in 0..PLAYLIST_WAIT_POLLS {
+        // NAS-bound 4K remux is production time in the double-digit seconds;
+        // and on a stalled hardware start it is the whole
+        // hardware→software recovery, which is why the window is
+        // PLAYLIST_WAIT_BUDGET rather than a number chosen here. Holding
+        // beats erroring because the client's patience is asymmetric,
+        // verified against the vendored hls.js: a slow first byte is waited
+        // on indefinitely (manifestLoadPolicy.maxTimeToFirstByteMs: Infinity,
+        // 20 s per attempt, two timeout retries), while an error response
+        // spends one of a single error retry. A failed session still returns
+        // immediately — the budget below is only ever spent on a session that
+        // is genuinely still starting, never on one that has already lost.
+        let budget = self.playlist_wait();
+        let deadline = Instant::now() + budget;
+        loop {
             if session.failed.load(Relaxed) {
-                return None;
+                return Err(session.failure_reason());
             }
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 if !bytes.is_empty() {
@@ -5658,7 +5881,10 @@ impl TranscodeManager {
                     if !session.playlist_published.load(Relaxed) {
                         if !transcode_first_playlist_ready(&bytes) {
                             if self.playlist_producer_failed(&session, session_id).await {
-                                return None;
+                                return Err(session.failure_reason());
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(PlaylistError::StartupTimedOut(budget));
                             }
                             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
                             continue;
@@ -5669,7 +5895,7 @@ impl TranscodeManager {
                     // moment the segment index can be refreshed for free.
                     self.flow_control(&session, session_id).await;
                     if session.cached {
-                        return Some(bytes);
+                        return Ok(bytes);
                     }
                     let first_retained = session.segments.lock().await.first_retained_index();
                     if let Some(first_retained_index) = first_retained.filter(|index| *index > 0) {
@@ -5702,7 +5928,7 @@ impl TranscodeManager {
                             .await;
                         }
                     }
-                    return Some(served_live_playlist(
+                    return Ok(served_live_playlist(
                         bytes,
                         first_retained,
                         session.typeless_sliding,
@@ -5714,11 +5940,40 @@ impl TranscodeManager {
             // told us startup is impossible. This request polls much sooner
             // and knows that no usable playlist was present above.
             if self.playlist_producer_failed(&session, session_id).await {
-                return None;
+                return Err(session.failure_reason());
+            }
+            // Checked after the terminal verdicts, never before them: a
+            // session that has already lost must not be reported as one that
+            // merely ran out of time, and a session that is still inside the
+            // recovery path must not be reported as terminal.
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    session = %session_id,
+                    waited_s = budget.as_secs(),
+                    "no usable HLS playlist within the startup budget; telling the client \
+                     to retry rather than that the stream failed"
+                );
+                return Err(PlaylistError::StartupTimedOut(budget));
             }
             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
         }
-        None
+    }
+
+    /// How long one playlist request holds a still-starting session.
+    ///
+    /// Production always answers [`PLAYLIST_WAIT_BUDGET`]. The override exists
+    /// so the deadline's *mechanics* can be exercised in milliseconds; the
+    /// budget's *value* is pinned separately against the recovery graces it
+    /// has to outlive, which is the relation whose absence caused #263.
+    fn playlist_wait(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let ms = self.playlist_wait_override_ms.load(Relaxed);
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+        PLAYLIST_WAIT_BUDGET
     }
 
     /// Resolve one segment against the complete session timeline.
@@ -7998,6 +8253,7 @@ mod tests {
             encoder_label: Mutex::new("test"),
             started_unix: 0,
             failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
@@ -8110,10 +8366,212 @@ mod tests {
         let playlist = tokio::time::timeout(Duration::from_millis(500), mgr.playlist("early-exit"))
             .await
             .expect("an unsuccessful producer exit must not consume the startup window");
-        assert!(playlist.is_none(), "failed startup has no playlist");
+        // And it says *which* terminal cause, carrying the exit status: this
+        // is the one place the status is knowable, and an anonymous refusal
+        // here is what left #263's operator reading logs on a headless box.
+        assert!(
+            matches!(&playlist, Err(PlaylistError::ProducerExited(status)) if !status.is_empty()),
+            "a failed startup must name the producer exit, got {playlist:?}"
+        );
         assert!(
             session.failed.load(Relaxed),
             "the terminal startup verdict must be shared with later requests"
+        );
+    }
+
+    /// **The #263 regression.** A playlist request must outlive the server's
+    /// own startup recovery, because a session inside that recovery is one the
+    /// server is still successfully starting.
+    ///
+    /// A stalled hardware start is given `FIRST_SEGMENT_GRACE` before it is
+    /// downgraded and then `SOFTWARE_GRACE` for the software fallback to
+    /// produce real output. The wait used to be an independently chosen 30 s,
+    /// sized against the copy path's publish gate and never against this — so
+    /// at 30 s the request 404'd, hls.js escalated it to a fatal
+    /// `levelLoadError`, and the viewer was told the stream had permanently
+    /// failed with twelve seconds of legitimate recovery still to run.
+    ///
+    /// Reverting the budget to that 30 s fails this assertion.
+    #[test]
+    fn the_playlist_wait_outlives_the_startup_recovery_it_has_to_cover() {
+        let recovery = FIRST_SEGMENT_GRACE + SOFTWARE_GRACE;
+        assert!(
+            PLAYLIST_WAIT_BUDGET > recovery,
+            "a playlist request may not give up ({PLAYLIST_WAIT_BUDGET:?}) while the \
+             session is still inside its own hardware->software recovery ({recovery:?})"
+        );
+        // And with room for each stage to actually render its verdict: the
+        // first-segment watch and the lifetime watchdog both re-ask on
+        // WATCHDOG_POLL, with a respawn between them. A budget that lands in
+        // the gap before the last verdict reports "still starting" for a
+        // session that has already lost.
+        assert!(
+            PLAYLIST_WAIT_BUDGET >= recovery + WATCHDOG_POLL * 2,
+            "the budget must clear the recovery's own polling cadence, not just its graces"
+        );
+    }
+
+    /// The wait ends at its budget and not a poll before it.
+    ///
+    /// Pinned in milliseconds through the same deadline the production budget
+    /// uses, because the value that budget takes is pinned separately above:
+    /// together they say a session publishing at 42 s is served and one that
+    /// never publishes is refused, without a 45-second test.
+    #[tokio::test]
+    async fn a_playlist_is_held_for_the_whole_budget_and_no_longer() {
+        use plurx_core::store::SqliteStore;
+
+        async fn manager(dir: &std::path::Path, budget_ms: u64) -> TranscodeManager {
+            let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+            let mgr = TranscodeManager::new(
+                store,
+                dir.join("manager-work"),
+                EncoderCaps::default(),
+                Pipeline::Cpu,
+            );
+            mgr.playlist_wait_override_ms.store(budget_ms, Relaxed);
+            mgr
+        }
+
+        // Published late — but inside the budget. Held, then served.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = watchdog_session(dir.path(), None, false);
+        let mgr = manager(dir.path(), 4_000).await;
+        mgr.sessions
+            .lock()
+            .await
+            .insert("slow-start".into(), Arc::clone(&session));
+        let publish = {
+            let path = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                seeded_session_dir(&path, 2, 2.0).await;
+            })
+        };
+        let started = Instant::now();
+        let served = mgr.playlist("slow-start").await;
+        assert!(
+            served.is_ok(),
+            "a session still starting inside the budget must be served, got {served:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "it must have actually waited rather than found the playlist already there"
+        );
+        publish.await.expect("publisher");
+
+        // Never published. Refused at the deadline — and as a retryable
+        // "still starting", never as a session that failed or went away.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let stuck = watchdog_session(empty.path(), None, false);
+        let mgr = manager(empty.path(), 600).await;
+        mgr.sessions
+            .lock()
+            .await
+            .insert("never-starts".into(), Arc::clone(&stuck));
+        let started = Instant::now();
+        let refused = mgr.playlist("never-starts").await;
+        assert_eq!(
+            refused,
+            Err(PlaylistError::StartupTimedOut(Duration::from_millis(600)))
+        );
+        let err = refused.expect_err("refused");
+        assert_eq!(err.code(), "startup_timeout");
+        assert!(
+            err.retryable(),
+            "a stream the server may still publish is not a permanent failure"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "the deadline must be the budget, not an earlier poll count"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and it must actually end at the budget"
+        );
+    }
+
+    /// A terminal verdict is reported as itself, immediately, by every later
+    /// reader — the whole point of recording *why* alongside the flag.
+    #[tokio::test]
+    async fn a_terminal_verdict_names_its_cause_to_every_later_reader() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = watchdog_session(dir.path(), None, false);
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        // A long budget, so a wait would be unmistakable: a session that has
+        // already lost must not spend one poll of it.
+        mgr.playlist_wait_override_ms.store(30_000, Relaxed);
+        mgr.sessions
+            .lock()
+            .await
+            .insert("stalled".into(), Arc::clone(&session));
+
+        session.fail(PlaylistError::SessionFailed(
+            "the encoder never produced any video".into(),
+        ));
+        let started = Instant::now();
+        let refused = mgr.playlist("stalled").await;
+        assert_eq!(
+            refused,
+            Err(PlaylistError::SessionFailed(
+                "the encoder never produced any video".into()
+            ))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a failed session still returns immediately — the longer budget is only \
+             ever spent on a session that is genuinely still starting"
+        );
+        assert!(!refused.expect_err("refused").retryable());
+
+        // First verdict wins. A later reader that merely notices the flag
+        // must not overwrite the real cause with a vaguer restatement.
+        session.fail(PlaylistError::ProducerExited("exit status: 1".into()));
+        assert_eq!(
+            mgr.playlist("stalled").await,
+            Err(PlaylistError::SessionFailed(
+                "the encoder never produced any video".into()
+            ))
+        );
+    }
+
+    /// Every cause carries a distinct machine-readable code and a sentence
+    /// that is actually about that cause. The HLS route branches on the code;
+    /// the overlay shows the message.
+    #[test]
+    fn every_playlist_refusal_is_distinguishable_and_readable() {
+        let all = [
+            PlaylistError::SessionGone,
+            PlaylistError::ProducerExited("exit status: 1".into()),
+            PlaylistError::SessionFailed("the encoder never produced any video".into()),
+            PlaylistError::StartupTimedOut(Duration::from_secs(45)),
+        ];
+        let codes: std::collections::HashSet<&str> = all.iter().map(|e| e.code()).collect();
+        assert_eq!(codes.len(), all.len(), "each cause needs its own code");
+        for err in &all {
+            let message = err.message();
+            assert!(
+                message.len() > 20 && !message.contains("Settings"),
+                "a refusal must explain itself rather than send someone to a log \
+                 file on a headless box: {message}"
+            );
+        }
+        // The two details a person can only get from the server.
+        assert!(all[1].message().contains("exit status: 1"));
+        assert!(all[3].message().contains("45"));
+        // And exactly one of them is a "not yet" rather than a "never".
+        assert_eq!(
+            all.iter().filter(|e| e.retryable()).count(),
+            1,
+            "only a startup that ran out of budget is retryable"
         );
     }
 
@@ -9365,6 +9823,7 @@ mod tests {
             encoder_label: Mutex::new("test"),
             started_unix: 0,
             failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             playlist_published: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
             fetched_end_ms: AtomicI64::new(0),
@@ -10088,7 +10547,7 @@ mod tests {
             0,
             "and nothing to wait behind — the work is already done"
         );
-        assert!(mgr.playlist(&info.session_id).await.is_some());
+        assert!(mgr.playlist(&info.session_id).await.is_ok());
 
         // Retention must not treat a finished asset as this session's scratch.
         // Pretend the viewer has watched well past the window and let the
@@ -10259,7 +10718,7 @@ mod tests {
             "the producer and the player disagree about what this transcode is called"
         );
         assert_eq!(info.encoder, "cached");
-        assert!(mgr.playlist(&info.session_id).await.is_some());
+        assert!(mgr.playlist(&info.session_id).await.is_ok());
         assert!(mgr.stop_session(&info.session_id, "test").await);
 
         // Producing it again is a no-op rather than a second encode.
@@ -11023,7 +11482,11 @@ mod tests {
         assert_eq!(prefs.audio_lang, "jpn");
 
         // Unknown session lookups fail fast (no waiting).
-        assert!(mgr.playlist("missing").await.is_none());
+        assert_eq!(
+            mgr.playlist("missing").await,
+            Err(PlaylistError::SessionGone),
+            "an id with no session is gone, not a stream that failed to build"
+        );
         assert!(mgr.segment("missing", "seg00000.ts").await.is_none());
         assert!(mgr.segment("missing", "../evil").await.is_none());
         assert!(!mgr.stop_session("missing", "test").await);
@@ -11120,7 +11583,11 @@ mod tests {
             .expect("seek again");
         assert_eq!(mgr.admissions.software_in_use(), live_weight);
         assert_eq!(mgr.active_sessions().await, 1);
-        assert!(mgr.playlist(&first.session_id).await.is_none());
+        assert_eq!(
+            mgr.playlist(&first.session_id).await,
+            Err(PlaylistError::SessionGone),
+            "a superseded session is gone — the viewer's own seek replaced it"
+        );
         assert!(!mgr.stop_session(&second.session_id, "test").await);
         assert!(mgr.stop_session(&third.session_id, "test").await);
 

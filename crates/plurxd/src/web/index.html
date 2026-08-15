@@ -2437,7 +2437,11 @@ async function api(path, {method="GET", body=null, raw=false}={}){
   if(body){ headers["content-type"]="application/json"; }
   const res=await fetch(API+path,{method,headers,body:body?JSON.stringify(body):null});
   if(res.status===401){ logout(); throw new Error("unauthorized"); }
-  if(!res.ok){ let m="request failed"; try{m=(await res.json()).error||m}catch(e){} throw new Error(m); }
+  // `{error}` is the legacy body; `{code, message}` is the typed one routes
+  // migrate to as their client contracts need a machine-readable cause. Read
+  // both, or a typed refusal — "this server's ffmpeg has no subtitles filter"
+  // — reaches the viewer as the useless "request failed".
+  if(!res.ok){ let m="request failed"; try{const b=await res.json(); m=b.error||b.message||m}catch(e){} throw new Error(m); }
   return raw?res:res.json();
 }
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
@@ -4502,6 +4506,24 @@ function preferNativeHls(video){
     hlsJsSupported:hlsJsSupported()
   })==='native';
 }
+// The last refusal the server explained.
+//
+// hls.js consumes the HTTP response and hands its ERROR event only the status
+// line (verified in the vendored build: `response:{url,data:void 0,code:
+// o.status,text:o.statusText}`), so the `{code, message}` body naming the
+// actual cause never reaches the error handler. Catching it at the transport
+// is the only place it exists.
+//
+// Two guards against this file's documented stale-reason trap (PLAYBACK.md,
+// "The error fallback"): it is cleared whenever a stream is attached, and it
+// is stamped, so a segment refused at minute two cannot be produced as the
+// confident explanation for a fatal error at minute forty.
+let STREAM_FAILURE=null;
+function clearStreamFailure(){ STREAM_FAILURE=null; }
+function noteStreamFailure(status, body){
+  const parsed=PlaybackPolicy.parseStreamFailure({status:status, body:body});
+  if(parsed){ parsed.at=Date.now(); STREAM_FAILURE=parsed; }
+}
 // One place that attaches an HLS playlist to the video element (used by start,
 // seek-restart, and audio-switch). Worker off: a wallet extension's injected
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
@@ -4517,6 +4539,9 @@ function attachHls(video, playlistUrl, startAt){
   // another. Also cancels the previous session's segment fetches, which is the
   // client half of the server's supersede.
   teardownHls();
+  // A new stream owns its own explanations. Whatever the last one was refused
+  // for is now stale, and a stale reason is worse than no reason.
+  clearStreamFailure();
   if(!preferNativeHls(video) && window.Hls && Hls.isSupported()){
     // Buffer targets, in SECONDS, and deliberately not in bytes.
     //
@@ -4551,7 +4576,16 @@ function attachHls(video, playlistUrl, startAt){
       // on a 4K cache hit that is tens of megabytes and several seconds of
       // the viewer watching a spinner to arrive where they already were.
       startPosition:(startAt>0?startAt:-1),
-      xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+      // `load` rather than a property assignment: hls.js installs its own
+      // onreadystatechange *after* this hook runs, so anything set there is
+      // overwritten — an added listener coexists with it and sees the body
+      // hls.js is about to throw away.
+      xhrSetup:x=>{
+        if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN);
+        x.addEventListener("load",()=>{
+          if(x.status>=400) noteStreamFailure(x.status, x.responseText);
+        });
+      }});
     const estimateSeed=PlaybackPolicy.bandwidthSeedBps({
       outgoingEstimateBps:PLAYER&&PLAYER.bandwidthSeedBps,
       priorKbps:PLAYER&&PLAYER.priorKbps
@@ -4738,6 +4772,23 @@ function attachHls(video, playlistUrl, startAt){
           "this browser's decoder refused the copied stream ("+d.details+"); re-encoding instead");
         startTranscodeFallback("stream-rejected",
           "the browser refused the "+PLAYER.method.replace('_',' ')+" stream ("+d.details+") — re-encoded instead");
+        return;
+      }
+      // Say what the server said. This used to be "the server couldn't build
+      // this stream — see Settings → Logs" for every cause alike: a producer
+      // that exited non-zero, a session superseded by another device, an
+      // ffmpeg build with no `subtitles` filter, and — the case that made this
+      // a defect rather than a wording problem — a session the server was
+      // still successfully starting. The refusal body names which; the
+      // overlay is only useful if it repeats that instead of sending someone
+      // to a log file on a headless box.
+      const explained=PlaybackPolicy.streamFailureOverlay(STREAM_FAILURE,Date.now());
+      if(explained){
+        clientLog(Object.assign({level:"error",event:"stream_refused",
+          detail:STREAM_FAILURE.code||String(STREAM_FAILURE.status),
+          message:explained.detail}, playbackContext()));
+        setLoading(true,explained.title,explained.detail);
+        toast(explained.retryable?"Still starting…":"Playback failed");
         return;
       }
       setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs");

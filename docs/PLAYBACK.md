@@ -267,6 +267,10 @@ The practical rule for a client: **gate a session-mode subtitle pick on
 values the client implements.** An absent or unknown `overlay` value is
 unsupported, not a preparation state. VobSub and XSUB remain burn-only.
 
+A burn the server's ffmpeg build cannot run is refused when the session is
+opened, naming the missing filter — see [Burn-in is preflighted against the
+ffmpeg build](#burn-in-is-preflighted-against-the-ffmpeg-build).
+
 ### PGS overlay server contract — staged and default-off
 
 The server side of `pgs-v1` is implemented behind `PLURX_PGS_OVERLAY=1` and is
@@ -630,6 +634,95 @@ even the copy path can't hand to the browser).
 *and* reasons that only mention container/audio is the fallback firing — the
 browser rejected a cheaper stream. `Method: Transcode` with a "video codec …"
 or "HDR …" reason is a real, up-front transcode verdict.
+
+## When a stream cannot start — the wait, and the named refusals
+
+A transcode session is not ready the moment it is created. Its first media
+playlist appears when ffmpeg has published enough of one, and the server holds
+the request open until then rather than answering "not found" — because the
+client's patience is asymmetric. Verified against the vendored hls.js: a slow
+first byte is waited on indefinitely (`manifestLoadPolicy.maxTimeToFirstByteMs:
+Infinity`, 20 s per attempt, two timeout retries), while an error response
+spends one of a single error retry and then goes fatal.
+
+### The playlist wait is the startup-recovery budget
+
+`PLAYLIST_WAIT_BUDGET` is **derived from the recovery it has to outlive**, not
+chosen independently:
+
+```
+FIRST_SEGMENT_GRACE  12 s   a stalled hardware start, before it is downgraded
+SOFTWARE_GRACE     + 30 s   the software fallback's window to produce output
+PLAYLIST_WAIT_SLACK+ 13 s   two WATCHDOG_POLLs and a respawn, so the budget
+                            lands after the last verdict, not in the gap
+                   ------
+                     55 s
+```
+
+This bound used to be an independent 30 s, sized against the copy path's
+publish gate (`COPY_PUBLISH_GATE_SECS`) and never against startup recovery. The
+consequence was a defect, not a tuning miss: a hardware start that stalled had
+its playlist request refused at 30 s with **twelve seconds of legitimate
+recovery still to run**, hls.js escalated that to a fatal `levelLoadError`
+(it is the only level, so there is nothing to fall back to), and the viewer was
+told the stream had permanently failed while the server was still successfully
+starting it. A mid-film bitmap subtitle burn is the likeliest session to need
+exactly that fallback — a full re-encode plus a subtitle composite from a
+non-zero `-ss`, with no direct-play or remux escape.
+
+**Changing either grace moves this bound with it.** A terminal verdict is still
+answered immediately: the budget is only ever spent on a session that is
+genuinely still starting.
+
+### Every refusal names its cause
+
+`TranscodeManager::playlist` returns a `PlaylistError`, not an `Option`. Each
+cause reaches the client as its own status and a typed `{code, message}` body:
+
+| Cause | Status | `code` | What the client should do |
+|---|---|---|---|
+| No session under this id — expired, superseded, or never opened | 404 | `session_gone` | re-open, or accept that it is over |
+| Producer exited non-zero before publishing (carries ffmpeg's exit status) | 502 | `producer_failed` | terminal; report it |
+| Session failed after starting — stall verdict, or a fallback that could not spawn | 502 | `session_failed` | terminal; report it |
+| Still starting when the budget ran out | 503 | `startup_timeout` | **retry** — the stream is being built right now |
+| This ffmpeg build cannot perform the requested burn | 501 | `unsupported_build` | pick another subtitle track, or install a full ffmpeg |
+
+Why the session's verdict has to be recorded at the moment it is taken: the
+process that fails a session knows the exit status or the stall detail, and
+before this the next reader had only a `failed` boolean. Every terminal cause
+collapsed into one anonymous 404 and the web overlay could say nothing better
+than "the server couldn't build this stream — see Settings → Logs" — which is
+what an operator was told, about a failure the server had already classified
+and logged, on a headless box they were not sitting at. The first verdict wins;
+a later reader that merely notices the flag never overwrites it.
+
+The web player captures that body at the transport (`xhrSetup`, `load`
+listener) because hls.js's `ERROR` event carries only the response line —
+`{code: status, text: statusText}` — and drops the body. `PlaybackPolicy`
+`parseStreamFailure` / `streamFailureOverlay` turn it into the overlay's two
+lines, and a `startup_timeout` is shown as **"Still preparing this stream…"**
+rather than as a failure.
+
+### Burn-in is preflighted against the ffmpeg build
+
+Burning a subtitle needs `overlay` + `scale` for a bitmap composite, or the
+libass `subtitles` filter for text. A build without them does not degrade — the
+graph is rejected at spawn with `No such filter`, and that used to reach the
+viewer as an anonymous failure a minute later. Homebrew's ffmpeg 8.1.2 has no
+`subtitles` filter at all, so this is not an exotic configuration.
+
+`pipeprobe::burn_filters()` asks `ffmpeg -filters` once per process, matching
+the filter *column* (a substring search reports a filter any build merely
+mentions in another's description). A session open that requests a burn the
+build cannot run is refused at the door with 501 and the missing filter's name.
+`sub2video` is deliberately not checked: it is ffmpeg's own CLI-level
+conversion of a subtitle stream into filter-graph frames, not a row in
+`-filters`.
+
+**An unreadable listing refuses nothing.** A build that could not be asked is
+not a build that answered "no" — the burn proceeds exactly as it did before the
+preflight existed, because refusing sessions on no evidence would be a new
+outage.
 
 ## The decode-margin rescue — routing around a pipeline with no slack
 
