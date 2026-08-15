@@ -2093,13 +2093,11 @@ mod startup_tests {
         // this reads the extension exactly the way `RemoteAddress` does, so the
         // assertion tracks the mechanism the real extractor depends on.
         async fn peer(request: axum::extract::Request) -> String {
-            match request
+            request
                 .extensions()
                 .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            {
-                Some(axum::extract::ConnectInfo(address)) => address.to_string(),
-                None => String::new(),
-            }
+                .map(|axum::extract::ConnectInfo(address)| address.to_string())
+                .unwrap_or_default()
         }
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2132,17 +2130,14 @@ mod startup_tests {
             .expect("join")
             .expect("an orderly shutdown is exit 0, not an error");
 
-        let seen: SocketAddr = body
-            .parse()
-            .unwrap_or_else(|_| panic!("a served request must carry a peer, got {body:?}"));
+        // An empty body is the revert symptom exactly: a bare router serves the
+        // request perfectly well and simply has no peer to hand over.
+        let seen: SocketAddr = body.parse().expect("a served request must carry a peer");
         // The /24 reduction in `http::network` admits IPv4 only, so a peer that
         // arrives as something other than the loopback the client actually came
         // from would silently produce no identity at all.
-        assert_eq!(
-            seen.ip(),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            "the peer must be the address the client connected from"
-        );
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(seen.ip(), loopback);
     }
 
     /// The daemon installs exactly one subscriber, and losing that race is not
