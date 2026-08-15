@@ -629,9 +629,10 @@ fn make_trakt_fixture_row_cleartext(path: &std::path::Path) {
 fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     let path = populated_current_import_fixture(data_dir);
     let connection = rusqlite::Connection::open(&path).expect("open current SQLite fixture");
-    // Recreate the exact two schema differences between v14 and current.
-    // The v15 tables and v17 node-local telemetry did not exist; v16 had not
-    // added the recoverable outbox claim deadline yet.
+    // Recreate the exact v15-v19 schema differences so this is also a valid
+    // input to ordinary SQLite startup migration, not merely a current-schema
+    // database carrying an older user_version. The activation coordinator now
+    // runs that ordinary upgrade before publishing its immutable backup.
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -640,6 +641,8 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE scan_reconcile_guards;
              DROP TABLE library_roots;
              DROP TABLE playback_events;
+             DROP TABLE network_priors;
+             ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
              CREATE TABLE watched_outbox (
@@ -1071,6 +1074,11 @@ fn run_injected_activation(launch: &ActivationNodeLaunch, failpoint: &str) {
 
 #[cfg(feature = "hiqlite-store")]
 async fn assert_one_voter_activation(data_dir: &std::path::Path, source_version: i64) {
+    // The raw importer fixture is pre-sealed to test that boundary in
+    // isolation. A real legacy activation starts before credential encryption,
+    // so put this source back in that shape and require the coordinator to run
+    // the ordinary one-time sealing upgrade before it publishes the backup.
+    make_trakt_fixture_row_cleartext(&data_dir.join("plurx.db"));
     let config = one_voter_config(data_dir);
     let launch = ActivationNodeLaunch {
         data_dir: data_dir.to_owned(),
@@ -1157,11 +1165,107 @@ async fn populated_v14_and_current_sources_activate_once_and_reopen_replicated()
 
     let v14 = tempfile::tempdir().expect("v14 activation fixture");
     populated_v14_import_fixture(v14.path());
-    assert_one_voter_activation(v14.path(), 14).await;
+    assert_one_voter_activation(v14.path(), plurx_core::store::SQLITE_SCHEMA_VERSION).await;
 
     let current = tempfile::tempdir().expect("current activation fixture");
     populated_current_import_fixture(current.path());
     assert_one_voter_activation(current.path(), plurx_core::store::SQLITE_SCHEMA_VERSION).await;
+}
+
+/// A direct pre-encryption upgrade seals Trakt before publishing its backup.
+///
+/// The importer correctly refuses cleartext, but that refusal would turn every
+/// linked legacy install into a dead end unless the activation coordinator ran
+/// the ordinary SQLite credential upgrade first. This covers both halves: a
+/// key-resolution refusal leaves no incoming target, then the same directory
+/// activates and its replicated envelope still opens under the node-local key.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_upgrade_seals_legacy_trakt_before_any_import_state_exists() {
+    let _case = HIQLITE_CASE.lock().await;
+    install_contract_crypto_provider();
+
+    let fixture = tempfile::tempdir().expect("legacy Trakt activation fixture");
+    let source_path = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source_path);
+    let config = one_voter_config(fixture.path());
+
+    // A directory at the configured key path is an explicit key-resolution
+    // failure. It occurs before the coordinator writes its attempt marker or
+    // creates the incoming target, so the legacy source remains recoverable.
+    let key_path = config.cluster.credential_key_path(&config.storage.data_dir);
+    std::fs::create_dir(&key_path).expect("block credential-key loading");
+    let refusal = select_daemon_store(&config)
+        .await
+        .err()
+        .expect("an unusable credential-key path must refuse activation")
+        .to_string();
+    assert!(refusal.contains("credential key"), "{refusal}");
+    assert!(
+        !refusal.contains(FIXTURE_TRAKT_ACCESS) && !refusal.contains(FIXTURE_TRAKT_REFRESH),
+        "the refusal must not quote either bearer credential: {refusal}"
+    );
+    assert!(
+        !fixture.path().join("hiqlite.incoming").exists(),
+        "a pre-import refusal must leave no partial incoming target"
+    );
+    assert!(
+        !fixture.path().join(HIQLITE_ACTIVE_DIRNAME).exists(),
+        "a pre-import refusal must not publish an active target"
+    );
+    std::fs::remove_dir(&key_path).expect("unblock credential-key loading");
+
+    let selected = select_daemon_store(&config)
+        .await
+        .expect("direct legacy upgrade must activate after key recovery");
+    assert_eq!(selected.backend, SelectedBackend::Replicated);
+    let imported = selected
+        .store
+        .get_trakt_auth(FIXTURE_TRAKT_USER)
+        .await
+        .expect("read imported Trakt row")
+        .expect("linked Trakt row survives activation");
+    assert!(
+        imported.access_token.is_wrapped() && imported.refresh_token.is_wrapped(),
+        "replicated durable state must contain envelopes"
+    );
+    assert_eq!(
+        selected
+            .credential_key
+            .open_trakt(FIXTURE_TRAKT_USER, &imported.access_token)
+            .expect("open imported access token")
+            .expose(),
+        FIXTURE_TRAKT_ACCESS
+    );
+    assert_eq!(
+        selected
+            .credential_key
+            .open_trakt(FIXTURE_TRAKT_USER, &imported.refresh_token)
+            .expect("open imported refresh token")
+            .expose(),
+        FIXTURE_TRAKT_REFRESH
+    );
+
+    let (source_access, source_refresh): (String, String) =
+        rusqlite::Connection::open(&source_path)
+            .expect("reopen sealed rollback source")
+            .query_row(
+                "SELECT access_token, refresh_token FROM trakt_auth WHERE user_id = ?1",
+                [FIXTURE_TRAKT_USER],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read sealed rollback row");
+    for (label, stored, expected) in [
+        ("access", source_access, FIXTURE_TRAKT_ACCESS),
+        ("refresh", source_refresh, FIXTURE_TRAKT_REFRESH),
+    ] {
+        assert_ne!(stored, expected, "{label} token remained cleartext");
+        assert!(
+            stored.starts_with("plxenc:v1:"),
+            "{label} token is not a v1 envelope"
+        );
+    }
+    selected.shutdown().await.expect("stop activated voter");
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -1172,7 +1276,8 @@ async fn killed_activation_boundaries_recover_sqlite_or_completed_target() {
 
     for failpoint in ["after-quiescence", "after-incoming", "after-marker"] {
         let fixture = tempfile::tempdir().expect("interrupted activation fixture");
-        populated_current_import_fixture(fixture.path());
+        let source = populated_current_import_fixture(fixture.path());
+        make_trakt_fixture_row_cleartext(&source);
         let config = one_voter_config(fixture.path());
         let launch = ActivationNodeLaunch {
             data_dir: fixture.path().to_owned(),
@@ -1202,7 +1307,8 @@ async fn killed_activation_boundaries_recover_sqlite_or_completed_target() {
     }
 
     let fixture = tempfile::tempdir().expect("post-rename activation fixture");
-    populated_current_import_fixture(fixture.path());
+    let source = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source);
     let config = one_voter_config(fixture.path());
     let launch = ActivationNodeLaunch {
         data_dir: fixture.path().to_owned(),
@@ -1328,7 +1434,8 @@ async fn a_lost_replicated_target_refuses_to_reimport_the_retained_source() {
     install_contract_crypto_provider();
 
     let fixture = tempfile::tempdir().expect("activated source fixture");
-    populated_current_import_fixture(fixture.path());
+    let source = populated_current_import_fixture(fixture.path());
+    make_trakt_fixture_row_cleartext(&source);
     let config = one_voter_config(fixture.path());
     let launch = ActivationNodeLaunch {
         data_dir: fixture.path().to_owned(),

@@ -36,7 +36,7 @@ use crate::secrets::{self, CredentialKey, SealedRowCensus};
 #[cfg(feature = "hiqlite-store")]
 use crate::store::{
     HiqliteAuthStore, SettingsStore, SqliteImportReport, SqliteImportTableDigest, SqliteStore,
-    Store, AUTH_SCHEMA_VERSION,
+    Store, TraktStore, AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
@@ -282,15 +282,7 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
     let credential_key = legacy.credential_key;
     drop(legacy.store);
 
-    match activate_fresh_store(
-        config,
-        failpoint,
-        daemon_lock,
-        identity,
-        credential_key,
-    )
-    .await
-    {
+    match activate_fresh_store(config, failpoint, daemon_lock, identity, credential_key).await {
         Ok(store) => Ok(store),
         Err(error) => Err(activation_failure(&config.storage.data_dir, error)),
     }
@@ -561,9 +553,7 @@ async fn open_active_credential_key(
     for auth in store.list_trakt_auth().await? {
         census.observe_row(&auth.access_token, &auth.refresh_token);
     }
-    let path = config
-        .cluster
-        .credential_key_path(&config.storage.data_dir);
+    let path = config.cluster.credential_key_path(&config.storage.data_dir);
     let key = secrets::open_credential_key(&path, &census)
         .map_err(|error| StoreError::Identity(error.to_string()))?;
     tracing::debug!(

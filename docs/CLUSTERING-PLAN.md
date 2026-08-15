@@ -767,12 +767,12 @@ mode without lowering quality or losing selected tracks.
 
 M0 through M2 provide the complete one-voter path: exact import parity, a
 durable activation marker, atomic target selection, failure-injected SQLite
-recovery, and replicated daemon startup. The post-coalescer compacted-growth
-record is closed; credential encryption is M2's remaining production-selection
-merge gate. Node removal is not a one-voter activation gate: it belongs to M3,
-where a survivor exists and offline work can otherwise be stranded or re-homed
-incorrectly. The next implementation boundary is membership, health, and
-singleton fencing in §6.7.
+recovery, replicated daemon startup, and credential sealing before the immutable
+source backup is published. The post-coalescer compacted-growth and credential
+encryption gates are closed. Node removal is not a one-voter activation gate: it
+belongs to M3, where a survivor exists and offline work can otherwise be stranded
+or re-homed incorrectly. The next implementation boundary is membership, health,
+and singleton fencing in §6.7.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
