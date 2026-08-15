@@ -78,7 +78,16 @@ import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
 import tv.plurx.app.ui.components.safeDisplayInsets
 import tv.plurx.app.ui.components.detailMediaFacts
+import tv.plurx.app.ui.components.audioPreferredLanguageLine
+import tv.plurx.app.ui.components.audioStreamLabel
+import tv.plurx.app.ui.components.subtitlePreferredLanguageLine
+import tv.plurx.app.ui.components.subtitleStreamLabel
 import tv.plurx.app.ui.components.tvFocusRing
+import tv.plurx.app.player.PreplaySubtitleCost
+import tv.plurx.app.player.PreplayTracks
+import tv.plurx.app.player.SubtitleChoice
+import tv.plurx.app.player.preplaySubtitleCost
+import tv.plurx.app.player.preplaySubtitleNotice
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Bg
 import tv.plurx.app.ui.theme.Muted
@@ -96,7 +105,7 @@ private data class DetailLoad(
 fun DetailScreen(
     vm: AppViewModel,
     itemId: Long,
-    onPlay: (itemId: Long, fileId: Long, startMs: Long) -> Unit,
+    onPlay: (itemId: Long, fileId: Long, startMs: Long, tracks: PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
     onBack: () -> Unit,
@@ -154,7 +163,7 @@ private fun DetailContent(
     vm: AppViewModel,
     detail: ItemDetail,
     seriesPlayback: EpisodePlaybackTarget?,
-    onPlay: (Long, Long, Long) -> Unit,
+    onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
     onWatchedChanged: () -> Unit,
@@ -165,6 +174,11 @@ private fun DetailContent(
     val item = detail.item
     val scope = rememberCoroutineScope()
     var startingEpisodeId by remember(item.id) { mutableStateOf<Long?>(null) }
+    // The viewer's pre-play track choice, per file, for this item only. Keyed
+    // on the item so opening the next one starts from the server's defaults
+    // again — the choice belongs to one playback and is never written back as
+    // a Playback setting.
+    var trackChoices by remember(item.id) { mutableStateOf(emptyMap<Long, PreplayTracks>()) }
     val resumeMs = item.watch?.position_ms ?: 0L
     val resumeFile = playbackFile(item, detail.files, resumeMs)
     val durationMs = if (item.isAudiobook) item.runtime_ms ?: resumeFile?.duration_ms else resumeFile?.duration_ms ?: item.runtime_ms
@@ -240,6 +254,7 @@ private fun DetailContent(
                         seriesPlayback = seriesPlayback,
                         resumeMs = resumeMs,
                         canResume = canResume,
+                        trackChoices = trackChoices,
                         requestInitialFocus = formFactor == FormFactor.Television,
                         onPlay = onPlay,
                         onViewPhoto = onViewPhoto,
@@ -277,7 +292,9 @@ private fun DetailContent(
                         style = MaterialTheme.typography.titleMedium,
                     )
                     detail.files.forEachIndexed { index, file ->
+                        val chosen = trackChoices[file.id] ?: PreplayTracks.NONE
                         VersionCard(
+                            vm = vm,
                             file = file,
                             showPlay = !item.isBook && detail.files.size > 1 && file.available,
                             playStartMs = if (item.isAudiobook && canResume && best?.id == file.id) {
@@ -290,10 +307,18 @@ private fun DetailContent(
                                     item.id,
                                     file.id,
                                     if (item.isAudiobook) startMs else if (canResume) resumeMs else 0L,
+                                    chosen,
                                 )
                             },
                             label = if (detail.files.size > 1) (if (item.isAudiobook) "Part ${index + 1}" else "Version ${index + 1}") else null,
                             showChapters = item.isAudiobook,
+                            // A video's tracks are a choice; an audiobook part
+                            // or a book has nothing here worth a picker.
+                            showTracks = item.isPlayableVideo,
+                            tracks = chosen,
+                            onTracks = { picked ->
+                                trackChoices = trackChoices + (file.id to picked)
+                            },
                         )
                     }
                 }
@@ -318,7 +343,8 @@ private fun DetailContent(
                                 startingEpisodeId = null
                                 if (result != null) {
                                     val target = result.playback
-                                    onPlay(target.itemId, target.fileId, target.startMs)
+                                    // A different item: its own defaults apply.
+                                    onPlay(target.itemId, target.fileId, target.startMs, PreplayTracks.NONE)
                                 } else {
                                     onOpenItem(child.id)
                                 }
@@ -467,8 +493,9 @@ private fun Actions(
     seriesPlayback: EpisodePlaybackTarget?,
     resumeMs: Long,
     canResume: Boolean,
+    trackChoices: Map<Long, PreplayTracks>,
     requestInitialFocus: Boolean,
-    onPlay: (Long, Long, Long) -> Unit,
+    onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onViewPhoto: (Long) -> Unit,
     onWatchedChanged: () -> Unit,
 ) {
@@ -487,6 +514,9 @@ private fun Actions(
     } else {
         resumeMs
     }
+    // Play means "play the file the track picker below is describing", so the
+    // two have to read the same choice.
+    val chosenTracks = playable?.let { trackChoices[it.id] } ?: PreplayTracks.NONE
     val offline = playable?.let { file -> offlineRecords.firstOrNull {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
             it.fileId == file.id
@@ -521,7 +551,10 @@ private fun Actions(
                 DetailPrimaryActionButton(
                     onClick = {
                         val target = seriesPlayback.playback
-                        onPlay(target.itemId, target.fileId, target.startMs)
+                        // A show/season page plays an episode that is a
+                        // different item, with its own detail screen and its
+                        // own defaults.
+                        onPlay(target.itemId, target.fileId, target.startMs, PreplayTracks.NONE)
                     },
                     requestInitialFocus = requestInitialFocus,
                 ) {
@@ -532,7 +565,9 @@ private fun Actions(
         } else if (playable != null && item.isPlayable) {
             item {
                 DetailPrimaryActionButton(
-                    onClick = { onPlay(item.id, playable.id, if (canResume) localResume else 0L) },
+                    onClick = {
+                        onPlay(item.id, playable.id, if (canResume) localResume else 0L, chosenTracks)
+                    },
                     requestInitialFocus = requestInitialFocus,
                 ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
@@ -541,7 +576,10 @@ private fun Actions(
             }
             if (canResume) {
                 item {
-                    TvOutlinedButton(onClick = { onPlay(item.id, startOverFile?.id ?: playable.id, 0L) }) {
+                    TvOutlinedButton(onClick = {
+                        val file = startOverFile?.id ?: playable.id
+                        onPlay(item.id, file, 0L, trackChoices[file] ?: PreplayTracks.NONE)
+                    }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  Start over")
                     }
@@ -658,12 +696,16 @@ internal fun DetailPrimaryActionButton(
 
 @Composable
 private fun VersionCard(
+    vm: AppViewModel,
     file: MediaFileDto,
     showPlay: Boolean,
     playStartMs: Long,
     onPlay: (Long) -> Unit,
     label: String?,
     showChapters: Boolean,
+    showTracks: Boolean,
+    tracks: PreplayTracks,
+    onTracks: (PreplayTracks) -> Unit,
 ) {
     Column(
         Modifier.fillMaxWidth().background(SurfaceHi, MaterialTheme.shapes.medium)
@@ -691,6 +733,18 @@ private fun VersionCard(
         } else if (!file.probed) {
             Text("Media details have not been read yet; re-analyze it from the web admin.", color = MaterialTheme.colorScheme.error)
         }
+        // Only a probed file has tracks to describe. An unprobed one would
+        // otherwise report "No subtitles in this file" for a file nobody has
+        // read yet, which is a claim the server never made.
+        if (showTracks && file.probed) {
+            TrackFactsCard(
+                vm = vm,
+                file = file,
+                enabled = file.available,
+                tracks = tracks,
+                onTracks = onTracks,
+            )
+        }
         if (showChapters && file.chapters.isNotEmpty()) {
             Text("Chapters", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
             file.chapters.forEach { chapter ->
@@ -704,6 +758,171 @@ private fun VersionCard(
                 }
             }
         }
+    }
+}
+
+/**
+ * Every audio and subtitle track this file carries, the server's own default
+ * markers and language verdicts, and a pre-play choice of both.
+ *
+ * Nothing here re-derives policy. The default markers are
+ * `playback_defaults.*.selected_index`, the sentences under each list are the
+ * five `preferred_language_status` states, and the cost of a burn-in comes from
+ * a selection-aware `/decision` rather than from a codec table — see
+ * docs/CLIENTS.md §"Shared track facts — clients render the server's answer".
+ */
+@Composable
+private fun TrackFactsCard(
+    vm: AppViewModel,
+    file: MediaFileDto,
+    enabled: Boolean,
+    tracks: PreplayTracks,
+    onTracks: (PreplayTracks) -> Unit,
+) {
+    // Pricing a subtitle is the server's answer too. Ask `/decision` with the
+    // pending selection and read `selection`; a newer choice supersedes the
+    // request in flight, and no choice asks nothing at all.
+    val cost by produceState<PreplaySubtitleCost?>(null, file.id, tracks) {
+        val chosen = tracks.subtitle?.index
+        value = if (chosen == null) {
+            null
+        } else {
+            try {
+                preplaySubtitleCost(vm.decision(file.id, tracks), chosen)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // A preflight that could not be made claims nothing. The
+                // in-player path still discloses the burn when playback starts.
+                null
+            }
+        }
+    }
+    TrackFactsSection(
+        file = file,
+        enabled = enabled,
+        tracks = tracks,
+        subtitleNotice = preplaySubtitleNotice(cost),
+        onTracks = onTracks,
+    )
+}
+
+@Composable
+internal fun TrackFactsSection(
+    file: MediaFileDto,
+    enabled: Boolean,
+    tracks: PreplayTracks,
+    subtitleNotice: String?,
+    onTracks: (PreplayTracks) -> Unit,
+) {
+    val defaults = file.playback_defaults
+    // What would play if Play were pressed now: the viewer's choice where they
+    // made one, the server's answer everywhere else.
+    val chosenAudio = tracks.audio ?: defaults?.audio?.selected_index
+    val chosenSubtitle = if (tracks.subtitle != null) {
+        tracks.subtitle.index
+    } else {
+        defaults?.subtitle?.selected_index
+    }
+    val audioLine = audioPreferredLanguageLine(defaults?.audio, file.audio_streams)
+    val subtitleLine = subtitlePreferredLanguageLine(defaults?.subtitle, file.subtitle_streams)
+
+    Column(
+        Modifier.fillMaxWidth().padding(top = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text("Audio", style = MaterialTheme.typography.labelLarge)
+        file.audio_streams.forEach { stream ->
+            val index = stream.index
+            TrackChoiceRow(
+                label = audioStreamLabel(stream),
+                selected = index != null && index == chosenAudio,
+                isServerDefault = index != null && index == defaults?.audio?.selected_index,
+                enabled = enabled && index != null,
+                onClick = { if (index != null) onTracks(tracks.copy(audio = index)) },
+            )
+        }
+        if (file.audio_streams.isEmpty() && audioLine == null) {
+            Text("No audio tracks in this file.", color = Muted, style = MaterialTheme.typography.bodyMedium)
+        }
+        audioLine?.let {
+            Text(it, color = Muted, style = MaterialTheme.typography.bodySmall)
+        }
+
+        Text(
+            "Subtitles",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(top = 10.dp),
+        )
+        if (file.subtitle_streams.isEmpty()) {
+            // The server's `no_tracks` line says this too; this is the fallback
+            // for a server older than the contract, so a file with no subtitles
+            // never renders as an empty gap.
+            if (subtitleLine == null) {
+                Text("No subtitles in this file.", color = Muted, style = MaterialTheme.typography.bodyMedium)
+            }
+        } else {
+            TrackChoiceRow(
+                label = "Off",
+                selected = chosenSubtitle == null,
+                isServerDefault = defaults != null && defaults.subtitle.selected_index == null,
+                enabled = enabled,
+                onClick = { onTracks(tracks.copy(subtitle = SubtitleChoice(null))) },
+            )
+            file.subtitle_streams.forEach { stream ->
+                val index = stream.index
+                TrackChoiceRow(
+                    label = subtitleStreamLabel(stream),
+                    selected = index != null && index == chosenSubtitle,
+                    isServerDefault = index != null && index == defaults?.subtitle?.selected_index,
+                    enabled = enabled && index != null,
+                    onClick = {
+                        if (index != null) onTracks(tracks.copy(subtitle = SubtitleChoice(index)))
+                    },
+                )
+            }
+        }
+        subtitleLine?.let {
+            Text(it, color = Muted, style = MaterialTheme.typography.bodySmall)
+        }
+        subtitleNotice?.let {
+            Text(it, color = Accent, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun TrackChoiceRow(
+    label: String,
+    selected: Boolean,
+    isServerDefault: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.01f)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            if (selected) "●" else "○",
+            color = if (selected) Accent else Muted,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            label,
+            modifier = Modifier.weight(1f),
+            color = if (enabled) Color(0xFFECECEF) else Muted,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (isServerDefault) SpecChip("Default")
     }
 }
 
