@@ -1264,27 +1264,37 @@ fn gdm_bind_port(value: Option<&str>) -> anyhow::Result<u16> {
         .with_context(|| format!("invalid PLURX_GDM_PORT {value:?}"))
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("installing Ctrl-C handler");
-    };
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    // Install the terminate stream before returning the future. `axum::serve`
+    // binds before it first polls its graceful-shutdown future, so creating the
+    // stream inside that future leaves a small interval where the HTTP port is
+    // reachable but SIGTERM still has its process-killing default action. That
+    // race showed up as a healthy daemon exiting with signal 15 in the
+    // process-level restart contract.
     #[cfg(unix)]
-    let terminate = async {
+    let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+            .expect("installing SIGTERM handler");
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("installing Ctrl-C handler");
+        };
+        #[cfg(unix)]
+        let terminate = async move {
+            terminate.recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+        tracing::info!("shutdown signal received, draining");
     }
-    tracing::info!("shutdown signal received, draining");
 }
 
 /// Minimal HTTP/1.0 probe over std TcpStream — deliberately dependency-free.
