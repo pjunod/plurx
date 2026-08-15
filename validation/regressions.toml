@@ -309,3 +309,9 @@ commits = ["415db12"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained watchdog and production-fallback regressions pin that a routine kill ends without a false stall while a deliberately killed predecessor cannot poison its replacement; reverting only the production correction restores the false teardown verdict."
+
+[[coverage]]
+commits = ["70084d1"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained unrelated-session regression pins that playlist producer inspection releases the global session map before waiting on a child lock; reverting only the production correction makes an unrelated status request time out behind that lock."
