@@ -33,6 +33,19 @@ use crate::meter::Meter;
 
 /// Idle timeout after which a session's ffmpeg is killed and its dir removed.
 const SESSION_IDLE_SECS: u64 = 60;
+/// Stable classification for a start that lost a bounded admission wait.
+/// The HTTP layer maps only this class to 503; source, filesystem, and ffmpeg
+/// failures remain server errors rather than being mislabeled as contention.
+const RETRYABLE_CAPACITY_PREFIX: &str = "transcode capacity is temporarily unavailable: ";
+const ADMISSION_POLL: Duration = Duration::from_millis(250);
+
+fn capacity_error(message: impl AsRef<str>) -> String {
+    format!("{RETRYABLE_CAPACITY_PREFIX}{}", message.as_ref())
+}
+
+pub(crate) fn is_retryable_capacity_error(error: &str) -> bool {
+    error.starts_with(RETRYABLE_CAPACITY_PREFIX)
+}
 /// What "Auto" resolves to — see [`TranscodeManager::auto_height`].
 const AUTO_SOFTWARE_HEIGHT: i64 = 720;
 const AUTO_HARDWARE_MAX_HEIGHT: i64 = 1080;
@@ -2234,6 +2247,14 @@ enum PartEnd {
     Failed(String),
 }
 
+/// The owner-aware permits a foreground encoder keeps for its whole lifetime.
+/// Constructed only after every background permit has been released.
+struct LiveAdmission {
+    encoder: Encoder,
+    hw_slot: Option<HwSlot>,
+    sw_permit: Option<crate::admission::SwPermit>,
+}
+
 /// Which tracks a session carries. Part of its recipe, which is why it is a
 /// named thing rather than two loose values.
 #[derive(Debug, Clone, Default)]
@@ -4394,6 +4415,116 @@ impl TranscodeManager {
         .await
     }
 
+    /// Acquire the foreground encoder's durable permit after every background
+    /// encoder has actually yielded.
+    ///
+    /// The waiter remains registered until the returned hardware/software
+    /// permit exists, so there is no handoff gap in which a producer can take
+    /// capacity back. The permit then carries live ownership for the session's
+    /// whole lifetime, keeping every background pool parked after this method
+    /// drops the short-lived waiter.
+    async fn admit_live(
+        &self,
+        preferred: Encoder,
+        work: Workload<'_>,
+        max_wait: Duration,
+    ) -> Result<LiveAdmission, String> {
+        let _queued = self.admissions.wait_for_slot();
+        let deadline = Instant::now() + max_wait;
+        let sw_budget = self.software_budget().await;
+
+        if preferred != Encoder::Software {
+            let max = self.max_hw_sessions().await;
+            loop {
+                let decision = self.admissions.admit(max, work);
+                if let Admission::Hardware(slot) = decision {
+                    return Ok(LiveAdmission {
+                        encoder: preferred,
+                        hw_slot: Some(slot),
+                        sw_permit: None,
+                    });
+                }
+
+                let now = Instant::now();
+                if now < deadline {
+                    tokio::time::sleep(ADMISSION_POLL.min(deadline - now)).await;
+                    continue;
+                }
+
+                return match decision {
+                    Admission::WaitingForBackground => Err(capacity_error(format!(
+                        "background encoding did not yield within {:.1}s; try again in a moment",
+                        max_wait.as_secs_f64()
+                    ))),
+                    Admission::Software => match self.admissions.try_admit_software(
+                        sw_budget,
+                        work.software_threads(),
+                        Priority::Live,
+                    ) {
+                        Some(permit) => {
+                            tracing::info!(
+                                class = %work.software_class(),
+                                threads = permit.threads(),
+                                "hardware transcode slots full; this class runs comfortably in software here, so starting it there"
+                            );
+                            Ok(LiveAdmission {
+                                encoder: Encoder::Software,
+                                hw_slot: None,
+                                sw_permit: Some(permit),
+                            })
+                        }
+                        None => {
+                            let why = format!(
+                                "all {max} hardware transcode slots are in use and the software CPU pool is spent ({} of {sw_budget} threads reserved); try again in a moment",
+                                self.admissions.software_in_use()
+                            );
+                            tracing::warn!(class = %work.software_class(), "{why}");
+                            Err(capacity_error(why))
+                        }
+                    },
+                    Admission::Refused(why) => {
+                        tracing::warn!(class = %work.software_class(), "{why}");
+                        Err(capacity_error(why))
+                    }
+                    Admission::Hardware(_) => unreachable!("hardware returned above"),
+                };
+            }
+        }
+
+        loop {
+            if let Some(permit) = self.admissions.try_admit_software(
+                sw_budget,
+                work.software_threads(),
+                Priority::Live,
+            ) {
+                return Ok(LiveAdmission {
+                    encoder: Encoder::Software,
+                    hw_slot: None,
+                    sw_permit: Some(permit),
+                });
+            }
+            let now = Instant::now();
+            if now < deadline {
+                tokio::time::sleep(ADMISSION_POLL.min(deadline - now)).await;
+                continue;
+            }
+            let why = if self.admissions.background_is_active() {
+                format!(
+                    "background encoding did not yield within {:.1}s; try again in a moment",
+                    max_wait.as_secs_f64()
+                )
+            } else {
+                format!(
+                    "the software CPU pool is spent ({} of {sw_budget} threads reserved) and no slot freed within {:.1}s; try again in a moment",
+                    self.admissions.software_in_use(),
+                    max_wait.as_secs_f64()
+                )
+            };
+            tracing::warn!(class = %work.software_class(), "{why}");
+            return Err(capacity_error(why));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // one stream's worth of knobs
     async fn start_with_audio_offset(
         &self,
@@ -4476,100 +4607,10 @@ impl TranscodeManager {
         // (a superseded session, a closed tab), and someone who has pressed
         // play will forgive five seconds far sooner than a hang.
         let work = Workload::of(&file, target_height);
-        let mut hw_slot = None;
-        let mut sw_permit = None;
-        let sw_budget = self.software_budget().await;
-        if encoder != Encoder::Software {
-            let max = self.max_hw_sessions().await;
-            // Announced for the whole wait, including the first attempt. A
-            // producer holding the slot this start wants sees the announcement,
-            // checkpoints and terminates; and while the announcement stands it
-            // cannot take the slot back. The guard is dropped by every exit
-            // from this block, so a start that fails or gives up does not park
-            // background work for the life of the process.
-            let _queued = self.admissions.wait_for_slot();
-            let deadline = Instant::now() + QUEUE_WAIT;
-            loop {
-                match self.admissions.admit(max, work) {
-                    Admission::Hardware(slot) => {
-                        hw_slot = Some(slot);
-                        break;
-                    }
-                    _ if Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                    // Out of patience. Software only when this box has measured
-                    // this *class of work* running comfortably above realtime —
-                    // never because the output is small, which is the reasoning
-                    // that admits a 4K HDR source at 480p and then stalls: the
-                    // decode and the tone-map happen at source resolution
-                    // whatever size you ask the output to be. And only with a
-                    // permit from the CPU pool: measured-fast is a claim about
-                    // one session on an otherwise-idle box, not about joining
-                    // three others already spending every core (§2.4).
-                    Admission::Software => {
-                        match self.admissions.try_admit_software(
-                            sw_budget,
-                            work.software_threads(),
-                            Priority::Live,
-                        ) {
-                            Some(permit) => {
-                                tracing::info!(
-                                    file = file_id, class = %work.software_class(),
-                                    threads = permit.threads(),
-                                    "hardware transcode slots full; this class runs comfortably                                      in software here, so starting it there"
-                                );
-                                encoder = Encoder::Software;
-                                sw_permit = Some(permit);
-                                break;
-                            }
-                            None => {
-                                let why = format!(
-                                    "all {max} hardware transcode slots are in use and the                                      software CPU pool is spent ({} of {sw_budget} threads                                      reserved). Try again in a moment.",
-                                    self.admissions.software_in_use()
-                                );
-                                tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
-                                return Err(why);
-                            }
-                        }
-                    }
-                    Admission::Refused(why) => {
-                        tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
-                        return Err(why);
-                    }
-                }
-            }
-        } else {
-            // Software from the start — a box with no hardware encoder. This
-            // path used to bypass admission entirely: every x264 process
-            // chose its own thread count, and nothing stopped a fourth
-            // session from joining three that already had every core spoken
-            // for (§2.4). The wait is announced exactly like a hardware
-            // queue, so the producer checkpoints out of the way of a viewer
-            // here too.
-            let _queued = self.admissions.wait_for_slot();
-            let deadline = Instant::now() + QUEUE_WAIT;
-            loop {
-                if let Some(permit) = self.admissions.try_admit_software(
-                    sw_budget,
-                    work.software_threads(),
-                    Priority::Live,
-                ) {
-                    sw_permit = Some(permit);
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    let why = format!(
-                        "the software CPU pool is spent ({} of {sw_budget} threads reserved)                          and no slot freed within {}s. Try again in a moment.",
-                        self.admissions.software_in_use(),
-                        QUEUE_WAIT.as_secs()
-                    );
-                    tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
-                    return Err(why);
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
+        let admission = self.admit_live(encoder, work, QUEUE_WAIT).await?;
+        encoder = admission.encoder;
+        let hw_slot = admission.hw_slot;
+        let sw_permit = admission.sw_permit;
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let dir = self.work_dir.join(&session_id);
@@ -8821,6 +8862,169 @@ mod tests {
             .expect("file")
     }
 
+    /// A background process that ignores the yield signal cannot turn a Play
+    /// request into an unbounded spinner. The production path uses five
+    /// seconds; this focused test supplies a small window to prove the same
+    /// deadline and error classification without sleeping for the full one.
+    #[tokio::test]
+    async fn live_admission_fails_retryably_when_background_does_not_release() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work_dir = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            store,
+            work_dir.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        );
+        let producer = mgr
+            .admissions
+            .try_acquire(2, Priority::Background)
+            .expect("background permit");
+        let wait = Duration::from_millis(25);
+        let began = Instant::now();
+        let error = match mgr
+            .admit_live(
+                Encoder::Nvenc,
+                Workload {
+                    source_height: 1080,
+                    codec: "h264",
+                    hdr: None,
+                    target_height: 720,
+                },
+                wait,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("live admission overlapped a stuck background permit"),
+        };
+        let elapsed = began.elapsed();
+        assert!(elapsed >= wait, "returned before the configured window");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "polling overshot the bounded window: {elapsed:?}"
+        );
+        assert!(is_retryable_capacity_error(&error), "{error}");
+        assert!(
+            error.contains("background encoding did not yield"),
+            "{error}"
+        );
+        assert!(
+            !mgr.admissions.live_is_waiting(),
+            "the failed request leaked its waiter"
+        );
+        drop(producer);
+        assert_eq!(mgr.admissions.in_use(), 0, "the background guard returned");
+    }
+
+    /// Cancelling the HTTP request while it is waiting must withdraw the
+    /// yield signal. Otherwise one abandoned Play request parks every future
+    /// producer even though no live encoder owns capacity.
+    #[tokio::test]
+    async fn aborting_a_waiting_live_admission_releases_its_yield_signal() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work_dir = tempfile::tempdir().expect("work");
+        let mgr = Arc::new(TranscodeManager::new(
+            store,
+            work_dir.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        ));
+        let producer = mgr
+            .admissions
+            .try_acquire(2, Priority::Background)
+            .expect("background permit");
+        let waiting = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.admit_live(
+                    Encoder::Nvenc,
+                    Workload {
+                        source_height: 1080,
+                        codec: "h264",
+                        hdr: None,
+                        target_height: 720,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !mgr.admissions.live_is_waiting() && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mgr.admissions.live_is_waiting(),
+            "the request never registered its yield signal"
+        );
+        waiting.abort();
+        let cancelled = waiting.await;
+        assert!(
+            matches!(cancelled, Err(error) if error.is_cancelled()),
+            "the admission task was not cancelled"
+        );
+        assert!(
+            !mgr.admissions.live_is_waiting(),
+            "the cancelled request leaked its yield signal"
+        );
+        assert_eq!(mgr.admissions.in_use(), 1, "only the producer remains");
+        assert_eq!(mgr.admissions.software_in_use(), 0);
+        drop(producer);
+        assert_eq!(mgr.admissions.in_use(), 0, "all permits returned");
+    }
+
+    /// A start owns its permit before it creates scratch or spawns ffmpeg, so
+    /// every error in that interval must return admission automatically. A
+    /// file where the work directory belongs makes the first post-admission
+    /// filesystem operation fail deterministically.
+    #[tokio::test]
+    async fn a_post_admission_start_failure_returns_every_permit() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let root = tempfile::tempdir().expect("root");
+        let not_a_directory = root.path().join("not-a-directory");
+        tokio::fs::write(&not_a_directory, b"occupied")
+            .await
+            .expect("sentinel file");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            not_a_directory,
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+
+        let error = match mgr
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-failed-start")
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the invalid work root must fail after admission"),
+        };
+        assert!(error.contains("creating session dir"), "{error}");
+        assert_eq!(mgr.active_sessions().await, 0);
+        assert!(!mgr.admissions.live_is_waiting());
+        assert_eq!(mgr.admissions.in_use(), 0);
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            0,
+            "the failed start leaked its software permit"
+        );
+    }
+
     /// The cap has to hold against *concurrent* starts, which is the only case
     /// that matters: a third 4K session admitted alongside two others does not
     /// run a third as fast, it drags all three under realtime. A count read and
@@ -8943,6 +9147,11 @@ mod tests {
             Workload::of(&file, session.target_height).software_class(),
             "speeds measured from here on are software evidence"
         );
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            work_class.software_threads(),
+            "the fallback owns its software weight"
+        );
         // The whole point, stated as the viewer experiences it: with the cap
         // at one and the demoted session still alive, the next hardware start
         // is admitted immediately instead of queuing for this session's life.
@@ -8954,6 +9163,12 @@ mod tests {
             other => panic!("the freed slot must be grantable now, got {other:?}"),
         }
         assert!(mgr.stop_session(&info.session_id, "test").await);
+        assert_eq!(mgr.admissions.in_use(), 0);
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            0,
+            "fallback teardown returned its replacement permit"
+        );
     }
 
     // ---- the software CPU pool, wired through start() (review §2.4) ---------
@@ -10404,6 +10619,90 @@ mod tests {
         );
     }
 
+    /// Exercise the production handoff rather than holding a waiter manually:
+    /// a real foreground `start` must make a running software producer
+    /// terminate before it spawns, keep that producer from making another
+    /// part while the session owns its permit, then let it resume afterwards.
+    #[tokio::test]
+    async fn a_real_live_start_preempts_and_parks_a_software_producer() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+
+        if !crate::ffmpeg::pacing_caps().await.readrate {
+            eprintln!(
+                "SKIP: a_real_live_start_preempts_and_parks_a_software_producer: \
+                 `{}` has no -readrate (needs ffmpeg 5.1+)",
+                crate::ffmpeg::ffmpeg_bin()
+            );
+            return;
+        }
+
+        const SECONDS: u32 = 8;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        store
+            .put_setting(keys::SW_POOL_THREADS, "8")
+            .await
+            .expect("software budget");
+        let media = tempfile::tempdir().expect("media");
+        let source = media.path().join("Handoff.mkv");
+        write_real_video(&source, SECONDS);
+        let file_id = seed_real_file(&store, &source).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let (mgr, _work, cache) = cached_manager(&store);
+        let mgr = Arc::new(mgr.with_producer_tuning(ProducerTuning {
+            pacing: Pacing {
+                readrate: Some(1.0),
+                initial_burst: None,
+                legacy_re: false,
+            },
+            retry: Duration::from_millis(25),
+        }));
+
+        let producer = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.produce(&file, 240, Instant::now() + Duration::from_secs(60))
+                    .await
+            })
+        };
+        wait_for_part_segment(cache.path(), 0).await;
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            2,
+            "the running producer owns its background permit"
+        );
+
+        let live = mgr
+            .start(file_id, 240, 0.0, None, None, "paul", "pb-live-handoff")
+            .await
+            .expect("foreground start after bounded preemption");
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            2,
+            "the producer released before the live encoder acquired; only the viewer remains"
+        );
+
+        assert!(
+            tokio::time::timeout(PRODUCER_POLL * 2, wait_for_part_segment(cache.path(), 1))
+                .await
+                .is_err(),
+            "the producer reacquired capacity while a live permit was held"
+        );
+
+        assert!(mgr.stop_session(&live.session_id, "test").await);
+        wait_for_part_segment(cache.path(), 1).await;
+        let made = producer
+            .await
+            .expect("producer join")
+            .expect("producer result")
+            .expect("producer resumed and published");
+        assert!(
+            made.parts >= 2,
+            "preemption must leave a resumed second part"
+        );
+        assert_eq!(mgr.admissions.software_in_use(), 0, "all permits returned");
+    }
+
     /// Preempted mid-encode, then resumed — and the film that comes out has no
     /// hole in it.
     ///
@@ -10797,20 +11096,29 @@ mod tests {
             .put_setting(keys::SW_POOL_THREADS, "64")
             .await
             .expect("pool headroom");
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let live_weight = Workload::of(&file, 720).software_threads();
 
         // Play, then "seek" three times. Only the newest survives.
         let first = mgr
             .start(file_id, 720, 0.0, None, None, "paul", "pb-paul")
             .await
             .expect("start");
+        assert_eq!(mgr.admissions.software_in_use(), live_weight);
         let second = mgr
             .start(file_id, 720, 600.0, None, None, "paul", "pb-paul")
             .await
             .expect("seek");
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            live_weight,
+            "supersession returns the predecessor before admitting its replacement"
+        );
         let third = mgr
             .start(file_id, 720, 1200.0, None, None, "paul", "pb-paul")
             .await
             .expect("seek again");
+        assert_eq!(mgr.admissions.software_in_use(), live_weight);
         assert_eq!(mgr.active_sessions().await, 1);
         assert!(mgr.playlist(&first.session_id).await.is_none());
         assert!(!mgr.stop_session(&second.session_id, "test").await);
@@ -10849,6 +11157,11 @@ mod tests {
             .await
             .expect("second device");
         assert_eq!(mgr.active_sessions().await, 2);
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            live_weight * 2,
+            "multiple viewers retain one permit each"
+        );
         let reseek = mgr
             .start(file_id, 720, 30.0, None, None, "paul", "pb-paul")
             .await
@@ -10858,10 +11171,20 @@ mod tests {
             2,
             "one player's seek must not touch another player's stream"
         );
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            live_weight * 2,
+            "replacing one viewer preserves the aggregate live cap"
+        );
         assert!(!mgr.stop_session(&fallback.session_id, "test").await);
         assert!(mgr.stop_session(&laptop.session_id, "test").await);
         assert!(mgr.stop_session(&reseek.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            0,
+            "every superseded and stopped live permit returned"
+        );
     }
 
     /// Creating a session spawns a process and kills its predecessor, so a

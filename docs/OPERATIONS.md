@@ -896,11 +896,26 @@ offers it) help the burst land quickly.
 
 ### Playback cache protection and a temporarily soft ceiling
 
-The pre-transcode budget never wins over an active viewer. A cached HLS
-session protects its recipe from LRU, stale-claim, and orphan cleanup until the
-last reader leaves; a later enabled sweep may then reclaim it. This can hold
-the cache above `cache_max_gb` temporarily, which is safer than turning the
-next playlist or segment request into a 404.
+The pre-transcode budget never wins over an active viewer. A foreground
+transcode start first announces itself, then waits up to five seconds for any
+speculative or offline encoder to checkpoint and terminate before it starts
+its own ffmpeg. This handoff applies across both hardware and software: a
+numerically free hardware slot or spare CPU threads do not authorize overlap
+with background work. Once admitted, the viewer's permit keeps background
+hardware and software work parked until the live session stops, is superseded,
+fails, or changes pools during hardware-to-software fallback. The permits are
+RAII guards, so every one of those exits returns ownership without a separate
+counter-cleanup branch.
+
+If a background encoder does not release within the five-second admission
+window, the start returns HTTP 503 with `transcode capacity is temporarily
+unavailable`; retrying is safe. Cached playback and copy/remux sessions do not
+need an encoder permit and never pay this wait.
+
+A cached HLS session protects its recipe from LRU, stale-claim, and orphan
+cleanup until the last reader leaves; a later enabled sweep may then reclaim
+it. This can hold the cache above `cache_max_gb` temporarily, which is safer
+than turning the next playlist or segment request into a 404.
 
 Sweeps run only when `transcode_cleanup_mins` or `cache_produce_mins` is set;
 both default to `0` (off). With both off, nothing reclaims playback-cache
@@ -1086,6 +1101,7 @@ the loading overlay a few seconds longer, then playback).
 | GDM won't bind / port conflict | A running Plex owns UDP 32414 | Set `PLURX_GDM_PORT`, or stop Plex |
 | Gray screen then playback | Hardware session stalled, watchdog fell back to software | Expected under concurrency; check `PLURX_HWACCEL` |
 | HLS playback errors immediately at startup | ffmpeg exited unsuccessfully before publishing a usable playlist; plurx now reports that known server failure promptly instead of waiting for a client-side `manifestLoadTimeOut` | Read the final `plurxd::transcode` line for the source, filter, decoder, or encoder failure |
+| A transcode start returns HTTP 503 with `transcode capacity is temporarily unavailable` | The five-second foreground admission window expired before a background encoder yielded, or before configured live hardware/software capacity became available | Retry after the named work releases. If the response says background encoding did not yield, read `pre-transcode yielded` and session-end lines in `plurxd::transcode`; absence after five seconds means that worker is stuck rather than permission to start beside it |
 | 4K HDR is slow but plays | The tone-map is running on the CPU. `GET /api/v1/system` → `tone_map` names the graph in use and why each candidate was rejected — no GPU device, a driver that refused the filter, output that didn't match the reference, or a graph that wasn't faster than the CPU chain | A rejection naming a missing device is usually a container passthrough (`--device /dev/dri`) or a missing driver package. HLG and Dolby Vision always use the CPU chain by design |
 | "All hardware transcode slots are in use" | The cap (`transcode.max_hw_sessions`, default 2) is doing its job. A start waits up to 5 s for a slot, then runs in software *only if this server has measured that class of stream above realtime there* — never because the output is small, since the decode and the tone-map happen at source resolution whatever size you ask for | `GET /api/v1/system` → `hw_slots_in_use` / `hw_slots_max`. Refused at 0 of 2 is a bug; refused at 2 of 2 is the design. A 4K HDR source is the shape software cannot carry, so it is refused rather than started to stall |
 | A GPU tone-map worked and then stopped | The pipeline downgrades once, per session, to the CPU chain and logs it | Look for `pipeline=` on the session's ffmpeg log line: it names what actually ran, not what the box can do |
