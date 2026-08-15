@@ -115,7 +115,7 @@ voter disk is not enough to use a household's Trakt account.
 | Algorithm | XChaCha20-Poly1305, 24-byte random nonce per seal. Two seals of the same token differ, and voters need no nonce coordination |
 | Envelope | `plxenc:v1:<key id>:<hex nonce‖ciphertext‖tag>` — the key id says which key opens it, and is a one-way function of that key |
 | Binding | The row's `user_id` is authenticated additional data. Repointing a sealed row at another `user_id` makes it fail to open rather than handing one household member another's account |
-| Key at rest | A 32-byte key in a mode-`0600` file beside `node.id` — `<data_dir>/credentials.key`, or `cluster.credential_key_file` / `PLURX_CREDENTIAL_KEY_FILE`. Node-local configuration, never a durable row, never replicated, never in a setting or an API response |
+| Key at rest | A 32-byte key in a mode-`0600` file beside `node.id` — `<data_dir>/credentials.key`, or `cluster.credential_key_file` / `PLURX_CREDENTIAL_KEY_FILE`. Node-local configuration, never a durable row, never replicated, and never returned by a settings or status API. Cluster admission is the one narrower transport exception: the admin-only token-issuance response wraps the key inside the opaque encrypted one-time token described below |
 | Unwrapping | Only at the point of an outbound call, via `TraktAuth::reveal_access_token`. The cleartext is a `Secret`: `Debug`/`Display` redact, there is no `Serialize`, and it is zeroized on drop |
 | Upgrade | A boot with cleartext rows seals them in place and logs the row count and key id — never the credential. Columns are sealed one at a time, so a boot killed mid-migration is finished by the next one instead of double-wrapping what already made it |
 | Durable write | **Refusal.** Every backend funnels its bearer columns through one check that the value really is an envelope, so "a durable Trakt row holds ciphertext" is enforced at the write rather than assumed of each caller |
@@ -141,16 +141,20 @@ that no table was committed before the refusal.
 Two limits stated plainly. The key sits beside the database, so this protects a
 copied voter disk, a snapshot, and a backup — not an attacker who already has
 read access to the whole data directory as the plurx user. And every voter that
-must open a credential needs the same key, distributed out of band exactly like
-`secret_raft` and `secret_api`; raft never carries it.
+must open a credential needs the same key. The first voter creates it; an M3a
+join token carries it with `secret_raft` and `secret_api` inside one encrypted,
+single-use envelope. Raft and the redemption/finalization HTTP bodies never
+carry the key or that envelope.
 
 ## Cluster admission — one bearer, one voter, one use
 
 `POST /api/v1/cluster/join-tokens` requires an admin login token and returns a
-join token once. The join token is then the only credential accepted by the
-narrow redeem/finalize endpoints: requiring a user login there would make a
-fresh node impossible to admit, while accepting an admin token as a node
-credential would give it much broader authority than it needs.
+join token once. The joining node opens that token locally, then sends only its
+SHA-256 digest to the narrow redeem/finalize endpoints. That digest proves
+possession against the coordinator's stored digest without putting the
+self-contained cluster secrets on the public HTTP wire. Requiring a user login
+there would make a fresh node impossible to admit, while accepting an admin
+token as a node credential would give it much broader authority than it needs.
 
 The token is `plxjoin:v1:<key>:<nonce+ciphertext+tag>`. XChaCha20-Poly1305
 authenticates and hides cluster id · assigned Raft id · bootstrap addresses ·
@@ -164,9 +168,9 @@ disclosure and tampering; single-use state and a short lifetime limit replay.
 |---|---|
 | Issuance | Admin-only, 10 minutes by default, clamped to 60–3,600 seconds. A typo must not mint a near-permanent cluster credential |
 | Replicated record | SHA-256 token digest · expiry · assigned Raft id · state · admitted node id. The token and cluster secrets never enter replicated SQL |
-| Redemption | The digest changes atomically from `issued` to `redeeming` and is reserved to one generated `node.id`. Another node gets `join_token_reserved` rather than sharing authority |
+| Redemption | The fresh node sends the token digest, assigned Raft id, compatibility versions, node id, and peer addresses — never the full token. The stored digest changes atomically from `issued` to `redeeming` and is reserved to one generated `node.id`. Another node gets `join_token_reserved` rather than sharing authority |
 | Finalization | Only after Hiqlite reports the assigned Raft id as a voter does state become `redeemed`. Later redemption gets `join_token_reused`; an expired token gets `join_token_expired` |
-| Local material | Put the token in an owner-only file named by `cluster.join_token_file`, never in TOML or a command transcript. Successful finalization deletes that file; interrupted startup retains it only to resume the same staged identity |
+| Local material | Put the token in an owner-only file named by `cluster.join_token_file`, never in TOML or a command transcript. Successful finalization deletes that file; interrupted startup retains it only to resume the same staged identity. Local membership stores its digest, so an unrelated or copied token file warns and is ignored rather than bricking a healthy voter |
 | Public status | Node id · Raft id · role · reachability · last-seen and the existing replication projection. It omits token material, peer addresses, media paths, and library data |
 
 A joining data directory must be fresh: the presence of `plurx.db` refuses the
@@ -312,7 +316,9 @@ their separate shared secrets. They may bind a reachable LAN address for voter
 membership; startup refuses any public cleartext form of either listener. Those
 internal listeners do not make the public API or the join redemption URL HTTPS.
 Peer addresses are internal membership data and are omitted from the public
-node-status payload.
+node-status payload. The automatic certificates encrypt traffic but are
+self-signed and accepted without certificate verification; the shared secrets,
+not a certificate authority, authenticate membership requests.
 
 The consequence is explicit: **anything past a network you fully trust belongs
 behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik). Over plain
@@ -320,6 +326,12 @@ HTTP the bearer token crosses the wire in the clear, so on an untrusted segment
 a passive listener can lift it and gain exactly the holder's access. The proxy
 is also where you add the two things plurx intentionally omits below —
 HTTPS and request rate limiting. Deploy recipes: [deploy/README.md](../deploy/README.md).
+
+Cluster admission narrows that exposure but does not erase it. The
+redeem/finalize bodies carry only the join-token digest, never its embedded
+secrets. The admin issuance response still returns the complete bearer once,
+so mint it over a trusted LAN or an HTTPS reverse-proxy URL and put it directly
+into the owner-only file.
 
 ## Non-goals — what plurx does not defend against
 
@@ -330,10 +342,20 @@ the protections above believable. plurx does **not**:
   with a reverse proxy for any exposure beyond a trusted LAN (see above). The
   Hiqlite Raft/API listeners use internal automatic TLS, not operator-facing
   HTTPS.
-- **Rate-limit login.** There is no per-IP throttle or lockout on
-  `/auth/login`; brute-force resistance rests on Argon2id's cost and 256-bit
-  tokens. If the login is reachable from an untrusted network, put rate
-  limiting at the proxy — the layer that can see the client IP.
+- **Authenticate cluster peers with a certificate authority.** Hiqlite's
+  automatic self-signed certificates are accepted without verification. The
+  shared Raft/API secrets authenticate requests, but an active LAN attacker who
+  can impersonate an internal listener can capture those bearer secrets. Keep
+  the cluster listeners on a trusted network; this milestone does not deliver
+  managed peer certificates or pinning.
+- **Rate-limit login or cluster admission.** There is no per-IP throttle or
+  lockout on `/auth/login`, `/api/v1/cluster/join/redeem`, or
+  `/api/v1/cluster/join/finalize`. Login brute-force resistance rests on
+  Argon2id's cost and 256-bit tokens; admission accepts only a 256-bit token
+  digest already present in replicated state. Invalid admission attempts still
+  cost one leader lookup. If either surface is reachable from an untrusted
+  network, put rate limiting at the proxy — the layer that can see the client
+  IP.
 - **Authenticate `/metrics` or the APK download.** Both are public by design
   (a scrape endpoint and a client binary). `/metrics` leaks deployment shape,
   not user data; firewall it if that matters to you.
@@ -363,10 +385,12 @@ knows the guarantee is checked, not asserted:
 - **Credential handling** — the `auth` tests (`plurx-core/src/auth.rs`) assert
   passwords hash as Argon2id and tokens hash stably to a stored form.
 - **Cluster admission** — `cluster::membership::tests` pins opaque token
-  round-trip, tamper rejection, and stable error codes;
+  round-trip, tamper rejection, and stable error codes; the migration test
+  `daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization`
+  drives the production token-file and HTTP join path; and
   `plurx-cluster-check membership` drives expiry, reuse, 1→3 voter growth,
-  offline-work refusal, 3→2 removal, and quorum-loss refusal through real
-  processes.
+  tombstone preservation, offline-work refusal, 3→2 removal, readable status
+  during quorum loss, and quorum-loss refusal through real processes.
 
 Per the project rule, **security-relevant behavior and this doc change in the
 same commit** — a change that alters who can reach what and doesn't update this

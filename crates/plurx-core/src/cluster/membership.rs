@@ -35,7 +35,7 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
          schema_version INTEGER NOT NULL) STRICT",
     "CREATE TABLE IF NOT EXISTS cluster_join_tokens (\
          token_hash TEXT PRIMARY KEY, \
-         raft_id INTEGER NOT NULL UNIQUE CHECK (raft_id > 0), \
+         raft_id INTEGER NOT NULL CHECK (raft_id > 0), \
          expires_at INTEGER NOT NULL, \
          state TEXT NOT NULL CHECK (state IN ('issued', 'redeeming', 'redeemed')), \
          node_id TEXT, \
@@ -136,11 +136,20 @@ pub struct LocalMembership {
     pub raft_id: u64,
     pub local: ClusterPeer,
     pub bootstrap: Vec<ClusterPeer>,
+    /// Digest of the one-time token that admitted this node. Initial voters
+    /// have no digest. This is the local gate that keeps an unrelated token
+    /// file from turning an otherwise healthy restart into a failed join.
+    #[serde(default)]
+    pub join_token_digest: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedeemJoinRequest {
-    pub token: String,
+    /// SHA-256 of the bearer held by the joining node. The coordinator needs
+    /// only proof of possession; sending the self-contained token would put
+    /// every cluster secret on the public HTTP wire.
+    pub token_digest: String,
+    pub raft_id: u64,
     pub node_id: String,
     pub raft_address: String,
     pub api_address: String,
@@ -148,17 +157,55 @@ pub struct RedeemJoinRequest {
     pub protocol_version: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl std::fmt::Debug for RedeemJoinRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedeemJoinRequest")
+            .field("token_digest", &"<redacted>")
+            .field("raft_id", &self.raft_id)
+            .field("node_id", &self.node_id)
+            .field("raft_address", &self.raft_address)
+            .field("api_address", &self.api_address)
+            .field("schema_version", &self.schema_version)
+            .field("protocol_version", &self.protocol_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizeJoinRequest {
-    pub token: String,
+    pub token_digest: String,
+    pub raft_id: u64,
     pub node_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl std::fmt::Debug for FinalizeJoinRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FinalizeJoinRequest")
+            .field("token_digest", &"<redacted>")
+            .field("raft_id", &self.raft_id)
+            .field("node_id", &self.node_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedJoinToken {
     pub token: String,
     pub expires_at: i64,
     pub raft_id: u64,
+}
+
+impl std::fmt::Debug for IssuedJoinToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedJoinToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("raft_id", &self.raft_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,11 +277,22 @@ pub struct JoinPayload {
     pub protocol_version: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinSecretPayload {
     pub raft: String,
     pub api: String,
     pub credential_key: String,
+}
+
+impl std::fmt::Debug for JoinSecretPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JoinSecretPayload")
+            .field("raft", &"<redacted>")
+            .field("api", &"<redacted>")
+            .field("credential_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl MembershipManager {
@@ -324,9 +382,7 @@ impl MembershipManager {
             let rows = inner
                 .client
                 .query_consistent_map::<MaxRaftIdRow, _>(
-                    "SELECT MAX(raft_id) AS max_raft_id FROM (\
-                         SELECT raft_id FROM cluster_join_tokens UNION ALL \
-                         SELECT raft_id FROM cluster_nodes)",
+                    "SELECT MAX(raft_id) AS max_raft_id FROM cluster_nodes",
                     params!(),
                 )
                 .await?;
@@ -352,13 +408,17 @@ impl MembershipManager {
                 protocol_version: AUTH_PROTOCOL_VERSION,
             };
             let token = encode_join_token(&payload)?;
-            let token_hash = hash_join_token(&token);
+            let token_hash = join_token_digest(&token);
             let inserted = inner
                 .client
                 .execute(
-                    "INSERT OR IGNORE INTO cluster_join_tokens \
+                    "INSERT INTO cluster_join_tokens \
                      (token_hash, raft_id, expires_at, state, node_id, created_at, redeemed_at) \
-                     VALUES ($1, $2, $3, 'issued', NULL, $4, NULL)",
+                     SELECT $1, $2, $3, 'issued', NULL, $4, NULL \
+                     WHERE NOT EXISTS (\
+                       SELECT 1 FROM cluster_join_tokens \
+                       WHERE raft_id = $2 AND state IN ('issued', 'redeeming') AND expires_at > $4\
+                     )",
                     params!(token_hash, raft_id as i64, expires_at, now),
                 )
                 .await?;
@@ -377,22 +437,20 @@ impl MembershipManager {
 
     pub async fn redeem(&self, request: &RedeemJoinRequest) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
-        let payload = decode_join_token(&request.token)?;
         if request.schema_version != AUTH_SCHEMA_VERSION
             || request.protocol_version != AUTH_PROTOCOL_VERSION
-            || payload.schema_version != AUTH_SCHEMA_VERSION
-            || payload.protocol_version != AUTH_PROTOCOL_VERSION
-            || payload.cluster_id != inner.identity.cluster_id
         {
             return Err(MembershipError::Incompatible);
         }
+        if !is_join_token_digest(&request.token_digest) {
+            return Err(MembershipError::InvalidToken);
+        }
         let now = unix_ms()?;
-        let token_hash = hash_join_token(&request.token);
-        let record = self.token_record(&token_hash).await?;
-        if record.expires_at <= now || payload.expires_at <= now {
+        let record = self.token_record(&request.token_digest).await?;
+        if record.expires_at <= now {
             return Err(MembershipError::ExpiredToken);
         }
-        if record.raft_id != payload.raft_id as i64 {
+        if record.raft_id != request.raft_id as i64 {
             return Err(MembershipError::InvalidToken);
         }
         match record.state.as_str() {
@@ -410,11 +468,11 @@ impl MembershipManager {
             .execute(
                 "UPDATE cluster_join_tokens SET state = 'redeeming', node_id = $1 \
                  WHERE token_hash = $2 AND state = 'issued' AND expires_at > $3",
-                params!(request.node_id.as_str(), token_hash.as_str(), now),
+                params!(request.node_id.as_str(), request.token_digest.as_str(), now),
             )
             .await?;
         if changed != 1 {
-            let latest = self.token_record(&token_hash).await?;
+            let latest = self.token_record(&request.token_digest).await?;
             return if latest.expires_at <= now {
                 Err(MembershipError::ExpiredToken)
             } else if latest.state == "redeemed" {
@@ -435,7 +493,7 @@ impl MembershipManager {
                    removed_at = NULL",
                 params!(
                     request.node_id.as_str(),
-                    payload.raft_id as i64,
+                    request.raft_id as i64,
                     request.raft_address.as_str(),
                     request.api_address.as_str(),
                     now
@@ -447,11 +505,12 @@ impl MembershipManager {
 
     pub async fn finalize(&self, request: &FinalizeJoinRequest) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
-        let payload = decode_join_token(&request.token)?;
-        let token_hash = hash_join_token(&request.token);
-        let record = self.token_record(&token_hash).await?;
+        if !is_join_token_digest(&request.token_digest) {
+            return Err(MembershipError::InvalidToken);
+        }
+        let record = self.token_record(&request.token_digest).await?;
         if record.node_id.as_deref() != Some(&request.node_id)
-            || record.raft_id != payload.raft_id as i64
+            || record.raft_id != request.raft_id as i64
         {
             return Err(MembershipError::ReservedToken);
         }
@@ -462,7 +521,7 @@ impl MembershipManager {
         if !metrics
             .membership_config
             .voter_ids()
-            .any(|id| id == payload.raft_id)
+            .any(|id| id == request.raft_id)
         {
             return Err(MembershipError::Internal(
                 "joining node has not committed voter membership".to_owned(),
@@ -474,7 +533,7 @@ impl MembershipManager {
             .execute(
                 "UPDATE cluster_join_tokens SET state = 'redeemed', redeemed_at = $1 \
                  WHERE token_hash = $2 AND state = 'redeeming' AND node_id = $3",
-                params!(now, token_hash, request.node_id.as_str()),
+                params!(now, request.token_digest.as_str(), request.node_id.as_str()),
             )
             .await?;
         if changed != 1 {
@@ -506,7 +565,7 @@ impl MembershipManager {
                  (node_id, raft_id, raft_address, api_address, last_seen_at, removed_at) \
                  VALUES ($1, $2, $3, $4, $5, NULL) \
                  ON CONFLICT(node_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, \
-                   removed_at = NULL",
+                   removed_at = NULL WHERE cluster_nodes.removed_at IS NULL",
                 params!(
                     inner.identity.node_id.as_str(),
                     inner.identity.raft_id as i64,
@@ -533,7 +592,6 @@ impl MembershipManager {
 
     pub async fn status(&self) -> Result<MembershipStatus, MembershipError> {
         let inner = self.replicated_inner()?;
-        self.heartbeat().await?;
         let now = unix_ms()?;
         let metrics = inner.client.metrics_db().await?;
         let voters = metrics
@@ -547,7 +605,7 @@ impl MembershipManager {
             .collect::<BTreeSet<_>>();
         let rows = inner
             .client
-            .query_consistent_map::<NodeRow, _>(
+            .query_map::<NodeRow, _>(
                 "SELECT node_id, raft_id, last_seen_at FROM cluster_nodes \
                  WHERE removed_at IS NULL ORDER BY raft_id",
                 params!(),
@@ -692,8 +750,13 @@ fn encode_join_token(payload: &JoinPayload) -> Result<String, MembershipError> {
     ))
 }
 
-fn hash_join_token(token: &str) -> String {
+#[must_use]
+pub fn join_token_digest(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+fn is_join_token_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn change_membership(
@@ -865,12 +928,52 @@ mod tests {
     }
 
     #[test]
-    fn token_debug_types_do_not_exist_for_the_manager_secrets() {
+    fn stable_membership_refusal_codes_are_operator_visible() {
         assert_eq!(MembershipError::ExpiredToken.code(), "join_token_expired");
         assert_eq!(MembershipError::ReusedToken.code(), "join_token_reused");
         assert_eq!(
             MembershipError::QuorumLoss.code(),
             "removal_would_lose_quorum"
         );
+    }
+
+    #[test]
+    fn join_credentials_and_cluster_secrets_are_redacted_from_debug() {
+        let payload = payload();
+        let token = encode_join_token(&payload).expect("encode token");
+        let digest = join_token_digest(&token);
+        let issued = IssuedJoinToken {
+            token: token.clone(),
+            expires_at: payload.expires_at,
+            raft_id: payload.raft_id,
+        };
+        let redeem = RedeemJoinRequest {
+            token_digest: digest.clone(),
+            raft_id: payload.raft_id,
+            node_id: "node-b".to_owned(),
+            raft_address: "node-b:32401".to_owned(),
+            api_address: "node-b:32402".to_owned(),
+            schema_version: payload.schema_version,
+            protocol_version: payload.protocol_version,
+        };
+        let finalize = FinalizeJoinRequest {
+            token_digest: digest.clone(),
+            raft_id: payload.raft_id,
+            node_id: "node-b".to_owned(),
+        };
+
+        for rendered in [
+            format!("{issued:?}"),
+            format!("{redeem:?}"),
+            format!("{finalize:?}"),
+            format!("{payload:?}"),
+        ] {
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(!rendered.contains(&digest), "{rendered}");
+            assert!(!rendered.contains(&"r".repeat(64)), "{rendered}");
+            assert!(!rendered.contains(&"a".repeat(64)), "{rendered}");
+            assert!(!rendered.contains(&"c".repeat(64)), "{rendered}");
+        }
     }
 }

@@ -2436,6 +2436,40 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "membership_unavailable");
+
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/cluster/join/redeem",
+                None,
+                json!({
+                    "token_digest": "00".repeat(32),
+                    "raft_id": 2,
+                    "node_id": "joining-node",
+                    "raft_address": "127.0.0.1:32411",
+                    "api_address": "127.0.0.1:32412",
+                    "schema_version": 5,
+                    "protocol_version": 4
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "membership_unavailable");
+
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/cluster/join/redeem",
+                None,
+                json!({
+                    "token": "a complete join token must never cross this route",
+                    "node_id": "joining-node"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The storage numbers have to reach `/system`, and an unmeasured server

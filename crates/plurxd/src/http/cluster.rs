@@ -57,9 +57,11 @@ pub async fn remove_node(
         .map_err(api_error)
 }
 
-/// The join token is the credential for this route. Requiring an account token
-/// would make a fresh node impossible to admit; accepting either would widen
-/// the admin token into a node credential. The two doors stay separate.
+/// The join token's SHA-256 digest is the credential for this route. The fresh
+/// node decodes the full bearer locally and sends only proof of possession, so
+/// the cluster secrets inside it never cross the public HTTP listener.
+/// Requiring an account token would make a fresh node impossible to admit;
+/// accepting either would widen the admin token into a node credential.
 pub async fn redeem_join(
     State(state): State<AppState>,
     Json(request): Json<RedeemJoinRequest>,

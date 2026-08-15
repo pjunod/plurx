@@ -120,7 +120,7 @@ existing `[server]\nnmae = "typo"` rejection remains unchanged.
 [cluster]
 raft_bind = "0.0.0.0:32401"      # raft replication, adjacent to public 32400
 api_bind = "0.0.0.0:32402"       # authenticated node-to-node requests
-advertise_host = ""              # empty derives this node's reachable address
+advertise_host = ""              # empty keeps a never-joined voter on loopback
 join_url = ""                    # empty derives the public API URL above
 join_token_file = ""             # absent bootstraps/reopens one voter
 trusted_network = ""             # required if transport is not TLS
@@ -144,7 +144,11 @@ The joining daemon reads the token from `join_token_file`, creates a distinct
 deletes the token file only after voter membership and token finalization both
 commit. Expired and finalized tokens have the stable, distinct codes
 `join_token_expired` and `join_token_reused`; token material is absent from
-logs, status, node records, and TOML.
+logs, status, node records, and TOML. The joining node opens the complete token
+locally and sends only its SHA-256 digest to redeem/finalize, so the secrets in
+the envelope never cross the public HTTP request. `membership.json` keeps that
+digest as the local crash-resume gate; a foreign leftover token warns and is
+ignored on an already healthy voter.
 
 Trakt is the exception to the otherwise hash-only credential rows: its access
 and refresh tokens are live bearer secrets. Replicating plaintext would copy
@@ -684,12 +688,13 @@ commit and byte budgets. No §6.6 activation blocker remains outstanding.
 
 Before M3 introduces peers, both cluster listeners are loopback-only; no
 replication traffic exists to expose and no remote consumer exists to serve.
-The API listener keeps automatic TLS and its authenticating secret, but it
-ignores a non-loopback `api_bind` and `advertise_host`: its only consumer is a
-maintenance command on the same machine, so honouring the `0.0.0.0` default
-would open a LAN port on every single-node install at upgrade with nothing on
-the other end. M3 opens it deliberately, with membership, when a peer exists to
-talk to.
+The API listener keeps automatic TLS and its authenticating secret, but before
+M3 it ignored a non-loopback `api_bind` and `advertise_host`: its only consumer
+was a maintenance command on the same machine, so honouring the `0.0.0.0`
+default would have opened a LAN port on every single-node install at upgrade
+with nothing on the other end. M3 keeps that default closed and opens the
+listeners only when the operator sets `advertise_host` as the explicit first
+step toward admitting a peer.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -703,10 +708,16 @@ the replicated `instance.id`. The admin-only membership API exposes
 privacy-safe node id, Raft id, voter/learner role, reachability, and last-seen,
 then embeds the existing §6.6/#233 replication projection as its only lag
 answer. Both remote cluster listeners use automatic TLS, and the listener
-policy refuses a public cleartext bind. Follower removal is allowed only from
-three or more voters; the resulting two-voter set reports
-`degraded_reconfiguration`, and any further removal is refused with
-`removal_would_lose_quorum`.
+policy refuses a public cleartext bind. A never-joined installation remains on
+loopback until the operator sets `advertise_host`; a sole voter then rebuilds
+only its one-node Raft metadata from a verified Hiqlite snapshot so the
+committed address, not merely `membership.json`, becomes reachable. The
+transition is refused after a learner or peer exists, and later remote listener
+host or port drift is refused rather than validating one address and silently
+binding another. Follower removal is allowed only from three or more voters;
+the resulting two-voter set reports `degraded_reconfiguration`, and any 2→1
+removal is deliberately refused with `removal_would_lose_quorum` until a later
+milestone proves a downgrade protocol.
 
 Node removal must also resolve offline work owned by that node. A `preparing`
 package cannot be silently re-homed because its replicated `source_path` does

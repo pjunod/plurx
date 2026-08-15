@@ -206,6 +206,15 @@ failure.
 cluster-API addresses. `advertise_host` is a host or IP, not a URL. Set
 `join_url` when the public API is reached through a different hostname, port,
 or HTTPS reverse proxy; this is the URL embedded in a token for redemption.
+`advertise_host` is also the explicit opt-in that opens a never-joined voter's
+internal listeners beyond loopback. Leaving it empty preserves the old
+single-node network surface even though the configured bind defaults are
+`0.0.0.0`. On an already-activated sole voter, the first restart with
+`advertise_host` set takes a metadata-reset Hiqlite snapshot, proves the same
+`instance.id`, and replaces only the one-node Raft history so the committed
+peer address becomes reachable. The old target remains beside the replacement
+until that replacement opens successfully; startup refuses this transition
+once any learner or second voter exists.
 
 ```toml
 [cluster]
@@ -217,7 +226,10 @@ join_url = "http://plurx-a.lan:32400"
 
 Raft and the internal cluster API use automatic TLS. Startup refuses a public
 cleartext form of either listener; the public `join_url` still follows the
-plain-HTTP/reverse-proxy boundary in [SECURITY.md](SECURITY.md).
+plain-HTTP/reverse-proxy boundary in [SECURITY.md](SECURITY.md). The joining
+node opens the complete token locally and sends only its SHA-256 digest over
+that public URL; the Raft/API secrets and credential-wrapping key do not cross
+the redemption or finalization request.
 
 **Mint one token into a protected file.** The default lifetime is 10 minutes;
 the API clamps requests to 60–3,600 seconds. It returns the token once, so do
@@ -242,6 +254,11 @@ It checks schema/protocol compatibility before admission, creates a distinct
 `node.id`, catches up as a learner, becomes a voter, verifies the unchanged
 replicated `instance.id`, and deletes the token file only after finalization.
 An interrupted join reuses its staged identity instead of minting another one.
+`membership.json` records that token's digest. A leftover token from another
+node therefore produces a warning and is ignored rather than taking an already
+healthy voter offline. If the coordinator is temporarily unavailable after
+the voter and activation marker are durable, that voter still starts and keeps
+its identity-bound token file; a later boot retries finalization.
 
 ```toml
 [storage]
@@ -279,7 +296,16 @@ curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
 `cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
 `node_owns_offline_work` are operator-facing refusal codes. After a successful
 3→2 removal, keep both survivors online and add a third voter; the status must
-remain `degraded_reconfiguration` until then.
+remain `degraded_reconfiguration` until then. M3a deliberately does not support
+2→1 removal, even while both voters are reachable: every membership change from
+two depends on both nodes, and this release keeps the degraded waypoint visible
+until a third voter is added instead of presenting an unproved downgrade path
+as rollback.
+
+A removed node's old data directory is intentionally tombstoned: startup sees
+that its Raft id is no longer a voter and refuses. To add that machine again,
+stop it, discard its old plurx data directory, and join from a fresh directory
+with a newly issued token. Never copy the removed directory back into service.
 
 ## Configuration surface
 
@@ -298,9 +324,9 @@ membership addresses and token-file paths are intentionally file-only:
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
-| — | `cluster.raft_bind` | `0.0.0.0:32401` | Raft listener for this voter. Remote traffic uses automatic TLS; every node needs a unique reachable address |
-| — | `cluster.api_bind` | `0.0.0.0:32402` | Authenticated Hiqlite cluster API with automatic TLS |
-| — | `cluster.advertise_host` | derived bind IP, otherwise `127.0.0.1` | Host or IP placed in peer records. Set it explicitly when binding `0.0.0.0`; loopback cannot admit another machine |
+| — | `cluster.raft_bind` | `0.0.0.0:32401` | Raft listener for this voter. A never-joined node still binds loopback until `advertise_host` opts into membership. Remote traffic uses automatic TLS; every node needs a unique reachable address |
+| — | `cluster.api_bind` | `0.0.0.0:32402` | Authenticated Hiqlite cluster API with automatic TLS. It follows the same loopback-until-opt-in rule |
+| — | `cluster.advertise_host` | empty | Host or IP placed in committed peer records and the explicit membership-listener opt-in. Leave empty for an ordinary one-voter install; set it on every joining node. A sole loopback voter performs one crash-recoverable local metadata readdress on restart. Once any peer or remote membership exists, changing the advertised host or either listener port is refused until an online membership-reconfiguration path exists |
 | — | `cluster.join_url` | `http://<advertise_host>:<server port>` | Public plurxd base URL a fresh node uses to redeem/finalize its one-time token. Set the HTTPS proxy URL when applicable |
 | — | `cluster.join_token_file` | empty | Owner-only file containing one token on a fresh joining node. Empty bootstraps or reopens; a successful join deletes it |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |

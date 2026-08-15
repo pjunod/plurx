@@ -22,10 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
-use hiqlite::{Client, Node, NodeConfig};
+use hiqlite::{Client, Node, NodeConfig, Row};
 use plurx_core::cluster::membership::{
-    ClusterAvailability, ClusterPeer, FinalizeJoinRequest, IssuedJoinToken, JoinSecrets,
-    MembershipManager, MembershipStatus, RedeemJoinRequest,
+    join_token_digest, ClusterAvailability, ClusterPeer, FinalizeJoinRequest, IssuedJoinToken,
+    JoinSecrets, MembershipManager, MembershipStatus, RedeemJoinRequest,
 };
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
@@ -243,8 +243,10 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             );
         }
         let spec = specs[(node_id - 1) as usize].clone();
+        let token_digest = join_token_digest(&issued.token);
         let request = RedeemJoinRequest {
-            token: issued.token.clone(),
+            token_digest: token_digest.clone(),
+            raft_id: issued.raft_id,
             node_id: format!("node-{node_id}"),
             raft_address: spec.raft,
             api_address: spec.api,
@@ -282,7 +284,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 1,
                 Request::FinalizeJoin {
                     request: FinalizeJoinRequest {
-                        token: issued.token.clone(),
+                        token_digest,
+                        raft_id: issued.raft_id,
                         node_id: request.node_id.clone(),
                     },
                 },
@@ -290,12 +293,11 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             .await?
             .require_ok()?;
         if node_id == 2 {
-            first_redeemed = Some(request);
+            first_redeemed = Some((request, issued.token));
         }
     }
 
-    let request = first_redeemed.context("missing first redeemed token")?;
-    let redeemed_token = request.token.clone();
+    let (request, redeemed_token) = first_redeemed.context("missing first redeemed token")?;
     require_membership_error(
         cluster.request(1, Request::RedeemJoin { request }).await?,
         "join_token_reused",
@@ -314,7 +316,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 1,
                 Request::RedeemJoin {
                     request: RedeemJoinRequest {
-                        token: expired.token,
+                        token_digest: join_token_digest(&expired.token),
+                        raft_id: expired.raft_id,
                         node_id: "expired-candidate".to_owned(),
                         raft_address: "127.0.0.1:1".to_owned(),
                         api_address: "127.0.0.1:2".to_owned(),
@@ -379,6 +382,15 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         )
         .await?
         .require_ok()?;
+    cluster
+        .request(
+            target,
+            Request::HeartbeatPreservesTombstone {
+                node_id: format!("node-{target}"),
+            },
+        )
+        .await?
+        .require_ok()?;
     let remaining = (1..=3)
         .filter(|node_id| *node_id != target)
         .collect::<Vec<_>>();
@@ -418,6 +430,17 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         response => bail!("unexpected final membership dump: {response:?}"),
     };
     require_dump_setting(&final_dump, "instance.id", INSTANCE_ID)?;
+    cluster.kill(quorum_target).await?;
+    let no_quorum_status = match cluster.request(leader, Request::MembershipStatus).await? {
+        Response::MembershipStatus { status } => status,
+        response => bail!("roster was unavailable during quorum loss: {response:?}"),
+    };
+    if no_quorum_status.availability != ClusterAvailability::DegradedReconfiguration
+        || no_quorum_status.nodes.len() != 2
+        || no_quorum_status.replication.health != ReplicationHealth::Degraded
+    {
+        bail!("quorum-loss roster did not explain the outage: {no_quorum_status:?}");
+    }
     cluster.shutdown_all().await?;
     Ok(())
 }
@@ -1026,6 +1049,7 @@ pub enum Request {
     RedeemJoin { request: RedeemJoinRequest },
     FinalizeJoin { request: FinalizeJoinRequest },
     MembershipStatus,
+    HeartbeatPreservesTombstone { node_id: String },
     RemoveVoter { node_id: String },
     SeedOfflineWork { node_id: String },
     ResetContractState,
@@ -1819,6 +1843,19 @@ async fn handle_request(
             .await
             .map(|status| Response::MembershipStatus { status })
             .or_else(|error| Ok(membership_error_response(error))),
+        Request::HeartbeatPreservesTombstone { node_id } => {
+            membership_ref(membership)?.heartbeat().await?;
+            let rows = client
+                .query_consistent_map::<MembershipTombstoneRow, _>(
+                    "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                    hiqlite::macros::params!(node_id),
+                )
+                .await?;
+            if rows.first().and_then(|row| row.removed_at).is_none() {
+                bail!("removed node heartbeat cleared its durable tombstone");
+            }
+            Ok(Response::Ok)
+        }
         Request::RemoveVoter { node_id } => membership_ref(membership)?
             .remove_voter(&node_id)
             .await
@@ -1939,6 +1976,18 @@ async fn handle_request(
                 .put_setting("no-quorum.write", "must-not-ack")
                 .await?;
             Ok(Response::Ok)
+        }
+    }
+}
+
+struct MembershipTombstoneRow {
+    removed_at: Option<i64>,
+}
+
+impl From<&mut Row<'_>> for MembershipTombstoneRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            removed_at: row.get("removed_at"),
         }
     }
 }
