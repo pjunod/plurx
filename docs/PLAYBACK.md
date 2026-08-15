@@ -101,10 +101,12 @@ one.
 |---|---|---|---|
 | `web.initial-route` | First browser delivery | Transcode verdict → HLS. Remux → copy HLS when Safari needs it or the server hint passes the MSE codec gate; otherwise progressive fMP4. Direct stays range-served unless a nonzero preferred audio track requires remux. | Node table over the shipped policy module |
 | `web.hls-transport` | Native HLS vs hls.js | Native capability counts only with WebKit's playback-target API, or when hls.js/MSE is unavailable. Even on Safari, native HLS is reserved for copied HEVC; other HLS uses hls.js so plurx keeps its controls and timeline. | Node native/MSE matrix |
-| `web.manual-quality` | Force and session height | Auto omits height unless a burn/refused remux must preserve a direct/remux resolution promise. Original and `nomse` preserve source height. Explicit 1080/720/480 requests that exact rung. | Node force/height matrix |
+| `web.manual-quality` | Force and session height | Auto omits height unless a burn/refused remux must preserve a direct/remux resolution promise. Original and `nomse` preserve source height. Every server-advertised numbered choice requests that rung. | Node force/height matrix |
+| `web.auto-rung` | Auto transcode rung | The menu and controller consume the source-filtered server ladder. Every 5 s Auto samples hls.js bandwidth, runway, stalls, and server speed; emergencies jump directly to the highest sustainable lower rung, while voluntary moves pay the 60 s dwell and restart-cost gates. Upgrades move one rung and never exceed the player height. | Node Auto-policy matrix |
 | `web.compatibility-fallback` | Rejection to rescue | A direct/remux media rejection before real playback gets one H.264/AAC transcode. A transcode failure, a repeated failure, established playback, or an hls.js network failure does not loop into another encode. | Node fallback matrix |
 | `web.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS, VobSub, and styled text require the SDR burn pipeline. While HDR is on the wire, the selection is refused with a visible notice and the current stream is untouched; SDR playback may still burn it. | Node subtitle/dynamic-range matrix |
 | `web.decode-rescue` | Accepted-but-choppy original | On Auto, after ≥150 s and ≥15 lost frames at ≥6/min, switch the copy/direct route to transcode. Pipeline latency is diagnostic only. Remember by codec/height unless buffer quota, and allow explicit Original/retests to clear it. | Node threshold/boundary unit |
+| `web.supply-rescue` | Repeated supply stalls | Three `supply` stalls in 60 s make a ladder session jump down once or move direct/remux into transcode Auto. `decode` stalls never select a rung; their measured decode rescue remains separate. | Node supply/decode Auto-policy unit |
 
 ### Native clients — execute the plan without inventing a second server
 
@@ -799,9 +801,11 @@ covering the other.
   successor's own status is re-checked once the change lands). Web and
   Android still reopen for every non-VOD seek; adopting the same window
   routing there is open work.
-- **No client-side bitrate adaptation yet.** One encode runs at a time; the
-  rung is chosen at start, not adapted per segment. The design for that is
-  [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
+- **Auto adapts by restarting one encode, not by running a multivariant
+  ladder.** The web controller consumes the server ladder and changes the one
+  active transcode when bandwidth, runway, or classified supply stalls demand
+  it. The switch is visible and bounded; seamless per-segment switching stays
+  behind [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) Phase 3's decision gate.
 - **Burn-only bitmap subs cost a stream restart.** VobSub and PGS without a
   client-recognized overlay capability can't be copied or `<track>`'d — a
   picture has no text to send — so selecting one re-opens the

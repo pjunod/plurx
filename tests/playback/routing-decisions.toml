@@ -148,6 +148,13 @@ test = "tests/playback/web-policy.test.js"
 test_anchor = "manual quality and rescue height preserve the viewer's promise"
 
 [[decisions]]
+id = "web.auto-rung"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function decideRung("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "a bandwidth cliff drops from 1080p to the sustainable rung in one move"
+
+[[decisions]]
 id = "web.compatibility-fallback"
 source = "crates/plurxd/src/web/playback-policy.js"
 source_anchor = "function fallbackAction("
@@ -167,6 +174,13 @@ source = "crates/plurxd/src/web/playback-policy.js"
 source_anchor = "function decodeMarginVerdict("
 test = "tests/playback/web-policy.test.js"
 test_anchor = "decode rescue uses lost frames over a long window, not pipeline latency"
+
+[[decisions]]
+id = "web.supply-rescue"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function decideRung("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "three supply stalls act while decode stalls never choose a rung"
 
 [[decisions]]
 id = "apple.transport-and-dv"
