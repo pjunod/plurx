@@ -8212,7 +8212,7 @@ function replicationText(r){
   const label=sqlite?"SQLite single-node":degraded?"Replicated DEGRADED":r.clustered?"Replicated in sync":"Replicated one node";
   const point=r.last_applied_index==null?"":` · applied term ${r.last_applied_term??"?"}, index ${r.last_applied_index}`;
   const lag=r.behind_by?` · ${r.behind_by} change${r.behind_by===1?'':'s'} behind`:"";
-  const converged=r.last_converged_at?` · last confirmed in sync ${fmtAgo(r.last_converged_at)}`:"";
+  const converged=r.last_converged_at?` · last observed in sync ${fmtAgo(r.last_converged_at)}`:"";
   return esc(`${label}${point}${lag} — ${r.explanation||""}${converged}`);
 }
 function playbackSummaryCard(events){

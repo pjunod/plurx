@@ -146,12 +146,17 @@ impl SelectedStore {
     /// Read-only watch-state replication projection for the server API.
     #[must_use]
     pub fn replication_monitor(&self) -> status::ReplicationMonitor {
-        match (&self.backend, &self.local_client) {
-            (SelectedBackend::Replicated, Some(client)) => {
-                status::ReplicationMonitor::replicated(client.clone())
+        match self.backend {
+            SelectedBackend::Replicated => status::ReplicationMonitor::replicated(
+                self.local_client
+                    .as_ref()
+                    .expect("replicated backend must carry its local client")
+                    .clone(),
+            ),
+            SelectedBackend::SqliteRecovery => {
+                debug_assert!(self.local_client.is_none());
+                status::ReplicationMonitor::sqlite()
             }
-            (SelectedBackend::SqliteRecovery, None) => status::ReplicationMonitor::sqlite(),
-            _ => unreachable!("selected backend and local client must agree"),
         }
     }
 
@@ -1576,9 +1581,7 @@ pub mod status {
 
     use serde::{Deserialize, Serialize};
 
-    #[cfg(feature = "hiqlite-store")]
     use hiqlite::Client;
-    #[cfg(feature = "hiqlite-store")]
     use std::sync::{Arc, Mutex};
 
     /// The durable backend serving this daemon process.
@@ -1617,6 +1620,11 @@ pub mod status {
         /// Unix seconds when this process last positively observed convergence.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub last_converged_at: Option<i64>,
+        /// Process-local applied-index baseline retained across degraded samples.
+        ///
+        /// This is classifier state, not part of the public JSON contract.
+        #[serde(skip)]
+        last_converged_index: Option<u64>,
         /// Unix seconds when this projection was sampled.
         pub checked_at: i64,
         /// Plain-language interpretation for clients that do not speak Raft.
@@ -1645,9 +1653,7 @@ pub mod status {
     #[derive(Clone)]
     pub struct ReplicationMonitor {
         backend: ReplicationBackend,
-        #[cfg(feature = "hiqlite-store")]
         client: Option<Client>,
-        #[cfg(feature = "hiqlite-store")]
         previous: Arc<Mutex<Option<ReplicationStatus>>>,
     }
 
@@ -1657,15 +1663,12 @@ pub mod status {
         pub fn sqlite() -> Self {
             Self {
                 backend: ReplicationBackend::Sqlite,
-                #[cfg(feature = "hiqlite-store")]
                 client: None,
-                #[cfg(feature = "hiqlite-store")]
                 previous: Arc::new(Mutex::new(None)),
             }
         }
 
         /// Monitor a local Hiqlite voter through the same client the Store uses.
-        #[cfg(feature = "hiqlite-store")]
         #[must_use]
         pub fn replicated(client: Client) -> Self {
             Self {
@@ -1687,57 +1690,50 @@ pub mod status {
                     last_applied_index: None,
                     behind_by: None,
                     last_converged_at: None,
+                    last_converged_index: None,
                     checked_at,
                     explanation: "Watch progress is stored only on this server; this SQLite node is not clustered."
                         .to_owned(),
                 };
             }
 
-            #[cfg(feature = "hiqlite-store")]
-            {
-                let previous = self.previous();
-                let client = self
-                    .client
-                    .as_ref()
-                    .expect("replicated monitor must carry a client");
-                let status = match client.metrics_db().await {
-                    Ok(metrics) => {
-                        let peer_matched_indexes =
-                            metrics.replication.as_ref().map(|replication| {
-                                replication
-                                    .iter()
-                                    .filter(|(node_id, _)| **node_id != metrics.id)
-                                    .map(|(_, applied)| applied.as_ref().map(|log| log.index))
-                                    .collect()
-                            });
-                        let observation = ReplicationObservation {
-                            running: metrics.running_state.is_ok(),
-                            leader_known: metrics.current_leader.is_some(),
-                            voter_count: metrics.membership_config.voter_ids().count(),
-                            last_log_index: metrics.last_log_index,
-                            last_applied_term: metrics
-                                .last_applied
-                                .as_ref()
-                                .map(|log| log.leader_id.term),
-                            last_applied_index: metrics.last_applied.as_ref().map(|log| log.index),
-                            peer_matched_indexes,
-                        };
-                        classify_replicated(&observation, previous.as_ref(), checked_at)
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "reading replicated-store status failed");
-                        unavailable(previous.as_ref(), checked_at)
-                    }
-                };
-                self.remember(status.clone());
-                status
-            }
-
-            #[cfg(not(feature = "hiqlite-store"))]
-            unreachable!("replicated backend requires the hiqlite-store feature")
+            let previous = self.previous();
+            let client = self
+                .client
+                .as_ref()
+                .expect("replicated monitor must carry a client");
+            let status = match client.metrics_db().await {
+                Ok(metrics) => {
+                    let peer_matched_indexes = metrics.replication.as_ref().map(|replication| {
+                        replication
+                            .iter()
+                            .filter(|(node_id, _)| **node_id != metrics.id)
+                            .map(|(_, applied)| applied.as_ref().map(|log| log.index))
+                            .collect()
+                    });
+                    let observation = ReplicationObservation {
+                        running: metrics.running_state.is_ok(),
+                        leader_known: metrics.current_leader.is_some(),
+                        voter_count: metrics.membership_config.voter_ids().count(),
+                        last_log_index: metrics.last_log_index,
+                        last_applied_term: metrics
+                            .last_applied
+                            .as_ref()
+                            .map(|log| log.leader_id.term),
+                        last_applied_index: metrics.last_applied.as_ref().map(|log| log.index),
+                        peer_matched_indexes,
+                    };
+                    classify_replicated(&observation, previous.as_ref(), checked_at)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "reading replicated-store status failed");
+                    unavailable(previous.as_ref(), checked_at)
+                }
+            };
+            self.remember(status.clone());
+            status
         }
 
-        #[cfg(feature = "hiqlite-store")]
         fn previous(&self) -> Option<ReplicationStatus> {
             self.previous
                 .lock()
@@ -1745,7 +1741,6 @@ pub mod status {
                 .clone()
         }
 
-        #[cfg(feature = "hiqlite-store")]
         fn remember(&self, status: ReplicationStatus) {
             *self
                 .previous
@@ -1754,7 +1749,6 @@ pub mod status {
         }
     }
 
-    #[cfg(any(feature = "hiqlite-store", test))]
     fn classify_replicated(
         observation: &ReplicationObservation,
         previous: Option<&ReplicationStatus>,
@@ -1788,8 +1782,7 @@ pub mod status {
         // case into a useful lower bound without inventing an exact peer index.
         let inferred_peer_lag = if unknown_peer {
             previous
-                .filter(|status| status.health == ReplicationHealth::InSync)
-                .and_then(|status| status.last_applied_index)
+                .and_then(|status| status.last_converged_index)
                 .zip(observation.last_applied_index)
                 .map_or(0, |(previous_index, current_index)| {
                     current_index.saturating_sub(previous_index)
@@ -1808,6 +1801,11 @@ pub mod status {
             previous.and_then(|status| status.last_converged_at)
         } else {
             Some(checked_at)
+        };
+        let last_converged_index = if degraded {
+            previous.and_then(|status| status.last_converged_index)
+        } else {
+            observation.last_applied_index
         };
         let explanation = if !degraded && clustered {
             "Watch progress is replicated; this node has applied the latest known change and every reporting peer has received it."
@@ -1838,12 +1836,12 @@ pub mod status {
             last_applied_index: observation.last_applied_index,
             behind_by: (behind_by > 0).then_some(behind_by),
             last_converged_at,
+            last_converged_index,
             checked_at,
             explanation,
         }
     }
 
-    #[cfg(feature = "hiqlite-store")]
     fn unavailable(previous: Option<&ReplicationStatus>, checked_at: i64) -> ReplicationStatus {
         ReplicationStatus {
             backend: ReplicationBackend::Replicated,
@@ -1853,6 +1851,7 @@ pub mod status {
             last_applied_index: previous.and_then(|status| status.last_applied_index),
             behind_by: previous.and_then(|status| status.behind_by),
             last_converged_at: previous.and_then(|status| status.last_converged_at),
+            last_converged_index: previous.and_then(|status| status.last_converged_index),
             checked_at,
             explanation:
                 "Replication status cannot be confirmed, so watch progress may not yet appear on every node."
@@ -1968,6 +1967,77 @@ pub mod status {
             assert_eq!(status.health, ReplicationHealth::Degraded);
             assert_eq!(status.behind_by, Some(3));
             assert_eq!(status.last_converged_at, Some(100));
+        }
+
+        #[test]
+        fn missing_peer_lag_survives_repeated_samples_and_tracks_new_writes() {
+            let prior = classify_replicated(&converged(3), None, 100);
+            let first_degraded = classify_replicated(
+                &ReplicationObservation {
+                    last_log_index: Some(45),
+                    last_applied_index: Some(45),
+                    peer_matched_indexes: Some(vec![Some(45)]),
+                    ..converged(3)
+                },
+                Some(&prior),
+                200,
+            );
+            let later_degraded = classify_replicated(
+                &ReplicationObservation {
+                    last_log_index: Some(50),
+                    last_applied_index: Some(50),
+                    peer_matched_indexes: Some(vec![Some(50)]),
+                    ..converged(3)
+                },
+                Some(&first_degraded),
+                300,
+            );
+
+            assert_eq!(first_degraded.behind_by, Some(3));
+            assert_eq!(later_degraded.health, ReplicationHealth::Degraded);
+            assert_eq!(later_degraded.behind_by, Some(8));
+            assert_eq!(later_degraded.last_converged_at, Some(100));
+        }
+
+        #[test]
+        fn replicated_json_has_only_the_privacy_safe_status_contract() {
+            let prior = classify_replicated(&converged(3), None, 100);
+            let status = classify_replicated(
+                &ReplicationObservation {
+                    last_log_index: Some(45),
+                    last_applied_index: Some(45),
+                    peer_matched_indexes: Some(vec![Some(45)]),
+                    ..converged(3)
+                },
+                Some(&prior),
+                200,
+            );
+            let serialized = serde_json::to_value(status).expect("serialize status");
+            let keys = serialized
+                .as_object()
+                .expect("status object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+
+            assert_eq!(
+                keys,
+                [
+                    "backend",
+                    "behind_by",
+                    "checked_at",
+                    "clustered",
+                    "explanation",
+                    "health",
+                    "last_applied_index",
+                    "last_applied_term",
+                    "last_converged_at",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                "replicated status must not expose users, media, paths, tokens, addresses, or membership"
+            );
         }
     }
 }

@@ -629,6 +629,7 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .find(|node_id| *node_id != leader)
             .context("choose follower")?,
     };
+    let failure_name = format!("{target:?}").to_ascii_lowercase();
     cluster.kill(target_id).await?;
 
     let survivor = (1..=3)
@@ -643,20 +644,62 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         .request(
             survivor,
             Request::PostLossWrite {
-                target: format!("{target:?}").to_ascii_lowercase(),
+                target: failure_name.clone(),
+                position_ms: 60_000,
             },
         )
         .await?
         .require_ok()?;
     let current_leader = cluster.leader().await?;
-    let degraded = cluster
+    let first_degraded = cluster
         .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
         .await?;
-    if degraded.behind_by.is_none_or(|lag| lag == 0) || degraded.last_converged_at.is_none() {
-        bail!("degraded status omitted known lag or prior convergence: {degraded:?}");
+    let first_lag = first_degraded
+        .behind_by
+        .filter(|lag| *lag > 0)
+        .context("first degraded status omitted its known lag")?;
+    let converged_at = first_degraded
+        .last_converged_at
+        .context("first degraded status omitted its prior convergence")?;
+
+    let repeated_degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    if repeated_degraded
+        .behind_by
+        .is_none_or(|lag| lag < first_lag)
+        || repeated_degraded.last_converged_at != Some(converged_at)
+    {
+        bail!(
+            "repeated degraded sample forgot known lag or prior convergence: first={first_degraded:?}, repeated={repeated_degraded:?}"
+        );
+    }
+
+    cluster
+        .request(
+            survivor,
+            Request::PostLossWrite {
+                target: format!("{failure_name}-later"),
+                position_ms: 90_000,
+            },
+        )
+        .await?
+        .require_ok()?;
+    let current_leader = cluster.leader().await?;
+    let advanced_degraded = cluster
+        .wait_for_replication_health(current_leader, ReplicationHealth::Degraded)
+        .await?;
+    if advanced_degraded
+        .behind_by
+        .is_none_or(|lag| lag <= first_lag)
+        || advanced_degraded.last_converged_at != Some(converged_at)
+    {
+        bail!(
+            "degraded status did not grow its lag after another acknowledged watch write: first={first_degraded:?}, advanced={advanced_degraded:?}"
+        );
     }
     cluster.wait_for_equal_dumps().await?;
-    let post_loss_key = format!("post_loss.{}", format!("{target:?}").to_ascii_lowercase());
+    let post_loss_key = format!("post_loss.{failure_name}");
     let post_loss_dump = match cluster.request(survivor, Request::Dump).await? {
         Response::Dump { digest, dump } => {
             if digest != hex::encode(Sha256::digest(dump.as_bytes())) {
@@ -739,7 +782,7 @@ pub enum Request {
     RecordLocalTelemetry { marker: String },
     CountLocalTelemetry { marker: String },
     Exercise { ordinal: u64 },
-    PostLossWrite { target: String },
+    PostLossWrite { target: String, position_ms: i64 },
     VerifyProof,
     Dump,
     CatalogView,
@@ -1490,7 +1533,10 @@ async fn handle_request(
             exercise(store_ref(store)?, ordinal).await?;
             Ok(Response::Ok)
         }
-        Request::PostLossWrite { target } => {
+        Request::PostLossWrite {
+            target,
+            position_ms,
+        } => {
             let store = store_ref(store)?;
             store
                 .put_setting(&format!("post_loss.{target}"), "acknowledged")
@@ -1516,9 +1562,9 @@ async fn handle_request(
                 .find(|item| item.item.title == "Replicated Catalog Proof 1")
                 .context("post-loss watch item is missing")?;
             let watch = store
-                .put_progress(user.id, movie.item.id, 60_000, Some(120_000))
+                .put_progress(user.id, movie.item.id, position_ms, Some(120_000))
                 .await?;
-            if watch.position_ms != 60_000 {
+            if watch.position_ms != position_ms {
                 bail!("post-loss watch progress was not acknowledged");
             }
             Ok(Response::Ok)

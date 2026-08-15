@@ -174,14 +174,18 @@ Raft progress facts, never users, titles, media paths, tokens, or library data.
 | `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
 | `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
 | `Replicated in sync` | This node has applied its latest known entry and, when this node is leader, every reporting peer has matched that point. | No action. The displayed term and index are the exact convergence point. |
-| `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last confirmed convergence time. If the gap does not fall, inspect the logs before restarting anything. |
+| `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
 
 **How to read the numbers:** `applied term T, index I` is this node's latest
 applied durable entry; `N changes behind` is the largest index gap the node can
-currently prove. **Last confirmed in sync** is process-local observation time,
-not a fabricated Raft timestamp: a degraded sample preserves the last positive
-observation instead of replacing it with "now." It is absent after a restart
-until the endpoint observes an in-sync sample.
+currently prove. When a peer stays unavailable, the gap remains anchored to the
+last observed convergence index and grows as this node applies new writes.
+**Last observed in sync** is process-local observation time, not a fabricated
+Raft timestamp: a degraded sample preserves the last positive observation
+instead of replacing it with "now." It is absent after a restart until the
+endpoint observes an in-sync sample. The Settings page samples this when you
+open it; the timestamp does not claim that an unseen convergence happened
+between visits.
 
 This row is status, not membership control. It deliberately does not list,
 join, add, or remove voters; the M3 admin membership surface in
