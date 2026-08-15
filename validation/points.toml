@@ -115,6 +115,20 @@ requires = ["cargo", "ffmpeg", "node"]
 missing = "skip"
 timeout_seconds = 3600
 
+# The browser matrix above needs ffmpeg, a server build, and Chrome, so it only
+# runs in the deep profiles. The shaping layer's own contract — the profile
+# grammar, the rate limiter, the cliff, the recovery scoring, and the artifact
+# rules — is pure Node and runs on every commit, because a shaper that silently
+# stops shaping would turn a green stall-recovery run into false evidence.
+[[checks]]
+id = "playback-shaping"
+title = "Network-shaping harness contract"
+command = "node tests/playback/network-shaping.test.js"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["node"]
+missing = "fail"
+timeout_seconds = 300
+
 [[checks]]
 id = "apple-simulators"
 title = "Shared iOS and tvOS XCTest suite"
@@ -387,7 +401,7 @@ paths = [
   "scripts/playback-lab",
   "tests/playback/**",
 ]
-checks = ["rust-gate", "web-static", "playback-smoke", "playback-recovery", "resource-bounds", "playback-exhaustive"]
+checks = ["rust-gate", "web-static", "playback-shaping", "playback-smoke", "playback-recovery", "resource-bounds", "playback-exhaustive"]
 depends_on = ["core.media", "server.api", "library.catalog"]
 
 [[points]]
