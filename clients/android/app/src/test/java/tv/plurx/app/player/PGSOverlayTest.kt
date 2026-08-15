@@ -66,6 +66,45 @@ class PGSOverlayTest {
     }
 
     @Test
+    fun manifestRejectsOverlappingAndDuplicateCueStarts() {
+        val first = cue("first", 1_000, 2_000)
+
+        listOf(1_999L, 1_000L).forEach { secondStart ->
+            val overlapping = manifest(
+                listOf(
+                    first,
+                    cue("second-$secondStart", secondStart, 3_000),
+                ),
+            )
+
+            assertThrows(IllegalArgumentException::class.java) {
+                overlapping.validated(42, 3)
+            }
+        }
+    }
+
+    @Test
+    fun manifestRejectsZeroLengthCue() {
+        val zeroLength = manifest(listOf(cue("zero-length", 1_000, 1_000)))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            zeroLength.validated(42, 3)
+        }
+    }
+
+    @Test
+    fun manifestAcceptsExactlyAdjacentCues() {
+        val adjacent = manifest(
+            listOf(
+                cue("first", 1_000, 2_000),
+                cue("second", 2_000, 3_000),
+            ),
+        )
+
+        assertEquals(adjacent, adjacent.validated(42, 3))
+    }
+
+    @Test
     fun timelineUsesSourcePositionAndSchedulesExactBoundaries() {
         assertEquals(
             listOf(
