@@ -393,3 +393,9 @@ commits = ["09d540c0"]
 points = ["web.experience", "playback.pipeline"]
 checks = ["web-static"]
 reason = "The retained episode-counter unit pins one Auto supply event per browser pause even when hls.js reports at the start and the video element reports at the end; restoring only the prior wall-clock coalescing lets two long pauses reach the three-stall rescue threshold."
+
+[[coverage]]
+commits = ["d839b97c"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shared-claim units drive the shipped interval order against a session-open that stays pending, in both the decode-first and supply-first orders, and prove exactly one automatic fallback session is opened and that the claim is released on failure; restoring only the prior controller lets the second rescue start a second server session that only generation-supersession hides."
