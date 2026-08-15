@@ -578,13 +578,20 @@ an untracked WAL sidecar beside immutable source material.
 
 `HiqliteAuthStore::import_sqlite_backup` accepts only a fresh bootstrapped
 target whose `instance.id` matches the source. It imports all 17 shared durable
-tables in foreign-key order and 64-row Raft transactions, preserving explicit
-ids, timestamps, nullable text, and integer values. Items compute their
-parent-first id order in one recursive source pass, then load each bounded
-chunk through indexed point reads; numeric id order cannot violate their
-self-reference, and large catalogues do not re-run and re-sort the full tree
-for every 64 rows. A v14 source contributes empty scan-reconciliation tables
-and zero outbox claim deadlines; v15–v17 preserve their newer durable facts.
+tables in foreign-key order and 16-row Raft transactions, preserving explicit
+ids, timestamps, nullable text, and integer values. `IMPORT_CHUNK_ROWS` is 16
+as a WAL-payload safety bound rather than a throughput choice: one chunk
+becomes one Raft transaction, `files.probe_json` holds whole ffprobe documents,
+and 64 rows of a real library serialized to 3,137,236 bytes — past the
+2,097,118-byte payload capacity of the production 2 MiB WAL, which panicked
+activation into unreplicated SQLite recovery. Raising it back for import
+throughput re-opens that crash; a byte-measured chunk builder is the real fix.
+Items compute their parent-first id order in one recursive source pass, then
+load each bounded chunk through indexed point reads; numeric id order cannot
+violate their self-reference, and large catalogues do not re-run and re-sort
+the full tree for every 16 rows. A v14 source contributes empty
+scan-reconciliation tables and zero outbox claim deadlines; v15–v17 preserve
+their newer durable facts.
 `playback_events`, `items_fts`, and `offline_lease_guards` never cross the
 boundary: telemetry is node-local, FTS is rebuilt, and the lease guard is an
 internal transaction scratch table.
@@ -595,9 +602,12 @@ and SHA-256 for each table only after parity. Source validation, row loading,
 and digest scans share one blocking worker, so synchronous SQLite work never
 occupies an async runtime worker. Row data crosses that boundary in bounded
 chunks; one parent-first item-id ordering remains O(items) so the importer does
-not rebuild and re-sort the full item tree for every 64 rows. Target parity
-advances through 64-row primary-key pages and feeds an incremental digest
-instead of returning a whole table through the leader. Each page is a
+not rebuild and re-sort the full item tree for every 16 rows. Target parity
+advances through 64-row `PARITY_PAGE_ROWS` primary-key pages — a separate
+constant that stays 64 because parity pages are consistent reads that never
+enter a Raft transaction, so the WAL payload cap does not apply to them — and
+feeds an incremental digest instead of returning a whole table through the
+leader. Each page is a
 consistent read against the quiescent incoming target; activation does not
 start a concurrent writer before parity succeeds.
 
