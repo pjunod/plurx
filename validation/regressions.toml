@@ -291,3 +291,9 @@ commits = ["71aed1840d236d6dbd84f9107de5b42060827d29"]
 points = ["cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The retained three-voter `a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft` regression proves that a legacy bearer credential is refused before the first application row is submitted to Raft."
+
+[[coverage]]
+commits = ["e3689787903cdb1ce94c9fb7906fe51f0cf463e7"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy unit pins cap-stranded emergency downgrades, ladder-floor fallback, and backing-pixel height measurement; restoring only the prior controller policy strands a 720p session above the sustainable rung under the recorded cliff conditions."
