@@ -15,6 +15,34 @@ Shared across all: the server's OpenAPI-generated types, the device-profile defi
 
 **Ship order:** Web first (it's also the admin UI and the Tizen/webOS seed). Then Android TV (cheapest native win, trivial sideload, biggest device coverage), then tvOS, then Tizen/webOS ports, then Roku. Kodi-family Plex clients (§3) cover living rooms in the meantime.
 
+### Shared track facts — clients render the server's answer
+
+The shared contract for every first-party detail screen is the per-file
+`audio_streams`, `subtitle_streams`, and `playback_defaults` fields from the
+native item-detail API. `playback_defaults.audio` and `.subtitle` each carry the
+selected stream index, the preferred language code, and one status:
+
+| Status | What the client says |
+|---|---|
+| `selected` | The preferred language exists and this track is the server default. |
+| `available` | The preferred language exists, but policy selected another track or Off. |
+| `missing` | Tracks exist, but none matches the preferred language. |
+| `no_tracks` | This file has no tracks of that kind; for subtitles, say so plainly. |
+
+Clients mark the selected indices and render the status; they do not fetch
+admin settings or reimplement `select_tracks`. That boundary matters for anime:
+the server can select Japanese original audio while reporting an available
+English dub, and every platform must tell the same story.
+
+A pre-play choice goes back to `/decision` as `audio=<index>` and
+`subtitle=<index>` (`-1` is Off). The client executes the returned delivery plan
+and reads `selection.subtitle_requires_burn_in` before presenting the cost. A
+true `selection.subtitle_burn_in_blocked_by_hdr` means the existing HDR guard
+kept the current delivery instead of replacing it with SDR. The choice belongs
+to one playback only; no client writes Playback defaults as a side effect. The
+server contract is shipped. Web, Apple, and Android rendering land in their
+platform follow-ups rather than inventing placeholder policy in the meantime.
+
 ## 2. Per-platform notes
 
 **Web** — MSE playback of direct/remuxed fMP4 + HLS; capability probing via `MediaCapabilities` API feeds the decision engine. HDR in browsers is inconsistent → the profile system, not wishful thinking, decides (tone-mapped stream when the browser can't attest HDR output).

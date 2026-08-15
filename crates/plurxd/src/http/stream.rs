@@ -9,7 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::{ItemKind, MediaFile};
 use plurx_core::playback::{self, Decision};
-use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle};
+use plurx_core::tracks::{
+    is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle, prefers_original_audio,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -185,6 +187,12 @@ pub struct Caps {
     pub dvhls: Option<u8>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
+    /// Request-local audio choice (`a:{index}`). Absent keeps the shared
+    /// playback-default policy; it never writes the server setting.
+    pub audio: Option<i64>,
+    /// Request-local subtitle choice (`s:{index}`), or `-1` for Off. Absent
+    /// keeps the shared playback-default policy.
+    pub subtitle: Option<i64>,
 }
 
 fn csv(s: &Option<String>) -> Vec<String> {
@@ -425,6 +433,22 @@ fn delivery_plan(file_id: i64, decision: &Decision) -> (String, DeliveryPlan) {
     }
 }
 
+/// Effective request-local choices returned only when the caller supplied an
+/// audio or subtitle selection. Omitting both query parameters preserves the
+/// existing `/decision` JSON shape for older clients.
+#[derive(Serialize)]
+pub struct DecisionSelection {
+    pub audio_index: Option<i64>,
+    pub subtitle_index: Option<i64>,
+    /// True when the selected subtitle is bitmap data with no enabled
+    /// application-overlay route, so showing it requires drawing into a video
+    /// transcode. Text sidecars and an advertised PGS overlay remain false.
+    pub subtitle_requires_burn_in: bool,
+    /// The existing HDR guard refuses that burn instead of silently replacing
+    /// HDR/Dolby Vision with SDR. False when no burn is needed.
+    pub subtitle_burn_in_blocked_by_hdr: bool,
+}
+
 #[derive(Serialize)]
 pub struct DecisionResponse {
     pub file_id: i64,
@@ -444,6 +468,9 @@ pub struct DecisionResponse {
     pub audio: Vec<AudioTrackDto>,
     /// Selectable text subtitle tracks (served as WebVTT sidecars).
     pub subtitles: Vec<SubTrackDto>,
+    /// Effective audio/subtitle choices for a selection-aware request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<DecisionSelection>,
     /// Skippable intro/credits regions (chapter-derived where possible).
     pub markers: Vec<Marker>,
     /// Initial manual A/V correction. Always zero: corrections belong to one
@@ -535,6 +562,94 @@ fn sub_tracks(file: &MediaFile, overlay_enabled: bool) -> Vec<SubTrackDto> {
                 .then_some(crate::pgs_overlay::PROTOCOL),
         })
         .collect()
+}
+
+fn effective_audio_selection(
+    file: &MediaFile,
+    requested: Option<i64>,
+    policy_default: Option<i64>,
+) -> Result<Option<i64>, ApiError> {
+    match requested {
+        Some(index)
+            if index >= 0 && file.audio_streams.iter().any(|track| track.index == index) =>
+        {
+            Ok(Some(index))
+        }
+        Some(_) => Err(ApiError::BadRequest("unknown audio track".into())),
+        None => Ok(policy_default),
+    }
+}
+
+fn effective_subtitle_selection(
+    file: &MediaFile,
+    requested: Option<i64>,
+    policy_default: Option<i64>,
+) -> Result<Option<i64>, ApiError> {
+    match requested {
+        Some(-1) => Ok(None),
+        Some(index)
+            if index >= 0
+                && file
+                    .subtitle_streams
+                    .iter()
+                    .any(|track| track.index == index) =>
+        {
+            Ok(Some(index))
+        }
+        Some(_) => Err(ApiError::BadRequest("unknown subtitle track".into())),
+        None => Ok(policy_default),
+    }
+}
+
+fn subtitle_requires_burn_in(
+    file: &MediaFile,
+    selected: Option<i64>,
+    overlay_enabled: bool,
+) -> bool {
+    selected
+        .and_then(|index| {
+            file.subtitle_streams
+                .iter()
+                .find(|track| track.index == index)
+        })
+        .is_some_and(|track| {
+            is_bitmap_subtitle(&track.codec) && !(overlay_enabled && is_pgs_subtitle(&track.codec))
+        })
+}
+
+fn apply_selected_subtitle(
+    decision: &mut Decision,
+    file: &MediaFile,
+    selected: Option<i64>,
+    requires_burn_in: bool,
+) {
+    if !requires_burn_in {
+        return;
+    }
+    let codec = selected
+        .and_then(|index| {
+            file.subtitle_streams
+                .iter()
+                .find(|track| track.index == index)
+        })
+        .map(|track| track.codec.as_str())
+        .unwrap_or("unknown");
+
+    // The established HDR guard refuses an SDR burn rather than silently
+    // replacing HDR/Dolby Vision video. Selection-aware preflight discloses
+    // that separately in `DecisionSelection`; do not add a reason for a failure
+    // that did not change the returned playback method.
+    if matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg")) {
+        return;
+    }
+
+    decision.method = playback::PlaybackMethod::Transcode;
+    decision.transcode_audio = true;
+    decision.preserve_dolby_vision = false;
+    decision.delivered_dynamic_range = "sdr";
+    decision
+        .reasons
+        .push(format!("selected subtitle codec {codec} requires burn-in"));
 }
 
 /// Classify a chapter title as an intro or end-credits marker. Case-insensitive
@@ -702,8 +817,9 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
 }
 
 /// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
-/// container=…&hdr=…&force=…` (runtime browser capabilities + quality override);
-/// native clients still pass `?profile=`.
+/// container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime browser
+/// capabilities + request-local track/quality choices); native clients still
+/// pass `?profile=`. `subtitle=-1` explicitly selects Off.
 pub async fn decision(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -736,20 +852,31 @@ pub async fn decision(
     // Select tracks before evaluating compatibility. The container's default
     // audio is only a fallback; the execution plan must describe the codec
     // selected by the same language policy exposed to the clients below.
-    let prefer_original = file
-        .audio_streams
-        .iter()
-        .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-        && file.audio_streams.len() > 1;
     let prefs = state.transcode.lang_prefs().await;
-    let selection = plurx_core::tracks::select_tracks(
+    let policy_selection = plurx_core::tracks::select_tracks(
         &file.audio_streams,
         &file.subtitle_streams,
-        prefer_original,
+        prefers_original_audio(&file.audio_streams),
         &prefs,
     );
-    set_selected_audio_default(&mut file.audio_streams, selection.audio_index);
-    let decision = q.decide(&file, dv_strippable(&state));
+    let selected_audio = effective_audio_selection(&file, q.audio, policy_selection.audio_index)?;
+    let selected_subtitle =
+        effective_subtitle_selection(&file, q.subtitle, policy_selection.subtitle_index)?;
+    let selection_requested = q.audio.is_some() || q.subtitle.is_some();
+    let selected_subtitle_requires_burn =
+        subtitle_requires_burn_in(&file, selected_subtitle, state.pgs_overlay_enabled);
+    let subtitle_burn_in_blocked_by_hdr = selected_subtitle_requires_burn
+        && matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"));
+    set_selected_audio_default(&mut file.audio_streams, selected_audio);
+    let mut decision = q.decide(&file, dv_strippable(&state));
+    if selection_requested {
+        apply_selected_subtitle(
+            &mut decision,
+            &file,
+            selected_subtitle,
+            selected_subtitle_requires_burn,
+        );
+    }
 
     tracing::info!(
         user_id = user.id,
@@ -765,6 +892,10 @@ pub async fn decision(
         dvprofile = q.dvprofile.as_deref().unwrap_or(""),
         dvhls = q.dvhls.unwrap_or_default(),
         force = q.force.as_deref().unwrap_or("auto"),
+        audio = selected_audio,
+        subtitle = selected_subtitle,
+        subtitle_requires_burn_in = selected_subtitle_requires_burn,
+        subtitle_burn_in_blocked_by_hdr,
         source_hdr = file.hdr.as_deref().unwrap_or("sdr"),
         source_hdr_format = file.hdr_format.as_deref().unwrap_or(""),
         method = ?decision.method,
@@ -790,7 +921,7 @@ pub async fn decision(
     let audio = audio_tracks(&file);
     let mut subtitles = sub_tracks(&file, state.pgs_overlay_enabled);
     for s in &mut subtitles {
-        s.default = selection.subtitle_index == Some(s.index);
+        s.default = selected_subtitle == Some(s.index);
     }
 
     // No "watching now" from here. Deciding how a file would be delivered is
@@ -806,6 +937,12 @@ pub async fn decision(
         delivery,
         audio,
         subtitles,
+        selection: selection_requested.then_some(DecisionSelection {
+            audio_index: selected_audio,
+            subtitle_index: selected_subtitle,
+            subtitle_requires_burn_in: selected_subtitle_requires_burn,
+            subtitle_burn_in_blocked_by_hdr,
+        }),
         markers,
         audio_offset_ms: 0,
         declared_offset_ms: declared_av_offset(&state, id).await,
@@ -1037,11 +1174,7 @@ fn remux_audio_index(
     if let Some(index) = audio_override.filter(|index| *index >= 0) {
         return index;
     }
-    let prefer_original = audio
-        .iter()
-        .any(|track| matches!(track.language.as_deref(), Some("jpn" | "ja" | "jp")))
-        && audio.len() > 1;
-    plurx_core::tracks::select_tracks(audio, &[], prefer_original, prefs)
+    plurx_core::tracks::select_tracks(audio, &[], prefers_original_audio(audio), prefs)
         .audio_index
         .unwrap_or(0)
         .max(0)
@@ -1082,6 +1215,8 @@ impl StreamQuery {
             dvprofile: self.dvprofile.clone(),
             dvhls: self.dvhls,
             force: self.force.clone(),
+            audio: None,
+            subtitle: None,
         }
     }
 }
@@ -2055,6 +2190,8 @@ mod tests {
 
         // Bitmap is neither, and always was.
         assert!(!tracks[3].text && !tracks[3].native);
+        assert!(subtitle_requires_burn_in(&file, Some(3), false));
+        assert!(!subtitle_requires_burn_in(&file, Some(0), false));
 
         // Default-off and old servers remain wire-compatible: the additive
         // field is absent rather than null.
@@ -2067,6 +2204,10 @@ mod tests {
 
         let enabled = sub_tracks(&file, true);
         assert_eq!(enabled[3].overlay, Some("pgs-v1"));
+        assert!(
+            !subtitle_requires_burn_in(&file, Some(3), true),
+            "an enabled PGS overlay keeps the video bytes untouched"
+        );
         assert!(enabled
             .iter()
             .enumerate()

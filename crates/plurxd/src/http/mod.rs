@@ -4221,6 +4221,119 @@ mod tests {
         assert!(why.contains("69 Mb/s"), "{body}");
     }
 
+    /// A caller-selected audio track must replace the policy default before
+    /// capability evaluation. This is the retained regression for #265: with
+    /// the production selection handling removed, the second request silently
+    /// returns the first request's direct-play verdict.
+    #[tokio::test]
+    async fn selected_unsupported_audio_changes_the_delivery_decision() {
+        use plurx_core::domain::{AudioStream, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let dir =
+            std::env::temp_dir().join(format!("plurx-selected-audio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("media dir");
+        let path = dir.join("Two Audio Tracks.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("media file");
+        let file = state
+            .store
+            .upsert_file(
+                seeded.movie,
+                &path.to_string_lossy(),
+                24,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(60_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "aac".into(),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "dts".into(),
+                            language: Some("fre".into()),
+                            default: false,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        let caps = "vcodec=h264&acodec=aac&container=mp4&hdr=0";
+
+        let (status, default) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{default}");
+        assert_eq!(default["method"], "direct_play", "{default}");
+        assert!(
+            default.get("selection").is_none(),
+            "the no-selection response keeps its prior JSON shape: {default}"
+        );
+
+        let (status, selected) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}&audio=1"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected["method"], "remux", "{selected}");
+        assert_eq!(selected["delivery"]["mode"], "remux", "{selected}");
+        assert_eq!(selected["delivery"]["aac"], true, "{selected}");
+        assert_eq!(selected["selection"]["audio_index"], 1, "{selected}");
+        assert!(
+            selected["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("audio codec dts unsupported"))
+                })),
+            "{selected}"
+        );
+
+        let (status, invalid) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}&audio=9"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        assert_eq!(invalid["error"], "unknown audio track", "{invalid}");
+
+        assert_eq!(
+            state
+                .store
+                .get_setting(plurx_core::store::keys::AUDIO_LANG)
+                .await
+                .expect("audio setting"),
+            None,
+            "request-local selection must not create or change a setting"
+        );
+    }
+
     /// `/decision` must say what to DO, not just what was decided. Clients
     /// that re-derived policy from `method` got it differently wrong on every
     /// platform — Android played transcode verdicts through the copy-only
@@ -4904,6 +5017,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn item_detail_reports_policy_defaults_and_language_match_states() {
+        use plurx_core::domain::{AudioStream, ProbeResult, SubtitleStream};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let dir =
+            std::env::temp_dir().join(format!("plurx-detail-tracks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("media dir");
+
+        let french_path = dir.join("French Subtitles.mp4");
+        std::fs::write(&french_path, b"present").expect("French media");
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &french_path.to_string_lossy(),
+                7,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "subrip".into(),
+                        language: Some("fre".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("French subtitle file");
+
+        // Deliberately absent on disk: stored track facts still have a useful
+        // answer, and rendering detail must not become a playback decision.
+        let no_subs_path = dir.join("Missing No Subtitles.mp4");
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &no_subs_path.to_string_lossy(),
+                8,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("subtitle-free file");
+
+        let anime_path = dir.join("Dual Audio.mp4");
+        std::fs::write(&anime_path, b"present").expect("dual-audio media");
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &anime_path.to_string_lossy(),
+                9,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "aac".into(),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "aac".into(),
+                            language: Some("jpn".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "subrip".into(),
+                        language: Some("eng".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dual-audio file");
+
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::logbuf::BufferLayer(Arc::clone(&state.logs)));
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+        let (status, detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", seeded.ep), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let files = detail["files"].as_array().expect("detail files");
+        let named = |filename: &str| {
+            files
+                .iter()
+                .find(|file| file["filename"] == filename)
+                .unwrap_or_else(|| panic!("missing {filename}: {detail}"))
+        };
+
+        let ordinary = named("Heat.mp4");
+        assert_eq!(ordinary["playback_defaults"]["audio"]["selected_index"], 0);
+        assert_eq!(
+            ordinary["playback_defaults"]["audio"]["preferred_language_status"],
+            "selected"
+        );
+        assert_eq!(
+            ordinary["playback_defaults"]["subtitle"]["selected_index"],
+            Value::Null
+        );
+        assert_eq!(
+            ordinary["playback_defaults"]["subtitle"]["preferred_language_status"], "available",
+            "English subtitles exist but Auto leaves them off over English audio: {ordinary}"
+        );
+
+        let french = named("French Subtitles.mp4");
+        assert_eq!(
+            french["playback_defaults"]["subtitle"]["preferred_language"],
+            "eng"
+        );
+        assert_eq!(
+            french["playback_defaults"]["subtitle"]["preferred_language_status"], "missing",
+            "{french}"
+        );
+
+        let none = named("Missing No Subtitles.mp4");
+        assert_eq!(none["available"], false, "{none}");
+        assert_eq!(
+            none["playback_defaults"]["subtitle"]["preferred_language_status"], "no_tracks",
+            "{none}"
+        );
+
+        let anime = named("Dual Audio.mp4");
+        assert_eq!(anime["playback_defaults"]["audio"]["selected_index"], 1);
+        assert_eq!(
+            anime["playback_defaults"]["audio"]["preferred_language_status"], "available",
+            "English is present, but the shared original-audio rule selects Japanese: {anime}"
+        );
+        assert_eq!(
+            anime["playback_defaults"]["subtitle"]["selected_index"], 0,
+            "{anime}"
+        );
+        assert_eq!(
+            anime["playback_defaults"]["subtitle"]["preferred_language_status"], "selected",
+            "{anime}"
+        );
+        assert_eq!(
+            state.transcode.active_sessions().await,
+            0,
+            "browsing detail must not create playback work"
+        );
+        assert!(
+            state
+                .logs
+                .tail("trace", usize::MAX)
+                .iter()
+                .all(|entry| !entry.message.contains("playback capability decision")),
+            "browsing detail must not emit a playback decision log"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_native_api_fixture_uses_the_servers_live_wire_keys() {
         const FIXTURE: &str = include_str!("../../../../tests/contracts/native-api.json");
 
@@ -4965,6 +5264,11 @@ mod tests {
                 "/files/0/video_codec",
                 "/files/0/audio_streams",
                 "/files/0/subtitle_streams",
+                "/files/0/playback_defaults/audio/preferred_language",
+                "/files/0/playback_defaults/audio/preferred_language_status",
+                "/files/0/playback_defaults/subtitle/selected_index",
+                "/files/0/playback_defaults/subtitle/preferred_language",
+                "/files/0/playback_defaults/subtitle/preferred_language_status",
                 "/files/0/available",
                 "/files/0/probed",
                 "/children",
@@ -6634,6 +6938,28 @@ mod tests {
         let admin = setup_admin(&app).await;
         let file = seed_mixed_subtitles(&state, Some("hdr10")).await;
 
+        let (status, preflight) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=1&subtitle=2"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preflight}");
+        assert_eq!(preflight["method"], "direct_play", "{preflight}");
+        assert_eq!(
+            preflight["selection"]["subtitle_requires_burn_in"], true,
+            "{preflight}"
+        );
+        assert_eq!(
+            preflight["selection"]["subtitle_burn_in_blocked_by_hdr"], true,
+            "selection preflight must preserve the established HDR refusal: {preflight}"
+        );
+        assert_eq!(preflight["reasons"], json!([]), "{preflight}");
+
         let (status, body) = call(
             &app,
             post(
@@ -6737,6 +7063,80 @@ mod tests {
             ],
             "{body}"
         );
+
+        let (status, selected) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&subtitle=3"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected["selection"]["subtitle_index"], 3, "{selected}");
+        assert_eq!(
+            selected["selection"]["subtitle_requires_burn_in"], true,
+            "bitmap subtitles without an enabled overlay must disclose their cost: {selected}"
+        );
+        assert_eq!(
+            selected["selection"]["subtitle_burn_in_blocked_by_hdr"], false,
+            "{selected}"
+        );
+        assert_eq!(selected["subtitles"][3]["default"], true, "{selected}");
+        assert_eq!(selected["method"], "transcode", "{selected}");
+        assert_eq!(selected["delivery"]["mode"], "transcode", "{selected}");
+        assert!(
+            selected["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("requires burn-in"))
+                })),
+            "{selected}"
+        );
+
+        let (status, off) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&subtitle=-1"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{off}");
+        assert_eq!(off["selection"]["subtitle_index"], Value::Null, "{off}");
+        assert_eq!(
+            off["selection"]["subtitle_requires_burn_in"], false,
+            "{off}"
+        );
+        assert_eq!(
+            off["selection"]["subtitle_burn_in_blocked_by_hdr"], false,
+            "{off}"
+        );
+        assert!(
+            off["subtitles"]
+                .as_array()
+                .is_some_and(|tracks| tracks.iter().all(|track| track["default"] == false)),
+            "Off must clear the effective subtitle default: {off}"
+        );
+
+        let (status, invalid) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&subtitle=9"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        assert_eq!(invalid["error"], "unknown subtitle track", "{invalid}");
 
         // The promise `native: false` makes, kept: asking for one of these by
         // index is refused before a session is ever spawned.

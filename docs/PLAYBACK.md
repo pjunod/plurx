@@ -22,9 +22,10 @@ and the player says so out loud in `/decision`.
       │            canPlayType() / MediaSource.isTypeSupported()
       ▼
  GET /api/v1/files/{id}/decision?<caps>&force=<auto|original|transcode>
+                                      &audio=<index>&subtitle=<index|-1>
       │
       ▼
- server pure fn:  (file streams, device profile, caps, prefs) ─▶ Decision
+ server pure fn:  (file streams, device profile, caps, prefs, selection) ─▶ Decision
       │           { method, delivery, reasons[], transcode_audio, audio[], subs[], markers[] }
       │
       │    `delivery` is the server-owned EXECUTION PLAN for the verdict, so a
@@ -85,7 +86,7 @@ one.
 | `server.apple-high-tier-master` | High-tier Apple HLS playlist envelope | HDR HEVC High-tier sessions without native text renditions serve their media playlist directly, avoiding AVPlayer's multivariant eligibility rejection without changing video samples. | High/Main-tier, HDR/SDR, and subtitle-gate Rust matrix |
 | `server.apple-high-tier-init` | High-tier Apple HLS initialization record | The generated initialization segment clears only its HEVC High-tier declaration for the same narrowly gated HDR sessions, allowing VideoToolbox to inspect otherwise decodable picture data. | Synthetic High-tier `hvcC` Rust regression |
 | `server.segmented-remux` | Progressive vs segmented remux hint | Every probed remux prefers segments. Average bitrate and storage speed cannot predict a transient path gap, while progressive fMP4 has only about 2.2 s of browser runway. The browser must still prove MSE accepts the exact codec pair; **Original · one stream** remains an explicit veto. | Eligibility units in `playback/mod.rs`; browser policy matrix |
-| `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
+| `server.track-selection` | Initial audio/subtitle | Item detail exposes the cold-start result from one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. A request-local `/decision` choice overrides it without changing settings. | Track-policy Rust matrix plus selection-aware HTTP regressions |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
 | `server.hdr-subtitle-burn-guard` | Old-client burn request on HDR | Session creation independently refuses `subtitle_burn` for a probed DV, HDR10, or HLG source with a machine-readable 422 before playback accounting or encoder creation. SDR and unprobed sources retain burn support. There is deliberately no override: missing client-plan context is not permission to replace HDR with SDR. | Rust HTTP refusal contract plus helper matrix |
 | `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
@@ -169,6 +170,57 @@ containers to MP4/MOV/M4V and asks the server to remux everything else into HLS.
 browsers. A 4K HEVC/HDR MKV with DTS audio reports the *same* verdict on Chrome
 and Safari — `remux`, because the container (mkv) and audio (dts) fail but the
 HEVC/HDR video passes on both. What differs is the *transport*, below.
+
+## Track preflight — one policy answer before Play
+
+Item detail and `/decision` answer different halves of the same question. Item
+detail says what the file contains and what the server-wide policy would choose;
+`/decision` says what this device can do with a request-local choice.
+
+Every file in `GET /api/v1/items/{id}` carries `playback_defaults.audio` and
+`playback_defaults.subtitle`:
+
+| Field | Meaning |
+|---|---|
+| `selected_index` | The `a:{index}` or `s:{index}` chosen by `select_tracks`; `null` means no selected track. |
+| `preferred_language` | The configured language code, included so a client can say "no English subtitles" without reading admin settings. |
+| `preferred_language_status` | `selected` · `available` (present, but policy chose something else or Off) · `missing` (tracks exist, none match) · `no_tracks`. |
+
+The original-language anime rule runs inside that same `select_tracks` call. An
+English dub can therefore be `available` while Japanese audio is the selected
+index; the status does not collapse "present" into "selected". The calculation
+uses stored stream rows and one settings snapshot. It does not probe or open the
+media, create a playback session, or emit the `playback capability decision`
+event. The detail endpoint's separate `available` field retains its existing
+path check; track selection adds no media I/O of its own.
+
+A client preflights a choice by adding `audio=<index>` and/or
+`subtitle=<index>` to `/decision`. `subtitle=-1` explicitly means Off. Unknown
+indices return 400 rather than promising a stream FFmpeg cannot map. The
+response then adds:
+
+```json
+"selection": {
+  "audio_index": 1,
+  "subtitle_index": 3,
+  "subtitle_requires_burn_in": true,
+  "subtitle_burn_in_blocked_by_hdr": false
+}
+```
+
+The audio choice replaces the policy default before codec compatibility is
+evaluated, so `method`, `reasons`, `transcode_audio`, and `delivery` all describe
+the selected codec. On SDR, selecting a bitmap subtitle with no enabled PGS
+overlay similarly changes the plan to transcode and names the burn-in reason.
+The established HDR guard remains stricter: it reports both
+`subtitle_requires_burn_in: true` and
+`subtitle_burn_in_blocked_by_hdr: true`, but keeps the HDR delivery unchanged,
+because a caller choice is not permission to replace Dolby Vision/HDR with SDR.
+Text sidecars and an enabled `pgs-v1` overlay report both fields as false.
+
+Selections live only for that request. Omitting both parameters uses the same
+policy path as before and omits `selection`, preserving the previous response
+shape; no setting is written in either case.
 
 ## The verdict — direct / remux / transcode
 
