@@ -185,9 +185,9 @@ test_anchor = "clearing an exact learned limit restores the ordinary HDR remux"
 [[decisions]]
 id = "web.supply-rescue"
 source = "crates/plurxd/src/web/playback-policy.js"
-source_anchor = "function decideRung("
+source_anchor = "function recordStallEpisode("
 test = "tests/playback/web-policy.test.js"
-test_anchor = "three supply stalls act while decode stalls never choose a rung"
+test_anchor = "two long supply-stall episodes do not satisfy the three-stall rescue"
 
 [[decisions]]
 id = "apple.transport-and-dv"

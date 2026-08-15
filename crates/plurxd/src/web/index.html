@@ -2647,21 +2647,25 @@ function beginWait(v){
   const generation=p._seekToken||0;
   p.waitTimer=setTimeout(()=>persistentWait(v,p,began,generation),PERSISTENT_STALL_MS);
 }
-function noteAutoStall(p,kind){
+function noteAutoStall(p,kind,episodeAtMs){
   const abr=p&&p.abr; if(!abr||!(kind==='supply'||kind==='decode')) return;
-  const now=performance.now(), events=abr.stallEvents[kind]||[];
-  // `waiting` and hls.js's bufferStalledError describe the same dry instant on
-  // the MSE path. Coalesce that pair so a single pause cannot satisfy the
-  // three-stall rescue by being reported through two APIs.
-  if(!events.length || now-events[events.length-1]>1000) events.push(now);
-  abr.stallEvents[kind]=events.filter(at=>now-at<PlaybackPolicy.AUTO_DEFAULTS.stallWindowMs);
+  const now=performance.now();
+  // `waiting` and hls.js's bufferStalledError describe opposite edges of one
+  // pause. Key both reports to the wait's start so a long pause cannot satisfy
+  // the three-stall rescue by being counted once at each edge.
+  const episodeAt=episodeAtMs!=null&&Number.isFinite(Number(episodeAtMs))
+    ? Number(episodeAtMs)
+    : (p.waitAt!=null?p.waitAt:now);
+  abr.stallEvents[kind]=PlaybackPolicy.recordStallEpisode({
+    events:abr.stallEvents[kind],episodeAtMs:episodeAt,nowMs:now
+  });
   abr.lastStallAtMs=now;
 }
-function recordWaitStall(p, kind, ms, runway, detail){
+function recordWaitStall(p, kind, ms, runway, detail, episodeAtMs){
   p.stalls=(p.stalls||0)+1;
   p.stallsByKind=p.stallsByKind||{supply:0,decode:0};
   p.stallsByKind[kind]++;
-  noteAutoStall(p,kind);
+  noteAutoStall(p,kind,episodeAtMs);
   const ctx=playbackContext();
   clientLog(Object.assign({level:"warn",event:"stall",detail:detail||kind,ms,
     message:`${kind} stall, ${(ms/1000).toFixed(1)}s, ${runway==null?"?":runway}s buffered`},
@@ -2672,14 +2676,15 @@ function recordWaitStall(p, kind, ms, runway, detail){
 function endWait(resumed){
   const p=PLAYER; if(!p||!p.waitAt) return;
   clearTimeout(p.waitTimer); p.waitTimer=null;
-  const ms=Math.round(performance.now()-p.waitAt);
+  const began=p.waitAt;
+  const ms=Math.round(performance.now()-began);
   const runway=p.waitRunway;
   const reported=!!p.waitReported;
   p.waitAt=null; p.waitRunway=null; p.waitReported=false;
   if(reported) return;                       // persistentWait already emitted it
   if(!resumed || ms<STALL_MIN_MS) return;    // a hitch, not a stall
   const kind=(runway!=null && runway<SUPPLY_RUNWAY_SECS)?"supply":"decode";
-  recordWaitStall(p,kind,ms,runway,kind);
+  recordWaitStall(p,kind,ms,runway,kind,began);
 }
 // A wait that never resumes used to be invisible forever: endWait() was the
 // only reporter and therefore never ran. Record it at a fixed deadline, then
@@ -2692,7 +2697,7 @@ function persistentWait(v,p,began,generation){
   const ms=Math.round(performance.now()-began), runway=p.waitRunway;
   const kind=(runway!=null && runway<SUPPLY_RUNWAY_SECS)?"supply":"decode";
   p.waitReported=true;
-  recordWaitStall(p,kind,ms,runway,`${kind}-persistent`);
+  recordWaitStall(p,kind,ms,runway,`${kind}-persistent`,began);
   p.stallFrom=pbPosSec();
   const action=PlaybackPolicy.stallRecoveryAction({
     method:p.method, quality:playQuality(),
@@ -4677,7 +4682,9 @@ function attachHls(video, playlistUrl, startAt){
           const p=PLAYER;
           if(p){
             if(/bufferstallederror/i.test(det)){
-              noteAutoStall(p,bufferRunway(video)<SUPPLY_RUNWAY_SECS?'supply':'decode');
+              const stallRunway=p.waitAt!=null?p.waitRunway:bufferRunway(video);
+              noteAutoStall(p,
+                stallRunway<SUPPLY_RUNWAY_SECS?'supply':'decode',p.waitAt);
             }
             p._hlsEvt=p._hlsEvt||{};
             const n=(p._hlsEvt[det]=(p._hlsEvt[det]||0)+1);

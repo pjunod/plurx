@@ -142,6 +142,38 @@
     return (bytes * 8) / elapsedMs;
   }
 
+  // One browser pause can be reported near its start by hls.js and again at
+  // its end by the video element. Both reports carry the wait's start time as
+  // their episode identity, so a long pause still contributes exactly one
+  // event to the rolling rescue window.
+  function recordStallEpisode({
+    events = [],
+    episodeAtMs = null,
+    nowMs = 0,
+    windowMs = AUTO_DEFAULTS.stallWindowMs,
+  } = {}) {
+    const now = Number(nowMs);
+    const episodeAt = episodeAtMs == null ? NaN : Number(episodeAtMs);
+    const window = Number(windowMs);
+    if (!Number.isFinite(now) || !(window > 0)) return [];
+    const retained = (Array.isArray(events) ? events : [])
+      .map(Number)
+      .filter(
+        (at) =>
+          Number.isFinite(at) &&
+          at <= now &&
+          now - at < window,
+      );
+    if (
+      Number.isFinite(episodeAt) &&
+      episodeAt <= now &&
+      !retained.includes(episodeAt)
+    ) {
+      retained.push(episodeAt);
+    }
+    return retained;
+  }
+
   function playerPixelHeight({
     layoutHeight = null,
     devicePixelRatio = 1,
@@ -756,6 +788,7 @@
     initialAutoRung,
     bandwidthSeedBps,
     transferSampleKbps,
+    recordStallEpisode,
     playerPixelHeight,
     decideRung,
     sessionHeight,

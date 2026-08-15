@@ -506,6 +506,34 @@ test("three supply stalls act while decode stalls never choose a rung", () => {
   assert.equal(decode.reason, null);
 });
 
+test("two long supply-stall episodes do not satisfy the three-stall rescue", () => {
+  let events = [];
+  for (const stall of [
+    { start: 5_000, duration: 3_000 },
+    { start: 25_000, duration: 3_000 },
+  ]) {
+    events = policy.recordStallEpisode({
+      events,
+      episodeAtMs: stall.start,
+      nowMs: stall.start + 100,
+    });
+    events = policy.recordStallEpisode({
+      events,
+      episodeAtMs: stall.start,
+      nowMs: stall.start + stall.duration,
+    });
+  }
+  assert.deepEqual(events, [5_000, 25_000]);
+  assert.equal(events.length >= 3, false);
+
+  events = policy.recordStallEpisode({
+    events,
+    episodeAtMs: 45_000,
+    nowMs: 48_000,
+  });
+  assert.equal(events.length, 3, "a third real episode reaches the threshold");
+});
+
 test("mild pressure needs two samples plus cooldown, dwell, and switch gain", () => {
   const first = policy.decideRung({
     ladder: serverLadder,
