@@ -194,9 +194,13 @@ Every file in `GET /api/v1/items/{id}` carries `playback_defaults.audio` and
 The original-language anime rule runs inside that same `select_tracks` call. An
 English dub can therefore be `available` while Japanese audio is the selected
 index; the status does not collapse "present" into "selected". Language tags are
-compared case-insensitively: item detail, `/decision`, and offline options all
-route through the one `prefers_original_audio` predicate, so a file tagged `JPN`
-is not advertised one way and quoted another. The calculation
+compared case-insensitively: item detail, `/decision`, offline options, and the
+live HLS session all route through the one `prefers_original_audio` predicate, so
+a file tagged `JPN` is not advertised one way, quoted another, and played a
+third. Scanning stores `tags.language` exactly as the container wrote it, so that
+folding is what makes an upper-case tag behave like a lower-case one; a caller
+that adds a fifth delivery path uses the shared predicate rather than its own
+match. The calculation
 uses stored stream rows and one settings snapshot. It does not probe or open the
 media, create a playback session, or emit the `playback capability decision`
 event. The detail endpoint's separate `available` field retains its existing

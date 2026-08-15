@@ -2938,11 +2938,12 @@ impl TranscodeManager {
         // anime-style (REQ-SUB-2), and honour the server-wide language
         // preferences otherwise. Native WebVTT-capable tracks remain media
         // renditions; only bitmap/styled fallbacks are drawn into the video.
-        let prefer_original = file
-            .audio_streams
-            .iter()
-            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-            && file.audio_streams.len() > 1;
+        // The same predicate item detail, `/decision` and the offline quote
+        // use. It folds language-tag case, which an inline copy here did not:
+        // scanning stores `tags.language` exactly as the container wrote it,
+        // so a `JPN` dual-audio file was advertised as Japanese by all three
+        // of those surfaces and then played as English by this one.
+        let prefer_original = plurx_core::tracks::prefers_original_audio(&file.audio_streams);
         let prefs = self.lang_prefs().await;
         let selection = plurx_core::tracks::select_tracks(
             &file.audio_streams,

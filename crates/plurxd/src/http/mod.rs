@@ -5393,6 +5393,30 @@ mod tests {
             shouty["playback_defaults"]["subtitle"]["selected_index"],
             "{offline}"
         );
+
+        // The fourth surface, and the only one that actually plays the file.
+        // The other three merely describe it, so a session that disagreed with
+        // them would advertise Japanese and then deliver English — the failure
+        // this whole test exists to catch. Compared against the advertised
+        // default rather than a literal `1`, so a later change to the policy
+        // moves all four together or fails here.
+        let session_audio = state
+            .transcode
+            .session_audio_index(
+                &state
+                    .store
+                    .get_file(file)
+                    .await
+                    .expect("file lookup")
+                    .expect("uppercase-tag file row"),
+            )
+            .await;
+        assert_eq!(
+            serde_json::json!(session_audio),
+            shouty["playback_defaults"]["audio"]["selected_index"],
+            "a live session disagreed with the advertised default about an \
+             uppercase tag: session chose {session_audio:?}"
+        );
     }
 
     #[tokio::test]
