@@ -893,16 +893,33 @@ fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Move a pre-M3 one-voter cluster from its committed loopback address to the
-/// operator's advertised address before any peer is admitted.
+/// Rebuild a sole voter's local Raft metadata around its unchanged state
+/// machine, for the two cases that need it before Hiqlite opens the target.
 ///
-/// Openraft supports an atomic `SetNodes` address update, but Hiqlite 0.14 does
-/// not expose it. Rebuilding only the one-voter Raft metadata from Hiqlite's
-/// metadata-reset backup is safe while there is exactly one voter; doing the
-/// same after a peer exists would fork membership history and is refused.
+/// **Address change.** Openraft supports an atomic `SetNodes` address update,
+/// but Hiqlite 0.14 does not expose it. Rebuilding only the one-voter Raft
+/// metadata from Hiqlite's metadata-reset backup is safe while there is exactly
+/// one voter; doing the same after a peer exists would fork membership history
+/// and is refused.
+///
+/// **Ungraceful shutdown.** Hiqlite's `auto-heal` deletes the whole
+/// state-machine database whenever it finds its own lock file at startup, and
+/// expects the Raft log to rebuild it. Activation imports the operator's SQLite
+/// data straight into that database rather than through Raft, and nothing
+/// snapshots before `logs_until_snapshot`, so for an activated node that
+/// replay reconstructs nothing and the install is lost. Running first, while
+/// the database is still intact, turns that into an ordinary crash recovery:
+/// the committed state machine is preserved and only the one-voter Raft
+/// metadata is rebuilt around it. A sole voter acks a write only after applying
+/// it, so the discarded log tail holds nothing a client was told was durable.
+/// A node with peers is left to Hiqlite, whose catch-up from the leader is the
+/// correct recovery there and does not fork membership.
 #[cfg(feature = "hiqlite-store")]
 fn readdress_single_voter_if_needed(config: &Config) -> Result<(), StoreError> {
-    if config.cluster.advertise_host.trim().is_empty() {
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    let ungraceful_shutdown = path_exists(&active.join("state_machine").join("lock"))?;
+    let advertised = !config.cluster.advertise_host.trim().is_empty();
+    if !advertised && !ungraceful_shutdown {
         return Ok(());
     }
     let existing_membership = read_local_membership(&config.storage.data_dir)?;
@@ -912,13 +929,17 @@ fn readdress_single_voter_if_needed(config: &Config) -> Result<(), StoreError> {
     // cluster harness - and testing loopback-ness there never reaches a fixed
     // point, so every boot would rebuild the state machine and every joined
     // follower would refuse to start.
-    if let Some(membership) = &existing_membership {
-        if membership.local == configured_local_peer(config, membership.raft_id)? {
-            return Ok(());
+    let address_changed = match &existing_membership {
+        Some(membership) if advertised => {
+            membership.local != configured_local_peer(config, membership.raft_id)?
         }
+        Some(_) => false,
+        None => advertised,
+    };
+    if !address_changed && !ungraceful_shutdown {
+        return Ok(());
     }
 
-    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     let marker = read_activation_marker(&active)?;
     let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     if let Some(membership) = &existing_membership {
@@ -937,11 +958,20 @@ fn readdress_single_voter_if_needed(config: &Config) -> Result<(), StoreError> {
     // one-node Raft metadata that silently ejects it.
     let admitted_peers = admitted_peer_count(&active, identity.raft_id)?;
     if admitted_peers > 0 {
-        return Err(StoreError::Migration(format!(
-            "cluster.advertise_host cannot change after another voter or learner exists \
-             ({admitted_peers} other node(s) are admitted); use a future online \
-             membership-reconfiguration path instead"
-        )));
+        if address_changed {
+            return Err(StoreError::Migration(format!(
+                "cluster.advertise_host cannot change after another voter or learner exists \
+                 ({admitted_peers} other node(s) are admitted); use a future online \
+                 membership-reconfiguration path instead"
+            )));
+        }
+        // Ungraceful shutdown with peers: rebuilding one-node Raft metadata
+        // here would eject them. Hiqlite rebuilds this node from the leader.
+        tracing::warn!(
+            admitted_peers,
+            "recovering from an ungraceful shutdown by catching up from the cluster"
+        );
+        return Ok(());
     }
     let desired = configured_local_peer(config, identity.raft_id)?;
     let backup = config

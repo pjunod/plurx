@@ -154,11 +154,20 @@ The variable is evaluated only while activation is pending, so a stale value
 cannot take an already-activated node offline.
 
 After activation, an ungraceful death may leave Hiqlite's state-machine lock.
-The next boot automatically discards and rebuilds that derived state machine
-from the one voter's retained local Raft log and snapshot, including
-acknowledged state newer than the frozen SQLite source. Never delete the lock:
-unlinking it skips the reconstruction that makes recovery safe. If the active
-target itself is missing, startup follows the lost-target refusal in
+Left to itself, Hiqlite would delete the state-machine database and rebuild it
+by replaying the Raft log — which reconstructs nothing on an activated node,
+because activation imports the operator's SQLite data directly into that
+database rather than through Raft, and nothing snapshots before 10,000 log
+entries. Startup therefore repairs a sole voter first, while the database is
+still intact: the committed state machine is preserved and only the one-voter
+Raft metadata is rebuilt around it, keeping acknowledged state newer than the
+frozen SQLite source. A sole voter acknowledges a write only after applying it,
+so nothing a client was told was durable is in the discarded log tail. A node
+that has admitted a peer is left to Hiqlite instead, whose catch-up from the
+leader is the correct recovery there and does not fork membership. Never delete
+the lock by hand: unlinking it skips this repair and hands an activated node to
+the rebuild that cannot restore it. If the active target itself is missing,
+startup follows the lost-target refusal in
 [Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
 SQLite.
 
