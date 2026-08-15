@@ -92,6 +92,12 @@ app-private cache, and a cache-only player for offline viewing. Android TV and
 Google TV deliberately hide offline controls; a television is expected to
 remain attached to the server and keeps the existing streaming path.
 
+**Native stall recovery contract** — The server accepts a bound
+`previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
+`height` under the attempt's `request_id`. That wire is additive and available
+to both native codebases. Their watchdog/cause-precedence integrations remain
+separate work, so neither client is yet claimed to step down on a stall.
+
 **Roku** — Hardest constraints, embraced rather than fought: SceneGraph Video node only (no custom demux/decoders). Envelope: HLS/DASH preferred; HEVC 4K@40Mbps, **AVC capped 1080p/10Mbps**, AV1 only newer devices/DASH-only; DV/HDR10+ device-tier-dependent; AC3/EAC3/DTS passthrough-only with an AAC stereo fallback track required; subs TTML/WebVTT/SRT only → **PGS/VobSub must burn in server-side**. plurx's remux/transcode pipeline makes Roku a well-behaved HLS client. Distribution reality: private channels are dead (since 2022); dev mode sideloads exactly one app; beta channels last 120 days/20 users. Roku ships last, and public store certification is the eventual real path there.
 
 **Explicit non-targets (2026):** Fire TV's new Vega OS devices (no sideloading at all — Android Fire TVs still work via codebase 3), Vidaa/Hisense and Vizio (no private install path), Titan OS (web-app platform — port candidate if it ever opens self-serve).

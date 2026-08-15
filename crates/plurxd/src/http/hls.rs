@@ -58,6 +58,10 @@ pub struct StartResponse {
     /// requested position. Old clients continue using `start_seconds`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_origin_ms: Option<i64>,
+    /// The normalized output height this request actually received. For a
+    /// bound stall reopen this is the persisted one-rung-down answer, repeated
+    /// unchanged on a transport replay of the same `request_id`.
+    pub height: i64,
     pub encoder: String,
     /// The whole stream already exists on disk (a pre-transcode cache hit).
     /// The player treats it like direct play: seek by `currentTime`, and don't
@@ -95,6 +99,11 @@ pub struct CreateSession {
     pub playback_id: String,
     /// Optional idempotency key for this one attempt.
     pub request_id: Option<String>,
+    /// Exact predecessor for a typed recovery. Both fields are required for a
+    /// stall reopen, which also requires `request_id`; ordinary seeks and
+    /// track changes omit them.
+    pub previous_session_id: Option<String>,
+    pub reopen_reason: Option<crate::transcode::ReopenReason>,
     /// Target height for a transcode. Ignored when `copy` is set. Omitted
     /// means Auto, and Auto is the SERVER's decision: the rung depends on
     /// which encoder wins, and the player only learns that from the response
@@ -127,13 +136,13 @@ pub struct CreateSession {
 }
 
 impl CreateSession {
-    /// `height` is fully resolved by the caller — Auto answered, explicit
-    /// rungs snapped, the source-height promise honored — because resolution
-    /// needs the store and the encoder choice, and because it must be settled
-    /// before the request is fingerprinted, or two identical requests could
-    /// not recognise each other.
+    /// `height` is initially resolved by the caller — Auto answered, explicit
+    /// rungs snapped, the source-height promise honored. A bound stall reopen
+    /// is the one later normalization: `claim_request` replaces this value
+    /// from the predecessor's resolved rung and persists it before supersede.
     fn into_request(self, file_id: i64, height: i64) -> crate::transcode::SessionRequest {
         use crate::transcode::SessionKind;
+        let automatic = self.height.is_none();
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
                 aac: self.aac == Some(true),
@@ -146,6 +155,9 @@ impl CreateSession {
             file_id,
             playback_id: self.playback_id,
             request_id: self.request_id,
+            automatic,
+            previous_session_id: self.previous_session_id,
+            reopen_reason: self.reopen_reason,
             kind,
             start_seconds: self.start.unwrap_or(0.0).max(0.0),
             audio_index: self.audio.filter(|a| *a >= 0),
@@ -258,14 +270,19 @@ pub async fn create(
         }
     }
     let request = req.into_request(id, height);
-    let delivered = session_delivered_dynamic_range(source.as_ref(), &request.kind);
+    let info = state
+        .transcode
+        .create_session(&request, &user.username)
+        .await
+        // A reused request id asking for a different stream is the client's
+        // mistake, not the server's; say which it is.
+        .map_err(|error| session_start_error(id, error))?;
+    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind);
     // A session being created is playback beginning — the honest moment for
-    // the scrobble that used to fire from `/decision`. The method is the one
-    // this request settled on rather than one read back off an encoder label:
-    // `encoder` says "cached" on a cache hit and changes under a
-    // hardware→software fallback, so a copy-remux inferred from it could
-    // report itself as a transcode.
-    let method = match request.kind {
+    // the scrobble that used to fire from `/decision`. Read the normalized
+    // route from the result: a bound Auto stall may have changed a copy request
+    // into a lower transcode before the session was spawned.
+    let method = match info.kind {
         crate::transcode::SessionKind::Copy { .. } => crate::delivery::Method::HlsCopy,
         crate::transcode::SessionKind::Transcode { .. } => crate::delivery::Method::Transcode,
     };
@@ -277,13 +294,6 @@ pub async fn create(
         method,
         Some(&request.playback_id),
     );
-    let info = state
-        .transcode
-        .create_session(&request, &user.username)
-        .await
-        // A reused request id asking for a different stream is the client's
-        // mistake, not the server's; say which it is.
-        .map_err(|error| session_start_error(id, error))?;
     let playlist_url = if native_subtitles {
         // Give the multivariant playlist its own path. AVPlayer caches HLS
         // resources by URL and can otherwise conflate `index.m3u8?native=1`
@@ -304,6 +314,7 @@ pub async fn create(
         duration_ms: info.duration_ms,
         start_seconds: info.start_seconds,
         media_origin_ms: Some((info.media_origin_seconds * 1000.0).round() as i64),
+        height: info.target_height,
         encoder: info.encoder.to_owned(),
         vod: info.vod,
         ladder: crate::transcode::ladder(source_height),
@@ -319,6 +330,9 @@ fn session_start_error(file_id: i64, error: String) -> ApiError {
     tracing::warn!(file = file_id, "session create failed: {error}");
     if crate::transcode::is_retryable_capacity_error(&error) {
         return ApiError::ServiceUnavailable(error);
+    }
+    if let Some(reason) = crate::transcode::invalid_reopen_reason(&error) {
+        return ApiError::BadRequest(reason.to_owned());
     }
     // A build that lacks a filter is not a server fault to be swallowed as
     // "internal server error" — it is a fact about this install that the
@@ -367,6 +381,8 @@ pub async fn start(
     let legacy = CreateSession {
         playback_id: format!("legacy:{}:{id}", user.username),
         request_id: None,
+        previous_session_id: None,
+        reopen_reason: None,
         height: q.height,
         subtitle_burn: None, // the deprecated GET bridge never offered a burn
         native_subtitles: None,
@@ -1601,6 +1617,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_typed_stall_reopen_reaches_the_claim_unchanged() {
+        let body = serde_json::json!({
+            "playback_id": "native-player",
+            "request_id": "stall-attempt",
+            "previous_session_id": "previous-session",
+            "reopen_reason": "stall",
+            "start": 42.5,
+            "audio": 2,
+            "subtitle_burn": 5
+        });
+        let create: CreateSession = serde_json::from_value(body).expect("typed create body");
+        let request = create.into_request(17, 1080);
+
+        assert!(request.automatic);
+        assert_eq!(
+            request.previous_session_id.as_deref(),
+            Some("previous-session")
+        );
+        assert_eq!(
+            request.reopen_reason,
+            Some(crate::transcode::ReopenReason::Stall)
+        );
+        assert_eq!(request.start_seconds, 42.5);
+        assert_eq!(request.audio_index, Some(2));
+        assert_eq!(request.subtitle_burn, Some(5));
+
+        let unknown = serde_json::json!({
+            "playback_id": "native-player",
+            "request_id": "future-attempt",
+            "previous_session_id": "previous-session",
+            "reopen_reason": "network_changed"
+        });
+        assert!(serde_json::from_value::<CreateSession>(unknown).is_err());
+    }
+
+    #[test]
+    fn an_invalid_bound_reopen_is_a_400_not_an_idempotency_conflict() {
+        let response = session_start_error(
+            42,
+            "invalid stall reopen: the previous session does not belong to this user, playback, and file"
+                .into(),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A build that cannot burn is a fact the viewer can act on, not an
     /// "internal server error" whose message is deliberately dropped.
     #[test]
@@ -1768,6 +1831,8 @@ mod tests {
         let request = CreateSession {
             playback_id: "player".into(),
             request_id: Some("attempt".into()),
+            previous_session_id: None,
+            reopen_reason: None,
             height: None,
             subtitle_burn: None,
             native_subtitles: None,
@@ -1790,6 +1855,8 @@ mod tests {
         let request = CreateSession {
             playback_id: "apple-bitmap".into(),
             request_id: None,
+            previous_session_id: None,
+            reopen_reason: None,
             height: Some(2160),
             subtitle_burn: Some(5),
             native_subtitles: Some(true),

@@ -232,6 +232,22 @@ most one upgrade per 60 s; switch-interruption p95 is measured and
 documented; recreating hls.js demonstrably preserves the bandwidth
 estimate.
 
+## Native stall-reopen server boundary
+
+The server half landed 2026-08-15. A native Auto session that reopens after a
+stall sends one `request_id` with the exact `previous_session_id` and typed
+`reopen_reason: "stall"`. The server verifies the authenticated user,
+`playback_id`, and file, reads that predecessor's resolved rung once, and
+stores the next-lower target in the existing request claim before replacement.
+`StartResponse.height` is the authoritative answer. Replaying the same request
+returns the same session and height; the 360p floor repeats once under the
+client's existing recovery budget, and a manual height is never stepped.
+
+Omitting either bound field, naming a stale or foreign session, or sending an
+unknown reason is a client error. Ordinary seeks and track changes omit both
+fields and keep their existing behavior. Apple and Android adoption remains a
+separate client change; until then, this endpoint addition is inert for them.
+
 ## Phase 3 — seamless switching (optional, the majors' UX)
 
 True multivariant HLS, adapted to JIT: `master.m3u8` advertises every rung

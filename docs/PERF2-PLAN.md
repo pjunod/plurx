@@ -891,6 +891,12 @@ prediction-error cuts) and the cost here is a table:
 
 ### 7.3 Native clients get a way down — bound, normalized, replayable (review R5)
 
+**Server status (2026-08-15): implemented.** Session create now accepts the
+bound cause below and returns the normalized `height` in `StartResponse`. The
+claim stores that answer before it can supersede the predecessor. Apple and
+Android still need their separately owned watchdog/reopen work; this server
+slice does not claim native recovery by itself.
+
 A bare `reopen_reason=stall` flag is not enough to make "one rung
 down" deterministic: the create body carries no prior-session binding,
 a transport retry re-normalizes against different state once the first
@@ -908,7 +914,7 @@ concurrent causes last-writer-wins. The contract:
 - **Normalized once, under the existing idempotency key.** The
   resolved target is persisted under `request_id` *before* the
   previous session is superseded — extending `claim_request`
-  (`transcode.rs:3204`), not adding a parallel retry store (the
+  (`TranscodeManager::claim_request`), not adding a parallel retry store (the
   review's clean-list endorses exactly this). A transport replay of
   the same `request_id` returns the same session and target; it can
   never step down twice or 409 on a re-normalized fingerprint.
@@ -1288,7 +1294,8 @@ All changes flow through the single `effective_recipe()` builder
 ### 11.5 API deltas
 
 `DecisionResponse`/`StartResponse` gain `prior_kbps: Option<u32>`
-(N4); session create accepts `previous_session_id` + a typed
+(N4), and `StartResponse` reports the normalized `height`; session create
+accepts `previous_session_id` + a typed
 `reopen_reason`, with the resolved target persisted under `request_id`
 before supersede (N4, review R5), and optionally the same `Caps`
 object the decision request carries (N5, review R6); `SessionInfo`
