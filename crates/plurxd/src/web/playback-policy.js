@@ -24,6 +24,7 @@
     dwellMs: 60_000,
     nearEmptyRunwaySeconds: 1.5,
     restartCostSeconds: 2.5,
+    recentSampleMaxAgeMs: 15_000,
   });
 
   const DECODE_LIMIT_DEFAULTS = Object.freeze({
@@ -127,6 +128,20 @@
       : null;
   }
 
+  function transferSampleKbps({
+    loadedBytes = null,
+    loadingStartMs = null,
+    loadingEndMs = null,
+  } = {}) {
+    const bytes = Number(loadedBytes);
+    const start = Number(loadingStartMs);
+    const end = Number(loadingEndMs);
+    const elapsedMs = end - start;
+    if (!(bytes > 0) || !(elapsedMs > 0)) return null;
+    // bytes * 8 / milliseconds is numerically kilobits per second.
+    return (bytes * 8) / elapsedMs;
+  }
+
   function playerPixelHeight({
     layoutHeight = null,
     devicePixelRatio = 1,
@@ -182,6 +197,8 @@
     ladder,
     currentHeight,
     estimateKbps = null,
+    recentEstimateKbps = null,
+    recentEstimateAtMs = null,
     runwaySeconds = null,
     previousRunwaySeconds = null,
     recentSpeed = null,
@@ -213,6 +230,19 @@
     }
     const current = available[currentIndex];
     const estimate = estimateKbps == null ? NaN : Number(estimateKbps);
+    const recentEstimate = recentEstimateKbps == null
+      ? NaN
+      : Number(recentEstimateKbps);
+    const recentEstimateAt = recentEstimateAtMs == null
+      ? NaN
+      : Number(recentEstimateAtMs);
+    const freshRecentEstimate =
+      recentEstimate > 0 &&
+      Number.isFinite(recentEstimateAt) &&
+      recentEstimateAt <= nowMs &&
+      nowMs - recentEstimateAt <= defaults.recentSampleMaxAgeMs
+        ? recentEstimate
+        : NaN;
     const runway = runwaySeconds == null ? NaN : Number(runwaySeconds);
     const priorRunway = previousRunwaySeconds == null
       ? NaN
@@ -230,7 +260,18 @@
     const severe = activeSupplyStall || nearEmpty || farBelow || supplyBurst;
 
     if (severe && currentIndex > 0) {
-      const safe = highestSafeRung(available, estimate, defaults);
+      // hls.js's EWMA intentionally carries history. At a sharp cliff that
+      // history can briefly make the next rung look safe, even though the
+      // fragment that just completed already measured the lower link. During
+      // severe pressure only, bound the stable EWMA by that fresh transfer so
+      // one restart lands below the cliff instead of teaching a replacement
+      // instance the same lesson and walking the ladder.
+      const severeEstimate = freshRecentEstimate > 0
+        ? (estimate > 0
+          ? Math.min(estimate, freshRecentEstimate)
+          : freshRecentEstimate)
+        : estimate;
+      const safe = highestSafeRung(available, severeEstimate, defaults);
       const safeIndex = safe
         ? closestRungIndex(available, safe.height)
         : currentIndex - 1;
@@ -714,6 +755,7 @@
     normalizedLadder,
     initialAutoRung,
     bandwidthSeedBps,
+    transferSampleKbps,
     playerPixelHeight,
     decideRung,
     sessionHeight,

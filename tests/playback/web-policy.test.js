@@ -258,6 +258,18 @@ test("an outgoing hls.js estimate survives a restart and outranks the cold prior
   assert.equal(policy.bandwidthSeedBps({}), null);
 });
 
+test("a completed fragment provides a fresh severe-pressure estimate", () => {
+  assert.equal(
+    policy.transferSampleKbps({
+      loadedBytes: 250_000,
+      loadingStartMs: 1_000,
+      loadingEndMs: 2_000,
+    }),
+    2_000,
+  );
+  assert.equal(policy.transferSampleKbps({ loadedBytes: 250_000 }), null);
+});
+
 test("learned decode identity is versioned, deterministic, and bitrate-bucketed", () => {
   const reordered = {
     bitrate: demandingDolbyVision.bitrate,
@@ -428,6 +440,49 @@ test("an emergency downgrade cannot be stranded by the player-height ceiling", (
     assert.equal(decision.reason, "supply stalls", `player height ${playerHeight}`);
     assert.equal(decision.emergency, true, `player height ${playerHeight}`);
   }
+});
+
+test("one cliff episode uses fresh throughput and cannot restart twice", () => {
+  const first = policy.decideRung({
+    ladder: serverLadder,
+    currentHeight: 720,
+    // The pre-cliff EWMA still admits 480p; the completed fragment measures
+    // the shaped link closely enough that only 360p is sustainable.
+    estimateKbps: 2_800,
+    recentEstimateKbps: 2_000,
+    recentEstimateAtMs: 5_000,
+    runwaySeconds: 8,
+    nowMs: 10_000,
+  });
+  assert.equal(first.height, 360);
+  assert.equal(first.reason, "bandwidth cliff");
+  assert.equal(first.emergency, true);
+
+  const duplicateSupplySignal = policy.decideRung({
+    ladder: serverLadder,
+    currentHeight: first.height,
+    estimateKbps: 2_800,
+    recentEstimateKbps: 2_000,
+    recentEstimateAtMs: 5_000,
+    runwaySeconds: 0.1,
+    activeSupplyStall: true,
+    supplyStalls: 3,
+    nowMs: 10_000,
+  });
+  assert.equal(duplicateSupplySignal.height, 360);
+  assert.equal(duplicateSupplySignal.reason, null);
+  assert.equal(duplicateSupplySignal.emergency, false);
+
+  const staleSample = policy.decideRung({
+    ladder: serverLadder,
+    currentHeight: 720,
+    estimateKbps: 2_800,
+    recentEstimateKbps: 2_000,
+    recentEstimateAtMs: 5_000,
+    runwaySeconds: 8,
+    nowMs: 20_001,
+  });
+  assert.equal(staleSample.height, 480, "a stale transfer cannot steer a switch");
 });
 
 test("three supply stalls act while decode stalls never choose a rung", () => {

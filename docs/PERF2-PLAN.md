@@ -832,6 +832,12 @@ since adds:
   the dwell horizon exceeds the restart cost. Asymmetric thresholds
   mirror hls.js's own 0.95-stay/0.7-up factors, widened for the
   restart cost.
+- **Cliff samples outrank pre-cliff memory.** hls.js's EWMA remains the stable
+  estimate for ordinary control, but during severe pressure the controller
+  bounds it by a completed-fragment throughput sample no more than 15 seconds
+  old. The 8 → 1.5 Mb/s acceptance run showed the EWMA briefly admitting
+  480p after the link had already measured below it, causing a second restart
+  to 360p; the fresh severe-only bound makes the first restart the final one.
 - **Supply-stall rescue** (B17, the ADAPTIVE-QUALITY "adjacent win"):
   ≥3 `supply`-classified stalls in 60 s (A-Q's threshold; tune with N0
   data) on a ladder session → severe pressure (one-move drop). On

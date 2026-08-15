@@ -157,6 +157,10 @@ it unit-tests without a video element:
 - **Severe pressure** (an active supply stall, ≤1.5 s of runway, three
   supply stalls in 60 s, or an estimate below 0.7× the current rung) selects
   the highest rung whose `total_kbps` is ≤0.95× the estimate **in one move**.
+  During severe pressure, the stable hls.js EWMA is bounded by the most recent
+  completed-fragment throughput when that sample is at most 15 s old. The EWMA
+  deliberately remembers the pre-cliff link; the fresh bound prevents that
+  memory from admitting an intermediate rung and forcing a second restart.
   If no rung fits, the lowest rung is the only actionable choice. It never
   walks one rung at a time through a
   bandwidth cliff, which leaves the player above the sustainable rate for
