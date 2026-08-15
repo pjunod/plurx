@@ -86,8 +86,13 @@
     playerHeight = Infinity,
     defaults = AUTO_DEFAULTS,
   }) {
-    const available = normalizedLadder(ladder, playerHeight);
-    if (!available.length) return null;
+    const fullLadder = normalizedLadder(ladder);
+    if (!fullLadder.length) return null;
+    const cappedLadder = normalizedLadder(fullLadder, playerHeight);
+    // The cap is a ceiling, not permission to discard the ladder's floor. A
+    // player shorter than the lowest rung still starts at that lowest rung
+    // when a prior or persisted choice asks the client to pick explicitly.
+    const available = cappedLadder.length ? cappedLadder : [fullLadder[0]];
     const prior = highestSafeRung(available, priorKbps, defaults);
     if (prior) return prior.height;
     if (persistedHeight > 0) {
@@ -111,6 +116,26 @@
     return Number.isFinite(priorKbps) && priorKbps > 0
       ? priorKbps * 1_000
       : null;
+  }
+
+  function playerPixelHeight({
+    layoutHeight = null,
+    devicePixelRatio = 1,
+    intrinsicHeight = null,
+  } = {}) {
+    const cssHeight = Number(layoutHeight);
+    if (cssHeight > 0) {
+      const ratio = Number(devicePixelRatio);
+      // Extreme browser zoom or synthetic environments can report enormous
+      // ratios. Understating them is safe for a resolution ceiling; overstating
+      // the real backing pixels is not.
+      const scale = Number.isFinite(ratio) && ratio > 0
+        ? Math.min(ratio, 4)
+        : 1;
+      return Math.round(cssHeight * scale);
+    }
+    const decodedHeight = Number(intrinsicHeight);
+    return decodedHeight > 0 ? Math.round(decodedHeight) : Infinity;
   }
 
   function voluntaryGainSeconds({
@@ -161,7 +186,12 @@
     playerHeight = Infinity,
     defaults = AUTO_DEFAULTS,
   }) {
-    const available = normalizedLadder(ladder, playerHeight);
+    // Pressure decisions need the complete ladder. Filtering it by the player
+    // ceiling first can map a currently-running 720p session onto the sole
+    // surviving 360p rung and make the emergency branch think it is already at
+    // the floor. The ceiling only vetoes an upgrade; it must never strand a
+    // downgrade from a rung that is already above it.
+    const available = normalizedLadder(ladder);
     const currentIndex = closestRungIndex(available, Number(currentHeight));
     if (currentIndex < 0) {
       return {
@@ -255,7 +285,13 @@
       }
     }
 
-    const next = available[currentIndex + 1];
+    const playerCeiling = Number(playerHeight) > 0
+      ? Number(playerHeight)
+      : Infinity;
+    const nextCandidate = available[currentIndex + 1];
+    const next = nextCandidate && nextCandidate.height <= playerCeiling
+      ? nextCandidate
+      : null;
     const stallFree =
       lastStallAtMs == null || nowMs - lastStallAtMs >= defaults.stallWindowMs;
     const upgradeReady =
@@ -463,6 +499,7 @@
     normalizedLadder,
     initialAutoRung,
     bandwidthSeedBps,
+    playerPixelHeight,
     decideRung,
     sessionHeight,
     nativeHlsAvailable,

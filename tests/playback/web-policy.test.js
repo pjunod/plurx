@@ -196,6 +196,30 @@ test("Auto starts from the server ladder, prior, and persisted last-good rung", 
     }),
     480,
   );
+  assert.equal(
+    policy.initialAutoRung({
+      ladder: serverLadder,
+      persistedHeight: 1080,
+      playerHeight: 300,
+    }),
+    360,
+    "a player below the ladder floor still gets the lowest rung",
+  );
+});
+
+test("the player-height ceiling uses backing pixels rather than CSS pixels", () => {
+  assert.equal(
+    policy.playerPixelHeight({ layoutHeight: 469, devicePixelRatio: 2 }),
+    938,
+  );
+  assert.equal(
+    policy.playerPixelHeight({ layoutHeight: 469, devicePixelRatio: 1 }),
+    469,
+  );
+  assert.equal(
+    policy.playerPixelHeight({ intrinsicHeight: 720 }),
+    720,
+  );
 });
 
 test("an outgoing hls.js estimate survives a restart and outranks the cold prior", () => {
@@ -240,6 +264,23 @@ test("an emergency downgrade ignores cooldown, dwell, and restart cost", () => {
   assert.equal(decision.height, 480);
   assert.equal(decision.reason, "supply stalls");
   assert.equal(decision.emergency, true);
+});
+
+test("an emergency downgrade cannot be stranded by the player-height ceiling", () => {
+  const input = {
+    ladder: serverLadder,
+    currentHeight: 720,
+    estimateKbps: 1541,
+    runwaySeconds: 0.1,
+    activeSupplyStall: true,
+    supplyStalls: 3,
+  };
+  for (const playerHeight of [469, 300]) {
+    const decision = policy.decideRung({ ...input, playerHeight });
+    assert.equal(decision.height, 360, `player height ${playerHeight}`);
+    assert.equal(decision.reason, "supply stalls", `player height ${playerHeight}`);
+    assert.equal(decision.emergency, true, `player height ${playerHeight}`);
+  }
 });
 
 test("three supply stalls act while decode stalls never choose a rung", () => {
