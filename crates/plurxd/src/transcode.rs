@@ -5285,17 +5285,21 @@ impl TranscodeManager {
     /// a retired session, or does not exist because this is a cache hit. Only
     /// a known non-zero exit from the session still registered under this id
     /// is a failure, and callers invoke this only after finding no usable
-    /// playlist. Holding the manager guard through the verdict closes the
-    /// remove-before-kill teardown interval without shortening live startup.
+    /// playlist. Liveness is checked on both sides of child inspection: the
+    /// manager-wide guard is never held while a slow kill owns the per-session
+    /// child lock, while the final check still closes the remove-before-kill
+    /// teardown interval before the verdict is recorded.
     async fn playlist_producer_failed(&self, session: &Arc<Session>, session_id: &str) -> bool {
         if session.cached {
             return false;
         }
-        let sessions = self.sessions.lock().await;
-        if !sessions
+        let active = self
+            .sessions
+            .lock()
+            .await
             .get(session_id)
-            .is_some_and(|active| Arc::ptr_eq(active, session))
-        {
+            .is_some_and(|active| Arc::ptr_eq(active, session));
+        if !active {
             return false;
         }
         let unsuccessful_exit = {
@@ -5311,6 +5315,14 @@ impl TranscodeManager {
         let Some(status) = unsuccessful_exit else {
             return false;
         };
+        let sessions = self.sessions.lock().await;
+        if session.replacing_child.load(Acquire)
+            || !sessions
+                .get(session_id)
+                .is_some_and(|active| Arc::ptr_eq(active, session))
+        {
+            return false;
+        }
         tracing::error!(
             session = %session_id,
             %status,
@@ -8020,6 +8032,50 @@ mod tests {
 
         playlist.abort();
         session.kill_child().await;
+    }
+
+    /// Inspecting one producer may wait behind a slow kill that holds its
+    /// child lock. That wait must not retain the manager-wide sessions lock
+    /// and freeze status, playlist, or stop work for unrelated viewers.
+    #[tokio::test]
+    async fn playlist_exit_check_does_not_block_an_unrelated_session() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wedged = watchdog_session(dir.path(), None, false);
+        let unrelated = watchdog_session(dir.path(), None, false);
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = Arc::new(TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+        {
+            let mut sessions = mgr.sessions.lock().await;
+            sessions.insert("wedged".into(), Arc::clone(&wedged));
+            sessions.insert("unrelated".into(), unrelated);
+        }
+
+        let held_child = wedged.child.lock().await;
+        let exit_check = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            let wedged = Arc::clone(&wedged);
+            async move { mgr.playlist_producer_failed(&wedged, "wedged").await }
+        });
+        // Let the exit check reach the held per-session child lock. The
+        // manager-wide lock must already be available again at that point.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let status =
+            tokio::time::timeout(Duration::from_millis(250), mgr.session_status("unrelated")).await;
+        assert!(
+            status.is_ok(),
+            "a slow child inspection must not block an unrelated session's status"
+        );
+
+        drop(held_child);
+        assert!(!exit_check.await.expect("exit-check task"));
     }
 
     /// Re-evaluating an unchanged running session must be a no-op. Without the
