@@ -315,3 +315,9 @@ commits = ["70084d1"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained unrelated-session regression pins that playlist producer inspection releases the global session map before waiting on a child lock; reverting only the production correction makes an unrelated status request time out behind that lock."
+
+[[coverage]]
+commits = ["a37f3f5"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog replacement-race regressions pause after stale Done and Stall observations, require the replacement to survive with coverage intact, then require a later successor stall to fail; reverting only the production correction either kills the successor or abandons its watchdog."
