@@ -101,10 +101,14 @@ one.
 |---|---|---|---|
 | `web.initial-route` | First browser delivery | Transcode verdict → HLS. Remux → copy HLS when Safari needs it or the server hint passes the MSE codec gate; otherwise progressive fMP4. Direct stays range-served unless a nonzero preferred audio track requires remux. | Node table over the shipped policy module |
 | `web.hls-transport` | Native HLS vs hls.js | Native capability counts only with WebKit's playback-target API, or when hls.js/MSE is unavailable. Even on Safari, native HLS is reserved for copied HEVC; other HLS uses hls.js so plurx keeps its controls and timeline. | Node native/MSE matrix |
-| `web.manual-quality` | Force and session height | Auto omits height unless a burn/refused remux must preserve a direct/remux resolution promise. Original and `nomse` preserve source height. Explicit 1080/720/480 requests that exact rung. | Node force/height matrix |
+| `web.manual-quality` | Force and session height | Cold Auto omits height unless a burn/refused remux must preserve a direct/remux resolution promise. Once Auto knows the active rung, later transcode opens carry it across seeks and track changes. Original and `nomse` preserve source height; every numbered choice requests its server rung. | Node force/height matrix |
+| `web.auto-rung` | Auto transcode rung | The menu and controller consume the source-filtered server ladder. Every 5 s Auto samples hls.js bandwidth, runway, stalls, and server speed; emergencies jump directly to the highest sustainable lower rung, while voluntary moves pay the 60 s dwell and restart-cost gates. Upgrades move one rung, never exceed the player height, and remain pinned across later session opens. | Node Auto-policy matrix |
 | `web.compatibility-fallback` | Rejection to rescue | A direct/remux media rejection before real playback gets one H.264/AAC transcode. A transcode failure, a repeated failure, established playback, or an hls.js network failure does not loop into another encode. | Node fallback matrix |
 | `web.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS, VobSub, and styled text require the SDR burn pipeline. While HDR is on the wire, the selection is refused with a visible notice and the current stream is untouched; SDR playback may still burn it. | Node subtitle/dynamic-range matrix |
-| `web.decode-rescue` | Accepted-but-choppy original | On Auto, after ≥150 s and ≥15 lost frames at ≥6/min, switch the copy/direct route to transcode. Pipeline latency is diagnostic only. Remember by codec/height unless buffer quota, and allow explicit Original/retests to clear it. | Node threshold/boundary unit |
+| `web.decode-rescue` | Accepted-but-choppy original | On Auto, after ≥150 s and ≥15 lost frames at ≥6/min, switch the copy/direct route to transcode. Pipeline latency is diagnostic only. Unless buffer quota explains the loss, remember the exact versioned media-load identity. | Node threshold/boundary unit |
+| `web.learned-decode-limit` | Remembered client evidence to Auto route | Only an exact v2 codec/profile/resolution/bit-depth/dynamic-range/bitrate-bucket match may steer Auto to transcode. Legacy broad keys are discarded; Original, exact forget, and the weekly re-test restore the ordinary route. An HDR-to-SDR result names the learned client-performance cause and range loss. | Node identity, applicability, attribution, and reset units |
+| `web.supply-rescue` | Repeated supply stalls | Three distinct `supply` stall episodes in 60 s make a ladder session jump down once or move direct/remux into transcode Auto. Start/end reports for one pause count once. `decode` stalls never select a rung; their measured decode rescue remains separate. | Node episode-counter and supply/decode policy units |
+| `web.auto-fallback-claim` | Two automatic moves in one sample | The decode rescue, the supply rescue, and an Auto rung switch share one in-flight claim taken before the session-open request, so a single 5 s sample opens at most one replacement session and a refused path consumes none of its own one-shot latches. A failed open releases the claim. The viewer's Force transcode, the stall watchdog, and a browser stream rejection are never withheld by it. | Node rescue-collision units over the shipped controller |
 
 ### Native clients — execute the plan without inventing a second server
 
@@ -651,14 +655,33 @@ out of order. The rescue is the same `startTranscodeFallback()` restart-at-
 position as the error path, once per session, and it writes a `decode_rescue`
 beacon with the numbers.
 
-The verdict is remembered per `codec@height` in the browser
-(`plurx_decode_limits`), so the next Auto play of a matching stream routes
-straight to a transcode — the Reason row says so, with the measured numbers.
-Two things keep the memory honest: an explicit **Quality → Original** always
-wins (the limit only steers Auto, never the viewer), and an explicit-Original
-session that plays **60 s under the same 6-per-minute rate** clears the entry
-and logs `decode_limit_cleared`, so a device that stops needing the rescue is
-noticed rather than distrusted forever.
+The verdict is remembered under an explicit `decode-v2` media-load identity in
+the browser (`plurx_decode_limits`). The identity contains normalized codec and
+profile, width and height, bit depth, dynamic-range class and rich HDR format,
+plus a deterministic 10 Mb/s bitrate bucket. A 90 Mb/s Dolby Vision Profile 7
+file therefore cannot teach Auto a verdict about a 40 Mb/s HDR10 file merely
+because both are `hevc@2160`. Missing facts use named deterministic values;
+unknown is not allowed to shift bucket boundaries between loads. The bucket
+keeps a one-bit metadata difference from creating a new identity while a
+10 Mb/s step remains large enough to represent a materially different decoder
+load in the high-bitrate 4K population this mechanism exists to judge.
+
+Legacy `codec@height` entries are discarded on read rather than migrated. They
+do not contain enough evidence to construct the new identity, so migration
+would preserve the poisoning under a more impressive-looking key. An exact
+match routes the next Auto play straight to a transcode, and the Reason row
+says it is a **learned client-performance limit** with the measured lost-frame
+rate. Two things keep the memory subordinate to the viewer: **Quality →
+Original** bypasses every learned entry, and an explicit-Original session that
+plays **60 s under the same 6-per-minute rate** clears only its exact identity
+and logs `decode_limit_cleared`.
+
+When that learned route replaces an ordinary HDR/Dolby Vision delivery with an
+SDR transcode, the Quality menu and Reason row name the consequence, such as
+`HDR10 → SDR`. The text attributes the choice to measured client performance;
+it does not claim the server found the source incompatible. Forgetting that
+measurement immediately re-runs the ordinary decision, so a playable DV P7
+source with an HDR10-compatible base returns to its HDR10 remux route.
 
 **The decode figure is not allowed to decide this, and getting there took
 three passes.** Clearing originally required `decodeMs` under 60% of the frame
@@ -688,9 +711,11 @@ Two consequences worth stating plainly, because both were live bugs:
   described as flawless (6 compositor holds, 3 lost frames, two and a half
   minutes) still counted 9 "faults" against a bar of 4, so it could not clear
   its own entry no matter how well it played.
-- Entries written by the old gate are **discarded on read** rather than
+- Entries written by the old frame gate are **discarded on read** rather than
   migrated. They carry `decode_ms` and no `rate`, they were produced by a test
   that reads true on every stream, and they are not measurements of anything.
+  The later `codec@height` entries are also discarded: their lost-frame
+  evidence is real, but their identity is too broad to apply safely.
 
 Found from the couch, 2026-07-30: Safari on Auto played 4K while Chrome on
 Auto would not, same machine, same file — only Chrome carried the remembered
@@ -822,9 +847,11 @@ covering the other.
   successor's own status is re-checked once the change lands). Web and
   Android still reopen for every non-VOD seek; adopting the same window
   routing there is open work.
-- **No client-side bitrate adaptation yet.** One encode runs at a time; the
-  rung is chosen at start, not adapted per segment. The design for that is
-  [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
+- **Auto adapts by restarting one encode, not by running a multivariant
+  ladder.** The web controller consumes the server ladder and changes the one
+  active transcode when bandwidth, runway, or classified supply stalls demand
+  it. The switch is visible and bounded; seamless per-segment switching stays
+  behind [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) Phase 3's decision gate.
 - **Burn-only bitmap subs cost a stream restart.** VobSub and PGS without a
   client-recognized overlay capability can't be copied or `<track>`'d — a
   picture has no text to send — so selecting one re-opens the
