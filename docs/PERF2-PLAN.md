@@ -914,9 +914,19 @@ week), `playback.network_priors` (default off first release),
 per-client reopen behavior rides client versions.
 
 **Acceptance:** playback-lab first grows the shaping layer it
-deliberately lacks today (PLAYBACK-TESTING.md's non-goals exclude
-WAN/Wi-Fi simulation — the harness slice precedes the feature, review
-R7). Shape: `scripts/playback-lab run --suite stall-recovery
+deliberately lacked (review R7 — the harness slice precedes the
+feature). Issue #143 implements the loopback shaper, the
+`stall-recovery` suite, the recovery criteria, and the normalization
+command described in
+[PLAYBACK-TESTING.md](PLAYBACK-TESTING.md#network-shaping--a-bandwidth-cliff-you-can-reproduce-and-timestamp).
+It creates the condition and records the answer; it decides no rungs,
+which is the rest of this milestone's work. Until the controller lands, a
+`stall-recovery` run is expected to fail with `outcome: recovery`, and
+that recorded failure is the baseline the controller must move. The
+base-versus-candidate normalized smoke equality and a green required gate are
+the acceptance evidence, recorded on #143 and PR #145; source and helper tests
+do not substitute for either run. Shape:
+`scripts/playback-lab run --suite stall-recovery
 --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json`,
 failing nonzero when recovery misses the criteria. On it: the 8 →
 1.5 Mb/s cliff reaches a sustainable rung with ≤ 1 automatic
