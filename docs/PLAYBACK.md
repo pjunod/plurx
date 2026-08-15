@@ -553,12 +553,14 @@ a minute-long client `manifestLoadTimeOut`. A successful exit remains ordinary
 EOF because a short file may have completed cleanly, and a cached VOD has no
 producer to judge and is never marked failed.
 
-A fallback replacement owns one session-scoped transition from predecessor
-kill through successor publication. Playlist startup and the lifetime watchdog
-re-confirm any terminal child observation inside that transition boundary, so
-an old producer's exit or stall can neither poison the new producer nor make
-the watchdog abandon it. The boundary is per session; a slow replacement does
-not block another viewer's playlist or status work.
+A fallback replacement owns one session-scoped transition from its final live
+session check through successor publication. If the lifetime watchdog wins that
+transition first, a failed stall prevents the replacement; a predecessor exit
+may still fall back, but the successor claims a fresh lifetime watchdog before
+the transition ends. Playlist startup and the watchdog likewise re-confirm
+terminal child observations inside the boundary, so an old producer can neither
+poison the new producer nor leave it unmonitored. The boundary is per session;
+a slow replacement does not block another viewer's playlist or status work.
 
 ## Persistent stalls — one bounded recovery, with an outcome
 

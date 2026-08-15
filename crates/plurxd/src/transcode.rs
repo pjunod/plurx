@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU64,
-    Ordering::{Acquire, Relaxed, Release},
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1040,14 +1040,33 @@ async fn observed_watch_next(session: &Session) -> WatchNext {
 /// purpose — and `apply_ahead_window` restarts the motion clock at resume, so
 /// the suspension itself can never be read back as a stall — and a *cached*
 /// session has no process at all, so there is nothing here to watch.
-async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
-    // No process, nothing to judge — and `failed` on a cache entry would be a
-    // lie with consequences (its segments exist; readers would refuse them).
-    // No start path spawns a watchdog for a cache hit; this is the guard that
-    // keeps that true if one ever does.
-    if session.cached {
-        return;
+struct WatchdogClaim {
+    session: Arc<Session>,
+}
+
+impl WatchdogClaim {
+    fn take(session: &Arc<Session>) -> Option<Self> {
+        if session.cached
+            || session
+                .watchdog_active
+                .compare_exchange(false, true, AcqRel, Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            session: Arc::clone(session),
+        })
     }
+}
+
+impl Drop for WatchdogClaim {
+    fn drop(&mut self) {
+        self.session.watchdog_active.store(false, Release);
+    }
+}
+
+async fn watch_for_stall_claimed(session: Arc<Session>, dir: PathBuf, sid: String) {
     // A generous floor before the first verdict: opening a 4K file over NFS
     // and filling a first segment is legitimately slow, and `stalled_for`
     // counts from session start, so judging earlier would fail cold opens.
@@ -1085,6 +1104,18 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
         // final check-to-kill window: a replacement cannot start between this
         // confirmation and the verdict it authorizes.
         let transition = session.child_transition.lock().await;
+        #[cfg(test)]
+        {
+            let pause = session
+                .watchdog_transition_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(pause) = pause {
+                pause.wait().await;
+                pause.wait().await;
+            }
+        }
         let next = observed_watch_next(&session).await;
         match next {
             WatchNext::Done => return,
@@ -1113,6 +1144,32 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
             }
         }
     }
+}
+
+async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
+    // No process, nothing to judge — and `failed` on a cache entry would be a
+    // lie with consequences (its segments exist; readers would refuse them).
+    // Claiming also makes duplicate starts harmless: a fallback may ensure a
+    // successor has coverage while the predecessor's watcher is still alive.
+    let Some(_claim) = WatchdogClaim::take(&session) else {
+        return;
+    };
+    watch_for_stall_claimed(session, dir, sid).await;
+}
+
+/// Ensure one lifetime watchdog owns this session before returning.
+///
+/// The claim is taken synchronously, before the task is scheduled, so a copy
+/// fallback can publish a successor without leaving a scheduler-sized gap in
+/// which no watchdog owns it. An existing watcher makes this a no-op.
+fn spawn_watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
+    let Some(claim) = WatchdogClaim::take(&session) else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _claim = claim;
+        watch_for_stall_claimed(session, dir, sid).await;
+    });
 }
 
 /// Remove the (empty/partial) HLS output so a restarted ffmpeg starts clean.
@@ -1187,6 +1244,10 @@ struct Session {
     /// every action is re-confirmed while holding it so a replacement cannot
     /// land in the check-to-use gap.
     child_transition: Mutex<()>,
+    /// Exactly one task owns lifetime stall coverage for the current producer.
+    /// A copy fallback that follows a predecessor `Done` verdict re-arms it
+    /// before publishing the successor; an already-active watcher wins.
+    watchdog_active: AtomicBool,
     /// True only while a fallback deliberately replaces one live producer
     /// with another inside this same session. The predecessor's non-zero kill
     /// status is neither a terminal playlist verdict nor a watchdog exit.
@@ -1198,6 +1259,11 @@ struct Session {
     /// deterministic instead of hoping the scheduler lands in a tiny window.
     #[cfg(test)]
     watchdog_verdict_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Test-only seam after the watchdog owns the transition, before its
+    /// terminal re-observation. This pins the inverse race where a fallback
+    /// has decided to replace but reaches the gate after the watchdog.
+    #[cfg(test)]
+    watchdog_transition_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Served from the pre-transcode cache.
     ///
     /// Two things follow, and the second is the dangerous one. A cached
@@ -1402,6 +1468,46 @@ impl Session {
             }
         }
         replacement
+    }
+
+    /// Begin a replacement only while its session is still live after this
+    /// task acquires the transition.
+    ///
+    /// The copy reader decides `Unsupported` outside this gate. In between
+    /// that decision and acquiring it, the lifetime watchdog may win, observe
+    /// `Done` or `Stall`, and end. Re-checking the directory and failure flag
+    /// under the gate prevents a failed or retired session from receiving a
+    /// successor. An exited child is still replaceable: the caller re-arms a
+    /// watchdog synchronously when it publishes that successor.
+    async fn begin_copy_child_replacement(&self) -> Option<ChildReplacement<'_>> {
+        let replacement = self.begin_child_replacement().await;
+        if self.failed.load(Relaxed) || tokio::fs::metadata(&self.dir).await.is_err() {
+            return None;
+        }
+        {
+            let mut child = self.child.lock().await;
+            let child = child.as_mut()?;
+            match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill().await;
+                }
+                Ok(Some(_)) => {}
+                Err(_) => return None,
+            }
+        }
+        #[cfg(test)]
+        {
+            let pause = self
+                .replacement_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(pause) = pause {
+                pause.wait().await;
+                pause.wait().await;
+            }
+        }
+        Some(replacement)
     }
 
     /// Stop the encoder, if there is one. A cache hit has no process; a
@@ -2905,11 +3011,14 @@ impl TranscodeManager {
             dir,
             child: Mutex::new(None),
             child_transition: Mutex::new(()),
+            watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            watchdog_transition_pause: std::sync::Mutex::new(None),
             cached: true,
             _cache_reader: Some(cache_reader),
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -4514,11 +4623,14 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
             child_transition: Mutex::new(()),
+            watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            watchdog_transition_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -5003,11 +5115,14 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
             child_transition: Mutex::new(()),
+            watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            watchdog_transition_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -5105,12 +5220,20 @@ impl TranscodeManager {
                         {
                             return;
                         }
+                        // `Unsupported` was decided before this task reached
+                        // the transition. The watchdog may have terminally
+                        // judged the predecessor in that gap. A failed session
+                        // cannot restart; an exited predecessor may, but its
+                        // successor gets a fresh watchdog below.
+                        let Some(_replacement) = session.begin_copy_child_replacement().await
+                        else {
+                            return;
+                        };
                         tracing::warn!(
                             session = %sid,
                             "copy segmenter cannot read this stream ({reason}); \
                              falling back to ffmpeg's HLS muxer for this session"
                         );
-                        let _replacement = session.kill_child_for_replacement().await;
                         clear_session_dir(&dir).await;
                         let args = transcode::hls_copy_args_with_dolby_vision(
                             &file,
@@ -5146,6 +5269,11 @@ impl TranscodeManager {
                                 *session.child.lock().await = Some(child);
                                 *session.last_request.lock().await =
                                     LastRequest::now("fallback-start");
+                                spawn_watch_for_stall(
+                                    Arc::clone(&session),
+                                    dir.clone(),
+                                    sid.clone(),
+                                );
                                 tracing::info!(session = %sid, "fallback copy started");
                             }
                             Err(e) => {
@@ -5165,7 +5293,7 @@ impl TranscodeManager {
             let session = Arc::clone(&session);
             let dir = dir.clone();
             let sid = session_id.clone();
-            tokio::spawn(async move { watch_for_stall(session, dir, sid).await });
+            spawn_watch_for_stall(session, dir, sid);
         }
 
         Ok(StartInfo {
@@ -7749,11 +7877,14 @@ mod tests {
             dir,
             child: Mutex::new(Some(child)),
             child_transition: Mutex::new(()),
+            watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            watchdog_transition_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -8936,11 +9067,14 @@ mod tests {
             dir: dir.to_path_buf(),
             child: Mutex::new(child),
             child_transition: Mutex::new(()),
+            watchdog_active: AtomicBool::new(false),
             replacing_child: AtomicBool::new(false),
             #[cfg(test)]
             replacement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             watchdog_verdict_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            watchdog_transition_pause: std::sync::Mutex::new(None),
             cached,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -9180,6 +9314,146 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn copy_replacement_invalidates_an_in_flight_done_verdict() {
         assert_copy_replacement_invalidates_watchdog_verdict(WatchNext::Done).await;
+    }
+
+    /// The mirror ordering: the copy reader has already decided its stream is
+    /// unsupported, but the watchdog owns `child_transition` before the
+    /// reader can begin the replacement. A terminal predecessor verdict must
+    /// not be followed by an unmonitored successor.
+    async fn assert_watchdog_first_copy_replacement(next: WatchNext) {
+        let dir = tempfile::tempdir().expect("dir");
+        let child = match next {
+            WatchNext::Done => {
+                let mut child = tokio::process::Command::new("false")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("spawn failed predecessor");
+                let status = child.wait().await.expect("wait for predecessor");
+                assert!(!status.success(), "the predecessor must fail");
+                child
+            }
+            WatchNext::Stall => long_running_child(),
+            WatchNext::Wait => panic!("the race needs an actionable watchdog verdict"),
+        };
+        let session = watchdog_session(dir.path(), Some(child), false);
+        if next == WatchNext::Stall {
+            force_stalled(&session.progress);
+        }
+
+        let pause = Arc::new(tokio::sync::Barrier::new(2));
+        *session
+            .watchdog_transition_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        let watchdog = tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "watchdog-first-copy-replacement".into(),
+        ));
+
+        // The first rendezvous proves the watchdog owns the transition. The
+        // already-decided copy fallback now queues behind it, exactly the
+        // ordering missed by the replacement-first regressions above.
+        pause.wait().await;
+        *session
+            .watchdog_transition_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let replacement_session = Arc::clone(&session);
+        let replacement = tokio::spawn(async move {
+            let Some(replacement) = replacement_session.begin_copy_child_replacement().await else {
+                return false;
+            };
+            replacement_session.progress.begin_attempt();
+            *replacement_session.child.lock().await = Some(long_running_child());
+            spawn_watch_for_stall(
+                Arc::clone(&replacement_session),
+                replacement_session.dir.clone(),
+                "watchdog-first-copy-successor".into(),
+            );
+            drop(replacement);
+            true
+        });
+        assert!(
+            !replacement.is_finished(),
+            "the decided fallback must wait behind the watchdog transition"
+        );
+        pause.wait().await;
+
+        settle(watchdog).await;
+        let installed = replacement.await.expect("copy fallback task");
+        if next == WatchNext::Done {
+            assert!(installed, "an exited predecessor may still fall back");
+            assert!(
+                session.watchdog_active.load(Acquire),
+                "the successor must have lifetime watchdog coverage before publication"
+            );
+            assert!(
+                session
+                    .child
+                    .lock()
+                    .await
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(None))),
+                "the covered successor must remain alive"
+            );
+            assert!(
+                !session.failed.load(Relaxed),
+                "Done is not a terminal session failure"
+            );
+            force_stalled(&session.progress);
+            for _ in 0..1_000 {
+                if session.failed.load(Relaxed) && !session.watchdog_active.load(Acquire) {
+                    break;
+                }
+                tokio::time::sleep(WATCHDOG_POLL).await;
+            }
+            assert!(
+                session.failed.load(Relaxed),
+                "the fresh watchdog must detect a later successor stall"
+            );
+            assert!(
+                session
+                    .child
+                    .lock()
+                    .await
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_)))),
+                "the fresh watchdog must kill the later stalled successor"
+            );
+        } else {
+            assert!(
+                !installed,
+                "a terminal failed verdict must prevent a late successor"
+            );
+            assert!(
+                session
+                    .child
+                    .lock()
+                    .await
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_)))),
+                "no successor may remain after the watchdog failed the session"
+            );
+            assert!(
+                session.failed.load(Relaxed),
+                "the Stall verdict must remain terminal"
+            );
+            assert!(
+                !session.watchdog_active.load(Acquire),
+                "a terminal failed session has no producer left to watch"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn winning_stall_watchdog_prevents_a_late_copy_replacement() {
+        assert_watchdog_first_copy_replacement(WatchNext::Stall).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn winning_done_watchdog_rearms_for_a_late_copy_replacement() {
+        assert_watchdog_first_copy_replacement(WatchNext::Done).await;
     }
 
     /// Flow control SIGSTOPs a session that has run far enough ahead; that is
