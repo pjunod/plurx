@@ -208,6 +208,7 @@ commits = [
   "b9eafb2d",
   "9cd542f8",
   "7aa665be",
+  "552e3449",
 ]
 points = []
 checks = []
@@ -266,3 +267,15 @@ commits = ["4a700cc"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
 reason = "The retained server manifest regression proves a same-millisecond last-state replacement is re-coalesced against the preceding effective composition, preventing adjacent duplicate cues after A@0, B@1000, A@1000."
+
+[[coverage]]
+commits = ["bc2cc577"]
+points = ["playback.pipeline", "persistence.upgrades"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "One wire test reports over /client-log and reads prior_kbps back from /decision and session-create under a single unmodified Chrome User-Agent, which fails when the class is derived from two different inputs; a classifier table pins real shipping browser strings against the AppleWebKit collision; store and consult tables pin the starvation verdict's expiry, re-arm, and replace-not-min rules; the three-voter store contract pins the verdict's stamp across both backends."
+
+[[coverage]]
+commits = ["0fda21eb"]
+points = ["core.media"]
+checks = ["rust-gate"]
+reason = "The retained sidecar test seeds the exact interrupted-migration state — network_priors committed, user_version still 1 — and requires NodeLocalTelemetry::open to reopen it, keep the recorded event and prior, and finish the version stamp; restoring only the pre-fix initialize reproduces the permanent `table network_priors already exists` startup failure."
