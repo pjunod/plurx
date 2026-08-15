@@ -89,7 +89,7 @@ pub fn validate_compacted_growth(report: &CompactedGrowthReport) -> Result<()> {
     if report.incoming_beats == 0 || report.active_streams == 0 {
         bail!("compacted-growth load must contain beats and active streams");
     }
-    if report.incoming_beats % report.active_streams != 0 {
+    if !report.incoming_beats.is_multiple_of(report.active_streams) {
         bail!("compacted-growth beats must divide evenly across active streams");
     }
     let beats_per_stream = report.incoming_beats / report.active_streams;
