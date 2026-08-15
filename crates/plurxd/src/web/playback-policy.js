@@ -26,6 +26,15 @@
     restartCostSeconds: 2.5,
   });
 
+  const DECODE_LIMIT_DEFAULTS = Object.freeze({
+    schema: "v2",
+    // Ignore immaterial metadata jitter without grouping the 40 and 90 Mb/s
+    // 4K loads that exposed the old codec/height poisoning.
+    bitrateBucketBps: 10_000_000,
+    ttlMs: 30 * 24 * 60 * 60 * 1_000,
+    retestMs: 7 * 24 * 60 * 60 * 1_000,
+  });
+
   function qualityForce(quality) {
     if (quality === "auto") return "auto";
     return quality === "original" || quality === "nomse"
@@ -491,9 +500,215 @@
     };
   }
 
+  function normalizedText(value, fallback = "unknown") {
+    const text = value == null
+      ? ""
+      : String(value).trim().toLowerCase().replace(/\s+/g, " ");
+    return text || fallback;
+  }
+
+  function positiveInteger(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0
+      ? Math.trunc(Math.min(number, Number.MAX_SAFE_INTEGER))
+      : 0;
+  }
+
+  function sourceDynamicRange(source = {}) {
+    const declared = normalizedText(source && source.hdr, "");
+    if (declared) return declared;
+    const rich = normalizedText(source && source.hdr_format, "");
+    if (/dolby vision|\bdv\b/.test(rich)) return "dolby_vision";
+    if (/hdr10/.test(rich)) return "hdr10";
+    if (/\bhlg\b/.test(rich)) return "hlg";
+    return "sdr_or_unknown";
+  }
+
+  function bitrateBucket(
+    bitrateBps,
+    bucketBps = DECODE_LIMIT_DEFAULTS.bitrateBucketBps,
+  ) {
+    const bitrate = Number(bitrateBps);
+    const width = Number(bucketBps);
+    if (!(bitrate > 0) || !Number.isFinite(bitrate) || !(width > 0)) {
+      return null;
+    }
+    const index = Math.floor(
+      Math.min(bitrate, Number.MAX_SAFE_INTEGER) / width,
+    );
+    return {
+      index,
+      lower_bps: index * width,
+      upper_bps: (index + 1) * width,
+    };
+  }
+
+  // A learned verdict describes one decoder load, not every file sharing a
+  // codec and height. The schema prefix deliberately makes the old
+  // `codec@height` keys unreadable instead of pretending they were precise
+  // enough to migrate. JSON over a fixed-order array is collision-free and
+  // deterministic even when a future source string contains our separators.
+  function decodeLimitIdentity(source = {}) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      return null;
+    }
+    const bucket = bitrateBucket(source.bitrate);
+    const fields = [
+      normalizedText(source.video_codec),
+      normalizedText(source.video_profile),
+      positiveInteger(source.width),
+      positiveInteger(source.height),
+      positiveInteger(source.bit_depth),
+      sourceDynamicRange(source),
+      normalizedText(source.hdr_format, "none"),
+      bucket ? bucket.index : "unknown",
+    ];
+    return `decode-${DECODE_LIMIT_DEFAULTS.schema}:${JSON.stringify(fields)}`;
+  }
+
+  function dynamicRangeLabel(value) {
+    const normalized = normalizedText(value, "unknown");
+    const labels = {
+      dolby_vision: "Dolby Vision",
+      hdr10: "HDR10",
+      hlg: "HLG",
+      sdr: "SDR",
+      sdr_or_unknown: "SDR or unknown range",
+      unknown: "unknown range",
+    };
+    return labels[normalized] || String(value || "unknown range").trim();
+  }
+
+  function mediaLoadLabel(source = {}) {
+    const codec = normalizedText(source && source.video_codec).toUpperCase();
+    const profile = normalizedText(source && source.video_profile, "");
+    const width = positiveInteger(source && source.width);
+    const height = positiveInteger(source && source.height);
+    const depth = positiveInteger(source && source.bit_depth);
+    const richRange = source && source.hdr_format != null
+      ? String(source.hdr_format).trim()
+      : "";
+    const bucket = bitrateBucket(source && source.bitrate);
+    const facts = [codec];
+    if (profile) facts.push(profile);
+    facts.push(width && height ? `${width}\u00d7${height}` : "unknown resolution");
+    facts.push(depth ? `${depth}-bit` : "unknown bit depth");
+    facts.push(richRange || dynamicRangeLabel(sourceDynamicRange(source)));
+    facts.push(bucket
+      ? `${bucket.lower_bps / 1_000_000}\u2013<${bucket.upper_bps / 1_000_000} Mb/s`
+      : "unknown bitrate");
+    return facts.join(" \u00b7 ");
+  }
+
+  function isDecodeLimitIdentity(key) {
+    const prefix = `decode-${DECODE_LIMIT_DEFAULTS.schema}:`;
+    if (typeof key !== "string" || !key.startsWith(prefix)) return false;
+    try {
+      const fields = JSON.parse(key.slice(prefix.length));
+      return Array.isArray(fields) && fields.length === 8 &&
+        key === `${prefix}${JSON.stringify(fields)}`;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function pruneDecodeLimits(
+    entries,
+    {
+      nowMs = 0,
+      ttlMs = DECODE_LIMIT_DEFAULTS.ttlMs,
+    } = {},
+  ) {
+    const source = entries && typeof entries === "object" && !Array.isArray(entries)
+      ? entries
+      : {};
+    const limits = {};
+    let changed = source !== entries;
+    for (const [key, limit] of Object.entries(source)) {
+      const at = Number(limit && limit.at);
+      const rate = Number(limit && limit.rate);
+      const age = Number(nowMs) - at;
+      const valid =
+        isDecodeLimitIdentity(key) &&
+        at > 0 &&
+        limit.rate != null &&
+        Number.isFinite(rate) &&
+        age >= 0 &&
+        age <= ttlMs;
+      if (valid) limits[key] = limit;
+      else changed = true;
+    }
+    return { limits, changed };
+  }
+
+  // Pure lookup policy for the cached route. The caller owns localStorage and
+  // the server request; this function says whether the exact media-load entry
+  // may steer Auto, must be re-tested, or is bypassed by the viewer.
+  function learnedDecodeLimitAction({
+    quality = "auto",
+    source = {},
+    limits = {},
+    nowMs = 0,
+    ttlMs = DECODE_LIMIT_DEFAULTS.ttlMs,
+    retestMs = DECODE_LIMIT_DEFAULTS.retestMs,
+  } = {}) {
+    const key = decodeLimitIdentity(source);
+    if (!key) return { action: "none", key: null, limit: null };
+    if (qualityForce(quality) !== "auto") {
+      return { action: "bypass", key, limit: null };
+    }
+    const pruned = pruneDecodeLimits(limits, { nowMs, ttlMs }).limits;
+    const limit = Object.prototype.hasOwnProperty.call(pruned, key)
+      ? pruned[key]
+      : null;
+    if (!limit) return { action: "none", key, limit: null };
+    return {
+      action: Number(nowMs) - Number(limit.at) > retestMs ? "retest" : "apply",
+      key,
+      limit,
+    };
+  }
+
+  function withoutLearnedDecodeLimit(entries, source) {
+    const key = decodeLimitIdentity(source);
+    const limits = entries && typeof entries === "object" && !Array.isArray(entries)
+      ? { ...entries }
+      : {};
+    const removed = !!key && Object.prototype.hasOwnProperty.call(limits, key);
+    if (removed) delete limits[key];
+    return { limits, removed, key };
+  }
+
+  function learnedDecodeLimitView({
+    source = {},
+    limit = null,
+    ordinaryRange = null,
+    deliveredRange = null,
+  } = {}) {
+    const loadLabel = mediaLoadLabel(source);
+    const measurement = limit && Number.isFinite(Number(limit.rate))
+      ? `lost ${Number(limit.lost) || 0} frames in ${Number(limit.secs) || 0}s (${Number(limit.rate)}/min)`
+      : "measured unstable original playback";
+    const ordinary = normalizedText(ordinaryRange, "unknown");
+    const delivered = normalizedText(deliveredRange, "unknown");
+    const rangeConsequence =
+      ["dolby_vision", "hdr10", "hlg"].includes(ordinary) && delivered === "sdr"
+        ? `${dynamicRangeLabel(ordinary)} \u2192 SDR`
+        : null;
+    return {
+      identity: decodeLimitIdentity(source),
+      loadLabel,
+      measurement,
+      rangeConsequence,
+      reason: `learned client-performance limit for ${loadLabel}: ${measurement}` +
+        (rangeConsequence ? `; ${rangeConsequence}` : ""),
+    };
+  }
+
   return Object.freeze({
     DEFAULTS,
     AUTO_DEFAULTS,
+    DECODE_LIMIT_DEFAULTS,
     qualityForce,
     transcodeHeight,
     normalizedLadder,
@@ -514,5 +729,12 @@
     seekDeltaSeconds,
     lostFrameRate,
     decodeMarginVerdict,
+    bitrateBucket,
+    decodeLimitIdentity,
+    mediaLoadLabel,
+    pruneDecodeLimits,
+    learnedDecodeLimitAction,
+    withoutLearnedDecodeLimit,
+    learnedDecodeLimitView,
   });
 });
