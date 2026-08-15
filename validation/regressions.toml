@@ -444,7 +444,7 @@ checks = ["rust-gate"]
 reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."
 
 [[coverage]]
-commits = ["22797a4f"]
+commits = ["f6d795a2"]
 points = ["persistence.upgrades", "server.api"]
 checks = ["rust-gate"]
 reason = "The retained shipped-binary regression `subsequent_plurxd_run_reopens_the_completed_replicated_target` waits for the HTTP listener, sends SIGTERM to both the first activated daemon and its reopened successor, and requires each process to complete its graceful drain with exit 0; restoring lazy signal-stream registration reopens the interval where a reachable daemon dies with signal 15 instead."
