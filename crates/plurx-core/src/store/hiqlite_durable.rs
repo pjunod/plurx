@@ -19,6 +19,8 @@ use crate::domain::{
     OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, TraktAuth,
 };
 use crate::error::StoreError;
+use crate::secrets::SealedSecret;
+use crate::store::persistable_credential;
 use crate::trakt::{Ident, LocalWatch, SyncCandidate};
 
 const DURABLE_SCHEMA: &str = r#"
@@ -265,8 +267,11 @@ impl From<TraktAuthRow> for TraktAuth {
     fn from(row: TraktAuthRow) -> Self {
         Self {
             user_id: row.user_id,
-            access_token: row.access_token,
-            refresh_token: row.refresh_token,
+            // Raft only ever carried the envelope; this is the same adoption
+            // the SQLite backend does, so both replicas agree byte for byte
+            // and the refresh-token compare-and-set stays an equality test.
+            access_token: SealedSecret::from_stored(row.access_token),
+            refresh_token: SealedSecret::from_stored(row.refresh_token),
             expires_at: row.expires_at,
             trakt_username: row.trakt_username,
             connected_at: row.connected_at,
@@ -390,8 +395,11 @@ impl TraktStore for HiqliteAuthStore {
                  last_sync_at = excluded.last_sync_at, last_activities = excluded.last_activities",
             params!(
                 auth.user_id,
-                auth.access_token.clone(),
-                auth.refresh_token.clone(),
+                // The same refusal the SQLite backend applies, on the path where
+                // it matters most: this statement becomes a raft log entry that
+                // every voter keeps.
+                persistable_credential(&auth.access_token)?,
+                persistable_credential(&auth.refresh_token)?,
                 auth.expires_at,
                 auth.trakt_username.clone(),
                 auth.connected_at,
@@ -415,12 +423,12 @@ impl TraktStore for HiqliteAuthStore {
     async fn delete_trakt_auth_if_current(
         &self,
         user_id: i64,
-        expected_refresh_token: &str,
+        expected_refresh_token: &SealedSecret,
     ) -> Result<bool, StoreError> {
         Ok(self
             .execute(
                 "DELETE FROM trakt_auth WHERE user_id = $1 AND refresh_token = $2",
-                params!(user_id, expected_refresh_token),
+                params!(user_id, expected_refresh_token.as_stored().to_owned()),
             )
             .await?
             > 0)
@@ -429,9 +437,9 @@ impl TraktStore for HiqliteAuthStore {
     async fn update_trakt_tokens(
         &self,
         user_id: i64,
-        expected_refresh_token: &str,
-        access_token: &str,
-        refresh_token: &str,
+        expected_refresh_token: &SealedSecret,
+        access_token: &SealedSecret,
+        refresh_token: &SealedSecret,
         expires_at: i64,
     ) -> Result<bool, StoreError> {
         Ok(self
@@ -439,11 +447,12 @@ impl TraktStore for HiqliteAuthStore {
                 "UPDATE trakt_auth SET access_token = $1, refresh_token = $2, expires_at = $3 \
              WHERE user_id = $4 AND refresh_token = $5",
                 params!(
-                    access_token,
-                    refresh_token,
+                    persistable_credential(access_token)?,
+                    persistable_credential(refresh_token)?,
                     expires_at,
                     user_id,
-                    expected_refresh_token
+                    // Compared, never written — see the SQLite backend.
+                    expected_refresh_token.as_stored().to_owned()
                 ),
             )
             .await?

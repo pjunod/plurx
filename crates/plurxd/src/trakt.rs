@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use plurx_core::domain::{ItemKind, TraktAuth};
+use plurx_core::secrets::{CredentialKey, Secret};
 use plurx_core::store::{keys, Store};
 use plurx_core::trakt::{
     plan_sync, DevicePoll, Ident, ScrobbleAction, TraktClient, TraktError, REFRESH_MARGIN_SECS,
@@ -63,6 +64,10 @@ const SYNC_EVERY: Duration = Duration::from_secs(3600);
 
 pub struct TraktManager {
     store: Arc<dyn Store>,
+    /// Node-local key for the stored bearer pair. Sync is the only subsystem
+    /// that unwraps a credential, and it unwraps exactly at the point of an
+    /// outbound call — never on the way out of the store.
+    key: Arc<CredentialKey>,
     base: String,
     sessions: Mutex<HashMap<(i64, i64), ScrobbleSession>>,
     pending: Mutex<Option<PendingLink>>,
@@ -72,9 +77,10 @@ pub struct TraktManager {
 }
 
 impl TraktManager {
-    pub fn new(store: Arc<dyn Store>, base: String) -> Self {
+    pub fn new(store: Arc<dyn Store>, key: Arc<CredentialKey>, base: String) -> Self {
         TraktManager {
             store,
+            key,
             base,
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(None),
@@ -104,38 +110,79 @@ impl TraktManager {
         Some(TraktClient::new(id.trim(), secret.trim(), &self.base))
     }
 
+    /// Unwrap a stored access token for one outbound call.
+    ///
+    /// A failure here means the row is sealed under a key this node does not
+    /// hold, or was never migrated. Both are operator problems, and both are
+    /// reported as "not linked" rather than guessed at: there is no cleartext
+    /// to fall back to, which is the entire point of storing an envelope.
+    async fn reveal_access(&self, auth: &TraktAuth) -> Option<Secret> {
+        match auth.reveal_access_token(&self.key) {
+            Ok(secret) => Some(secret),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    user_id = auth.user_id,
+                    "trakt: stored access token cannot be decrypted with this node's credential key"
+                );
+                None
+            }
+        }
+    }
+
     /// A live access token for the user, refreshing (and persisting) when
     /// it's close to expiry. `None` = not linked / creds gone / refresh dead.
-    async fn access(&self, client: &TraktClient, user_id: i64) -> Option<String> {
+    async fn access(&self, client: &TraktClient, user_id: i64) -> Option<Secret> {
         let auth = self.store.get_trakt_auth(user_id).await.ok().flatten()?;
         if auth.expires_at - now_unix() > REFRESH_MARGIN_SECS {
-            return Some(auth.access_token);
+            return self.reveal_access(&auth).await;
         }
-        match client.refresh(&auth.refresh_token).await {
+        let refresh_token = match auth.reveal_refresh_token(&self.key) {
+            Ok(secret) => secret,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "trakt: stored refresh token cannot be decrypted with this node's credential key"
+                );
+                return None;
+            }
+        };
+        match client.refresh(refresh_token.expose()).await {
             Ok(tok) => {
+                // Seal before the store call, not after: `update_trakt_tokens`
+                // takes envelopes, so there is no signature that could carry
+                // the new bearer pair into a durable row in the clear.
+                let (sealed_access, sealed_refresh) = match (
+                    self.key.seal_trakt(user_id, &tok.access_token),
+                    self.key.seal_trakt(user_id, &tok.refresh_token),
+                ) {
+                    (Ok(access), Ok(refresh)) => (access, refresh),
+                    _ => {
+                        tracing::warn!("trakt: could not encrypt the rotated tokens for storage");
+                        return None;
+                    }
+                };
                 let updated = self
                     .store
                     .update_trakt_tokens(
                         user_id,
+                        // The compare-and-set operand is the envelope we read,
+                        // so the race is decided on the exact stored bytes.
                         &auth.refresh_token,
-                        &tok.access_token,
-                        &tok.refresh_token,
+                        &sealed_access,
+                        &sealed_refresh,
                         tok.expires_at(),
                     )
                     .await
                     .unwrap_or(false);
                 if updated {
-                    Some(tok.access_token)
+                    Some(Secret::from_cleartext(tok.access_token))
                 } else {
                     // Another refresh using the same rotating token won the
                     // compare-and-set. Use the winner's credential instead of
                     // returning a token that was deliberately not persisted.
-                    self.store
-                        .get_trakt_auth(user_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|current| current.access_token)
+                    let current = self.store.get_trakt_auth(user_id).await.ok().flatten()?;
+                    self.reveal_access(&current).await
                 }
             }
             Err(TraktError::AuthExpired) => {
@@ -150,16 +197,13 @@ impl TraktManager {
                             Some("Trakt link expired — connect again".to_owned());
                         None
                     }
-                    Ok(false) => self
-                        .store
-                        .get_trakt_auth(user_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|current| current.access_token),
+                    Ok(false) => {
+                        let current = self.store.get_trakt_auth(user_id).await.ok().flatten()?;
+                        self.reveal_access(&current).await
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "trakt: could not classify rejected refresh token");
-                        Some(auth.access_token)
+                        self.reveal_access(&auth).await
                     }
                 }
             }
@@ -167,7 +211,7 @@ impl TraktManager {
                 // Transient (network, 5xx): keep the stale token; a request
                 // with it may still succeed, and the next pass retries.
                 tracing::warn!("trakt: token refresh failed: {e}");
-                Some(auth.access_token)
+                self.reveal_access(&auth).await
             }
         }
     }
@@ -222,7 +266,7 @@ impl TraktManager {
                 },
             );
             if let Err(e) = client
-                .scrobble(&access, ScrobbleAction::Start, ident, pct)
+                .scrobble(access.expose(), ScrobbleAction::Start, ident, pct)
                 .await
             {
                 tracing::warn!("trakt: scrobble start failed: {e}");
@@ -257,7 +301,7 @@ impl TraktManager {
             // 95% threshold so the two agree and the next sync is a no-op.
             let send = pct.max(95.0);
             if let Err(e) = client
-                .scrobble(&access, ScrobbleAction::Stop, ident, send)
+                .scrobble(access.expose(), ScrobbleAction::Stop, ident, send)
                 .await
             {
                 tracing::warn!("trakt: scrobble stop failed: {e}");
@@ -296,7 +340,7 @@ impl TraktManager {
                     continue;
                 };
                 if let Err(e) = client
-                    .scrobble(&access, ScrobbleAction::Pause, ident, pct)
+                    .scrobble(access.expose(), ScrobbleAction::Pause, ident, pct)
                     .await
                 {
                     tracing::warn!("trakt: scrobble pause failed: {e}");
@@ -338,10 +382,29 @@ impl TraktManager {
                 match client.poll_device(&code.device_code).await {
                     Ok(DevicePoll::Ready(tok)) => {
                         let username = client.username(&tok.access_token).await.ok();
+                        // A freshly linked account is sealed on the way in, so
+                        // the credential is never durable in the clear even for
+                        // the moment between linking and the first refresh.
+                        let sealed =
+                            mgr.key
+                                .seal_trakt(user_id, &tok.access_token)
+                                .and_then(|access| {
+                                    mgr.key
+                                        .seal_trakt(user_id, &tok.refresh_token)
+                                        .map(|refresh| (access, refresh))
+                                });
+                        let (access_token, refresh_token) = match sealed {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                mgr.fail_pending(&format!("securing the link failed: {error}"))
+                                    .await;
+                                return;
+                            }
+                        };
                         let auth = TraktAuth {
                             user_id,
-                            access_token: tok.access_token.clone(),
-                            refresh_token: tok.refresh_token.clone(),
+                            access_token,
+                            refresh_token,
                             expires_at: tok.expires_at(),
                             trakt_username: username.clone(),
                             connected_at: now_unix(),
@@ -493,7 +556,7 @@ impl TraktManager {
         // Change gate: if Trakt reports the same last_activities as the
         // previous run AND nothing local moved since, skip the heavy pulls.
         let activities = client
-            .last_activities(&access)
+            .last_activities(access.expose())
             .await
             .map_err(|e| e.to_string())?;
         let local_dirty = candidates.iter().any(|c| {
@@ -509,8 +572,14 @@ impl TraktManager {
             return Ok(());
         }
 
-        let remote_watched = client.watched(&access).await.map_err(|e| e.to_string())?;
-        let remote_playback = client.playback(&access).await.map_err(|e| e.to_string())?;
+        let remote_watched = client
+            .watched(access.expose())
+            .await
+            .map_err(|e| e.to_string())?;
+        let remote_playback = client
+            .playback(access.expose())
+            .await
+            .map_err(|e| e.to_string())?;
         let plan = plan_sync(
             &candidates,
             &remote_watched,
@@ -540,13 +609,13 @@ impl TraktManager {
         // bodies but chunking keeps any one failure small).
         for chunk in plan.push_add.chunks(500) {
             client
-                .history_add(&access, chunk)
+                .history_add(access.expose(), chunk)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         if !plan.push_remove.is_empty() {
             client
-                .history_remove(&access, &plan.push_remove)
+                .history_remove(access.expose(), &plan.push_remove)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -556,7 +625,10 @@ impl TraktManager {
         let activities = if plan.push_add.is_empty() && plan.push_remove.is_empty() {
             activities
         } else {
-            client.last_activities(&access).await.unwrap_or(activities)
+            client
+                .last_activities(access.expose())
+                .await
+                .unwrap_or(activities)
         };
         self.store
             .set_trakt_sync(user_id, now_unix(), Some(&activities))
@@ -617,11 +689,23 @@ mod tests {
         (store, user.id)
     }
 
+    /// The cleartext behind an `access()` result, for assertions.
+    fn revealed(secret: Option<Secret>) -> Option<String> {
+        secret.map(|s| s.expose().to_owned())
+    }
+
+    /// A fixed key so a fixture row and the manager that opens it agree
+    /// without either writing key material to disk.
+    fn test_key() -> Arc<CredentialKey> {
+        Arc::new(CredentialKey::from_bytes([0x5a; 32]))
+    }
+
     fn linked_auth(user_id: i64, expires_at: i64) -> TraktAuth {
+        let key = test_key();
         TraktAuth {
             user_id,
-            access_token: "acc".into(),
-            refresh_token: "ref".into(),
+            access_token: key.seal_trakt(user_id, "acc").expect("seal access"),
+            refresh_token: key.seal_trakt(user_id, "ref").expect("seal refresh"),
             expires_at,
             trakt_username: Some("neo".into()),
             connected_at: now_unix(),
@@ -633,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn client_present_only_when_configured() {
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
-        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), "http://unused".into());
         assert!(mgr.client().await.is_none());
         store
             .put_setting(keys::TRAKT_CLIENT_ID, "cid")
@@ -659,19 +743,22 @@ mod tests {
             .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
             .await
             .expect("live auth");
-        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), "http://unused".into());
         let client = mgr.client().await.expect("client");
-        assert_eq!(mgr.access(&client, user).await.as_deref(), Some("acc"));
+        assert_eq!(
+            revealed(mgr.access(&client, user).await).as_deref(),
+            Some("acc")
+        );
 
         store
             .put_trakt_auth(&linked_auth(user, now_unix() + 100))
             .await
             .expect("expiring auth");
         let base = serve(fixed(503, json!({ "error": "temporary" }))).await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
         let client = mgr.client().await.expect("client");
         assert_eq!(
-            mgr.access(&client, user).await.as_deref(),
+            revealed(mgr.access(&client, user).await).as_deref(),
             Some("acc"),
             "a transient refresh failure keeps the last token available"
         );
@@ -736,7 +823,7 @@ mod tests {
             })
             .await
             .expect("episode");
-        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), "http://unused".into());
         assert_eq!(
             mgr.ident_for(episode).await,
             Some(Ident::Episode {
@@ -825,7 +912,7 @@ mod tests {
                 }),
             );
         let base = serve(app).await;
-        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), test_key(), base));
 
         mgr.on_start(user, movie, 12.5);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -894,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn syncing_activity_and_unconfigured_link_are_explicit() {
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
-        let mgr = Arc::new(TraktManager::new(store, "http://unused".into()));
+        let mgr = Arc::new(TraktManager::new(store, test_key(), "http://unused".into()));
         let error = match mgr.link_start(1).await {
             Ok(_) => panic!("an unconfigured manager started a link"),
             Err(error) => error,
@@ -955,7 +1042,7 @@ mod tests {
             .await
             .expect("auth");
 
-        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), "http://unused".into());
         let st = mgr.status(user).await;
         assert!(st.configured);
         assert!(st.auth.is_some());
@@ -983,16 +1070,28 @@ mod tests {
             }),
         ))
         .await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
         let client = mgr.client().await.expect("client");
-        assert_eq!(mgr.access(&client, user).await.as_deref(), Some("fresh"));
-        // The refreshed token is persisted.
+        assert_eq!(
+            revealed(mgr.access(&client, user).await).as_deref(),
+            Some("fresh")
+        );
+        // The refreshed token is persisted — sealed, not in the clear.
         let auth = store
             .get_trakt_auth(user)
             .await
             .expect("get")
             .expect("some");
-        assert_eq!(auth.access_token, "fresh");
+        assert!(
+            !auth.access_token.as_stored().contains("fresh"),
+            "a rotated token must not land in the durable row as cleartext"
+        );
+        assert_eq!(
+            auth.reveal_access_token(&test_key())
+                .expect("open")
+                .expose(),
+            "fresh"
+        );
     }
 
     #[tokio::test]
@@ -1004,7 +1103,7 @@ mod tests {
             .expect("auth");
         // 400 on /oauth/token → AuthExpired → the link is dropped.
         let base = serve(fixed(400, json!({}))).await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
         let client = mgr.client().await.expect("client");
         assert!(mgr.access(&client, user).await.is_none());
         assert!(store.get_trakt_auth(user).await.expect("get").is_none());
@@ -1022,7 +1121,7 @@ mod tests {
             }),
         ))
         .await;
-        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), test_key(), base));
         let pending = mgr.link_start(user).await.expect("link");
         assert_eq!(pending.user_code, "WXYZ");
         // The pending attempt shows up in status + activity.
@@ -1065,7 +1164,7 @@ mod tests {
                 get(|| async { Json(json!({ "user": { "username": "neo" } })) }),
             );
         let base = serve(app).await;
-        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), test_key(), base));
 
         mgr.link_start(user).await.expect("device link");
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1086,8 +1185,23 @@ mod tests {
 
         let status = mgr.status(user).await;
         let auth = status.auth.expect("linked auth");
-        assert_eq!(auth.access_token, "linked-access");
-        assert_eq!(auth.refresh_token, "linked-refresh");
+        assert!(
+            !auth.access_token.as_stored().contains("linked-access")
+                && !auth.refresh_token.as_stored().contains("linked-refresh"),
+            "a freshly linked account must be sealed before it is stored"
+        );
+        assert_eq!(
+            auth.reveal_access_token(&test_key())
+                .expect("open access")
+                .expose(),
+            "linked-access"
+        );
+        assert_eq!(
+            auth.reveal_refresh_token(&test_key())
+                .expect("open refresh")
+                .expose(),
+            "linked-refresh"
+        );
         assert_eq!(auth.trakt_username.as_deref(), Some("neo"));
         assert!(status.pending.is_none());
         assert_eq!(
@@ -1121,7 +1235,7 @@ mod tests {
                 post(|| async { StatusCode::IM_A_TEAPOT }),
             );
         let base = serve(app).await;
-        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), test_key(), base));
 
         mgr.link_start(user).await.expect("device link");
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1230,7 +1344,7 @@ mod tests {
             .route("/sync/history", post(|| async { Json(json!({})) }))
             .route("/sync/history/remove", post(|| async { Json(json!({})) }));
         let base = serve(app).await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
 
         mgr.sync_user(user).await.expect("sync");
         // The remote watch landed locally.
@@ -1314,7 +1428,7 @@ mod tests {
                 }),
             );
         let base = serve(app).await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
         mgr.sync_user(user).await.expect("sync");
         assert_eq!(
             history_hits.load(Ordering::SeqCst),
@@ -1354,7 +1468,7 @@ mod tests {
                 }),
             );
         let base = serve(app).await;
-        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let mgr = TraktManager::new(Arc::clone(&store), test_key(), base);
         mgr.sync_user(user).await.expect("sync");
         // The change gate short-circuits before any heavy pull.
         assert_eq!(watched_hits.load(Ordering::SeqCst), 0, "pull was skipped");

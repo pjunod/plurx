@@ -237,7 +237,11 @@ fn read_password(input: &mut impl std::io::BufRead) -> std::io::Result<String> {
 async fn run(config: Config) -> anyhow::Result<()> {
     let logs = init_logging();
 
-    let StoreHandle { store, identity } = open_store(&config)
+    let StoreHandle {
+        store,
+        identity,
+        credential_key,
+    } = open_store(&config)
         .await
         .with_context(|| format!("opening store in {}", config.storage.data_dir.display()))?;
 
@@ -246,6 +250,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let parts = Boot {
         store,
         identity,
+        credential_key,
         dirs,
         encoder_caps,
         system,
@@ -258,6 +263,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
 struct Boot {
     store: Arc<dyn plurx_core::store::Store>,
     identity: plurx_core::cluster::ClusterIdentity,
+    /// Resolved before the store is handed on, so a node that cannot open its
+    /// existing Trakt rows fails here rather than at the first sync.
+    credential_key: Arc<plurx_core::secrets::CredentialKey>,
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
     system: SystemInfo,
@@ -280,6 +288,7 @@ async fn boot(
     let Boot {
         store,
         identity,
+        credential_key,
         dirs,
         encoder_caps,
         system,
@@ -291,6 +300,7 @@ async fn boot(
     let state = build_state(
         &config,
         identity.node_id,
+        credential_key,
         store,
         dirs,
         encoder_caps,
@@ -579,6 +589,7 @@ fn probe_preference(hwaccel_pref: &str) -> String {
 fn build_state(
     config: &Config,
     node_id: String,
+    credential_key: Arc<plurx_core::secrets::CredentialKey>,
     store: Arc<dyn plurx_core::store::Store>,
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
@@ -590,6 +601,7 @@ fn build_state(
             server_name: config.server.name.clone(),
             node_id,
             scan_prune_percent: config.storage.scan_prune_percent,
+            credential_key,
         },
         store,
         dirs,
@@ -1997,6 +2009,7 @@ mod startup_tests {
         build_state(
             &config,
             "test-node".to_owned(),
+            Arc::new(plurx_core::secrets::CredentialKey::generate()),
             store_in(dir),
             create_dirs(dir).expect("dirs"),
             Default::default(),
@@ -2272,6 +2285,7 @@ mod startup_tests {
             Boot {
                 store: handle.store,
                 identity: handle.identity,
+                credential_key: handle.credential_key,
                 dirs: create_dirs(tmp.path()).expect("dirs"),
                 encoder_caps: Default::default(),
                 system: Default::default(),

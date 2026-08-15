@@ -31,6 +31,7 @@ use plurx_core::domain::{
     NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
     OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, TraktAuth,
 };
+use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
@@ -2154,12 +2155,16 @@ async fn trakt_contract_runs_through_dyn_store() {
             .await
             .expect("watch state");
 
+        // Both backends persist the Trakt bearer pair as envelopes. The
+        // credential only ever exists in the clear on either side of this
+        // boundary, never inside it — see CLUSTERING-PLAN.md §3.2.
+        let key = CredentialKey::generate();
         assert!(store.get_trakt_auth(user.id).await.expect("get").is_none());
         store
             .put_trakt_auth(&TraktAuth {
                 user_id: user.id,
-                access_token: "access-1".into(),
-                refresh_token: "refresh-1".into(),
+                access_token: key.seal_trakt(user.id, "access-1").expect("seal access"),
+                refresh_token: key.seal_trakt(user.id, "refresh-1").expect("seal refresh"),
                 expires_at: 100,
                 trakt_username: Some("contract".into()),
                 connected_at: 1,
@@ -2173,21 +2178,55 @@ async fn trakt_contract_runs_through_dyn_store() {
             .await
             .expect("get linked auth")
             .expect("linked auth");
-        assert_eq!(linked.access_token, "access-1");
-        assert_eq!(linked.refresh_token, "refresh-1");
+        assert!(linked.is_wrapped(), "the stored bearer pair must be sealed");
+        assert!(
+            !linked.access_token.as_stored().contains("access-1")
+                && !linked.refresh_token.as_stored().contains("refresh-1"),
+            "a durable Trakt row must not hold its bearer credential in the clear"
+        );
+        assert_eq!(
+            linked
+                .reveal_access_token(&key)
+                .expect("open access")
+                .expose(),
+            "access-1"
+        );
+        assert_eq!(
+            linked
+                .reveal_refresh_token(&key)
+                .expect("open refresh")
+                .expose(),
+            "refresh-1"
+        );
         assert_eq!(linked.expires_at, 100);
         assert_eq!(linked.trakt_username.as_deref(), Some("contract"));
         assert_eq!(store.list_trakt_auth().await.expect("list").len(), 1);
+        // The rotation compare-and-set runs on the stored envelope, so it stays
+        // an exact equality check that no voter has to decrypt anything to make.
+        let stale_refresh = linked.refresh_token.clone();
         assert!(store
-            .update_trakt_tokens(user.id, "refresh-1", "access-2", "refresh-2", 200)
+            .update_trakt_tokens(
+                user.id,
+                &stale_refresh,
+                &key.seal_trakt(user.id, "access-2").expect("seal access"),
+                &key.seal_trakt(user.id, "refresh-2").expect("seal refresh"),
+                200,
+            )
             .await
             .expect("update tokens"));
         assert!(!store
-            .update_trakt_tokens(user.id, "refresh-1", "loser", "loser-refresh", 300)
+            .update_trakt_tokens(
+                user.id,
+                &stale_refresh,
+                &key.seal_trakt(user.id, "loser").expect("seal access"),
+                &key.seal_trakt(user.id, "loser-refresh")
+                    .expect("seal refresh"),
+                300,
+            )
             .await
             .expect("reject stale refresh"));
         assert!(!store
-            .delete_trakt_auth_if_current(user.id, "refresh-1")
+            .delete_trakt_auth_if_current(user.id, &stale_refresh)
             .await
             .expect("reject stale unlink"));
         let refreshed = store
@@ -2195,8 +2234,20 @@ async fn trakt_contract_runs_through_dyn_store() {
             .await
             .expect("get refreshed auth")
             .expect("refreshed auth");
-        assert_eq!(refreshed.access_token, "access-2");
-        assert_eq!(refreshed.refresh_token, "refresh-2");
+        assert_eq!(
+            refreshed
+                .reveal_access_token(&key)
+                .expect("open access")
+                .expose(),
+            "access-2"
+        );
+        assert_eq!(
+            refreshed
+                .reveal_refresh_token(&key)
+                .expect("open refresh")
+                .expose(),
+            "refresh-2"
+        );
         assert_eq!(refreshed.expires_at, 200);
         store
             .set_trakt_sync(user.id, 50, Some(r#"{"movies":{"watched_at":50}}"#))

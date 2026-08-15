@@ -17,6 +17,7 @@ pub mod mediafacts;
 pub mod metadata;
 pub mod playback;
 pub mod scan;
+pub mod secrets;
 pub mod store;
 /// Media fixtures for the test suites, shared so `plurx-core` and `plurxd`
 /// cannot drift onto different GOP structures and disagree about what the
