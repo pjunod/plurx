@@ -5133,6 +5133,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     refusedOriginal:false,
     aoffset:sessionAudioOffset, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
+    // The one automatic session-open claim; see claimAutoFallback.
+    autoFallbackInFlight:false,
     learnedLimit:learnedLimitView,
     bookOffset:book?(meta.part_offset_ms||0):0,
     bookDuration:book?(meta.book_duration_ms||0):0,
@@ -6119,6 +6121,27 @@ function playbackIsReal(){
   if(q && typeof q.totalVideoFrames==="number") return q.totalVideoFrames>0;
   return v.videoWidth>0;                     // no counter: do not rescue on a guess
 }
+// One in-flight claim shared by every AUTOMATIC session-open: the decode
+// rescue, the supply rescue, and an Auto rung switch. `abr.switching` cannot
+// carry this. The decode rescue never sets it, and both rescues yield at
+// `openSession` before anything marks the player — so one 5-second interval
+// could run `maybeDecodeRescue()` (unawaited) and then `autoControllerTick()`,
+// see the still-remux method and `switching === false` in both, and open two
+// replacement sessions. The later generation only supersedes the earlier one
+// AFTER the earlier request has already created its server session, so the
+// at-most-one-automatic-restart guarantee was lost and a decode verdict could
+// cross-trigger a supply rescue. Deliberately not applied to the manual Force
+// transcode, the stall watchdog, or a browser stream rejection: those are the
+// viewer's or the watchdog's decision and must never be swallowed by an
+// automatic move already in flight.
+function claimAutoFallback(p){
+  if(!p || p.autoFallbackInFlight) return false;
+  p.autoFallbackInFlight=true;
+  return true;
+}
+// Always released, including on failure: a 5xx on the replacement session must
+// leave Auto able to try again rather than wedging every later rescue.
+function releaseAutoFallback(p){ if(p) p.autoFallbackInFlight=false; }
 // Rescue path: the browser rejected a remux/direct stream outright, so restart
 // this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
 async function startTranscodeFallback(reason, note){
@@ -6226,6 +6249,12 @@ function maybeDecodeRescue(){
   if(q!=='auto' || p.decodeRescued) return;
   const verdict=decodeMarginVerdict(h, secs);
   if(!verdict) return;
+  // A supply rescue already opening a replacement owns this playback's one
+  // automatic move. Return without latching `decodeRescued` or writing a note:
+  // if that rescue lands the session becomes a transcode and the method check
+  // above ends this path anyway, and if it fails the verdict is re-evaluated on
+  // the next sample with nothing consumed.
+  if(!claimAutoFallback(p)) return;
   p.decodeRescued=true;
   // A session the browser refused data on has an explanation for its hitches
   // that is not the decoder, and a decode limit is the wrong thing to learn
@@ -6257,7 +6286,8 @@ function maybeDecodeRescue(){
         `playing ${decodeLimitLabel(p.source)||'this stream'} — switching to transcode`},
     playbackContext()));
   toast("This browser can't hold Original smoothly — switching to optimized");
-  startTranscodeFallback("decode-rescue");
+  startTranscodeFallback("decode-rescue")
+    .finally(()=>releaseAutoFallback(p)).catch(()=>{});
 }
 function autoSwitchLabel(value){
   return typeof value==='number'?`${value}p`:String(value||'Auto');
@@ -6275,55 +6305,67 @@ function recordAutoSwitch(p,from,to,reason,position){
 async function switchAutoRung(currentHeight,decision){
   const p=PLAYER, v=document.getElementById("video");
   if(!p||!v||!p.abr||p.abr.switching||!(decision&&decision.height>0)) return;
-  const pos=(p.offset||0)+(v.currentTime||0);
-  const track=p.audio&&p.audio[p.curAudio], aidx=track?track.index:(p.curAudio||0);
-  const {me,live}=streamGeneration();
-  me.abr.switching=true;
-  me.stallFrom=pos;
-  newAttempt("auto-quality");
-  me.started=false;
-  setLoading(true,"Adjusting quality…",
-    `${autoSwitchLabel(currentHeight)} → ${autoSwitchLabel(decision.height)} — ${decision.reason}`);
-  // This is the measured restart model, not Phase 3's prepared handoff. Capture
-  // the outgoing estimate while tearing down, then pay one visible restart.
-  teardownHls();
-  let info;
+  // The rung switch opens a session like either rescue does, so it takes the
+  // same single automatic claim rather than a guard of its own.
+  if(!claimAutoFallback(p)) return;
   try{
-    info=await openSession(me.fileId,transcodeOpts(pos,aidx,decision.height));
-  }catch(e){
-    if(live()){
-      me.abr.switching=false;
-      setLoading(true,"Quality adjustment failed.",e.message,
-        `<button onclick="retryPlayback()">Try again</button>`+
-        `<button onclick="closePlayer()">Close</button>`);
+    const pos=(p.offset||0)+(v.currentTime||0);
+    const track=p.audio&&p.audio[p.curAudio], aidx=track?track.index:(p.curAudio||0);
+    const {me,live}=streamGeneration();
+    me.abr.switching=true;
+    me.stallFrom=pos;
+    newAttempt("auto-quality");
+    me.started=false;
+    setLoading(true,"Adjusting quality…",
+      `${autoSwitchLabel(currentHeight)} → ${autoSwitchLabel(decision.height)} — ${decision.reason}`);
+    // This is the measured restart model, not Phase 3's prepared handoff. Capture
+    // the outgoing estimate while tearing down, then pay one visible restart.
+    teardownHls();
+    let info;
+    try{
+      info=await openSession(me.fileId,transcodeOpts(pos,aidx,decision.height));
+    }catch(e){
+      if(live()){
+        me.abr.switching=false;
+        setLoading(true,"Quality adjustment failed.",e.message,
+          `<button onclick="retryPlayback()">Try again</button>`+
+          `<button onclick="closePlayer()">Close</button>`);
+      }
+      return;
     }
-    return;
-  }
-  if(!live()) return;
-  me.method='transcode'; me.copyHls=false; me.autoHeight=decision.height;
-  me.health=null;
-  const now=performance.now();
-  me.abr.lastSwitchAtMs=now;
-  me.abr.stableSinceMs=now;
-  me.abr.mildSamples=0;
-  me.abr.upgradeSinceMs=null;
-  me.abr.previousRunway=null;
-  me.abr.stallEvents.supply=[];
-  recordAutoSwitch(me,currentHeight,decision.height,decision.reason,pos);
-  me.abr.switching=false;
-  armStall(attachSession(v,me,info,pos),20000);
-  toast(`Quality → ${decision.height}p — ${decision.reason}`);
+    if(!live()) return;
+    me.method='transcode'; me.copyHls=false; me.autoHeight=decision.height;
+    me.health=null;
+    const now=performance.now();
+    me.abr.lastSwitchAtMs=now;
+    me.abr.stableSinceMs=now;
+    me.abr.mildSamples=0;
+    me.abr.upgradeSinceMs=null;
+    me.abr.previousRunway=null;
+    me.abr.stallEvents.supply=[];
+    recordAutoSwitch(me,currentHeight,decision.height,decision.reason,pos);
+    me.abr.switching=false;
+    armStall(attachSession(v,me,info,pos),20000);
+    toast(`Quality → ${decision.height}p — ${decision.reason}`);
+  } finally { releaseAutoFallback(p); }
 }
 async function rescueAutoSupply(){
   const p=PLAYER, v=document.getElementById("video");
   if(!p||!v||!p.abr||p.abr.switching||p.abr.supplyRescued) return;
+  // A decode rescue started earlier in this same interval is already opening a
+  // replacement session and has not reached the point where it marks the
+  // player. Claim before any state changes or overlay text, so a refused claim
+  // costs nothing and this path can run untouched on the next sample.
+  if(!claimAutoFallback(p)) return;
   const before=p.method, pos=(p.offset||0)+(v.currentTime||0);
   p.abr.switching=true;
   p.abr.supplyRescued=true;
   setLoading(true,"Adjusting quality…","repeated supply stalls — starting transcode Auto");
   toast("Quality → Auto transcode — supply stalls");
-  await startTranscodeFallback("auto-supply",
-    "switched to transcode Auto after 3 supply stalls in 60 seconds");
+  try{
+    await startTranscodeFallback("auto-supply",
+      "switched to transcode Auto after 3 supply stalls in 60 seconds");
+  } finally { releaseAutoFallback(p); }
   if(PLAYER!==p) return;
   p.abr.switching=false;
   if(p.method!=='transcode'){
@@ -6339,8 +6381,12 @@ async function rescueAutoSupply(){
 async function autoControllerTick(){
   const p=PLAYER, v=document.getElementById("video");
   if(!p||!v||!p.abr||qualityForce()!=='auto'||!p.started||v.paused||p.abr.switching) return;
+  if(p.autoFallbackInFlight) return;
   await pollSessionHealth(true);
-  if(PLAYER!==p||!p.abr||p.abr.switching) return;
+  // Re-checked after the poll for the same reason it is checked before it: the
+  // unawaited `maybeDecodeRescue()` earlier in this interval can have claimed
+  // the automatic move while this tick was waiting on the health request.
+  if(PLAYER!==p||!p.abr||p.abr.switching||p.autoFallbackInFlight) return;
   const now=performance.now(), windowMs=PlaybackPolicy.AUTO_DEFAULTS.stallWindowMs;
   for(const kind of ['supply','decode']){
     p.abr.stallEvents[kind]=(p.abr.stallEvents[kind]||[]).filter(at=>now-at<windowMs);

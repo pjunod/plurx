@@ -18,12 +18,40 @@ const SHIPPED_UI = fs.readFileSync(
 // <script>, so the next top-level `function` is a reliable terminator and no
 // brace/string parsing is needed. A rename fails loudly rather than silently
 // testing nothing.
+const DECLARATIONS = ["\nfunction ", "\nasync function "];
 function shippedSource(name) {
-  const start = SHIPPED_UI.indexOf(`\nfunction ${name}(`);
-  assert.notEqual(start, -1, `index.html no longer declares ${name}`);
+  const start = DECLARATIONS.map((kind) =>
+    SHIPPED_UI.indexOf(`${kind}${name}(`),
+  ).find((at) => at !== -1);
+  assert.notEqual(start, undefined, `index.html no longer declares ${name}`);
   const rest = SHIPPED_UI.slice(start + 1);
-  const end = rest.indexOf("\nfunction ");
+  const ends = DECLARATIONS.map((kind) => rest.indexOf(kind, 1)).filter(
+    (at) => at !== -1,
+  );
+  const end = ends.length ? Math.min(...ends) : -1;
   return (end === -1 ? rest : rest.slice(0, end)).trimEnd();
+}
+
+// Deliberately NOT `shippedSource`. The rescue-collision regression has to be
+// able to run against a build with no guard at all, or reverting the correction
+// would fail it on a missing declaration instead of on the two sessions it
+// opens — a name check dressed up as a behaviour check. A build that names the
+// guard differently but keeps one automatic session-open still passes, which is
+// the contract that actually matters.
+function shippedSourceIfPresent(name) {
+  const declared = DECLARATIONS.some((kind) =>
+    SHIPPED_UI.includes(`${kind}${name}(`),
+  );
+  return declared ? shippedSource(name) : "";
+}
+
+// Rescue paths are async and interleave, so they cannot be judged by a
+// synchronous call. Registered here and drained in order at the end of the
+// file; a rejection is left unhandled exactly like a synchronous failure, so
+// the process still exits nonzero.
+const ASYNC_TESTS = [];
+function asyncTest(name, run) {
+  ASYNC_TESTS.push([name, run]);
 }
 
 function test(name, run) {
@@ -626,6 +654,229 @@ test("every shipped stall report carries the wait's start as its identity", () =
   }
 });
 
+// Both automatic rescues open a replacement session and both yield at that
+// request before anything marks the player, so only the shipped wiring can
+// answer whether two of them can be in flight at once. This runs the real
+// `maybeDecodeRescue`, `rescueAutoSupply` and `autoControllerTick` against a
+// session-open that stays pending until the test releases it — the ordering the
+// browser actually produces, where the cheap health GET returns before the
+// session-create POST.
+function autoRescueHarness(player) {
+  const opened = [];
+  let releaseOpen = null;
+  let openFails = false;
+  const video = { currentTime: 12, paused: false, videoHeight: 720 };
+
+  async function startTranscodeFallback(reason) {
+    opened.push(reason);
+    await new Promise((resolve) => {
+      releaseOpen = resolve;
+    });
+    if (openFails) return; // a 5xx leaves the outgoing stream untouched
+    player.method = "transcode";
+  }
+
+  const noop = () => {};
+  const build = new Function(
+    "PLAYER",
+    "document",
+    "performance",
+    "PlaybackPolicy",
+    "qualityForce",
+    "playedSecs",
+    "lostFrameRate",
+    "MARGIN_CLEAR_SECS",
+    "MARGIN_LOST_PER_MIN",
+    "SUPPLY_RUNWAY_SECS",
+    "clearDecodeLimit",
+    "decodeLimitLabel",
+    "decodeMarginVerdict",
+    "rememberDecodeLimit",
+    "clientLog",
+    "toast",
+    "playbackContext",
+    "setLoading",
+    "recordAutoSwitch",
+    "startTranscodeFallback",
+    "pollSessionHealth",
+    "bufferRunway",
+    "playerPixelHeight",
+    "switchAutoRung",
+    "rememberAutoRung",
+    [
+      shippedSourceIfPresent("claimAutoFallback"),
+      shippedSourceIfPresent("releaseAutoFallback"),
+      shippedSource("maybeDecodeRescue"),
+      shippedSource("rescueAutoSupply"),
+      shippedSource("autoControllerTick"),
+      "return {maybeDecodeRescue, rescueAutoSupply, autoControllerTick};",
+    ].join("\n"),
+  );
+
+  const shipped = build(
+    player,
+    { getElementById: () => video },
+    { now: () => 90_000 },
+    policy,
+    () => "auto",
+    () => 150,
+    () => ({ lost: 0, rate: 0 }),
+    60,
+    2,
+    6,
+    () => false,
+    () => "HEVC 2160p",
+    () => ({ lost: 15, rate: 6, secs: 150, decodeMs: 91, budgetMs: 41.7 }),
+    noop,
+    noop,
+    noop,
+    () => ({}),
+    noop,
+    noop,
+    startTranscodeFallback,
+    async () => {}, // the health poll resolves before the session-create request
+    () => 30,
+    () => 720,
+    async () => {},
+    noop,
+  );
+
+  return {
+    ...shipped,
+    opened,
+    video,
+    failNextOpen() {
+      openFails = true;
+    },
+    // Let every pending continuation run without completing the session-open.
+    async settle() {
+      for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    },
+    async finishOpen() {
+      assert.notEqual(releaseOpen, null, "no session-open was in flight");
+      const resolve = releaseOpen;
+      releaseOpen = null;
+      resolve();
+      await this.settle();
+    },
+  };
+}
+
+function pressuredRemuxPlayer() {
+  return {
+    method: "remux",
+    started: true,
+    offset: 0,
+    decodeRescued: false,
+    decodeRetest: false,
+    hitches: { back: 5, drop: 5, gap: 5, fps: 24, decodeMs: 91 },
+    source: { codec: "hevc", height: 2160 },
+    bufferLimits: null,
+    autoFallbackInFlight: false,
+    // Three supply episodes inside the 60 s window: the rescue is armed.
+    abr: {
+      switching: false,
+      supplyRescued: false,
+      stallEvents: { supply: [40_000, 60_000, 80_000], decode: [] },
+      lastStallAtMs: 80_000,
+      lastSwitchAtMs: 0,
+      stableSinceMs: 0,
+      switches: [],
+    },
+  };
+}
+
+asyncTest(
+  "a decode verdict and the third supply stall in one interval open one session",
+  async () => {
+    const player = pressuredRemuxPlayer();
+    const h = autoRescueHarness(player);
+
+    // Exactly the shipped 5-second interval: maybeDecodeRescue() is not awaited,
+    // and autoControllerTick() runs straight after it.
+    h.maybeDecodeRescue();
+    const tick = h.autoControllerTick();
+    await h.settle();
+
+    assert.deepEqual(
+      h.opened,
+      ["decode-rescue"],
+      "a supply rescue must not open a second session behind an in-flight decode rescue",
+    );
+    assert.equal(
+      player.abr.supplyRescued,
+      false,
+      "the refused supply rescue must not consume its one-shot latch",
+    );
+
+    await h.finishOpen();
+    await tick;
+    assert.deepEqual(h.opened, ["decode-rescue"]);
+    assert.equal(
+      player.autoFallbackInFlight,
+      false,
+      "the claim must be released once the session-open settles",
+    );
+  },
+);
+
+asyncTest(
+  "a decode verdict during an in-flight supply rescue opens no second session",
+  async () => {
+    const player = pressuredRemuxPlayer();
+    const h = autoRescueHarness(player);
+
+    // The other order: the supply rescue wins the interval, and the decode
+    // verdict lands on the next sample while its session-open is still pending.
+    const rescue = h.rescueAutoSupply();
+    await h.settle();
+    h.maybeDecodeRescue();
+    await h.settle();
+
+    assert.deepEqual(
+      h.opened,
+      ["auto-supply"],
+      "the decode rescue must not open a session behind an in-flight supply rescue",
+    );
+    assert.equal(
+      player.decodeRescued,
+      false,
+      "the refused decode rescue must not consume its one-shot latch",
+    );
+
+    await h.finishOpen();
+    await rescue;
+    assert.deepEqual(h.opened, ["auto-supply"]);
+    assert.equal(player.autoFallbackInFlight, false);
+  },
+);
+
+asyncTest("a failed automatic session-open releases the claim", async () => {
+  const player = pressuredRemuxPlayer();
+  const h = autoRescueHarness(player);
+  h.failNextOpen();
+
+  h.maybeDecodeRescue();
+  await h.settle();
+  assert.deepEqual(h.opened, ["decode-rescue"]);
+  await h.finishOpen();
+
+  assert.equal(player.method, "remux", "the failed open must leave the stream");
+  assert.equal(
+    player.autoFallbackInFlight,
+    false,
+    "a 5xx must not wedge every later automatic rescue",
+  );
+
+  // The supply rescue that was refused while the decode rescue was in flight
+  // can now run, so the guard costs nothing once the failure is known.
+  const rescue = h.rescueAutoSupply();
+  await h.settle();
+  assert.deepEqual(h.opened, ["decode-rescue", "auto-supply"]);
+  await h.finishOpen();
+  await rescue;
+});
+
 test("mild pressure needs two samples plus cooldown, dwell, and switch gain", () => {
   const first = policy.decideRung({
     ladder: serverLadder,
@@ -874,3 +1125,16 @@ test("decode rescue uses lost frames over a long window, not pipeline latency", 
     budgetMs: 41.7,
   });
 });
+
+// Drained last, in registration order, after every synchronous case has run.
+(async () => {
+  for (const [name, run] of ASYNC_TESTS) {
+    try {
+      await run();
+    } catch (error) {
+      error.message = `${name}: ${error.message}`;
+      throw error;
+    }
+    process.stdout.write(`PASS ${name}\n`);
+  }
+})();

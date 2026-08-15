@@ -178,6 +178,15 @@ it unit-tests without a video element:
   waste). The cap governs starts and upgrades only: it never removes the
   ladder floor or prevents pressure from downgrading a session already above
   the cap.
+- **One automatic move in flight.** The decode rescue, the supply rescue and a
+  rung switch all open a replacement session, and all three yield at that
+  request before anything on the player records the attempt. They therefore
+  share a single claim, taken before the request rather than after it: one 5 s
+  sample opens at most one replacement session, a refused path consumes none of
+  its own one-shot latches and re-evaluates on the next sample, and a failed
+  open releases the claim rather than wedging every later rescue. The viewer's
+  Force transcode, the stall watchdog, and a browser stream rejection are
+  outside the claim — those are not the controller's move to withhold.
 - **Start** at the persisted last-good rung when one exists; a fresh browser
   with no network prior omits height and preserves the server's existing
   encoder-aware Auto choice. **Seed the replacement Hls instance's

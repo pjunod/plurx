@@ -189,6 +189,16 @@ source_anchor = "function recordStallEpisode("
 test = "tests/playback/web-policy.test.js"
 test_anchor = "two long supply-stall episodes do not satisfy the three-stall rescue"
 
+# The only web fork that lives in the shipped page rather than the pure policy
+# module: it is about the ORDER two rescues take, which a pure decision function
+# cannot observe.
+[[decisions]]
+id = "web.auto-fallback-claim"
+source = "crates/plurxd/src/web/index.html"
+source_anchor = "function claimAutoFallback("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "a decode verdict and the third supply stall in one interval open one session"
+
 [[decisions]]
 id = "apple.transport-and-dv"
 source = "clients/apple/Sources/PlayerController.swift"
