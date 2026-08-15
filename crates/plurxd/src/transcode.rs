@@ -8,7 +8,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1032,12 +1035,18 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
         if !produced && session_producing(&dir).await {
             produced = true;
         }
-        let exited = {
+        let (replacing_child, exited) = {
             let mut child = session.child.lock().await;
-            child
+            let replacing_child = session.replacing_child.load(Acquire);
+            let exited = child
                 .as_mut()
-                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+            (replacing_child, exited)
         };
+        if replacing_child {
+            tokio::time::sleep(WATCHDOG_POLL).await;
+            continue;
+        }
         match watch_next(
             session.failed.load(Relaxed),
             exited,
@@ -1136,6 +1145,12 @@ struct Session {
     /// where the segments already exist and there is nothing to run, watch,
     /// suspend or kill.
     child: Mutex<Option<Child>>,
+    /// True only while a fallback deliberately replaces one live producer
+    /// with another inside this same session. The predecessor's non-zero kill
+    /// status is neither a terminal playlist verdict nor a watchdog exit.
+    replacing_child: AtomicBool,
+    #[cfg(test)]
+    replacement_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Served from the pre-transcode cache.
     ///
     /// Two things follow, and the second is the dangerous one. A cached
@@ -1278,6 +1293,19 @@ struct Session {
     first_slide_logged: AtomicBool,
 }
 
+/// Keeps the replacement marker true across every await between killing the
+/// predecessor and publishing (or failing) its successor. Cancellation clears
+/// it too, so a dropped fallback task cannot leave the session unjudgeable.
+struct ChildReplacement<'a> {
+    session: &'a Session,
+}
+
+impl Drop for ChildReplacement<'_> {
+    fn drop(&mut self) {
+        self.session.replacing_child.store(false, Release);
+    }
+}
+
 #[derive(Default)]
 struct SessionEventFields<'a> {
     reason: Option<&'a str>,
@@ -1301,13 +1329,36 @@ fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
 }
 
 impl Session {
+    fn begin_child_replacement(&self) -> ChildReplacement<'_> {
+        self.replacing_child.store(true, Release);
+        ChildReplacement { session: self }
+    }
+
+    async fn kill_child_for_replacement(&self) -> ChildReplacement<'_> {
+        let replacement = self.begin_child_replacement();
+        self.kill_child().await;
+        #[cfg(test)]
+        {
+            let pause = self
+                .replacement_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(pause) = pause {
+                pause.wait().await;
+                pause.wait().await;
+            }
+        }
+        replacement
+    }
+
     /// Stop the encoder, if there is one. A cache hit has no process; a
     /// session whose ffmpeg already exited has one that is already reaped.
-    /// Remove it from the live slot before waiting so playlist startup cannot
-    /// mistake a deliberately killed predecessor for its replacement's
-    /// terminal verdict.
+    /// Keep the handle in the slot after waiting: detached watchdogs use its
+    /// exit status to tell routine teardown from a real stall. Replacement
+    /// paths suppress that same status with `begin_child_replacement`.
     async fn kill_child(&self) {
-        if let Some(mut child) = self.child.lock().await.take() {
+        if let Some(child) = self.child.lock().await.as_mut() {
             let _ = child.kill().await;
         }
     }
@@ -2801,6 +2852,9 @@ impl TranscodeManager {
         let session = Arc::new(Session {
             dir,
             child: Mutex::new(None),
+            replacing_child: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_pause: std::sync::Mutex::new(None),
             cached: true,
             _cache_reader: Some(cache_reader),
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -4404,6 +4458,9 @@ impl TranscodeManager {
         let session = Arc::new(Session {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
+            replacing_child: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -4648,7 +4705,7 @@ impl TranscodeManager {
                 "retrying on software"
             }
         );
-        session.kill_child().await;
+        let _replacement = session.kill_child_for_replacement().await;
         clear_session_dir(dir).await;
         if !downgrade_pipeline {
             // The slot belonged to the encoder that just died, not
@@ -4887,6 +4944,9 @@ impl TranscodeManager {
         let session = Arc::new(Session {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
+            replacing_child: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("session-start")),
@@ -4989,7 +5049,7 @@ impl TranscodeManager {
                             "copy segmenter cannot read this stream ({reason}); \
                              falling back to ffmpeg's HLS muxer for this session"
                         );
-                        session.kill_child().await;
+                        let _replacement = session.kill_child_for_replacement().await;
                         clear_session_dir(&dir).await;
                         let args = transcode::hls_copy_args_with_dolby_vision(
                             &file,
@@ -5240,6 +5300,9 @@ impl TranscodeManager {
         }
         let unsuccessful_exit = {
             let mut child = session.child.lock().await;
+            if session.replacing_child.load(Acquire) {
+                return false;
+            }
             child.as_mut().and_then(|child| match child.try_wait() {
                 Ok(Some(status)) if !status.success() => Some(status),
                 _ => None,
@@ -7604,6 +7667,9 @@ mod tests {
         Session {
             dir,
             child: Mutex::new(Some(child)),
+            replacing_child: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_pause: std::sync::Mutex::new(None),
             cached: false,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -7792,7 +7858,7 @@ mod tests {
             .spawn()
             .expect("spawn false");
         let session = watchdog_session(dir.path(), Some(child), false);
-        session.kill_child().await;
+        let _replacement = session.kill_child_for_replacement().await;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let mgr = TranscodeManager::new(
             store,
@@ -7815,6 +7881,76 @@ mod tests {
             !session.failed.load(Relaxed),
             "the killed predecessor must not poison its replacement"
         );
+    }
+
+    /// Drive the hardware-to-software fallback itself, paused after it kills
+    /// the predecessor. This pins the production call site as well as the
+    /// replacement marker: a playlist poll inside that gap must not poison the
+    /// successor the fallback is about to install.
+    #[tokio::test]
+    async fn playlist_waits_during_the_production_fallback_replacement() {
+        use plurx_core::store::SqliteStore;
+
+        super::require_ffmpeg();
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let dir = tempfile::tempdir().expect("session dir");
+        let session = Arc::new(test_session(dir.path().to_path_buf()));
+        mgr.sessions
+            .lock()
+            .await
+            .insert("fallback-gap".into(), Arc::clone(&session));
+
+        let pause = Arc::new(tokio::sync::Barrier::new(2));
+        *session
+            .replacement_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let mut opts = mgr.options_for_tone_map(
+            Encoder::VideoToolbox,
+            &file,
+            720,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+        );
+        opts.pipeline = Pipeline::Cpu;
+        let sw_pool = mgr.admissions.software_pool();
+        let fallback = TranscodeManager::downgrade_one_step(
+            &session,
+            &file,
+            &opts,
+            Encoder::VideoToolbox,
+            EffectiveRateControl::Vbr,
+            Pacing::unpaced(),
+            &sw_pool,
+            dir.path(),
+            "fallback-gap",
+            &mgr.runtime_cache,
+        );
+        let observe_gap = async {
+            pause.wait().await;
+            let waiting =
+                tokio::time::timeout(Duration::from_millis(250), mgr.playlist("fallback-gap"))
+                    .await;
+            assert!(
+                waiting.is_err(),
+                "the production replacement gap keeps the publication window open"
+            );
+            assert!(
+                !session.failed.load(Relaxed),
+                "the production fallback's killed predecessor must not poison its successor"
+            );
+            pause.wait().await;
+        };
+
+        let (_, ()) = tokio::join!(fallback, observe_gap);
+        session.kill_child().await;
     }
 
     /// Teardown removes a session from the manager before it kills the child.
@@ -8671,6 +8807,9 @@ mod tests {
         Arc::new(Session {
             dir: dir.to_path_buf(),
             child: Mutex::new(child),
+            replacing_child: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_pause: std::sync::Mutex::new(None),
             cached,
             _cache_reader: None,
             last_request: Mutex::new(LastRequest::now("test-start")),
@@ -8771,9 +8910,41 @@ mod tests {
             session.failed.load(Relaxed),
             "a mid-stream wedge must fail the session even though a segment was published"
         );
+        let killed = session
+            .child
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
+        assert!(killed, "and the wedged process must be gone");
+    }
+
+    /// Session teardown deliberately kills a live child without failing the
+    /// session. The detached watchdog must observe that exit as `Done`, not
+    /// wait until the motion clock turns an ordinary stop into a false stall.
+    #[tokio::test(start_paused = true)]
+    async fn an_ordinary_kill_ends_the_watchdog_without_a_stall() {
+        let dir = tempfile::tempdir().expect("dir");
+        tokio::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n",
+        )
+        .await
+        .expect("playlist");
+        let session = watchdog_session(dir.path(), Some(long_running_child()), false);
+        let watchdog = tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "ordinary-stop".into(),
+        ));
+
+        session.kill_child().await;
+        force_stalled(&session.progress);
+        settle(watchdog).await;
+
         assert!(
-            session.child.lock().await.is_none(),
-            "and the wedged process must be killed, reaped, and removed"
+            !session.failed.load(Relaxed),
+            "a deliberately killed child must end the watchdog without a stall verdict"
         );
     }
 
