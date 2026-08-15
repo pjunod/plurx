@@ -370,6 +370,7 @@ struct PlaybackStallTerminalState: Equatable {
 }
 
 enum SameDeliveryStallRecoveryOutcome: String, Equatable {
+    case reconnect
     case reopen
     case terminal
 }
@@ -377,13 +378,6 @@ enum SameDeliveryStallRecoveryOutcome: String, Equatable {
 enum SameDeliveryStallRecoveryDecision: Equatable {
     case reopen
     case stop(PlaybackStallTerminalState)
-
-    var outcome: SameDeliveryStallRecoveryOutcome {
-        switch self {
-        case .reopen: return .reopen
-        case .stop: return .terminal
-        }
-    }
 }
 
 /// The same stream gets one reconnect. Five seconds of later film-clock
@@ -644,6 +638,7 @@ enum PlayerItemEndAction: Equatable {
 }
 
 enum SameDeliveryRecoveryTransport: Equatable {
+    case currentHLSItem
     case serverSession
     case offlineAsset
 }
@@ -1612,6 +1607,16 @@ final class PlayerController: ObservableObject {
             nextBaseMs = Self.sessionMediaOriginMs(hls, requestedStartMs: startMs)
             if isVOD {
                 if startMs > 0 { seekAfterAttach = startMs }
+            } else {
+                // A copied/remuxed session begins on the clean keyframe before
+                // the requested film position. Map that preroll into the new
+                // item's local clock and skip it after attach; otherwise every
+                // recovery visibly replays one source GOP (about four seconds
+                // on the reported Apple TV title).
+                seekAfterAttach = Self.sessionPrerollSeekMs(
+                    hls,
+                    requestedStartMs: startMs
+                )
             }
             url = Session.shared.url(hls.playlistUrl)
             startStatusPolling()
@@ -2070,21 +2075,45 @@ final class PlayerController: ObservableObject {
     }
 
     /// One bounded transport recovery shared by buffering and non-HDR silent
-    /// freezes. It deliberately calls `reopen` directly: no capability flag or
-    /// selected format changes, so the replacement uses the identical recipe.
+    /// freezes. It chooses the least-destructive form of the identical
+    /// delivery: local offline reload, current live-HLS item reattach, or a
+    /// replacement server session when neither of those can apply.
     private func retrySameDeliveryAfterStall(_ event: PlaybackStallEvent) async {
         let decision = sameDeliveryStallRecovery.next(for: event.kind)
-        reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
         case .reopen:
             #if os(iOS)
-            if Self.recoveryTransport(hasOfflineAsset: offlineAssetURL != nil) == .offlineAsset {
-                await reloadOffline(at: event.positionMs)
-                return
-            }
+            let hasOfflineAsset = offlineAssetURL != nil
+            #else
+            let hasOfflineAsset = false
             #endif
-            await reopen(at: event.positionMs)
+            switch Self.recoveryTransport(
+                hasOfflineAsset: hasOfflineAsset,
+                isGrowingHLS: sessionId != nil && !isVOD
+            ) {
+            case .offlineAsset:
+                reportPlaybackStall(event, outcome: .reopen)
+                #if os(iOS)
+                await reloadOffline(at: event.positionMs)
+                #endif
+            case .currentHLSItem:
+                // A sustained wait with an otherwise-live session is usually
+                // AVPlayer's fetch loop, not a reason to kill a healthy
+                // producer. Reattach the same capability first. Besides being
+                // faster, this keeps the source timeline intact instead of
+                // starting a new copy session at the preceding keyframe.
+                if let outcome = await reconnectCurrentHLSItem(at: event.positionMs) {
+                    reportPlaybackStall(event, outcome: outcome)
+                } else {
+                    reportPlaybackStall(event, outcome: .reopen)
+                    await reopen(at: event.positionMs)
+                }
+            case .serverSession:
+                reportPlaybackStall(event, outcome: .reopen)
+                await reopen(at: event.positionMs)
+            }
         case .stop(let terminal):
+            reportPlaybackStall(event, outcome: .terminal)
             player.pause()
             isPlaying = terminal.isPlaying
             wantsPlayback = terminal.wantsPlayback
@@ -2095,9 +2124,110 @@ final class PlayerController: ObservableObject {
     }
 
     nonisolated static func recoveryTransport(
-        hasOfflineAsset: Bool
+        hasOfflineAsset: Bool,
+        isGrowingHLS: Bool
     ) -> SameDeliveryRecoveryTransport {
-        hasOfflineAsset ? .offlineAsset : .serverSession
+        if hasOfflineAsset { return .offlineAsset }
+        return isGrowingHLS ? .currentHLSItem : .serverSession
+    }
+
+    /// Reset AVPlayer's live-playlist loader without replacing the server
+    /// session. A new item pointed at the same capability forces a fresh
+    /// playlist request, while the explicit local seek keeps the picture at
+    /// the frozen source position. Viewer commands that arrive during the
+    /// reattach are drained through the ordinary serialized reopen path.
+    private func reconnectCurrentHLSItem(
+        at positionMs: Int
+    ) async -> SameDeliveryStallRecoveryOutcome? {
+        guard started,
+              sessionId != nil,
+              !isVOD,
+              let previousItem = player.currentItem,
+              let asset = previousItem.asset as? AVURLAsset
+        else { return nil }
+
+        let resumesPlayback = wantsPlayback
+        let resumeRate = preferredRate
+        let localPositionMs = max(0, positionMs - baseMs)
+        let nativeSubtitle = Self.sessionSubtitleFields(
+            selected: selectedSubtitle,
+            tracks: subtitles,
+            legacyBurn: forceLegacySubtitleBurn
+        ).native
+
+        finished = false
+        attachmentRecovery.opened(at: positionMs)
+        isChangingStream = true
+        failed = false
+        playbackError = nil
+        player.pause()
+
+        let item = AVPlayerItem(url: asset.url)
+        Self.configureBuffering(item, growingHLS: true)
+        #if os(iOS)
+        item.externalMetadata = [titleMetadata(title)]
+        #endif
+        observeEnd(of: item)
+        observeStatus(of: item)
+        pgsOverlayItemGeneration &+= 1
+        pgsOverlayWindowTask?.cancel()
+        pgsOverlayWindow = nil
+        stallObservation.reset()
+        player.replaceCurrentItem(with: item)
+        refreshPGSOverlayWindow(at: positionMs, force: true)
+
+        // Start the network request immediately, then land on the exact local
+        // clock once AVPlayer declares the replacement ready.
+        player.play()
+        do {
+            try await seekWhenReady(item, ms: localPositionMs)
+        } catch {
+            guard started, player.currentItem === item else { return .reconnect }
+            isChangingStream = false
+            if item.status == .failed {
+                await handleItemFailure(item)
+            } else {
+                // The old capability did not become ready inside the same
+                // bounded manifest window as the server. Replace its session
+                // instead of stranding recovery on another loading screen.
+                await reopen(at: positionMs)
+                return .reopen
+            }
+            return .reconnect
+        }
+
+        guard started, player.currentItem === item else { return .reconnect }
+        await applyPreferredAudioSelection(to: item)
+        await applyNativeSubtitleSelection(nativeSubtitle, to: item)
+        guard started, player.currentItem === item else { return .reconnect }
+
+        if resumesPlayback {
+            player.play()
+            if resumeRate != 1 { player.rate = resumeRate }
+        } else {
+            player.pause()
+        }
+        isPlaying = resumesPlayback
+        currentMs = realPositionMs()
+        playbackRecoveryMonitor.reset()
+        failed = false
+        isChangingStream = false
+        updateNowPlaying()
+
+        // Retention should keep this position in the live window. If it did
+        // not, a fresh server session is the only truthful fallback.
+        if abs(currentMs - positionMs) > 1_000 {
+            await reopen(at: positionMs)
+            return .reopen
+        }
+        if item.status == .failed {
+            await handleItemFailure(item)
+            return .reconnect
+        }
+        if let trailing = reopenQueue.takePending() {
+            await reopen(at: trailing)
+        }
+        return .reconnect
     }
 
     private func fail(_ error: Error) {
@@ -2684,7 +2814,11 @@ final class PlayerController: ObservableObject {
         // finite deadline so playback either resumes or surfaces a useful
         // connection error.
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(15))
+        // A fresh growing playlist can legitimately spend most of the
+        // server's 30-second first-manifest window filling its publish gate.
+        // Direct, VOD, and offline items keep the shorter failure deadline.
+        let timeoutSeconds = sessionId != nil && !isVOD ? 30 : 15
+        let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
         while item.status == .unknown {
             try Task.checkCancellation()
             guard clock.now < deadline else { throw PlaybackPreparationError.timedOut }
@@ -2896,6 +3030,28 @@ final class PlayerController: ObservableObject {
         if hls.vod == true { return 0 }
         if let mediaOriginMs = hls.mediaOriginMs { return max(0, mediaOriginMs) }
         return Int((hls.startSeconds ?? Double(requestedStartMs) / 1000.0) * 1000)
+    }
+
+    /// Player-local catch-up needed when a live copy session starts at the
+    /// preceding source keyframe. VOD owns a whole-title clock and follows the
+    /// ordinary absolute seek path; legacy servers without `media_origin_ms`
+    /// conservatively report no preroll because the actual offset is unknown.
+    nonisolated static func sessionPrerollSeekMs(
+        _ hls: HlsStart,
+        requestedStartMs: Int
+    ) -> Int? {
+        guard hls.vod != true,
+              let mediaOriginMs = hls.mediaOriginMs,
+              mediaOriginMs >= 0
+        else { return nil }
+        let local = requestedStartMs - sessionMediaOriginMs(
+            hls,
+            requestedStartMs: requestedStartMs
+        )
+        // Millisecond rounding between the request and the probed keyframe is
+        // not visible preroll and must not put an otherwise-zero-cost attach
+        // behind the readiness gate.
+        return local >= 250 ? local : nil
     }
 
     private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {

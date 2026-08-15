@@ -118,13 +118,26 @@ private struct DetailNavigationTestHost<Content: View>: View {
 #endif
 
 final class AppleClientTests: XCTestCase {
-    func testSameDeliveryRecoveryKeepsOfflinePlaybackOnTheLocalAsset() {
+    func testSameDeliveryRecoveryChoosesTheLeastDestructiveTransport() {
         XCTAssertEqual(
-            PlayerController.recoveryTransport(hasOfflineAsset: true),
+            PlayerController.recoveryTransport(
+                hasOfflineAsset: true,
+                isGrowingHLS: true
+            ),
             .offlineAsset
         )
         XCTAssertEqual(
-            PlayerController.recoveryTransport(hasOfflineAsset: false),
+            PlayerController.recoveryTransport(
+                hasOfflineAsset: false,
+                isGrowingHLS: true
+            ),
+            .currentHLSItem
+        )
+        XCTAssertEqual(
+            PlayerController.recoveryTransport(
+                hasOfflineAsset: false,
+                isGrowingHLS: false
+            ),
             .serverSession
         )
     }
@@ -1253,7 +1266,7 @@ final class AppleClientTests: XCTestCase {
     func testAppleBufferingStallLogCarriesPositionMethodAndDuration() throws {
         let payload = ApplePlaybackStallLog(
             kind: .buffering,
-            outcome: .reopen,
+            outcome: .reconnect,
             positionMs: 90_000,
             durationMs: 12_000,
             method: "remux",
@@ -1274,7 +1287,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(object["encoder"] as? String, "copy")
         XCTAssertEqual(
             object["detail"] as? String,
-            "kind=buffering · position_ms=90000 · outcome=reopen"
+            "kind=buffering · position_ms=90000 · outcome=reconnect"
         )
     }
 
@@ -3020,6 +3033,51 @@ final class AppleClientTests: XCTestCase {
             PlayerController.sessionMediaOriginMs(invalid, requestedStartMs: 10_500),
             0
         )
+    }
+
+    func testGrowingHlsRecoverySkipsCopyKeyframePreroll() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let copied = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"copy","playlist_url":"/hls/copy/index.m3u8",
+         "start_seconds":90.0,"media_origin_ms":86000,"vod":false}
+        """#.utf8))
+        XCTAssertEqual(
+            PlayerController.sessionPrerollSeekMs(copied, requestedStartMs: 90_000),
+            4_000,
+            "the replacement item must skip the source GOP instead of replaying it"
+        )
+
+        let exact = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"transcode","playlist_url":"/hls/transcode/index.m3u8",
+         "start_seconds":90.0,"media_origin_ms":90000,"vod":false}
+        """#.utf8))
+        XCTAssertNil(PlayerController.sessionPrerollSeekMs(exact, requestedStartMs: 90_000))
+
+        let rounding = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"rounding","playlist_url":"/hls/rounding/index.m3u8",
+         "start_seconds":90.0,"media_origin_ms":89999,"vod":false}
+        """#.utf8))
+        XCTAssertNil(PlayerController.sessionPrerollSeekMs(rounding, requestedStartMs: 90_000))
+
+        let legacy = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"legacy","playlist_url":"/hls/legacy/index.m3u8",
+         "start_seconds":90.0,"vod":false}
+        """#.utf8))
+        XCTAssertNil(PlayerController.sessionPrerollSeekMs(legacy, requestedStartMs: 90_000))
+
+        let invalid = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"invalid","playlist_url":"/hls/invalid/index.m3u8",
+         "start_seconds":90.0,"media_origin_ms":-1,"vod":false}
+        """#.utf8))
+        XCTAssertNil(PlayerController.sessionPrerollSeekMs(invalid, requestedStartMs: 90_000))
+
+        let vod = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"vod","playlist_url":"/hls/vod/index.m3u8",
+         "start_seconds":0,"media_origin_ms":86000,"vod":true}
+        """#.utf8))
+        XCTAssertNil(PlayerController.sessionPrerollSeekMs(vod, requestedStartMs: 90_000))
     }
 
     /// Servers from before the Apple DV transport hint can approve Profile 8

@@ -10,6 +10,15 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Apple HLS stall recovery no longer replays a source GOP.** A sustained
+  wait on a growing HLS item now reattaches AVPlayer to the existing live
+  session first, forcing a fresh playlist request without killing a healthy
+  producer. If recovery does need a new copy/remux session, the replacement
+  skips the clean-keyframe preroll and lands on the requested source position;
+  the roughly four-second rewind seen after one Apple TV freeze is therefore
+  not part of recovery. Direct, cached-VOD, and offline recovery keep their
+  existing transports. Apple build 49 carries the change.
+
 - **Web playback no longer waits forever on a starved remux.** Every probed
   remux now prefers copy-video HLS when the browser proves it can accept the
   exact video/audio pair through MediaSource; explicit **Original · one
