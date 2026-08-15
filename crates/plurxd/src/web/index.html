@@ -663,10 +663,31 @@
   .version{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-top:14px}
   .version .vh{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:4px}
   .version .vt{font-weight:600;font-size:14px}
-  .specs{display:grid;grid-template-columns:64px 1fr;gap:5px 14px;font-size:13px;margin:8px 0 0}
+  /* 84px, not 64: "Subtitles" is the longest term this list has to name, and a
+     wrapped two-line label beside a one-line value reads as a broken row. */
+  .specs{display:grid;grid-template-columns:84px 1fr;gap:5px 14px;font-size:13px;margin:8px 0 0}
   .specs dt{color:var(--muted)}
   .specs dd{margin:0;color:var(--text)}
   .specs .fn{color:var(--muted);font-size:12px;word-break:break-all}
+  /* Track facts: one chip per audio/subtitle track, with the track the server
+     would select marked. The marker is words and not only a colour — "plays by
+     default" has to survive a monochrome theme and a screen reader. */
+  .specs .trks{display:flex;flex-wrap:wrap;gap:6px}
+  .specs .trk{border:1px solid var(--line);border-radius:999px;padding:2px 9px;line-height:1.5}
+  .specs .trk.on{border-color:var(--accent);color:var(--accent)}
+  .specs .trk .tdef{font-weight:600}
+  .specs .langnote{color:var(--muted);font-size:12px;margin-top:4px}
+  /* Pre-play pickers. Deliberately inside the version block: the tracks belong
+     to one file, and a multi-version item must not offer one item-wide choice
+     that half its files cannot honour. */
+  .preplay{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+  .preplay .pprow{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+  .preplay .ppfield{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .preplay label{color:var(--muted);font-size:12px}
+  .preplay select{max-width:100%}
+  .preplay .ppnote{margin-top:8px;font-size:12.5px;color:var(--muted)}
+  .preplay .ppnote.warn{color:var(--warn,#fbbf24)}
+  .preplay .ppnote b{color:var(--text)}
 
   .eplist{margin-top:10px;border:1px solid var(--line);border-radius:12px;overflow:hidden}
   .eprow{display:grid;grid-template-columns:150px minmax(0,1fr) auto;gap:16px;align-items:center;padding:12px;cursor:pointer;background:var(--panel);transition:background .1s}
@@ -4064,14 +4085,241 @@ function playerFactBadges(){
   if(au) b.push(`<span class="vbadge audio" title="${esc(au.full)}">${mediaIcon('audio')}${esc(au.text)}</span>`);
   return b.join('');
 }
+// ---- detail-screen track facts (docs/CLIENTS.md §"Shared track facts") ----
+// The item-detail payload already carries the server's cold-start answer in
+// `playback_defaults`: which audio and subtitle stream would play, and how the
+// configured preferred language relates to the tracks that exist. This renders
+// that answer. It does not re-run `select_tracks` in JavaScript and it never
+// reads admin settings — two clients that each invented the rule would tell the
+// same file's story two different ways, which is the whole reason the server
+// computes it.
+//
+// FIVE statuses, not four. `unknown` is a file with at least one untagged
+// track: the preferred language may well be sitting right there under a missing
+// tag, so "no English subtitles" would be a claim the data does not support.
+// Folding it into `missing` is the specific mistake this note exists to stop.
+function preferredLanguageNote(kind, d){
+  if(!d) return "";
+  const lang=langName(d.preferred_language)||d.preferred_language||"";
+  const s=d.preferred_language_status;
+  if(s==="available") return `${lang} ${kind} available — the server’s default is another track`;
+  if(s==="missing")   return `no ${lang} ${kind}`;
+  if(s==="unknown")   return `a track has no language tag, so ${lang} ${kind} can’t be ruled out`;
+  // `selected` needs no sentence (the marked chip is the sentence) and
+  // `no_tracks` is already said by the row itself.
+  return "";
+}
+// One track chip. The marker is a word, not only a colour: a monochrome theme,
+// a screen reader, and a printed page all have to survive it.
+function trackChip(label, isDefault){
+  return `<span class="trk${isDefault?" on":""}">${esc(label)}${
+    isDefault?' · <span class="tdef">plays by default</span>':""}</span>`;
+}
+// Subtitle format as the container spells it, in the words a viewer recognises.
+// Display only — nothing here decides delivery. Whether a track has to be
+// burned into the picture is the server's answer (`selection.subtitle_requires_
+// burn_in`), asked for in prePlayPreview() rather than guessed from a codec.
+const SUB_FORMATS={subrip:"SRT",srt:"SRT",webvtt:"WebVTT",vtt:"WebVTT",ass:"ASS",ssa:"SSA",
+  mov_text:"mov_text",text:"Text",hdmv_pgs_subtitle:"PGS",pgs:"PGS",dvd_subtitle:"VobSub",
+  dvdsub:"VobSub",dvb_subtitle:"DVB",xsub:"XSUB",eia_608:"CEA-608",eia_708:"CEA-708"};
+function subFormat(codec){
+  const c=String(codec||"").toLowerCase();
+  return SUB_FORMATS[c]||(c?c.toUpperCase():"");
+}
+// Language · format · markers. `forced` and `hearing_impaired` are the
+// container's own dispositions, which is exactly what the in-player Subtitles
+// menu shows — one story per track, wherever you read it.
+function subFactLabel(s){
+  return [langName(s.language)||"Untagged", subFormat(s.codec),
+          s.forced?"forced":null, s.hearing_impaired?"SDH":null,
+          s.title].filter(Boolean).join(" · ");
+}
+// Deliberately the same shape as subFactLabel: language first, then format,
+// then what distinguishes this track from its neighbours. Two rows that read
+// the same way are what makes "English audio, no English subtitles" legible in
+// one glance — the older `audioLabel()` form led with the codec and left the
+// language as a raw `eng` at the end, which is the one fact being compared.
+function audioFactLabel(a){
+  return [langName(a.language)||"Untagged", a.codec&&a.codec.toUpperCase(),
+          fmtChannels(a.channels), a.title].filter(Boolean).join(" · ");
+}
+function trackFactRow(label, tracks, selectedIndex, chip, note){
+  const chips=tracks.length
+    ? `<div class="trks">${tracks.map(t=>chip(t, t.index===selectedIndex)).join("")}</div>`
+    : `<div class="trks">None</div>`;
+  return `<dt>${label}</dt><dd>${chips}${note?`<div class="langnote">${esc(note)}</div>`:""}</dd>`;
+}
 function specBlock(f){
   const vid=[f.video_codec&&f.video_codec.toUpperCase(),(f.width&&f.height)?`${f.width}×${f.height}`:null,(f.hdr_format||f.hdr),f.bit_depth?`${f.bit_depth}-bit`:null,fmtMbps(f.bitrate)].filter(Boolean).join(" · ");
-  const aud=(f.audio_streams||[]).map(audioLabel).filter(Boolean).join("  /  ")||"—";
   const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size),fmtDur(f.duration_ms)].filter(Boolean).join(" · ");
+  const auds=f.audio_streams||[], subs=f.subtitle_streams||[];
+  const pd=f.playback_defaults||{};
+  const ad=pd.audio, sd=pd.subtitle;
+  // Audio keeps its existing one-line form when the server sent no defaults (an
+  // older server, or a file that was never probed) — the row must not become
+  // emptier than it was.
+  const audRow=ad
+    ? trackFactRow("Audio", auds, ad.selected_index==null?-1:ad.selected_index,
+        (a,on)=>trackChip(audioFactLabel(a),on), preferredLanguageNote("audio",ad))
+    : `<dt>Audio</dt><dd>${esc(auds.map(audioLabel).filter(Boolean).join("  /  ")||"—")}</dd>`;
+  // Subtitles were previously not on this page at all: the only way to learn a
+  // file's subtitles was to start playback and open the CC menu. A file with
+  // none says so — an absent row would read as "not loaded yet".
+  //
+  // Skipped entirely for a file with neither video nor subtitles, which is an
+  // audiobook part: "Subtitles: None" there is noise about something nobody
+  // expected to exist.
+  const subRow=(!subs.length && !f.video_codec) ? ""
+    : trackFactRow("Subtitles", subs, sd&&sd.selected_index!=null?sd.selected_index:-1,
+        (s,on)=>trackChip(subFactLabel(s),on),
+        subs.length?preferredLanguageNote("subtitles",sd):"");
   return `<dl class="specs">
-    ${vid||!(f.audio_streams||[]).length?`<dt>Video</dt><dd>${esc(vid||"—")}</dd>`:''}
-    <dt>Audio</dt><dd>${esc(aud)}</dd>
-    <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
+    ${vid||!auds.length?`<dt>Video</dt><dd>${esc(vid||"—")}</dd>`:''}
+    ${audRow}
+    ${subRow}
+    <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>${prePlayPickers(f)}`;
+}
+// ---- pre-play audio / subtitle selection ----------------------------------
+// A choice made on the detail screen, before there is a player at all. It
+// belongs to ONE playback: nothing here writes Settings → Playback defaults,
+// and loadItem() empties the store on the way into another item, so a French
+// track picked for one film is not silently picked for the next.
+//
+// Keyed by file, not by item. A multi-version item's two files have different
+// streams, and one item-wide choice would be an index into the wrong file.
+let PREPLAY={};
+// Replaced, never mutated: prePlayPreview() compares identity after its await
+// to notice that a later change superseded the answer it is holding.
+function prePlaySelection(fileId){ return PREPLAY[fileId]||null; }
+function clearPrePlay(){ PREPLAY={}; }
+function prePlaySelectionQuery(sel){
+  if(!sel) return "";
+  return (sel.audio!=null?"&audio="+sel.audio:"")+(sel.subtitle!=null?"&subtitle="+sel.subtitle:"");
+}
+// Every `/decision` this app makes, so the selection cannot be wired into some
+// of them and forgotten in the rest. An omitted parameter is load-bearing: a
+// request that sends no `audio=` keeps its previous verdict byte-for-byte
+// (docs/PLAYBACK.md), which is what stops an untouched picker from turning a
+// direct play into a remux for nothing.
+function decisionUrl(fileId, force, sel){
+  return `/files/${fileId}/decision?${CAPS_Q}&force=${force}${prePlaySelectionQuery(sel)}`;
+}
+// `null` for a field means "no explicit choice" and is NOT the same as picking
+// the track the server would have picked anyway: a request that sends no
+// `audio=` keeps its previous verdict byte-for-byte (docs/PLAYBACK.md), and
+// that is what stops an untouched picker from turning a direct play into a
+// remux for no reason.
+function setPrePlay(fileId, kind, raw){
+  const cur=PREPLAY[fileId]||{audio:null,subtitle:null};
+  const next=Object.assign({},cur);
+  next[kind] = raw===""||raw==null ? null : Number(raw);
+  PREPLAY[fileId] = (next.audio==null&&next.subtitle==null) ? null : next;
+  prePlayPreview(fileId);
+}
+function prePlayPickers(f){
+  const auds=f.audio_streams||[], subs=f.subtitle_streams||[];
+  // Nothing to choose between: one audio track and no subtitles at all.
+  if(!f.available || (auds.length<2 && !subs.length)) return "";
+  const pd=f.playback_defaults||{}, ad=pd.audio||{}, sd=pd.subtitle||{};
+  const sel=prePlaySelection(f.id)||{audio:null,subtitle:null};
+  const defAudio=auds.find(a=>a.index===ad.selected_index);
+  const defSub=subs.find(s=>s.index===sd.selected_index);
+  const opt=(value,label,on)=>`<option value="${esc(String(value))}"${on?" selected":""}>${esc(label)}</option>`;
+  const audioField=auds.length>1?`<div class="ppfield">
+      <label for="pp-a-${f.id}">Audio</label>
+      <select id="pp-a-${f.id}" onchange="setPrePlay(${f.id},'audio',this.value)">
+        ${opt("",defAudio?`Default · ${audioFactLabel(defAudio)}`:"Default",sel.audio==null)}
+        ${auds.map(a=>opt(a.index,audioFactLabel(a),sel.audio===a.index)).join("")}
+      </select></div>`:"";
+  const subField=subs.length?`<div class="ppfield">
+      <label for="pp-s-${f.id}">Subtitles</label>
+      <select id="pp-s-${f.id}" onchange="setPrePlay(${f.id},'subtitle',this.value)">
+        ${opt("",defSub?`Default · ${subFactLabel(defSub)}`:"Default · Off",sel.subtitle==null)}
+        ${opt(-1,"Off",sel.subtitle===-1)}
+        ${subs.map(s=>opt(s.index,subFactLabel(s),sel.subtitle===s.index)).join("")}
+      </select></div>`:"";
+  return `<div class="preplay">
+    <div class="pprow">${audioField}${subField}</div>
+    <div class="ppnote" id="pp-n-${f.id}" role="status">${esc(PREPLAY_SCOPE_NOTE)}</div></div>`;
+}
+// Criterion 7, said out loud rather than merely implemented: this is one
+// playback's choice, and Settings → Playback defaults is untouched by it.
+const PREPLAY_SCOPE_NOTE="Applies to this playback only — it doesn’t change your Playback defaults.";
+// Does THIS player have to burn the chosen subtitle into the picture?
+//
+// Two authorities that answer two different questions, and the player owes the
+// viewer whichever one says yes. `selection.subtitle_requires_burn_in` is about
+// the server's delivery plan, and it is false when the PGS application overlay
+// is enabled — a route the native clients have and this player does not.
+// `subNeedsBurn()` is about the browser: a picture has nothing to hand a
+// <track>. Trusting only the server's field would start a pre-play choice on a
+// plan that cannot show it and then restart to fix that, which is precisely the
+// re-buffer a pre-play choice exists to avoid.
+function prePlayBurnNeeded(decision, index){
+  if(index==null || index<0) return false;
+  const sel=decision.selection||{};
+  const server=sel.subtitle_index===index && !!sel.subtitle_requires_burn_in;
+  return server || subNeedsBurn((decision.subtitles||[]).find(s=>s.index===index));
+}
+// What a pre-play selection means for the cold start, decided in one place so
+// it can be reasoned about — and checked — without standing a player up.
+//
+// `subtitle` is null unless the viewer chose one explicitly. The server echoes
+// its OWN policy subtitle in `selection` for an audio-only request, and reading
+// that echo as a choice would burn a track nobody asked for into a film that
+// was direct-playing.
+function prePlayApplication(decision, selection){
+  const sub=selection&&selection.subtitle!=null?selection.subtitle:null;
+  const action=prePlayBurnNeeded(decision, sub)
+    ? PlaybackPolicy.subtitleBurnAction({requiresBurn:true,
+        deliveredRange:decision.delivered_dynamic_range})
+    : "native";
+  return {
+    subtitle:sub,
+    // The established HDR guard, reached before the stream exists rather than
+    // after: a viewer choice is not permission to replace HDR with SDR.
+    blockedByHdr:action==="keep_hdr",
+    // A burn has to be part of the FIRST session open — `transcodeOpts()` reads
+    // `PLAYER.burnedSub` — or applying it costs a second session and a visible
+    // re-buffer to satisfy a choice made before playback began.
+    burnedSub:action==="burn"?sub:null,
+    // A text track is handed to a <track> once the route knows its offset. Off
+    // (`-1`) and "no explicit choice" apply nothing here; the latter leaves the
+    // cold-start server default alone.
+    textSub:action==="native"&&sub!=null&&sub>=0?sub:null,
+  };
+}
+// What the current selection would cost, in the server's own words, before
+// anyone presses Play. This is the pre-play half of criterion 6: the in-player
+// path already says "this format is a picture, so the server draws it in" as it
+// restarts the stream, and finding that out afterwards is the thing being
+// fixed.
+async function prePlayPreview(fileId){
+  const note=document.getElementById(`pp-n-${fileId}`); if(!note) return;
+  const sel=prePlaySelection(fileId);
+  if(!sel){ note.className="ppnote"; note.textContent=PREPLAY_SCOPE_NOTE; return; }
+  note.className="ppnote"; note.textContent="Checking what this selection needs…";
+  let d;
+  try{ d=await api(decisionUrl(fileId, qualityForce(), sel)); }
+  catch(e){
+    if(prePlaySelection(fileId)!==sel) return;
+    note.className="ppnote warn"; note.textContent=e.message||"Couldn’t check that combination"; return;
+  }
+  if(prePlaySelection(fileId)!==sel) return;   // superseded while we were away
+  const applied=prePlayApplication(d, sel);
+  const blocked=applied.blockedByHdr, burn=blocked||applied.burnedSub!=null;
+  const method=d.method==='direct_play'?"Direct play — no conversion"
+    : d.method==='transcode'?"Transcode — the server re-encodes the video"
+    : "Remux — the video is copied, only the container changes";
+  const parts=[`<b>${esc(burn&&!blocked?"Transcode — the server re-encodes the video":method)}</b>.`];
+  if(blocked) parts.push(esc("That subtitle is a picture and can only be shown by burning it into an SDR "+
+    "re-encode. This file is HDR, so playback keeps its HDR picture and the track will not be shown."));
+  else if(burn) parts.push(esc("That subtitle is a picture, so the server draws it into the frames — "+
+    "it starts burned in and turning it off restarts the stream."));
+  const why=(d.reasons||[]).filter(Boolean);
+  if(why.length && !burn) parts.push(esc(why.join(" · ")));
+  note.className="ppnote"+(blocked||burn?" warn":"");
+  note.innerHTML=parts.join(" ");
 }
 function bookSpecBlock(f){
   const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size)].filter(Boolean).join(" · ");
@@ -4146,6 +4394,10 @@ let AUTOPLAY=null;
 async function loadItem(id){
   const [d, libs]=await Promise.all([api(`/items/${id}`), libsCached()]);
   const it=d.item;
+  // A pre-play track choice belongs to the item it was made on. Arriving at
+  // another one starts from the server's defaults again — the alternative is a
+  // French audio track chosen for one film quietly applying to the next.
+  clearPrePlay();
   const lib=libs.find(l=>l.id===it.library_id);
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
   const files=d.files, children=d.children||[], ancestors=d.ancestors||[];
@@ -5149,6 +5401,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
         outgoingEstimateBps:PLAYER.hls&&PLAYER.hls.bandwidthEstimate,
         priorKbps:PLAYER.priorKbps})
     : null;
+  // The track choice this playback runs with. A cold start takes the detail
+  // screen's pickers; an internal reopen (a quality change) takes what the
+  // playback is already using, so changing quality reproduces what is on screen
+  // rather than falling back to the cold-start policy default.
+  const selection=(PLAYER&&PLAYER.fileId===fileId&&PLAYER.preplay)
+    ? PLAYER.preplay : prePlaySelection(fileId);
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   // Stamp the click, not the decision: time-to-first-frame is what the person
@@ -5158,7 +5416,11 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
-  let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+  // The selection travels WITH the decision, so `method`, `reasons`, `delivery`
+  // and the marked default tracks all describe the tracks that are about to
+  // play. Asking for the policy default and correcting afterwards is what used
+  // to force a remux over a perfectly decodable audio choice.
+  let decision; try{ decision=await api(decisionUrl(fileId, qualityForce(), selection));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   let retestDecodeLimit=false;
   let learnedLimitView=null;
   // A device that measured this exact media load as unstable routes straight
@@ -5187,7 +5449,11 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     } else if(learned.action==='apply'){
       try{
         const ordinaryRange=decision.delivered_dynamic_range;
-        const d2=await api(`/files/${fileId}/decision?${CAPS_Q}&force=transcode`);
+        // Same selection: this replaces the decision above, so dropping it here
+        // would hand the learned-limit transcode the policy default audio and
+        // silently discard the viewer's choice on exactly the devices that need
+        // the transcode most.
+        const d2=await api(decisionUrl(fileId, "transcode", selection));
         learnedLimitView=PlaybackPolicy.learnedDecodeLimitView({
           source:decision.source||{},limit:lim,ordinaryRange,
           deliveredRange:d2.delivered_dynamic_range
@@ -5219,6 +5485,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
   const book=meta&&meta.audiobook;
+  // A pre-play subtitle is resolved BEFORE the player object exists, because a
+  // burn has to ride the first session open — `transcodeOpts()` reads
+  // `PLAYER.burnedSub`.
+  const applied=prePlayApplication(decision, selection);
+  const wantSub=applied.subtitle, preBurn=applied.burnedSub;
+  if(applied.blockedByHdr) toast("That subtitle requires an SDR burn-in. HDR playback was kept unchanged.");
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
     decodeRetest:retestDecodeLimit,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
@@ -5226,8 +5498,14 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // this keeps the DECISION's verdict, which is what sessionHeight() needs
     // to tell a burn-over-remux from a burn on a genuine transcode.
     decidedMethod:decision.method,
+    // `default` on both arrays is the EFFECTIVE selection, not the container's
+    // flag: the server marks whatever it selected, including the index this
+    // request asked for. So a pre-play audio choice is already the checked one.
     audio:decision.audio||[], subs:(decision.subtitles||[]),
-    curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
+    curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:preBurn!=null?preBurn:-1,
+    // This playback's track choice, carried across an internal reopen and kept
+    // current by the in-player Audio and Subtitles menus.
+    preplay:selection||null,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, directUrl:null,
     triedFallback:false,
@@ -5257,7 +5535,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
       switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false},
     waitAt:null, waitRunway:null, waitTimer:null, waitReported:false,
     stallsByKind:null, stallRecoveries:0, recoveringStall:null, stallPrompt:false,
-    burnedSub:null, vod:false, };
+    burnedSub:preBurn, vod:false, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
@@ -5275,18 +5553,39 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   const ab=document.getElementById("autonextbtn"); if(ab){ ab.classList.toggle("on", autoNextOn()); ab.style.display=book?"none":""; }
   // Server-chosen default subtitle (Settings → Playback defaults / anime rule).
   // Native <track> subs ride direct/remux only; transcode burns them instead.
+  //
+  // A pre-play choice owns this instead. Off (`-1`) means leave it off; a burn
+  // is already in `burnedSub` above and rides the first session open; a text
+  // track is applied below, after the route knows its offset, so it lands
+  // without the 400 ms guess and in every delivery method rather than only the
+  // two the cold-start default is limited to.
   const defSub=PLAYER.subs.find(s=>s.default);
-  if(defSub && !skipDefaultSub && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
+  if(defSub && !skipDefaultSub && wantSub==null && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
 
   const nativeHls=useNativeHls(video);
   const segmentedRemux=segmentedRemuxOk(decision,video);
-  const initialRoute=PlaybackPolicy.initialRoute({
+  let initialRoute=PlaybackPolicy.initialRoute({
     method:decision.method, selectedAudioIndex:initialAudio,
     nativeHls, segmentedRemux
   });
+  // A burn is a transcode whatever the plan said. The server's plan is a remux
+  // (or a direct play) when the PGS application overlay is enabled — a delivery
+  // this player does not implement, so `prePlayBurnNeeded()` said yes where the
+  // plan said no. Following the plan there would start a stream that cannot
+  // show the chosen track and replace it a moment later, which is the re-buffer
+  // a pre-play choice exists to avoid.
+  if(preBurn!=null && initialRoute!=='transcode_hls'){
+    initialRoute='transcode_hls';
+    PLAYER.method='transcode'; PLAYER.copyHls=false;
+    PLAYER.reasons=[`subtitle burn-in (${subLabelFor(PLAYER.subs.find(s=>s.index===preBurn),preBurn)}) `+
+                    `— drawing subtitles into the picture forces a re-encode`].concat(PLAYER.reasons||[]);
+  }
   if(initialRoute==='transcode_hls'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
-    setLoading(true,"Starting the transcoder…",transcodeReason(decision));
+    // Read from PLAYER, not the decision: they hold the same array on the
+    // ordinary path, and on the forced-burn path above PLAYER is the one that
+    // knows a burn is why this is a transcode at all.
+    setLoading(true,"Starting the transcoder…",transcodeReason(PLAYER));
     let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     const from=attachSession(video, PLAYER, info, startSec);
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
@@ -5344,6 +5643,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
       if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
     video.play().catch(()=>{});
   }
+
+  // A pre-play TEXT subtitle, applied to the stream that just attached. Here
+  // rather than before the route, because setSub() shifts the cues by
+  // `PLAYER.offset` and the route is what sets it. A <track> is not a stream
+  // restart, so the choice arrives with the first frames.
+  if(applied.textSub!=null && PLAYER.fileId===fileId) setSub(applied.textSub);
 
   // Once, per playback, as soon as the element knows what it is decoding.
   probeDecode();
@@ -7397,6 +7702,14 @@ function vttParse(text){
   }
   return out;
 }
+// Keep this playback's track choice current, so an internal reopen (a quality
+// change) reproduces what is on screen instead of falling back to the
+// cold-start policy default. Same shape as a pre-play selection, because it is
+// the same thing: what this one playback is watching.
+function rememberPlaybackSelection(kind, index){
+  if(!PLAYER) return;
+  PLAYER.preplay=Object.assign({audio:null,subtitle:null}, PLAYER.preplay||{}, {[kind]:index});
+}
 async function setSub(index){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   const me=PLAYER; if(!me) return;
@@ -7412,8 +7725,9 @@ async function setSub(index){
   });
   if(burnAction==="keep_hdr"){
     toast("That subtitle requires an SDR burn-in. HDR playback was kept unchanged.");
-    return false;
+    return false;   // nothing changed, so nothing to remember
   }
+  rememberPlaybackSelection("subtitle", index);
   if(burnAction==="burn"){ await burnSub(index); return true; }
   if(me.burnedSub!=null){
     // Leaving a burned track behind: the picture still has it drawn on, so
@@ -7542,6 +7856,7 @@ async function switchAudio(idx){
   const v=document.getElementById("video");
   const pos=(PLAYER.offset||0)+(v.currentTime||0);
   const track=PLAYER.audio[idx]; const aidx=track?track.index:idx;
+  rememberPlaybackSelection("audio", aidx);
   // Same generation counter as seekTo: this also restarts the server stream, so
   // a seek landing mid-switch (or a second switch) must win outright instead of
   // both attaching.

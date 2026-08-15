@@ -227,9 +227,29 @@ the physical Apple/Android device matrix remains a release acceptance step.
   title, year, rating) and **filter** (unwatched, HDR, 4K) on the loaded page.
 - **Item detail:** hero backdrop, poster, breadcrumb trail (Home / Show / Season,
   every level clickable), title, spec chips (year, runtime, kind, resolution,
-  HDR), overview, and a labeled spec block per version (Video / Audio / File).
-  Book details instead label Ebook versus Audiobook, show audio parts and
-  chapters where applicable, and expose the correct Open or Play action.
+  HDR), overview, and a labeled spec block per version (Video / Audio /
+  Subtitles / File). Book details instead label Ebook versus Audiobook, show
+  audio parts and chapters where applicable, and expose the correct Open or
+  Play action.
+- **Audio and subtitle tracks are on the page, not behind a play button.** The
+  web spec block lists every audio track (language, codec, channels, title) and
+  every subtitle track (language, format, and *forced* / *SDH* markers), marks
+  the one the server would select as **plays by default**, and adds one sentence
+  when the preferred language is available but not chosen, is missing, or cannot
+  be ruled out because a track has no language tag. A file with no subtitle
+  tracks says **None**. An audiobook part, which has neither video nor
+  subtitles, is not asked about them.
+- **Pre-play audio and subtitle pickers (web).** Below the facts, each version
+  offers an Audio and a Subtitles dropdown — every track plus **Off**, with
+  *Default* as the untouched option. The choice travels with the `/decision`
+  request, so the delivery method, the reasons and the marked tracks all
+  describe what is about to play, and it is applied on the first session open:
+  no start-then-restart to satisfy a choice made before playback began. Picking
+  a subtitle the server must burn into the picture says so, in the server's own
+  verdict, *before* Play is pressed; on HDR the established guard still refuses
+  the burn rather than replacing HDR with SDR. The choice belongs to that one
+  playback: it does not write Settings → Playback defaults and does not follow
+  you to the next item.
 - **Track facts are ready before playback.** Every file in the native item-detail
   response carries its complete audio/subtitle lists plus `playback_defaults`:
   the exact audio and subtitle indices the shared server policy would select,
@@ -238,8 +258,8 @@ the physical Apple/Android device matrix remains a release acceptance step.
   a stream lacks a language tag · or the file has no tracks of that kind.
   Clients can therefore say "no English subtitles" only when the stored facts
   prove it, without reading admin settings, probing media, or opening a
-  playback session. Detail rendering in the first-party clients lands in the
-  client-specific follow-ups.
+  playback session. The web client renders it (above); Apple and Android land
+  in the client-specific follow-ups.
 - **Search** across the library (SQLite FTS5), debounced from the header on every
   page.
 - **Progress + watched indicators** on posters: a glowing progress bar for
