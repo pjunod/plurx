@@ -1138,7 +1138,7 @@ fn source_count(
 }
 
 /// Count the source rows whose sealed columns are not envelopes this build can
-/// open.
+/// parse.
 ///
 /// The test is [`SealedSecret::is_wrapped`], not the laxer
 /// [`looks_wrapped`](SealedSecret::looks_wrapped) the SQLite upgrade pass uses.

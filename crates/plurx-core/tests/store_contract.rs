@@ -593,11 +593,7 @@ fn seed_sealed_trakt_fixture_row(connection: &rusqlite::Connection, key: &Creden
              ON CONFLICT(user_id) DO UPDATE SET
                  access_token = excluded.access_token,
                  refresh_token = excluded.refresh_token",
-            rusqlite::params![
-                FIXTURE_TRAKT_USER,
-                access.as_stored(),
-                refresh.as_stored(),
-            ],
+            rusqlite::params![FIXTURE_TRAKT_USER, access.as_stored(), refresh.as_stored(),],
         )
         .expect("seed sealed Trakt fixture row");
 }
