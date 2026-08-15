@@ -279,3 +279,9 @@ commits = ["0fda21eb"]
 points = ["core.media"]
 checks = ["rust-gate"]
 reason = "The retained sidecar test seeds the exact interrupted-migration state — network_priors committed, user_version still 1 — and requires NodeLocalTelemetry::open to reopen it, keep the recorded event and prior, and finish the version stamp; restoring only the pre-fix initialize reproduces the permanent `table network_priors already exists` startup failure."
+
+[[coverage]]
+commits = ["bb16e82a2639468da01ecd768e2a0941abde8056"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The cluster growth gate drives the production coalescer at a deterministic five-second playback cadence, asserts the ten-second commit ratio with bounded headroom, and requires an uncoalesced replicated-write control to violate both the commit and compacted-byte budgets."
