@@ -110,6 +110,7 @@ mod tests {
     use crate::state::{Dirs, SystemInfo};
     use crate::trakt::TraktManager;
     use plurx_core::domain::TraktAuth;
+    use plurx_core::secrets::CredentialKey;
     use plurx_core::store::{keys, SqliteStore, Store};
     use serde_json::json;
     use std::sync::Arc;
@@ -149,11 +150,12 @@ mod tests {
             .put_setting(keys::TRAKT_CLIENT_SECRET, "secret")
             .await
             .expect("client secret");
+        let key = Arc::new(CredentialKey::from_bytes([0x5a; 32]));
         store
             .put_trakt_auth(&TraktAuth {
                 user_id: user.id,
-                access_token: "access".into(),
-                refresh_token: "refresh".into(),
+                access_token: key.seal_trakt(user.id, "access").expect("seal access"),
+                refresh_token: key.seal_trakt(user.id, "refresh").expect("seal refresh"),
                 expires_at: now_unix() + 3600,
                 trakt_username: Some("neo".into()),
                 connected_at: 123,
@@ -181,6 +183,7 @@ mod tests {
         );
         state.trakt = Arc::new(TraktManager::new(
             Arc::clone(&store),
+            Arc::clone(&key),
             serve_device_code().await,
         ));
 

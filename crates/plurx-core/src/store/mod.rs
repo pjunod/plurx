@@ -53,6 +53,23 @@ use crate::domain::{
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
 use crate::mediafacts::MediaFacts;
+use crate::secrets::SealedSecret;
+
+/// The text a backend may write into a durable Trakt bearer column.
+///
+/// Every store implementation funnels its bearer writes through here, so the
+/// promise in `CLUSTERING-PLAN.md` §3.2 — a durable, and once M2 activates a
+/// replicated, row carries only wrapped material — is enforced at the write
+/// rather than assumed of every caller. Refusing costs one linked account a
+/// loud error; accepting would put a cleartext bearer token in every voter's
+/// raft log, where deleting the row cannot reach it.
+pub(crate) fn persistable_credential(value: &SealedSecret) -> Result<String, StoreError> {
+    value.to_persist().map(str::to_owned).map_err(|error| {
+        StoreError::Credential(format!(
+            "refusing to persist a Trakt bearer credential that is not sealed: {error}"
+        ))
+    })
+}
 
 /// Well-known settings keys. Keys are dotted, lowercase, and owned by the
 /// module that writes them.
@@ -757,18 +774,23 @@ pub trait TraktStore: Send + Sync + 'static {
     async fn delete_trakt_auth(&self, user_id: i64) -> Result<(), StoreError>;
     /// Delete a rejected OAuth link only if no other voter has already
     /// rotated the refresh token.
+    ///
+    /// The compare-and-set operand is the stored envelope, not the cleartext
+    /// token: every voter sees the same ciphertext for a given row, so this
+    /// stays an exact equality check without any node unwrapping anything.
     async fn delete_trakt_auth_if_current(
         &self,
         user_id: i64,
-        expected_refresh_token: &str,
+        expected_refresh_token: &SealedSecret,
     ) -> Result<bool, StoreError>;
-    /// Refresh bookkeeping after a token rotation.
+    /// Refresh bookkeeping after a token rotation. The caller seals the new
+    /// tokens; the store never sees a bearer credential in the clear.
     async fn update_trakt_tokens(
         &self,
         user_id: i64,
-        expected_refresh_token: &str,
-        access_token: &str,
-        refresh_token: &str,
+        expected_refresh_token: &SealedSecret,
+        access_token: &SealedSecret,
+        refresh_token: &SealedSecret,
         expires_at: i64,
     ) -> Result<bool, StoreError>;
     /// Stamp a completed sync run (and the last_activities gate JSON).

@@ -138,10 +138,43 @@ after membership commits.
 Trakt is the exception to the otherwise hash-only credential rows: its access
 and refresh tokens are live bearer secrets. Replicating plaintext would copy
 them into every voter database, raft WAL, snapshot, and backup, where row
-deletion cannot erase historical log entries. Before M2 may select Hiqlite,
-those columns must use envelope encryption under a plurx-owned key file; only
-ciphertext, key version, and non-secret metadata may enter raft. A copied voter
-disk must not be sufficient to use a household's Trakt account.
+deletion cannot erase historical log entries.
+
+**Delivered 2026-08-14.** Both columns are envelope-encrypted before they reach
+the `Store`: `TraktAuth` carries `SealedSecret`, not `String`, and outside
+`plurx-core` sealing with the key is the only way to make one. Because the
+upgrade path must still be able to read a pre-encryption row, the durable write
+also refuses a value that is not an envelope, so the guarantee does not rest on
+the type alone. The SQLite→Hiqlite importer does not go through that write, so
+it audits its source's credential columns up front and refuses a pre-encryption
+backup rather than replicating one. Only ciphertext, key id, and non-secret
+metadata enter raft, and a copied voter disk is not sufficient to use a
+household's Trakt account.
+
+```toml
+[cluster]
+credential_key_file = ""         # empty means <data_dir>/credentials.key
+```
+
+The wrapping key is a 32-byte mode-`0600` file beside `node.id`, minted on
+first boot and never written to a durable row. It is node-local configuration
+in the §3.2 sense — not replicated, and distributed to other voters out of band
+exactly like `secret_raft` and `secret_api`. Being an addition to `[cluster]`,
+it also inherits this section's rollback rule: an M0 binary reading a config
+that sets it still loads.
+
+The envelope is `plxenc:v1:<key id>:<hex nonce‖ciphertext‖tag>` under
+XChaCha20-Poly1305, with the row's `user_id` as authenticated additional data
+so a re-pointed row fails to open rather than yielding another user's account.
+The refresh-token compare-and-set in `update_trakt_tokens` and
+`delete_trakt_auth_if_current` operates on the stored envelope, so a rotation
+race is still decided by exact equality on bytes every voter already agrees on
+— no voter has to hold the key to arbitrate one.
+
+Unwrapping happens only at an outbound call. There is no cleartext fallback
+anywhere: `open_trakt` returns an error for an unwrapped value rather than the
+value, and startup refuses outright when sealed rows exist and the key file
+does not, instead of minting a key that cannot open them.
 
 M0 must verify hiqlite 0.14's transport support. If it cannot provide TLS, the
 first clustering release is explicit: authenticated-but-cleartext inter-node
@@ -585,10 +618,25 @@ and fallback to unchanged SQLite. The post-coalescer blocker is closed by the
 2026-08-14 `make cluster-growth` record: 4,441,360 compacted bytes for 10,000
 incoming beats at five-second logical cadence (444.136 bytes/beat), 5,040
 physical commits for 80 streams, and a raw 10,000-write control that violates
-both the commit and byte budgets. Trakt credential encryption remains an
-activation blocker. Bounded target parity and blocking-worker source reads are
-now in place; the next boundary is the activation coordinator, not another
-importer expansion.
+both the commit and byte budgets. Bounded target parity and blocking-worker
+source reads are now in place; the next boundary is the activation coordinator,
+not another importer expansion.
+
+**Trakt credential encryption is no longer a blocker (2026-08-14).** Both
+bearer columns are envelope-encrypted under a node-local key file before they
+reach the `Store` (§3.2), an existing cleartext install is migrated forward on
+upgrade, and a boot that finds sealed rows it cannot open refuses to start
+rather than falling back to cleartext — whether the key file is missing, is a
+replaced key that opens none of those rows, or is readable by more than its
+owner. The importer does need a change, and has it. Copying `trakt_auth` as
+text is only safe when the source install has already been sealed, and a
+backup taken from a pre-encryption install has not: import is the one
+production path that bypasses the durable write, so it audits the backup's
+credential columns and refuses one carrying cleartext before submitting any
+row to raft.
+
+With the growth record and credential encryption both closed, no §6.6
+activation blocker remains outstanding.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 

@@ -2219,6 +2219,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "chacha20poly1305",
  "getrandom 0.2.17",
  "hex",
  "hiqlite",
@@ -2238,6 +2239,7 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

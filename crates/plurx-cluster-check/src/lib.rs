@@ -28,6 +28,7 @@ use plurx_core::domain::{
     OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
     TraktAuth,
 };
+use plurx_core::secrets::CredentialKey;
 use plurx_core::store::{
     ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
     OfflinePackageStore, PlaybackTelemetryStore, ReconcileOutcome, RootFingerprintStatus,
@@ -1769,10 +1770,16 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated watch progress did not prefer the probed duration");
     }
 
+    // Trakt is the one durable credential plurx replays rather than verifies,
+    // so what raft carries here must be ciphertext (CLUSTERING-PLAN.md §3.2).
+    // The key is node-local and never replicated; this harness shares one
+    // across the voters exactly as a real cluster distributes it out of band.
+    let key = CredentialKey::generate();
+    let sealed_refresh = key.seal_trakt(user.id, &format!("trakt-refresh-{suffix}"))?;
     let trakt = TraktAuth {
         user_id: user.id,
-        access_token: format!("trakt-access-{suffix}"),
-        refresh_token: format!("trakt-refresh-{suffix}"),
+        access_token: key.seal_trakt(user.id, &format!("trakt-access-{suffix}"))?,
+        refresh_token: sealed_refresh.clone(),
         expires_at: 4_000_000_000,
         trakt_username: Some(format!("trakt-{suffix}")),
         connected_at: 1_700_000_000 + ordinal as i64,
@@ -1784,21 +1791,23 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     store
         .set_trakt_sync(user.id, trakt_sync_at, Some("{}"))
         .await?;
+    // The compare-and-set operand is the replicated envelope, so the winner is
+    // decided on bytes every voter already agrees on without holding the key.
     if !store
         .update_trakt_tokens(
             user.id,
-            &format!("trakt-refresh-{suffix}"),
-            &format!("trakt-access-new-{suffix}"),
-            &format!("trakt-refresh-new-{suffix}"),
+            &sealed_refresh,
+            &key.seal_trakt(user.id, &format!("trakt-access-new-{suffix}"))?,
+            &key.seal_trakt(user.id, &format!("trakt-refresh-new-{suffix}"))?,
             4_000_000_001,
         )
         .await?
         || store
             .update_trakt_tokens(
                 user.id,
-                &format!("trakt-refresh-{suffix}"),
-                &format!("trakt-access-loser-{suffix}"),
-                &format!("trakt-refresh-loser-{suffix}"),
+                &sealed_refresh,
+                &key.seal_trakt(user.id, &format!("trakt-access-loser-{suffix}"))?,
+                &key.seal_trakt(user.id, &format!("trakt-refresh-loser-{suffix}"))?,
                 4_000_000_002,
             )
             .await?
@@ -1806,8 +1815,19 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated Trakt token compare-and-set failed");
     }
     if store.get_trakt_auth(user.id).await?.is_none_or(|auth| {
-        auth.access_token != format!("trakt-access-new-{suffix}")
-            || auth.refresh_token != format!("trakt-refresh-new-{suffix}")
+        let replicated_cleartext = auth.access_token.as_stored().contains("trakt-access")
+            || auth.refresh_token.as_stored().contains("trakt-refresh");
+        let access = auth
+            .reveal_access_token(&key)
+            .ok()
+            .is_none_or(|token| token.expose() != format!("trakt-access-new-{suffix}"));
+        let refresh = auth
+            .reveal_refresh_token(&key)
+            .ok()
+            .is_none_or(|token| token.expose() != format!("trakt-refresh-new-{suffix}"));
+        replicated_cleartext
+            || access
+            || refresh
             || auth.expires_at != 4_000_000_001
             || auth.last_sync_at != trakt_sync_at
             || auth.last_activities.as_deref() != Some("{}")
@@ -1825,7 +1845,7 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated Trakt link/candidate join failed");
     }
     if store
-        .delete_trakt_auth_if_current(user.id, &format!("trakt-refresh-{suffix}"))
+        .delete_trakt_auth_if_current(user.id, &sealed_refresh)
         .await?
         || store.get_trakt_auth(user.id).await?.is_none()
     {
@@ -2317,8 +2337,13 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
             bail!("lost acknowledged media/watch state from node {ordinal}");
         }
         if store.get_trakt_auth(user.id).await?.is_none_or(|auth| {
-            auth.access_token != format!("trakt-access-new-{suffix}")
-                || auth.refresh_token != format!("trakt-refresh-new-{suffix}")
+            // `exercise` sealed these under a key it did not persist, so this
+            // pass proves the durable form and not the cleartext: what came
+            // back through raft is still an envelope, and still not the bearer
+            // token. A voter disk alone is not enough to use the account.
+            !auth.is_wrapped()
+                || auth.access_token.as_stored().contains("trakt-access")
+                || auth.refresh_token.as_stored().contains("trakt-refresh")
                 || auth.expires_at != 4_000_000_001
                 || auth.last_sync_at != 1_700_000_100 + ordinal as i64
                 || auth.last_activities.as_deref() != Some("{}")

@@ -143,6 +143,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 | `PLURX_TRAKT_BASE` | `https://api.trakt.tv` | Trakt API base (tests/mocks) |
 | `PLURX_LOG` | `info` | `tracing` filter (e.g. `plurxd=debug`) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `10` | Maximum percentage of known files one scan may delete; `0` disables automatic pruning |
+| `PLURX_CREDENTIAL_KEY_FILE` | `<data_dir>/credentials.key` | Key encrypting the stored Trakt credential — back it up with the database |
 | `PLURX_HLS_CLOSED_CAPTIONS_NONE` | off | Experiment: `CLOSED-CAPTIONS=NONE` on the HLS variant |
 | `PLURX_HLS_FORCED_AUTOSELECT` | off | Experiment: `AUTOSELECT=YES` on forced subtitle renditions |
 | `PLURX_PGS_OVERLAY` | off | Staged authenticated PGS manifest/PNG producer; not a production rollout switch until device acceptance |
