@@ -144,8 +144,11 @@ default until daemon selection lands.
 - ✅ **M1d complete 2026-08-08:** the 120-method backend, shared three-voter
   contract factory, multi-writer Trakt/outbox safety, offline/cache identity
   guards, and the progress coalescer passed the full PR #90 review and CI
-  sequence. Post-coalescer compacted growth remains an explicit activation
-  measurement.
+  sequence. The bounded post-coalescer gate now drives 10,000 incoming beats
+  across 80 streams, commits 160 physical writes, and records 1,017,640 bytes
+  (101.764 bytes/beat) of growth after production-threshold compaction against
+  a 256-byte/beat budget; `make cluster-growth` reproduces the measurement and
+  rejects the 10,000-commit raw-write control.
 - ✅ **M2 import complete 2026-08-09:** content-addressed backup and fresh-target
   import preserve v14 through current durable rows, rebuild derived FTS, and
   prove exact parity with bounded keyset pages, an incremental digest, and

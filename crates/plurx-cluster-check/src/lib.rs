@@ -17,6 +17,7 @@ use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,6 +39,13 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+// Compile the production daemon policy directly. This avoids a test-only
+// coalescer and keeps the already-governed plurxd source path as its sole home.
+#[allow(dead_code)] // Response fields are consumed by HTTP, not this load driver.
+#[path = "../../plurxd/src/progress.rs"]
+mod production_progress;
+use production_progress::ProgressCoalescer;
+
 const RAFT_SECRET: &str = "plurx-m1b-raft-secret";
 const API_SECRET: &str = "plurx-m1b-api-secret";
 pub const INSTANCE_ID: &str = "m1b-cluster-check";
@@ -45,6 +53,53 @@ const START_TIMEOUT: Duration = Duration::from_secs(45);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// How long the convergence helpers retry before reporting failure.
 pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Incoming active-player heartbeats in the compacted-growth record.
+pub const GROWTH_INCOMING_BEATS: u64 = 10_000;
+/// Independent user/item streams represented by the growth load.
+pub const GROWTH_ACTIVE_STREAMS: u64 = 80;
+/// Production hiqlite snapshot threshold used by the bounded gate.
+pub const GROWTH_COMPACTION_LOGS: u64 = 10_000;
+/// Maximum net compacted directory growth per incoming heartbeat.
+pub const GROWTH_BYTES_PER_BEAT_BUDGET: u64 = 256;
+
+/// Result of one post-coalescer compacted-growth load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactedGrowthReport {
+    pub incoming_beats: u64,
+    pub active_streams: u64,
+    pub physical_progress_commits: u64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub compacted_growth_bytes: u64,
+}
+
+/// Apply the checked-in write-amplification and compacted-growth budgets.
+pub fn validate_compacted_growth(report: &CompactedGrowthReport) -> Result<()> {
+    if report.incoming_beats == 0 || report.active_streams == 0 {
+        bail!("compacted-growth load must contain beats and active streams");
+    }
+    let commit_budget = report.active_streams.saturating_mul(2);
+    if report.physical_progress_commits > commit_budget {
+        bail!(
+            "physical progress commits {} exceeded {} for {} active streams",
+            report.physical_progress_commits,
+            commit_budget,
+            report.active_streams
+        );
+    }
+    let growth_budget = report
+        .incoming_beats
+        .saturating_mul(GROWTH_BYTES_PER_BEAT_BUDGET);
+    if report.compacted_growth_bytes > growth_budget {
+        bail!(
+            "compacted growth {} bytes exceeded {} bytes for {} incoming beats",
+            report.compacted_growth_bytes,
+            growth_budget,
+            report.incoming_beats
+        );
+    }
+    Ok(())
+}
 
 /// Dispatch one harness mode from a full `argv`.
 ///
@@ -52,7 +107,11 @@ pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 /// contract — including every rejection — is exercised by the crate's tests.
 pub async fn run(args: Vec<String>) -> Result<()> {
     match args.get(1).map(String::as_str) {
-        None | Some("check") => controller().await,
+        None | Some("check") => {
+            run_growth_subprocess().await?;
+            controller().await
+        }
+        Some("growth") => compacted_growth_gate().await,
         Some("node") => {
             let launch: NodeLaunch =
                 serde_json::from_str(args.get(2).context("node mode requires its launch JSON")?)?;
@@ -69,6 +128,24 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
 }
 
+async fn run_growth_subprocess() -> Result<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        Command::new(harness_executable()?).arg("growth").output(),
+    )
+    .await
+    .context("compacted-growth subprocess timed out")??;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    if !output.status.success() {
+        bail!(
+            "compacted-growth subprocess exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 async fn controller() -> Result<()> {
     println!("cluster-check: follower loss and incompatible-voter guard");
     run_failure_case(FailureTarget::Follower).await?;
@@ -76,6 +153,317 @@ async fn controller() -> Result<()> {
     run_failure_case(FailureTarget::Leader).await?;
     println!("cluster-check: all M1b/M1c/M1d failure contracts passed");
     Ok(())
+}
+
+async fn compacted_growth_gate() -> Result<()> {
+    println!("cluster-check: post-coalescer compacted growth");
+    install_crypto_provider();
+    let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
+
+    let root = tempfile::tempdir().context("compacted-growth data root")?;
+    let launch = NodeLaunch {
+        node_id: 1,
+        root: root.path().to_path_buf(),
+        nodes: allocate_nodes(1)?,
+    };
+    let mut config = node_config(&launch)?;
+    config.filename_db = Cow::Borrowed("growth.db");
+    config.raft_config = NodeConfig::default_raft_config(GROWTH_COMPACTION_LOGS);
+    let client = hiqlite::start_node(config)
+        .await
+        .context("start compacted-growth voter")?;
+    tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
+        .await
+        .context("compacted-growth voter health timed out")?;
+    let metrics_client = client.clone();
+    let telemetry_path = launch.root.join("node-1").join("telemetry-growth.db");
+    let store = Arc::new(
+        HiqliteAuthStore::bootstrap(client, "compacted-growth-check", &telemetry_path)
+            .await
+            .context("bootstrap compacted-growth store")?,
+    );
+
+    let (users, item_id) = growth_fixture(store.as_ref()).await?;
+    let initial_snapshot = snapshot_index(&metrics_client).await?;
+    let warm_snapshot = ensure_compaction_after(
+        &metrics_client,
+        store.as_ref(),
+        initial_snapshot,
+        "baseline warm-up",
+    )
+    .await?;
+    // The first snapshot also lets SQLite settle its state-machine WAL. Take a
+    // second compacted baseline so its one-time checkpoint is not mistaken for
+    // negative progress growth in the measured cycle.
+    let baseline_snapshot = ensure_compaction_after(
+        &metrics_client,
+        store.as_ref(),
+        warm_snapshot,
+        "baseline settle",
+    )
+    .await?;
+    let data_dir = launch.root.join("node-1");
+    let before_bytes = stable_directory_bytes(&data_dir).await?;
+
+    let applied_before = applied_index(&metrics_client).await?;
+    let coalescer: Arc<ProgressCoalescer> = ProgressCoalescer::new(store.clone());
+    let beats_per_stream = GROWTH_INCOMING_BEATS / GROWTH_ACTIVE_STREAMS;
+    let mut tasks = tokio::task::JoinSet::new();
+    for user_id in users.iter().copied() {
+        let coalescer = Arc::clone(&coalescer);
+        tasks.spawn(async move {
+            let mut committed = 0_u64;
+            for beat in 0..beats_per_stream {
+                let update = coalescer
+                    .put(
+                        user_id,
+                        item_id,
+                        i64::try_from((beat + 1) * 1_000)?,
+                        Some(10_000_000),
+                    )
+                    .await?;
+                committed += u64::from(update.committed);
+            }
+            Ok::<u64, anyhow::Error>(committed)
+        });
+    }
+    let mut synchronous_commits = 0_u64;
+    while let Some(result) = tasks.join_next().await {
+        synchronous_commits += result.context("coalesced stream task panicked")??;
+    }
+    let drained = u64::try_from(coalescer.drain().await.context("drain coalescer")?)?;
+    if synchronous_commits != GROWTH_ACTIVE_STREAMS || drained != GROWTH_ACTIVE_STREAMS {
+        bail!(
+            "coalescer produced {synchronous_commits} leading and {drained} trailing commits; expected {} each",
+            GROWTH_ACTIVE_STREAMS
+        );
+    }
+    let applied_after = applied_index(&metrics_client).await?;
+    let physical_progress_commits = applied_after.saturating_sub(applied_before);
+    let measured_snapshot = ensure_compaction_after(
+        &metrics_client,
+        store.as_ref(),
+        baseline_snapshot,
+        "coalesced load",
+    )
+    .await?;
+    // hiqlite's retained WAL segment alternates allocation across adjacent
+    // compactions. Compare equally settled, two-cycle states so that rollover
+    // is not reported as durable progress growth (or as a negative delta).
+    let _ = ensure_compaction_after(
+        &metrics_client,
+        store.as_ref(),
+        measured_snapshot,
+        "coalesced settle",
+    )
+    .await?;
+    let after_bytes = stable_directory_bytes(&data_dir).await?;
+    let report = CompactedGrowthReport {
+        incoming_beats: GROWTH_INCOMING_BEATS,
+        active_streams: GROWTH_ACTIVE_STREAMS,
+        physical_progress_commits,
+        before_bytes,
+        after_bytes,
+        compacted_growth_bytes: after_bytes.saturating_sub(before_bytes),
+    };
+    validate_compacted_growth(&report)?;
+
+    let raw_before_bytes = after_bytes;
+    let raw_snapshot = snapshot_index(&metrics_client).await?;
+    let raw_applied_before = applied_index(&metrics_client).await?;
+    for beat in 0..GROWTH_INCOMING_BEATS {
+        let user_id = users[usize::try_from(beat % GROWTH_ACTIVE_STREAMS)?];
+        store
+            .put_progress(
+                user_id,
+                item_id,
+                i64::try_from((beat / GROWTH_ACTIVE_STREAMS + 1) * 1_000)?,
+                Some(10_000_000),
+            )
+            .await
+            .context("raw induced-regression progress write")?;
+    }
+    let raw_applied_after = applied_index(&metrics_client).await?;
+    let raw_measured_snapshot =
+        ensure_compaction_after(&metrics_client, store.as_ref(), raw_snapshot, "raw control")
+            .await?;
+    let _ = ensure_compaction_after(
+        &metrics_client,
+        store.as_ref(),
+        raw_measured_snapshot,
+        "raw settle",
+    )
+    .await?;
+    let raw_after_bytes = stable_directory_bytes(&data_dir).await?;
+    let raw_report = CompactedGrowthReport {
+        incoming_beats: GROWTH_INCOMING_BEATS,
+        active_streams: GROWTH_ACTIVE_STREAMS,
+        physical_progress_commits: raw_applied_after.saturating_sub(raw_applied_before),
+        before_bytes: raw_before_bytes,
+        after_bytes: raw_after_bytes,
+        compacted_growth_bytes: raw_after_bytes.saturating_sub(raw_before_bytes),
+    };
+    let raw_rejection = validate_compacted_growth(&raw_report)
+        .expect_err("bypassing the coalescer must fail the growth gate");
+
+    println!(
+        "CLUSTER_GROWTH incoming_beats={} active_streams={} physical_commits={} \
+         before_bytes={} after_bytes={} compacted_growth_bytes={} \
+         bytes_per_beat={:.6} budget_bytes_per_beat={} \
+         raw_control_physical_commits={} raw_control_rejected={}",
+        report.incoming_beats,
+        report.active_streams,
+        report.physical_progress_commits,
+        report.before_bytes,
+        report.after_bytes,
+        report.compacted_growth_bytes,
+        report.compacted_growth_bytes as f64 / report.incoming_beats as f64,
+        GROWTH_BYTES_PER_BEAT_BUDGET,
+        raw_report.physical_progress_commits,
+        raw_rejection,
+    );
+    Ok(())
+}
+
+async fn growth_fixture(store: &HiqliteAuthStore) -> Result<(Vec<i64>, i64)> {
+    let library = store
+        .create_library(&NewLibrary {
+            name: "Compacted growth".to_owned(),
+            kind: LibraryKind::Movies,
+            paths: vec![PathBuf::from("/cluster-growth")],
+            anime: false,
+        })
+        .await?;
+    let item_id = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: "Progress load".to_owned(),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let mut users = Vec::with_capacity(usize::try_from(GROWTH_ACTIVE_STREAMS)?);
+    for ordinal in 0..GROWTH_ACTIVE_STREAMS {
+        users.push(
+            store
+                .create_user(&format!("growth-{ordinal}"), "hash", false)
+                .await?
+                .id,
+        );
+    }
+    Ok((users, item_id))
+}
+
+async fn applied_index(client: &Client) -> Result<u64> {
+    client
+        .metrics_db()
+        .await?
+        .last_applied
+        .map(|log| log.index)
+        .context("replicated store has no applied log index")
+}
+
+async fn snapshot_index(client: &Client) -> Result<u64> {
+    Ok(client
+        .metrics_db()
+        .await?
+        .snapshot
+        .map(|log| log.index)
+        .unwrap_or(0))
+}
+
+async fn ensure_compaction_after(
+    client: &Client,
+    store: &HiqliteAuthStore,
+    previous_snapshot: u64,
+    phase: &str,
+) -> Result<u64> {
+    let marker = format!("cluster.growth.compaction.{phase}");
+    for ordinal in 0..=GROWTH_COMPACTION_LOGS + 512 {
+        if ordinal % 64 == 0 {
+            let metrics = client.metrics_db().await?;
+            if let Some(snapshot) = metrics.snapshot.filter(|log| log.index > previous_snapshot) {
+                return wait_for_purge(client, snapshot.index, phase).await;
+            }
+        }
+        store.put_setting(&marker, &ordinal.to_string()).await?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let metrics = client.metrics_db().await?;
+        if let Some(snapshot) = metrics.snapshot.filter(|log| log.index > previous_snapshot) {
+            return wait_for_purge(client, snapshot.index, phase).await;
+        }
+        if Instant::now() >= deadline {
+            bail!("{phase} did not create a snapshot after the bounded write load");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_purge(client: &Client, snapshot: u64, phase: &str) -> Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // The production raft config deliberately retains one log that is already
+    // represented by the snapshot. Everything before it must be gone.
+    let required_purge = snapshot.saturating_sub(1);
+    loop {
+        let metrics = client.metrics_db().await?;
+        if metrics
+            .purged
+            .is_some_and(|log| log.index >= required_purge)
+        {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            bail!("{phase} snapshot {snapshot} was not followed by purge through {required_purge}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn stable_directory_bytes(root: &Path) -> Result<u64> {
+    // Snapshot and WAL cleanup runs after the Raft purge metric advances.
+    // Let that task begin, then require three seconds of an unchanged total.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous = None;
+    let mut stable_samples = 0_u8;
+    loop {
+        let current = directory_bytes(root)?;
+        if previous == Some(current) {
+            stable_samples += 1;
+            if stable_samples >= 30 {
+                return Ok(current);
+            }
+        } else {
+            previous = Some(current);
+            stable_samples = 0;
+        }
+        if Instant::now() >= deadline {
+            bail!("compacted directory size did not settle under {root:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn directory_bytes(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Clone, Copy, Debug)]

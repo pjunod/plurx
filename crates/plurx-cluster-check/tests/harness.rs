@@ -21,8 +21,9 @@ use plurx_cluster_check::{
     allocate_nodes, free_port, harness_executable, install_crypto_provider, node_config,
     prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
     require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry, unix_now,
-    validate_known_dump, ClusterProcesses, NodeLaunch, NodeProcess, NodeSpec, Preflight, Request,
-    Response, INSTANCE_ID,
+    validate_compacted_growth, validate_known_dump, ClusterProcesses, CompactedGrowthReport,
+    NodeLaunch, NodeProcess, NodeSpec, Preflight, Request, Response, GROWTH_BYTES_PER_BEAT_BUDGET,
+    INSTANCE_ID,
 };
 use plurx_core::store::{ClusterCompatibility, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 use serde_json::json;
@@ -54,6 +55,44 @@ fn require_ok(response: Response, what: &str) {
     response
         .require_ok()
         .unwrap_or_else(|error| panic!("{what} was refused: {error:#}"));
+}
+
+#[test]
+fn compacted_growth_gate_rejects_an_uncoalesced_commit_volume() {
+    let report = CompactedGrowthReport {
+        incoming_beats: 10_000,
+        active_streams: 80,
+        physical_progress_commits: 10_000,
+        before_bytes: 1_000_000,
+        after_bytes: 1_000_000,
+        compacted_growth_bytes: 0,
+    };
+    let error = format!(
+        "{:#}",
+        validate_compacted_growth(&report)
+            .expect_err("one durable write per heartbeat must fail the gate")
+    );
+    assert!(error.contains("physical progress commits 10000 exceeded 160"));
+}
+
+#[test]
+fn compacted_growth_gate_rejects_bytes_over_the_per_beat_budget() {
+    let incoming_beats = 10_000;
+    let compacted_growth_bytes = incoming_beats * GROWTH_BYTES_PER_BEAT_BUDGET + 1;
+    let report = CompactedGrowthReport {
+        incoming_beats,
+        active_streams: 80,
+        physical_progress_commits: 160,
+        before_bytes: 1_000_000,
+        after_bytes: 1_000_000 + compacted_growth_bytes,
+        compacted_growth_bytes,
+    };
+    let error = format!(
+        "{:#}",
+        validate_compacted_growth(&report)
+            .expect_err("one byte over the compacted-growth budget must fail")
+    );
+    assert!(error.contains("compacted growth 2560001 bytes exceeded 2560000 bytes"));
 }
 
 /// One voter, the whole protocol.

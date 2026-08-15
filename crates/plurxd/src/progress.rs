@@ -1,4 +1,4 @@
-//! Server-side coalescing for active playback progress.
+//! Server-side coalescing for active playback progress before writes reach [`Store`].
 //!
 //! Players are deliberately free to report more often than durable consensus
 //! should commit. The first beat is written immediately, intermediate beats

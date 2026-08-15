@@ -1,11 +1,11 @@
 # Clustering transition — from one plurxd node to Phase 4
 
 **Status:** executing — M0 through M1d and M2's source backup, table import,
-and bounded parity verification slices are complete; import orchestration,
-post-coalescer growth measurement, and daemon activation remain pending
+bounded parity verification, and post-coalescer compacted-growth gate are
+complete; import orchestration and daemon activation remain pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-09
+2026-08-14
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -32,12 +32,15 @@ single-node gate is:
 |---|---:|---|
 | p95 `put_progress_at` latency | ≤25 ms and ≤max(2× baseline, baseline + 0.5 ms) | A five-second player beat must not become visible UI latency; the additive branch is derived from the measured fixed Raft tax, while the ratio branch takes over on slower storage. |
 | Idle RSS after warm-up | ≤100 MiB additional | The recommended third voter includes Pi/NAS-class hardware. |
-| 10,000 progress writes | ≤2× logical payload + 64 MiB fixed growth | A raft log that grows without compaction will fill small data volumes. |
+| 10,000 incoming progress beats | ≤256 bytes/beat (2,560,000 bytes total) after production-threshold snapshot, purge, and WAL-settle cycles | Pre-compaction log size is not disk occupancy; the gate compares equally compacted states so retained WAL allocation is not mistaken for growth. |
+| Physical progress commits under that load | ≤2 commits/active stream (160 for the 80-stream fixture) | A disk-size result can stay small after compaction even when every heartbeat reached consensus, so the same gate must reject lost coalescing directly. |
 | Watch-state commit rate | ≤1 commit / 10 s / active stream | [ARCHITECTURE.md](ARCHITECTURE.md) §2.2 already promises coalescing; clustering must make it true. |
 
-M0 records the SQLite baseline and hiqlite result on the same machine. A budget
-change requires measured evidence in [PHASE3-SPIKE.md](PHASE3-SPIKE.md), not a
-quietly wider threshold.
+M0 records the raw SQLite baseline and hiqlite result on the same machine. M2's
+bounded `make cluster-growth` command records the coalesced result under the
+production 10,000-log snapshot policy. A budget change requires measured
+evidence in this plan and [PHASE3-SPIKE.md](PHASE3-SPIKE.md), not a quietly
+wider threshold.
 
 ## 2. Starting point — the seams exist, eight assumptions do not
 
@@ -501,14 +504,18 @@ and graceful shutdown makes a bounded drain attempt.
 
 The existing raw-write cost record measures 0.083333 ms p95 progress latency,
 6,832,128 bytes (6.52 MiB) additional idle RSS, and 8,309,777 bytes of data
-growth for 10,000 direct store writes. Those values remain inside the raw §1
-budgets, but the unchanged growth number is not a post-coalescer rerun: that
-benchmark bypasses `ProgressCoalescer`. Paused-time daemon tests prove one
-steady-state durable commit per ten-second stream window and the terminal
-watched exception. Before M2 selects Hiqlite, a committed benchmark must drive
-incoming beats through the coalescer, count physical commits, compact, and
-record resulting directory growth. M2 also owns importing an existing SQLite
-store and selecting the complete backend at startup.
+growth for 10,000 direct store writes. The committed `make cluster-growth`
+gate now drives 10,000 incoming beats through the production
+`ProgressCoalescer`: 80 user/item streams × 125 beats produced 80 leading and
+80 drained trailing commits. With hiqlite's production 10,000-log snapshot
+policy, two successive snapshot/purge cycles normalize retained WAL rollover
+before each directory comparison. The 2026-08-14 record is 3,832,601 bytes
+before, 4,850,241 bytes after, and 1,017,640 bytes of compacted growth —
+101.764 bytes/incoming beat against the 256-byte budget. The same run bypasses
+the coalescer and requires the 10,000-commit control to fail the 160-commit
+limit. Paused-time tests still prove the ten-second window and terminal watched
+exception independently. M2 also owns importing an existing SQLite store and
+selecting the complete backend at startup.
 
 ### 6.6 M2 — migrate an existing install
 
@@ -566,10 +573,13 @@ blocked.
 This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
 and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
 fsynced completion marker, atomic activation, failure injection at each step,
-and fallback to unchanged SQLite. Trakt credential encryption and the
-post-coalescer growth record also remain activation blockers. Bounded target
-parity and blocking-worker source reads are now in place; the next boundary is
-the activation coordinator, not another importer expansion.
+and fallback to unchanged SQLite. The post-coalescer blocker is closed by the
+2026-08-14 `make cluster-growth` record: 1,017,640 compacted bytes for 10,000
+incoming beats (101.764 bytes/beat), 160 physical commits for 80 streams, and a
+rejected 10,000-commit raw control. Trakt credential encryption remains an
+activation blocker. Bounded target parity and blocking-worker source reads are
+now in place; the next boundary is the activation coordinator, not another
+importer expansion.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -671,15 +681,16 @@ the importer can now prove the 17 shared durable tables without unbounded
 leader responses or blocking the async executor. It still does not select the
 target in `plurxd`. Keep SQLite as the daemon's selected store until
 incoming-cluster orchestration, credential encryption, node removal, and the
-post-coalescer growth gates are ready. The next implementation boundary is the
-fsynced completion marker plus failure-injected one-voter activation; that
-coordinator must delete partial incoming state and keep SQLite active on every
-failure.
+remaining activation gates are ready. Post-coalescer compacted growth is now
+recorded and gated; the next implementation boundary is the fsynced completion
+marker plus failure-injected one-voter activation. That coordinator must delete
+partial incoming state and keep SQLite active on every failure.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
 make cluster-check            # M1b-M2 durable state, import, FTS, and loss gate
+make cluster-growth           # 10,000-beat compacted growth + raw control
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```
