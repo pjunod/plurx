@@ -293,13 +293,19 @@ checks = ["cluster-auth"]
 reason = "The retained three-voter `a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft` regression proves that a legacy bearer credential is refused before the first application row is submitted to Raft."
 
 [[coverage]]
-commits = ["e3689787903cdb1ce94c9fb7906fe51f0cf463e7"]
+commits = [
+  "5559d9b3222a48851454f450b3c226a9c972af4b",
+  "e3689787903cdb1ce94c9fb7906fe51f0cf463e7",
+]
 points = ["web.experience", "playback.pipeline"]
 checks = ["web-static"]
 reason = "The retained web policy unit pins cap-stranded emergency downgrades, ladder-floor fallback, and backing-pixel height measurement; restoring only the prior controller policy strands a 720p session above the sustainable rung under the recorded cliff conditions."
 
 [[coverage]]
-commits = ["5b36c5019b42b58a36021dcf7a2cee72b6359ba0"]
+commits = [
+  "650bcb86d8d3277cf302aa612b71150181528ef3",
+  "5b36c5019b42b58a36021dcf7a2cee72b6359ba0",
+]
 points = ["web.experience", "playback.pipeline"]
 checks = ["web-static"]
 reason = "The retained web policy units pin the versioned media-load identity, deterministic bitrate buckets, legacy-key rejection, exact forget/retest routing, Original bypass, and learned HDR-to-SDR attribution; restoring only the prior browser policy makes one broad codec/height verdict steer materially different 4K HDR sources."
