@@ -39,6 +39,10 @@ make playback-fixtures     # build + ffprobe the corpus; cached under target/
 make playback-smoke        # 11 risk-weighted Chrome cases, about 2–4 minutes
 make playback-full         # 44 Chrome cases: every fixture × quality + restarts
 
+# Fault injection: drive a session through a bandwidth cliff (see below).
+scripts/playback-lab run --suite stall-recovery \
+  --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json
+
 # Safari: first enable Develop → Allow Remote Automation in Safari.
 # macOS may also require you to run `safaridriver --enable` once yourself.
 scripts/playback-lab doctor --browser safari
@@ -93,6 +97,7 @@ branch; do not multiply the suite merely because another axis exists.
 | `transcode-mpeg4-mp3-720.avi` | Unsupported video codec forces a real video transcode. |
 | `direct-vp9-opus-720.webm` | Non-MP4 direct path where this browser reports VP9 + Opus. |
 | `hevc-hdr-open-gop-2160.mkv` | 3840×2160 · 10-bit PQ/BT.2020 · open GOP · approximately 48 Mb/s, preserving the high-bitrate copy/segmenter stress case. |
+| `shaping-mpeg4-mp3-720.avi` | Opt-in, `stall-recovery` only: the same forced-transcode shape as the AVI above, but 120 s long so a cliff at 12 s still leaves a full recovery window. |
 
 Generation is cached. Every invocation still runs `ffprobe` and rejects a file
 whose codec, streams, dimensions, HDR tags, duration, or critical bitrate no
@@ -122,6 +127,235 @@ failure that once turned a 4K remux into a 720p transcode. TTFF, runway, dropped
 frames, `MediaCapabilities`, encoder, and server-ahead health are recorded but
 not all are hard gates yet; promote a number to a gate only after it is stable
 across the target hardware.
+
+## Network shaping — a bandwidth cliff you can reproduce and timestamp
+
+The `stall-recovery` suite is fault injection, not a correctness matrix. It
+holds a link at one rate until the session has proven itself, drops it to a
+lower rate at a recorded moment, and then records what the session did about
+it. It is the harness [PERF2-PLAN.md §7](PERF2-PLAN.md) requires *before* the
+N4 Auto controller exists, so that the controller's acceptance can be measured
+rather than asserted.
+
+```bash
+scripts/playback-lab run --suite stall-recovery \
+  --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json
+```
+
+**How the shaping works.** A loopback reverse proxy sits between the browser
+and the isolated server, metering every byte the browser pulls through one
+shared token bucket. This process keeps talking to the server directly, so the
+harness's own polling never competes with the shaped budget. Three properties
+follow, and each is the reason it is not an OS-level shaper:
+
+- it needs no root, no `pfctl`/`tc`, and no kernel state that could outlive a
+  failed run or affect anything else on the machine;
+- the cliff is a function call, so the report can timestamp it exactly rather
+  than infer it; and
+- the bucket is shared across connections, so the cliff constrains *the link*
+  rather than whichever request happened to be open.
+
+Pre-cliff credit is clamped when the rate drops. Without that, a bucket filled
+at 8 Mb/s would fund several seconds of post-cliff burst and blur the very
+edge the suite exists to observe.
+
+The evidence window starts only after the first presented frame. Stage-zero
+byte, time, and ledger counters reset there.
+
+**What is scored, and why it is the ledger.** Every shaped byte is claimed from
+the bucket before it is written, so the proxy keeps that bucket's own outflow
+ledger: `+bytes` at the instant a reservation claims them, `−bytes` when a
+canceled write is refunded, each stamped with the clock reading the bucket used
+and filed against the stage live at that instant. Two quantities are read off
+it, and both are scored against the same identity:
+
+- `admitted_bytes` over `admitted_span_ms` — the whole stage, from its first
+  bucket mutation to its last.
+- `admitted_peak_kbps` — the widest one-second rolling window over the same
+  ledger.
+
+The identity is token conservation, not an estimate. Over any window that opens
+on one claim and closes on another, the balance can only fall by the net bytes
+claimed and rise by what the window earned, so `tokens(end) ≤ tokens(start) +
+window × rate − claimed`. `refill` caps every balance at 250 ms of rate, and
+`setRate` clamps it again when the cliff shrinks the bucket, so `tokens(start) ≤
+burst × rate` at the head of any stage. Reservation attempts are serialized: a
+later attempt cannot begin until the preceding attempt has repaid its debt to a
+non-negative balance and returned. The next claim can therefore drive the
+balance no further than one slice into debt, so `tokens(end) ≥ −16 KiB`.
+Multiple granted claims may remain outstanding on separate downstream drains;
+they do not deepen the bucket debt because their pricing waits completed in
+sequence. Rearranged:
+
+    claimed ≤ (burst + window) × rate + one 16 KiB slice
+
+That single slice is the entire in-flight term, and serialization is what proves
+it. The same formula scores both gates at the two windows that matter. Over one
+second it is 1.25× the cap plus a slice. Over a stage it amortizes the fixed
+burst and slice terms, so a long stage is held far closer to its cap than a
+short one: on a 45 s stage at 1.5 Mb/s the sustained bound is 1537.9 kb/s, well
+inside the flat `cap × 1.25` (1875 kb/s) it replaced.
+
+Refunds cancel out of the identity only because the ledger records them exactly
+as the bucket does: the credit the bucket actually took — a balance already at
+capacity takes back less than a slice, or none of it — against the stage whose
+bucket took it. There is one bucket, so a refund credits whichever stage is live
+when it happens, never the stage that made the claim. Filing it against the
+claiming stage would hand the post-cliff bucket spendable credit its own ledger
+never saw, and the claims that credit funds would then read as bytes the bucket
+could not have released.
+
+Neither gate takes a tolerance multiplier. A multiplier is an unproved band in
+which a real leak scores as healthy, and the identity leaves nothing for one to
+cover: the sustained gate compares exact byte counts, and the burst gate
+compares its bound at the same 0.1 kb/s quantum the peak is reported in, so the
+only slack is the half-quantum rounding can add. One reporting quantum past the
+ceiling already fails — a rate that the 1% tolerance this replaced would have
+passed.
+
+**Why delivery is reported but not scored as a rate.** Reservations are
+serialized through the shared bucket, but downstream drain is deliberately
+per-connection, so one non-reading response cannot stall the rest of the link.
+A slice is therefore priced when it is claimed and recorded only when its own
+connection drains, and any number of separately priced slices can be recorded
+together when several players resume reading at once. Three connections that
+each take one legally priced slice and then stop reading, releasing together,
+deliver a whole stage in a single instant: 4500 kb/s on a 1500 kb/s link, with a
+one-second delivered peak of 2228.2 kb/s once further legal slices follow. No
+reservation ever overspent the bucket, so scoring either delivered rate invents
+`outcome: shaping` and the run proves nothing about playback. No multiplier and
+no eligibility rule repairs it: the skew is one undrained slice *per
+connection*, the proxy allows 32 upstream sockets, and the grouping can compress
+a stage's delivery interval to zero. `measured_kbps` and `peak_kbps` are still
+reported, because they are what a viewer would have felt.
+
+Delivered **bytes** are a different matter — a total survives regrouping when a
+rate does not — and they carry the one check the ledger cannot make about
+itself: that nothing reached the browser without being claimed from the bucket
+first. Total delivered bytes are gated against total admitted bytes.
+
+That gate needs one exemption, because `beginEvidence` clears both series
+mid-stage: a slice the bucket priced before the first presented frame can be
+delivered after it with its claim in the discarded ledger. The exemption is
+**measured, not assumed**. The shaper holds every priced-but-undelivered claim
+by identity, marks exactly those outstanding when the evidence window opens, and
+settles each one by the path it actually took. A delivered claim contributes to
+`carried_over_bytes`. A canceled claim contributes no delivery allowance, but
+its actual credited refund contributes to `evidence_refunded_claim_bytes`: the
+new ledger retained that negative refund after discarding the matching positive
+claim, so the total proof must reconcile it before judging later ordinary
+delivery. The two settlements are mutually exclusive and their sum may not
+exceed `evidence_pending_claim_bytes`, the bytes measured in flight at the seam.
+Those three artifact fields keep every adjustment re-checkable without the
+script; neither the nominal claim size nor the socket count can manufacture one.
+
+A post-window cancellation has the opposite shape. Its positive claim is in the
+retained admission ledger, but an idle bucket may have refilled to capacity and
+accept only part of the requested refund — or none of it. The uncredited part
+must stay in the bucket ledger because that is the token mutation that actually
+happened, yet it cannot authorize browser delivery because the claim settled
+without delivering. `undelivered_admitted_bytes` adds the exact remainder from
+each canceled claim, and the delivery gate subtracts that total from admitted
+bytes. An equal-size unreserved delivery therefore still returns `outcome:
+shaping`; it cannot hide behind a canceled reservation whose refund happened to
+be zero.
+
+A blanket `max_sockets × slice_bytes` ceiling was wrong here and was removed: at
+32 sockets it excused 512 KiB of delivery with no claim behind it anywhere in
+the run, which at 1.5 Mb/s is 2.8 seconds of link capacity scoring `passed`.
+`max_sockets` is still reported for context, but no scored bound is derived from
+it.
+
+Scheduler delay lengthens the observed window and lowers the measured peak
+instead of spending additional headroom.
+Only token reservations share the global scheduler; downstream socket drain
+remains per-connection, so one non-reading response cannot stop the rest of the
+shaped link. The proxy freezes one telemetry snapshot when the observation ends
+and reuses it at both result and report level. Browser-side request cancellation
+during a rendition restart closes the matching upstream request, refunds an
+undelivered reservation, and is not a link error.
+
+A reservation stops being refundable the moment the downstream takes its slice —
+either `write` accepted it outright or `drain` reported the buffer emptied behind
+it. A `close` arriving after that point, including one that lands between `drain`
+and the continuation resuming, leaves both the admission and the delivery
+standing. Refunding there would return credit the bucket had already spent on
+bytes the socket accepted and drop the delivery from the artifact at the same
+time, letting the limiter release those bytes a second time and still score
+clean. Only a transfer the client abandons *before* the downstream takes the
+slice is refunded, which is the rung switch the stall-recovery suite exercises.
+
+**The profile grammar** is `<high>-to-<low>[@<seconds>]`, e.g.
+`8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`. The descent is mandatory: a flat
+or rising "cliff" is refused, because accepting one would let a green
+stall-recovery run mean nothing at all. The cliff defaults to 12 s after the
+first presented frame.
+
+**Why 8 → 1.5 Mb/s.** It is the ladder's own geometry. The 1080 rung costs
+about 8.16 Mb/s and the 720 rung about 4.16 Mb/s, so 8 Mb/s comfortably feeds
+the rung the corpus source starts on; 1.5 Mb/s leaves only the 360 rung
+(≈1.36 Mb/s) sustainable. The cliff therefore demands a real way down rather
+than a cosmetic one.
+
+**What a failure means.** The checks run in a fixed order, because that order
+is the diagnosis. An unapplied or leaked cliff invalidates everything after
+it; a baseline that was never healthy makes a post-cliff failure meaningless.
+Only when the link and the baseline are both trustworthy does the verdict
+describe adaptation. Every artifact therefore carries an `outcome`:
+
+| `outcome` | What it says |
+|---|---|
+| `passed` | The shaped link and baseline were trustworthy, and the session met every recovery criterion. |
+| `shaping` | The cliff never applied, the proxy reported a transport error, or the bucket let out more than its own conservation identity allows — over a whole stage, over one second, or as bytes the browser received without a matching claim. The run proves nothing about playback. |
+| `browser_playback` | The baseline was unhealthy, or the player reported a media failure. There is no trustworthy recovery verdict. |
+| `server_supply` | The link still had headroom and the player starved anyway — a producer problem, not an adaptation problem. |
+| `recovery` | The link was shaped, the baseline was healthy, and the session did not answer the cliff within its criteria. |
+| `harness` | The observation was too short to outlast banked runway, or the run itself failed before it could produce a playback verdict. |
+
+The criteria live in `tests/playback/cases.json` beside the case, not in the
+script: restarts, upgrades per 60 s, the recovery deadline, and the sustained
+window are review material. The player gives every attempt a globally
+monotonic identity, while its raw stall counter carries across in-place
+`newAttempt()` changes and resets only when `play()` creates a new player
+object. The harness samples both identities. Attempt transitions therefore
+count same-reason restarts directly; a player-object transition records a
+`counter_rebase` and rebases the raw counter before deciding whether a window
+was stall-free. The current `stall-recovery` case restarts the live object, so
+its counter remains exact at any poll rate. A future case that can replace one
+or more player objects between samples needs a player-owned monotonic total
+before it can claim the same evidence; intermediate counters would otherwise
+be unobservable.
+
+**What it deliberately does not do.** It injects no probe onto the play path,
+changes no rate control, and does not steer the player. Choosing a rung in
+response to the cliff is the N4 controller's job; this harness only creates the
+condition and records the answer. Until that controller lands, a
+`stall-recovery` run is *expected* to fail with `outcome: recovery` — that
+recorded failure is the baseline the controller has to move, which is why the
+suite is not part of `make validate`.
+
+**Comparing runs.** `scripts/playback-lab normalize --json <artifact>` reduces
+a report to its behavioral shape with UUIDs, ports, wall-clock, temporary
+paths, and durations removed. Run the same unshaped smoke suite against the
+base commit and the candidate on the same machine, then compare their traces.
+Equality is the acceptance evidence that the inactive harness did not alter
+existing playback behavior; unit tests or two candidate-only runs do not prove
+that claim:
+
+```bash
+# In a full clone at the base commit:
+scripts/playback-lab run --suite smoke --json out/base.json
+scripts/playback-lab normalize --json out/base.json --out out/base.trace.json
+
+# In a separate full clone at the candidate commit, on the same machine:
+scripts/playback-lab run --suite smoke --json out/head.json
+scripts/playback-lab normalize --json out/head.json --out out/head.trace.json
+diff -u out/base.trace.json out/head.trace.json
+```
+
+The shaping fixture is opt-in: it is built only for the suite that plays it,
+and it is excluded from `full`'s source × quality product, so the existing
+suites keep exactly their previous cases and corpus.
 
 ## Reports keep enough evidence to reproduce the failing layer
 
@@ -225,8 +459,11 @@ probe contract is stable.
 - **No exhaustive codec-profile proof.** H.264 and HEVC each contain more
   profiles, levels, reference-frame patterns, and vendor quirks than a small
   generated corpus can represent.
-- **No WAN or congested-Wi-Fi simulation.** This is a correctness and local
-  performance harness. Network shaping is a separate fault-injection layer.
+- **No WAN or congested-Wi-Fi *fidelity*.** The shaping layer above injects a
+  bandwidth cliff, and that is all it claims: one shared rate limit, changed at
+  a known moment. It models no latency, jitter, loss, reordering, competing
+  traffic, or radio behavior, so it can prove that a session answers a
+  bandwidth collapse — never that it behaves like a particular real network.
 - **No visual-quality oracle yet.** It detects presentation failure, cadence,
   size, and fallback; it does not score banding, color accuracy, or subtitle
   placement from screenshots.

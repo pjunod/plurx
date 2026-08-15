@@ -17,6 +17,7 @@ mod images;
 mod items;
 mod keys;
 mod libraries;
+mod network;
 mod offline;
 mod pgs_overlay;
 mod photos;
@@ -25,6 +26,25 @@ mod scan;
 pub(crate) mod stream;
 pub(crate) mod system;
 mod trakt;
+
+/// Unmodified User-Agent strings as the shipping clients actually send them.
+/// Shared with the HTTP wire tests so the write-then-read proof and the
+/// classifier unit tests cannot drift onto different inputs.
+#[cfg(test)]
+pub(crate) mod test_agents {
+    pub(crate) const CHROME_WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+    pub(crate) const CHROME_MACOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+    pub(crate) const CHROME_ANDROID_UA: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
+    pub(crate) const SAFARI_MACOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
+    pub(crate) const SAFARI_IOS_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1";
+    pub(crate) const EDGE_WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
+    pub(crate) const FIREFOX_WINDOWS_UA: &str =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0";
+    pub(crate) const FIREFOX_IOS_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/130.0 Mobile/15E148 Safari/605.1.15";
+    pub(crate) const APPLE_NATIVE_UA: &str = "Plurx/59 CFNetwork/1498.700.2 Darwin/23.6.0";
+    pub(crate) const ANDROID_NATIVE_UA: &str = "okhttp/5.1.0";
+}
+
 mod users;
 mod watch;
 mod web;
@@ -2629,6 +2649,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_telemetry_updates_the_matching_network_prior() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let user = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("admin lookup")
+            .expect("admin user");
+        state
+            .store
+            .put_setting(plurx_core::store::keys::PLAYBACK_NETWORK_PRIORS, "1")
+            .await
+            .expect("enable priors");
+
+        let report =
+            |event: &'static str, bandwidth: i64, height: i64, detail: Option<&'static str>| {
+                let mut request = post(
+                    "/api/v1/client-log",
+                    Some(&admin),
+                    json!({
+                        "event": event,
+                        "bandwidth": bandwidth,
+                        "height": height,
+                        "detail": detail,
+                        "ua": "Safari"
+                    }),
+                );
+                request.headers_mut().insert(
+                    "x-forwarded-for",
+                    axum::http::HeaderValue::from_static("198.51.100.77"),
+                );
+                request.headers_mut().insert(
+                    axum::http::header::USER_AGENT,
+                    axum::http::HeaderValue::from_static(super::test_agents::SAFARI_MACOS_UA),
+                );
+                request
+            };
+        let prior = || {
+            state
+                .store
+                .network_prior(user.id, "safari", "198.51.100.0/24")
+        };
+
+        let (status, _) = call(&app, report("ttff", 8_000, 1080, None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        for _ in 0..100 {
+            if prior()
+                .await
+                .expect("first prior lookup")
+                .is_some_and(|prior| prior.sample_count == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            prior()
+                .await
+                .expect("first prior lookup")
+                .expect("first observation")
+                .sustained_kbps,
+            Some(8_000)
+        );
+
+        let (status, _) = call(&app, report("stall", 4_000, 720, Some("supply:empty"))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut updated = None;
+        for _ in 0..100 {
+            let current = prior().await.expect("updated prior lookup");
+            if current
+                .as_ref()
+                .is_some_and(|prior| prior.sample_count == 2)
+            {
+                updated = current;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let updated = updated.expect("second observation");
+        assert_eq!(updated.sustained_kbps, Some(7_000));
+        assert_eq!(updated.worst_rung_height, Some(720));
+    }
+
+    #[tokio::test]
     async fn plex_facade_requires_a_valid_token() {
         let app = test_app();
         let admin = setup_admin(&app).await;
@@ -4315,6 +4420,239 @@ mod tests {
             info.target_height, 900,
             "the source's own height is a promise"
         );
+    }
+
+    /// The write path and the read paths have to agree on the primary key.
+    /// They did not: `/client-log` classified from the player's own `ua` field
+    /// and wrote under `chrome`, while `/decision` and session-create had no
+    /// hint and fell through to a header test that matched `AppleWebKit` and
+    /// read under `apple`. Every browser prior was maintained and never read.
+    /// So this test refuses to touch the store directly — it reports telemetry
+    /// and reads the prior back over the wire, with one unmodified shipping
+    /// User-Agent on every request, which is the only shape that can catch it.
+    #[tokio::test]
+    async fn a_browser_reads_back_the_prior_it_reported_over_the_wire() {
+        use super::test_agents::{CHROME_WINDOWS_UA, FIREFOX_WINDOWS_UA};
+
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+        state
+            .store
+            .put_setting(plurx_core::store::keys::PLAYBACK_NETWORK_PRIORS, "1")
+            .await
+            .expect("enable priors");
+
+        let as_client = |mut request: Request<Body>, ua: &'static str| {
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_static("203.0.113.91"),
+            );
+            request.headers_mut().insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(ua),
+            );
+            request
+        };
+        let decision_url = format!(
+            "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0",
+            s.file
+        );
+
+        // The web player reports over `/client-log`, exactly as it ships:
+        // no `client` query parameter anywhere, and the `ua` field carrying
+        // its own short label rather than the header.
+        let (status, _) = call(
+            &app,
+            as_client(
+                post(
+                    "/api/v1/client-log",
+                    Some(&admin),
+                    json!({
+                        "event": "ttff",
+                        "bandwidth": 9_000,
+                        "height": 1080,
+                        "ua": "Chrome"
+                    }),
+                ),
+                CHROME_WINDOWS_UA,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Recording is asynchronous, so poll the wire rather than the store.
+        let mut decision = json!({});
+        for _ in 0..200 {
+            let (status, body) = call(
+                &app,
+                as_client(get(&decision_url, Some(&admin)), CHROME_WINDOWS_UA),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body.get("prior_kbps").is_some() {
+                decision = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            decision
+                .get("prior_kbps")
+                .and_then(serde_json::Value::as_u64),
+            Some(9_000),
+            "the browser must read back the prior it just reported: {decision}"
+        );
+
+        let (status, session) = call(
+            &app,
+            as_client(
+                post(
+                    &format!("/api/v1/files/{}/hls/sessions", s.file),
+                    Some(&admin),
+                    json!({ "playback_id": "browser-prior-roundtrip", "copy": true }),
+                ),
+                CHROME_WINDOWS_UA,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(
+            session
+                .get("prior_kbps")
+                .and_then(serde_json::Value::as_u64),
+            Some(9_000),
+            "session-create must resolve the same key as /decision: {session}"
+        );
+        if let Some(session_id) = session["session_id"].as_str() {
+            state.transcode.stop_session(session_id, "test").await;
+        }
+
+        // The class is still part of the key: a different browser on the same
+        // /24 starts cold rather than inheriting somebody else's link history.
+        let (status, other) = call(
+            &app,
+            as_client(get(&decision_url, Some(&admin)), FIREFOX_WINDOWS_UA),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{other}");
+        assert!(
+            other.get("prior_kbps").is_none(),
+            "a different client class must not read the Chrome prior: {other}"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_prior_is_opt_in_and_additive_on_decision_and_session_wires() {
+        use plurx_core::domain::NetworkPriorObservation;
+
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+        let request_with_network = |mut request: Request<Body>, ua: &'static str| {
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_static("192.0.2.143"),
+            );
+            request.headers_mut().insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(ua),
+            );
+            request
+        };
+        let decision_url = format!(
+            "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&client=apple",
+            s.file
+        );
+
+        let (status, cold) = call(
+            &app,
+            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cold}");
+        assert!(
+            cold.get("prior_kbps").is_none(),
+            "the default-off response must be byte-for-byte additive: {cold}"
+        );
+        let (status, cold_session) = call(
+            &app,
+            request_with_network(
+                post(
+                    &format!("/api/v1/files/{}/hls/sessions", s.file),
+                    Some(&admin),
+                    json!({ "playback_id": "network-prior-cold-wire", "copy": true }),
+                ),
+                "Apple AVPlayer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cold_session}");
+        assert!(
+            cold_session.get("prior_kbps").is_none(),
+            "the default-off session response must omit the additive key: {cold_session}"
+        );
+        if let Some(session_id) = cold_session["session_id"].as_str() {
+            state.transcode.stop_session(session_id, "test").await;
+        }
+
+        let (status, settings) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "playback_network_priors": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        assert_eq!(settings["playback_network_priors"], true);
+        let user = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("admin lookup")
+            .expect("admin user");
+        state
+            .store
+            .observe_network_prior(&NetworkPriorObservation {
+                user_id: user.id,
+                client_class: "apple".to_owned(),
+                network_fingerprint: "192.0.2.0/24".to_owned(),
+                throughput_kbps: Some(20_000),
+                observed_at_ms: 1_700_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("seed prior");
+
+        let (status, warm) = call(
+            &app,
+            request_with_network(get(&decision_url, Some(&admin)), "Apple AVPlayer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{warm}");
+        assert_eq!(warm["prior_kbps"], 20_000, "{warm}");
+
+        let (status, session) = call(
+            &app,
+            request_with_network(
+                post(
+                    &format!("/api/v1/files/{}/hls/sessions", s.file),
+                    Some(&admin),
+                    json!({ "playback_id": "network-prior-wire", "copy": true }),
+                ),
+                "Apple AVPlayer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["prior_kbps"], 20_000, "{session}");
+        if let Some(session_id) = session["session_id"].as_str() {
+            state.transcode.stop_session(session_id, "test").await;
+        }
     }
 
     #[tokio::test]

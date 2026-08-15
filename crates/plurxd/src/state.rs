@@ -1314,6 +1314,11 @@ impl JobManager {
                     keys::TELEMETRY_RETAIN_DEFAULT_DAYS,
                 )
                 .await,
+            network_priors: self
+                .store
+                .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
+                .await?
+                .is_some_and(|value| value.trim() == "1"),
             last_telemetry_prune: self.job_stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await,
             cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
             last_cache_produce: self.job_stamp(keys::JOB_LAST_CACHE_PRODUCE).await,
@@ -1433,15 +1438,28 @@ impl JobManager {
                 keys::TELEMETRY_RETAIN_DEFAULT_DAYS,
             )
             .await;
-        if retain_days <= 0 {
-            return Ok(0);
-        }
-        let before_ms = now_secs
-            .saturating_sub(retain_days.saturating_mul(24 * 60 * 60))
-            .saturating_mul(1_000);
         let mut removed = 0;
+        if retain_days > 0 {
+            let before_ms = now_secs
+                .saturating_sub(retain_days.saturating_mul(24 * 60 * 60))
+                .saturating_mul(1_000);
+            for _ in 0..MAX_BATCHES {
+                let batch = self.store.prune_playback_events(before_ms, BATCH).await?;
+                removed += batch;
+                if batch < BATCH as u64 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        let prior_before_ms = now_secs
+            .saturating_sub(keys::NETWORK_PRIOR_RETAIN_DAYS * 24 * 60 * 60)
+            .saturating_mul(1_000);
         for _ in 0..MAX_BATCHES {
-            let batch = self.store.prune_playback_events(before_ms, BATCH).await?;
+            let batch = self
+                .store
+                .prune_network_priors(prior_before_ms, BATCH)
+                .await?;
             removed += batch;
             if batch < BATCH as u64 {
                 break;
@@ -1644,7 +1662,7 @@ impl JobManager {
             // The rung a viewer would actually be given, so the entry matches
             // what a real playback looks up. Asking the manager rather than
             // assuming is what keeps the two in step when Auto's policy moves.
-            let height = transcode.auto_height(file.height).await;
+            let height = transcode.auto_height(file.height, None).await;
             match transcode.produce(&file, height, deadline).await {
                 Ok(Some(made)) => {
                     produced += 1;

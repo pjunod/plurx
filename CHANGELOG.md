@@ -76,6 +76,70 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **The playback lab can now drive a session through a bandwidth cliff.**
+  `scripts/playback-lab run --suite stall-recovery --network-profile
+  8mbps-to-1.5mbps --json <artifact>` meters everything the browser pulls
+  through one shared loopback token bucket and drops the rate at a recorded
+  moment, so adaptation can be measured instead of asserted. It needs no root
+  and no kernel-level shaping, leaves no kernel or temporary-runtime state
+  after cleanup, and touches no live server or library; retained fixtures and
+  JSON/JUnit reports are its deliberate output. The artifact classifies its
+  outcome — `passed`, `shaping`, `browser_playback`, `server_supply`,
+  `recovery`, or `harness` — so a cliff that never applied, a proxy transport
+  error, or a shaper that leaked can never be misread as a verdict about
+  playback. A leak is scored entirely from the bucket's own signed ledger of
+  claims and refunds, against one identity read over two windows: no window may
+  claim more than `(250 ms + window) × rate` plus one 16 KiB slice. Over one
+  second that is the familiar 1.25× burst ceiling; over a whole stage the fixed
+  terms amortize, so a 45-second stage is held to 1537.9 kb/s on a 1.5 Mb/s cap
+  rather than the 1875 kb/s a flat tolerance allowed. Metering the claim rather
+  than the completion is what makes it a proof: reservation attempts are
+  serialized, so each attempt repays its debt before the next can begin, while
+  multiple granted claims may remain outstanding on downstream drains and
+  separately priced slices can therefore finish together
+  and no delivered *rate* has a bound the design can state — three connections
+  releasing at once deliver a whole stage in a single instant. Delivered rates
+  are therefore reported, because they are what a viewer would have felt, but
+  never scored; delivered *bytes* are gated as a total against admitted bytes,
+  which is the one check the ledger cannot make about itself — that nothing
+  reached the browser without being claimed first. A canceled post-evidence
+  claim that the refilled bucket cannot credit back remains in the conservation
+  ledger, but `undelivered_admitted_bytes` removes that exact stranded amount
+  from delivery authorization, so it cannot mask an equal unreserved delivery.
+  Neither gate carries a tolerance multiplier, since a multiplier is an
+  unproved band in which a real
+  leak scores as healthy: the sustained gate compares exact byte counts and the
+  burst gate compares its bound at the 0.1 kb/s quantum the peak is reported in,
+  so one quantum past the ceiling already fails. Recovery criteria are
+  reviewable in
+  `tests/playback/cases.json`, and `playback-lab normalize` reduces a report to
+  its behavioral shape with UUIDs, ports, wall-clock, and temporary paths
+  removed. This is the harness Performance II N4 requires before its Auto
+  controller; it creates the condition and records the answer, and chooses no
+  quality rung itself. Existing suites and case counts are unchanged; the new
+  120-second shaping fixture is opt-in and built only for the suite that plays
+  it.
+
+- **Performance II N4.2 adds privacy-bounded network memory for Auto quality.**
+  The default-off `playback.network_priors` setting lets N0 client telemetry
+  maintain a 25% sustained-throughput EWMA and lowest starved rung per user,
+  fixed client class, and IPv4 `/24`; full addresses never enter storage,
+  logs, or responses. SQLite v19 and each Hiqlite voter's node-local sidecar
+  retain the aggregate for 30 days and cap each user/client class at 64
+  networks, so another voter deliberately starts cold without a replicated
+  schema or protocol bump. The client class comes from the request's own
+  `User-Agent` on every path, reporting and consulting alike, so a prior cannot
+  be written under one key and read under another. Decision and session-create
+  responses add optional `prior_kbps`, and server-side Auto keeps its old
+  answer without a prior; with one it applies both signals and takes the lower
+  rung, starting below known starvation and within proven throughput. A
+  starvation verdict stops binding 7 days after the stall that recorded it, so
+  one transient dropout cannot cap a link for the row's lifetime, and any
+  further starvation re-arms it. `docs/OPERATIONS.md` documents the setting,
+  its bounds, and what `telemetry.retain_days = 0` does and does not disable
+  once priors are on. The web controller, normalized reopen contract, and
+  native client changes remain separate N4 work.
+
 - **TV episode lists and details now name the media they will open.** Season
   detail responses attach each episode's best-file resolution and HDR facts in
   one batched query, so the Apple season shelf can show a compact resolution +

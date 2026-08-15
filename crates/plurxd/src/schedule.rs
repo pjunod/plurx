@@ -48,6 +48,7 @@ pub struct GlobalSchedule {
     pub transcode_cleanup_mins: i64,
     pub last_transcode_cleanup: Option<i64>,
     pub telemetry_retain_days: i64,
+    pub network_priors: bool,
     pub last_telemetry_prune: Option<i64>,
     pub cache_produce_mins: i64,
     pub last_cache_produce: Option<i64>,
@@ -98,7 +99,9 @@ pub fn due_jobs(now: i64, libraries: &[Library], global: GlobalSchedule) -> Vec<
     ) {
         jobs.push(DueJob::CleanupTranscode);
     }
-    if global.telemetry_retain_days > 0 && due(now, global.last_telemetry_prune, 24 * 60) {
+    if (global.telemetry_retain_days > 0 || global.network_priors)
+        && due(now, global.last_telemetry_prune, 24 * 60)
+    {
         jobs.push(DueJob::PruneTelemetry);
     }
     // Last, and that is deliberate rather than incidental. This is the only
@@ -257,6 +260,12 @@ mod tests {
             ..GlobalSchedule::default()
         };
         assert!(due_jobs(NOW, &[], disabled).is_empty());
+
+        let priors_only = GlobalSchedule {
+            network_priors: true,
+            ..disabled
+        };
+        assert_eq!(due_jobs(NOW, &[], priors_only), [DueJob::PruneTelemetry]);
     }
 
     #[test]

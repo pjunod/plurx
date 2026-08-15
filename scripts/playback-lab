@@ -10,6 +10,7 @@
 
 const fs = require("node:fs");
 const fsp = fs.promises;
+const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -21,29 +22,111 @@ const DEFAULT_FIXTURE_DIR = path.join(ROOT, "target", "playback-lab", "fixtures"
 const DEFAULT_REPORT_DIR = path.join(ROOT, "target", "playback-lab", "reports");
 const ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
+// How long the shaper waits, after the first presented frame, before it drops
+// the link. Long enough that a healthy session has proven itself at the high
+// rate, so a post-cliff failure is attributable to the cliff and not to a
+// session that was never sustainable.
+const DEFAULT_CLIFF_AFTER_SECONDS = 12;
+
+// The named links. A profile is a descent: a rate that holds, then a lower
+// rate that holds. Only what the plan's acceptance shape needs is named here;
+// the parser below accepts the same grammar for one-off experiments.
+const NETWORK_PROFILES = {
+  "8mbps-to-1.5mbps": {
+    description: "8 Mb/s holds, then a cliff to 1.5 Mb/s (PERF2-PLAN §7 acceptance)",
+  },
+};
+
+function parseRate(text) {
+  const match = /^(\d+(?:\.\d+)?)(kbps|mbps)$/.exec(String(text).trim().toLowerCase());
+  if (!match) throw new Error(`rate "${text}" must look like 8mbps or 1500kbps`);
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`rate "${text}" must be positive`);
+  const kbps = match[2] === "mbps" ? value * 1000 : value;
+  if (kbps < 1) throw new Error(`rate "${text}" is below the 1 kb/s floor`);
+  return Math.round(kbps);
+}
+
+/**
+ * `<high>-to-<low>[@<seconds>]`, e.g. `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`.
+ *
+ * The descent is mandatory. A profile that rises, or holds flat, cannot make a
+ * cliff, and silently accepting one would let a green stall-recovery run mean
+ * nothing at all — the single most expensive failure this harness could have.
+ */
+function parseNetworkProfile(spec) {
+  if (spec === undefined || spec === null || spec === false || spec === "" || spec === "none") {
+    return null;
+  }
+  if (spec === true) throw new Error("--network-profile needs a value, e.g. 8mbps-to-1.5mbps");
+  const raw = String(spec).trim().toLowerCase();
+  const profileParts = raw.split("@");
+  if (profileParts.length > 2) {
+    throw new Error(`network profile "${spec}" has more than one cliff delay`);
+  }
+  const [shape, cliffText] = profileParts;
+  const parts = shape.split("-to-");
+  if (parts.length !== 2) {
+    const known = Object.keys(NETWORK_PROFILES).join(", ");
+    throw new Error(`unknown network profile "${spec}"; known profiles: ${known}`);
+  }
+  const from = parseRate(parts[0]);
+  const to = parseRate(parts[1]);
+  if (to >= from) {
+    throw new Error(`network profile "${spec}" must descend: ${to} kb/s is not below ${from} kb/s`);
+  }
+  let cliffAfterSeconds = DEFAULT_CLIFF_AFTER_SECONDS;
+  if (cliffText !== undefined) {
+    cliffAfterSeconds = Number(cliffText);
+    if (!Number.isFinite(cliffAfterSeconds) || cliffAfterSeconds <= 0) {
+      throw new Error(`network profile "${spec}" needs a positive cliff delay in seconds`);
+    }
+  }
+  const id = `${parts[0]}-to-${parts[1]}`;
+  return {
+    id,
+    spec: raw,
+    description: NETWORK_PROFILES[id]?.description || `${from} kb/s, then a cliff to ${to} kb/s`,
+    cliff_after_seconds: cliffAfterSeconds,
+    stages: [
+      { index: 0, label: "before-cliff", kbps: from },
+      { index: 1, label: "after-cliff", kbps: to },
+    ],
+  };
+}
+
 function usage() {
   process.stdout.write(`plurx playback lab
 
 Usage:
   scripts/playback-lab doctor [--browser chrome|safari|edge|firefox]
   scripts/playback-lab fixtures [--rebuild] [--fixtures DIR]
-  scripts/playback-lab plan [--suite smoke|full] [--case TEXT]
-  scripts/playback-lab run [--suite smoke|full] [--browser chrome|safari|edge|firefox]
+  scripts/playback-lab plan [--suite smoke|full|stall-recovery] [--case TEXT]
+  scripts/playback-lab run [--suite smoke|full|stall-recovery]
+                             [--browser chrome|safari|edge|firefox]
                              [--case TEXT] [--observe SECONDS]
+                             [--network-profile NAME] [--json PATH] [--junit PATH]
                              [--fixtures DIR] [--server PATH]
                              [--chrome PATH] [--edge PATH]
                              [--firefox PATH] [--geckodriver PATH]
                              [--headed] [--keep-runtime]
+  scripts/playback-lab normalize --json PATH [--out PATH]
 
 Commands:
-  doctor    Verify the external programs and browser automation surface.
-  fixtures  Generate and ffprobe-verify the deterministic media corpus.
-  plan      Print the cases without starting a server or browser.
-  run       Boot an isolated server, scan the corpus, and play every case.
+  doctor     Verify the external programs and browser automation surface.
+  fixtures   Generate and ffprobe-verify the deterministic media corpus.
+  plan       Print the cases without starting a server or browser.
+  run        Boot an isolated server, scan the corpus, and play every case.
+  normalize  Scrub a report's run-local values so two runs can be compared.
 
 The smoke suite covers each verdict plus the high-risk 4K transport forks and
 seek/audio/subtitle restarts. The full suite adds every fixture x quality mode.
+The stall-recovery suite drives a shaped link through a bandwidth cliff and
+records how the session answers it.
 Reports are written below target/playback-lab/reports/ as JSON and JUnit XML.
+
+Network profiles (--network-profile), applied by a local loopback shaper:
+${Object.keys(NETWORK_PROFILES).map((id) => `  ${id.padEnd(20)} ${NETWORK_PROFILES[id].description}`).join("\n")}
 `);
 }
 
@@ -100,8 +183,10 @@ function expandCases(manifest, suiteName, filter) {
   const fixtures = fixtureMap(manifest);
   const cases = [];
   if (suite.cross_product) {
+    // "all" means the general corpus. An opt-in fixture exists for one named
+    // suite and must not silently widen the full matrix.
     const fixtureIds = suite.cross_product.fixtures === "all"
-      ? manifest.fixtures.map((fixture) => fixture.id)
+      ? manifest.fixtures.filter((fixture) => !fixture.opt_in).map((fixture) => fixture.id)
       : suite.cross_product.fixtures;
     const qualities = suite.cross_product.qualities === "all"
       ? manifest.qualities
@@ -312,6 +397,17 @@ function fixtureCommand(fixture, output, directory, fixtures) {
         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-q:v", "3",
         "-c:a", "libmp3lame", "-b:a", "192k", "-shortest", output,
       ];
+    // Same forced-transcode shape as above, but long enough that a cliff at
+    // 12 s still leaves a full recovery window — and rate-capped rather than
+    // quality-capped so its size stays predictable.
+    case "mpeg4_mp3_avi_long":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=120",
+        "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=120",
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-b:v", "3M",
+        "-c:a", "libmp3lame", "-b:a", "192k", "-shortest", output,
+      ];
     case "vp9_opus_webm":
       return [
         ...ffmpegPrefix(),
@@ -376,6 +472,7 @@ function verifyFixture(fixture, file) {
     h264_aac_mp4: { video: "h264", audio: ["aac"], width: 1920, height: 1080, minDuration: 20 },
     h264_multitrack_mkv: { video: "h264", audio: ["aac", "ac3"], subtitles: 1, width: 1920, height: 1080, minDuration: 20 },
     mpeg4_mp3_avi: { video: "mpeg4", audio: ["mp3"], width: 1280, height: 720, minDuration: 20 },
+    mpeg4_mp3_avi_long: { video: "mpeg4", audio: ["mp3"], width: 1280, height: 720, minDuration: 110 },
     vp9_opus_webm: { video: "vp9", audio: ["opus"], width: 1280, height: 720, minDuration: 20 },
     hevc_hdr_open_gop_mkv: { video: "hevc", audio: ["aac"], width: 3840, height: 2160, hdr: true, minBitrate: 40_000_000, minDuration: 16 },
   }[fixture.builder];
@@ -402,12 +499,17 @@ function verifyFixture(fixture, file) {
   };
 }
 
-async function buildFixtures(manifest, options) {
+/**
+ * `wanted` restricts the build to the fixtures a plan actually uses, so an
+ * opt-in corpus member costs nothing to the suites that never play it.
+ */
+async function buildFixtures(manifest, options, wanted) {
   const directory = path.resolve(options.fixtures || DEFAULT_FIXTURE_DIR);
   await fsp.mkdir(directory, { recursive: true });
   const fixtures = fixtureMap(manifest);
   const metadata = {};
-  for (const fixture of manifest.fixtures) {
+  const selected = fixturesForBuild(manifest, wanted);
+  for (const fixture of selected) {
     const output = path.join(directory, fixture.filename);
     let valid = false;
     if (!options.rebuild && fs.existsSync(output)) {
@@ -433,6 +535,17 @@ async function buildFixtures(manifest, options) {
   return { directory, metadata };
 }
 
+function fixturesForBuild(manifest, wanted) {
+  const needed = wanted ? new Set(wanted) : null;
+  if (needed) {
+    // A fixture built by copying another's video needs that other one present.
+    for (const fixture of manifest.fixtures) {
+      if (needed.has(fixture.id) && fixture.depends_on) needed.add(fixture.depends_on);
+    }
+  }
+  return manifest.fixtures.filter((fixture) => needed ? needed.has(fixture.id) : !fixture.opt_in);
+}
+
 async function freePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -443,6 +556,619 @@ async function freePort() {
       server.close(() => resolve(port));
     });
   });
+}
+
+// A bucket wide enough to keep TCP moving, narrow enough that it cannot fund a
+// post-cliff burst out of pre-cliff credit.
+const SHAPER_BURST_MS = 250;
+const SHAPER_SLICE_BYTES = 16 * 1024;
+const SHAPER_TELEMETRY_WINDOW_MS = 1_000;
+
+/**
+ * The rate limiter, kept free of sockets and wall-clock so it can be tested
+ * directly: every method takes the current millisecond from its caller.
+ */
+class TokenBucket {
+  constructor(kbps, nowMs = 0) {
+    this.tokens = 0;
+    this.updatedAt = nowMs;
+    this.bytesPerMs = 0;
+    this.capacity = 0;
+    this.setRate(kbps, nowMs);
+  }
+
+  setRate(kbps, nowMs) {
+    if (!Number.isFinite(kbps) || kbps <= 0) throw new Error(`shaper rate must be positive, got ${kbps}`);
+    this.refill(nowMs);
+    this.kbps = kbps;
+    this.bytesPerMs = kbps / 8; // kb/s ÷ 8 = bytes per millisecond
+    this.capacity = this.bytesPerMs * SHAPER_BURST_MS;
+    // Drop pre-cliff credit that the new, lower rate never earned.
+    if (this.tokens > this.capacity) this.tokens = this.capacity;
+  }
+
+  refill(nowMs) {
+    const elapsed = Math.max(0, nowMs - this.updatedAt);
+    this.updatedAt = nowMs;
+    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.bytesPerMs);
+  }
+
+  /**
+   * Give back a claim the browser never received, and report the credit the
+   * bucket actually took. A balance already at capacity absorbs less than the
+   * full slice — or none of it — and the ledger that scores this bucket has to
+   * record the mutation that happened rather than the one that was asked for.
+   */
+  refund(bytes, nowMs) {
+    this.refill(nowMs);
+    const credited = Math.max(0, Math.min(bytes, this.capacity - this.tokens));
+    this.tokens += credited;
+    return credited;
+  }
+
+  /**
+   * Claim `bytes` now and return how long the caller must wait first. Debt is
+   * allowed to go negative and is repaid by time, which is what makes the
+   * long-run average exactly the configured rate instead of merely near it.
+   */
+  reserve(bytes, nowMs) {
+    this.refill(nowMs);
+    this.tokens -= bytes;
+    return this.delay(nowMs);
+  }
+
+  delay(nowMs) {
+    this.refill(nowMs);
+    return this.tokens < 0 ? -this.tokens / this.bytesPerMs : 0;
+  }
+}
+
+// Bytes that are the stream itself, as opposed to the app shell and control
+// plane. Recorded separately so a report can say whether the shaped budget was
+// actually spent on media supply.
+function isMediaPath(urlPath) {
+  const route = String(urlPath || "").split("?")[0];
+  return /\/hls\//.test(route)
+    || /\/stream\.mp4$/.test(route)
+    || /\/files\/\d+\/direct$/.test(route)
+    || /\/offline\/media\//.test(route)
+    || /\.(m3u8|ts|m4s|mp4)$/.test(route);
+}
+
+// Proxy diagnostics name the route, never its query. Media requests carry the
+// isolated lab bearer token in `?token=...`; even an ephemeral credential has
+// no place in a retained artifact.
+function diagnosticPath(urlPath) {
+  return String(urlPath || "").split(/[?#]/)[0] || "/";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A byte count over a millisecond window, in kb/s, at the reporting quantum. */
+function spanRateKbps(bytes, spanMs) {
+  if (bytes === null || !Number.isFinite(spanMs) || spanMs <= 0) return null;
+  return Number(((bytes * 8) / spanMs).toFixed(1));
+}
+
+/**
+ * The widest `SHAPER_TELEMETRY_WINDOW_MS` rate over a byte series ordered by
+ * time. Entries may be negative — the admission ledger withdraws a refunded
+ * slice — so the running sum is signed and the peak floors at zero.
+ */
+function rollingPeakKbps(samples, mediaOnly) {
+  if (!samples.length) return null;
+  let first = 0;
+  let bytes = 0;
+  let peak = 0;
+  for (let last = 0; last < samples.length; last += 1) {
+    if (!mediaOnly || samples[last].media) bytes += samples[last].bytes;
+    const cutoff = samples[last].at_ms - SHAPER_TELEMETRY_WINDOW_MS;
+    while (samples[first]?.at_ms < cutoff) {
+      if (!mediaOnly || samples[first].media) bytes -= samples[first].bytes;
+      first += 1;
+    }
+    peak = Math.max(peak, bytes * 8 / SHAPER_TELEMETRY_WINDOW_MS);
+  }
+  return Number(peak.toFixed(1));
+}
+
+/**
+ * A loopback reverse proxy that meters everything the browser pulls through one
+ * shared bucket. It is deliberately not an OS-level shaper: no root, no
+ * kernel state to leak into the next run, no machine-wide blast radius, and the
+ * cliff is a function call the report can timestamp.
+ */
+class ShapingProxy {
+  constructor(profile, targetOrigin) {
+    this.profile = profile;
+    this.target = new URL(targetOrigin);
+    this.stageIndex = 0;
+    this.bucket = new TokenBucket(profile.stages[0].kbps, performance.now());
+    this.agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+    this.errors = [];
+    this.closed = false;
+    this.limiterTail = Promise.resolve();
+    this.limiterWaiters = new Set();
+    this.frozenTelemetry = null;
+    this.deliverySamples = profile.stages.map(() => []);
+    this.admissionSamples = profile.stages.map(() => []);
+    // Claims priced by the bucket but not yet delivered or refunded. Held by
+    // identity, not as a count, so the evidence seam below can exempt exactly
+    // the slices that crossed it instead of a blanket per-socket allowance.
+    this.pendingClaims = new Set();
+    this.evidencePendingBytes = 0;
+    this.carriedOverBytes = 0;
+    this.evidenceRefundedClaimBytes = 0;
+    // Admission the bucket still retains for claims canceled after the evidence
+    // reset. It remains part of the bucket-conservation proof, but it cannot
+    // authorize delivery because the named claim never reached the browser.
+    this.undeliveredAdmittedBytes = 0;
+    this.stages = profile.stages.map((stage) => ({
+      index: stage.index,
+      label: stage.label,
+      kbps: stage.kbps,
+      entered_at_ms: null,
+      left_at_ms: null,
+      first_byte_at_ms: null,
+      last_byte_at_ms: null,
+      bytes: 0,
+      media_bytes: 0,
+    }));
+  }
+
+  now() {
+    return performance.now();
+  }
+
+  async start(binder) {
+    const bind = binder || ((server) => new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve(server.address().port));
+    }));
+    this.server = http.createServer((request, response) => this.handle(request, response));
+    this.server.keepAliveTimeout = 30_000;
+    try {
+      this.port = await bind(this.server);
+    } catch (error) {
+      throw new Error(`network shaping is unavailable: ${error.message}`);
+    }
+    if (!this.port) throw new Error("network shaping is unavailable: the shaper bound no port");
+    this.startedAt = this.now();
+    this.stages[0].entered_at_ms = 0;
+    this.baseUrl = `http://127.0.0.1:${this.port}`;
+    return this.baseUrl;
+  }
+
+  /** Start stage-zero evidence after the browser has presented its first frame. */
+  beginEvidence() {
+    const stage = this.stages[this.stageIndex];
+    const at = this.now() - this.startedAt;
+    stage.entered_at_ms = at;
+    stage.left_at_ms = null;
+    stage.first_byte_at_ms = null;
+    stage.last_byte_at_ms = null;
+    stage.bytes = 0;
+    stage.media_bytes = 0;
+    this.deliverySamples[this.stageIndex] = [];
+    this.admissionSamples[this.stageIndex] = [];
+    // Clearing the ledger opens a seam: a slice the bucket already priced can
+    // be delivered after the reset with its claim left in the discarded series.
+    // Snapshot exactly which claims are outstanding at this instant so the
+    // delivery gate can exempt those completions and nothing else. Marking the
+    // claims themselves — rather than trusting a `max_sockets x slice_bytes`
+    // ceiling — keeps an unclaimed byte unexempt even when it is the only one.
+    this.evidencePendingBytes = 0;
+    this.carriedOverBytes = 0;
+    this.evidenceRefundedClaimBytes = 0;
+    this.undeliveredAdmittedBytes = 0;
+    for (const claim of this.pendingClaims) {
+      claim.crossedEvidenceSeam = true;
+      this.evidencePendingBytes += claim.bytes;
+    }
+  }
+
+  /** Drop the link to the next stage. Called once, at a point the report keeps. */
+  applyCliff() {
+    if (this.stageIndex + 1 >= this.stages.length) return null;
+    const at = this.now() - this.startedAt;
+    this.stages[this.stageIndex].left_at_ms = at;
+    this.stageIndex += 1;
+    const stage = this.stages[this.stageIndex];
+    stage.entered_at_ms = at;
+    this.bucket.setRate(stage.kbps, this.now());
+    this.wakeLimiter();
+    return at;
+  }
+
+  /**
+   * The bucket's own outflow ledger: `+bytes` at the instant a reservation
+   * claims them, `-bytes` when a canceled write refunds them. Signed, because
+   * the rolling bound this feeds is the bucket's token-conservation identity —
+   * the net bytes taken out of a bucket over a window cannot exceed the credit
+   * it held when the window opened plus what the window earned. Refunds cancel
+   * out of that identity only if the ledger records them the same way the
+   * bucket does.
+   *
+   * Delivery timestamps cannot carry that proof. A slice is priced when it is
+   * claimed but recorded only after its own connection drains, and drains are
+   * deliberately per-connection, so any number of separately priced slices can
+   * land together. Metering the claim keeps the measured event and the bound
+   * describing the same thing.
+   *
+   * `at` is the clock reading the bucket itself used, not a later sample of it,
+   * and the entry is filed against the stage current at that instant. Both keep
+   * the ledger and the bucket from disagreeing across a cliff.
+   */
+  meterAdmission(bytes, media, at = this.now()) {
+    this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes, media });
+    // The claim stays outstanding until its slice is delivered or refunded. It
+    // is the provenance the delivery gate needs: an exemption is granted to a
+    // completion only when it can name the claim it belongs to.
+    const claim = { media, bytes, crossedEvidenceSeam: false };
+    this.pendingClaims.add(claim);
+    return claim;
+  }
+
+  /**
+   * Retire a claim without delivering it. The bytes never reach the exemption,
+   * so a canceled pre-seam reservation cannot widen the delivery allowance.
+   */
+  settleClaim(claim) {
+    if (claim) this.pendingClaims.delete(claim);
+  }
+
+  /**
+   * Withdraw credit the bucket gave back, against the stage that received it.
+   *
+   * There is one bucket, so a refund always credits whichever stage is live
+   * when it happens — never the stage that made the original claim. Filing the
+   * withdrawal against the claiming stage would hand the post-cliff bucket
+   * spendable credit that the post-cliff ledger never saw, and the later claims
+   * that credit funds would then look like bytes the bucket could not have
+   * released. `bytes` is what the bucket actually took back, which is less than
+   * the slice whenever the balance was already near capacity.
+   */
+  meterRefund(bytes, media, at = this.now(), claim = null) {
+    const credited = claim ? Math.max(0, Math.min(bytes, claim.bytes)) : 0;
+    // `beginEvidence` discards the positive entry for an outstanding claim. If
+    // that exact claim is canceled afterwards, its negative refund survives in
+    // the new ledger and needs the same measured seam reconciliation as a
+    // completion. Record only the credit the bucket actually accepted; this is
+    // neither the claim's nominal size nor a blanket delivery allowance.
+    if (claim?.crossedEvidenceSeam && this.pendingClaims.has(claim)) {
+      this.evidenceRefundedClaimBytes += credited;
+    } else if (claim && this.pendingClaims.has(claim)) {
+      // A post-reset claim is present in the retained admission ledger. If the
+      // bucket is already full, some or all of its canceled reservation cannot
+      // be credited back and therefore stays in that conservation series. Name
+      // exactly that remainder so it cannot authorize unrelated delivery.
+      this.undeliveredAdmittedBytes += claim.bytes - credited;
+    }
+    if (bytes <= 0) return;
+    this.admissionSamples[this.stageIndex].push({ at_ms: at - this.startedAt, bytes: -bytes, media });
+  }
+
+  record(bytes, media, claim = null) {
+    // A completion is exempt from the delivery gate only when it carries the
+    // identity of a claim that was already outstanding when `beginEvidence`
+    // discarded the ledger holding it. Crediting the claim's own bytes — once,
+    // and only on delivery — bounds the allowance by what actually crossed the
+    // seam instead of by how many sockets the proxy may open.
+    if (claim?.crossedEvidenceSeam && this.pendingClaims.has(claim)) {
+      this.carriedOverBytes += Math.min(bytes, claim.bytes);
+    }
+    this.settleClaim(claim);
+    // What the browser received, billed to the stage current at completion.
+    // Reservations are priced when they are claimed and recorded only once
+    // their own connection drains, so this series says when bytes landed, not
+    // when the link released them: at a cliff every still-draining slice
+    // crosses into the next stage, and slices held by separate connections can
+    // land together in any order. Byte totals survive that regrouping and rates
+    // do not, so delivery is scored only as a total, against the ledger below.
+    const stage = this.stages[this.stageIndex];
+    const at = this.now() - this.startedAt;
+    if (stage.first_byte_at_ms === null) stage.first_byte_at_ms = at;
+    stage.last_byte_at_ms = at;
+    stage.bytes += bytes;
+    if (media) stage.media_bytes += bytes;
+    this.deliverySamples[this.stageIndex].push({ at_ms: at, bytes, media });
+  }
+
+  handle(request, response) {
+    const media = isMediaPath(request.url);
+    const route = diagnosticPath(request.url);
+    const transfer = { cancelled: false, upstreamResponse: null };
+    const cancel = () => {
+      // `close` also fires after a successful response. Only an unfinished
+      // downstream is a browser cancellation, which is normal when the player
+      // replaces a rung/session during recovery.
+      if (response.writableFinished || transfer.cancelled) return;
+      transfer.cancelled = true;
+      this.wakeLimiter();
+      transfer.upstreamResponse?.destroy();
+      upstream.destroy();
+    };
+    const upstream = http.request({
+      agent: this.agent,
+      host: this.target.hostname,
+      port: this.target.port,
+      path: request.url,
+      method: request.method,
+      headers: { ...request.headers, host: this.target.host },
+    }, (upstreamResponse) => {
+      transfer.upstreamResponse = upstreamResponse;
+      if (transfer.cancelled) {
+        upstreamResponse.destroy();
+        return;
+      }
+      response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
+      this.pump(upstreamResponse, response, media, () => transfer.cancelled).catch((error) => {
+        if (!this.closed && !transfer.cancelled) {
+          this.errors.push(`${request.method} ${route}: ${error.message}`);
+        }
+        upstreamResponse.destroy();
+        response.destroy();
+      }).finally(() => {
+        request.off("aborted", cancel);
+        response.off("close", cancel);
+      });
+    });
+    upstream.on("error", (error) => {
+      if (transfer.cancelled || this.closed) return;
+      this.errors.push(`${request.method} ${route}: ${error.message}`);
+      if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
+      response.end("playback-lab shaper: upstream error");
+    });
+    request.once("aborted", cancel);
+    response.once("close", cancel);
+    request.on("error", cancel);
+    request.pipe(upstream);
+  }
+
+  /**
+   * Serialize reservations across every connection. A token bucket is shared
+   * state, but independent sleeps are not a shared scheduler: requests queued
+   * before the cliff would otherwise retain their high-rate timers and burst
+   * through the low-rate stage. `applyCliff` wakes the one active reservation,
+   * which recomputes its remaining debt at the new rate.
+   */
+  async writeShaped(slice, sink, media, cancelled) {
+    let admission = null;
+    let committed = false;
+    const reservation = this.limiterTail.then(() => this.reserveSlice(slice.length, media, cancelled));
+    this.limiterTail = reservation.catch(() => {});
+    try {
+      admission = await reservation;
+      if (this.closed) throw new Error("shaper closed");
+      if (cancelled() || sink.destroyed || !sink.writable) {
+        throw new Error("client cancelled the transfer");
+      }
+      if (!sink.write(slice)) await this.waitForDrain(sink, cancelled);
+      // The downstream has taken the slice: either the write was accepted
+      // outright or `drain` reported the buffer emptied behind it. That is the
+      // commit point, and it is deliberately reached before the cancellation
+      // check below. A close landing between `drain` and this continuation
+      // resuming used to refund the reservation and drop the delivery, so the
+      // bucket got back credit it had already spent on bytes the socket
+      // accepted and the artifact showed neither — the limiter could then
+      // release the same bytes a second time and still score clean. A
+      // reservation the client abandons *before* the downstream takes it is
+      // the genuinely refundable case, and `waitForDrain` still rejects there.
+      committed = true;
+      this.record(slice.length, media, admission);
+      if (cancelled() || sink.destroyed) throw new Error("client cancelled the transfer");
+    } finally {
+      // A restart canceled *before* the downstream write must not leave debt in
+      // the shared link or meter a slice the browser never received. The next
+      // rendition gets only the credit genuinely earned while the canceled
+      // reservation was waiting. `committed` is set at the write, so this path
+      // can only be reached by a reservation that never reached the socket.
+      if (admission && !committed) {
+        if (!this.closed) {
+          const at = this.now();
+          this.meterRefund(this.bucket.refund(slice.length, at), admission.media, at, admission);
+          this.wakeLimiter();
+        }
+        this.settleClaim(admission);
+      }
+    }
+  }
+
+  async reserveSlice(bytes, media, cancelled) {
+    let admission = null;
+    try {
+      if (this.closed) throw new Error("shaper closed");
+      if (cancelled()) throw new Error("client cancelled the transfer");
+      const at = this.now();
+      let delay = this.bucket.reserve(bytes, at);
+      // Meter the claim at the instant the bucket loses the bytes, using the
+      // clock reading the bucket itself used and the stage current at that
+      // instant. Metering the later grant instead would file a slice priced at
+      // the pre-cliff rate against the post-cliff stage.
+      admission = this.meterAdmission(bytes, media, at);
+      while (delay > 0) {
+        await this.waitForLimiter(delay);
+        if (this.closed) throw new Error("shaper closed");
+        if (cancelled()) throw new Error("client cancelled the transfer");
+        delay = this.bucket.delay(this.now());
+      }
+      return admission;
+    } catch (error) {
+      if (admission) {
+        if (!this.closed) {
+          const at = this.now();
+          this.meterRefund(this.bucket.refund(bytes, at), admission.media, at, admission);
+          this.wakeLimiter();
+        }
+        this.settleClaim(admission);
+      }
+      throw error;
+    }
+  }
+
+  waitForDrain(sink, cancelled) {
+    return new Promise((resolve, reject) => {
+      const done = (error) => {
+        sink.off("drain", onDrain);
+        sink.off("close", onClose);
+        error ? reject(error) : resolve();
+      };
+      const onDrain = () => done();
+      const onClose = () => done(new Error("client cancelled the transfer"));
+      if (cancelled() || sink.destroyed) return done(new Error("client cancelled the transfer"));
+      sink.once("drain", onDrain);
+      sink.once("close", onClose);
+    });
+  }
+
+  waitForLimiter(delay) {
+    return new Promise((resolve) => {
+      let timer;
+      const wake = () => {
+        clearTimeout(timer);
+        this.limiterWaiters.delete(wake);
+        resolve();
+      };
+      timer = setTimeout(wake, delay);
+      this.limiterWaiters.add(wake);
+    });
+  }
+
+  wakeLimiter() {
+    for (const wake of [...this.limiterWaiters]) wake();
+  }
+
+  async pump(source, sink, media, cancelled) {
+    try {
+      for await (const chunk of source) {
+        for (let offset = 0; offset < chunk.length; offset += SHAPER_SLICE_BYTES) {
+          const slice = chunk.subarray(offset, offset + SHAPER_SLICE_BYTES);
+          await this.writeShaped(slice, sink, media, cancelled);
+        }
+      }
+      if (!cancelled()) sink.end();
+    } catch (error) {
+      if (cancelled()) return;
+      sink.destroy();
+      throw error;
+    }
+  }
+
+  /**
+   * What the link released and what it delivered, per stage. The scored
+   * quantities are the ledger's — `admitted_bytes` over `admitted_span_ms`, and
+   * the rolling `admitted_peak_kbps` — because only those have a bound the
+   * bucket's design can prove. The delivered rates are reported beside them
+   * because they are what a viewer would have felt.
+   */
+  telemetrySnapshot() {
+    const endedAt = this.now() - this.startedAt;
+    return {
+      profile: this.profile.id,
+      spec: this.profile.spec,
+      cliff_after_seconds: this.profile.cliff_after_seconds,
+      cliff_applied_at_ms: this.stages[1] ? this.stages[1].entered_at_ms : null,
+      // The constants the scored bounds are built from, so an artifact can be
+      // rechecked without the script that produced it. `max_sockets` is
+      // reported for context only; no scored bound is derived from it any more.
+      slice_bytes: SHAPER_SLICE_BYTES,
+      max_sockets: this.agent.maxSockets,
+      // The measured evidence seam. `evidence_pending_claim_bytes` is what the
+      // bucket had priced but not yet delivered when `beginEvidence` discarded
+      // the ledger; `carried_over_bytes` is how much of that was actually
+      // delivered afterwards. A marked claim refunded after the reset instead
+      // contributes the actual credit accepted by the bucket to
+      // `evidence_refunded_claim_bytes`, reconciling the retained negative
+      // ledger entry with its discarded positive entry. The two settlements
+      // are mutually exclusive and retain the provenance of every adjustment.
+      evidence_pending_claim_bytes: this.evidencePendingBytes,
+      carried_over_bytes: this.carriedOverBytes,
+      evidence_refunded_claim_bytes: this.evidenceRefundedClaimBytes,
+      // A canceled post-evidence claim may receive only a partial refund (or no
+      // refund) when the bucket has refilled to capacity. Its uncredited bytes
+      // correctly remain in the conservation ledger, but this separate total
+      // removes them from the delivery authorization because they never landed.
+      undelivered_admitted_bytes: this.undeliveredAdmittedBytes,
+      transport_errors: this.errors.slice(-10),
+      stages: this.stages.map((stage) => {
+        const left = stage.left_at_ms === null ? endedAt : stage.left_at_ms;
+        // Browser preparation before the first byte and player idle after the
+        // last byte are not transfer time. Keeping both out of the rate window
+        // prevents either dead interval from hiding a shaper leak.
+        const activeStart = stage.first_byte_at_ms;
+        const activeEnd = stage.last_byte_at_ms === null ? null : Math.min(left, stage.last_byte_at_ms);
+        const activeSeconds = activeStart === null || activeEnd === null
+          ? 0
+          : Math.max(0, activeEnd - activeStart) / 1000;
+        const samples = this.deliverySamples[stage.index];
+        // `record` runs after a reserved slice reaches the downstream socket.
+        // The first-to-last sample interval therefore contains N - 1 slice
+        // waits while the byte count contains N slices. Add the first slice's
+        // cap-time to keep the estimate unbiased without admitting browser
+        // preparation or trailing player idle into the window. That correction
+        // is exact when delivery holds the configured cap; it cannot make this
+        // an unbiased estimate when drains group, which is why the rate below
+        // is reported and the ledger is what gets scored.
+        const firstSliceSeconds = samples.length
+          ? (samples[0].bytes * 8) / (stage.kbps * 1000)
+          : 0;
+        const measuredSeconds = samples.length ? activeSeconds + firstSliceSeconds : 0;
+        const ledger = this.admissionSamples[stage.index];
+        // The window the ledger's own identity is stated over: it opens on the
+        // first mutation of the bucket inside this stage and closes on the last.
+        const admittedSpanMs = ledger.length
+          ? Number((ledger[ledger.length - 1].at_ms - ledger[0].at_ms).toFixed(3))
+          : null;
+        const admittedBytes = ledger.length
+          ? ledger.reduce((total, entry) => total + entry.bytes, 0)
+          : null;
+        return {
+          ...stage,
+          held_seconds: Number(activeSeconds.toFixed(3)),
+          measured_kbps: measuredSeconds > 0
+            ? Number(((stage.bytes * 8) / 1000 / measuredSeconds).toFixed(1))
+            : null,
+          measured_media_kbps: measuredSeconds > 0
+            ? Number(((stage.media_bytes * 8) / 1000 / measuredSeconds).toFixed(1))
+            : null,
+          // What the browser received. Reported because it is what a viewer
+          // would have felt, but deliberately not scored: per-connection drains
+          // can group separately-priced slices, so neither of these rates has a
+          // bound the shaper's design can prove.
+          peak_kbps: rollingPeakKbps(samples, false),
+          peak_media_kbps: rollingPeakKbps(samples, true),
+          // What the bucket let out, net of refunds. These are the scored
+          // quantities, and the window each is scored over travels with it.
+          admitted_bytes: admittedBytes,
+          admitted_span_ms: admittedSpanMs,
+          admitted_kbps: spanRateKbps(admittedBytes, admittedSpanMs),
+          admitted_peak_kbps: rollingPeakKbps(ledger, false),
+        };
+      }),
+    };
+  }
+
+  telemetry() {
+    return this.frozenTelemetry || this.telemetrySnapshot();
+  }
+
+  freezeTelemetry() {
+    if (!this.frozenTelemetry) this.frozenTelemetry = this.telemetrySnapshot();
+    return this.frozenTelemetry;
+  }
+
+  async close() {
+    this.freezeTelemetry();
+    this.closed = true;
+    this.wakeLimiter();
+    this.agent.destroy();
+    if (!this.server) return;
+    const closed = new Promise((resolve) => this.server.close(resolve));
+    this.server.closeAllConnections?.();
+    await closed;
+  }
 }
 
 async function stopChild(child, graceMs = 5_000) {
@@ -879,6 +1605,14 @@ function qualityForce(quality) {
 function playerSnapshotExpression() {
   return `(()=>{
     const p=(typeof PLAYER!=='undefined'&&PLAYER)||{};
+    const playerObject=(typeof PLAYER!=='undefined'&&PLAYER)||null;
+    const labPlayers=globalThis.__plurxLabPlayerObjects||
+      (globalThis.__plurxLabPlayerObjects={next:0,ids:new WeakMap()});
+    let playerGeneration=null;
+    if(playerObject){
+      if(!labPlayers.ids.has(playerObject)) labPlayers.ids.set(playerObject,++labPlayers.next);
+      playerGeneration=labPlayers.ids.get(playerObject);
+    }
     const v=document.getElementById('video');
     const h=p.hitches||{};
     const q=(()=>{try{return v&&v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null}catch(e){return null}})();
@@ -886,7 +1620,9 @@ function playerSnapshotExpression() {
     return {
       file_id:p.fileId||null, started:!!p.started, decided_method:p.decidedMethod||null,
       method:p.method||null, copy_hls:!!p.copyHls, tried_fallback:!!p.triedFallback,
-      encoder:p.encoder||null, vod:!!p.vod, attempt_reason:p.attemptReason||null,
+      encoder:p.encoder||null, vod:!!p.vod, attempt_id:p.attemptId||null,
+      attempt_reason:p.attemptReason||null, player_generation:playerGeneration,
+      play_started_at:p.playStartedAt==null?null:p.playStartedAt,
       offset:Number(p.offset||0),
       ttff_ms:p.ttffMs==null?null:p.ttffMs, stalls:p.stalls||0,
       stalls_by_kind:p.stallsByKind||{supply:0,decode:0}, buffer_limits:p.bufferLimits||{},
@@ -932,7 +1668,8 @@ async function setCasePreferences(driver, quality) {
           v.addEventListener(event,()=>{
             const p=(typeof PLAYER!=='undefined'&&PLAYER)||{};
             globalThis.__plurxLabMediaEvents.push({event,at_ms:Math.round(performance.now()),
-              attempt:p.attemptReason||null,current_time:Number((v.currentTime||0).toFixed(3)),
+              attempt:p.attemptReason||null,attempt_id:p.attemptId||null,
+              current_time:Number((v.currentTime||0).toFixed(3)),
               paused:!!v.paused,ended:!!v.ended,seeking:!!v.seeking,
               ready_state:v.readyState,network_state:v.networkState});
           });
@@ -985,6 +1722,93 @@ async function performOperation(driver, testCase, start) {
 function hitchTotal(snapshot) {
   const h = snapshot.hitches || {};
   return (h.back || 0) + (h.held || 0) + (h.late || 0) + (h.drop || 0) + (h.gap || 0);
+}
+
+/** One row of the timeline: everything a later rung decision could need. */
+function sampleFrom(snapshot, atMs) {
+  return {
+    at_ms: Math.round(atMs),
+    absolute_time: snapshot.video.absolute_time,
+    current_time: snapshot.video.current_time,
+    width: snapshot.video.width,
+    height: snapshot.video.height,
+    ready_state: snapshot.video.ready_state,
+    paused: snapshot.video.paused,
+    seeking: snapshot.video.seeking,
+    runway_seconds: snapshot.video.runway,
+    dropped_frames: snapshot.video.dropped,
+    media_error: snapshot.video.error ? snapshot.video.error.code : null,
+    stalls: snapshot.stalls || 0,
+    stalls_by_kind: snapshot.stalls_by_kind || null,
+    stall_recoveries: snapshot.stall_recoveries || 0,
+    hitches: hitchTotal(snapshot),
+    ttff_ms: snapshot.ttff_ms ?? null,
+    method: snapshot.method || null,
+    decided_method: snapshot.decided_method || null,
+    attempt_id: snapshot.attempt_id || null,
+    attempt_reason: snapshot.attempt_reason || null,
+    player_generation: snapshot.player_generation ?? null,
+    play_started_at: snapshot.play_started_at ?? null,
+    server_health: snapshot.health || null,
+  };
+}
+
+async function sampleWindow(driver, seconds, intervalMs, originMs, sink) {
+  const deadline = performance.now() + seconds * 1000;
+  let last = null;
+  while (performance.now() < deadline) {
+    last = await driver.eval(playerSnapshotExpression());
+    sink.push(sampleFrom(last, performance.now() - originMs));
+    await sleep(Math.max(0, Math.min(intervalMs, deadline - performance.now())));
+  }
+  last = await driver.eval(playerSnapshotExpression());
+  sink.push(sampleFrom(last, performance.now() - originMs));
+  return last;
+}
+
+/**
+ * Hold the link high until the session has proven itself, drop it, then watch.
+ * The harness applies the cliff and records the timeline; it deliberately makes
+ * no attempt to steer the player, which is N4's job and not this slice's.
+ */
+async function observeShapedCliff(driver, shaper, testCase, start) {
+  const criteria = testCase.recovery || {};
+  const intervalMs = (criteria.sample_interval_seconds ?? 1) * 1000;
+  const baseline = [];
+  // Both windows are timestamped from their own start, and the recovery window
+  // from the cliff itself, so every `at_ms` in the artifact reads as "since the
+  // cliff" without the reader having to subtract anything.
+  // Reset stage-zero measurement only after the first frame. Browser launch,
+  // page assets, and player preparation are not part of the shaped baseline and
+  // must not dilute a pre-cliff leak below the ceiling check.
+  shaper.beginEvidence();
+  const baselineStart = performance.now();
+  const beforeCliff = await sampleWindow(
+    driver, shaper.profile.cliff_after_seconds, intervalMs, baselineStart, baseline,
+  );
+  const baselineElapsed = (performance.now() - baselineStart) / 1000;
+  const baselineAdvanced = beforeCliff.video.absolute_time - start.video.absolute_time;
+  const cliffAtMs = shaper.applyCliff();
+  const cliffOrigin = performance.now();
+  const timeline = [];
+  const afterCliff = await sampleWindow(
+    driver, criteria.recovery_observe_seconds ?? 45, intervalMs, cliffOrigin, timeline,
+  );
+  const observation = {
+    // End the evidence window with the sampled observation. The same immutable
+    // snapshot is reused at the report top level after cleanup, so one artifact
+    // cannot contain two throughput accounts for the same stage.
+    shaping: shaper.freezeTelemetry(),
+    baseline_clock_rate: baselineElapsed > 0 ? baselineAdvanced / baselineElapsed : 0,
+    pre_cliff_runway_seconds: Number(beforeCliff.video.runway || 0),
+    baseline_error: beforeCliff.video.error
+      ? `media error ${beforeCliff.video.error.code}: ${beforeCliff.video.error.message || "unknown"}`
+      : !beforeCliff.started ? "the player never reached a presented frame" : null,
+    baseline,
+    timeline,
+  };
+  const score = scoreRecovery(criteria, observation);
+  return { observation, score, cliffAtMs, end: afterCliff };
 }
 
 function scoreCase(manifest, testCase, decision, start, end, elapsedSeconds) {
@@ -1042,7 +1866,445 @@ function scoreCase(manifest, testCase, decision, start, end, elapsedSeconds) {
   };
 }
 
-async function runOneCase(driver, server, manifest, fixture, testCase, browserInfo, observeOverride) {
+function attemptTransitions(previous, sample) {
+  if (!previous.attempt_id || !sample.attempt_id || previous.attempt_id === sample.attempt_id) return 0;
+  const before = /^a(\d+)$/.exec(String(previous.attempt_id));
+  const after = /^a(\d+)$/.exec(String(sample.attempt_id));
+  if (before && after) {
+    const delta = Number(after[1]) - Number(before[1]);
+    if (delta > 0) return delta;
+  }
+  return 1;
+}
+
+function playerCounterRebased(previous, sample) {
+  if (previous.player_generation !== null && previous.player_generation !== undefined
+      && sample.player_generation !== null && sample.player_generation !== undefined) {
+    return previous.player_generation !== sample.player_generation;
+  }
+  return previous.play_started_at !== null && previous.play_started_at !== undefined
+    && sample.play_started_at !== null && sample.play_started_at !== undefined
+    && previous.play_started_at !== sample.play_started_at;
+}
+
+/**
+ * Compress a sampled timeline into the rung history N4 will judge. Every
+ * player attempt has a globally monotonic identity, so two same-reason
+ * reconnects remain two restarts even when height and TTFF are unchanged.
+ */
+function rungHistory(timeline) {
+  const events = [];
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1];
+    const sample = timeline[index];
+    const heightChanged = sample.height > 0 && previous.height > 0 && sample.height !== previous.height;
+    const attempts = attemptTransitions(previous, sample);
+    if (!heightChanged && attempts === 0) continue;
+    events.push({
+      at_ms: sample.at_ms,
+      from_height: previous.height,
+      to_height: sample.height,
+      direction: !heightChanged ? "restart" : sample.height > previous.height ? "up" : "down",
+      restart_count: Math.max(1, attempts),
+      attempt_id: sample.attempt_id || null,
+      attempt_reason: sample.attempt_reason || null,
+      counter_rebase: playerCounterRebased(previous, sample),
+    });
+  }
+  return events;
+}
+
+/** The widest count of upgrades inside any 60-second window. */
+function peakUpgradeRate(events, windowMs = 60_000) {
+  const upgrades = events.filter((event) => event.direction === "up");
+  let peak = 0;
+  for (const anchor of upgrades) {
+    const inWindow = upgrades.filter((event) => event.at_ms >= anchor.at_ms && event.at_ms < anchor.at_ms + windowMs);
+    peak = Math.max(peak, inWindow.length);
+  }
+  return peak;
+}
+
+/**
+ * The first moment from which playback held at `minimumRate` with no new stall
+ * *for the rest of the observation*. Null means it never did.
+ *
+ * Holding to the end is the load-bearing part. A player that keeps presenting
+ * for ten seconds on buffer it filled before the cliff looks identical, over
+ * that window, to one that genuinely found a sustainable rung — and then
+ * starves. Requiring the window to reach the end of the observation is what
+ * separates recovery from drainage, and the observation must therefore be
+ * longer than the runway the pre-cliff rate could bank.
+ */
+function timeToSustained(timeline, sustainedSeconds, minimumRate) {
+  if (timeline.length < 2) return null;
+  const last = timeline[timeline.length - 1];
+  if (last.media_error !== null && last.media_error !== undefined) return null;
+  if (last.paused === true || last.seeking === true) return null;
+  if (last.ready_state !== null && last.ready_state !== undefined && last.ready_state < 2) return null;
+  // In-place newAttempt() calls carry PLAYER.stalls; only play() replaces the
+  // PLAYER object and resets it. The harness-owned object generation makes
+  // that reset explicit, while attempt_id independently marks every restart.
+  const cumulativeStalls = [0];
+  let previousStalls = Number(timeline[0].stalls || 0);
+  for (let index = 1; index < timeline.length; index += 1) {
+    const stalls = Number(timeline[index].stalls || 0);
+    const delta = playerCounterRebased(timeline[index - 1], timeline[index])
+      ? stalls
+      : stalls >= previousStalls ? stalls - previousStalls : stalls;
+    cumulativeStalls.push(cumulativeStalls[index - 1] + Math.max(0, delta));
+    previousStalls = stalls;
+  }
+  const windowMs = sustainedSeconds * 1000;
+  for (let index = 0; index < timeline.length; index += 1) {
+    const from = timeline[index];
+    // Too little left to prove anything; every later start is shorter still.
+    if (last.at_ms - from.at_ms < windowMs) break;
+    if (cumulativeStalls[cumulativeStalls.length - 1] > cumulativeStalls[index]) continue;
+    const elapsed = (last.at_ms - from.at_ms) / 1000;
+    if (elapsed > 0 && (last.absolute_time - from.absolute_time) / elapsed >= minimumRate) return from.at_ms;
+  }
+  return null;
+}
+
+/**
+ * Judge a shaped run. The order of the checks is the diagnosis: a leaked or
+ * unapplied cliff invalidates everything after it, and a baseline that was
+ * never healthy makes a post-cliff failure meaningless. Only once the link and
+ * the baseline are trustworthy does a verdict about recovery mean anything.
+ */
+function sustainedSecondsOf(criteria) {
+  return criteria.sustained_seconds ?? 10;
+}
+
+/**
+ * The most a bucket at `capKbps` can let out over a window of `windowMs`.
+ *
+ * This is the bucket's token-conservation identity, not an estimate. Over any
+ * window that opens on one claim and closes on another, tokens can only fall by
+ * the net bytes claimed and rise by what the window earned:
+ *
+ *   tokens(end) <= tokens(start) + window * rate - claimed
+ *
+ * `refill` caps every balance at `SHAPER_BURST_MS` of rate, and `setRate`
+ * clamps it again when the cliff shrinks the bucket, so
+ * `tokens(start) <= burst * rate` at the head of any stage. Reservation attempts
+ * are serialized: a later attempt cannot begin until the preceding attempt has
+ * repaid its debt to a non-negative balance and returned. The next claim can
+ * therefore drive the balance no further than one slice into debt, giving
+ * `tokens(end) >= -SHAPER_SLICE_BYTES`. Multiple granted claims may still wait
+ * on separate downstream drains; that does not deepen the bucket debt because
+ * their pricing waits completed sequentially. Rearranged, the bytes claimed
+ * inside a window cannot exceed `(burst + window) * rate` plus one slice.
+ *
+ * That one slice is the whole in-flight term, and serialization is what proves
+ * it. The same identity scores both shaping gates, at the two window lengths
+ * that matter: one second for the rolling burst, and the stage's own ledger
+ * span for the sustained rate — where the fixed burst and slice terms are
+ * amortized, so a long stage is held far closer to its cap than a short one.
+ *
+ * Metering completions instead of claims would need one in-flight term for
+ * every slice separate connections may hold undrained, which the proxy does not
+ * bound below `max_sockets`, and per-connection drain is deliberate.
+ */
+function shaperClaimBoundBytes(capKbps, windowMs) {
+  const bytesPerMs = capKbps / 8;
+  return bytesPerMs * (SHAPER_BURST_MS + Math.max(0, windowMs || 0)) + SHAPER_SLICE_BYTES;
+}
+
+/** The same identity at the telemetry window, as a rate. */
+function shaperBurstBoundKbps(capKbps) {
+  return (shaperClaimBoundBytes(capKbps, SHAPER_TELEMETRY_WINDOW_MS) * 8) / SHAPER_TELEMETRY_WINDOW_MS;
+}
+
+/**
+ * The scored shaping gates for one stage: the same conservation identity read
+ * over the stage's own ledger span and over the one-second telemetry window.
+ *
+ * Both are proofs about the bucket, so neither takes a tolerance multiplier. A
+ * multiplier would be an unproved band in which a real leak scores as healthy,
+ * and the identity leaves nothing for one to cover: the sustained gate compares
+ * exact byte counts, and the burst gate compares its bound at the same 0.1 kb/s
+ * quantum the peak is reported in, so the only slack is the half-quantum that
+ * rounding can add.
+ */
+function shapingGates(stage) {
+  const gates = [];
+  if (Number.isFinite(stage.admitted_bytes) && Number.isFinite(stage.admitted_span_ms)) {
+    const boundBytes = shaperClaimBoundBytes(stage.kbps, stage.admitted_span_ms);
+    const rate = spanRateKbps(stage.admitted_bytes, stage.admitted_span_ms);
+    const boundRate = spanRateKbps(boundBytes, stage.admitted_span_ms);
+    gates.push({
+      kind: "sustained",
+      over: stage.admitted_bytes > boundBytes,
+      message: `${stage.label} admitted ${stage.admitted_bytes} B in ${stage.admitted_span_ms} ms`
+        + `${rate === null ? "" : ` (${rate} kb/s)`}, past the ${Math.floor(boundBytes)} B`
+        + `${boundRate === null ? "" : ` (${boundRate} kb/s)`}`
+        + ` its ${stage.kbps} kb/s bucket can release over that window`,
+    });
+  }
+  if (Number.isFinite(stage.admitted_peak_kbps)) {
+    const bound = Number(shaperBurstBoundKbps(stage.kbps).toFixed(1));
+    gates.push({
+      kind: "1s burst",
+      over: stage.admitted_peak_kbps > bound,
+      message: `${stage.label} admitted a 1s burst rate of ${stage.admitted_peak_kbps} kb/s`
+        + ` over a ${stage.kbps} kb/s cap, past its ${bound} kb/s bound`,
+    });
+  }
+  return gates;
+}
+
+function scoreRecovery(criteria, observation) {
+  const errors = [];
+  const shaping = observation.shaping;
+  const after = shaping.stages[1];
+  const before = shaping.stages[0];
+
+  if (shaping.cliff_applied_at_ms === null || shaping.cliff_applied_at_ms === undefined) {
+    return { outcome: "shaping", errors: ["the shaper never applied the cliff"], metrics: { shaping } };
+  }
+  if (shaping.transport_errors?.length) {
+    return {
+      outcome: "shaping",
+      errors: [`the shaping proxy reported ${shaping.transport_errors.length} transport error(s)`],
+      metrics: { shaping },
+    };
+  }
+  for (const stage of [before, after]) {
+    const gates = shapingGates(stage);
+    if (gates.length < 2) {
+      return {
+        outcome: "shaping",
+        errors: [`the shaper recorded no admission ledger for ${stage.label}`],
+        metrics: { shaping },
+      };
+    }
+    const leak = gates.find((gate) => gate.over);
+    if (leak) {
+      return { outcome: "shaping", errors: [`the shaper leaked: ${leak.message}`], metrics: { shaping } };
+    }
+  }
+
+  // Delivery is scored once, as a total. Byte counts survive drain regrouping
+  // and the rates computed from them do not, so this is the only shape a
+  // delivered quantity can be gated in. It proves the one thing the ledger
+  // cannot prove about itself: that nothing reached the browser without being
+  // claimed from the bucket first.
+  //
+  // The allowance is the evidence window's own seam, measured rather than
+  // assumed. `beginEvidence` clears both series mid-stage, so a slice the
+  // bucket priced before the first frame can be delivered after it with its
+  // claim in the discarded ledger. The shaper marks exactly those outstanding
+  // claims and counts a byte here only when the completion names one of them.
+  // If one of those claims is canceled, the surviving ledger contains its
+  // negative refund but not the discarded positive claim. The actual credit
+  // the bucket accepted is therefore a separate seam adjustment; otherwise a
+  // healthy replacement delivery appears unclaimed by exactly that refund.
+  // Conversely, a claim created after the reset can be canceled after the
+  // bucket has refilled and accepts no refund. Its positive admission correctly
+  // remains in the conservation ledger, but `undelivered_admitted_bytes`
+  // removes that stranded amount from delivery authorization: a claim that
+  // settled without delivery cannot fund unrelated bytes later in the run.
+  // A blanket `max_sockets x slice_bytes` ceiling would instead excuse that
+  // many unclaimed bytes from anywhere in the run — at 1.5 Mb/s, seconds of
+  // link capacity with no provenance at all.
+  const delivered = shaping.stages.reduce((total, stage) => total + (stage.bytes || 0), 0);
+  const admitted = shaping.stages.reduce((total, stage) => total + (stage.admitted_bytes || 0), 0);
+  const evidencePending = shaping.evidence_pending_claim_bytes ?? 0;
+  const carriedOver = shaping.carried_over_bytes ?? 0;
+  const evidenceRefunded = shaping.evidence_refunded_claim_bytes ?? 0;
+  const undeliveredAdmitted = shaping.undelivered_admitted_bytes ?? 0;
+  const seamAdjustment = carriedOver + evidenceRefunded;
+  if (![evidencePending, carriedOver, evidenceRefunded, undeliveredAdmitted]
+    .every((value) => Number.isFinite(value) && value >= 0)
+      || seamAdjustment > evidencePending) {
+    return {
+      outcome: "shaping",
+      errors: [
+        `the shaper recorded invalid evidence-seam provenance: ${carriedOver} B delivered and `
+        + `${evidenceRefunded} B refunded from ${evidencePending} B pending`,
+      ],
+      metrics: { shaping },
+    };
+  }
+  const deliveryAuthorization = admitted - undeliveredAdmitted + seamAdjustment;
+  if (delivered > deliveryAuthorization) {
+    return {
+      outcome: "shaping",
+      errors: [
+        `the shaper leaked: the browser received ${delivered} B while the bucket released ${admitted} B`
+        + `; canceled claims left ${undeliveredAdmitted} B of admission without delivery`
+        + ` (reconciling ${carriedOver} B delivered and ${evidenceRefunded} B refunded from claims`
+        + ` pending before the evidence window)`,
+      ],
+      metrics: { shaping },
+    };
+  }
+
+  const baselineRate = observation.baseline_clock_rate;
+  if (observation.baseline_error) {
+    return {
+      outcome: "browser_playback",
+      errors: [`the session failed before the cliff: ${observation.baseline_error}`],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  if (baselineRate < (criteria.baseline_minimum_clock_rate ?? 0.9)) {
+    return {
+      outcome: "browser_playback",
+      errors: [
+        `the pre-cliff baseline was not sustainable (${baselineRate.toFixed(3)}x at ${before.kbps} kb/s), ` +
+        "so the cliff cannot prove anything about recovery",
+      ],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+
+  // The runway banked at the high rate is exactly how long a doomed session can
+  // impersonate a recovered one. If the observation cannot outlast it, the run
+  // is not evidence about recovery no matter how it scores.
+  const runway = observation.pre_cliff_runway_seconds ?? 0;
+  const observeSeconds = criteria.recovery_observe_seconds ?? 45;
+  if (observeSeconds < runway + sustainedSecondsOf(criteria)) {
+    return {
+      outcome: "harness",
+      errors: [
+        `the ${observeSeconds}s recovery window cannot outlast the ${runway.toFixed(1)}s of runway ` +
+        `banked before the cliff plus a ${sustainedSecondsOf(criteria)}s sustained window`,
+      ],
+      metrics: { shaping, baseline_clock_rate: baselineRate, pre_cliff_runway_seconds: runway },
+    };
+  }
+
+  const timeline = observation.timeline || [];
+  if (!timeline.length) {
+    return {
+      outcome: "harness",
+      errors: ["the post-cliff observation contains no player samples"],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  const incompleteSample = timeline.find((sample) => !sample.attempt_id
+    || sample.player_generation === null || sample.player_generation === undefined);
+  if (incompleteSample) {
+    return {
+      outcome: "harness",
+      errors: ["the post-cliff timeline is missing player attempt or object identity"],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  const invalidCounter = timeline.find((sample, index) => index > 0
+    && Number(sample.stalls || 0) < Number(timeline[index - 1].stalls || 0)
+    && !playerCounterRebased(timeline[index - 1], sample));
+  if (invalidCounter) {
+    return {
+      outcome: "harness",
+      errors: [`the player stall counter decreased without an object rebase at ${invalidCounter.at_ms} ms`],
+      metrics: { shaping, baseline_clock_rate: baselineRate },
+    };
+  }
+  const mediaFailure = timeline.find((sample) =>
+    sample.media_error !== null && sample.media_error !== undefined);
+  if (mediaFailure) {
+    return {
+      outcome: "browser_playback",
+      errors: [`the player reported media error ${mediaFailure.media_error} after the cliff`],
+      metrics: {
+        shaping,
+        baseline_clock_rate: baselineRate,
+        media_error_at_ms: mediaFailure.at_ms,
+      },
+    };
+  }
+  const events = rungHistory(timeline);
+  const restarts = events.reduce((total, event) => total + (event.restart_count || 1), 0);
+  const upgrades = peakUpgradeRate(events);
+  const sustainedSeconds = sustainedSecondsOf(criteria);
+  const sustainedRate = criteria.sustained_minimum_clock_rate ?? 0.9;
+  const recoveredAt = timeToSustained(timeline, sustainedSeconds, sustainedRate);
+  const deadlineMs = (criteria.recovery_deadline_seconds ?? 45) * 1000;
+  const headroom = after.measured_media_kbps !== null && after.measured_media_kbps < after.kbps * 0.6;
+
+  if (recoveredAt === null) {
+    errors.push(
+      `playback never held ${sustainedSeconds}s at ${sustainedRate}x after the cliff ` +
+      `(${after.kbps} kb/s link, ${restarts} restarts)`,
+    );
+  } else if (recoveredAt > deadlineMs) {
+    errors.push(`recovery took ${(recoveredAt / 1000).toFixed(1)}s, want <= ${(deadlineMs / 1000).toFixed(0)}s`);
+  }
+  if (restarts > (criteria.maximum_automatic_restarts ?? 1)) {
+    errors.push(`${restarts} automatic restarts, want <= ${criteria.maximum_automatic_restarts ?? 1}`);
+  }
+  if (upgrades > (criteria.maximum_upgrades_per_60s ?? 1)) {
+    errors.push(`${upgrades} upgrades inside one 60s window, want <= ${criteria.maximum_upgrades_per_60s ?? 1}`);
+  }
+
+  // A starved player on a link that still had room is a supply problem, not an
+  // adaptation problem. Saying so is the difference between a useful artifact
+  // and one that blames the controller for the producer.
+  const outcome = errors.length === 0 ? "passed" : headroom && recoveredAt === null ? "server_supply" : "recovery";
+  return {
+    outcome,
+    errors,
+    metrics: {
+      shaping,
+      baseline_clock_rate: baselineRate,
+      pre_cliff_runway_seconds: runway,
+      restarts,
+      peak_upgrades_per_60s: upgrades,
+      recovered_after_ms: recoveredAt,
+      rung_events: events,
+      counter_rebases: events.filter((event) => event.counter_rebase).length,
+      samples: timeline.length,
+    },
+  };
+}
+
+const NORMALIZE_RULES = [
+  [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>"],
+  [/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<timestamp>"],
+  [/127\.0\.0\.1:\d+/g, "127.0.0.1:<port>"],
+  [/(\/var\/folders\/|\/tmp\/)[^\s"']*plurx-playback-lab-[^\s"',)]*/g, "<runtime>"],
+  [/\b\d+(\.\d+)?\s?ms\b/g, "<duration>"],
+];
+
+function normalizeText(value) {
+  return NORMALIZE_RULES.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), String(value));
+}
+
+/**
+ * The behavioral shape of a run with every run-local value removed: no UUIDs,
+ * ports, wall-clock, temp paths, or timings. Two runs of the same suite on the
+ * same machine must produce identical output, which is what lets "the
+ * controller is off" be proven rather than asserted.
+ */
+function normalizeTrace(report) {
+  return {
+    schema_version: report.schema_version,
+    suite: report.suite,
+    browser: report.browser?.browser || null,
+    network_profile: report.network_profile?.id || null,
+    summary: report.summary,
+    results: (report.results || []).map((result) => ({
+      name: result.name,
+      status: result.status,
+      operation: result.operation,
+      decision_method: result.decision?.method ?? null,
+      delivery_mode: result.decision?.delivery?.mode ?? null,
+      actual_method: result.metrics?.actual_method ?? null,
+      copy_hls: result.metrics?.copy_hls ?? null,
+      encoder: result.metrics?.encoder ?? null,
+      decoded_dimensions: result.metrics?.decoded_dimensions ?? null,
+      tried_fallback: result.end?.tried_fallback ?? null,
+      errors: (result.errors || []).map(normalizeText),
+      warnings: (result.warnings || []).map(normalizeText),
+    })),
+  };
+}
+
+async function runOneCase(driver, server, manifest, fixture, testCase, browserInfo, observeOverride, shaper) {
   const file = server.files.get(fixture.filename);
   if (!file) throw new Error(`scanner did not return ${fixture.filename}`);
   await setCasePreferences(driver, testCase.quality);
@@ -1072,6 +2334,27 @@ async function runOneCase(driver, server, manifest, fixture, testCase, browserIn
       name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
       status: "failed", duration_ms: Date.now() - startedAt,
       errors: [`media error ${start.video.error.code}: ${start.video.error.message || "unknown"}`], warnings: [], decision, start, end: start,
+    };
+  }
+  if (testCase.operation === "shaped-cliff") {
+    if (!shaper) throw new Error("a shaped-cliff case needs --network-profile");
+    const shaped = await observeShapedCliff(driver, shaper, testCase, start);
+    return {
+      name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+      status: shaped.score.errors.length ? "failed" : "passed",
+      outcome: shaped.score.outcome,
+      duration_ms: Date.now() - startedAt,
+      errors: shaped.score.errors,
+      warnings: shaped.observation.shaping.transport_errors.length
+        ? [`shaper reported ${shaped.observation.shaping.transport_errors.length} transport errors`] : [],
+      metrics: shaped.score.metrics,
+      operation_detail: { cliff_applied_at_ms: shaped.cliffAtMs },
+      shaping: shaped.observation.shaping,
+      baseline: shaped.observation.baseline,
+      timeline: shaped.observation.timeline,
+      decision,
+      start,
+      end: shaped.end,
     };
   }
   let operation = null;
@@ -1121,7 +2404,7 @@ function junit(report) {
     const failure = result.status === "passed" ? "" :
       `<failure message="${xmlEscape(result.errors.join("; "))}">${xmlEscape(JSON.stringify(result, null, 2))}</failure>`;
     const output = xmlEscape(JSON.stringify({ metrics: result.metrics, warnings: result.warnings }, null, 2));
-    return `  <testcase classname="playback.${xmlEscape(report.browser.browser)}" name="${xmlEscape(result.name)}" time="${(result.duration_ms / 1000).toFixed(3)}">${failure}<system-out>${output}</system-out></testcase>`;
+    return `  <testcase classname="playback.${xmlEscape(report.browser?.browser || "unknown")}" name="${xmlEscape(result.name)}" time="${(result.duration_ms / 1000).toFixed(3)}">${failure}<system-out>${output}</system-out></testcase>`;
   }).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="plurx playback ${xmlEscape(report.suite)}" tests="${report.results.length}" failures="${failures}" time="${totalSeconds.toFixed(3)}">\n${cases}\n</testsuite>\n`;
 }
@@ -1129,7 +2412,8 @@ function junit(report) {
 async function writeReport(report, options) {
   await fsp.mkdir(DEFAULT_REPORT_DIR, { recursive: true });
   const stamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
-  const stem = path.join(DEFAULT_REPORT_DIR, `${stamp}-${report.browser.browser.toLowerCase()}-${report.suite}`);
+  const label = (report.browser?.browser || "unknown").toLowerCase();
+  const stem = path.join(DEFAULT_REPORT_DIR, `${stamp}-${label}-${report.suite}`);
   const jsonPath = path.resolve(options.json || `${stem}.json`);
   const junitPath = path.resolve(options.junit || `${stem}.xml`);
   await fsp.mkdir(path.dirname(jsonPath), { recursive: true });
@@ -1139,7 +2423,63 @@ async function writeReport(report, options) {
   return { jsonPath, junitPath };
 }
 
-async function runSuite(manifest, options) {
+function sanitizedText(value) {
+  return String(value)
+    .replace(/([?&](?:token|x-plex-token)=)[^&\s"']+/gi, "$1<redacted>")
+    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer <redacted>");
+}
+
+function sanitizedError(error) {
+  return sanitizedText(error?.message || error || "unknown harness failure");
+}
+
+function harnessFailureResult(error) {
+  const message = sanitizedError(error);
+  return {
+    name: "playback-lab harness",
+    fixture: null,
+    quality: null,
+    operation: "harness",
+    status: "failed",
+    outcome: "harness",
+    duration_ms: 0,
+    errors: [message],
+    warnings: [],
+    metrics: {},
+  };
+}
+
+async function writeFatalRunReport(options, error) {
+  const result = harnessFailureResult(error);
+  let profile = null;
+  try {
+    profile = parseNetworkProfile(options.network_profile);
+  } catch (_) {
+    // The parse error is already the retained failure; an invalid profile is
+    // not represented as though it were an applied link.
+  }
+  const report = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    suite: options.suite || "smoke",
+    browser: { browser: options.browser || "chrome" },
+    network_profile: profile,
+    shaping: null,
+    server: null,
+    corpus: {},
+    outcome: "harness",
+    fatal_error: result.errors[0],
+    summary: { total: 1, passed: 0, failed: 1 },
+    results: [result],
+  };
+  const paths = await writeReport(report, options);
+  process.stdout.write(`\nRESULT  0/1 passed · outcome harness\n`);
+  process.stdout.write(`JSON    ${paths.jsonPath}\n`);
+  process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
+  error.reportWritten = true;
+}
+
+async function runSuite(manifest, options, dependencies = {}) {
   const suite = options.suite || "smoke";
   const browserName = options.browser || "chrome";
   if (!new Set(["chrome", "safari", "edge", "firefox"]).has(browserName)) {
@@ -1148,31 +2488,66 @@ async function runSuite(manifest, options) {
   if (options.observe !== undefined && !(Number(options.observe) > 0)) {
     throw new Error("--observe must be a positive number of seconds");
   }
+  // Parsed before the corpus is built: a typo in the profile should cost a
+  // second, not the 195 MB fixture build and a server boot.
+  const profile = parseNetworkProfile(options.network_profile);
   const plan = printPlan(manifest, suite, options.case);
+  const shapedCases = plan.cases.filter((testCase) => testCase.operation === "shaped-cliff");
+  if ((shapedCases.length || manifest.suites[suite]?.requires_network_profile) && !profile) {
+    throw new Error(`suite ${suite} has shaped-cliff cases; pass --network-profile, e.g. 8mbps-to-1.5mbps`);
+  }
   process.stdout.write("\n");
-  const corpus = await buildFixtures(manifest, options);
+  const wanted = new Set(plan.cases.map((testCase) => testCase.fixture));
+  const corpus = await (dependencies.buildFixtures || buildFixtures)(manifest, options, wanted);
   process.stdout.write("\nSTART   isolated plurx server\n");
-  const server = await startServer(options, corpus.directory);
-  const missing = manifest.fixtures.filter((fixture) => !server.files.has(fixture.filename));
+  const server = await (dependencies.startServer || startServer)(options, corpus.directory);
+  const missing = manifest.fixtures
+    .filter((fixture) => wanted.has(fixture.id))
+    .filter((fixture) => !server.files.has(fixture.filename));
   if (missing.length) {
     await server.close(options.keep_runtime);
     throw new Error(`scan missed fixtures: ${missing.map((fixture) => fixture.filename).join(", ")}`);
   }
-  let driver;
-  if (browserName === "safari") {
-    driver = new SafariDriver(options, server.baseUrl, server.runtime);
-  } else if (browserName === "firefox") {
-    driver = new FirefoxDriver(options, server.baseUrl, server.runtime);
-  } else {
-    driver = new CdpDriver(options, server.baseUrl, server.runtime, browserName);
+  // The browser pulls through the shaper; this process keeps talking to the
+  // server directly, so the control plane never competes with the shaped
+  // budget and never distorts the throughput the report attributes to media.
+  let shaper = null;
+  let playerBaseUrl = server.baseUrl;
+  if (profile) {
+    try {
+      shaper = dependencies.createShaper
+        ? dependencies.createShaper(profile, server.baseUrl)
+        : new ShapingProxy(profile, server.baseUrl);
+      playerBaseUrl = await shaper.start(options.shaper_binder);
+    } catch (error) {
+      if (shaper) await shaper.close().catch(() => {});
+      await server.close(options.keep_runtime);
+      throw error;
+    }
+    process.stdout.write(
+      `SHAPE   ${profile.spec}: ${profile.stages[0].kbps} kb/s, cliff to ` +
+      `${profile.stages[1].kbps} kb/s ${profile.cliff_after_seconds}s after the first frame\n`,
+    );
   }
-  let browserInfo;
+  let driver = null;
+  let browserInfo = null;
+  let system = null;
+  let fatal = null;
   const results = [];
   try {
+    if (dependencies.createDriver) {
+      driver = dependencies.createDriver(options, playerBaseUrl, server.runtime, browserName);
+    } else if (browserName === "safari") {
+      driver = new SafariDriver(options, playerBaseUrl, server.runtime);
+    } else if (browserName === "firefox") {
+      driver = new FirefoxDriver(options, playerBaseUrl, server.runtime);
+    } else {
+      driver = new CdpDriver(options, playerBaseUrl, server.runtime, browserName);
+    }
     process.stdout.write(`START   ${browserName} player\n`);
     await driver.start();
-    browserInfo = await prepareBrowser(driver, server.token);
-    const system = await api(server.baseUrl, "/system", { token: server.token });
+    browserInfo = await (dependencies.prepareBrowser || prepareBrowser)(driver, server.token);
+    system = await (dependencies.api || api)(server.baseUrl, "/system", { token: server.token });
     process.stdout.write(`CAPS    ${browserInfo.browser}: video=${browserInfo.caps.vcodec} · audio=${browserInfo.caps.acodec} · hdr=${browserInfo.caps.hdr} · native_hls=${browserInfo.native_hls}\n\n`);
     for (let index = 0; index < plan.cases.length; index += 1) {
       const testCase = plan.cases[index];
@@ -1181,7 +2556,9 @@ async function runSuite(manifest, options) {
       const caseLogStart = Date.now();
       let result;
       try {
-        result = await runOneCase(driver, server, manifest, fixture, testCase, browserInfo, options.observe);
+        result = await (dependencies.runOneCase || runOneCase)(
+          driver, server, manifest, fixture, testCase, browserInfo, options.observe, shaper,
+        );
       } catch (error) {
         result = {
           name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
@@ -1202,7 +2579,9 @@ async function runSuite(manifest, options) {
         }
       }
       try {
-        const logs = await api(server.baseUrl, "/system/logs?level=trace&limit=500", { token: server.token });
+        const logs = await (dependencies.api || api)(
+          server.baseUrl, "/system/logs?level=trace&limit=500", { token: server.token },
+        );
         result.server_logs = logs.filter((entry) => entry.ts_ms >= caseLogStart - 100);
         result.diagnostics = result.server_logs
           .filter((entry) => entry.level === "ERROR" || entry.level === "WARN")
@@ -1213,42 +2592,112 @@ async function runSuite(manifest, options) {
         result.diagnostics = [];
       }
       results.push(result);
-      if (result.status === "passed") {
+      if (result.status === "passed" && result.operation === "shaped-cliff") {
+        const m = result.metrics;
+        process.stdout.write(
+          `PASS         cliff held · recovered in ${(m.recovered_after_ms / 1000).toFixed(1)}s · ` +
+          `${m.restarts} restarts · ${m.peak_upgrades_per_60s} upgrades/60s\n`,
+        );
+      } else if (result.status === "passed") {
         const m = result.metrics;
         process.stdout.write(`PASS         ${m.decision_method} -> ${m.actual_method}${m.copy_hls ? " / copy-HLS" : ""} · TTFF ${m.ttff_ms ?? "?"} ms · clock ${m.clock_rate.toFixed(3)}x · hitches ${m.hitches} · stalls ${m.stalls}\n`);
       } else {
-        process.stdout.write(`FAIL         ${result.errors.join("; ")}\n`);
-        for (const diagnostic of result.diagnostics.slice(-5)) {
+        process.stdout.write(`FAIL    ${result.outcome ? `[${result.outcome}] ` : ""}     ${result.errors.join("; ")}\n`);
+        for (const diagnostic of (result.diagnostics || []).slice(-5)) {
           process.stdout.write(`SERVER       ${diagnostic.level} ${diagnostic.target}: ${diagnostic.message}\n`);
         }
       }
     }
-    const passed = results.filter((result) => result.status === "passed").length;
-    const report = {
-      schema_version: 1,
-      generated_at: new Date().toISOString(),
-      suite,
-      browser: browserInfo,
-      server: {
-        base_url: server.baseUrl,
-        version: system.version,
-        build: system.build,
-        ffmpeg_version: system.ffmpeg_version,
-        encoder_selected: system.encoder_selected,
-        tone_map: system.tone_map,
-      },
-      corpus: corpus.metadata,
-      summary: { total: results.length, passed, failed: results.length - passed },
-      results,
-    };
-    const paths = await writeReport(report, options);
-    process.stdout.write(`\nRESULT  ${passed}/${results.length} passed\n`);
-    process.stdout.write(`JSON    ${paths.jsonPath}\n`);
-    process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
-    if (passed !== results.length) process.exitCode = 1;
+  } catch (error) {
+    // Keep the artifact. A run that dies mid-suite is exactly when the reader
+    // needs to know which layer died, and a missing file answers nothing.
+    fatal = error;
   } finally {
-    await driver.close().catch(() => {});
+    if (driver) await driver.close().catch(() => {});
+    if (shaper) await shaper.close().catch(() => {});
     await server.close(options.keep_runtime);
+  }
+  if (fatal) results.push(harnessFailureResult(fatal));
+  const passed = results.filter((result) => result.status === "passed").length;
+  const report = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    suite,
+    browser: browserInfo,
+    network_profile: profile,
+    shaping: shaper ? shaper.telemetry() : null,
+    server: {
+      base_url: server.baseUrl,
+      player_base_url: playerBaseUrl,
+      version: system?.version ?? null,
+      build: system?.build ?? null,
+      ffmpeg_version: system?.ffmpeg_version ?? null,
+      encoder_selected: system?.encoder_selected ?? null,
+      tone_map: system?.tone_map ?? null,
+    },
+    corpus: corpus.metadata,
+    outcome: fatal ? "harness" : results.find((result) => result.outcome && result.status !== "passed")?.outcome
+      || (passed === results.length ? "passed" : "browser_playback"),
+    fatal_error: fatal ? sanitizedError(fatal) : null,
+    summary: { total: results.length, passed, failed: results.length - passed },
+    results,
+  };
+  const paths = await writeReport(report, options);
+  process.stdout.write(`\nRESULT  ${passed}/${results.length} passed · outcome ${report.outcome}\n`);
+  process.stdout.write(`JSON    ${paths.jsonPath}\n`);
+  process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
+  if (fatal) {
+    fatal.reportWritten = true;
+    throw fatal;
+  }
+  return passed === results.length ? 0 : 1;
+}
+
+async function executeRun(manifest, options, dependencies = {}) {
+  try {
+    return { code: await runSuite(manifest, options, dependencies), error: null };
+  } catch (error) {
+    if (!error.reportWritten) await writeFatalRunReport(options, error);
+    return { code: 1, error };
+  }
+}
+
+/**
+ * Read a report back. Every rejection here is a real failure mode of an
+ * evidence artifact — absent, truncated, or something else entirely — and each
+ * one must be loud, because a silently-empty comparison would "pass".
+ */
+async function loadArtifact(file) {
+  if (!file || file === true) throw new Error("--json PATH is required");
+  const resolved = path.resolve(file);
+  let text;
+  try {
+    text = await fsp.readFile(resolved, "utf8");
+  } catch (error) {
+    throw new Error(`artifact ${resolved} could not be read: ${error.code || error.message}`);
+  }
+  let report;
+  try {
+    report = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`artifact ${resolved} is not valid JSON: ${error.message}`);
+  }
+  if (report === null || typeof report !== "object" || report.schema_version !== 1 || !Array.isArray(report.results)) {
+    throw new Error(`artifact ${resolved} is not a playback-lab report`);
+  }
+  return report;
+}
+
+async function normalizeCommand(options) {
+  const report = await loadArtifact(options.json);
+  const text = `${JSON.stringify(normalizeTrace(report), null, 2)}\n`;
+  if (options.out && options.out !== true) {
+    const target = path.resolve(options.out);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, text, "utf8");
+    process.stdout.write(`NORMAL  ${target}\n`);
+  } else {
+    process.stdout.write(text);
   }
 }
 
@@ -1258,15 +2707,48 @@ async function main() {
     usage();
     return;
   }
+  if (command === "normalize") return normalizeCommand(options);
+  if (command === "run") {
+    const outcome = await executeRun(loadManifest(), options);
+    if (outcome.error) throw outcome.error;
+    if (outcome.code !== 0) process.exitCode = outcome.code;
+    return;
+  }
   const manifest = loadManifest();
   if (command === "doctor") doctor(options);
   else if (command === "fixtures") await buildFixtures(manifest, options);
   else if (command === "plan") printPlan(manifest, options.suite || "smoke", options.case);
-  else if (command === "run") await runSuite(manifest, options);
   else throw new Error(`unknown command ${command}`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`playback-lab: ${error.stack || error.message}\n`);
-  process.exitCode = 1;
-});
+// Required as a module by tests/playback/network-shaping.test.js, which drives
+// the shaping, scoring, and normalization logic without a browser.
+module.exports = {
+  NETWORK_PROFILES,
+  SHAPER_SLICE_BYTES,
+  ShapingProxy,
+  TokenBucket,
+  diagnosticPath,
+  executeRun,
+  expandCases,
+  fixturesForBuild,
+  isMediaPath,
+  loadArtifact,
+  loadManifest,
+  normalizeTrace,
+  parseNetworkProfile,
+  peakUpgradeRate,
+  rungHistory,
+  scoreRecovery,
+  shaperBurstBoundKbps,
+  shaperClaimBoundBytes,
+  timeToSustained,
+  writeFatalRunReport,
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`playback-lab: ${sanitizedText(error.stack || error.message)}\n`);
+    process.exitCode = 1;
+  });
+}

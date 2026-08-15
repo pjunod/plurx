@@ -672,12 +672,19 @@ async fn serve(
     let (drain_started, drain_signal) = tokio::sync::oneshot::channel();
     // `WithGracefulShutdown` is IntoFuture rather than Future, and select!
     // needs the future itself to poll it more than once.
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            let _ = drain_started.send(());
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        // Connect info is load-bearing for the network-priors handlers in
+        // `http::network`, which extract the peer address; serving the bare
+        // router would make them reject at runtime with nothing to compile
+        // against.
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = drain_started.send(());
+    })
+    .into_future();
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => {
@@ -2066,6 +2073,75 @@ mod startup_tests {
                 .await
                 .is_err(),
             "the port must be released once serve returns"
+        );
+    }
+
+    /// A served request carries its socket peer, because the network-priors
+    /// handlers read one.
+    ///
+    /// This is the quietest way this file can break. `http::network`'s
+    /// `RemoteAddress` takes the peer from the request extensions as an
+    /// `Option` and its rejection is `Infallible`, so serving the bare router
+    /// instead of `into_make_service_with_connect_info` is not a compile error
+    /// and not a failed request — every prior simply reduces to `None` and gets
+    /// written under a key nothing reads. Nothing else in the crate would
+    /// notice, so this asserts the peer arrives at a handler served through
+    /// `serve` rather than trusting the call site to keep saying so.
+    #[tokio::test]
+    async fn a_served_request_arrives_with_its_socket_peer() {
+        // Deliberately not `http::router`: `network` is private to `http`, and
+        // this reads the extension exactly the way `RemoteAddress` does, so the
+        // assertion tracks the mechanism the real extractor depends on.
+        async fn peer(request: axum::extract::Request) -> String {
+            match request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            {
+                Some(axum::extract::ConnectInfo(address)) => address.to_string(),
+                None => String::new(),
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = booted_state(tmp.path());
+        let progress = Arc::clone(&state.progress);
+        let app = axum::Router::new().route("/peer", axum::routing::get(peer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve(listener, app, progress, None, async move {
+            let _ = stopped.await;
+        }));
+
+        let body = reqwest::Client::new()
+            .get(format!("http://{addr}/peer"))
+            .send()
+            .await
+            .expect("peer")
+            .text()
+            .await
+            .expect("body");
+
+        stop.send(()).expect("stop");
+        tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("serve must finish inside the drain window")
+            .expect("join")
+            .expect("an orderly shutdown is exit 0, not an error");
+
+        let seen: SocketAddr = body
+            .parse()
+            .unwrap_or_else(|_| panic!("a served request must carry a peer, got {body:?}"));
+        // The /24 reduction in `http::network` admits IPv4 only, so a peer that
+        // arrives as something other than the loopback the client actually came
+        // from would silently produce no identity at all.
+        assert_eq!(
+            seen.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "the peer must be the address the client connected from"
         );
     }
 

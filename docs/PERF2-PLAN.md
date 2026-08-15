@@ -342,7 +342,8 @@ backfill to `vbr`, and every resume uses that immutable value rather than the
 mutable global request. The replicated protocol remains v4 because no wire
 operation changes; schema v5 applies to fresh bootstrap/import, and an existing
 v4 cluster stays refused until the clustering upgrade protocol exists. N3's
-previously reserved SQLite v18 migration moves to v19.
+previously reserved SQLite v18 migration moves to v20: D9 assigns v19 to
+N4.2's node-local network priors.
 Production encoding still uses the deployed
 server's Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is
 behavior-probed and scores captured bytes on the controller only after the
@@ -836,6 +837,27 @@ since adds:
 
 ### 7.2 Network priors — the CS2P-lite memory
 
+**Implementation status (2026-08-14):** the server groundwork is implemented.
+`playback.network_priors` defaults off. When enabled, N0 client telemetry folds
+the conservative minimum of its client estimate and joined server delivery
+rate into a 25% EWMA. A supply/network stall records the lowest height known to
+starve, and when. Rows are node-local, retained for 30 days, and capped at 64
+networks per user/client class; a client routed to another cluster voter
+therefore starts cold, the tradeoff ratified in D9. The table stores only the
+client class and IPv4 `/24`, never a full address. The class is derived from
+the request's own `User-Agent` on every path — the class is part of the primary
+key, so the reporting path and the consulting path must not derive it
+differently.
+
+`/decision` and session-create responses now return the optional derived
+`prior_kbps`. Server-side Auto preserves its previous answer exactly without a
+matching prior; with one it applies both signals and takes the lower rung —
+below the lowest starved rung, and within the highest rung whose advertised
+peak fits the EWMA. The starvation verdict expires 7 days after the stall that
+recorded it so a transient dropout cannot cap a link permanently
+(`docs/ADAPTIVE-QUALITY.md` carries the recovery rule). The web controller does
+not consume the field yet; that remains in the N4 controller slice.
+
 The evidence for remembering networks is strong
 ([CS2P](https://users.ece.cmu.edu/~vsekar/assets/pdf/sigcomm16_cs2p.pdf):
 sessions sharing network features have similar throughput; 40–50%
@@ -914,9 +936,19 @@ week), `playback.network_priors` (default off first release),
 per-client reopen behavior rides client versions.
 
 **Acceptance:** playback-lab first grows the shaping layer it
-deliberately lacks today (PLAYBACK-TESTING.md's non-goals exclude
-WAN/Wi-Fi simulation — the harness slice precedes the feature, review
-R7). Shape: `scripts/playback-lab run --suite stall-recovery
+deliberately lacked (review R7 — the harness slice precedes the
+feature). Issue #143 implements the loopback shaper, the
+`stall-recovery` suite, the recovery criteria, and the normalization
+command described in
+[PLAYBACK-TESTING.md](PLAYBACK-TESTING.md#network-shaping--a-bandwidth-cliff-you-can-reproduce-and-timestamp).
+It creates the condition and records the answer; it decides no rungs,
+which is the rest of this milestone's work. Until the controller lands, a
+`stall-recovery` run is expected to fail with `outcome: recovery`, and
+that recorded failure is the baseline the controller must move. The
+base-versus-candidate normalized smoke equality and a green required gate are
+the acceptance evidence, recorded on #143 and PR #145; source and helper tests
+do not substitute for either run. Shape:
+`scripts/playback-lab run --suite stall-recovery
 --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json`,
 failing nonzero when recovery misses the criteria. On it: the 8 →
 1.5 Mb/s cliff reaches a sustainable rung with ≤ 1 automatic
@@ -1228,10 +1260,13 @@ All changes flow through the single `effective_recipe()` builder
   rows default/backfill to `vbr`). The replicated protocol remains v4.
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
+- N4.2: the node-local network-priors table is SQLite **v19**, matching N0's
+  node-local telemetry replication class. Replicated schema stays **v5** and
+  protocol stays **v4**; another voter deliberately starts cold.
 - N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
-  manifest on location rows (schema **v19**; N0's telemetry table is
-  **v17** and N1's offline rate-control snapshot is **v18** — unique versions
-  per slice, review R8); `prefix_secs` in
+  manifest on location rows (schema **v20**; N0's telemetry table is
+  **v17**, N1's offline rate-control snapshot is **v18**, and N4.2's priors
+  table is **v19** — unique versions per slice, review R8); `prefix_secs` in
   the recipe.
 - N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
   HEVC changes the `muxer`/`segment_policy` fields — its own
@@ -1367,7 +1402,12 @@ settings and may be amended without changing the contracts below.
    replicated schema v5 uses the same representation for fresh
    bootstrap/import and keeps protocol v4. Existing replicated v4 clusters
    remain refused pending the clustering upgrade protocol. N3's SQLite
-   migration moves to v19.
+   migration moved to v19 when D8 was ratified; D9 supersedes that N3 number.
+9. **D9 — N4.2 network-prior storage.** Ratified 2026-08-14: the node-local
+   priors table takes SQLite v19 and moves N3 to v20. Replicated schema stays
+   v5 and protocol stays v4. A client routed to another voter loses its prior
+   and starts cold; that is the accepted cost of keeping coarse network
+   observations off Raft.
 
 ---
 
