@@ -869,7 +869,10 @@ pub async fn decision(
         && matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"));
     set_selected_audio_default(&mut file.audio_streams, selected_audio);
     let mut decision = q.decide(&file, dv_strippable(&state));
-    if selection_requested {
+    // Only an explicit subtitle choice may change the delivery verdict. An
+    // audio-only request still echoes the effective policy subtitle below,
+    // but delivery does not burn that track unless the caller chose it.
+    if q.subtitle.is_some() {
         apply_selected_subtitle(
             &mut decision,
             &file,

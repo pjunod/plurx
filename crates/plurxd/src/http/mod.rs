@@ -4334,6 +4334,95 @@ mod tests {
         );
     }
 
+    /// Echoing an explicit audio choice must not make the policy-default
+    /// subtitle part of delivery. Subtitle burn-in is request-local too: the
+    /// client has to send `subtitle=` before it can change the verdict.
+    #[tokio::test]
+    async fn audio_only_selection_does_not_apply_the_policy_default_subtitle() {
+        use plurx_core::domain::{AudioStream, ProbeResult, SubtitleStream};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let dir = std::env::temp_dir().join(format!(
+            "plurx-audio-only-policy-subtitle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("media dir");
+        let path = dir.join("Foreign Audio With PGS.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("media file");
+        let file = state
+            .store
+            .upsert_file(
+                seeded.movie,
+                &path.to_string_lossy(),
+                24,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(60_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        language: Some("fre".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "hdmv_pgs_subtitle".into(),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        let caps = "vcodec=h264&acodec=aac&container=mp4&hdr=0";
+
+        let (status, default) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{default}");
+        assert_eq!(default["method"], "direct_play", "{default}");
+
+        let (status, audio_only) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/decision?{caps}&audio=0"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{audio_only}");
+        assert_eq!(audio_only["method"], default["method"], "{audio_only}");
+        assert_eq!(audio_only["delivery"], default["delivery"], "{audio_only}");
+        assert_eq!(audio_only["reasons"], default["reasons"], "{audio_only}");
+        assert_eq!(
+            audio_only["transcode_audio"], default["transcode_audio"],
+            "{audio_only}"
+        );
+        assert_eq!(audio_only["selection"]["audio_index"], 0, "{audio_only}");
+        assert_eq!(
+            audio_only["selection"]["subtitle_index"], 0,
+            "the effective policy subtitle remains visible without changing delivery: {audio_only}"
+        );
+        assert_eq!(
+            audio_only["selection"]["subtitle_requires_burn_in"], true,
+            "{audio_only}"
+        );
+    }
+
     /// `/decision` must say what to DO, not just what was decided. Clients
     /// that re-derived policy from `method` got it differently wrong on every
     /// platform — Android played transcode verdicts through the copy-only
@@ -5123,6 +5212,38 @@ mod tests {
             .await
             .expect("dual-audio file");
 
+        let untagged_path = dir.join("Untagged Tracks.mp4");
+        std::fs::write(&untagged_path, b"present").expect("untagged media");
+        state
+            .store
+            .upsert_file(
+                seeded.ep,
+                &untagged_path.to_string_lossy(),
+                10,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        language: None,
+                        default: true,
+                        ..Default::default()
+                    }],
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "subrip".into(),
+                        language: None,
+                        default: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("untagged file");
+
         use tracing_subscriber::prelude::*;
         let subscriber = tracing_subscriber::registry()
             .with(crate::logbuf::BufferLayer(Arc::clone(&state.logs)));
@@ -5186,6 +5307,16 @@ mod tests {
         assert_eq!(
             anime["playback_defaults"]["subtitle"]["preferred_language_status"], "selected",
             "{anime}"
+        );
+
+        let untagged = named("Untagged Tracks.mp4");
+        assert_eq!(
+            untagged["playback_defaults"]["audio"]["preferred_language_status"], "unknown",
+            "an absent language tag is not evidence that English audio is missing: {untagged}"
+        );
+        assert_eq!(
+            untagged["playback_defaults"]["subtitle"]["preferred_language_status"], "unknown",
+            "an absent language tag is not evidence that English subtitles are missing: {untagged}"
         );
         assert_eq!(
             state.transcode.active_sessions().await,
@@ -5264,6 +5395,7 @@ mod tests {
                 "/files/0/video_codec",
                 "/files/0/audio_streams",
                 "/files/0/subtitle_streams",
+                "/files/0/playback_defaults/audio/selected_index",
                 "/files/0/playback_defaults/audio/preferred_language",
                 "/files/0/playback_defaults/audio/preferred_language_status",
                 "/files/0/playback_defaults/subtitle/selected_index",

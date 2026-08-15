@@ -234,10 +234,12 @@ the physical Apple/Android device matrix remains a release acceptance step.
   response carries its complete audio/subtitle lists plus `playback_defaults`:
   the exact audio and subtitle indices the shared server policy would select,
   the configured preferred language for each, and whether that language was
-  selected · is available but not selected · is missing · or the file has no
-  tracks of that kind. Clients can therefore say "no English subtitles" without
-  reading admin settings, probing media, or opening a playback session. Detail
-  rendering in the first-party clients lands in the client-specific follow-ups.
+  selected · is available but not selected · is missing · is unknown because
+  a stream lacks a language tag · or the file has no tracks of that kind.
+  Clients can therefore say "no English subtitles" only when the stored facts
+  prove it, without reading admin settings, probing media, or opening a
+  playback session. Detail rendering in the first-party clients lands in the
+  client-specific follow-ups.
 - **Search** across the library (SQLite FTS5), debounced from the header on every
   page.
 - **Progress + watched indicators** on posters: a glowing progress bar for

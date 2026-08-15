@@ -303,14 +303,16 @@ pub struct FileDto {
 ///
 /// `available` is intentionally distinct from `selected`: the dual-audio anime
 /// rule can select Japanese original audio even when the configured audio
-/// language is also present. `missing` means tracks exist but none matches;
-/// `no_tracks` lets a detail screen say "no subtitles" instead.
+/// language is also present. `missing` means every track is tagged and none
+/// matches; `unknown` means an untagged track prevents that claim; `no_tracks`
+/// lets a detail screen say "no subtitles" instead.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredLanguageStatus {
     Selected,
     Available,
     Missing,
+    Unknown,
     NoTracks,
 }
 
@@ -331,6 +333,7 @@ fn preference_status(
     tracks_present: bool,
     preferred_present: bool,
     selected_matches_preference: bool,
+    unknown_language_present: bool,
 ) -> PreferredLanguageStatus {
     if !tracks_present {
         PreferredLanguageStatus::NoTracks
@@ -338,6 +341,8 @@ fn preference_status(
         PreferredLanguageStatus::Selected
     } else if preferred_present {
         PreferredLanguageStatus::Available
+    } else if unknown_language_present {
+        PreferredLanguageStatus::Unknown
     } else {
         PreferredLanguageStatus::Missing
     }
@@ -361,6 +366,13 @@ fn defaults_from_selection(
     let audio_preferred = audio
         .iter()
         .any(|track| lang_matches(&track.language, &prefs.audio_lang));
+    let audio_unknown = audio.iter().any(|track| {
+        track
+            .language
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    });
     let audio_selected_preferred = selected
         .audio_index
         .and_then(|index| audio.iter().find(|track| track.index == index))
@@ -368,6 +380,13 @@ fn defaults_from_selection(
     let subtitle_preferred = subtitles
         .iter()
         .any(|track| lang_matches(&track.language, &prefs.sub_lang));
+    let subtitle_unknown = subtitles.iter().any(|track| {
+        track
+            .language
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    });
     let subtitle_selected_preferred = selected
         .subtitle_index
         .and_then(|index| subtitles.iter().find(|track| track.index == index))
@@ -381,6 +400,7 @@ fn defaults_from_selection(
                 !audio.is_empty(),
                 audio_preferred,
                 audio_selected_preferred,
+                audio_unknown,
             ),
         },
         subtitle: PlaybackTrackDefaultDto {
@@ -390,6 +410,7 @@ fn defaults_from_selection(
                 !subtitles.is_empty(),
                 subtitle_preferred,
                 subtitle_selected_preferred,
+                subtitle_unknown,
             ),
         },
     }

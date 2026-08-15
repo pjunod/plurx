@@ -27,6 +27,7 @@ selected stream index, the preferred language code, and one status:
 | `selected` | The preferred language exists and this track is the server default. |
 | `available` | The preferred language exists, but policy selected another track or Off. |
 | `missing` | Tracks exist, but none matches the preferred language. |
+| `unknown` | At least one track has no language tag, so absence of the preferred language cannot be claimed. |
 | `no_tracks` | This file has no tracks of that kind; for subtitles, say so plainly. |
 
 Clients mark the selected indices and render the status; they do not fetch
@@ -35,11 +36,14 @@ the server can select Japanese original audio while reporting an available
 English dub, and every platform must tell the same story.
 
 A pre-play choice goes back to `/decision` as `audio=<index>` and
-`subtitle=<index>` (`-1` is Off). The client executes the returned delivery plan
-and reads `selection.subtitle_requires_burn_in` before presenting the cost. A
-true `selection.subtitle_burn_in_blocked_by_hdr` means the existing HDR guard
-kept the current delivery instead of replacing it with SDR. The choice belongs
-to one playback only; no client writes Playback defaults as a side effect. The
+`subtitle=<index>` (`-1` is Off). The client executes the returned delivery
+plan. For bitmap tracks it reads `selection.subtitle_requires_burn_in` before
+presenting the cost; text tracks still use the existing `native` flag because
+ASS/SSA and `mov_text` require a burn on native HLS even though the server can
+extract them as sidecars. A true
+`selection.subtitle_burn_in_blocked_by_hdr` means the existing HDR guard kept
+the current delivery instead of replacing it with SDR. The choice belongs to
+one playback only; no client writes Playback defaults as a side effect. The
 server contract is shipped. Web, Apple, and Android rendering land in their
 platform follow-ups rather than inventing placeholder policy in the meantime.
 

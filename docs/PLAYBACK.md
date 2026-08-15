@@ -184,7 +184,7 @@ Every file in `GET /api/v1/items/{id}` carries `playback_defaults.audio` and
 |---|---|
 | `selected_index` | The `a:{index}` or `s:{index}` chosen by `select_tracks`; `null` means no selected track. |
 | `preferred_language` | The configured language code, included so a client can say "no English subtitles" without reading admin settings. |
-| `preferred_language_status` | `selected` · `available` (present, but policy chose something else or Off) · `missing` (tracks exist, none match) · `no_tracks`. |
+| `preferred_language_status` | `selected` · `available` (present, but policy chose something else or Off) · `missing` (all tracks are tagged, none match) · `unknown` (an untagged track prevents an absence claim) · `no_tracks`. |
 
 The original-language anime rule runs inside that same `select_tracks` call. An
 English dub can therefore be `available` while Japanese audio is the selected
@@ -210,13 +210,18 @@ response then adds:
 
 The audio choice replaces the policy default before codec compatibility is
 evaluated, so `method`, `reasons`, `transcode_audio`, and `delivery` all describe
-the selected codec. On SDR, selecting a bitmap subtitle with no enabled PGS
-overlay similarly changes the plan to transcode and names the burn-in reason.
+the selected codec. An audio-only request may echo the policy-default subtitle
+in `selection`, but only an explicit `subtitle=` choice can let that subtitle
+change delivery. On SDR, selecting a bitmap subtitle with no enabled PGS
+overlay changes the plan to transcode and names the burn-in reason.
 The established HDR guard remains stricter: it reports both
 `subtitle_requires_burn_in: true` and
 `subtitle_burn_in_blocked_by_hdr: true`, but keeps the HDR delivery unchanged,
 because a caller choice is not permission to replace Dolby Vision/HDR with SDR.
-Text sidecars and an enabled `pgs-v1` overlay report both fields as false.
+Text sidecars and an enabled `pgs-v1` overlay report both fields as false. For
+native HLS, clients still consult each track's `native` flag: ASS/SSA and
+`mov_text` are extractable text but require a burn rather than a native
+rendition, so this bitmap-specific field does not classify them.
 
 Selections live only for that request. Omitting both parameters uses the same
 policy path as before and omits `selection`, preserving the previous response
