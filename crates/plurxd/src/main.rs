@@ -1272,9 +1272,8 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     // race showed up as a healthy daemon exiting with signal 15 in the
     // process-level restart contract.
     #[cfg(unix)]
-    let mut terminate =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing SIGTERM handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing SIGTERM handler");
 
     async move {
         let ctrl_c = async {
