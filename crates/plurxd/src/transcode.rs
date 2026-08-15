@@ -5216,6 +5216,34 @@ impl TranscodeManager {
         })
     }
 
+    /// Share a producer's terminal startup verdict with every playlist reader.
+    ///
+    /// `false` means the producer is still running, exited cleanly, or does
+    /// not exist because this is a cache hit. Only a known non-zero exit is a
+    /// failure, and callers invoke this only after finding no usable playlist.
+    async fn playlist_producer_failed(session: &Session, session_id: &str) -> bool {
+        let unsuccessful_exit = if session.cached {
+            None
+        } else {
+            let mut child = session.child.lock().await;
+            child.as_mut().and_then(|child| match child.try_wait() {
+                Ok(Some(status)) if !status.success() => Some(status),
+                _ => None,
+            })
+        };
+        let Some(status) = unsuccessful_exit else {
+            return false;
+        };
+        tracing::error!(
+            session = %session_id,
+            %status,
+            "HLS producer exited unsuccessfully before publishing a usable playlist; \
+             failing the session"
+        );
+        session.failed.store(true, Relaxed);
+        true
+    }
+
     /// Read the current media playlist for a session.
     pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
         let session = self.touch(session_id, "playlist").await?;
@@ -5248,6 +5276,9 @@ impl TranscodeManager {
                     // the publication store below stays on the old fast path.
                     if !session.playlist_published.load(Relaxed) {
                         if !transcode_first_playlist_ready(&bytes) {
+                            if Self::playlist_producer_failed(&session, session_id).await {
+                                return None;
+                            }
                             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
                             continue;
                         }
@@ -5296,6 +5327,13 @@ impl TranscodeManager {
                         session.typeless_sliding,
                     ));
                 }
+            }
+            // The stall watchdog deliberately grants a cold encoder its full
+            // startup grace, so it cannot surface a process that has already
+            // told us startup is impossible. This request polls much sooner
+            // and knows that no usable playlist was present above.
+            if Self::playlist_producer_failed(&session, session_id).await {
+                return None;
             }
             tokio::time::sleep(PLAYLIST_WAIT_POLL).await;
         }
@@ -7648,6 +7686,83 @@ mod tests {
         assert!(text.contains("seg00000.ts"));
         assert!(text.contains("seg00001.ts"));
         assert!(session.playlist_published.load(Relaxed));
+    }
+
+    /// A producer that has already reported an unsuccessful exit cannot make
+    /// startup output later. The first playlist request must surface that
+    /// verdict instead of consuming the full 30-second publication window.
+    #[tokio::test]
+    async fn playlist_fails_promptly_when_the_producer_exits_unsuccessfully() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        seeded_session_dir(dir.path(), 1, 2.0).await;
+        let mut child = tokio::process::Command::new("false")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn false");
+        let status = child.wait().await.expect("wait for false");
+        assert!(!status.success(), "the fixture must exit unsuccessfully");
+        let session = watchdog_session(dir.path(), Some(child), false);
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.sessions
+            .lock()
+            .await
+            .insert("early-exit".into(), Arc::clone(&session));
+
+        let playlist = tokio::time::timeout(Duration::from_millis(500), mgr.playlist("early-exit"))
+            .await
+            .expect("an unsuccessful producer exit must not consume the startup window");
+        assert!(playlist.is_none(), "failed startup has no playlist");
+        assert!(
+            session.failed.load(Relaxed),
+            "the terminal startup verdict must be shared with later requests"
+        );
+    }
+
+    /// A clean encoder exit is EOF, not evidence of a broken session. Its
+    /// final playlist may still be crossing the filesystem boundary, so the
+    /// ordinary startup window remains open and the failure flag stays clear.
+    #[tokio::test]
+    async fn playlist_does_not_report_a_clean_producer_exit_as_failure() {
+        use plurx_core::store::SqliteStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn true");
+        let status = child.wait().await.expect("wait for true");
+        assert!(status.success(), "the fixture must exit successfully");
+        let session = watchdog_session(dir.path(), Some(child), false);
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.sessions
+            .lock()
+            .await
+            .insert("clean-exit".into(), Arc::clone(&session));
+
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(250), mgr.playlist("clean-exit")).await;
+        assert!(
+            waiting.is_err(),
+            "clean EOF keeps the ordinary publication window open"
+        );
+        assert!(
+            !session.failed.load(Relaxed),
+            "clean EOF must not poison the session"
+        );
     }
 
     /// Re-evaluating an unchanged running session must be a no-op. Without the

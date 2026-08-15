@@ -543,6 +543,16 @@ requested start, and cached whole-title sessions report zero. New clients use
 this integer origin for timeline mapping and old clients continue to fall back
 to `start_seconds`.
 
+**Playlist startup distinguishes slow work from finished failure.** While the
+producer is alive, the first playlist request keeps the full 30-second window:
+the copy publish gate can legitimately take double-digit seconds on a NAS-bound
+4K remux. If that producer exits unsuccessfully before a usable playlist
+exists, the next 100 ms poll marks the session failed and ends the request, so
+the HTTP error names a server-side startup failure promptly instead of becoming
+a minute-long client `manifestLoadTimeOut`. A successful exit remains ordinary
+EOF because a short file may have completed cleanly, and a cached VOD has no
+producer to judge and is never marked failed.
+
 ## Persistent stalls — one bounded recovery, with an outcome
 
 The startup watchdog diagnoses a stream that never starts. Mid-playback was
