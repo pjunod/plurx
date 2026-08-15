@@ -297,3 +297,9 @@ commits = ["e3689787903cdb1ce94c9fb7906fe51f0cf463e7"]
 points = ["web.experience", "playback.pipeline"]
 checks = ["web-static"]
 reason = "The retained web policy unit pins cap-stranded emergency downgrades, ladder-floor fallback, and backing-pixel height measurement; restoring only the prior controller policy strands a 720p session above the sustainable rung under the recorded cliff conditions."
+
+[[coverage]]
+commits = ["5b36c5019b42b58a36021dcf7a2cee72b6359ba0"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy units pin the versioned media-load identity, deterministic bitrate buckets, legacy-key rejection, exact forget/retest routing, Original bypass, and learned HDR-to-SDR attribution; restoring only the prior browser policy makes one broad codec/height verdict steer materially different 4K HDR sources."
