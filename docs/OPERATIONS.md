@@ -162,6 +162,40 @@ target itself is missing, startup follows the lost-target refusal in
 [Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
 SQLite.
 
+### Reading watch-state replication status
+
+Open **Settings → System** and read **Watch state** in the Server card's
+**Right now** row. The same projection is in the admin-only
+`GET /api/v1/system` response under `replication`; it contains only backend and
+Raft progress facts, never users, titles, media paths, tokens, or library data.
+
+| Surface | What it means | What to do |
+|---|---|---|
+| `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
+| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
+| `Replicated in sync` | This node has applied its latest known entry. On the leader, every reporting peer has matched that point; on a follower, only this node's catch-up is confirmed and the explanation points you to the leader for peer status. | No action. Read the plain-language explanation before treating a follower's local catch-up as a cluster-wide all-clear. |
+| `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
+
+**How to read the numbers:** `applied term T, index I` is this node's latest
+applied durable entry. `N changes behind` is the largest gap in the current
+metrics, or a conservative worst-case upper bound when a peer stops reporting.
+That bound stays anchored to the last observed convergence index and grows as
+this node applies new writes. The missing peer may have received entries after
+the last observation, so the inferred number can overstate its lag; it is not
+proof of the peer's exact position.
+
+**Last observed in sync** is process-local observation time, not a fabricated
+Raft timestamp: a degraded sample preserves the last positive observation
+instead of replacing it with "now." It is absent after a restart until the
+endpoint observes an in-sync sample. The Settings page samples this when you
+open it; the timestamp does not claim that an unseen convergence happened
+between visits.
+
+This row is status, not membership control. It deliberately does not list,
+join, add, or remove voters; the M3 admin membership surface in
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md) §6.7 owns those actions and will
+consume this projection rather than create a second answer for lag.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.
