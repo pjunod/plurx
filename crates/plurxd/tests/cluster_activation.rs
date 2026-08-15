@@ -1,10 +1,11 @@
 //! Process-level proof that migration precedes every daemon side effect.
 
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use plurx_core::store::SqliteStore;
+use plurx_core::auth::hash_password;
+use plurx_core::store::{SqliteStore, UserStore};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -42,6 +43,19 @@ impl Daemon {
         #[cfg(unix)]
         assert!(status.success(), "daemon did not drain cleanly: {status}");
     }
+
+    #[cfg(unix)]
+    fn kill_ungracefully(&mut self) -> ExitStatus {
+        if self.0.try_wait().expect("daemon status").is_none() {
+            // SAFETY: the pid comes from the live child this guard owns.
+            assert_eq!(
+                unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGKILL) },
+                0,
+                "kill daemon without graceful shutdown"
+            );
+        }
+        self.0.wait().expect("wait for killed daemon")
+    }
 }
 
 impl Drop for Daemon {
@@ -65,6 +79,19 @@ fn wait_for_bind(daemon: &mut Daemon, port: u16) {
         assert!(Instant::now() < deadline, "daemon HTTP bind timed out");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+async fn login_status(port: u16, username: &str, password: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("login request")
+        .status()
 }
 
 #[test]
@@ -232,23 +259,24 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
     )
     .expect("daemon config");
 
-    let start = || {
-        Daemon(
-            Command::new(env!("CARGO_BIN_EXE_plurxd"))
-                .args([
-                    "--config",
-                    config_path.to_str().expect("config path"),
-                    "run",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start daemon"),
-        )
+    let start = |activation_failpoint: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_plurxd"));
+        command
+            .args([
+                "--config",
+                config_path.to_str().expect("config path"),
+                "run",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(value) = activation_failpoint {
+            command.env("PLURX_CLUSTER_ACTIVATION_FAILPOINT", value);
+        }
+        Daemon(command.spawn().expect("start daemon"))
     };
 
-    let mut first = start();
+    let mut first = start(None);
     wait_for_bind(&mut first, server_port);
     assert!(data.join("hiqlite/activation.json").is_file());
     let contender = Command::new(env!("CARGO_BIN_EXE_plurxd"))
@@ -264,7 +292,10 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
         .contains("another plurxd process already owns the data directory"));
     first.stop();
 
-    let mut second = start();
+    // The variable is meaningful only while activation is pending. A stale or
+    // misspelled value in a service definition must not take an already-active
+    // server offline when no injection boundary can be reached.
+    let mut second = start(Some("not-a-real-failpoint"));
     wait_for_bind(&mut second, server_port);
     assert!(data.join("hiqlite/activation.json").is_file());
     second.stop();
@@ -274,4 +305,115 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
         source_before,
         "subsequent replicated boots must not reopen or migrate retained SQLite"
     );
+}
+
+/// A one-voter node must recover current acknowledged state after SIGKILL.
+///
+/// Hiqlite treats a stale state-machine lock as proof that the SQLite state
+/// machine may be inconsistent with its Raft log. The `auto-heal` path removes
+/// and rebuilds that state machine from the retained local log/snapshot; merely
+/// unlinking the lock would skip the reconstruction. The password change is
+/// acknowledged after activation, so reading it after restart proves the
+/// rebuild preserved state newer than the retained pre-activation SQLite file.
+#[cfg(unix)]
+#[tokio::test]
+async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
+    let root = tempfile::tempdir().expect("SIGKILL recovery fixture");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("data directory");
+    let source = SqliteStore::open(&data.join("plurx.db")).expect("legacy SQLite source");
+    source
+        .create_user(
+            "recovery-owner",
+            &hash_password("password-before-kill").expect("initial password hash"),
+            true,
+        )
+        .await
+        .expect("seed recovery user");
+    drop(source);
+
+    let config_path = root.path().join("plurx.toml");
+    let server_port = free_port();
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\n\
+             bind = \"127.0.0.1:{server_port}\"\n\
+             [storage]\n\
+             data_dir = \"{}\"\n\
+             [cluster]\n\
+             raft_bind = \"127.0.0.1:{}\"\n\
+             api_bind = \"127.0.0.1:{}\"\n\
+             advertise_host = \"127.0.0.1\"\n",
+            toml_string(&data),
+            free_port(),
+            free_port(),
+        ),
+    )
+    .expect("SIGKILL recovery config");
+
+    let start = || {
+        Daemon(
+            Command::new(env!("CARGO_BIN_EXE_plurxd"))
+                .args([
+                    "--config",
+                    config_path.to_str().expect("config path"),
+                    "run",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start recovery daemon"),
+        )
+    };
+
+    let mut first = start();
+    wait_for_bind(&mut first, server_port);
+    assert_eq!(
+        login_status(server_port, "recovery-owner", "password-before-kill").await,
+        reqwest::StatusCode::OK
+    );
+
+    let update = Command::new(env!("CARGO_BIN_EXE_plurxd"))
+        .args([
+            "--config",
+            config_path.to_str().expect("config path"),
+            "reset-password",
+            "recovery-owner",
+            "--password",
+            "password-after-kill",
+        ])
+        .output()
+        .expect("acknowledged post-activation password update");
+    assert!(
+        update.status.success(),
+        "password update failed: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert_eq!(
+        login_status(server_port, "recovery-owner", "password-after-kill").await,
+        reqwest::StatusCode::OK
+    );
+
+    let status = first.kill_ungracefully();
+    assert!(!status.success(), "SIGKILL must be ungraceful: {status}");
+    assert!(
+        data.join("hiqlite/state_machine/lock").is_file(),
+        "the regression requires Hiqlite's stale-lock recovery path"
+    );
+
+    let mut recovered = start();
+    wait_for_bind(&mut recovered, server_port);
+    assert_eq!(
+        login_status(server_port, "recovery-owner", "password-after-kill").await,
+        reqwest::StatusCode::OK,
+        "the acknowledged post-activation update must survive log replay"
+    );
+    assert_eq!(
+        login_status(server_port, "recovery-owner", "password-before-kill").await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "recovery must not fall back to the retained pre-activation source"
+    );
+    recovered.stop();
 }

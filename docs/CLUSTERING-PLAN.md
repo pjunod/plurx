@@ -1,11 +1,11 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 through M1d and M2's source backup, table import,
-bounded parity verification, and post-coalescer compacted-growth gate are
-complete; import orchestration and daemon activation remain pending
+**Status:** executing — M0 through M2 are complete; one-voter Hiqlite activates
+after verified import, while M3 membership, health, and singleton fencing are
+next
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-14
+2026-08-15
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,

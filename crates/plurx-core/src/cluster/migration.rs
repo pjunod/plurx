@@ -207,7 +207,6 @@ impl ActivationFailpoint {
 #[cfg(feature = "hiqlite-store")]
 pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, StoreError> {
     install_default_crypto_provider();
-    let failpoint = ActivationFailpoint::configured()?;
     std::fs::create_dir_all(&config.storage.data_dir)
         .map_err(|error| migration_io("creating", &config.storage.data_dir, error))?;
     let daemon_lock = acquire_daemon_lock(&config.storage.data_dir)?;
@@ -249,6 +248,11 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
     ensure_sqlite_source(&config.storage.data_dir)?;
     // Future-schema refusal must precede cleanup or attempt-marker writes.
     inspect_sqlite_source(&config.storage.data_dir.join(SQLITE_FILENAME))?;
+    // The injection surface belongs only to a pending activation. Reading it
+    // before the active-target return let a stale or misspelled environment
+    // value take an already-activated server offline even though no failpoint
+    // could fire on that path.
+    let failpoint = ActivationFailpoint::configured()?;
 
     let incoming = config.storage.data_dir.join(HIQLITE_INCOMING_DIRNAME);
     let interrupted =
@@ -308,12 +312,7 @@ pub async fn connect_activated_store(config: &Config) -> Result<Arc<dyn Store>, 
         )));
     }
     let marker = read_activation_marker(&active)?;
-    let identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
-    if identity.cluster_id != marker.cluster_id {
-        return Err(StoreError::Identity(
-            "activation marker and local cluster identity disagree".to_owned(),
-        ));
-    }
+    super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     let secret_api = read_secret(&config.storage.data_dir.join(API_SECRET_FILENAME))?;
     let address = local_client_address(config.cluster.api_bind).to_string();
     let client = Client::remote(vec![address], true, true, secret_api, true, None)

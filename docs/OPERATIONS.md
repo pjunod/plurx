@@ -130,6 +130,38 @@ those rows in place, then take the backup again and re-run the import. Nobody
 has to reconnect the Trakt account. The refusal happens before any row is
 submitted, so a refused import leaves no partial replicated state to clean up.
 
+### M2 activation and crash recovery
+
+The first `plurxd run` against a legacy data directory imports into
+`hiqlite.incoming`, verifies every durable table, publishes the fsynced marker,
+and atomically renames that directory to `hiqlite`. Producers and the public
+HTTP listener do not exist until this sequence finishes.
+
+`PLURX_CLUSTER_ACTIVATION_FAILPOINT` is the process-exit test surface for those
+durability boundaries:
+
+| Value | Boundary after which the process exits |
+|---|---|
+| `after-quiescence` | No producer or listener has started |
+| `after-incoming` | The fresh incoming voter exists |
+| `after-marker` | The verified completion marker is fsynced |
+| `after-rename` | The completed target has been atomically renamed |
+
+Each injection exits with code `86`. Before rename, the next `plurxd run`
+removes incoming state and consumes one unchanged-SQLite recovery boot; the
+following restart retries activation. After rename, the completed target wins.
+The variable is evaluated only while activation is pending, so a stale value
+cannot take an already-activated node offline.
+
+After activation, an ungraceful death may leave Hiqlite's state-machine lock.
+The next boot automatically discards and rebuilds that derived state machine
+from the one voter's retained local Raft log and snapshot, including
+acknowledged state newer than the frozen SQLite source. Never delete the lock:
+unlinking it skips the reconstruction that makes recovery safe. If the active
+target itself is missing, startup follows the lost-target refusal in
+[Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
+SQLite.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.
@@ -137,7 +169,8 @@ Settings you edit at runtime (TMDB key, libraries, users) live in the database,
 not here — this surface is only what's needed before the database opens.
 
 The TOML file is looked for at `./plurx.toml` then `/etc/plurx/plurx.toml` (or the
-path in `PLURX_CONFIG`). Every key has an env override:
+path in `PLURX_CONFIG`). Environment-backed keys are named below; the two M2
+cluster listener ports are file-only until M3 owns their network surface:
 
 | Env var | TOML | Default | What it does |
 |---|---|---|---|
@@ -146,6 +179,8 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
+| — | `cluster.raft_bind` | `0.0.0.0:32401` | M2 uses the port but pins the listener host to loopback; M3 membership will make the host configurable |
+| — | `cluster.api_bind` | `0.0.0.0:32402` | M2 maintenance-client TLS port, pinned to loopback until M3 membership |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |
@@ -157,6 +192,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_MDNS_ADVERTISE` | — | `true` | Run Bonjour inside the server process; Compose sets this to `false` because its host-network companion advertises instead |
 | `PLURX_DISCOVERY_SERVER_URL` | — | `http://127.0.0.1:32400` | Server URL read by `plurxd advertise`; normally only the Compose companion uses it |
 | `PLURX_LOG` | — | `info` | Log filter (`tracing` EnvFilter syntax, e.g. `plurxd=debug`) |
+| `PLURX_CLUSTER_ACTIVATION_FAILPOINT` | — | — | Test-only activation exit: `after-quiescence` · `after-incoming` · `after-marker` · `after-rename`; each exits `86` |
 | `PLURX_HLS_CLOSED_CAPTIONS_NONE` | — | off | **Experiment.** Adds `CLOSED-CAPTIONS=NONE` to the HLS variant. Set `1` to enable |
 | `PLURX_HLS_FORCED_AUTOSELECT` | — | off | **Experiment.** Puts `AUTOSELECT=YES` on forced subtitle renditions. Set `1` to enable |
 | `PLURX_PGS_OVERLAY` | — | off | **Staged feature.** Advertises and serves the authenticated `pgs-v1` overlay producer. Keep off until native-client and physical HDR/DV acceptance is complete |
@@ -195,6 +231,8 @@ untested, and turn it back off if the device does not visibly improve.
 | Port | Proto | Purpose |
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
+| 32401 | TCP, loopback | One-voter Raft listener; M2 ignores the configured host until M3 membership |
+| 32402 | TCP, loopback + TLS | One-voter maintenance client API; M2 ignores the configured host until M3 membership |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
 | 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native clients |
 
