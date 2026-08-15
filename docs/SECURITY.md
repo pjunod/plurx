@@ -264,13 +264,18 @@ silently did nothing. `JSON.stringify` had escaped for the JS layer but not the
 HTML layer, and `esc()` did not yet cover `'`. The lesson is baked into the
 rule above: a string in an inline handler needs both layers, always.
 
-## Transport — plain HTTP, TLS is the proxy's job
+## Transport — public HTTP, loopback cluster TLS
 
-plurx listens on **plain HTTP**. It bundles no TLS (the one `rustls` dependency
-is for *outbound* calls to TMDB/Trakt, not the listener), because on a home LAN
-the certificate story is pure friction and the design target is "works on
-`http://192.168.x.x:32400` out of the box." The Android client even sets
-`usesCleartextTraffic` for the same reason.
+plurx's public HTTP/API listener remains **plain HTTP**. It does not terminate
+public HTTPS, because on a home LAN the certificate story is pure friction and
+the design target is "works on `http://192.168.x.x:32400` out of the box." The
+Android client even sets `usesCleartextTraffic` for the same reason.
+
+M2 also runs Hiqlite's internal cluster API with automatic rustls TLS. That
+listener is pinned to loopback while the cluster has one voter; its only client
+is a maintenance command on the same machine. This internal listener does not
+make the public API HTTPS and is not the M3 peer-trust or certificate-management
+design.
 
 The consequence is explicit: **anything past a network you fully trust belongs
 behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik). Over plain
@@ -284,9 +289,10 @@ HTTPS and request rate limiting. Deploy recipes: [deploy/README.md](../deploy/RE
 Listing these is the point, not an apology — an honest boundary is what makes
 the protections above believable. plurx does **not**:
 
-- **Terminate TLS.** No HTTPS in the binary; front it with a reverse proxy for
-  any exposure beyond a trusted LAN (see above). This is a deployment choice,
-  not a missing feature.
+- **Terminate public TLS.** No HTTPS on the public HTTP/API listener; front it
+  with a reverse proxy for any exposure beyond a trusted LAN (see above). The
+  loopback-only Hiqlite API uses internal automatic TLS, not operator-facing
+  HTTPS.
 - **Rate-limit login.** There is no per-IP throttle or lockout on
   `/auth/login`; brute-force resistance rests on Argon2id's cost and 256-bit
   tokens. If the login is reachable from an untrusted network, put rate
