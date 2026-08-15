@@ -295,10 +295,10 @@ id = "persistence.upgrades"
 title = "Persistent database compatibility"
 contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; clustering publishes a durable content-addressed SQLite backup, imports v14 through current durable rows into a fresh one-voter Hiqlite target, rebuilds derived FTS, and returns only after exact per-table parity. A fsynced completion marker and atomic rename make the verified target active; a failed or interrupted pre-rename attempt is cleaned before one unchanged-SQLite recovery boot, while post-rename recovery selects only the completed target. Synchronous source reads stay on one blocking worker, while target parity uses bounded primary-key pages and an incremental digest."
 paths = [
-    "crates/plurx-core/src/cluster/migration.rs",
-    "crates/plurx-core/src/store/hiqlite_import.rs",
-    "crates/plurx-core/src/store/sqlite/mod.rs",
-    "crates/plurxd/tests/cluster_activation.rs",
+  "crates/plurx-core/src/cluster/migration.rs",
+  "crates/plurx-core/src/store/hiqlite_import.rs",
+  "crates/plurx-core/src/store/sqlite/mod.rs",
+  "crates/plurxd/tests/cluster_activation.rs",
 ]
 checks = ["rust-gate", "database-upgrades", "cluster-auth"]
 depends_on = ["core.media"]
