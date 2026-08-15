@@ -12,7 +12,9 @@ use plurx_core::domain::{
     NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage,
 };
 use plurx_core::store::keys;
-use plurx_core::tracks::{is_native_text_subtitle, select_tracks, LangPrefs, SubMode};
+use plurx_core::tracks::{
+    is_native_text_subtitle, prefers_original_audio, select_tracks, LangPrefs, SubMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -172,15 +174,10 @@ pub async fn options(
         sub_lang: query.subtitle_lang.unwrap_or_else(|| "eng".to_owned()),
         sub_mode: SubMode::parse(query.subtitle_mode.as_deref().unwrap_or("auto")),
     };
-    let prefer_original = file.audio_streams.len() > 1
-        && file
-            .audio_streams
-            .iter()
-            .any(|stream| matches!(stream.language.as_deref(), Some("jpn" | "ja" | "jp")));
     let selected = select_tracks(
         &file.audio_streams,
         &file.subtitle_streams,
-        prefer_original,
+        prefers_original_audio(&file.audio_streams),
         &prefs,
     );
     let recommended_subtitle_index = selected.subtitle_index.filter(|index| {

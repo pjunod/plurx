@@ -73,6 +73,18 @@
             "forced": false
           }
         ],
+        "playback_defaults": {
+          "audio": {
+            "selected_index": 1,
+            "preferred_language": "eng",
+            "preferred_language_status": "selected"
+          },
+          "subtitle": {
+            "selected_index": 2,
+            "preferred_language": "eng",
+            "preferred_language_status": "selected"
+          }
+        },
         "available": true,
         "probed": true
       }

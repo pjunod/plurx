@@ -9,7 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::{ItemKind, MediaFile};
 use plurx_core::playback::{self, Decision};
-use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle};
+use plurx_core::tracks::{
+    is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle, prefers_original_audio,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -185,6 +187,12 @@ pub struct Caps {
     pub dvhls: Option<u8>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
+    /// Request-local audio choice (`a:{index}`). Absent keeps the shared
+    /// playback-default policy; it never writes the server setting.
+    pub audio: Option<i64>,
+    /// Request-local subtitle choice (`s:{index}`), or `-1` for Off. Absent
+    /// keeps the shared playback-default policy.
+    pub subtitle: Option<i64>,
 }
 
 fn csv(s: &Option<String>) -> Vec<String> {
@@ -367,9 +375,10 @@ pub struct Marker {
 /// client executes the plan instead of re-deriving policy from the verdict —
 /// which is how Android came to play transcode verdicts through a copy path
 /// and Apple came to re-encode remux verdicts at a hardcoded 1080p. Every
-/// URL and flag a client needs is here; the only things a client adds to a
-/// session create are its own identity (`playback_id`, `request_id`) and its
-/// position (`start`, `audio`).
+/// URL and flag a client needs is here — including the caller's audio
+/// selection, so a track choice is executed rather than re-derived; the only
+/// things a client adds to a session create are its own identity
+/// (`playback_id`, `request_id`) and its position (`start`).
 #[derive(Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum DeliveryPlan {
@@ -389,19 +398,44 @@ pub enum DeliveryPlan {
         /// Keep Dolby Vision signaling and dynamic metadata through the copy
         /// remux. False means expose the compatible HDR base for this client.
         preserve_dolby_vision: bool,
+        /// The audio stream index this plan carries, when the caller selected
+        /// one. Already applied to `url`; repeated here because the HLS
+        /// transport takes it in the session-create body instead of a query.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio: Option<i64>,
     },
     /// Re-encode. POST `sessions_url`, omitting `height`: Auto is the
     /// server's choice because the rung depends on which encoder wins, and
     /// only the create response knows that (`TranscodeManager::auto_height`).
-    Transcode { sessions_url: String },
+    Transcode {
+        sessions_url: String,
+        /// The audio stream index to put in the session-create body, when the
+        /// caller selected one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio: Option<i64>,
+    },
 }
 
 /// Turn the pure playback verdict into the API execution plan every client
 /// consumes. Kept pure so adding a fourth verdict cannot silently leave one
 /// client inventing its own URL or session flags.
-fn delivery_plan(file_id: i64, decision: &Decision) -> (String, DeliveryPlan) {
+///
+/// `selected_audio` is the caller's request-local track choice, and `None`
+/// when no `audio=` was sent — which keeps the plan of an unselected request
+/// byte-for-byte what it was. A selection has to reach the *delivery*, not
+/// only the verdict: a bare `stream.mp4` re-derives the policy default
+/// (`remux_audio_index`), so a plan that omitted it answered a French request
+/// with the English track it had just decided against.
+fn delivery_plan(
+    file_id: i64,
+    decision: &Decision,
+    selected_audio: Option<i64>,
+) -> (String, DeliveryPlan) {
     let direct_url = format!("/api/v1/files/{file_id}/direct");
-    let remux_url = format!("/api/v1/files/{file_id}/stream.mp4");
+    let remux_url = match selected_audio {
+        Some(index) => format!("/api/v1/files/{file_id}/stream.mp4?audio={index}"),
+        None => format!("/api/v1/files/{file_id}/stream.mp4"),
+    };
     let sessions_url = format!("/api/v1/files/{file_id}/hls/sessions");
     match decision.method {
         playback::PlaybackMethod::DirectPlay => {
@@ -414,15 +448,35 @@ fn delivery_plan(file_id: i64, decision: &Decision) -> (String, DeliveryPlan) {
                 sessions_url,
                 aac: decision.transcode_audio,
                 preserve_dolby_vision: decision.preserve_dolby_vision,
+                audio: selected_audio,
             },
         ),
         playback::PlaybackMethod::Transcode => (
             // Legacy clients still receive the only progressive URL in
             // `play_url`; current clients execute `delivery` and POST HLS.
             remux_url,
-            DeliveryPlan::Transcode { sessions_url },
+            DeliveryPlan::Transcode {
+                sessions_url,
+                audio: selected_audio,
+            },
         ),
     }
+}
+
+/// Effective request-local choices returned only when the caller supplied an
+/// audio or subtitle selection. Omitting both query parameters preserves the
+/// existing `/decision` JSON shape for older clients.
+#[derive(Serialize)]
+pub struct DecisionSelection {
+    pub audio_index: Option<i64>,
+    pub subtitle_index: Option<i64>,
+    /// True when the selected subtitle is bitmap data with no enabled
+    /// application-overlay route, so showing it requires drawing into a video
+    /// transcode. Text sidecars and an advertised PGS overlay remain false.
+    pub subtitle_requires_burn_in: bool,
+    /// The existing HDR guard refuses that burn instead of silently replacing
+    /// HDR/Dolby Vision with SDR. False when no burn is needed.
+    pub subtitle_burn_in_blocked_by_hdr: bool,
 }
 
 #[derive(Serialize)]
@@ -444,6 +498,9 @@ pub struct DecisionResponse {
     pub audio: Vec<AudioTrackDto>,
     /// Selectable text subtitle tracks (served as WebVTT sidecars).
     pub subtitles: Vec<SubTrackDto>,
+    /// Effective audio/subtitle choices for a selection-aware request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<DecisionSelection>,
     /// Skippable intro/credits regions (chapter-derived where possible).
     pub markers: Vec<Marker>,
     /// Initial manual A/V correction. Always zero: corrections belong to one
@@ -535,6 +592,151 @@ fn sub_tracks(file: &MediaFile, overlay_enabled: bool) -> Vec<SubTrackDto> {
                 .then_some(crate::pgs_overlay::PROTOCOL),
         })
         .collect()
+}
+
+fn effective_audio_selection(
+    file: &MediaFile,
+    requested: Option<i64>,
+    policy_default: Option<i64>,
+) -> Result<Option<i64>, ApiError> {
+    match requested {
+        Some(index)
+            if index >= 0 && file.audio_streams.iter().any(|track| track.index == index) =>
+        {
+            Ok(Some(index))
+        }
+        Some(_) => Err(ApiError::BadRequest("unknown audio track".into())),
+        None => Ok(policy_default),
+    }
+}
+
+fn effective_subtitle_selection(
+    file: &MediaFile,
+    requested: Option<i64>,
+    policy_default: Option<i64>,
+) -> Result<Option<i64>, ApiError> {
+    match requested {
+        Some(-1) => Ok(None),
+        Some(index)
+            if index >= 0
+                && file
+                    .subtitle_streams
+                    .iter()
+                    .any(|track| track.index == index) =>
+        {
+            Ok(Some(index))
+        }
+        Some(_) => Err(ApiError::BadRequest("unknown subtitle track".into())),
+        None => Ok(policy_default),
+    }
+}
+
+fn subtitle_requires_burn_in(
+    file: &MediaFile,
+    selected: Option<i64>,
+    overlay_enabled: bool,
+) -> bool {
+    selected
+        .and_then(|index| {
+            file.subtitle_streams
+                .iter()
+                .find(|track| track.index == index)
+        })
+        .is_some_and(|track| {
+            is_bitmap_subtitle(&track.codec) && !(overlay_enabled && is_pgs_subtitle(&track.codec))
+        })
+}
+
+/// The audio track a raw direct play actually delivers: the container's own
+/// default, else its first stream — the same "default, else first" rule
+/// `playback::evaluate` judges the audio codec on.
+///
+/// Read this *before* [`set_selected_audio_default`] rewrites the flags for
+/// the compatibility evaluation, because afterwards every track's `default`
+/// describes the selection rather than the container.
+fn container_default_audio_index(audio: &[plurx_core::domain::AudioStream]) -> Option<i64> {
+    audio
+        .iter()
+        .find(|track| track.default)
+        .or_else(|| audio.first())
+        .map(|track| track.index)
+}
+
+/// Direct play hands over the original file untouched, so the viewer gets
+/// whatever track the container flags — a `<video src>` exposes no audio
+/// selector to override it with. An explicit choice of any other track can
+/// therefore only be honored by ffmpeg, and a copy remux is the cheapest
+/// delivery that maps it: the same "only ffmpeg can apply this, so remux at
+/// minimum" rule [`playback::decide`] already applies to an A/V sync
+/// correction.
+///
+/// Without this the plan claims direct play for a selection it cannot carry,
+/// and the viewer who asked for the Japanese track silently gets the English
+/// one. Only an explicit `audio=` reaches here, so an unselected request keeps
+/// its previous verdict.
+fn apply_unselectable_direct_audio(
+    decision: &mut Decision,
+    file: &MediaFile,
+    selected: Option<i64>,
+    container_default: Option<i64>,
+) {
+    if decision.method != playback::PlaybackMethod::DirectPlay {
+        return;
+    }
+    let Some(selected) = selected else { return };
+    if container_default == Some(selected) {
+        return;
+    }
+    let language = file
+        .audio_streams
+        .iter()
+        .find(|track| track.index == selected)
+        .and_then(|track| track.language.as_deref())
+        .unwrap_or("untagged");
+    // Only the transport changes: the video is still copied and the selected
+    // codec already passed the profile check (or the verdict would not have
+    // been direct play), so `transcode_audio`, `preserve_dolby_vision` and the
+    // delivered dynamic range all read the same for a remux as they did here.
+    decision.method = playback::PlaybackMethod::Remux;
+    decision.reasons.push(format!(
+        "selected audio track {selected} ({language}) is not the container default; \
+         direct play cannot map it"
+    ));
+}
+
+fn apply_selected_subtitle(
+    decision: &mut Decision,
+    file: &MediaFile,
+    selected: Option<i64>,
+    requires_burn_in: bool,
+) {
+    if !requires_burn_in {
+        return;
+    }
+    let codec = selected
+        .and_then(|index| {
+            file.subtitle_streams
+                .iter()
+                .find(|track| track.index == index)
+        })
+        .map(|track| track.codec.as_str())
+        .unwrap_or("unknown");
+
+    // The established HDR guard refuses an SDR burn rather than silently
+    // replacing HDR/Dolby Vision video. Selection-aware preflight discloses
+    // that separately in `DecisionSelection`; do not add a reason for a failure
+    // that did not change the returned playback method.
+    if matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg")) {
+        return;
+    }
+
+    decision.method = playback::PlaybackMethod::Transcode;
+    decision.transcode_audio = true;
+    decision.preserve_dolby_vision = false;
+    decision.delivered_dynamic_range = "sdr";
+    decision
+        .reasons
+        .push(format!("selected subtitle codec {codec} requires burn-in"));
 }
 
 /// Classify a chapter title as an intro or end-credits marker. Case-insensitive
@@ -702,8 +904,9 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
 }
 
 /// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
-/// container=…&hdr=…&force=…` (runtime browser capabilities + quality override);
-/// native clients still pass `?profile=`.
+/// container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime browser
+/// capabilities + request-local track/quality choices); native clients still
+/// pass `?profile=`. `subtitle=-1` explicitly selects Off.
 pub async fn decision(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -736,20 +939,47 @@ pub async fn decision(
     // Select tracks before evaluating compatibility. The container's default
     // audio is only a fallback; the execution plan must describe the codec
     // selected by the same language policy exposed to the clients below.
-    let prefer_original = file
-        .audio_streams
-        .iter()
-        .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-        && file.audio_streams.len() > 1;
     let prefs = state.transcode.lang_prefs().await;
-    let selection = plurx_core::tracks::select_tracks(
+    let policy_selection = plurx_core::tracks::select_tracks(
         &file.audio_streams,
         &file.subtitle_streams,
-        prefer_original,
+        prefers_original_audio(&file.audio_streams),
         &prefs,
     );
-    set_selected_audio_default(&mut file.audio_streams, selection.audio_index);
-    let decision = q.decide(&file, dv_strippable(&state));
+    let selected_audio = effective_audio_selection(&file, q.audio, policy_selection.audio_index)?;
+    let selected_subtitle =
+        effective_subtitle_selection(&file, q.subtitle, policy_selection.subtitle_index)?;
+    let selection_requested = q.audio.is_some() || q.subtitle.is_some();
+    let selected_subtitle_requires_burn =
+        subtitle_requires_burn_in(&file, selected_subtitle, state.pgs_overlay_enabled);
+    let subtitle_burn_in_blocked_by_hdr = selected_subtitle_requires_burn
+        && matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"));
+    let container_default_audio = container_default_audio_index(&file.audio_streams);
+    set_selected_audio_default(&mut file.audio_streams, selected_audio);
+    let mut decision = q.decide(&file, dv_strippable(&state));
+    // Only an explicit subtitle choice may change the delivery verdict. An
+    // audio-only request still echoes the effective policy subtitle below,
+    // but delivery does not burn that track unless the caller chose it.
+    if q.subtitle.is_some() {
+        apply_selected_subtitle(
+            &mut decision,
+            &file,
+            selected_subtitle,
+            selected_subtitle_requires_burn,
+        );
+    }
+    // Likewise, only an explicit `audio=` may change the transport: criterion 4
+    // pins the unselected response byte-for-byte, so a *policy* default that
+    // differs from the container default still reports direct play here. That
+    // remaining gap is recorded on #265 rather than closed silently under a
+    // criterion that forbids it.
+    let requested_audio = q.audio.and(selected_audio);
+    apply_unselectable_direct_audio(
+        &mut decision,
+        &file,
+        requested_audio,
+        container_default_audio,
+    );
 
     tracing::info!(
         user_id = user.id,
@@ -765,6 +995,10 @@ pub async fn decision(
         dvprofile = q.dvprofile.as_deref().unwrap_or(""),
         dvhls = q.dvhls.unwrap_or_default(),
         force = q.force.as_deref().unwrap_or("auto"),
+        audio = selected_audio,
+        subtitle = selected_subtitle,
+        subtitle_requires_burn_in = selected_subtitle_requires_burn,
+        subtitle_burn_in_blocked_by_hdr,
         source_hdr = file.hdr.as_deref().unwrap_or("sdr"),
         source_hdr_format = file.hdr_format.as_deref().unwrap_or(""),
         method = ?decision.method,
@@ -774,7 +1008,7 @@ pub async fn decision(
         "playback capability decision"
     );
 
-    let (play_url, delivery) = delivery_plan(id, &decision);
+    let (play_url, delivery) = delivery_plan(id, &decision, requested_audio);
     // Only a remux has a transport choice to make. Direct play is already a
     // range-served file, which is the case Chrome buffers *well* — it was the
     // control in §4.3bis, at 10.8 s against the progressive path's 2.2 — and a
@@ -790,7 +1024,7 @@ pub async fn decision(
     let audio = audio_tracks(&file);
     let mut subtitles = sub_tracks(&file, state.pgs_overlay_enabled);
     for s in &mut subtitles {
-        s.default = selection.subtitle_index == Some(s.index);
+        s.default = selected_subtitle == Some(s.index);
     }
 
     // No "watching now" from here. Deciding how a file would be delivered is
@@ -806,6 +1040,12 @@ pub async fn decision(
         delivery,
         audio,
         subtitles,
+        selection: selection_requested.then_some(DecisionSelection {
+            audio_index: selected_audio,
+            subtitle_index: selected_subtitle,
+            subtitle_requires_burn_in: selected_subtitle_requires_burn,
+            subtitle_burn_in_blocked_by_hdr,
+        }),
         markers,
         audio_offset_ms: 0,
         declared_offset_ms: declared_av_offset(&state, id).await,
@@ -1037,11 +1277,7 @@ fn remux_audio_index(
     if let Some(index) = audio_override.filter(|index| *index >= 0) {
         return index;
     }
-    let prefer_original = audio
-        .iter()
-        .any(|track| matches!(track.language.as_deref(), Some("jpn" | "ja" | "jp")))
-        && audio.len() > 1;
-    plurx_core::tracks::select_tracks(audio, &[], prefer_original, prefs)
+    plurx_core::tracks::select_tracks(audio, &[], prefers_original_audio(audio), prefs)
         .audio_index
         .unwrap_or(0)
         .max(0)
@@ -1082,6 +1318,8 @@ impl StreamQuery {
             dvprofile: self.dvprofile.clone(),
             dvhls: self.dvhls,
             force: self.force.clone(),
+            audio: None,
+            subtitle: None,
         }
     }
 }
@@ -1592,14 +1830,15 @@ mod tests {
 
     #[test]
     fn every_verdict_has_one_server_owned_execution_plan() {
-        let (legacy, direct) = delivery_plan(42, &planned(playback::PlaybackMethod::DirectPlay));
+        let (legacy, direct) =
+            delivery_plan(42, &planned(playback::PlaybackMethod::DirectPlay), None);
         assert_eq!(legacy, "/api/v1/files/42/direct");
         assert!(matches!(
             direct,
             DeliveryPlan::Direct { url } if url == "/api/v1/files/42/direct"
         ));
 
-        let (legacy, remux) = delivery_plan(42, &planned(playback::PlaybackMethod::Remux));
+        let (legacy, remux) = delivery_plan(42, &planned(playback::PlaybackMethod::Remux), None);
         assert_eq!(legacy, "/api/v1/files/42/stream.mp4");
         assert!(matches!(
             remux,
@@ -1608,17 +1847,75 @@ mod tests {
                 sessions_url,
                 aac: true,
                 preserve_dolby_vision: true,
+                audio: None,
             } if url == "/api/v1/files/42/stream.mp4"
                 && sessions_url == "/api/v1/files/42/hls/sessions"
         ));
 
-        let (legacy, transcode) = delivery_plan(42, &planned(playback::PlaybackMethod::Transcode));
+        let (legacy, transcode) =
+            delivery_plan(42, &planned(playback::PlaybackMethod::Transcode), None);
         assert_eq!(legacy, "/api/v1/files/42/stream.mp4");
         assert!(matches!(
             transcode,
-            DeliveryPlan::Transcode { sessions_url }
+            DeliveryPlan::Transcode { sessions_url, audio: None }
                 if sessions_url == "/api/v1/files/42/hls/sessions"
         ));
+    }
+
+    /// The loop review finding 1 named: a plan is only executable if following
+    /// it delivers the track the caller selected. Feed the plan's own URL back
+    /// through the remux endpoint's extractor and track rule, and the answer
+    /// must be the selection — not the language policy the bare URL re-derives.
+    #[test]
+    fn a_selection_aware_plan_url_delivers_the_selected_track() {
+        use plurx_core::domain::AudioStream;
+
+        let tracks = vec![
+            AudioStream {
+                index: 0,
+                codec: "aac".into(),
+                language: Some("eng".into()),
+                default: true,
+                ..Default::default()
+            },
+            AudioStream {
+                index: 1,
+                codec: "aac".into(),
+                language: Some("fre".into()),
+                default: false,
+                ..Default::default()
+            },
+        ];
+        let prefs = plurx_core::tracks::LangPrefs {
+            audio_lang: "eng".into(),
+            ..Default::default()
+        };
+        // The policy default is track 0, so a bare plan URL would deliver it.
+        assert_eq!(remux_audio_index(&tracks, None, &prefs), 0);
+
+        let (play_url, remux) =
+            delivery_plan(42, &planned(playback::PlaybackMethod::Remux), Some(1));
+        assert_eq!(play_url, "/api/v1/files/42/stream.mp4?audio=1");
+        let DeliveryPlan::Remux { url, audio, .. } = remux else {
+            panic!("a remux verdict must plan a remux");
+        };
+        assert_eq!(audio, Some(1));
+
+        let uri: axum::http::Uri = url.parse().expect("the plan URL is a valid URI");
+        let Query(followed) = Query::<StreamQuery>::try_from_uri(&uri)
+            .expect("the remux endpoint's own extractor accepts the plan URL it was handed");
+        assert_eq!(
+            remux_audio_index(&tracks, followed.audio, &prefs),
+            1,
+            "following the plan must deliver the selected French track, not the policy default"
+        );
+
+        let (_, transcode) =
+            delivery_plan(42, &planned(playback::PlaybackMethod::Transcode), Some(1));
+        assert!(
+            matches!(transcode, DeliveryPlan::Transcode { audio: Some(1), .. }),
+            "an HLS session create takes the selection in its body, so the plan carries it"
+        );
     }
 
     #[test]
@@ -2003,9 +2300,9 @@ mod tests {
 
     #[test]
     fn native_is_not_the_same_question_as_text() {
-        fn sub(codec: &str) -> plurx_core::domain::SubtitleStream {
+        fn sub(index: i64, codec: &str) -> plurx_core::domain::SubtitleStream {
             plurx_core::domain::SubtitleStream {
-                index: 0,
+                index,
                 codec: codec.into(),
                 ..Default::default()
             }
@@ -2028,11 +2325,11 @@ mod tests {
             bitrate: Some(1_000),
             audio_streams: vec![],
             subtitle_streams: vec![
-                sub("subrip"),
-                sub("ass"),
-                sub("ssa"),
-                sub("hdmv_pgs_subtitle"),
-                sub("webvtt"),
+                sub(0, "subrip"),
+                sub(1, "ass"),
+                sub(2, "ssa"),
+                sub(3, "hdmv_pgs_subtitle"),
+                sub(4, "webvtt"),
             ],
             scanned_at: 0,
             audio_offset_ms: 0,
@@ -2055,6 +2352,8 @@ mod tests {
 
         // Bitmap is neither, and always was.
         assert!(!tracks[3].text && !tracks[3].native);
+        assert!(subtitle_requires_burn_in(&file, Some(3), false));
+        assert!(!subtitle_requires_burn_in(&file, Some(0), false));
 
         // Default-off and old servers remain wire-compatible: the additive
         // field is absent rather than null.
@@ -2067,6 +2366,10 @@ mod tests {
 
         let enabled = sub_tracks(&file, true);
         assert_eq!(enabled[3].overlay, Some("pgs-v1"));
+        assert!(
+            !subtitle_requires_burn_in(&file, Some(3), true),
+            "an enabled PGS overlay keeps the video bytes untouched"
+        );
         assert!(enabled
             .iter()
             .enumerate()

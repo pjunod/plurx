@@ -418,3 +418,27 @@ commits = ["4fae12ab"]
 points = ["playback.pipeline", "web.experience"]
 checks = ["rust-gate", "web-static"]
 reason = "The retained retirement regression begins a playlist wait with a 30-second budget, retires it through the production path, and requires prompt session_gone without a false producer failure; the shipped-web regressions drive the real api-to-openSession-to-burnSub rejection path into the persistent overlay and prove that only a matching successful level retry clears its earlier 503 while terminal refusals remain readable."
+
+[[coverage]]
+commits = ["b4d9825e"]
+points = ["server.api", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regressions `audio_only_selection_does_not_apply_the_policy_default_subtitle` and `item_detail_reports_policy_defaults_and_language_match_states` prove that an audio-only `/decision` selection leaves the delivery verdict free of the policy-default subtitle while still echoing that subtitle to the caller, and that an untagged-language track reports `unknown` instead of asserting `missing`; reverting only the production correction makes an audio-only selection burn the policy subtitle and makes an untagged track claim the preferred language is absent."
+
+[[coverage]]
+commits = ["438c506c"]
+points = ["server.api", "offline.viewing"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` proves that a container language tag written in upper case resolves to one audio and subtitle selection across item detail, `/decision`, and the offline options quote, because all three fold case through the shared `prefers_original_audio` predicate; reverting only the production correction restores the offline path's own case-sensitive match, so it stops treating the file as dual-audio and recommends the container-default English track the detail screen never advertised."
+
+[[coverage]]
+commits = ["f32fed88"]
+points = ["server.api", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regression `the_delivery_plan_carries_a_selected_non_default_audio_track` follows the returned execution plan for a decodable audio track that is not the container default, proving the plan URL names the selection and that the verdict is a remux rather than a direct play the raw file cannot present; reverting only the production correction returns `direct_play` with a bare `/stream.mp4` plan, so a viewer who selected the French track is delivered the English one."
+
+[[coverage]]
+commits = ["93e68029"]
+points = ["server.api", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."

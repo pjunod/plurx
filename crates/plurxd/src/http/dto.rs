@@ -7,6 +7,9 @@ use plurx_core::domain::{
     User, WatchRollup, WatchState,
 };
 use plurx_core::mediafacts::MediaFacts;
+use plurx_core::tracks::{
+    lang_matches, prefers_original_audio, select_tracks, LangPrefs, TrackSelection,
+};
 use serde::Serialize;
 
 /// Build the API URL for a cached artwork filename.
@@ -266,6 +269,10 @@ pub struct FileDto {
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
+    /// The server's cold-start track outcome for this file. This is computed
+    /// from stored stream facts and the same pure policy playback uses; clients
+    /// do not need the underlying admin preference values to reproduce it.
+    pub playback_defaults: PlaybackDefaultsDto,
     /// Start of this file within a multi-file audiobook. Zero for ordinary
     /// media and for the first part. Clients add this to local player time
     /// before posting item progress, so resume remains one continuous book.
@@ -291,8 +298,127 @@ pub struct FileDto {
     pub missing_path: Option<String>,
 }
 
-impl From<MediaFile> for FileDto {
-    fn from(f: MediaFile) -> Self {
+/// How the configured preferred language relates to one file's tracks and the
+/// policy-selected track.
+///
+/// `available` is intentionally distinct from `selected`: the dual-audio anime
+/// rule can select Japanese original audio even when the configured audio
+/// language is also present. `missing` means every track is tagged and none
+/// matches; `unknown` means an untagged track prevents that claim; `no_tracks`
+/// lets a detail screen say "no subtitles" instead.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredLanguageStatus {
+    Selected,
+    Available,
+    Missing,
+    Unknown,
+    NoTracks,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackTrackDefaultDto {
+    pub selected_index: Option<i64>,
+    pub preferred_language: String,
+    pub preferred_language_status: PreferredLanguageStatus,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackDefaultsDto {
+    pub audio: PlaybackTrackDefaultDto,
+    pub subtitle: PlaybackTrackDefaultDto,
+}
+
+fn preference_status(
+    tracks_present: bool,
+    preferred_present: bool,
+    selected_matches_preference: bool,
+    unknown_language_present: bool,
+) -> PreferredLanguageStatus {
+    if !tracks_present {
+        PreferredLanguageStatus::NoTracks
+    } else if selected_matches_preference {
+        PreferredLanguageStatus::Selected
+    } else if preferred_present {
+        PreferredLanguageStatus::Available
+    } else if unknown_language_present {
+        PreferredLanguageStatus::Unknown
+    } else {
+        PreferredLanguageStatus::Missing
+    }
+}
+
+fn playback_defaults(
+    audio: &[AudioStream],
+    subtitles: &[SubtitleStream],
+    prefs: &LangPrefs,
+) -> PlaybackDefaultsDto {
+    let selected = select_tracks(audio, subtitles, prefers_original_audio(audio), prefs);
+    defaults_from_selection(audio, subtitles, prefs, selected)
+}
+
+fn defaults_from_selection(
+    audio: &[AudioStream],
+    subtitles: &[SubtitleStream],
+    prefs: &LangPrefs,
+    selected: TrackSelection,
+) -> PlaybackDefaultsDto {
+    let audio_preferred = audio
+        .iter()
+        .any(|track| lang_matches(&track.language, &prefs.audio_lang));
+    let audio_unknown = audio.iter().any(|track| {
+        track
+            .language
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    });
+    let audio_selected_preferred = selected
+        .audio_index
+        .and_then(|index| audio.iter().find(|track| track.index == index))
+        .is_some_and(|track| lang_matches(&track.language, &prefs.audio_lang));
+    let subtitle_preferred = subtitles
+        .iter()
+        .any(|track| lang_matches(&track.language, &prefs.sub_lang));
+    let subtitle_unknown = subtitles.iter().any(|track| {
+        track
+            .language
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    });
+    let subtitle_selected_preferred = selected
+        .subtitle_index
+        .and_then(|index| subtitles.iter().find(|track| track.index == index))
+        .is_some_and(|track| lang_matches(&track.language, &prefs.sub_lang));
+
+    PlaybackDefaultsDto {
+        audio: PlaybackTrackDefaultDto {
+            selected_index: selected.audio_index,
+            preferred_language: prefs.audio_lang.clone(),
+            preferred_language_status: preference_status(
+                !audio.is_empty(),
+                audio_preferred,
+                audio_selected_preferred,
+                audio_unknown,
+            ),
+        },
+        subtitle: PlaybackTrackDefaultDto {
+            selected_index: selected.subtitle_index,
+            preferred_language: prefs.sub_lang.clone(),
+            preferred_language_status: preference_status(
+                !subtitles.is_empty(),
+                subtitle_preferred,
+                subtitle_selected_preferred,
+                subtitle_unknown,
+            ),
+        },
+    }
+}
+
+impl FileDto {
+    pub fn from_media_file(f: MediaFile, prefs: &LangPrefs) -> Self {
+        let playback_defaults = playback_defaults(&f.audio_streams, &f.subtitle_streams, prefs);
         let filename = f
             .path
             .file_name()
@@ -314,6 +440,7 @@ impl From<MediaFile> for FileDto {
             bitrate: f.bitrate,
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,
+            playback_defaults,
             part_offset_ms: 0,
             chapters: Vec::new(),
             available: true,
