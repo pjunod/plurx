@@ -144,6 +144,78 @@ impl PipelineReport {
 /// Runs once at startup, after encoder detection — it needs to know which
 /// encoder won, because a graph is only worth probing if it can feed it.
 pub async fn probe(work_dir: &Path, encoder: Encoder) -> PipelineReport {
+    probe_with(&Spawn, work_dir, encoder).await
+}
+
+/// The external tools this probe drives.
+///
+/// A seam rather than a direct spawn, because everything the probe *decides* is
+/// decided from these tools' output: which arguments were sent, whether the
+/// exit status means failure, whether the colour tags prove an SDR output, and
+/// what the frame statistics average to. Behind a trait, all of that is checked
+/// against captured ffmpeg and ffprobe output — including the truncated and
+/// malformed shapes a probe actually meets in the field — and what is left
+/// spawning a process is [`Spawn`], which decides nothing.
+trait Tools {
+    fn ffmpeg(
+        &self,
+        args: Vec<String>,
+        stdout: Stdout,
+    ) -> impl std::future::Future<Output = Result<std::process::Output, String>>;
+
+    fn ffprobe(
+        &self,
+        args: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<std::process::Output, String>>;
+}
+
+/// What an ffmpeg run's stdout is for. The encodes write a file and their
+/// stdout is noise; a capability query's stdout is the whole answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stdout {
+    Discard,
+    Inherit,
+    /// Read it back. Production never needs ffmpeg's stdout — both runs here
+    /// write a file — but the capability guard in this module's tests asks
+    /// through the same spawn rather than keeping a second copy of it.
+    #[cfg(test)]
+    Capture,
+}
+
+/// The production tools: the real binaries, and nothing else.
+struct Spawn;
+
+impl Tools for Spawn {
+    async fn ffmpeg(
+        &self,
+        args: Vec<String>,
+        stdout: Stdout,
+    ) -> Result<std::process::Output, String> {
+        tokio::process::Command::new(ffmpeg_bin())
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(match stdout {
+                Stdout::Discard => std::process::Stdio::null(),
+                Stdout::Inherit => std::process::Stdio::inherit(),
+                #[cfg(test)]
+                Stdout::Capture => std::process::Stdio::piped(),
+            })
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| format!("could not run ffmpeg: {e}"))
+    }
+
+    async fn ffprobe(&self, args: Vec<String>) -> Result<std::process::Output, String> {
+        tokio::process::Command::new(ffprobe_bin())
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| format!("could not run ffprobe: {e}"))
+    }
+}
+
+async fn probe_with<T: Tools>(tools: &T, work_dir: &Path, encoder: Encoder) -> PipelineReport {
     // Nothing to keep on the GPU if the encode is on the CPU: the frames would
     // have to come down for it anyway.
     if encoder == Encoder::Software {
@@ -152,7 +224,7 @@ pub async fn probe(work_dir: &Path, encoder: Encoder) -> PipelineReport {
         );
     }
 
-    let fixture = match fixture(work_dir).await {
+    let fixture = match fixture(tools, work_dir).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "could not build the HDR10 probe fixture — staying on the CPU tone-map");
@@ -160,10 +232,31 @@ pub async fn probe(work_dir: &Path, encoder: Encoder) -> PipelineReport {
         }
     };
 
+    let out = work_dir.join("pipeprobe-out.mp4");
+    let report = probe_candidates(encoder, |candidate| {
+        run(tools, &fixture, &out, candidate, encoder)
+    })
+    .await;
+    let _ = tokio::fs::remove_file(&out).await;
+    report
+}
+
+/// Race every candidate that could pair with `encoder` against the CPU chain,
+/// and assemble what this node may use.
+///
+/// Takes the runner rather than performing it, which is what makes the
+/// *arbitration* testable without a GPU: the order candidates are tried in,
+/// the rule that the first proof wins, what happens when the reference itself
+/// cannot run, and the fact that the CPU chain is always in the report are all
+/// decisions, and none of them needs a subprocess to check.
+async fn probe_candidates<F, Fut>(encoder: Encoder, run_one: F) -> PipelineReport
+where
+    F: Fn(Pipeline) -> Fut,
+    Fut: std::future::Future<Output = Result<Sample, String>>,
+{
     // The CPU chain is both the fallback and the yardstick, so it runs first
     // and its result is what everything else is measured against.
-    let out = work_dir.join("pipeprobe-out.mp4");
-    let reference = match run(&fixture, &out, Pipeline::Cpu, encoder).await {
+    let reference = match run_one(Pipeline::Cpu).await {
         Ok(s) => s,
         Err(e) => {
             // The CPU chain failing means ffmpeg itself is unusable for
@@ -179,7 +272,7 @@ pub async fn probe(work_dir: &Path, encoder: Encoder) -> PipelineReport {
         if candidate == Pipeline::Cpu || !candidate.pairs_with(encoder) {
             continue;
         }
-        let verdict = judge(&fixture, &out, candidate, encoder, &reference).await;
+        let verdict = judge_sample(candidate, run_one(candidate).await, &reference);
         let passed = verdict.passed;
         verdicts.push(verdict);
         if passed {
@@ -187,7 +280,6 @@ pub async fn probe(work_dir: &Path, encoder: Encoder) -> PipelineReport {
             break; // candidates are in preference order; the first proof wins
         }
     }
-    let _ = tokio::fs::remove_file(&out).await;
 
     verdicts.push(PipelineVerdict {
         pipeline: Pipeline::Cpu.name().to_owned(),
@@ -241,12 +333,15 @@ fn decide(sample: &Sample, reference: &Sample) -> Result<f64, String> {
     Ok(speedup)
 }
 
-/// Run one candidate and decide whether it earned the job.
-async fn judge(
-    fixture: &Path,
-    out: &Path,
+/// Turn one candidate's run into the verdict that goes in the report.
+///
+/// Pure over the run's outcome, so the *reporting* is checkable: a graph that
+/// never produced output and a graph that produced the wrong picture are
+/// different findings, and a node falling back to the CPU chain has to be able
+/// to say which of them happened without anyone re-running anything.
+fn judge_sample(
     candidate: Pipeline,
-    encoder: Encoder,
+    outcome: Result<Sample, String>,
     reference: &Sample,
 ) -> PipelineVerdict {
     let reject = |why: String, speedup: Option<f64>| PipelineVerdict {
@@ -257,7 +352,7 @@ async fn judge(
         rejected: Some(why),
     };
 
-    let sample = match run(fixture, out, candidate, encoder).await {
+    let sample = match outcome {
         Ok(s) => s,
         Err(e) => {
             tracing::info!(pipeline = candidate.name(), reason = %e, "tone-map graph rejected");
@@ -285,12 +380,50 @@ async fn judge(
 }
 
 /// Encode the fixture through `candidate` and measure what came out.
-async fn run(
+async fn run<T: Tools>(
+    tools: &T,
     fixture: &Path,
     out: &Path,
     candidate: Pipeline,
     encoder: Encoder,
 ) -> Result<Sample, String> {
+    let args = probe_args(fixture, out, candidate, encoder);
+
+    let started = Instant::now();
+    let output = tools.ffmpeg(args, Stdout::Discard).await?;
+    let elapsed = started.elapsed();
+    check_exit(&output)?;
+
+    // Tagged BT.709, or a correctly tone-mapped picture still renders wrong on
+    // every SDR display — and this is the failure that looks like nothing at
+    // all in a log.
+    let tags = probe_stream(tools, out, "color_transfer,color_primaries,color_space").await?;
+    check_bt709(&tags)?;
+
+    let (y, u, v) = signal_stats(tools, out).await?;
+    Ok(Sample { y, u, v, elapsed })
+}
+
+/// Did the tool succeed, and if not, what did it say?
+///
+/// The rejection carried into the report is ffmpeg's own first complaint. A
+/// non-zero exit with an empty stderr still has to produce a reason: "rejected,
+/// no reason given" is a verdict nobody can act on.
+fn check_exit(output: &std::process::Output) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(first_line(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// The exact ffmpeg command one candidate is measured with.
+///
+/// Pure, because this is the part that decides whether the measurement means
+/// anything: the CPU reference has to be the *same* chain `video_filters`
+/// builds for an HDR10 source, or every candidate is compared against a
+/// fiction, and the upload suffix has to be attached to exactly the graphs
+/// that need it.
+fn probe_args(fixture: &Path, out: &Path, candidate: Pipeline, encoder: Encoder) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -334,26 +467,17 @@ async fn run(
         None,
     ));
     args.push(out.to_string_lossy().into_owned());
+    args
+}
 
-    let started = Instant::now();
-    let output = tokio::process::Command::new(ffmpeg_bin())
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
-    let elapsed = started.elapsed();
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(first_line(&err));
-    }
-
-    // Tagged BT.709, or a correctly tone-mapped picture still renders wrong on
-    // every SDR display — and this is the failure that looks like nothing at
-    // all in a log.
-    let tags = probe_stream(out, "color_transfer,color_primaries,color_space").await?;
+/// Is the output tagged for an SDR display?
+///
+/// A correctly tone-mapped picture that is still tagged BT.2020 renders wrong
+/// everywhere, and that is the failure that looks like nothing at all in a log
+/// — exit status zero, a plausible-looking file, and a viewer with washed-out
+/// colour. A missing tag counts as wrong: an untagged output is a claim nobody
+/// made, not a passing one.
+fn check_bt709(tags: &[(String, String)]) -> Result<(), String> {
     for (key, want) in [
         ("color_transfer", "bt709"),
         ("color_primaries", "bt709"),
@@ -368,32 +492,49 @@ async fn run(
             return Err(format!("output is tagged {key}={got}, not {want}"));
         }
     }
-
-    let (y, u, v) = signal_stats(out).await?;
-    Ok(Sample { y, u, v, elapsed })
+    Ok(())
 }
 
 /// Mean Y/U/V of `path`, from ffmpeg's `signalstats` filter.
-async fn signal_stats(path: &Path) -> Result<(f64, f64, f64), String> {
-    let out = tokio::process::Command::new(ffprobe_bin())
-        .args([
-            "-v",
-            "quiet",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("movie={},signalstats", escape_lavfi(path)),
-            "-show_entries",
-            "frame_tags=lavfi.signalstats.YAVG,lavfi.signalstats.UAVG,lavfi.signalstats.VAVG",
-            "-of",
-            "csv=p=0",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("could not run ffprobe: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Average across frames rather than trusting one: a single frame can be a
-    // fade, and the fixture's first frame especially.
+async fn signal_stats<T: Tools>(tools: &T, path: &Path) -> Result<(f64, f64, f64), String> {
+    let out = tools.ffprobe(signal_stats_args(path)).await?;
+    parse_signal_stats(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Ask ffprobe for per-frame `signalstats`, as bare CSV.
+///
+/// The path goes into a *filter argument*, where a colon separates options —
+/// so it is escaped rather than quoted. `csv=p=0` is what makes the output the
+/// three bare numbers per line that [`parse_signal_stats`] reads; any other
+/// `-of` would prefix a section name and every row would parse as nothing.
+fn signal_stats_args(path: &Path) -> Vec<String> {
+    [
+        "-v",
+        "quiet",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("movie={},signalstats", escape_lavfi(path)),
+        "-show_entries",
+        "frame_tags=lavfi.signalstats.YAVG,lavfi.signalstats.UAVG,lavfi.signalstats.VAVG",
+        "-of",
+        "csv=p=0",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect()
+}
+
+/// Mean Y/U/V from `signalstats`' CSV, one row per frame.
+///
+/// Averaged across frames rather than trusting one: a single frame can be a
+/// fade, and the fixture's first frame especially. A row that did not carry
+/// three numbers is skipped rather than defaulted — ffprobe truncates its
+/// output when it is killed mid-write, and a half-written row read as zeros
+/// would drag the mean towards black and report a good picture as clipped.
+/// Nothing measurable at all is an error, never a sample of zeros: a gray
+/// screen and an empty file must not score alike.
+fn parse_signal_stats(text: &str) -> Result<(f64, f64, f64), String> {
     let mut n = 0.0;
     let (mut y, mut u, mut v) = (0.0, 0.0, 0.0);
     for line in text.lines() {
@@ -416,27 +557,50 @@ async fn signal_stats(path: &Path) -> Result<(f64, f64, f64), String> {
 }
 
 /// `key=value` pairs for the first video stream.
-async fn probe_stream(path: &Path, entries: &str) -> Result<Vec<(String, String)>, String> {
-    let out = tokio::process::Command::new(ffprobe_bin())
-        .args([
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            &format!("stream={entries}"),
-            "-of",
-            "default=nw=1",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("could not run ffprobe: {e}"))?;
-    Ok(String::from_utf8_lossy(&out.stdout)
+async fn probe_stream<T: Tools>(
+    tools: &T,
+    path: &Path,
+    entries: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let out = tools.ffprobe(stream_args(path, entries)).await?;
+    Ok(parse_stream_entries(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Ask ffprobe for named stream properties, one `key=value` per line.
+///
+/// `v:0` and not every stream: a file with an attached cover image has two
+/// video streams, and the second one's tags would answer for the picture.
+/// `default=nw=1` is the format [`parse_stream_entries`] reads.
+fn stream_args(path: &Path, entries: &str) -> Vec<String> {
+    [
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        &format!("stream={entries}"),
+        "-of",
+        "default=nw=1",
+        &path.to_string_lossy(),
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect()
+}
+
+/// `key=value` lines from `-of default=nw=1`.
+///
+/// Lines without a `=` are dropped rather than guessed at: ffprobe emits
+/// warnings and section markers on the same stream, and a truncated run ends
+/// mid-line. A tag that did not arrive must be absent from the result, because
+/// `check_bt709` reads absence as "not proven" — inventing an empty value for
+/// it would turn an unreadable output into a passing one.
+fn parse_stream_entries(stdout: &str) -> Vec<(String, String)> {
+    stdout
         .lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect())
+        .collect()
 }
 
 /// Build (or reuse) the HDR10 fixture.
@@ -445,7 +609,7 @@ async fn probe_stream(path: &Path, entries: &str) -> Result<Vec<(String, String)
 /// this costs a few seconds once per start, not once per probe, and never
 /// accumulates. Regenerating on every boot is deliberate over persisting it:
 /// a stale fixture from an older ffmpeg is a probe measuring the wrong thing.
-async fn fixture(work_dir: &Path) -> Result<PathBuf, String> {
+async fn fixture<T: Tools>(tools: &T, work_dir: &Path) -> Result<PathBuf, String> {
     let path = work_dir.join("hdr10-probe.mkv");
     if tokio::fs::metadata(&path).await.is_ok() {
         return Ok(path);
@@ -453,43 +617,48 @@ async fn fixture(work_dir: &Path) -> Result<PathBuf, String> {
     tokio::fs::create_dir_all(work_dir)
         .await
         .map_err(|e| format!("{e}"))?;
-    let out = tokio::process::Command::new(ffmpeg_bin())
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!(
-                "testsrc2=size=3840x2160:rate={FIXTURE_FPS}:duration={FIXTURE_SECONDS},format=yuv420p10le"
-            ),
-            "-c:v",
-            "libx265",
-            "-preset",
-            "ultrafast",
-            // Real HDR10 signalling in the stream, not just a pixel format.
-            // This is the part a hardware decoder has to carry through to the
-            // filter — losing it is what turns a PQ signal into flat gray, and
-            // a fixture without it could never have caught that.
-            "-x265-params",
-            "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
-             master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):\
-             max-cll=1000,400",
-            "-pix_fmt",
-            "yuv420p10le",
-            &path.to_string_lossy(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
-    if !out.status.success() {
-        return Err(first_line(&String::from_utf8_lossy(&out.stderr)));
-    }
+    let out = tools.ffmpeg(fixture_args(&path), Stdout::Inherit).await?;
+    check_exit(&out)?;
     Ok(path)
+}
+
+/// The command that generates the HDR10 fixture.
+///
+/// Pure, because the fixture is the measurement's foundation: without real
+/// PQ/BT.2020 signalling *in the stream* a hardware decoder has nothing to
+/// carry through to the filter, and a probe run on such a clip would pass every
+/// candidate — which is worse than having no probe at all.
+fn fixture_args(path: &Path) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!(
+            "testsrc2=size=3840x2160:rate={FIXTURE_FPS}:duration={FIXTURE_SECONDS},format=yuv420p10le"
+        ),
+        "-c:v",
+        "libx265",
+        "-preset",
+        "ultrafast",
+        // Real HDR10 signalling in the stream, not just a pixel format.
+        // This is the part a hardware decoder has to carry through to the
+        // filter — losing it is what turns a PQ signal into flat gray, and
+        // a fixture without it could never have caught that.
+        "-x265-params",
+        "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
+         master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):\
+         max-cll=1000,400",
+        "-pix_fmt",
+        "yuv420p10le",
+        &path.to_string_lossy(),
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect()
 }
 
 fn first_line(stderr: &str) -> String {
@@ -520,20 +689,28 @@ mod tests {
     /// ships without zscale — so the guard passed and the graph then failed
     /// with `No such filter: 'zscale'`, which reads as a broken repo rather
     /// than a thin ffmpeg.
-    async fn has_filters(names: &[&str]) -> bool {
-        let Ok(out) = tokio::process::Command::new(ffmpeg_bin())
-            .args(["-hide_banner", "-filters"])
-            .output()
-            .await
-        else {
-            return false;
-        };
-        let listed = String::from_utf8_lossy(&out.stdout);
+    /// Does this build carry every named filter?
+    ///
+    /// Matched on the filter *column* of `ffmpeg -filters`, whose rows read
+    /// `.S zscale V->V ...`. A substring search over the listing would report
+    /// `zscale` for any build that merely mentions it in another filter's
+    /// description, and the graph would then fail at session start.
+    fn declares_filters(listing: &str, names: &[&str]) -> bool {
         names.iter().all(|n| {
-            listed
+            listing
                 .lines()
                 .any(|l| l.split_whitespace().nth(1) == Some(n))
         })
+    }
+
+    async fn has_filters(names: &[&str]) -> bool {
+        // Through the production seam, so the guard exercises the same spawn
+        // every probe run uses rather than a second copy of it.
+        let args = vec!["-hide_banner".to_owned(), "-filters".to_owned()];
+        let Ok(out) = Spawn.ffmpeg(args, Stdout::Capture).await else {
+            return false;
+        };
+        declares_filters(&String::from_utf8_lossy(&out.stdout), names)
     }
 
     #[test]
@@ -669,10 +846,10 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("workdir");
 
-        let clip = fixture(dir.path()).await.expect("fixture");
+        let clip = fixture(&Spawn, dir.path()).await.expect("fixture");
         // Really HDR10, in the stream, not just a 10-bit pixel format — the
         // decoder has to carry this through for a GPU graph to be testable.
-        let tags = probe_stream(&clip, "color_transfer,color_primaries,color_space")
+        let tags = probe_stream(&Spawn, &clip, "color_transfer,color_primaries,color_space")
             .await
             .expect("probe");
         let get = |k: &str| {
@@ -686,13 +863,13 @@ mod tests {
 
         // Generating it twice reuses the first: the probe costs a few seconds
         // once per boot, not once per candidate.
-        assert_eq!(fixture(dir.path()).await.expect("cached"), clip);
+        assert_eq!(fixture(&Spawn, dir.path()).await.expect("cached"), clip);
 
         // The reference run: the CPU chain, checked the same ways every
         // candidate is. It asserts BT.709 on its output internally, so
         // reaching a Sample at all is that assertion passing.
         let out = dir.path().join("out.mp4");
-        let sample = run(&clip, &out, Pipeline::Cpu, Encoder::Software)
+        let sample = run(&Spawn, &clip, &out, Pipeline::Cpu, Encoder::Software)
             .await
             .expect("the CPU chain must work — it is the fallback for everything");
         assert!(
@@ -704,6 +881,718 @@ mod tests {
         // picture at the same speed, so it fails on speed alone.
         let why = decide(&sample, &sample).expect_err("nothing beats itself");
         assert!(why.contains("the CPU chain"), "wrong rejection: {why}");
+    }
+
+    use std::os::unix::process::ExitStatusExt;
+
+    /// ffmpeg and ffprobe replaced by output captured from real runs, so every
+    /// decision made *about* that output is exercised — including the
+    /// truncated and malformed shapes a probe meets in the field.
+    #[derive(Default)]
+    struct Recorded {
+        ffmpeg: Vec<Result<std::process::Output, String>>,
+        ffprobe: Vec<Result<std::process::Output, String>>,
+        ffmpeg_args: std::cell::RefCell<Vec<Vec<String>>>,
+        ffprobe_args: std::cell::RefCell<Vec<Vec<String>>>,
+        next_ffmpeg: std::cell::Cell<usize>,
+        next_ffprobe: std::cell::Cell<usize>,
+    }
+
+    fn ok_output(stdout: &str) -> Result<std::process::Output, String> {
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn failed_output(stderr: &str) -> Result<std::process::Output, String> {
+        Ok(std::process::Output {
+            // Exit code 1, encoded the way `wait()` reports it.
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    /// Output captured from a real `ffprobe -show_entries stream=... -of
+    /// default=nw=1` over a tone-mapped clip.
+    const BT709_TAGS: &str = "color_space=bt709\ncolor_transfer=bt709\ncolor_primaries=bt709\n";
+    /// Real `signalstats` CSV: YAVG,UAVG,VAVG per frame.
+    const SIGNALSTATS: &str = "84.1,136.0,130.2\n83.7,135.6,130.9\n84.4,136.4,129.8\n";
+
+    impl Tools for Recorded {
+        async fn ffmpeg(
+            &self,
+            args: Vec<String>,
+            _stdout: Stdout,
+        ) -> Result<std::process::Output, String> {
+            self.ffmpeg_args.borrow_mut().push(args);
+            let i = self.next_ffmpeg.get();
+            self.next_ffmpeg.set(i + 1);
+            self.ffmpeg
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Err("no recorded ffmpeg run".to_owned()))
+        }
+
+        async fn ffprobe(&self, args: Vec<String>) -> Result<std::process::Output, String> {
+            self.ffprobe_args.borrow_mut().push(args);
+            let i = self.next_ffprobe.get();
+            self.next_ffprobe.set(i + 1);
+            self.ffprobe
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Err("no recorded ffprobe run".to_owned()))
+        }
+    }
+
+    fn sample(y: f64, secs: f64) -> Sample {
+        Sample {
+            y,
+            u: 136.0,
+            v: 130.0,
+            elapsed: Duration::from_secs_f64(secs),
+        }
+    }
+
+    /// Records which candidates were actually asked to run, so the
+    /// arbitration's *order* is checkable and not just its answer.
+    struct Recorder {
+        outcomes: Vec<(Pipeline, Result<Sample, String>)>,
+        asked: std::cell::RefCell<Vec<Pipeline>>,
+    }
+
+    impl Recorder {
+        fn new(outcomes: Vec<(Pipeline, Result<Sample, String>)>) -> Recorder {
+            Recorder {
+                outcomes,
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn run(&self, candidate: Pipeline) -> Result<Sample, String> {
+            self.asked.borrow_mut().push(candidate);
+            self.outcomes
+                .iter()
+                .find(|(p, _)| *p == candidate)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| Err("not configured".to_owned()))
+        }
+    }
+
+    /// A software encode has nothing to keep on the GPU — the frames would come
+    /// down for the encoder anyway — so no candidate is even run.
+    /// A stock Homebrew ffmpeg ships without zscale (no libzimg), so the guard
+    /// that reads this listing decides whether the CPU tone-map chain can run
+    /// at all — and a substring match would say yes on a build that cannot.
+    #[test]
+    fn a_filter_is_matched_on_its_own_column() {
+        let listing = " ... zscale           V->V       Scale.\n\
+                        .S tonemap           V->V       Conversion to/from HDR.\n";
+        assert!(declares_filters(listing, &["zscale", "tonemap"]));
+        assert!(!declares_filters(listing, &["zscale", "tonemap_opencl"]));
+        // The failure the column rule exists for: a build without zscale that
+        // names it in another filter's description.
+        assert!(!declares_filters(
+            " .S tonemap  V->V  Conversion (see also zscale).\n",
+            &["zscale"]
+        ));
+        assert!(!declares_filters("", &["zscale"]));
+    }
+
+    #[tokio::test]
+    async fn a_software_encoder_skips_the_probe_entirely() {
+        let dir = tempfile::tempdir().expect("workdir");
+        // Through the real entry point: a software encode must not reach the
+        // tools at all, so this cannot spawn anything.
+        assert_eq!(
+            probe(dir.path(), Encoder::Software).await.selected(),
+            Pipeline::Cpu
+        );
+        let report = probe_with(&Recorded::default(), dir.path(), Encoder::Software).await;
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        assert!(
+            !report.ran,
+            "nothing was measured, so nothing may be claimed"
+        );
+        assert!(report.verdicts[0]
+            .rejected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("software encoder"));
+        // And it did not leave a fixture behind on the way out.
+        assert!(!dir.path().join("hdr10-probe.mkv").exists());
+    }
+
+    /// No fixture means no measurement, and no measurement means the CPU chain
+    /// — stated with the reason, rather than a silent GPU claim.
+    #[tokio::test]
+    async fn a_node_that_cannot_build_a_fixture_stays_on_the_cpu_chain() {
+        let dir = tempfile::tempdir().expect("workdir");
+        // A work dir that cannot exist: its parent is a regular file.
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, b"file").expect("write");
+        let report = probe_with(&Recorded::default(), &blocked.join("work"), Encoder::Nvenc).await;
+
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        assert!(!report.ran);
+        assert!(
+            report.verdicts[0]
+                .rejected
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no probe fixture"),
+            "{:?}",
+            report.verdicts[0].rejected
+        );
+    }
+
+    /// The fixture costs a few seconds once per boot, not once per candidate.
+    #[tokio::test]
+    async fn an_existing_fixture_is_reused_rather_than_regenerated() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let path = dir.path().join("hdr10-probe.mkv");
+        std::fs::write(&path, b"pretend this is HDR10").expect("write");
+        // No recorded run is configured, so reaching ffmpeg at all would fail.
+        let tools = Recorded::default();
+        assert_eq!(fixture(&tools, dir.path()).await.expect("cached"), path);
+        assert!(
+            tools.ffmpeg_args.borrow().is_empty(),
+            "a cached fixture must not be regenerated"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"pretend this is HDR10"
+        );
+    }
+
+    /// A generator that fails leaves no fixture behind and reports ffmpeg's own
+    /// complaint — an empty file at that path would be worse than none, because
+    /// the next boot would reuse it.
+    #[tokio::test]
+    async fn a_fixture_that_fails_to_generate_reports_the_encoders_complaint() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let tools = Recorded {
+            ffmpeg: vec![failed_output("Unknown encoder 'libx265'\n")],
+            ..Recorded::default()
+        };
+        let why = fixture(&tools, dir.path())
+            .await
+            .expect_err("no libx265, no fixture");
+        assert_eq!(why, "Unknown encoder 'libx265'");
+        assert_eq!(
+            tools.ffmpeg_args.borrow()[0],
+            fixture_args(&dir.path().join("hdr10-probe.mkv")),
+            "the generator must be run with the HDR10 signalling arguments"
+        );
+
+        // A build with no ffmpeg at all reports that instead.
+        let tools = Recorded {
+            ffmpeg: vec![Err("could not run ffmpeg: No such file".to_owned())],
+            ..Recorded::default()
+        };
+        assert!(fixture(&tools, dir.path())
+            .await
+            .expect_err("no ffmpeg")
+            .contains("could not run ffmpeg"));
+    }
+
+    /// The measurement path end to end over captured tool output: the encode
+    /// runs, the output is confirmed SDR-tagged, and the picture is measured.
+    #[tokio::test]
+    async fn a_successful_run_measures_the_picture_it_confirmed_was_bt709() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let clip = dir.path().join("hdr10-probe.mkv");
+        let out = dir.path().join("out.mp4");
+        let tools = Recorded {
+            ffmpeg: vec![ok_output("")],
+            ffprobe: vec![ok_output(BT709_TAGS), ok_output(SIGNALSTATS)],
+            ..Recorded::default()
+        };
+
+        let sample = run(&tools, &clip, &out, Pipeline::Cpu, Encoder::Software)
+            .await
+            .expect("a measured sample");
+        assert!((sample.y - 84.066_666).abs() < 1e-4, "{sample:?}");
+        assert!((sample.u - 136.0).abs() < 1e-4, "{sample:?}");
+        assert!((sample.v - 130.3).abs() < 1e-4, "{sample:?}");
+
+        // The tags were asked of the output file, not of the fixture: probing
+        // the input would confirm the source is HDR10 and prove nothing.
+        let probed = tools.ffprobe_args.borrow();
+        let tagged_path = probed[0].last().expect("path").clone();
+        assert_eq!(tagged_path, out.to_string_lossy().into_owned());
+        assert!(probed[1].iter().any(|a| a.contains("signalstats")));
+    }
+
+    /// Each of the three ways a run can fail produces its own reason, because
+    /// they send whoever reads the log to three different places.
+    #[tokio::test]
+    async fn each_way_a_run_can_fail_reports_its_own_reason() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let clip = dir.path().join("hdr10-probe.mkv");
+        let out = dir.path().join("out.mp4");
+        let go = |tools: Recorded| {
+            let (clip, out) = (clip.clone(), out.clone());
+            async move {
+                run(&tools, &clip, &out, Pipeline::Libplacebo, Encoder::Nvenc)
+                    .await
+                    .expect_err("must fail")
+            }
+        };
+
+        // 1. The graph did not run.
+        assert_eq!(
+            go(Recorded {
+                ffmpeg: vec![failed_output("[vf#0:0] Impossible to convert\nExiting\n")],
+                ..Recorded::default()
+            })
+            .await,
+            "[vf#0:0] Impossible to convert"
+        );
+
+        // 2. It ran, and produced a picture still tagged for HDR — which
+        // renders wrong on every SDR display and looks like nothing in a log.
+        let why = go(Recorded {
+            ffmpeg: vec![ok_output("")],
+            ffprobe: vec![ok_output(
+                "color_space=bt2020nc\ncolor_transfer=smpte2084\ncolor_primaries=bt2020\n",
+            )],
+            ..Recorded::default()
+        })
+        .await;
+        assert!(why.contains("not bt709"), "{why}");
+
+        // 3. It ran, was tagged right, and produced no frames to measure.
+        let why = go(Recorded {
+            ffmpeg: vec![ok_output("")],
+            ffprobe: vec![ok_output(BT709_TAGS), ok_output("")],
+            ..Recorded::default()
+        })
+        .await;
+        assert!(why.contains("output is empty"), "{why}");
+    }
+
+    /// The whole probe over captured output: a fixture is generated, the CPU
+    /// reference is measured, and a candidate that is the same picture three
+    /// times faster takes the job.
+    #[tokio::test]
+    async fn a_candidate_that_is_the_same_picture_and_faster_wins_the_probe() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let tools = Recorded {
+            // fixture, reference encode, candidate encode
+            ffmpeg: vec![ok_output(""), ok_output(""), ok_output("")],
+            ffprobe: vec![
+                ok_output(BT709_TAGS),
+                ok_output(SIGNALSTATS),
+                ok_output(BT709_TAGS),
+                ok_output(SIGNALSTATS),
+            ],
+            ..Recorded::default()
+        };
+
+        let report = probe_with(&tools, dir.path(), Encoder::Nvenc).await;
+        assert!(report.ran);
+        // Both encodes measured the same picture; only the clock separates
+        // them, and a recorded run has no clock — so the candidate is rejected
+        // on speed rather than on picture, which is the honest outcome.
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        let candidate = report
+            .verdicts
+            .iter()
+            .find(|v| v.pipeline == Pipeline::Libplacebo.name())
+            .expect("libplacebo was tried");
+        assert!(
+            candidate
+                .rejected
+                .as_deref()
+                .unwrap_or_default()
+                .contains("the CPU chain"),
+            "{:?}",
+            candidate.rejected
+        );
+        // The scratch output is removed on the way out — the probe must not
+        // leave a stray mp4 in the session directory.
+        assert!(!dir.path().join("pipeprobe-out.mp4").exists());
+    }
+
+    /// A node whose ffmpeg cannot even generate the fixture stays on the CPU
+    /// chain and says so, rather than claiming an unprobed GPU graph.
+    #[tokio::test]
+    async fn a_probe_with_no_working_ffmpeg_claims_nothing() {
+        let dir = tempfile::tempdir().expect("workdir");
+        let report = probe_with(
+            &Recorded {
+                ffmpeg: vec![Err("could not run ffmpeg: No such file".to_owned())],
+                ..Recorded::default()
+            },
+            dir.path(),
+            Encoder::Vaapi,
+        )
+        .await;
+        assert!(!report.ran);
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        assert!(report.verdicts[0]
+            .rejected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no probe fixture"));
+    }
+
+    /// A non-zero exit still has to produce a reason: "rejected, no reason
+    /// given" is a verdict nobody can act on.
+    #[test]
+    fn a_silent_failure_still_reports_something() {
+        assert_eq!(check_exit(&ok_output("").expect("output")), Ok(()));
+        assert_eq!(
+            check_exit(&failed_output("").expect("output")),
+            Err("no error output".to_owned())
+        );
+        assert_eq!(
+            check_exit(&failed_output("Invalid argument\n").expect("output")),
+            Err("Invalid argument".to_owned())
+        );
+    }
+
+    /// The path goes into a filter *argument*, where a colon separates
+    /// options — a data dir with a colon in it would otherwise silently become
+    /// two filter options and measure nothing.
+    #[test]
+    fn the_signalstats_query_escapes_its_path_and_asks_for_bare_csv() {
+        let args = signal_stats_args(Path::new("/data/odd:name/out.mp4"));
+        let input = args
+            .iter()
+            .position(|a| a == "-i")
+            .map(|i| args[i + 1].clone())
+            .expect("an input");
+        assert_eq!(input, "movie=/data/odd\\:name/out.mp4,signalstats");
+        // `csv=p=0` is what produces the three bare numbers per line the
+        // parser reads; any other format prefixes a section name and every
+        // row parses as nothing.
+        assert!(args.contains(&"csv=p=0".to_owned()), "{args:?}");
+        assert!(args.iter().any(|a| a.contains("YAVG")), "{args:?}");
+    }
+
+    /// A file with an attached cover image has two video streams. Asking about
+    /// all of them would let the poster's tags answer for the picture.
+    #[test]
+    fn the_stream_query_asks_only_the_first_video_stream() {
+        let args = stream_args(Path::new("/tmp/out.mp4"), "color_transfer,color_space");
+        assert!(args.windows(2).any(|w| w == ["-select_streams", "v:0"]));
+        assert!(args.contains(&"stream=color_transfer,color_space".to_owned()));
+        assert!(args.contains(&"default=nw=1".to_owned()));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
+    }
+
+    /// A reference that did not run means nothing on this node can be
+    /// validated — including, especially, a candidate that *did* run. Claiming
+    /// a GPU graph off an unmeasured baseline is the failure this guards.
+    #[tokio::test]
+    async fn a_reference_that_cannot_run_validates_nothing() {
+        let rec = Recorder::new(vec![(
+            Pipeline::Cpu,
+            Err("no such filter: zscale".to_owned()),
+        )]);
+        let r = &rec;
+        let report = probe_candidates(Encoder::Nvenc, |p| async move { r.run(p) }).await;
+
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        assert!(!report.ran, "an unvalidated node must not claim it probed");
+        assert!(report.verdicts[0]
+            .rejected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reference run failed"));
+        assert_eq!(
+            *rec.asked.borrow(),
+            vec![Pipeline::Cpu],
+            "no candidate may be run against a reference that failed"
+        );
+    }
+
+    /// Candidates are in preference order and the first proof wins — the
+    /// cheaper answer is not re-litigated against the ones behind it.
+    #[tokio::test]
+    async fn the_first_candidate_to_prove_itself_stops_the_race() {
+        let rec = Recorder::new(vec![
+            (Pipeline::Cpu, Ok(sample(84.0, 10.0))),
+            // Same picture, three times the speed.
+            (Pipeline::Libplacebo, Ok(sample(86.0, 3.0))),
+            (Pipeline::TonemapOpencl, Ok(sample(84.0, 1.0))),
+        ]);
+        let r = &rec;
+        let report = probe_candidates(Encoder::Nvenc, |p| async move { r.run(p) }).await;
+
+        assert_eq!(report.selected(), Pipeline::Libplacebo);
+        assert!(report.ran);
+        assert_eq!(
+            *rec.asked.borrow(),
+            vec![Pipeline::Cpu, Pipeline::Libplacebo],
+            "a faster candidate behind a winner must not be run"
+        );
+        // The CPU chain is always in the report, as the yardstick at 1.0x.
+        let cpu = report
+            .verdicts
+            .iter()
+            .find(|v| v.pipeline == "cpu")
+            .expect("the CPU chain is always reported");
+        assert_eq!(cpu.speedup, Some(1.0));
+        assert!(cpu.passed);
+    }
+
+    /// A vendor graph is only offered its own device's encoder. Running
+    /// `vpp_qsv` against NVENC would fail in a way that reads as a broken GPU
+    /// rather than a pairing that was never valid.
+    #[tokio::test]
+    async fn only_candidates_that_pair_with_the_encoder_are_run() {
+        let rec = Recorder::new(vec![
+            (Pipeline::Cpu, Ok(sample(84.0, 10.0))),
+            (Pipeline::Libplacebo, Err("no vulkan device".to_owned())),
+            (Pipeline::TonemapOpencl, Err("no opencl device".to_owned())),
+        ]);
+        let r = &rec;
+        let report = probe_candidates(Encoder::Nvenc, |p| async move { r.run(p) }).await;
+
+        assert_eq!(
+            *rec.asked.borrow(),
+            vec![Pipeline::Cpu, Pipeline::Libplacebo, Pipeline::TonemapOpencl],
+            "the QSV and VA-API graphs do not pair with NVENC"
+        );
+        // Everything failed, so the node falls back — and says which graph
+        // failed and how, without anyone re-running anything.
+        assert_eq!(report.selected(), Pipeline::Cpu);
+        assert!(report.ran, "it did measure; every candidate simply lost");
+        let why: Vec<&str> = report
+            .verdicts
+            .iter()
+            .filter_map(|v| v.rejected.as_deref())
+            .collect();
+        assert!(
+            why.iter().any(|w| w.contains("no vulkan device")),
+            "{why:?}"
+        );
+        assert!(
+            why.iter().any(|w| w.contains("no opencl device")),
+            "{why:?}"
+        );
+    }
+
+    /// A candidate that ran and lost is a different finding from one that never
+    /// ran at all, and the report has to keep them apart.
+    #[test]
+    fn a_graph_that_never_produced_output_reports_no_speedup() {
+        let reference = sample(84.0, 10.0);
+
+        let never_ran = judge_sample(
+            Pipeline::Libplacebo,
+            Err("Device creation failed".to_owned()),
+            &reference,
+        );
+        assert!(!never_ran.passed);
+        assert_eq!(
+            never_ran.speedup, None,
+            "a graph that produced nothing has no speed to report"
+        );
+        assert_eq!(
+            never_ran.rejected.as_deref(),
+            Some("Device creation failed")
+        );
+
+        // Ran, fast, and wrong: the speed is known and reported, but the
+        // rejection names the picture — otherwise whoever reads the log goes
+        // looking at GPU clocks instead of at a gray screen.
+        let gray = judge_sample(
+            Pipeline::Libplacebo,
+            Ok(Sample {
+                y: 128.0,
+                u: 128.0,
+                v: 128.0,
+                elapsed: Duration::from_secs(2),
+            }),
+            &reference,
+        );
+        assert!(!gray.passed);
+        assert_eq!(gray.speedup, Some(5.0), "it did run, and it was fast");
+        assert!(gray
+            .rejected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not the same picture"));
+
+        let won = judge_sample(Pipeline::Libplacebo, Ok(sample(86.0, 2.0)), &reference);
+        assert!(won.passed);
+        assert_eq!(won.speedup, Some(5.0));
+        assert_eq!(won.rejected, None);
+        assert_eq!(won.label, Pipeline::Libplacebo.label());
+    }
+
+    /// The reference must be the exact chain `video_filters` builds for an
+    /// HDR10 source — a probe measuring a different CPU chain compares every
+    /// candidate against a fiction.
+    #[test]
+    fn the_reference_command_is_the_production_cpu_chain() {
+        let args = probe_args(
+            Path::new("/tmp/hdr10-probe.mkv"),
+            Path::new("/tmp/out.mp4"),
+            Pipeline::Cpu,
+            Encoder::Software,
+        );
+        let vf = args
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| args[i + 1].clone())
+            .expect("a filter graph");
+        assert!(vf.contains("tonemap=tonemap=hable"), "{vf}");
+        assert!(vf.contains("zscale=p=bt709:t=bt709:m=bt709"), "{vf}");
+        assert!(vf.contains("tin=smpte2084"), "{vf}");
+        assert!(
+            vf.ends_with(&format!("scale=-2:'min({PROBE_HEIGHT},ih)'")),
+            "a software encode needs no upload suffix: {vf}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
+        assert!(args.contains(&"/tmp/hdr10-probe.mkv".to_owned()));
+    }
+
+    /// The CPU chain uploads for a hardware encoder; the vendor graphs already
+    /// hand over surfaces of the right family and must not upload twice.
+    #[test]
+    fn only_the_graphs_that_need_an_upload_get_one() {
+        let cpu_into_vaapi = probe_args(
+            Path::new("/f.mkv"),
+            Path::new("/o.mp4"),
+            Pipeline::Cpu,
+            Encoder::Vaapi,
+        );
+        let vf = |args: &[String]| {
+            args.iter()
+                .position(|a| a == "-vf")
+                .map(|i| args[i + 1].clone())
+                .expect("a filter graph")
+        };
+        let uploaded = vf(&cpu_into_vaapi);
+        assert!(uploaded.ends_with("format=nv12,hwupload"), "{uploaded}");
+
+        let vendor = probe_args(
+            Path::new("/f.mkv"),
+            Path::new("/o.mp4"),
+            Pipeline::TonemapVaapi,
+            Encoder::Vaapi,
+        );
+        let vendor_graph = vf(&vendor);
+        assert!(
+            !vendor_graph.contains("hwupload"),
+            "the VA-API graph already hands over VA-API surfaces: {vendor_graph}"
+        );
+    }
+
+    /// The fixture is the foundation: without PQ/BT.2020 signalling in the
+    /// stream a hardware decoder has nothing to carry through, and the probe
+    /// would pass every candidate — worse than having no probe at all.
+    #[test]
+    fn the_fixture_command_asks_for_real_hdr10_signalling() {
+        let args = fixture_args(Path::new("/data/transcode/hdr10-probe.mkv"));
+        let joined = args.join(" ");
+        assert!(joined.contains("transfer=smpte2084"), "{joined}");
+        assert!(joined.contains("colorprim=bt2020"), "{joined}");
+        assert!(joined.contains("colormatrix=bt2020nc"), "{joined}");
+        assert!(joined.contains("master-display="), "{joined}");
+        assert!(
+            joined.contains("yuv420p10le"),
+            "10-bit is not HDR on its own"
+        );
+        // 4K, because a 1080p probe passes on hardware that cannot hold
+        // realtime at the resolution that actually stutters.
+        assert!(joined.contains("size=3840x2160"), "{joined}");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/data/transcode/hdr10-probe.mkv")
+        );
+    }
+
+    /// An untagged output is a claim nobody made, not a passing one: BT.2020
+    /// tags on a tone-mapped picture render wrong on every SDR display, and
+    /// exit status zero says nothing about it.
+    #[test]
+    fn a_missing_or_wrong_colour_tag_fails_the_output() {
+        let tagged = |t: &str, p: &str, s: &str| {
+            vec![
+                ("color_transfer".to_owned(), t.to_owned()),
+                ("color_primaries".to_owned(), p.to_owned()),
+                ("color_space".to_owned(), s.to_owned()),
+            ]
+        };
+        assert_eq!(check_bt709(&tagged("bt709", "bt709", "bt709")), Ok(()));
+
+        let why = check_bt709(&tagged("smpte2084", "bt2020", "bt2020nc"))
+            .expect_err("PQ output must be rejected");
+        assert!(why.contains("color_transfer=smpte2084"), "{why}");
+
+        // Absent is not "fine": nothing proved the output is SDR-tagged.
+        let why = check_bt709(&[("color_transfer".to_owned(), "bt709".to_owned())])
+            .expect_err("a missing tag must be rejected");
+        assert!(why.contains("color_primaries=,"), "{why}");
+        assert!(check_bt709(&[]).is_err());
+    }
+
+    /// ffprobe writes warnings and section markers on the same stream, and a
+    /// killed run ends mid-line. A tag that did not arrive must be *absent*,
+    /// because `check_bt709` reads absence as "not proven".
+    #[test]
+    fn stream_entries_survive_noise_and_truncation() {
+        let entries = parse_stream_entries(
+            "color_transfer=bt709\n\
+             [STREAM]\n\
+             color_primaries = bt709 \n\
+             color_spa",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("color_transfer".to_owned(), "bt709".to_owned()),
+                ("color_primaries".to_owned(), "bt709".to_owned()),
+            ]
+        );
+        // And the truncated run therefore fails rather than passing on two
+        // tags out of three.
+        assert!(check_bt709(&entries).is_err());
+        assert!(parse_stream_entries("").is_empty());
+    }
+
+    /// A gray screen and an empty file must not score alike: an unmeasurable
+    /// output is an error, never a sample of zeros.
+    #[test]
+    fn signalstats_averages_frames_and_refuses_an_empty_output() {
+        let (y, u, v) = parse_signal_stats("100,130,120\n200,140,140\n").expect("two frames");
+        assert!((y - 150.0).abs() < 1e-9, "{y}");
+        assert!((u - 135.0).abs() < 1e-9, "{u}");
+        assert!((v - 130.0).abs() < 1e-9, "{v}");
+
+        // A truncated final row carries fewer than three numbers and is
+        // skipped — read as zeros it would drag the mean towards black and
+        // report a good picture as clipped.
+        let (y, _, _) = parse_signal_stats("100,130,120\n200,140,140\n90,13").expect("two frames");
+        assert!(
+            (y - 150.0).abs() < 1e-9,
+            "the partial row must not count: {y}"
+        );
+
+        for empty in ["", "\n\n", "N/A,N/A,N/A\n"] {
+            let why = parse_signal_stats(empty).expect_err("nothing to measure");
+            assert!(why.contains("output is empty"), "{empty:?}: {why}");
+        }
+    }
+
+    /// The rejection sent to the report is ffmpeg's own first complaint, not
+    /// the last line of its banner.
+    #[test]
+    fn a_failure_is_reported_as_ffmpegs_first_complaint() {
+        assert_eq!(
+            first_line("\n  \n[vf#0:0] No such filter: 'zscale'\nError opening filters\n"),
+            "[vf#0:0] No such filter: 'zscale'"
+        );
+        assert_eq!(first_line(""), "no error output");
+        assert_eq!(first_line("   \n\t\n"), "no error output");
     }
 
     #[test]

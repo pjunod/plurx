@@ -8,20 +8,23 @@
 
 use plurx_core::transcode::Pacing;
 
+/// An override wins only when it names something. An empty `PLURX_FFMPEG=` is
+/// what a Compose file produces for an unset variable, and treating that as a
+/// binary called "" would fail every spawn with a confusing ENOENT.
+fn resolve_bin(override_value: Option<String>, fallback: &str) -> String {
+    override_value
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 /// ffmpeg binary, overridable via `PLURX_FFMPEG` (jellyfin-ffmpeg / pinned path).
 pub fn ffmpeg_bin() -> String {
-    std::env::var("PLURX_FFMPEG")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_owned())
+    resolve_bin(std::env::var("PLURX_FFMPEG").ok(), "ffmpeg")
 }
 
 /// ffprobe binary, overridable via `PLURX_FFPROBE` (jellyfin-ffmpeg / pinned).
 pub fn ffprobe_bin() -> String {
-    std::env::var("PLURX_FFPROBE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ffprobe".to_owned())
+    resolve_bin(std::env::var("PLURX_FFPROBE").ok(), "ffprobe")
 }
 
 /// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
@@ -43,6 +46,59 @@ fn declares_bsf(list: &str, name: &str) -> bool {
     list.lines().any(|l| l.trim() == name)
 }
 
+/// Help and filter listings go to stdout on modern builds and to stderr on
+/// older ones, so every question here is asked of both.
+fn merged_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(stderr));
+    text
+}
+
+/// Ask this ffmpeg one question and hand back what it said.
+///
+/// The thin shell around the subprocess: everything that *decides* anything
+/// from the answer is a pure function below, so a missing binary and a build
+/// without a feature are classified by tested code rather than by the spawn.
+async fn probe_ffmpeg(args: &[&str]) -> Result<String, String> {
+    match tokio::process::Command::new(ffmpeg_bin())
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(out) => Ok(merged_output(&out.stdout, &out.stderr)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Classify a `-bsfs` listing, including the case where it never arrived.
+///
+/// A build that could not be asked is treated exactly like one that answered
+/// "no": the remux path must not attempt a filter it has no evidence for.
+fn dovi_from_probe(probe: Result<String, String>) -> bool {
+    let found = match &probe {
+        Ok(list) => declares_bsf(list, "dovi_rpu"),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not probe ffmpeg for bitstream filters");
+            false
+        }
+    };
+    if found {
+        tracing::info!(
+            "ffmpeg has dovi_rpu: Dolby Vision sources remux to their HDR10 base \
+             for browsers that cannot decode DV"
+        );
+    } else {
+        tracing::warn!(
+            "this ffmpeg has no dovi_rpu bitstream filter (added in 7.1), so a Dolby \
+             Vision configuration cannot be removed from a remux — browsers that \
+             don't decode DV (Chrome does not; Safari does) will be given a \
+             re-encode instead of the source video. Upgrade ffmpeg to 7.1+ to \
+             stream those files untouched"
+        );
+    }
+    found
+}
+
 /// Can this ffmpeg strip a Dolby Vision configuration (`dovi_rpu`, added in
 /// 7.1)?
 ///
@@ -56,38 +112,7 @@ fn declares_bsf(list: &str, name: &str) -> bool {
 /// verified against a live probe).
 pub async fn has_dovi_rpu() -> bool {
     *DOVI_RPU
-        .get_or_init(|| async {
-            let out = tokio::process::Command::new(ffmpeg_bin())
-                .args(["-hide_banner", "-bsfs"])
-                .output()
-                .await;
-            let found = match out {
-                Ok(o) => {
-                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    declares_bsf(&text, "dovi_rpu")
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not probe ffmpeg for bitstream filters");
-                    false
-                }
-            };
-            if found {
-                tracing::info!(
-                    "ffmpeg has dovi_rpu: Dolby Vision sources remux to their HDR10 base \
-                     for browsers that cannot decode DV"
-                );
-            } else {
-                tracing::warn!(
-                    "this ffmpeg has no dovi_rpu bitstream filter (added in 7.1), so a Dolby \
-                     Vision configuration cannot be removed from a remux — browsers that \
-                     don't decode DV (Chrome does not; Safari does) will be given a \
-                     re-encode instead of the source video. Upgrade ffmpeg to 7.1+ to \
-                     stream those files untouched"
-                );
-            }
-            found
-        })
+        .get_or_init(|| async { dovi_from_probe(probe_ffmpeg(&["-hide_banner", "-bsfs"]).await) })
         .await
 }
 
@@ -112,46 +137,42 @@ fn parse_pacing_caps(help: &str) -> PacingCaps {
     }
 }
 
+/// Classify a `-h full` listing, including the case where it never arrived.
+fn pacing_from_probe(probe: Result<String, String>) -> PacingCaps {
+    let caps = match &probe {
+        Ok(help) => parse_pacing_caps(help),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not probe ffmpeg for pacing support");
+            PacingCaps::default()
+        }
+    };
+    if !caps.readrate {
+        tracing::warn!(
+            "this ffmpeg has no -readrate; remux streams will run unpaced and can \
+             saturate a client's link, and HLS sessions fall back to realtime pacing \
+             (which cannot build a playback buffer). ffmpeg 6.1+ is recommended."
+        );
+    } else if !caps.initial_burst {
+        // WARN, not info, since the publish gate raised the stakes: a
+        // copy session's first playlist waits for COPY_PUBLISH_GATE_SECS
+        // of media, and without a burst that cushion is produced at the
+        // flat paced rate instead of at I/O speed — at the default 2x,
+        // that alone is ~6+ seconds of every time-to-first-frame, and
+        // it is invisible unless something names it.
+        tracing::warn!(
+            "this ffmpeg has -readrate but not -readrate_initial_burst (needs 6.1+; \
+             jellyfin-ffmpeg7 has it): sessions are paced flat from the first byte, \
+             so the copy path's publish gate fills at the paced rate instead of at \
+             I/O speed and every play starts seconds slower than it needs to"
+        );
+    }
+    caps
+}
+
 pub async fn pacing_caps() -> PacingCaps {
     *PACING
         .get_or_init(|| async {
-            let out = tokio::process::Command::new(ffmpeg_bin())
-                .args(["-hide_banner", "-h", "full"])
-                .output()
-                .await;
-            let caps = match out {
-                Ok(o) => {
-                    // Help goes to stdout, but older builds split it; check both.
-                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    parse_pacing_caps(&text)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not probe ffmpeg for pacing support");
-                    PacingCaps::default()
-                }
-            };
-            if !caps.readrate {
-                tracing::warn!(
-                    "this ffmpeg has no -readrate; remux streams will run unpaced and can \
-                     saturate a client's link, and HLS sessions fall back to realtime pacing \
-                     (which cannot build a playback buffer). ffmpeg 6.1+ is recommended."
-                );
-            } else if !caps.initial_burst {
-                // WARN, not info, since the publish gate raised the stakes: a
-                // copy session's first playlist waits for COPY_PUBLISH_GATE_SECS
-                // of media, and without a burst that cushion is produced at the
-                // flat paced rate instead of at I/O speed — at the default 2x,
-                // that alone is ~6+ seconds of every time-to-first-frame, and
-                // it is invisible unless something names it.
-                tracing::warn!(
-                    "this ffmpeg has -readrate but not -readrate_initial_burst (needs 6.1+; \
-                     jellyfin-ffmpeg7 has it): sessions are paced flat from the first byte, \
-                     so the copy path's publish gate fills at the paced rate instead of at \
-                     I/O speed and every play starts seconds slower than it needs to"
-                );
-            }
-            caps
+            pacing_from_probe(probe_ffmpeg(&["-hide_banner", "-h", "full"]).await)
         })
         .await
 }
@@ -187,6 +208,96 @@ impl PacingCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Compose file with an unset variable hands the process `PLURX_FFMPEG=`,
+    /// and spawning a binary named "" fails with an ENOENT that names nothing.
+    #[test]
+    fn an_empty_override_is_not_a_binary_name() {
+        assert_eq!(resolve_bin(None, "ffmpeg"), "ffmpeg");
+        assert_eq!(resolve_bin(Some(String::new()), "ffprobe"), "ffprobe");
+        assert_eq!(
+            resolve_bin(Some("/opt/jellyfin-ffmpeg/ffmpeg".to_owned()), "ffmpeg"),
+            "/opt/jellyfin-ffmpeg/ffmpeg"
+        );
+    }
+
+    /// Older builds print help and listings to stderr, so a probe that read
+    /// stdout alone would report every capability as absent on them.
+    #[test]
+    fn a_probe_reads_both_streams() {
+        assert_eq!(merged_output(b"out\n", b"err\n"), "out\nerr\n");
+        // Invalid UTF-8 is replaced rather than dropped: a lossy byte must not
+        // take the rest of the listing with it.
+        assert!(merged_output(&[0xff, b'\n'], b"dovi_rpu\n").ends_with("dovi_rpu\n"));
+    }
+
+    /// `-bsfs` lists exactly one filter per line. A substring search would
+    /// claim `dovi_rpu` on any build whose listing merely mentions it — and
+    /// then every Dolby Vision remux would fail at session start.
+    #[test]
+    fn a_bitstream_filter_is_matched_on_a_whole_line() {
+        let listing = "Bitstream filters:\n  h264_mp4toannexb\n  dovi_rpu\n  hevc_metadata\n";
+        assert!(declares_bsf(listing, "dovi_rpu"));
+        assert!(!declares_bsf(listing, "av1_metadata"));
+        // The failure the whole-line rule exists for.
+        assert!(!declares_bsf(
+            "  hevc_metadata (see also dovi_rpu)\n",
+            "dovi_rpu"
+        ));
+    }
+
+    /// A build that could not be asked must be classified exactly like one
+    /// that answered "no". Reporting the capability on a failed probe would
+    /// send every DV remux at a bitstream filter that is not there.
+    #[test]
+    fn an_unprobeable_ffmpeg_has_no_dovi_filter() {
+        assert!(dovi_from_probe(Ok("  dovi_rpu\n".to_owned())));
+        assert!(!dovi_from_probe(Ok("  hevc_metadata\n".to_owned())));
+        assert!(!dovi_from_probe(Err(
+            "No such file or directory (os error 2)".to_owned()
+        )));
+        // Truncated output — the spawn succeeded but the listing was cut off
+        // mid-name. Half a filter name is not a filter.
+        assert!(!dovi_from_probe(Ok(
+            "Bitstream filters:\n  dovi_r".to_owned()
+        )));
+    }
+
+    /// Same rule for pacing: an ffmpeg that could not be probed gets the
+    /// pre-5.1 answer, because passing `-readrate` to a build without it is a
+    /// hard exit rather than a warning.
+    #[test]
+    fn an_unprobeable_ffmpeg_gets_the_conservative_pacing_answer() {
+        let modern =
+            pacing_from_probe(Ok("  -readrate x\n  -readrate_initial_burst y\n".to_owned()));
+        assert!(modern.readrate && modern.initial_burst);
+
+        let failed = pacing_from_probe(Err("Permission denied (os error 13)".to_owned()));
+        assert!(!failed.readrate, "a failed probe must not claim -readrate");
+        assert!(!failed.initial_burst);
+        // And the conservative answer must survive into the flags: nothing is
+        // emitted for a transcode, `-re` for the copy path.
+        assert!(failed.resolve(2.0, 90.0, false).args().is_empty());
+    }
+
+    /// The 5.1–6.0 middle build, classified through the probe rather than the
+    /// parser: it keeps `-readrate` and loses only the burst clause. Worth
+    /// pinning separately because this is the build where the publish gate
+    /// fills at the paced rate — the flags must still carry the rate, since
+    /// degrading the whole thing to `-re` would unpace every session on it.
+    #[test]
+    fn a_build_with_readrate_but_no_burst_keeps_its_rate() {
+        let caps = pacing_from_probe(Ok(
+            "  -readrate speed     read input at specified rate\n".to_owned()
+        ));
+        assert!(caps.readrate, "5.1+ declares -readrate");
+        assert!(!caps.initial_burst, "the burst clause arrives in 6.1");
+        assert_eq!(
+            caps.resolve(2.0, 90.0, true).args(),
+            vec!["-readrate", "2.00"],
+            "the rate survives; only the burst is dropped"
+        );
+    }
 
     #[test]
     fn pacing_caps_come_from_the_help_text() {
