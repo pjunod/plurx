@@ -120,6 +120,26 @@ bump may break compatibility and a **patch** bump never does.
   120-second shaping fixture is opt-in and built only for the suite that plays
   it.
 
+- **Performance II N4.2 adds privacy-bounded network memory for Auto quality.**
+  The default-off `playback.network_priors` setting lets N0 client telemetry
+  maintain a 25% sustained-throughput EWMA and lowest starved rung per user,
+  fixed client class, and IPv4 `/24`; full addresses never enter storage,
+  logs, or responses. SQLite v19 and each Hiqlite voter's node-local sidecar
+  retain the aggregate for 30 days and cap each user/client class at 64
+  networks, so another voter deliberately starts cold without a replicated
+  schema or protocol bump. The client class comes from the request's own
+  `User-Agent` on every path, reporting and consulting alike, so a prior cannot
+  be written under one key and read under another. Decision and session-create
+  responses add optional `prior_kbps`, and server-side Auto keeps its old
+  answer without a prior; with one it applies both signals and takes the lower
+  rung, starting below known starvation and within proven throughput. A
+  starvation verdict stops binding 7 days after the stall that recorded it, so
+  one transient dropout cannot cap a link for the row's lifetime, and any
+  further starvation re-arms it. `docs/OPERATIONS.md` documents the setting,
+  its bounds, and what `telemetry.retain_days = 0` does and does not disable
+  once priors are on. The web controller, normalized reopen contract, and
+  native client changes remain separate N4 work.
+
 - **TV episode lists and details now name the media they will open.** Season
   detail responses attach each episode's best-file resolution and HDR facts in
   one batched query, so the Apple season shelf can show a compact resolution +

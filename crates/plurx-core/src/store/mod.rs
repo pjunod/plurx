@@ -45,10 +45,10 @@ use async_trait::async_trait;
 
 use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
-    MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
-    OfflineActivityPackage, OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage,
-    OfflinePackageStats, PlaybackEvent, PlaybackEventQuery, ProbeResult, RecentItem, TraktAuth,
-    User, WatchRollup, WatchState,
+    MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
+    NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, PlaybackEvent, PlaybackEventQuery,
+    ProbeResult, RecentItem, TraktAuth, User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -124,9 +124,16 @@ pub mod keys {
     /// This is deliberately on by default: it is bounded local bookkeeping and
     /// the measurement referee for every Performance II milestone.
     pub const TELEMETRY_RETAIN_DAYS: &str = "telemetry.retain_days";
+    /// Opt-in node-local network history used to seed Auto quality. Missing
+    /// and every value other than `"1"` are off.
+    pub const PLAYBACK_NETWORK_PRIORS: &str = "playback.network_priors";
     /// Last successful bounded telemetry-prune pass, in unix seconds.
     pub const JOB_LAST_TELEMETRY_PRUNE: &str = "jobs.last_telemetry_prune";
     pub const TELEMETRY_RETAIN_DEFAULT_DAYS: i64 = 30;
+    /// Fixed retention for the aggregate network-prior rows. The feature is
+    /// opt-in and cardinality-bounded as well; this age bound prevents old
+    /// networks from surviving indefinitely while it remains enabled.
+    pub const NETWORK_PRIOR_RETAIN_DAYS: i64 = 30;
     /// Default artwork-retry interval, in minutes. Half-hourly: often enough
     /// that a scan interrupted by a TMDB blip repairs itself while the user is
     /// still watching that evening, rare enough to be invisible to TMDB.
@@ -1060,6 +1067,25 @@ pub trait PlaybackTelemetryStore: Send + Sync + 'static {
     ) -> Result<Vec<PlaybackEvent>, StoreError>;
 }
 
+/// Bounded node-local network history derived from playback telemetry.
+///
+/// Like [`PlaybackTelemetryStore`], this data must not pass through Raft: a
+/// prior describes the network observed by one server node.
+#[async_trait]
+pub trait NetworkPriorStore: Send + Sync + 'static {
+    async fn observe_network_prior(
+        &self,
+        observation: &NetworkPriorObservation,
+    ) -> Result<NetworkPrior, StoreError>;
+    async fn network_prior(
+        &self,
+        user_id: i64,
+        client_class: &str,
+        network_fingerprint: &str,
+    ) -> Result<Option<NetworkPrior>, StoreError>;
+    async fn prune_network_priors(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -1073,6 +1099,7 @@ pub trait Store:
     + TranscodeCacheStore
     + OfflinePackageStore
     + PlaybackTelemetryStore
+    + NetworkPriorStore
     + Send
     + Sync
     + 'static
@@ -1091,6 +1118,7 @@ impl<T> Store for T where
         + TranscodeCacheStore
         + OfflinePackageStore
         + PlaybackTelemetryStore
+        + NetworkPriorStore
         + Send
         + Sync
         + 'static

@@ -439,12 +439,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let (drain_started, drain_signal) = tokio::sync::oneshot::channel();
     // `WithGracefulShutdown` is IntoFuture rather than Future, and select!
     // needs the future itself to poll it more than once.
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = drain_started.send(());
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = drain_started.send(());
+    })
+    .into_future();
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => {

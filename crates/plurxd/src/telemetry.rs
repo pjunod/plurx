@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use plurx_core::domain::PlaybackEvent;
+use plurx_core::domain::{NetworkPriorObservation, PlaybackEvent};
 use plurx_core::store::{keys, Store};
 
 const TTFF_BUCKETS: [i64; 8] = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
@@ -231,12 +231,30 @@ fn render_counters<const N: usize>(
 
 static METRICS: LazyLock<PlaybackMetrics> = LazyLock::new(PlaybackMetrics::new);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NetworkIdentity {
+    pub(crate) client_class: String,
+    pub(crate) network_fingerprint: String,
+}
+
 /// Record metrics and persist an event without delaying the caller. The
 /// retention setting is read inside the task so setting `0` makes this a true
 /// no-op while HTTP ingest can still return its existing 204 immediately.
 pub fn emit(store: Arc<dyn Store>, event: PlaybackEvent) {
+    emit_with_network(store, event, None);
+}
+
+/// Persist the N0 event and, independently when opted in, fold its bounded
+/// network measurement into the matching prior. Keeping the two switches
+/// independent means an operator may retain only the aggregate prior without
+/// retaining raw playback events.
+pub(crate) fn emit_with_network(
+    store: Arc<dyn Store>,
+    event: PlaybackEvent,
+    network: Option<NetworkIdentity>,
+) {
     tokio::spawn(async move {
-        let enabled = store
+        let telemetry_enabled = store
             .get_setting(keys::TELEMETRY_RETAIN_DAYS)
             .await
             .ok()
@@ -244,14 +262,73 @@ pub fn emit(store: Arc<dyn Store>, event: PlaybackEvent) {
             .and_then(|value| value.trim().parse::<i64>().ok())
             .unwrap_or(keys::TELEMETRY_RETAIN_DEFAULT_DAYS)
             > 0;
-        if !enabled {
-            return;
+        let priors_enabled = if network.is_some() {
+            store
+                .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|value| value.trim() == "1")
+        } else {
+            false
+        };
+
+        if telemetry_enabled {
+            METRICS.record(&event);
+            if let Err(error) = store.record_playback_event(&event).await {
+                tracing::warn!(%error, event = %event.event, "recording playback telemetry failed");
+            }
         }
-        METRICS.record(&event);
-        if let Err(error) = store.record_playback_event(&event).await {
-            tracing::warn!(%error, event = %event.event, "recording playback telemetry failed");
+
+        if priors_enabled {
+            if let Some(observation) = prior_observation(&event, network.as_ref()) {
+                if let Err(error) = store.observe_network_prior(&observation).await {
+                    tracing::warn!(%error, event = %event.event, "updating network prior failed");
+                }
+            }
         }
     });
+}
+
+fn prior_observation(
+    event: &PlaybackEvent,
+    network: Option<&NetworkIdentity>,
+) -> Option<NetworkPriorObservation> {
+    let network = network?;
+    let user_id = event.user_id.filter(|value| *value > 0)?;
+    let client_kbps = event
+        .bandwidth_kbps
+        .filter(|value| *value > 0)
+        .map(|value| u32::try_from(value).unwrap_or(u32::MAX));
+    let delivered_kbps = event
+        .delivered_bps
+        .filter(|value| *value > 0)
+        .map(|value| u32::try_from(value / 1_000).unwrap_or(u32::MAX));
+    let throughput_kbps = match (client_kbps, delivered_kbps) {
+        (Some(client), Some(delivered)) => Some(client.min(delivered)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    let detail = event.detail.as_deref().unwrap_or_default();
+    let starved = event.event == "stall"
+        && (detail.contains("supply")
+            || detail.contains("network")
+            || detail.contains("blocked")
+            || detail.contains("kind=buffering")
+            || event.runway_ds.is_some_and(|runway_ds| runway_ds <= 15));
+    let starved_rung_height = if starved {
+        event.height.filter(|height| *height > 0)
+    } else {
+        None
+    };
+    (throughput_kbps.is_some() || starved_rung_height.is_some()).then(|| NetworkPriorObservation {
+        user_id,
+        client_class: network.client_class.clone(),
+        network_fingerprint: network.network_fingerprint.clone(),
+        throughput_kbps,
+        starved_rung_height,
+        observed_at_ms: event.at_unix_ms,
+    })
 }
 
 pub fn prometheus() -> String {
@@ -307,5 +384,37 @@ mod tests {
         assert!(!text.contains("title="));
         assert!(!text.contains("user="));
         assert!(!text.contains("path="));
+    }
+
+    #[test]
+    fn prior_observation_uses_conservative_throughput_and_supply_stalls_only() {
+        let network = NetworkIdentity {
+            client_class: "chrome".to_owned(),
+            network_fingerprint: "192.0.2.0/24".to_owned(),
+        };
+        let event = PlaybackEvent {
+            at_unix_ms: 123,
+            user_id: Some(4),
+            event: "stall".to_owned(),
+            height: Some(720),
+            bandwidth_kbps: Some(8_000),
+            delivered_bps: Some(5_000_000),
+            detail: Some("supply:empty".to_owned()),
+            ..PlaybackEvent::default()
+        };
+        let observation = prior_observation(&event, Some(&network)).expect("observation");
+        assert_eq!(observation.throughput_kbps, Some(5_000));
+        assert_eq!(observation.starved_rung_height, Some(720));
+        assert_eq!(observation.observed_at_ms, 123);
+
+        let mut decode = event;
+        decode.detail = Some("decode:late_frames".to_owned());
+        let observation = prior_observation(&decode, Some(&network)).expect("throughput remains");
+        assert_eq!(observation.starved_rung_height, None);
+
+        decode.height = None;
+        let observation = prior_observation(&decode, Some(&network))
+            .expect("a throughput sample does not require a rung");
+        assert_eq!(observation.throughput_kbps, Some(5_000));
     }
 }
