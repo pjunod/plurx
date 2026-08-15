@@ -6,12 +6,12 @@
 //! turns one person's stream into two people's stutter. OPERATIONS has warned
 //! about this since Phase 2 with no mechanism behind the warning.
 //!
-//! The cap is a count with an atomic acquire, not a scan under the sessions
-//! lock. The property that matters is that two starts racing cannot both see
-//! the same free slot, and a compare-and-swap gives exactly that without
-//! introducing a second lock to order against the first. Leaking is the real
-//! risk with a counter, so the slot is a guard: whoever holds it releases it by
-//! being dropped, and a session owns its slot for its whole life — killed,
+//! The cap and its live/background ownership are one small state transition,
+//! not a scan under the sessions lock. The property that matters is that two
+//! starts racing cannot both see the same free slot, and that background
+//! acquisition cannot cross a live waiter's registration. Leaking is the real
+//! risk with counters, so every slot is a guard: whoever holds it releases it
+//! by being dropped, and a session owns its slot for its whole life — killed,
 //! reaped, superseded or finished, the slot comes back the same way.
 //!
 //! What happens when the cap is full is the interesting half, and the answer is
@@ -31,7 +31,6 @@
 //! nothing else.)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use plurx_core::domain::MediaFile;
@@ -61,9 +60,62 @@ pub enum Priority {
     /// Somebody pressed play and is looking at a spinner.
     Live,
     /// The pre-transcode producer. Takes what is spare, gives it back the
-    /// moment a live start wants it, and does not take it again until that
-    /// start has been served.
+    /// moment a live start wants it, and does not take it again until every
+    /// live encoder permit has been released.
     Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermitOwner {
+    Live,
+    Background,
+}
+
+impl From<Priority> for PermitOwner {
+    fn from(priority: Priority) -> Self {
+        match priority {
+            Priority::Live => PermitOwner::Live,
+            Priority::Background => PermitOwner::Background,
+        }
+    }
+}
+
+/// Ownership is one state machine, not several counters sampled in sequence.
+///
+/// The distinction is what makes the priority policy durable. A live waiter
+/// blocks new background permits, an existing background permit blocks the
+/// live encoder until that worker has actually terminated, and a live permit
+/// keeps background work parked after the waiter itself has gone away. Keeping
+/// both hardware and software ownership under this small synchronous mutex also
+/// closes the registration race: no caller can observe half of a transition
+/// between the two pools.
+#[derive(Debug, Default)]
+struct PermitState {
+    live_waiting: usize,
+    hardware_live: usize,
+    hardware_background: usize,
+    software_live_permits: usize,
+    software_background_permits: usize,
+    software_live_used: usize,
+    software_background_used: usize,
+}
+
+impl PermitState {
+    fn live_active(&self) -> bool {
+        self.hardware_live > 0 || self.software_live_permits > 0
+    }
+
+    fn background_active(&self) -> bool {
+        self.hardware_background > 0 || self.software_background_permits > 0
+    }
+
+    fn hardware_used(&self) -> usize {
+        self.hardware_live + self.hardware_background
+    }
+
+    fn software_used(&self) -> usize {
+        self.software_live_used + self.software_background_used
+    }
 }
 
 /// A held hardware slot. Releases on drop — which is what keeps the count
@@ -71,12 +123,26 @@ pub enum Priority {
 /// remembers to write a branch for.
 #[derive(Debug)]
 pub struct HwSlot {
-    held: Arc<AtomicUsize>,
+    permits: Arc<Mutex<PermitState>>,
+    owner: PermitOwner,
 }
 
 impl Drop for HwSlot {
     fn drop(&mut self) {
-        self.held.fetch_sub(1, Ordering::AcqRel);
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.owner {
+            PermitOwner::Live => {
+                debug_assert!(permits.hardware_live > 0);
+                permits.hardware_live = permits.hardware_live.saturating_sub(1);
+            }
+            PermitOwner::Background => {
+                debug_assert!(permits.hardware_background > 0);
+                permits.hardware_background = permits.hardware_background.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -84,7 +150,8 @@ impl Drop for HwSlot {
 /// Releases its weight on drop, for the same reason [`HwSlot`] does.
 #[derive(Debug)]
 pub struct SwPermit {
-    used: Arc<AtomicUsize>,
+    permits: Arc<Mutex<PermitState>>,
+    owner: PermitOwner,
     weight: usize,
 }
 
@@ -98,16 +165,35 @@ impl SwPermit {
 
 impl Drop for SwPermit {
     fn drop(&mut self) {
-        self.used.fetch_sub(self.weight, Ordering::AcqRel);
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.owner {
+            PermitOwner::Live => {
+                debug_assert!(permits.software_live_permits > 0);
+                debug_assert!(permits.software_live_used >= self.weight);
+                permits.software_live_permits = permits.software_live_permits.saturating_sub(1);
+                permits.software_live_used = permits.software_live_used.saturating_sub(self.weight);
+            }
+            PermitOwner::Background => {
+                debug_assert!(permits.software_background_permits > 0);
+                debug_assert!(permits.software_background_used >= self.weight);
+                permits.software_background_permits =
+                    permits.software_background_permits.saturating_sub(1);
+                permits.software_background_used =
+                    permits.software_background_used.saturating_sub(self.weight);
+            }
+        }
     }
 }
 
-/// A cloneable handle on the software CPU pool's counter, so a task that has
+/// A cloneable handle on the software CPU pool's permits, so a task that has
 /// no reach back to [`Admissions`] — the stall watchdog's one-step downgrade
 /// runs in a detached task — can still take the permit its fallback owes.
 #[derive(Debug, Clone)]
 pub struct SwPool {
-    used: Arc<AtomicUsize>,
+    permits: Arc<Mutex<PermitState>>,
 }
 
 impl SwPool {
@@ -115,27 +201,38 @@ impl SwPool {
     /// empty pool always grants, whatever the weight. On a 2-core box every
     /// session is over budget, and refusing all of them would turn the budget
     /// into a ban; one saturating session is the best that box can do.
-    fn try_take(&self, budget: usize, weight: usize) -> Option<SwPermit> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            if used > 0 && used + weight > budget {
+    fn try_take(&self, budget: usize, weight: usize, priority: Priority) -> Option<SwPermit> {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match priority {
+            Priority::Live if permits.background_active() => return None,
+            Priority::Background if permits.live_waiting > 0 || permits.live_active() => {
                 return None;
             }
-            match self.used.compare_exchange_weak(
-                used,
-                used + weight,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(SwPermit {
-                        used: Arc::clone(&self.used),
-                        weight,
-                    })
-                }
-                Err(actual) => used = actual,
+            _ => {}
+        }
+        let used = permits.software_used();
+        if used > 0 && used + weight > budget {
+            return None;
+        }
+        match priority {
+            Priority::Live => {
+                permits.software_live_permits += 1;
+                permits.software_live_used += weight;
+            }
+            Priority::Background => {
+                permits.software_background_permits += 1;
+                permits.software_background_used += weight;
             }
         }
+        drop(permits);
+        Some(SwPermit {
+            permits: Arc::clone(&self.permits),
+            owner: priority.into(),
+            weight,
+        })
     }
 
     /// Take `weight` threads unconditionally. For the hardware→software
@@ -144,9 +241,16 @@ impl SwPool {
     /// stall. Overcommit is recorded (the pool goes over budget, and every
     /// later `try_take` sees it) rather than hidden.
     pub fn take_forced(&self, weight: usize) -> SwPermit {
-        self.used.fetch_add(weight, Ordering::AcqRel);
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        permits.software_live_permits += 1;
+        permits.software_live_used += weight;
+        drop(permits);
         SwPermit {
-            used: Arc::clone(&self.used),
+            permits: Arc::clone(&self.permits),
+            owner: PermitOwner::Live,
             weight,
         }
     }
@@ -161,12 +265,17 @@ impl SwPool {
 /// producer with nothing to do.
 #[derive(Debug)]
 pub struct LiveWait {
-    waiting: Arc<AtomicUsize>,
+    permits: Arc<Mutex<PermitState>>,
 }
 
 impl Drop for LiveWait {
     fn drop(&mut self) {
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(permits.live_waiting > 0);
+        permits.live_waiting = permits.live_waiting.saturating_sub(1);
     }
 }
 
@@ -178,6 +287,11 @@ pub enum Admission {
     /// Hardware is full, but this class of work has been measured running
     /// comfortably above realtime in software. Run it there.
     Software,
+    /// A background encoder still owns either pool. The live start must wait
+    /// for the producer to checkpoint and terminate even when its preferred
+    /// pool has nominal headroom; starting first would recreate the physical
+    /// GPU/CPU contention this priority boundary exists to prevent.
+    WaitingForBackground,
     /// Hardware is full and software would stall. Say so.
     Refused(String),
 }
@@ -193,10 +307,7 @@ impl PartialEq for HwSlot {
 /// actually run here.
 #[derive(Debug)]
 pub struct Admissions {
-    held: Arc<AtomicUsize>,
-    /// Live starts currently queuing for a slot. Read by background work,
-    /// which stands down while it is non-zero.
-    waiting: Arc<AtomicUsize>,
+    permits: Arc<Mutex<PermitState>>,
     /// Encoder threads the software pool has handed out. Software transcodes
     /// used to bypass admission entirely — each x264 process picked its own
     /// thread count, and several of them could oversubscribe every core on
@@ -217,23 +328,29 @@ impl Default for Admissions {
 
 impl Admissions {
     pub fn new() -> Admissions {
+        let permits = Arc::new(Mutex::new(PermitState::default()));
         Admissions {
-            held: Arc::new(AtomicUsize::new(0)),
-            waiting: Arc::new(AtomicUsize::new(0)),
             software: SwPool {
-                used: Arc::new(AtomicUsize::new(0)),
+                permits: Arc::clone(&permits),
             },
+            permits,
             measured: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn in_use(&self) -> usize {
-        self.held.load(Ordering::Acquire)
+        self.permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hardware_used()
     }
 
     /// Encoder threads currently reserved from the software pool.
     pub fn software_in_use(&self) -> usize {
-        self.software.used.load(Ordering::Acquire)
+        self.permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .software_used()
     }
 
     /// A handle a detached task can carry — see [`SwPool`].
@@ -243,70 +360,89 @@ impl Admissions {
 
     /// Take a software permit if the pool has room, against `budget` threads.
     ///
-    /// Background callers are refused outright while a live start is queuing,
-    /// exactly as they are for hardware slots — the pre-transcode producer
-    /// must not spend the cores a viewer is waiting on.
+    /// Background callers are refused while a live start is queuing or a live
+    /// encoder is active, exactly as they are for hardware slots. Live callers
+    /// likewise wait for existing background ownership to terminate before
+    /// crossing pools.
     pub fn try_admit_software(
         &self,
         budget: usize,
         weight: usize,
         priority: Priority,
     ) -> Option<SwPermit> {
-        if priority == Priority::Background && self.live_is_waiting() {
-            return None;
-        }
-        self.software.try_take(budget, weight)
+        self.software.try_take(budget, weight, priority)
     }
 
     /// Announce that a live start is queuing. Hold the guard for as long as the
     /// wait lasts; drop it the moment the start has a slot or has given up.
     pub fn wait_for_slot(&self) -> LiveWait {
-        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        permits.live_waiting += 1;
+        drop(permits);
         LiveWait {
-            waiting: Arc::clone(&self.waiting),
+            permits: Arc::clone(&self.permits),
         }
     }
 
     /// Is a live start queuing right now?
     ///
     /// Background work asks this on a short interval and, when the answer is
-    /// yes, checkpoints and terminates. It is the whole preemption protocol:
-    /// no signal to the producer, no registry of who holds what, nothing to
-    /// leak — just a count that a waiting start makes non-zero.
+    /// yes, checkpoints and terminates. It is the termination signal; durable
+    /// ownership after the handoff lives on the returned encoder permit.
     pub fn live_is_waiting(&self) -> bool {
-        self.waiting.load(Ordering::Acquire) > 0
+        self.permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live_waiting
+            > 0
     }
 
-    /// Take a slot if one is free. The CAS loop is what makes two racing
-    /// starts unable to both succeed on the last slot.
+    /// Does background work still own an encoder permit?
     ///
-    /// Background callers are refused outright while a live start is queuing,
-    /// which is the other half of preemption: without it a producer that had
-    /// just yielded could win the race back to its own slot and the waiter it
-    /// yielded to would keep waiting.
+    /// Live admission uses this to distinguish a producer that has not yet
+    /// honored preemption from ordinary configured-cap pressure. The former
+    /// must not be bypassed by falling across to the other pool.
+    pub fn background_is_active(&self) -> bool {
+        self.permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .background_active()
+    }
+
+    /// Take a slot if one is free. Capacity and owner change under the same
+    /// mutex, which makes two racing starts unable to both succeed on the last
+    /// slot and closes the waiter-registration/background-acquisition race.
+    ///
+    /// Background callers are refused while a live start is queuing or any
+    /// live permit remains. Live callers wait while background owns either
+    /// pool, even if this hardware counter has numerical headroom.
     pub fn try_acquire(&self, max: usize, priority: Priority) -> Option<HwSlot> {
-        if priority == Priority::Background && self.live_is_waiting() {
-            return None;
-        }
-        let mut held = self.held.load(Ordering::Acquire);
-        loop {
-            if held >= max {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match priority {
+            Priority::Live if permits.background_active() => return None,
+            Priority::Background if permits.live_waiting > 0 || permits.live_active() => {
                 return None;
             }
-            match self.held.compare_exchange_weak(
-                held,
-                held + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(HwSlot {
-                        held: Arc::clone(&self.held),
-                    })
-                }
-                Err(actual) => held = actual,
-            }
+            _ => {}
         }
+        if permits.hardware_used() >= max {
+            return None;
+        }
+        match priority {
+            Priority::Live => permits.hardware_live += 1,
+            Priority::Background => permits.hardware_background += 1,
+        }
+        drop(permits);
+        Some(HwSlot {
+            permits: Arc::clone(&self.permits),
+            owner: priority.into(),
+        })
     }
 
     /// Record what a running session actually achieved, so the next admission
@@ -338,6 +474,14 @@ impl Admissions {
     pub fn admit(&self, max: usize, work: Workload<'_>) -> Admission {
         if let Some(slot) = self.try_acquire(max, Priority::Live) {
             return Admission::Hardware(slot);
+        }
+        // `try_acquire` performs the authoritative owner check together with
+        // its capacity transition. Re-observe only to classify the refusal;
+        // in production the caller's LiveWait prevents a producer from
+        // appearing in this interval, while a producer that just released is
+        // safe to follow into the ordinary software decision.
+        if self.background_is_active() {
+            return Admission::WaitingForBackground;
         }
         match self.measured(&work.software_class()) {
             Some(speed) if speed >= SOFTWARE_SAFE_SPEED => Admission::Software,
@@ -468,6 +612,7 @@ pub fn software_budget() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn work(
         source_height: i64,
@@ -627,18 +772,107 @@ mod tests {
         );
     }
 
-    /// Background work takes what is spare. Nothing about that changes when
-    /// there is spare capacity — the priority only decides who loses.
+    /// A nominally spare hardware slot is not permission to overlap a live
+    /// start with background work on the same physical codec block. The
+    /// foreground waits for termination first, then acquires; its permit keeps
+    /// the producer out after the short-lived waiter is gone.
     #[test]
-    fn background_work_uses_a_free_slot_like_anything_else() {
+    fn hardware_background_yields_before_a_real_live_handoff_with_spare_capacity() {
         let a = Admissions::new();
-        let slot = a.try_acquire(2, Priority::Background).expect("spare");
+        let producer = a.try_acquire(2, Priority::Background).expect("spare");
         assert_eq!(a.in_use(), 1);
+        let live = {
+            let _queued = a.wait_for_slot();
+            assert_eq!(
+                a.admit(2, work(1080, "h264", None, 720)),
+                Admission::WaitingForBackground,
+                "a numerically free slot must not start beside the producer"
+            );
+            // `run_part` observes the waiter, checkpoints, terminates ffmpeg,
+            // and only then drops this permit.
+            drop(producer);
+            match a.admit(2, work(1080, "h264", None, 720)) {
+                Admission::Hardware(slot) => slot,
+                other => panic!("the foreground did not win the handoff: {other:?}"),
+            }
+        }; // the real start has returned; no waiter is being held by the test
+        assert!(!a.live_is_waiting());
         assert!(
-            a.try_acquire(2, Priority::Live).is_some(),
-            "a producer must not consume the headroom a viewer needs"
+            a.try_acquire(2, Priority::Background).is_none(),
+            "durable live ownership must keep the producer parked"
         );
-        drop(slot);
+        assert!(
+            a.try_admit_software(12, 1, Priority::Background).is_none(),
+            "background work cannot escape to software while hardware is live"
+        );
+        drop(live);
+        assert!(a.try_acquire(2, Priority::Background).is_some());
+    }
+
+    /// Software is the same priority boundary, not a fallback loophole. A
+    /// background x264 process must terminate before a live x264 process can
+    /// start even when both weights fit the configured pool.
+    #[test]
+    fn software_background_yields_before_live_and_stays_out_until_release() {
+        let a = Admissions::new();
+        let producer = a
+            .try_admit_software(12, 4, Priority::Background)
+            .expect("background fits");
+        let live = {
+            let _queued = a.wait_for_slot();
+            assert!(
+                a.try_admit_software(12, 4, Priority::Live).is_none(),
+                "spare threads do not bypass background preemption"
+            );
+            drop(producer);
+            a.try_admit_software(12, 4, Priority::Live)
+                .expect("live wins after producer termination")
+        };
+        assert!(!a.live_is_waiting());
+        assert!(
+            a.try_admit_software(12, 1, Priority::Background).is_none(),
+            "the producer must remain parked for the live session's lifetime"
+        );
+        assert!(
+            a.try_acquire(4, Priority::Background).is_none(),
+            "live software ownership also parks background hardware work"
+        );
+        drop(live);
+        assert!(a.try_admit_software(12, 1, Priority::Background).is_some());
+    }
+
+    /// Registration and background acquisition share one state transition.
+    /// Whichever wins a race is visible to the other: either the background
+    /// attempt is refused, or the live start waits for and then receives its
+    /// released permit. They can never both leave admission holding permits.
+    #[test]
+    fn a_background_acquisition_racing_waiter_registration_cannot_cross_the_handoff() {
+        let a = Arc::new(Admissions::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let background = {
+            let a = Arc::clone(&a);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                a.try_acquire(2, Priority::Background)
+            })
+        };
+        barrier.wait();
+        let _queued = a.wait_for_slot();
+        let raced = background.join().expect("background racer");
+        if raced.is_some() {
+            assert_eq!(
+                a.admit(2, work(1080, "h264", None, 720)),
+                Admission::WaitingForBackground
+            );
+        }
+        drop(raced);
+        let live = match a.admit(2, work(1080, "h264", None, 720)) {
+            Admission::Hardware(slot) => slot,
+            other => panic!("live did not acquire after the race settled: {other:?}"),
+        };
+        assert!(a.try_acquire(2, Priority::Background).is_none());
+        drop(live);
     }
 
     /// The preemption protocol, both halves. A queuing live start is the signal

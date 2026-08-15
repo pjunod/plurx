@@ -365,6 +365,12 @@ checks = ["web-static"]
 reason = "The retained web policy unit pins severe-pressure selection against fresh completed-fragment throughput and proves a duplicate supply signal cannot trigger a second restart at the ladder floor; restoring only the pre-correction controller ignores the fresh cliff sample and walks through an intermediate rung."
 
 [[coverage]]
+commits = ["b15c68984cbb7c9f483bd20d63f8c49a8c459f87"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained owner-aware hardware/software admission, bounded retryable 503, real producer handoff/resume, waiter-registration race, and RAII lifecycle regressions pin durable live-over-background transcode priority."
+
+[[coverage]]
 commits = ["4745dd7"]
 points = ["persistence.upgrades", "server.api"]
 checks = ["rust-gate"]
