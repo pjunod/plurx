@@ -148,6 +148,56 @@ fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
     drop(listener);
 }
 
+/// M2 treats configured cluster hosts as future M3 membership input.
+///
+/// Use documentation-only non-local addresses so this shipped-binary test
+/// exits at the injected post-start boundary only when both one-voter
+/// listeners replace those hosts with loopback. Preserving either configured
+/// host makes voter startup fail before the failpoint can fire.
+#[test]
+fn m2_ignores_explicit_non_loopback_cluster_listener_hosts() {
+    let root = tempfile::tempdir().expect("listener host fixture");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("data directory");
+    drop(SqliteStore::open(&data.join("plurx.db")).expect("legacy SQLite source"));
+
+    let config_path = root.path().join("plurx.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\n\
+             bind = \"127.0.0.1:{}\"\n\
+             [storage]\n\
+             data_dir = \"{}\"\n\
+             [cluster]\n\
+             raft_bind = \"192.0.2.40:{}\"\n\
+             api_bind = \"198.51.100.40:{}\"\n\
+             advertise_host = \"203.0.113.40\"\n",
+            free_port(),
+            toml_string(&data),
+            free_port(),
+            free_port(),
+        ),
+    )
+    .expect("listener host config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_plurxd"))
+        .args([
+            "--config",
+            config_path.to_str().expect("config path"),
+            "run",
+        ])
+        .env("PLURX_CLUSTER_ACTIVATION_FAILPOINT", "after-incoming")
+        .output()
+        .expect("run listener host regression");
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "configured M3 hosts reached M2 listener startup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The maintenance commands must reach TLS through the real binary.
 ///
 /// `rustls` panics rather than erroring when a process reaches TLS with no

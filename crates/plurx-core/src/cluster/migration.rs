@@ -790,13 +790,9 @@ fn inspect_sqlite_source(path: &Path) -> Result<(i64, String), StoreError> {
 // keeping an unreachable one here.
 #[cfg(feature = "hiqlite-store")]
 fn local_client_address(bind: SocketAddr) -> SocketAddr {
-    let ip = if bind.ip().is_unspecified() {
-        match bind.ip() {
-            IpAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
-            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        }
-    } else {
-        bind.ip()
+    let ip = match bind.ip() {
+        IpAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     };
     SocketAddr::new(ip, bind.port())
 }
@@ -1364,6 +1360,26 @@ fn migration_io(action: &str, path: &Path, error: std::io::Error) -> StoreError 
 mod tests {
     use super::*;
     use crate::store::{SettingsStore, SqliteStore};
+
+    /// M2 has no remote voter, so an operator's future-facing M3 host setting
+    /// must not expose either listener before membership exists. The port and
+    /// address family remain configurable so parallel and IPv6-only installs
+    /// still work.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn m2_listener_addresses_ignore_explicitly_configured_hosts() {
+        let configured_v4: SocketAddr = "192.0.2.40:32401".parse().expect("IPv4 bind");
+        assert_eq!(
+            local_client_address(configured_v4),
+            "127.0.0.1:32401".parse().expect("IPv4 loopback")
+        );
+
+        let configured_v6: SocketAddr = "[2001:db8::40]:32402".parse().expect("IPv6 bind");
+        assert_eq!(
+            local_client_address(configured_v6),
+            "[::1]:32402".parse().expect("IPv6 loopback")
+        );
+    }
 
     #[tokio::test]
     async fn backup_includes_committed_wal_state_and_removes_abandoned_incoming() {
