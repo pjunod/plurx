@@ -5105,6 +5105,148 @@ mod tests {
         );
     }
 
+    /// ffprobe reports a container's language tag verbatim, and muxers write
+    /// `JPN` as readily as `jpn`. Every surface that answers "which audio
+    /// track" must therefore fold case identically, or the server advertises a
+    /// default on the detail screen that playback then declines to use. The
+    /// shared predicate exists precisely so these cannot drift apart; this
+    /// test is what fails when a caller reintroduces its own inline match.
+    #[tokio::test]
+    async fn an_uppercase_language_tag_selects_the_same_audio_on_every_surface() {
+        use plurx_core::domain::{AudioStream, ProbeResult, SubtitleStream};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let dir =
+            std::env::temp_dir().join(format!("plurx-uppercase-lang-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("media dir");
+        let path = dir.join("Shouty Tags.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("media file");
+        let file = state
+            .store
+            .upsert_file(
+                seeded.movie,
+                &path.to_string_lossy(),
+                31,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(60_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "aac".into(),
+                            channels: Some(2),
+                            language: Some("eng".into()),
+                            default: true,
+                            ..Default::default()
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "aac".into(),
+                            channels: Some(2),
+                            // Upper case on purpose: this is the whole test.
+                            language: Some("JPN".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    subtitle_streams: vec![SubtitleStream {
+                        index: 0,
+                        codec: "subrip".into(),
+                        language: Some("eng".into()),
+                        ..Default::default()
+                    }],
+                    // Marks the row probed, which the offline path requires
+                    // before it will quote anything.
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("uppercase-tag file");
+
+        // The shared original-audio rule fires on `JPN`, so every surface must
+        // land on the Japanese track paired with the English subtitle — never
+        // on the container-default English audio with subtitles off.
+        let (status, detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", seeded.movie), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let shouty = detail["files"]
+            .as_array()
+            .expect("detail files")
+            .iter()
+            .find(|f| f["filename"] == "Shouty Tags.mp4")
+            .unwrap_or_else(|| panic!("missing uppercase-tag file: {detail}"));
+        assert_eq!(
+            shouty["playback_defaults"]["audio"]["selected_index"], 1,
+            "{shouty}"
+        );
+        assert_eq!(
+            shouty["playback_defaults"]["subtitle"]["selected_index"], 0,
+            "{shouty}"
+        );
+
+        let (status, decision) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{decision}");
+        // An unselected `/decision` keeps its historical shape and marks the
+        // policy default on the track itself rather than emitting `selection`.
+        let marked_default = |tracks: &str| -> Value {
+            decision[tracks]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tracks} array: {decision}"))
+                .iter()
+                .find(|track| track["default"] == true)
+                .map(|track| track["index"].clone())
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(
+            marked_default("audio"),
+            shouty["playback_defaults"]["audio"]["selected_index"],
+            "/decision disagreed with the detail screen about an uppercase tag: {decision}"
+        );
+        assert_eq!(
+            marked_default("subtitles"),
+            shouty["playback_defaults"]["subtitle"]["selected_index"],
+            "{decision}"
+        );
+
+        let (status, offline) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file}/offline-options"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{offline}");
+        assert_eq!(
+            offline["recommended_audio_index"],
+            shouty["playback_defaults"]["audio"]["selected_index"],
+            "the offline recommendation disagreed with the advertised default: {offline}"
+        );
+        assert_eq!(
+            offline["recommended_subtitle_index"],
+            shouty["playback_defaults"]["subtitle"]["selected_index"],
+            "{offline}"
+        );
+    }
+
     #[tokio::test]
     async fn item_detail_reports_policy_defaults_and_language_match_states() {
         use plurx_core::domain::{AudioStream, ProbeResult, SubtitleStream};
