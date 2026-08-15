@@ -806,6 +806,12 @@ two more years of evidence changed.
 
 ### 7.1 The web Auto controller — Phase 2, with restart-aware constants
 
+**Implementation status (2026-08-14):** implemented in the pure web playback
+policy and embedded-player wiring. The controller consumes the response
+ladder, persists a last-good rung, preserves hls.js's outgoing estimate,
+samples session health, and records each restart in the loading, toast, client
+log, and Stats surfaces. The scripted shaping run remains the acceptance gate.
+
 As designed in ADAPTIVE-QUALITY Phase 2 (pure `decideRung` function,
 5 s sampling of `hls.bandwidthEstimate` + stalls + runway + server
 `recent_speed`, severe-pressure one-move drop, cooldown on upgrades
@@ -855,8 +861,9 @@ matching prior; with one it applies both signals and takes the lower rung —
 below the lowest starved rung, and within the highest rung whose advertised
 peak fits the EWMA. The starvation verdict expires 7 days after the stall that
 recorded it so a transient dropout cannot cap a link permanently
-(`docs/ADAPTIVE-QUALITY.md` carries the recovery rule). The web controller does
-not consume the field yet; that remains in the N4 controller slice.
+(`docs/ADAPTIVE-QUALITY.md` carries the recovery rule). The web controller now
+uses the field for its opening rung and cold hls.js estimate; an outgoing live
+estimate wins on every replacement instance.
 
 The evidence for remembering networks is strong
 ([CS2P](https://users.ece.cmu.edu/~vsekar/assets/pdf/sigcomm16_cs2p.pdf):

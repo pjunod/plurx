@@ -44,9 +44,9 @@ estimate it is supposed to inform. It is a *window*, not a per-segment cap —
 advertised bandwidth must cover the measured peak over that window rather than
 the nominal target.
 
-What remains here is the ladder API itself: snapping `height` to the nearest
-rung, and returning the rungs (height + total kb/s, source-height filtered) in
-the session and decision responses so the client stops hardcoding them.
+The ladder API and its first web consumer are now in place: session creation
+snaps explicit heights, decision/session responses return the source-filtered
+rungs, and the player builds both its menu and Auto policy from those rows.
 
 ## The ladder
 
@@ -83,10 +83,10 @@ responses return the source-filtered ladder with nominal and advertised-peak
 kb/s. The advertised per-rung bandwidth covers the *measured* peak, not the
 nominal target.
 
-*Client*: consume the server ladder instead of the hardcoded `QUALITIES`
-list; add the missing 360p rung; show the active rung and its reason in
-the Stats overlay. The menu itself, persistence, and the restart machinery
-are done.
+*Client*: complete. The player consumes the server ladder instead of a
+hardcoded quality list, so 360p and any later server rung appear without a
+second client edit. The menu, persistence, restart machinery, active rung, and
+switch reason all use that one response.
 
 Effort: **small** — one sitting, still. Risk: low; every mechanism is
 already exercised elsewhere.
@@ -114,9 +114,9 @@ same encoder/source-capped height it returned before this feature. With one,
 both signals apply and the lower rung wins: a known-starved client starts below
 its lowest failed rung, and Auto then picks the highest rung whose advertised
 peak fits the EWMA, including the existing cap on a proven-fast LAN. Rows stay
-off Raft by design, so another cluster voter starts cold. The future web
-controller still has to seed hls.js and pick its opening rung from this field;
-no client behavior changed in this slice.
+off Raft by design, so another cluster voter starts cold. The web controller
+now seeds the first hls.js instance and picks its opening rung from this field;
+without it, hls.js retains its existing cold default.
 
 **A starvation verdict recovers.** It is the stronger signal — a known supply
 failure beats an EWMA collected during healthy playback — but it is not
@@ -138,6 +138,12 @@ upward half.
 
 ## Phase 2 — Auto (the actual feature; controller revised per review R3)
 
+**Implementation status (2026-08-14):** the web controller is implemented in
+the pure playback-policy module and sampled by the embedded player every 5 s.
+The constants below are the live defaults. The browser shaping run remains the
+acceptance evidence for a host on which Chrome can start; unit tests do not
+stand in for that run.
+
 A client-side controller, roughly 120 lines, extracted as a pure function so
 it unit-tests without a video element:
 
@@ -148,9 +154,11 @@ it unit-tests without a video element:
   from the session status endpoint: on a JIT server the download estimate
   measures `min(link, encode)`, and a producer below 1× with shrinking
   runway is actionable *before* the client ever stalls.
-- **Severe pressure** (a stall, near-empty runway, or an estimate far
-  below the current rung) selects the highest rung safely below the
-  estimate **in one move** — never one-rung-at-a-time through a
+- **Severe pressure** (an active supply stall, ≤1.5 s of runway, three
+  supply stalls in 60 s, or an estimate below 0.7× the current rung) selects
+  the highest rung whose `total_kbps` is ≤0.95× the estimate **in one move**.
+  If no rung fits, the lowest rung is the only actionable choice. It never
+  walks one rung at a time through a
   bandwidth cliff, which leaves the player above the sustainable rate for
   two full cooldowns (the review's 8 → 1.5 Mb/s example: 40 s of
   guaranteed stalling).
@@ -162,10 +170,12 @@ it unit-tests without a video element:
 - **Up** one rung when the estimate exceeds 1.8× the *next* rung's bitrate
   for 45 s with no stall in the last 60 s — and never above the player's
   actual pixel height (a 1080p encode into a 700-px window is waste).
-- **Start** at the persisted last-good rung (default 720p), and **seed
-  the replacement Hls instance's `bandwidthEstimate`** from the outgoing
-  one — hls.js exposes the setter for exactly this, and without it every
-  restart forgets everything and re-learns from the 500 kb/s default.
+- **Start** at the persisted last-good rung when one exists; a fresh browser
+  with no network prior omits height and preserves the server's existing
+  encoder-aware Auto choice. **Seed the replacement Hls instance's
+  `bandwidthEstimate`** from the outgoing one — hls.js exposes the setter for
+  exactly this, and without it every restart forgets everything and re-learns
+  from the 500 kb/s default.
 
 Asymmetric *selection* (down in one move, up one rung slowly) is the whole
 trick of ABR; the constants are starting points to tune on real use.
@@ -183,9 +193,17 @@ always has an answer. A prepared-handoff variant (start the replacement,
 switch at a boundary) is Option B in the review record — build it only if
 the measured p95 misses the SLO.
 
+Voluntary moves make that restart cost explicit. Over the 60 s dwell horizon,
+a mild downgrade's estimated saved pressure is
+`(1.3 × current_total / estimate − 1) × 60 s`; server-pressure samples use
+`(1 / recent_speed − 1) × 60 s`; and an upgrade's estimated quality gain is
+`(next_total − current_total) / current_total × 60 s`. The move happens only
+when that value exceeds the 2.5 s restart-cost SLO. Emergencies are exempt,
+because preserving a draining stream outranks avoiding the interruption.
+
 Server prerequisites are Phase 1, the status endpoint, and the default-off
-network-prior groundwork above. The remaining work in this phase is the web
-controller and its restart/recovery contract.
+network-prior groundwork above. The web controller and its restart/recovery
+contract are now wired; Phase 3 remains optional.
 
 Effort: **medium** — one focused session including tests. Risk: low-medium;
 the failure mode of a mistuned controller is a visible switch, not a broken
@@ -234,17 +252,17 @@ Phase 2.
 | Phase | What you get | Effort | Risk |
 |---|---|---|---|
 | 1 — Ladder + menu | Bounded rungs, manual quality control, ladder API | Small | Low |
-| 2 — Auto | Bandwidth-adaptive streaming (Plex-class) | Medium | Low-med |
+| 2 — Auto | Bandwidth-adaptive streaming (Plex-class), implemented | Medium | Low-med |
 | 3 — Seamless | Blip-free switching (Netflix-class UX) | Large | High |
 
 Recommended: build 1 + 2 together; hold 3 behind the decision gate.
 
 ## Test plan
 
-Offline, in the existing Playwright harness: the controller as a pure
-function (`decideRung(estimate, stalls, rung, ladder)`) gets a table-driven
-unit test; end-to-end, the stub server's throttle knob simulates a bandwidth
-cliff mid-stream and the test asserts a `hls/start` re-call at a lower
-height, then recovery after the throttle lifts. On nynuc: play a 4K HDR
-title, clamp the client with browser DevTools network throttling to 3 Mb/s,
-and watch the Stats overlay walk down to 480p and back.
+Offline, `tests/playback/web-policy.test.js` drives the pure `decideRung`
+policy through cliff, mild-pressure, supply/decode, dwell, restart-cost, and
+recovery cases. End to end, the `stall-recovery` playback-lab suite applies an
+8 → 1.5 Mb/s cliff and requires one restart to the sustainable 360p rung, then
+no more than one upgrade per 60 s after the throttle lifts. On nynuc: play a
+4K HDR title, clamp the client with browser DevTools network throttling to
+3 Mb/s, and watch the Stats overlay move down to 480p and back.

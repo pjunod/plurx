@@ -2647,10 +2647,21 @@ function beginWait(v){
   const generation=p._seekToken||0;
   p.waitTimer=setTimeout(()=>persistentWait(v,p,began,generation),PERSISTENT_STALL_MS);
 }
+function noteAutoStall(p,kind){
+  const abr=p&&p.abr; if(!abr||!(kind==='supply'||kind==='decode')) return;
+  const now=performance.now(), events=abr.stallEvents[kind]||[];
+  // `waiting` and hls.js's bufferStalledError describe the same dry instant on
+  // the MSE path. Coalesce that pair so a single pause cannot satisfy the
+  // three-stall rescue by being reported through two APIs.
+  if(!events.length || now-events[events.length-1]>1000) events.push(now);
+  abr.stallEvents[kind]=events.filter(at=>now-at<PlaybackPolicy.AUTO_DEFAULTS.stallWindowMs);
+  abr.lastStallAtMs=now;
+}
 function recordWaitStall(p, kind, ms, runway, detail){
   p.stalls=(p.stalls||0)+1;
   p.stallsByKind=p.stallsByKind||{supply:0,decode:0};
   p.stallsByKind[kind]++;
+  noteAutoStall(p,kind);
   const ctx=playbackContext();
   clientLog(Object.assign({level:"warn",event:"stall",detail:detail||kind,ms,
     message:`${kind} stall, ${(ms/1000).toFixed(1)}s, ${runway==null?"?":runway}s buffered`},
@@ -4536,6 +4547,17 @@ function attachHls(video, playlistUrl, startAt){
       // the viewer watching a spinner to arrive where they already were.
       startPosition:(startAt>0?startAt:-1),
       xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+    const estimateSeed=PlaybackPolicy.bandwidthSeedBps({
+      outgoingEstimateBps:PLAYER&&PLAYER.bandwidthSeedBps,
+      priorKbps:PLAYER&&PLAYER.priorKbps
+    });
+    if(estimateSeed){
+      // hls.js exposes this setter so a restart does not throw away the EWMA
+      // it just paid to learn. A server prior seeds only the first instance;
+      // an outgoing live estimate always wins after that.
+      try{ hls.bandwidthEstimate=estimateSeed; }catch(e){}
+      PLAYER.bandwidthSeedBps=estimateSeed;
+    }
     PLAYER.hls=hls;
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
@@ -4641,6 +4663,9 @@ function attachHls(video, playlistUrl, startAt){
         if(/stall|nudge|hole|gap/i.test(det)){
           const p=PLAYER;
           if(p){
+            if(/bufferstallederror/i.test(det)){
+              noteAutoStall(p,bufferRunway(video)<SUPPLY_RUNWAY_SECS?'supply':'decode');
+            }
             p._hlsEvt=p._hlsEvt||{};
             const n=(p._hlsEvt[det]=(p._hlsEvt[det]||0)+1);
             if(n<=3) clientLog(Object.assign({level:"warn",event:"player_event",
@@ -4755,8 +4780,12 @@ function remuxUrl(base, audioIndex, startSec){
 // silence. A seek that omits the burned subtitle simply loses the subtitles,
 // which reads to a viewer as a bug in the subtitles rather than in the seek,
 // and that is exactly the shape of thing that survives a review.
-function transcodeOpts(startSec, audioIndex){
-  const o={height:transcodeHeight(), start:startSec};
+function transcodeOpts(startSec, audioIndex, autoHeightOverride){
+  let height=transcodeHeight();
+  if(height==null && qualityForce()==='auto'){
+    height=autoHeightOverride>0?autoHeightOverride:(PLAYER&&PLAYER.autoHeight);
+  }
+  const o={height, start:startSec};
   // No explicit rung: the session may still owe the viewer the source's
   // resolution (see sessionHeight). Every transcode open shares this helper
   // precisely so the burn, the fallback, a seek and an audio switch cannot
@@ -4803,6 +4832,8 @@ function attachSession(v, t, info, wantSec){
   t.sessionId=info.session_id||null;
   t.streamId=null;
   t.vod=!!info.vod;
+  if(Array.isArray(info.ladder)&&info.ladder.length) t.ladder=info.ladder;
+  if(info.prior_kbps>0) t.priorKbps=info.prior_kbps;
   // The one site every session passes through — transcode start, startCopyHls,
   // startTranscodeFallback, the subtitle burn, rung and audio re-opens — so the
   // badge follows the session and not the decision. Absent (an old server, or a
@@ -4892,20 +4923,38 @@ const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${
 // ask for it explicitly. Without this entry, testing "is it the segmenting?"
 // means finding a browser or codec that vetoes MSE and accepting two variables
 // at once, which is how a whole day gets spent eliminating the wrong things.
-const QUALITIES=[["auto","Auto"],["original","Original"],["nomse","Original · one stream"],
-                 ["1080","1080p"],["720","720p"],["480","480p"]];
+const QUALITY_MODES=[["auto","Auto"],["original","Original"],
+                     ["nomse","Original · one stream"]];
 function playQuality(){ try{ return localStorage.getItem("plurx_quality")||"auto"; }catch(e){ return "auto"; } }
+function qualityOptions(){
+  const ladder=PlaybackPolicy.normalizedLadder(PLAYER&&PLAYER.ladder);
+  return QUALITY_MODES.concat(ladder.slice().reverse().map(r=>[String(r.height),`${r.height}p`]));
+}
+function autoLastGoodHeight(){
+  try{ const h=Number.parseInt(localStorage.getItem("plurx_auto_rung")||"",10); return h>0?h:null; }
+  catch(e){ return null; }
+}
+function rememberAutoRung(height){
+  if(!(height>0)) return;
+  try{ localStorage.setItem("plurx_auto_rung",String(Math.round(height))); }catch(e){}
+}
+function playerPixelHeight(video){
+  if(!video) return Infinity;
+  try{
+    const h=video.getBoundingClientRect().height||video.clientHeight||video.videoHeight;
+    return h>0?Math.round(h):Infinity;
+  }catch(e){ return Infinity; }
+}
 function qualityForce(){
   return PlaybackPolicy.qualityForce(playQuality());
 }
 // The viewer has asked for one continuous stream, so decline the segmented
 // transport however attractive the server thinks it is.
 function noSegments(){ return playQuality()==="nomse"; }
-// The rung a transcode should run at, or null for Auto — which is not a
-// number this side can compute. Auto depends on which encoder the server ends
-// up using, and the player only finds that out in the response to the request
-// it is about to make. So it asks for nothing and lets the server answer
-// (PERF-PLAN §4.7); the menu's explicit rungs still mean exactly themselves.
+// The viewer's explicit rung, or null for Auto. Auto's opening rung is derived
+// separately from the server ladder after /decision; keeping this helper about
+// the manual choice stops a persisted Auto state from masquerading as a viewer
+// request in the menu and routing logs.
 function transcodeHeight(){ return PlaybackPolicy.transcodeHeight(playQuality()); }
 // The height a transcode session should carry when the rung is not Auto's to
 // pick, or null where it is. Two cases, one principle: the rung may not
@@ -4955,7 +5004,12 @@ function sessionHeight(){
     refusedOriginal:!!(PLAYER&&PLAYER.refusedOriginal)
   });
 }
-function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
+function qualityLabel(){
+  const q=playQuality(), f=qualityOptions().find(x=>x[0]===q);
+  if(f) return f[1];
+  const h=PlaybackPolicy.transcodeHeight(q);
+  return h?`${h}p`:"Auto";
+}
 
 async function play(fileId, title, resumeMs, knownDurMs, meta){
   // Consumed first, whatever happens to this attempt: a "subtitles off"
@@ -4966,6 +5020,11 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   // keeps its correction. A different title, or a player that was closed,
   // starts clean at zero.
   const sessionAudioOffset=PLAYER&&PLAYER.fileId===fileId ? (PLAYER.aoffset||0) : 0;
+  const replacementBandwidthSeed=PLAYER&&PLAYER.fileId===fileId
+    ? PlaybackPolicy.bandwidthSeedBps({
+        outgoingEstimateBps:PLAYER.hls&&PLAYER.hls.bandwidthEstimate,
+        priorKbps:PLAYER.priorKbps})
+    : null;
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   // Stamp the click, not the decision: time-to-first-frame is what the person
@@ -5003,6 +5062,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     }
   }
   const startSec=(resumeMs||0)/1000;
+  const ladder=decision.ladder||[];
+  const priorKbps=decision.prior_kbps||null;
+  const autoStartHeight=qualityForce()==='auto' && decision.method==='transcode'
+    ? PlaybackPolicy.initialAutoRung({ladder,persistedHeight:autoLastGoodHeight(),
+        priorKbps,playerHeight:playerPixelHeight(video)})
+    : null;
   // Stop the outgoing playback's timers *before* PLAYER is replaced below. The
   // clearInterval further down runs after the reassignment, so it only ever
   // cleared the new object's null timer — on auto-next each episode left its
@@ -5044,6 +5109,11 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     deliveredRange:decision.delivered_dynamic_range||null,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
+    ladder, priorKbps, autoHeight:autoStartHeight,
+    bandwidthSeedBps:replacementBandwidthSeed,
+    abr:{lastSwitchAtMs:clickedAt,lastStallAtMs:null,mildSamples:0,
+      upgradeSinceMs:null,previousRunway:null,stallEvents:{supply:[],decode:[]},
+      switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false},
     waitAt:null, waitRunway:null, waitTimer:null, waitReported:false,
     stallsByKind:null, stallRecoveries:0, recoveringStall:null, stallPrompt:false,
     burnedSub:null, vod:false, };
@@ -5139,7 +5209,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   video.addEventListener("loadedmetadata", probeDecode, {once:true});
   armHitchDetector(video);
   clearInterval(PLAYER.timer);
-  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); maybeDecodeRescue(); refreshSegTimes(); }, 5000);
+  PLAYER.timer=setInterval(()=>{
+    reportProgress(fileId); reportHitches(); maybeDecodeRescue();
+    autoControllerTick().catch(()=>{}); refreshSegTimes();
+  }, PlaybackPolicy.AUTO_DEFAULTS.sampleMs);
   video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
   pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
@@ -5937,7 +6010,17 @@ function retuneBuffer(segSecs, force){
             `${tgt.fwd}s ahead + one ${tgt.seg}s segment + ${tgt.back}s behind = `+
             `${Math.round(tgt.peakBytes/1e6)}MB against a ${Math.round(MSE_QUOTA_BYTES/1e6)}MB quota`});
 }
-function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+function teardownHls(){
+  if(PLAYER&&PLAYER.hls){
+    const estimate=PlaybackPolicy.bandwidthSeedBps({
+      outgoingEstimateBps:PLAYER.hls.bandwidthEstimate,
+      priorKbps:PLAYER.priorKbps
+    });
+    if(estimate) PLAYER.bandwidthSeedBps=estimate;
+    try{PLAYER.hls.destroy()}catch(e){}
+    PLAYER.hls=null;
+  }
+}
 function resetMediaSource(v){
   try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
 }
@@ -6136,6 +6219,125 @@ function maybeDecodeRescue(){
     playbackContext()));
   toast("This browser can't hold Original smoothly — switching to optimized");
   startTranscodeFallback("decode-rescue");
+}
+function autoSwitchLabel(value){
+  return typeof value==='number'?`${value}p`:String(value||'Auto');
+}
+function recordAutoSwitch(p,from,to,reason,position){
+  const entry={from:autoSwitchLabel(from),to:autoSwitchLabel(to),reason,
+    position:Math.max(0,position||0)};
+  p.abr.switches.push(entry);
+  if(p.abr.switches.length>8) p.abr.switches.shift();
+  clientLog(Object.assign({level:"warn",event:"quality_switch",reason:"auto",
+    detail:`from=${entry.from} to=${entry.to} cause=${reason}`,
+    message:`Auto quality ${entry.from} → ${entry.to} — ${reason}`},
+    playbackContext()));
+}
+async function switchAutoRung(currentHeight,decision){
+  const p=PLAYER, v=document.getElementById("video");
+  if(!p||!v||!p.abr||p.abr.switching||!(decision&&decision.height>0)) return;
+  const pos=(p.offset||0)+(v.currentTime||0);
+  const track=p.audio&&p.audio[p.curAudio], aidx=track?track.index:(p.curAudio||0);
+  const {me,live}=streamGeneration();
+  me.abr.switching=true;
+  me.stallFrom=pos;
+  newAttempt("auto-quality");
+  me.started=false;
+  setLoading(true,"Adjusting quality…",
+    `${autoSwitchLabel(currentHeight)} → ${autoSwitchLabel(decision.height)} — ${decision.reason}`);
+  // This is the measured restart model, not Phase 3's prepared handoff. Capture
+  // the outgoing estimate while tearing down, then pay one visible restart.
+  teardownHls();
+  let info;
+  try{
+    info=await openSession(me.fileId,transcodeOpts(pos,aidx,decision.height));
+  }catch(e){
+    if(live()){
+      me.abr.switching=false;
+      setLoading(true,"Quality adjustment failed.",e.message,
+        `<button onclick="retryPlayback()">Try again</button>`+
+        `<button onclick="closePlayer()">Close</button>`);
+    }
+    return;
+  }
+  if(!live()) return;
+  me.method='transcode'; me.copyHls=false; me.autoHeight=decision.height;
+  me.health=null;
+  const now=performance.now();
+  me.abr.lastSwitchAtMs=now;
+  me.abr.stableSinceMs=now;
+  me.abr.mildSamples=0;
+  me.abr.upgradeSinceMs=null;
+  me.abr.previousRunway=null;
+  me.abr.stallEvents.supply=[];
+  recordAutoSwitch(me,currentHeight,decision.height,decision.reason,pos);
+  me.abr.switching=false;
+  armStall(attachSession(v,me,info,pos),20000);
+  toast(`Quality → ${decision.height}p — ${decision.reason}`);
+}
+async function rescueAutoSupply(){
+  const p=PLAYER, v=document.getElementById("video");
+  if(!p||!v||!p.abr||p.abr.switching||p.abr.supplyRescued) return;
+  const before=p.method, pos=(p.offset||0)+(v.currentTime||0);
+  p.abr.switching=true;
+  p.abr.supplyRescued=true;
+  setLoading(true,"Adjusting quality…","repeated supply stalls — starting transcode Auto");
+  toast("Quality → Auto transcode — supply stalls");
+  await startTranscodeFallback("auto-supply",
+    "switched to transcode Auto after 3 supply stalls in 60 seconds");
+  if(PLAYER!==p) return;
+  p.abr.switching=false;
+  if(p.method!=='transcode'){
+    p.abr.supplyRescued=false;
+    return;
+  }
+  const now=performance.now();
+  p.abr.lastSwitchAtMs=now;
+  p.abr.stableSinceMs=now;
+  p.abr.stallEvents.supply=[];
+  recordAutoSwitch(p,before,"transcode Auto","supply stalls",pos);
+}
+async function autoControllerTick(){
+  const p=PLAYER, v=document.getElementById("video");
+  if(!p||!v||!p.abr||qualityForce()!=='auto'||!p.started||v.paused||p.abr.switching) return;
+  await pollSessionHealth(true);
+  if(PLAYER!==p||!p.abr||p.abr.switching) return;
+  const now=performance.now(), windowMs=PlaybackPolicy.AUTO_DEFAULTS.stallWindowMs;
+  for(const kind of ['supply','decode']){
+    p.abr.stallEvents[kind]=(p.abr.stallEvents[kind]||[]).filter(at=>now-at<windowMs);
+  }
+  if(p.method!=='transcode'){
+    if(p.abr.stallEvents.supply.length>=3) await rescueAutoSupply();
+    return;
+  }
+  const ladder=PlaybackPolicy.normalizedLadder(p.ladder);
+  if(!ladder.length) return;
+  const health=p.health||{};
+  const currentHeight=Number(health.target_height||p.autoHeight||v.videoHeight);
+  if(!(currentHeight>0)) return;
+  p.autoHeight=currentHeight;
+  const estimateBps=(p.hls&&p.hls.bandwidthEstimate)||p.bandwidthSeedBps;
+  const estimateKbps=estimateBps>0?estimateBps/1000:(p.priorKbps||null);
+  const runway=bufferRunway(v);
+  const activeSupplyStall=!!p.waitAt && p.waitRunway<SUPPLY_RUNWAY_SECS;
+  const result=PlaybackPolicy.decideRung({
+    ladder,currentHeight,estimateKbps,runwaySeconds:runway,
+    previousRunwaySeconds:p.abr.previousRunway,
+    recentSpeed:health.recent_speed,
+    activeSupplyStall,supplyStalls:p.abr.stallEvents.supply.length,
+    lastStallAtMs:p.abr.lastStallAtMs,nowMs:now,
+    lastSwitchAtMs:p.abr.lastSwitchAtMs,mildSamples:p.abr.mildSamples,
+    upgradeSinceMs:p.abr.upgradeSinceMs,playerHeight:playerPixelHeight(v)
+  });
+  p.abr.previousRunway=runway;
+  p.abr.mildSamples=result.mildSamples;
+  p.abr.upgradeSinceMs=result.upgradeSinceMs;
+  if(result.reason && result.height!==currentHeight){
+    await switchAutoRung(currentHeight,result);
+    return;
+  }
+  const stallFree=p.abr.lastStallAtMs==null||now-p.abr.lastStallAtMs>=windowMs;
+  if(stallFree&&now-p.abr.stableSinceMs>=windowMs) rememberAutoRung(currentHeight);
 }
 // Arm the watchdog for a stream we have just (re)started at `fromSec`. Recording
 // the intended position is what makes this work after a *seek*: the old check
@@ -6828,7 +7030,7 @@ function toggleMenu(kind,low){
         ${esc(decodeLimitWhy(lim))}, ${esc(agoLabel(Math.round(lim.at/1000)))}.
         ${limWhat}</div>
       <button onclick="forgetDecodeLimitHere()">Forget this measurement</button>`:"";
-    m.innerHTML=`<div class="amsec">Quality</div>`+QUALITIES.map(([v,l])=>{
+    m.innerHTML=`<div class="amsec">Quality</div>`+qualityOptions().map(([v,l])=>{
       const note=v==="auto"?" — automatic":v==="original"?" — max, no transcode":"";
       return `<button class="${playQuality()===v?'sel':''}" onclick="setQuality('${v}')">${l}${note}</button>`;
     }).join("")+limNote;
@@ -7377,6 +7579,9 @@ function updateStats(){
   // breaking inside of; this is that box.
   const sec=(rows,title,cls)=> rows? `<div class="stsec${cls||''}">`+
     `<div class="sechd">${title}</div>`+rows+`</div>` : '';
+  const autoLog=((PLAYER.abr&&PLAYER.abr.switches)||[]).map(entry=>
+    `<div><b>Auto log</b><span>${clockFromSec(entry.position)} · ${esc(entry.from)} → `+
+    `${esc(entry.to)} · ${esc(entry.reason)}</span></div>`).join("");
   body.innerHTML=
     sec(
     // **Which build this is, in the place people photograph.**
@@ -7412,6 +7617,7 @@ function updateStats(){
     // switches, so it cannot carry this.
     (PLAYER.rescuedNote?`<div><b>Switched</b><span style="color:var(--warn,#fbbf24)">${
       esc(PLAYER.rescuedNote)}</span></div>`:"")+
+    autoLog+
     `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`
     , "Playback", " wide")+
     sec(
@@ -7507,11 +7713,11 @@ function updateStats(){
 // a poll that ran regardless would keep an abandoned session's numbers moving
 // for no one. The endpoint deliberately does not count as activity, so this
 // can't keep a session alive past the idle reaper either.
-async function pollSessionHealth(){
+async function pollSessionHealth(force){
   const p=PLAYER;
   if(!p) return;
   const ov=document.getElementById("statsov");
-  if(!ov||!ov.classList.contains("on")) return;
+  if(!force&&(!ov||!ov.classList.contains("on"))) return;
   // Two shapes of stream, one question. An HLS session answers from the
   // transcode manager; a progressive remux answers from its own registry (see
   // progressive.rs) — that path is Chrome's whole remux experience, and until
