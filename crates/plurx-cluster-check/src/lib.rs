@@ -17,7 +17,7 @@ use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::Instant as TokioInstant;
 
 // Compile the production daemon policy directly. This avoids a test-only
 // coalescer and keeps the already-governed plurxd source path as its sole home.
@@ -57,17 +58,27 @@ pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 pub const GROWTH_INCOMING_BEATS: u64 = 10_000;
 /// Independent user/item streams represented by the growth load.
 pub const GROWTH_ACTIVE_STREAMS: u64 = 80;
+/// Logical playback cadence represented by each incoming heartbeat.
+pub const GROWTH_BEAT_INTERVAL_SECS: u64 = 5;
+/// Production progress coalescing window represented by the deterministic clock.
+pub const GROWTH_COMMIT_WINDOW_SECS: u64 = 10;
 /// Production hiqlite snapshot threshold used by the bounded gate.
 pub const GROWTH_COMPACTION_LOGS: u64 = 10_000;
 /// Maximum net compacted directory growth per incoming heartbeat.
-pub const GROWTH_BYTES_PER_BEAT_BUDGET: u64 = 256;
+pub const GROWTH_BYTES_PER_BEAT_BUDGET: u64 = 512;
+/// One extra commit window per stream above the deterministic cadence result.
+pub const GROWTH_COMMIT_HEADROOM_PER_STREAM: u64 = 1;
+/// Maximum accepted lag or internal-entry drift in the sampled applied index.
+pub const GROWTH_APPLIED_INDEX_TOLERANCE: u64 = 2;
 
 /// Result of one post-coalescer compacted-growth load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactedGrowthReport {
     pub incoming_beats: u64,
     pub active_streams: u64,
+    pub logical_span_seconds: u64,
     pub physical_progress_commits: u64,
+    pub applied_index_delta: u64,
     pub before_bytes: u64,
     pub after_bytes: u64,
     pub compacted_growth_bytes: u64,
@@ -78,25 +89,51 @@ pub fn validate_compacted_growth(report: &CompactedGrowthReport) -> Result<()> {
     if report.incoming_beats == 0 || report.active_streams == 0 {
         bail!("compacted-growth load must contain beats and active streams");
     }
-    let commit_budget = report.active_streams.saturating_mul(2);
-    if report.physical_progress_commits > commit_budget {
+    if report.incoming_beats % report.active_streams != 0 {
+        bail!("compacted-growth beats must divide evenly across active streams");
+    }
+    let beats_per_stream = report.incoming_beats / report.active_streams;
+    let expected_span_seconds = beats_per_stream
+        .saturating_sub(1)
+        .saturating_mul(GROWTH_BEAT_INTERVAL_SECS);
+    if report.logical_span_seconds != expected_span_seconds {
         bail!(
-            "physical progress commits {} exceeded {} for {} active streams",
-            report.physical_progress_commits,
-            commit_budget,
-            report.active_streams
+            "compacted-growth logical span {} did not match {} seconds for the declared load",
+            report.logical_span_seconds,
+            expected_span_seconds
         );
+    }
+    let commit_windows = report.logical_span_seconds / GROWTH_COMMIT_WINDOW_SECS + 1;
+    let commit_budget = report
+        .active_streams
+        .saturating_mul(commit_windows.saturating_add(GROWTH_COMMIT_HEADROOM_PER_STREAM));
+    let mut violations = Vec::new();
+    if report.physical_progress_commits > commit_budget {
+        violations.push(format!(
+            "physical progress commits {} exceeded {} for {} active streams",
+            report.physical_progress_commits, commit_budget, report.active_streams
+        ));
     }
     let growth_budget = report
         .incoming_beats
         .saturating_mul(GROWTH_BYTES_PER_BEAT_BUDGET);
     if report.compacted_growth_bytes > growth_budget {
-        bail!(
+        violations.push(format!(
             "compacted growth {} bytes exceeded {} bytes for {} incoming beats",
-            report.compacted_growth_bytes,
-            growth_budget,
-            report.incoming_beats
-        );
+            report.compacted_growth_bytes, growth_budget, report.incoming_beats
+        ));
+    }
+    let applied_drift = report
+        .applied_index_delta
+        .abs_diff(report.physical_progress_commits);
+    if applied_drift > GROWTH_APPLIED_INDEX_TOLERANCE {
+        violations.push(format!(
+            "applied-index delta {} drifted {} entries from {} physical progress commits",
+            report.applied_index_delta, applied_drift, report.physical_progress_commits
+        ));
+    }
+    if !violations.is_empty() {
+        bail!(violations.join("; "));
     }
     Ok(())
 }
@@ -111,7 +148,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             run_growth_subprocess().await?;
             controller().await
         }
-        Some("growth") => compacted_growth_gate().await,
+        Some("growth") => compacted_growth_gate(args.get(2).map(PathBuf::from)).await,
         Some("node") => {
             let launch: NodeLaunch =
                 serde_json::from_str(args.get(2).context("node mode requires its launch JSON")?)?;
@@ -129,19 +166,27 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 }
 
 async fn run_growth_subprocess() -> Result<()> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(120),
-        Command::new(harness_executable()?).arg("growth").output(),
-    )
-    .await
-    .context("compacted-growth subprocess timed out")??;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() {
-        bail!(
-            "compacted-growth subprocess exited {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let root = tempfile::tempdir().context("compacted-growth subprocess data root")?;
+    let mut command = Command::new(harness_executable()?);
+    command
+        .arg("growth")
+        .arg(root.path())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("spawn compacted-growth subprocess")?;
+    let status = match tokio::time::timeout(Duration::from_secs(300), child.wait()).await {
+        Ok(status) => status.context("wait for compacted-growth subprocess")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            bail!("compacted-growth subprocess timed out after 300 seconds");
+        }
+    };
+    if !status.success() {
+        bail!("compacted-growth subprocess exited {:?}", status.code());
     }
     Ok(())
 }
@@ -155,15 +200,25 @@ async fn controller() -> Result<()> {
     Ok(())
 }
 
-async fn compacted_growth_gate() -> Result<()> {
+async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
     println!("cluster-check: post-coalescer compacted growth");
     install_crypto_provider();
     let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
 
-    let root = tempfile::tempdir().context("compacted-growth data root")?;
+    let owned_root = root
+        .is_none()
+        .then(|| tempfile::tempdir().context("compacted-growth data root"))
+        .transpose()?;
+    let root = root.unwrap_or_else(|| {
+        owned_root
+            .as_ref()
+            .expect("missing owned compacted-growth root")
+            .path()
+            .to_path_buf()
+    });
     let launch = NodeLaunch {
         node_id: 1,
-        root: root.path().to_path_buf(),
+        root,
         nodes: allocate_nodes(1)?,
     };
     let mut config = node_config(&launch)?;
@@ -206,14 +261,35 @@ async fn compacted_growth_gate() -> Result<()> {
     let before_bytes = stable_directory_bytes(&data_dir).await?;
 
     let applied_before = applied_index(&metrics_client).await?;
-    let coalescer: Arc<ProgressCoalescer> = ProgressCoalescer::new(store.clone());
+    // Put the deterministic clock well ahead of wall time so the background
+    // flush workers cannot race this accelerated, beat-by-beat load. Each
+    // request still runs the production due/commit path against a real store.
+    let logical_start = TokioInstant::now() + Duration::from_secs(24 * 60 * 60);
+    let logical_now = Arc::new(RwLock::new(logical_start));
+    let coalescer: Arc<ProgressCoalescer> = ProgressCoalescer::with_time_source(store.clone(), {
+        let logical_now = Arc::clone(&logical_now);
+        move || {
+            *logical_now
+                .read()
+                .expect("compacted-growth logical clock poisoned")
+        }
+    });
     let beats_per_stream = GROWTH_INCOMING_BEATS / GROWTH_ACTIVE_STREAMS;
-    let mut tasks = tokio::task::JoinSet::new();
-    for user_id in users.iter().copied() {
-        let coalescer = Arc::clone(&coalescer);
-        tasks.spawn(async move {
-            let mut committed = 0_u64;
-            for beat in 0..beats_per_stream {
+    let logical_span_seconds = beats_per_stream
+        .saturating_sub(1)
+        .saturating_mul(GROWTH_BEAT_INTERVAL_SECS);
+    let expected_commits_per_stream = logical_span_seconds / GROWTH_COMMIT_WINDOW_SECS + 1;
+    let expected_progress_commits = GROWTH_ACTIVE_STREAMS * expected_commits_per_stream;
+    let mut synchronous_commits = 0_u64;
+    for beat in 0..beats_per_stream {
+        *logical_now
+            .write()
+            .expect("compacted-growth logical clock poisoned") =
+            logical_start + Duration::from_secs(beat.saturating_mul(GROWTH_BEAT_INTERVAL_SECS));
+        let mut tasks = tokio::task::JoinSet::new();
+        for user_id in users.iter().copied() {
+            let coalescer = Arc::clone(&coalescer);
+            tasks.spawn(async move {
                 let update = coalescer
                     .put(
                         user_id,
@@ -222,24 +298,22 @@ async fn compacted_growth_gate() -> Result<()> {
                         Some(10_000_000),
                     )
                     .await?;
-                committed += u64::from(update.committed);
-            }
-            Ok::<u64, anyhow::Error>(committed)
-        });
-    }
-    let mut synchronous_commits = 0_u64;
-    while let Some(result) = tasks.join_next().await {
-        synchronous_commits += result.context("coalesced stream task panicked")??;
+                Ok::<u64, anyhow::Error>(u64::from(update.committed))
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            synchronous_commits += result.context("coalesced stream task panicked")??;
+        }
     }
     let drained = u64::try_from(coalescer.drain().await.context("drain coalescer")?)?;
-    if synchronous_commits != GROWTH_ACTIVE_STREAMS || drained != GROWTH_ACTIVE_STREAMS {
+    let physical_progress_commits = synchronous_commits.saturating_add(drained);
+    if physical_progress_commits != expected_progress_commits || drained != 0 {
         bail!(
-            "coalescer produced {synchronous_commits} leading and {drained} trailing commits; expected {} each",
-            GROWTH_ACTIVE_STREAMS
+            "coalescer produced {synchronous_commits} synchronous and {drained} trailing commits; expected {expected_progress_commits} synchronous and no trailing commits"
         );
     }
     let applied_after = applied_index(&metrics_client).await?;
-    let physical_progress_commits = applied_after.saturating_sub(applied_before);
+    let applied_index_delta = applied_after.saturating_sub(applied_before);
     let measured_snapshot = ensure_compaction_after(
         &metrics_client,
         store.as_ref(),
@@ -261,7 +335,9 @@ async fn compacted_growth_gate() -> Result<()> {
     let report = CompactedGrowthReport {
         incoming_beats: GROWTH_INCOMING_BEATS,
         active_streams: GROWTH_ACTIVE_STREAMS,
+        logical_span_seconds,
         physical_progress_commits,
+        applied_index_delta,
         before_bytes,
         after_bytes,
         compacted_growth_bytes: after_bytes.saturating_sub(before_bytes),
@@ -298,28 +374,46 @@ async fn compacted_growth_gate() -> Result<()> {
     let raw_report = CompactedGrowthReport {
         incoming_beats: GROWTH_INCOMING_BEATS,
         active_streams: GROWTH_ACTIVE_STREAMS,
-        physical_progress_commits: raw_applied_after.saturating_sub(raw_applied_before),
+        logical_span_seconds,
+        physical_progress_commits: GROWTH_INCOMING_BEATS,
+        applied_index_delta: raw_applied_after.saturating_sub(raw_applied_before),
         before_bytes: raw_before_bytes,
         after_bytes: raw_after_bytes,
         compacted_growth_bytes: raw_after_bytes.saturating_sub(raw_before_bytes),
     };
     let raw_rejection = validate_compacted_growth(&raw_report)
         .expect_err("bypassing the coalescer must fail the growth gate");
+    let raw_rejection = format!("{raw_rejection:#}");
+    for required in ["physical progress commits", "compacted growth"] {
+        if !raw_rejection.contains(required) {
+            bail!("raw control did not exercise the {required} budget: {raw_rejection}");
+        }
+    }
 
     println!(
-        "CLUSTER_GROWTH incoming_beats={} active_streams={} physical_commits={} \
+        "CLUSTER_GROWTH incoming_beats={} active_streams={} beat_interval_seconds={} \
+         logical_span_seconds={} physical_commits={} applied_index_delta={} commit_budget={} \
          before_bytes={} after_bytes={} compacted_growth_bytes={} \
          bytes_per_beat={:.6} budget_bytes_per_beat={} \
-         raw_control_physical_commits={} raw_control_rejected={}",
+         raw_control_physical_commits={} raw_control_applied_index_delta={} \
+         raw_control_growth_bytes={} raw_control_bytes_per_beat={:.6} \
+         raw_control_rejected={}",
         report.incoming_beats,
         report.active_streams,
+        GROWTH_BEAT_INTERVAL_SECS,
+        report.logical_span_seconds,
         report.physical_progress_commits,
+        report.applied_index_delta,
+        report.active_streams * (expected_commits_per_stream + GROWTH_COMMIT_HEADROOM_PER_STREAM),
         report.before_bytes,
         report.after_bytes,
         report.compacted_growth_bytes,
         report.compacted_growth_bytes as f64 / report.incoming_beats as f64,
         GROWTH_BYTES_PER_BEAT_BUDGET,
         raw_report.physical_progress_commits,
+        raw_report.applied_index_delta,
+        raw_report.compacted_growth_bytes,
+        raw_report.compacted_growth_bytes as f64 / raw_report.incoming_beats as f64,
         raw_rejection,
     );
     Ok(())

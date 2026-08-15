@@ -83,6 +83,8 @@ hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
 cluster-check: ## Run compacted growth plus M1b-M2 durable-state, import, and failure contracts
 	$(CARGO) test --locked -p plurx-core --features hiqlite-store \
 	  --test store_contract -- --test-threads=1
+	$(CARGO) test --locked -p plurx-cluster-check \
+	  --test harness compacted_growth_gate -- --nocapture
 	$(CARGO) run --locked -p plurx-cluster-check -- check
 
 .PHONY: cluster-growth

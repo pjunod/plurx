@@ -145,10 +145,11 @@ default until daemon selection lands.
   contract factory, multi-writer Trakt/outbox safety, offline/cache identity
   guards, and the progress coalescer passed the full PR #90 review and CI
   sequence. The bounded post-coalescer gate now drives 10,000 incoming beats
-  across 80 streams, commits 160 physical writes, and records 1,017,640 bytes
-  (101.764 bytes/beat) of growth after production-threshold compaction against
-  a 256-byte/beat budget; `make cluster-growth` reproduces the measurement and
-  rejects the 10,000-commit raw-write control.
+  across 80 streams at a five-second logical cadence, commits 5,040 physical
+  writes over 620 seconds per stream, and records 4,441,360 bytes (444.136
+  bytes/beat) of growth after production-threshold compaction against a
+  512-byte/beat budget. `make cluster-growth` reproduces the measurement; its
+  uncoalesced 10,000-write control violates both the commit and byte limits.
 - ✅ **M2 import complete 2026-08-09:** content-addressed backup and fresh-target
   import preserve v14 through current durable rows, rebuild derived FTS, and
   prove exact parity with bounded keyset pages, an incremental digest, and

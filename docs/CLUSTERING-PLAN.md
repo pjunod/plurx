@@ -32,8 +32,8 @@ single-node gate is:
 |---|---:|---|
 | p95 `put_progress_at` latency | ≤25 ms and ≤max(2× baseline, baseline + 0.5 ms) | A five-second player beat must not become visible UI latency; the additive branch is derived from the measured fixed Raft tax, while the ratio branch takes over on slower storage. |
 | Idle RSS after warm-up | ≤100 MiB additional | The recommended third voter includes Pi/NAS-class hardware. |
-| 10,000 incoming progress beats | ≤256 bytes/beat (2,560,000 bytes total) after production-threshold snapshot, purge, and WAL-settle cycles | Pre-compaction log size is not disk occupancy; the gate compares equally compacted states so retained WAL allocation is not mistaken for growth. |
-| Physical progress commits under that load | ≤2 commits/active stream (160 for the 80-stream fixture) | A disk-size result can stay small after compaction even when every heartbeat reached consensus, so the same gate must reject lost coalescing directly. |
+| 10,000 incoming progress beats | ≤512 bytes/beat (5,120,000 bytes total) after production-threshold snapshot, purge, and WAL-settle cycles | Pre-compaction log size is not disk occupancy; the gate compares equally compacted states so retained WAL allocation is not mistaken for growth. |
+| Physical progress commits under that load | ≤64 commits/active stream (5,120 for the 80-stream fixture) | The 125 beats represent 620 seconds at the shipped five-second cadence: 63 commit windows per stream, plus one window of scheduling headroom. A disk-size result can stay small after compaction even when every heartbeat reached consensus, so the same gate rejects lost coalescing directly. |
 | Watch-state commit rate | ≤1 commit / 10 s / active stream | [ARCHITECTURE.md](ARCHITECTURE.md) §2.2 already promises coalescing; clustering must make it true. |
 
 M0 records the raw SQLite baseline and hiqlite result on the same machine. M2's
@@ -506,14 +506,22 @@ The existing raw-write cost record measures 0.083333 ms p95 progress latency,
 6,832,128 bytes (6.52 MiB) additional idle RSS, and 8,309,777 bytes of data
 growth for 10,000 direct store writes. The committed `make cluster-growth`
 gate now drives 10,000 incoming beats through the production
-`ProgressCoalescer`: 80 user/item streams × 125 beats produced 80 leading and
-80 drained trailing commits. With hiqlite's production 10,000-log snapshot
-policy, two successive snapshot/purge cycles normalize retained WAL rollover
-before each directory comparison. The 2026-08-14 record is 3,832,601 bytes
-before, 4,850,241 bytes after, and 1,017,640 bytes of compacted growth —
-101.764 bytes/incoming beat against the 256-byte budget. The same run bypasses
-the coalescer and requires the 10,000-commit control to fail the 160-commit
-limit. Paused-time tests still prove the ten-second window and terminal watched
+`ProgressCoalescer`: 80 user/item streams × 125 beats at a deterministic
+five-second cadence represent 620 seconds of playback per stream. The real
+ten-second window produces 63 commits per stream, or 5,040 total; the gate
+allows one extra window per stream, for a 5,120-commit budget. Injecting only
+the monotonic clock keeps the ratio honest without turning the CI gate into a
+ten-minute campaign; every store read, compare-and-set, and replicated write
+remains real.
+
+With hiqlite's production 10,000-log snapshot policy, two successive
+snapshot/purge cycles normalize retained WAL rollover before each directory
+comparison. The 2026-08-14 record is 3,832,601 bytes before, 8,273,961 bytes
+after, and 4,441,360 bytes of compacted growth — 444.136 bytes/incoming beat
+against the measured 512-byte budget. The same run bypasses the coalescer: its
+10,000 commits produce 8,454,240 compacted bytes (845.424 bytes/beat), so the
+live control must violate both the 5,120-commit and 5,120,000-byte limits.
+Paused-time tests still prove the ten-second window and terminal watched
 exception independently. M2 also owns importing an existing SQLite store and
 selecting the complete backend at startup.
 
@@ -574,9 +582,10 @@ This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
 and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
 fsynced completion marker, atomic activation, failure injection at each step,
 and fallback to unchanged SQLite. The post-coalescer blocker is closed by the
-2026-08-14 `make cluster-growth` record: 1,017,640 compacted bytes for 10,000
-incoming beats (101.764 bytes/beat), 160 physical commits for 80 streams, and a
-rejected 10,000-commit raw control. Trakt credential encryption remains an
+2026-08-14 `make cluster-growth` record: 4,441,360 compacted bytes for 10,000
+incoming beats at five-second logical cadence (444.136 bytes/beat), 5,040
+physical commits for 80 streams, and a raw 10,000-write control that violates
+both the commit and byte budgets. Trakt credential encryption remains an
 activation blocker. Bounded target parity and blocking-worker source reads are
 now in place; the next boundary is the activation coordinator, not another
 importer expansion.

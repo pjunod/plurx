@@ -5,6 +5,10 @@
 //! replace one pending value, and the newest pending value is flushed at the
 //! ten-second boundary. A newly completed item bypasses the wait so its
 //! watched transition and notification stay synchronous.
+//!
+//! The cluster growth harness compiles this file directly so its time-scaled
+//! load exercises the production policy. Keep imports portable across that
+//! source inclusion; a `crate::`-relative daemon import would break the gate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +26,7 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const ENTRY_SWEEP_AT: usize = 1024;
 type ProgressKey = (i64, i64);
 type SharedEntry = Arc<Mutex<Entry>>;
+type TimeSource = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone, Copy, Debug)]
 struct Pending {
@@ -55,6 +60,7 @@ pub struct ProgressCoalescer {
     entries: Mutex<HashMap<ProgressKey, SharedEntry>>,
     window: Duration,
     sweep_at: usize,
+    now: TimeSource,
 }
 
 impl ProgressCoalescer {
@@ -67,11 +73,35 @@ impl ProgressCoalescer {
     }
 
     fn with_limits(store: Arc<dyn Store>, window: Duration, sweep_at: usize) -> Arc<Self> {
+        Self::with_limits_and_time_source(store, window, sweep_at, Arc::new(Instant::now))
+    }
+
+    /// Build the production policy around a deterministic monotonic clock.
+    ///
+    /// The cluster growth harness uses this seam to preserve the real
+    /// five-second-beat/ten-second-window ratio without turning a bounded CI
+    /// gate into a ten-minute wall-clock campaign.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used when this source is included by plurx-cluster-check.
+    pub(crate) fn with_time_source<F>(store: Arc<dyn Store>, now: F) -> Arc<Self>
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
+        Self::with_limits_and_time_source(store, COMMIT_WINDOW, ENTRY_SWEEP_AT, Arc::new(now))
+    }
+
+    fn with_limits_and_time_source(
+        store: Arc<dyn Store>,
+        window: Duration,
+        sweep_at: usize,
+        now: TimeSource,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             entries: Mutex::new(HashMap::new()),
             window,
             sweep_at: sweep_at.max(1),
+            now,
         })
     }
 
@@ -81,7 +111,7 @@ impl ProgressCoalescer {
             return Some(Arc::clone(entry));
         }
         if entries.len() >= self.sweep_at {
-            let now = Instant::now();
+            let now = (self.now)();
             entries.retain(|_, entry| {
                 // The map lock prevents a new caller from cloning this entry
                 // while it is examined. Existing requests and flush workers
@@ -150,7 +180,7 @@ impl ProgressCoalescer {
             slot.committed = durable;
             slot.retry_attempts = 0;
         }
-        let now = Instant::now();
+        let now = (self.now)();
         let due = slot
             .last_commit
             .is_none_or(|last| now.duration_since(last) >= self.window);
@@ -176,7 +206,7 @@ impl ProgressCoalescer {
                 .store
                 .put_progress(user_id, item_id, position_ms, duration_ms)
                 .await?;
-            slot.last_commit = Some(Instant::now());
+            slot.last_commit = Some((self.now)());
             slot.committed = Some(watch);
             return Ok(ProgressUpdate {
                 reported_position_ms: watch.position_ms,
@@ -222,7 +252,7 @@ impl ProgressCoalescer {
                 }
                 slot.last_commit
                     .map(|last| last + self.window)
-                    .unwrap_or_else(Instant::now)
+                    .unwrap_or_else(|| (self.now)())
             };
             tokio::time::sleep_until(deadline).await;
 
@@ -230,7 +260,7 @@ impl ProgressCoalescer {
             let Some(last) = slot.last_commit else {
                 continue;
             };
-            if Instant::now().duration_since(last) < self.window {
+            if (self.now)().duration_since(last) < self.window {
                 continue;
             }
             let Some(pending) = slot.pending.take() else {
@@ -250,7 +280,7 @@ impl ProgressCoalescer {
                 .await
             {
                 Ok(Some(watch)) => {
-                    slot.last_commit = Some(Instant::now());
+                    slot.last_commit = Some((self.now)());
                     slot.committed = Some(watch);
                     slot.retry_attempts = 0;
                 }
@@ -287,7 +317,7 @@ impl ProgressCoalescer {
                             continue;
                         }
                     };
-                    slot.last_commit = slot.committed.as_ref().map(|_| Instant::now());
+                    slot.last_commit = slot.committed.as_ref().map(|_| (self.now)());
                 }
                 Err(error) => {
                     slot.retry_attempts = slot.retry_attempts.saturating_add(1);
@@ -359,13 +389,13 @@ impl ProgressCoalescer {
             {
                 Ok(Some(watch)) => {
                     slot.committed = Some(watch);
-                    slot.last_commit = Some(Instant::now());
+                    slot.last_commit = Some((self.now)());
                     flushed += 1;
                 }
                 Ok(None) => match self.store.watch_state(key.0, key.1).await {
                     Ok(current) => {
                         slot.committed = current;
-                        slot.last_commit = slot.committed.as_ref().map(|_| Instant::now());
+                        slot.last_commit = slot.committed.as_ref().map(|_| (self.now)());
                     }
                     Err(error) => {
                         slot.pending = Some(pending);

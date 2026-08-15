@@ -58,21 +58,25 @@ fn require_ok(response: Response, what: &str) {
 }
 
 #[test]
-fn compacted_growth_gate_rejects_an_uncoalesced_commit_volume() {
+fn compacted_growth_gate_rejects_uncoalesced_commit_and_byte_volume() {
+    let compacted_growth_bytes = 8_194_680;
     let report = CompactedGrowthReport {
         incoming_beats: 10_000,
         active_streams: 80,
+        logical_span_seconds: 620,
         physical_progress_commits: 10_000,
+        applied_index_delta: 9_999,
         before_bytes: 1_000_000,
-        after_bytes: 1_000_000,
-        compacted_growth_bytes: 0,
+        after_bytes: 1_000_000 + compacted_growth_bytes,
+        compacted_growth_bytes,
     };
     let error = format!(
         "{:#}",
         validate_compacted_growth(&report)
-            .expect_err("one durable write per heartbeat must fail the gate")
+            .expect_err("one durable write per heartbeat must fail both budgets")
     );
-    assert!(error.contains("physical progress commits 10000 exceeded 160"));
+    assert!(error.contains("physical progress commits 10000 exceeded 5120"));
+    assert!(error.contains("compacted growth 8194680 bytes exceeded 5120000 bytes"));
 }
 
 #[test]
@@ -82,7 +86,9 @@ fn compacted_growth_gate_rejects_bytes_over_the_per_beat_budget() {
     let report = CompactedGrowthReport {
         incoming_beats,
         active_streams: 80,
-        physical_progress_commits: 160,
+        logical_span_seconds: 620,
+        physical_progress_commits: 5_040,
+        applied_index_delta: 5_039,
         before_bytes: 1_000_000,
         after_bytes: 1_000_000 + compacted_growth_bytes,
         compacted_growth_bytes,
@@ -92,7 +98,22 @@ fn compacted_growth_gate_rejects_bytes_over_the_per_beat_budget() {
         validate_compacted_growth(&report)
             .expect_err("one byte over the compacted-growth budget must fail")
     );
-    assert!(error.contains("compacted growth 2560001 bytes exceeded 2560000 bytes"));
+    assert!(error.contains("compacted growth 5120001 bytes exceeded 5120000 bytes"));
+}
+
+#[test]
+fn compacted_growth_gate_allows_one_commit_window_and_index_sample_headroom() {
+    let report = CompactedGrowthReport {
+        incoming_beats: 10_000,
+        active_streams: 80,
+        logical_span_seconds: 620,
+        physical_progress_commits: 5_120,
+        applied_index_delta: 5_118,
+        before_bytes: 1_000_000,
+        after_bytes: 6_120_000,
+        compacted_growth_bytes: 5_120_000,
+    };
+    validate_compacted_growth(&report).expect("the declared headroom stays inside the gate");
 }
 
 /// One voter, the whole protocol.
