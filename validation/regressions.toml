@@ -285,3 +285,9 @@ commits = ["bb16e82a2639468da01ecd768e2a0941abde8056"]
 points = ["cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The cluster growth gate drives the production coalescer at a deterministic five-second playback cadence, asserts the ten-second commit ratio with bounded headroom, and requires an uncoalesced replicated-write control to violate both the commit and compacted-byte budgets."
+
+[[coverage]]
+commits = ["5559d9b"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy unit pins cap-stranded emergency downgrades, ladder-floor fallback, and backing-pixel height measurement; restoring only the prior controller policy strands a 720p session above the sustainable rung under the recorded cliff conditions."
