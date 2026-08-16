@@ -116,7 +116,16 @@ scopes *which* release inputs the branch touched; it is the branch point.
 `PLURX_VALIDATION_MERGE_TARGET` is `origin/<base ref>` re-fetched when the job
 runs, and supplies the counters the branch has to clear, because that is what
 the branch actually merges into. They name the same commit only until the base
-moves. Two branches that bump a build counter to the same value auto-merge with
+moves. Scope is the whole of scope: both the changed paths and the
+workspace-version comparison that marks a release are read against the recorded
+base, and only the two counters are read against the target. That split is
+load-bearing in both directions. Reading the workspace comparison off the target
+would conflate "this branch shipped a release" with "a release landed on the
+target", so every branch open across a release — including an ordinary
+dependency-only `Cargo.toml` edit, which is in this point's paths — would go red
+and be told to bump two store counters it never touched. Reading the counters
+off the branch point is the original defect. Two branches that bump a build
+counter to the same value auto-merge with
 no conflict marker and produce no `BEHIND` signal in this job, so a branch
 measured only against its branch point stays green forever once an unrelated
 release bump lands that same counter on the base. Re-baselining means a pull
