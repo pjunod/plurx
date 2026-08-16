@@ -177,6 +177,116 @@ struct ApplePlaybackTTFFState: Equatable {
     }
 }
 
+/// Last server status the Apple client observed before a stall. Recovery can
+/// supersede the session before the best-effort beacon reaches `/client-log`,
+/// so the snapshot travels with the client evidence and the server replaces
+/// it with a fresher live join only when that is still possible.
+struct ApplePlaybackServerSnapshot: Encodable, Equatable {
+    var observedAgeMs: Int?
+    var recentSpeed: Double?
+    var aheadSeconds: Int?
+    var aheadBytes: Int?
+    var suspended: Bool?
+    var holdReason: String?
+    var deliveredBps: Int?
+    var deliveredIdleMs: Int?
+    var readrate: Double?
+    var suspendCount: Int?
+    var progressIdleMs: Int?
+    var publishedEndMs: Int?
+    var fetchedEndMs: Int?
+    var fetchedSegment: Int?
+    var firstRetainedSegment: Int?
+    var playlistShape: String?
+    var lastRequest: String?
+    var lastRequestIdleMs: Int?
+
+    init(_ status: PlaybackSessionStatus, observedAgeMs: Int? = nil) {
+        self.observedAgeMs = observedAgeMs
+        recentSpeed = status.recentSpeed
+        aheadSeconds = status.aheadSeconds
+        aheadBytes = status.aheadBytes
+        suspended = status.suspended
+        holdReason = status.holdReason
+        deliveredBps = status.deliveredBps
+        deliveredIdleMs = status.deliveredIdleMs
+        readrate = status.readrate
+        suspendCount = status.suspendCount
+        progressIdleMs = status.progressIdleMs
+        publishedEndMs = status.publishedEndMs
+        fetchedEndMs = status.fetchedEndMs
+        fetchedSegment = status.fetchedSegment
+        firstRetainedSegment = status.firstRetainedSegment
+        playlistShape = status.playlistShape
+        lastRequest = status.lastRequest
+        lastRequestIdleMs = status.idleSeconds.map {
+            let seconds = max(0, $0)
+            return seconds > Int.max / 1_000 ? Int.max : seconds * 1_000
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case observedAgeMs = "observed_age_ms"
+        case recentSpeed = "recent_speed"
+        case aheadSeconds = "ahead_seconds"
+        case aheadBytes = "ahead_bytes"
+        case suspended
+        case holdReason = "hold_reason"
+        case deliveredBps = "delivered_bps"
+        case deliveredIdleMs = "delivered_idle_ms"
+        case readrate
+        case suspendCount = "suspend_count"
+        case progressIdleMs = "progress_idle_ms"
+        case publishedEndMs = "published_end_ms"
+        case fetchedEndMs = "fetched_end_ms"
+        case fetchedSegment = "fetched_segment"
+        case firstRetainedSegment = "first_retained_segment"
+        case playlistShape = "playlist_shape"
+        case lastRequest = "last_request"
+        case lastRequestIdleMs = "last_request_idle_ms"
+    }
+}
+
+/// AVPlayer and access-log state sampled at the same point that declared the
+/// clock stagnant. Runway separates an empty buffer from a decode/clock stop;
+/// request and transfer counters separate a client that stopped fetching from
+/// a server that had no segment to hand it.
+struct ApplePlaybackDiagnosticSnapshot: Encodable, Equatable {
+    var positionMs: Int?
+    var runway: Double?
+    var timeControlStatus: String?
+    var waitingReason: String?
+    var playbackBufferEmpty: Bool?
+    var playbackLikelyToKeepUp: Bool?
+    var playbackBufferFull: Bool?
+    var mediaRequests: Int?
+    var downloadedDuration: Double?
+    var bytesTransferred: Int?
+    var transferDuration: Double?
+    var observedBitrateBps: Double?
+    var indicatedBitrateBps: Double?
+    var accessStalls: Int?
+    var server: ApplePlaybackServerSnapshot?
+
+    enum CodingKeys: String, CodingKey {
+        case positionMs = "position_ms"
+        case runway
+        case timeControlStatus = "time_control_status"
+        case waitingReason = "waiting_reason"
+        case playbackBufferEmpty = "playback_buffer_empty"
+        case playbackLikelyToKeepUp = "playback_likely_to_keep_up"
+        case playbackBufferFull = "playback_buffer_full"
+        case mediaRequests = "media_requests"
+        case downloadedDuration = "downloaded_duration"
+        case bytesTransferred = "bytes_transferred"
+        case transferDuration = "transfer_duration"
+        case observedBitrateBps = "observed_bitrate_bps"
+        case indicatedBitrateBps = "indicated_bitrate_bps"
+        case accessStalls = "access_stalls"
+        case server
+    }
+}
+
 /// One sustained AVPlayer clock stall forwarded before the controller either
 /// reconnects the same delivery or stops after an immediate repeat. The
 /// server's existing `stall` vocabulary renders `ms` as `stall_ms`; position
@@ -193,6 +303,10 @@ struct ApplePlaybackStallLog: Encodable {
     let detail: String
     let ms: Int
     let encoder: String?
+    let sessionId: String?
+    let attempt: String
+    let reason: String
+    let snapshot: ApplePlaybackDiagnosticSnapshot
     let ua = "Apple AVPlayer"
 
     init(
@@ -204,7 +318,10 @@ struct ApplePlaybackStallLog: Encodable {
         title: String,
         fileId: Int,
         vcodec: String?,
-        encoder: String?
+        encoder: String?,
+        sessionId: String?,
+        attempt: String,
+        snapshot: ApplePlaybackDiagnosticSnapshot
     ) {
         message = kind == .buffering
             ? "AVPlayer buffering wait triggered same-delivery recovery"
@@ -216,11 +333,16 @@ struct ApplePlaybackStallLog: Encodable {
         detail = "kind=\(kind.rawValue) · position_ms=\(max(0, positionMs)) · outcome=\(outcome.rawValue)"
         ms = max(0, durationMs)
         self.encoder = encoder
+        self.sessionId = sessionId
+        self.attempt = attempt
+        reason = "stall-\(kind.rawValue)"
+        self.snapshot = snapshot
     }
 
     enum CodingKeys: String, CodingKey {
-        case level, event, message, method, title, detail, ms, encoder, ua
+        case level, event, message, method, title, detail, ms, encoder, attempt, reason, snapshot, ua
         case fileId = "file_id"
+        case sessionId = "session_id"
         case vcodec
     }
 }
@@ -239,6 +361,10 @@ struct ApplePlaybackObservedStallLog: Encodable {
     let detail: String
     let ms: Int
     let encoder: String?
+    let sessionId: String?
+    let attempt: String
+    let reason = "self-recovered"
+    let snapshot: ApplePlaybackDiagnosticSnapshot
     let ua = "Apple AVPlayer"
 
     init(
@@ -249,7 +375,10 @@ struct ApplePlaybackObservedStallLog: Encodable {
         title: String,
         fileId: Int,
         vcodec: String?,
-        encoder: String?
+        encoder: String?,
+        sessionId: String?,
+        attempt: String,
+        snapshot: ApplePlaybackDiagnosticSnapshot
     ) {
         self.method = method
         self.title = title
@@ -258,11 +387,15 @@ struct ApplePlaybackObservedStallLog: Encodable {
         detail = "kind=access_log · position_ms=\(max(0, positionMs)) · stall_delta=\(max(1, delta)) · outcome=self_recovered"
         ms = max(0, stagnantDurationMs)
         self.encoder = encoder
+        self.sessionId = sessionId
+        self.attempt = attempt
+        self.snapshot = snapshot
     }
 
     enum CodingKeys: String, CodingKey {
-        case level, event, message, method, title, detail, ms, encoder, ua
+        case level, event, message, method, title, detail, ms, encoder, attempt, reason, snapshot, ua
         case fileId = "file_id"
+        case sessionId = "session_id"
         case vcodec
     }
 }
@@ -765,6 +898,12 @@ final class PlayerController: ObservableObject {
 
     @Published private(set) var decision: Decision?
     @Published private(set) var sessionStatus: PlaybackSessionStatus?
+    /// Last successful status response for a stall report. The visible status
+    /// is allowed to become unavailable when a poll fails, but that failure is
+    /// precisely when diagnostics must retain the last server evidence and say
+    /// how old it was.
+    private var diagnosticSessionStatus: PlaybackSessionStatus?
+    private var diagnosticSessionStatusObservedAt: Date?
     @Published private(set) var currentMs = 0
     @Published private(set) var knownDurationMs = 0
     @Published private(set) var isPlaying = false
@@ -884,6 +1023,11 @@ final class PlayerController: ObservableObject {
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
+    /// Fresh for every attached AVPlayerItem. `playbackId` cannot serve this
+    /// purpose because it deliberately stays stable across session reopens;
+    /// telemetry needs the opposite so the stalled predecessor and recovered
+    /// successor never collapse into one attempt.
+    private var playbackAttemptId = UUID().uuidString
     private var pgsOverlayTrackIndex: Int?
     private var pgsOverlayManifest: PGSOverlayManifest?
     private var pgsOverlayPrepareTask: Task<Void, Never>?
@@ -953,6 +1097,93 @@ final class PlayerController: ObservableObject {
 
     var stalls: Int? {
         player.currentItem?.accessLog()?.events.last?.numberOfStalls
+    }
+
+    /// Playable seconds contiguous with the current clock. A later buffered
+    /// island beyond a gap is not runway: AVPlayer still has to stop before it
+    /// can reach it.
+    nonisolated static func bufferedRunwaySeconds(
+        playheadSeconds: Double,
+        ranges: [ClosedRange<Double>],
+        joinTolerance: Double = 0.25
+    ) -> Double {
+        guard playheadSeconds.isFinite else { return 0 }
+        let ranges = ranges
+            .filter {
+                $0.lowerBound.isFinite
+                    && $0.upperBound.isFinite
+                    && $0.upperBound >= $0.lowerBound
+            }
+            .sorted { $0.lowerBound < $1.lowerBound }
+        guard let start = ranges.firstIndex(where: {
+            $0.lowerBound <= playheadSeconds + joinTolerance
+                && $0.upperBound >= playheadSeconds - joinTolerance
+        }) else { return 0 }
+        var end = ranges[start].upperBound
+        for range in ranges.dropFirst(start + 1) {
+            guard range.lowerBound <= end + joinTolerance else { break }
+            end = max(end, range.upperBound)
+        }
+        return max(0, end - playheadSeconds)
+    }
+
+    private func playbackDiagnosticSnapshot(at positionMs: Int) -> ApplePlaybackDiagnosticSnapshot {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = max(0, positionMs)
+        snapshot.timeControlStatus = Self.timeControlStatusLabel(player.timeControlStatus)
+        snapshot.waitingReason = player.reasonForWaitingToPlay?.rawValue
+        if let item = player.currentItem {
+            let localSeconds = item.currentTime().seconds
+            let loaded = item.loadedTimeRanges.compactMap { value -> ClosedRange<Double>? in
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = CMTimeRangeGetEnd(range).seconds
+                guard start.isFinite, end.isFinite, end >= start else { return nil }
+                return start...end
+            }
+            snapshot.runway = Self.bufferedRunwaySeconds(
+                playheadSeconds: localSeconds,
+                ranges: loaded
+            )
+            snapshot.playbackBufferEmpty = item.isPlaybackBufferEmpty
+            snapshot.playbackLikelyToKeepUp = item.isPlaybackLikelyToKeepUp
+            snapshot.playbackBufferFull = item.isPlaybackBufferFull
+            if let event = item.accessLog()?.events.last {
+                snapshot.mediaRequests = Self.nonnegative(event.numberOfMediaRequests)
+                snapshot.downloadedDuration = Self.nonnegative(event.segmentsDownloadedDuration)
+                snapshot.bytesTransferred = event.numberOfBytesTransferred >= 0
+                    ? Int(clamping: event.numberOfBytesTransferred)
+                    : nil
+                snapshot.transferDuration = Self.nonnegative(event.transferDuration)
+                snapshot.observedBitrateBps = Self.nonnegative(event.observedBitrate)
+                snapshot.indicatedBitrateBps = Self.nonnegative(event.indicatedBitrate)
+                snapshot.accessStalls = Self.nonnegative(event.numberOfStalls)
+            }
+        }
+        if let status = diagnosticSessionStatus {
+            let ageMs = diagnosticSessionStatusObservedAt.map {
+                max(0, Int(Date().timeIntervalSince($0) * 1_000))
+            }
+            snapshot.server = ApplePlaybackServerSnapshot(status, observedAgeMs: ageMs)
+        }
+        return snapshot
+    }
+
+    nonisolated private static func nonnegative<T: BinaryInteger>(_ value: T) -> Int? {
+        value >= 0 ? Int(clamping: value) : nil
+    }
+
+    nonisolated private static func nonnegative(_ value: Double) -> Double? {
+        value.isFinite && value >= 0 ? value : nil
+    }
+
+    nonisolated static func timeControlStatusLabel(_ status: AVPlayer.TimeControlStatus) -> String {
+        switch status {
+        case .paused: return "paused"
+        case .waitingToPlayAtSpecifiedRate: return "waiting"
+        case .playing: return "playing"
+        @unknown default: return "unknown"
+        }
     }
 
     var presentationSize: CGSize { player.currentItem?.presentationSize ?? .zero }
@@ -1121,6 +1352,7 @@ final class PlayerController: ObservableObject {
 
     private func loadOffline(url: URL, startMs: Int) async {
         guard started else { return }
+        let attemptId = UUID().uuidString
         let asset = AVURLAsset(url: url)
         guard asset.assetCache?.isPlayableOffline == true else {
             fail(APIError.transport("Download incomplete"))
@@ -1132,6 +1364,7 @@ final class PlayerController: ObservableObject {
         observeEnd(of: item)
         observeStatus(of: item)
         player.replaceCurrentItem(with: item)
+        playbackAttemptId = attemptId
         baseMs = 0
         player.play()
         if startMs > 0 {
@@ -1436,6 +1669,8 @@ final class PlayerController: ObservableObject {
         isChangingStream = false
         finished = false
         sessionStatus = nil
+        diagnosticSessionStatus = nil
+        diagnosticSessionStatusObservedAt = nil
         if wasStarted { report(position) }
         if let sessionId {
             self.sessionId = nil
@@ -1567,6 +1802,7 @@ final class PlayerController: ObservableObject {
         guard let model, started else { return }
         openGeneration &+= 1
         let generation = openGeneration
+        let attemptId = UUID().uuidString
         finished = false
         attachmentRecovery.opened(at: startMs)
         isChangingStream = true
@@ -1723,6 +1959,16 @@ final class PlayerController: ObservableObject {
             nextBaseMs = Self.sessionMediaOriginMs(hls, requestedStartMs: startMs)
             if isVOD {
                 if startMs > 0 { seekAfterAttach = startMs }
+            } else if let itemPosition = Self.sessionAttachSeekMs(
+                requestedStartMs: startMs,
+                mediaOriginMs: nextBaseMs
+            ) {
+                // A copy session begins on the preceding keyframe. Timeline
+                // mapping alone makes progress truthful but still replays that
+                // lead-in after a stall recovery; seek within the newly
+                // published item so the first rendered frame lands back at the
+                // requested film position.
+                seekAfterAttach = itemPosition
             }
             url = Session.shared.url(hls.playlistUrl)
             startStatusPolling()
@@ -1766,6 +2012,7 @@ final class PlayerController: ObservableObject {
         pgsOverlayWindow = nil
         stallObservation.reset()
         player.replaceCurrentItem(with: item)
+        playbackAttemptId = attemptId
         // Publish the new local-to-film mapping only once the new item is the
         // one whose clock `realPositionMs()` reads. Updating it during session
         // creation mixed the predecessor's local time into the successor's
@@ -1855,6 +2102,8 @@ final class PlayerController: ObservableObject {
         statusTask?.cancel()
         statusTask = nil
         sessionStatus = nil
+        diagnosticSessionStatus = nil
+        diagnosticSessionStatusObservedAt = nil
     }
 
     /// Retire a superseded HLS session, best effort.
@@ -2130,6 +2379,10 @@ final class PlayerController: ObservableObject {
                       self.sessionId == polledSessionId
                 else { return }
                 self.sessionStatus = status
+                if let status {
+                    self.diagnosticSessionStatus = status
+                    self.diagnosticSessionStatusObservedAt = Date()
+                }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -2196,6 +2449,8 @@ final class PlayerController: ObservableObject {
         reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
         case .reopen:
+            ttffReason = "stall-\(event.kind.rawValue)"
+            ttffMeasurement.opened(at: event.positionMs)
             #if os(iOS)
             if Self.recoveryTransport(hasOfflineAsset: offlineAssetURL != nil) == .offlineAsset {
                 await reloadOffline(at: event.positionMs)
@@ -2222,6 +2477,7 @@ final class PlayerController: ObservableObject {
 
     private func fail(_ error: Error) {
         isChangingStream = false
+        ttffMeasurement.reset()
         failed = player.currentItem == nil || error is PlaybackPreparationError
         playbackFailureTitle = currentMs > 0
             ? Self.playbackStoppedFailureTitle
@@ -2524,7 +2780,7 @@ final class PlayerController: ObservableObject {
             height: height,
             encoder: encoder,
             sessionId: sessionId,
-            attempt: playbackId,
+            attempt: playbackAttemptId,
             reason: ttffReason
         ))
     }
@@ -2545,7 +2801,10 @@ final class PlayerController: ObservableObject {
             title: title,
             fileId: fileId,
             vcodec: decision?.source?.videoCodec,
-            encoder: encoder
+            encoder: encoder,
+            sessionId: sessionId,
+            attempt: playbackAttemptId,
+            snapshot: playbackDiagnosticSnapshot(at: event.positionMs)
         )
         postClientLog(payload)
     }
@@ -2563,7 +2822,10 @@ final class PlayerController: ObservableObject {
             title: title,
             fileId: fileId,
             vcodec: decision?.source?.videoCodec,
-            encoder: encoder
+            encoder: encoder,
+            sessionId: sessionId,
+            attempt: playbackAttemptId,
+            snapshot: playbackDiagnosticSnapshot(at: positionMs)
         ))
     }
 
@@ -3112,6 +3374,18 @@ final class PlayerController: ObservableObject {
         if hls.vod == true { return 0 }
         if let mediaOriginMs = hls.mediaOriginMs { return max(0, mediaOriginMs) }
         return Int((hls.startSeconds ?? Double(requestedStartMs) / 1000.0) * 1000)
+    }
+
+    /// Item-local seek needed after a live copy session opens on a keyframe
+    /// before the requested film position. Tiny timestamp rounding differences
+    /// stay at zero; only a real keyframe lead-in pays for an exact seek.
+    nonisolated static func sessionAttachSeekMs(
+        requestedStartMs: Int,
+        mediaOriginMs: Int,
+        minimumCorrectionMs: Int = 100
+    ) -> Int? {
+        let correction = max(0, requestedStartMs) - max(0, mediaOriginMs)
+        return correction >= minimumCorrectionMs ? correction : nil
     }
 
     private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {
