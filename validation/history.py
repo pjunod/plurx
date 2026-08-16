@@ -14,8 +14,9 @@ import tomllib
 from validation.runner import Catalog, REPO_ROOT, load_catalog, matches
 
 
-DEFAULT_COVERAGE = REPO_ROOT / "validation" / "regressions.toml"
+DEFAULT_COVERAGE = REPO_ROOT / "validation" / "regressions.d"
 DEFAULT_CLIENT_FIXES = REPO_ROOT / "tests" / "client-fixes.toml"
+COVERAGE_FIELDS = frozenset({"commits", "points", "checks", "reason", "ignore"})
 ISSUE_RE = re.compile(
     r"(^fix(?:\b|[(:])|^(?:perf(?:\([^)]*\))?:|address|hide|align|bind|delay|do not|fit|"
     r"harden|make .* (?:valid|playable)|map hls|normalize|put .* actually|"
@@ -53,6 +54,7 @@ class IssueCommit:
 
 @dataclasses.dataclass(frozen=True)
 class CoverageEntry:
+    origin: str
     commits: tuple[str, ...]
     points: tuple[str, ...]
     checks: tuple[str, ...]
@@ -116,30 +118,71 @@ def _commit_prefixes(value: object, field: str) -> tuple[str, ...]:
     return prefixes
 
 
-def load_coverage(path: Path = DEFAULT_COVERAGE) -> tuple[CoverageEntry, ...]:
+def _load_coverage_fragment(path: Path) -> CoverageEntry:
+    name = path.name
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise HistoryError(f"cannot read {path}: {exc}") from exc
     if raw.get("version") != 1:
-        raise HistoryError("regression coverage version must be 1")
+        raise HistoryError(f"{name} regression coverage version must be 1")
+    stray = set(raw) - {"version", "coverage"}
+    if stray:
+        raise HistoryError(f"{name} has unknown keys {', '.join(sorted(stray))}")
 
-    entries: list[CoverageEntry] = []
-    for index, item in enumerate(raw.get("coverage", [])):
-        where = f"coverage[{index}]"
-        if not isinstance(item, dict):
-            raise HistoryError(f"{where} must be a table")
-        entries.append(
-            CoverageEntry(
-                commits=_commit_prefixes(item.get("commits"), f"{where}.commits"),
-                points=_strings(item.get("points"), f"{where}.points"),
-                checks=_strings(item.get("checks"), f"{where}.checks"),
-                reason=str(item.get("reason", "")).strip(),
-                ignore=bool(item.get("ignore", False)),
-            )
+    items = raw.get("coverage")
+    if not isinstance(items, list) or len(items) != 1:
+        raise HistoryError(f"{name} must hold exactly one [[coverage]] entry")
+    item = items[0]
+    if not isinstance(item, dict):
+        raise HistoryError(f"{name} coverage entry must be a table")
+    unknown = set(item) - COVERAGE_FIELDS
+    if unknown:
+        raise HistoryError(
+            f"{name} coverage entry has unknown keys {', '.join(sorted(unknown))}"
         )
-    return tuple(entries)
+
+    entry = CoverageEntry(
+        origin=name,
+        commits=_commit_prefixes(item.get("commits"), f"{name} commits"),
+        points=_strings(item.get("points"), f"{name} points"),
+        checks=_strings(item.get("checks"), f"{name} checks"),
+        reason=str(item.get("reason", "")).strip(),
+        ignore=bool(item.get("ignore", False)),
+    )
+    # The file name carries the first mapped commit, so two branches can never
+    # choose the same path for two different entries. That binding is what
+    # makes the directory conflict-free rather than merely conflict-prone.
+    if entry.commits:
+        lead = entry.commits[0]
+        if path.stem != lead and not path.stem.startswith(f"{lead}-"):
+            raise HistoryError(
+                f"{name} must be named {lead}.toml or {lead}-<slug>.toml "
+                f"after its first mapped commit"
+            )
+    return entry
+
+
+def load_coverage(path: Path = DEFAULT_COVERAGE) -> tuple[CoverageEntry, ...]:
+    """Load every `[[coverage]]` fragment from a regression-mapping directory.
+
+    One entry per file means an author appends a new file instead of editing a
+    shared tail, so concurrent corrective changes never collide.
+    """
+
+    legacy = path.with_suffix(".toml")
+    if legacy.exists():
+        raise HistoryError(
+            f"{legacy.name} is no longer the regression ledger: move each "
+            f"[[coverage]] entry into {path.name}/<commit>-<slug>.toml"
+        )
+    if not path.is_dir():
+        raise HistoryError(f"cannot read {path}: not a directory")
+    return tuple(
+        _load_coverage_fragment(fragment)
+        for fragment in sorted(path.glob("*.toml"))
+    )
 
 
 def load_client_fixes(path: Path) -> ClientFixLedger:
@@ -285,8 +328,8 @@ def audit_history(
     resolved: dict[str, CoverageEntry] = {}
     anchored: set[str] = set()
 
-    for index, entry in enumerate(entries):
-        where = f"coverage[{index}]"
+    for entry in entries:
+        where = entry.origin
         if not entry.commits:
             errors.append(f"{where} has no commits")
         if not entry.reason:
@@ -400,7 +443,7 @@ def audit_history(
             if issue.sha not in resolved and issue.sha not in anchored:
                 errors.append(
                     f"corrective runtime commit {issue.sha[:8]} needs an explicit "
-                    f"regressions.toml mapping or client-fix anchor: {issue.subject}"
+                    f"regressions.d mapping or client-fix anchor: {issue.subject}"
                 )
             continue
         if issue.point_ids and issue.direct_test_evidence:

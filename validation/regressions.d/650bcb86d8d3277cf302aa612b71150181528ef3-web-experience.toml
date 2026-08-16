@@ -1,0 +1,10 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "650bcb86d8d3277cf302aa612b71150181528ef3",
+  "5b36c5019b42b58a36021dcf7a2cee72b6359ba0",
+]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy units pin the versioned media-load identity, deterministic bitrate buckets, legacy-key rejection, exact forget/retest routing, Original bypass, and learned HDR-to-SDR attribution; restoring only the prior browser policy makes one broad codec/height verdict steer materially different 4K HDR sources."

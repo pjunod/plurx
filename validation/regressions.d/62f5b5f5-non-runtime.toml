@@ -1,0 +1,23 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "62f5b5f5",
+  "3da02b51",
+  "f3160efb",
+  "8a380e6f",
+  "c8409161",
+  "ae09050e",
+  "fdfd9bdf",
+  "b9eafb2d",
+  "9cd542f8",
+  "7aa665be",
+  "552e3449",
+  "7868f4da",
+  "ea7862f6",
+  "9e649050",
+]
+points = []
+checks = []
+reason = "These commits only correct documentation, comments, record a review, change ignored generated cache state, or configure the repo-local external swarm harness; they introduce no executable application behavior."
+ignore = true
