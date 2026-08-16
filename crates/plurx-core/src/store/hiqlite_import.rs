@@ -58,9 +58,10 @@ const IMPORT_TXN_BUDGET_BYTES: usize = WAL_USABLE_PAYLOAD_BYTES / 4;
 /// header and `QueryWrite` framing wrapped around the statements.
 const IMPORT_TXN_ENVELOPE_BYTES: usize = 256;
 /// Held back from every transaction against encoding drift: [`estimated_row_bytes`]
-/// is an upper bound on `hiqlite-wal` 0.14's `bincode` encoding, but a later
-/// version could widen a discriminant or add a field, and the cost of being
-/// wrong is a panicked node rather than a slower import.
+/// is an upper bound on the `bincode::config::legacy()` encoding `hiqlite-wal`
+/// 0.14 writes, but a later version could widen a discriminant, add a field, or
+/// change config, and the cost of being wrong is a panicked node rather than a
+/// slower import.
 const WAL_ENCODING_RESERVE_BYTES: usize = 64 * 1024;
 /// A single row estimated above this is refused, because no transaction
 /// carrying it fits the WAL: submitting it panics the writer thread and
@@ -779,39 +780,55 @@ impl ImportTransactionBuilder {
     }
 }
 
-/// Bytes a statement costs inside a transaction beyond its SQL text and
-/// parameters: the `Query` length prefixes and the parameter vector header.
+/// Bytes a statement costs inside a transaction beyond its SQL text and its
+/// parameters: the length prefix on `Query::sql` and the statement's slot in the
+/// transaction vector. The parameter vector's own header is charged by
+/// [`estimated_row_bytes`] instead, so it is not counted here.
 const PER_STATEMENT_FRAMING_BYTES: usize = 32;
 
 /// Conservative upper bound on the bytes one row adds to a Raft entry.
 ///
-/// `hiqlite-wal` encodes entries with `bincode::config::standard()`, whose
-/// integers and length prefixes are variable width. Rather than depend on that
-/// encoding, every field is charged its widest form: a mis-estimate then makes
-/// transactions smaller than necessary, never larger than the WAL.
+/// `hiqlite-wal` 0.14 encodes log entries with `bincode::config::legacy()` —
+/// fixed-width integers, chosen there for speed — not with `standard()`:
+/// `log_store_impl.rs` serializes every appended entry with that config, and
+/// those are the bytes the writer thread measures before it panics. The
+/// `standard()` calls elsewhere in the crate serialize metadata and snapshots,
+/// which never carry an import transaction.
+///
+/// Rather than depend on one config, every param is charged the widest form it
+/// takes under either. A mis-estimate then makes transactions smaller than
+/// necessary, never larger than the WAL.
 fn estimated_row_bytes(row: &[Param]) -> usize {
-    row.iter()
-        .map(|param| PER_PARAM_FRAMING_BYTES + param_payload_bytes(param))
-        .sum()
+    PARAM_VEC_HEADER_BYTES
+        + row
+            .iter()
+            .map(|param| PER_PARAM_FRAMING_BYTES + param_payload_bytes(param))
+            .sum::<usize>()
 }
 
-/// Enum discriminant plus the widest `bincode` varint a length or integer can
-/// occupy.
-const PER_PARAM_FRAMING_BYTES: usize = 11;
+/// Length prefix written ahead of the row's parameter vector: a fixed 8 bytes
+/// under `legacy()`, never more than a 9-byte varint under `standard()`.
+const PARAM_VEC_HEADER_BYTES: usize = 9;
+
+/// Enum discriminant plus the one integer field the widest `Param` variant puts
+/// after it. Under `legacy()` that is a fixed 4 plus a fixed 8; under
+/// `standard()` neither a varint discriminant nor a varint length exceeds those.
+const PER_PARAM_FRAMING_BYTES: usize = 12;
 
 fn param_payload_bytes(param: &Param) -> usize {
     match param {
         Param::Null => 0,
-        // Charged by the framing allowance above, which already covers the
-        // widest varint form of both.
+        // Both land inside the framing allowance's integer field: a fixed-width
+        // `i64` and an `f64` bit pattern are 8 bytes each.
         Param::Integer(_) => 0,
-        Param::Real(_) => 8,
+        Param::Real(_) => 0,
         Param::Text(value) => value.len(),
         Param::Blob(value) => value.len(),
-        // Import never builds statement-output references; charge the framing
-        // allowance and a name rather than assume a future one is free.
-        Param::StmtOutputIndexed(..) => 0,
-        Param::StmtOutputNamed(_, name) => name.len(),
+        // Import never builds statement-output references, but both carry a
+        // second integer past the framing allowance. Charge it rather than
+        // leave a future caller silently under-counted.
+        Param::StmtOutputIndexed(..) => 8,
+        Param::StmtOutputNamed(_, name) => 8 + name.len(),
     }
 }
 
@@ -1999,9 +2016,15 @@ mod tests {
 
     /// The estimate exists to be an upper bound. If it ever under-counts the
     /// encoder, every bound above it is decoration.
+    ///
+    /// Measured against `legacy()` because that is the config `hiqlite-wal` 0.14
+    /// appends log entries with, and therefore the encoding whose length the
+    /// writer thread panics on. `standard()` is asserted alongside it as cheap
+    /// insurance should hiqlite ever switch.
     #[test]
     fn the_row_estimate_stays_above_what_the_wal_encoder_produces() {
         let rows: Vec<hiqlite::Params> = vec![
+            vec![],
             vec![Param::Null, Param::Integer(i64::MIN), Param::Real(-1.5)],
             vec![
                 Param::Integer(i64::MAX),
@@ -2009,15 +2032,45 @@ mod tests {
                 Param::Text(String::new()),
             ],
             vec![Param::Blob(vec![0xab; 8192])],
+            // Integer- and text-heavy rows: the per-param slack is the whole
+            // point of the estimate, so exercise many params rather than a few
+            // large ones. A `files` row is this shape.
+            std::iter::repeat_n(Param::Integer(i64::MAX), 64).collect(),
+            std::iter::repeat_n(Param::Text("path/segment".to_owned()), 64).collect(),
+            (0..64)
+                .map(|index| match index % 5 {
+                    0 => Param::Null,
+                    1 => Param::Integer(-index),
+                    2 => Param::Real(index as f64),
+                    3 => Param::Text("x".repeat(index as usize)),
+                    _ => Param::Blob(vec![0x5a; index as usize]),
+                })
+                .collect(),
+            // Never built by import, but the estimate claims to cover them.
+            vec![
+                Param::StmtOutputIndexed(usize::MAX, usize::MAX),
+                Param::StmtOutputNamed(usize::MAX, "column_name".into()),
+            ],
         ];
         for row in rows {
-            let encoded = bincode::serde::encode_to_vec(&row, bincode::config::standard())
-                .expect("encode row the way hiqlite-wal does");
+            let estimate = estimated_row_bytes(&row);
+            let legacy = bincode::serde::encode_to_vec(&row, bincode::config::legacy())
+                .expect("encode row the way hiqlite-wal's log store does");
+            let standard = bincode::serde::encode_to_vec(&row, bincode::config::standard())
+                .expect("encode row under the varint config");
             assert!(
-                estimated_row_bytes(&row) >= encoded.len(),
-                "estimate {} under-counted the {}-byte encoding",
-                estimated_row_bytes(&row),
-                encoded.len()
+                estimate >= legacy.len(),
+                "estimate {estimate} under-counted the {}-byte legacy encoding of a \
+                 {}-param row",
+                legacy.len(),
+                row.len()
+            );
+            assert!(
+                estimate >= standard.len(),
+                "estimate {estimate} under-counted the {}-byte standard encoding of a \
+                 {}-param row",
+                standard.len(),
+                row.len()
             );
         }
     }

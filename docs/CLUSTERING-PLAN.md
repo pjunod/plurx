@@ -597,14 +597,17 @@ tables in foreign-key order and byte-measured Raft transactions, preserving
 explicit ids, timestamps, nullable text, and integer values. Both chunk
 producers — offset paging and the parent-first item-id path — feed rows through
 one transaction builder that accumulates their serialized size and submits
-before the next row would cross a byte budget: half the 2,097,118-byte payload
-capacity that the production `wal_size: 2 * 1024 * 1024` leaves after the
-segment header. A row count cannot bound this. One transaction becomes one Raft
-entry, `files.probe_json` holds whole ffprobe documents, and `hiqlite` panics
-its WAL writer on an entry past that capacity: 64 rows of a real library
-serialized to 3,137,236 bytes, and a 16-row bound still overflowed whenever 16
-adjacent rows averaged more than ~131 KB — which is how node `m6` exited
-mid-import and restarted into unreplicated SQLite while reporting healthy.
+before the next row would cross a byte budget: a quarter of the 2,097,118-byte
+payload capacity that the production `wal_size: 2 * 1024 * 1024` leaves after
+the segment header. A quarter rather than the whole because the WAL is not the
+only bound on a submission — a transaction near the cap must also replicate to
+every voter inside the store's three-second timeout, which half the payload
+failed to do on a loaded host. A row count cannot bound this. One transaction
+becomes one Raft entry, `files.probe_json` holds whole ffprobe documents, and
+`hiqlite` panics its WAL writer on an entry past that capacity: 64 rows of a
+real library serialized to 3,137,236 bytes, and a 16-row bound still overflowed
+whenever 16 adjacent rows averaged more than ~131 KB — which is how node `m6`
+exited mid-import and restarted into unreplicated SQLite while reporting healthy.
 `IMPORT_CHUNK_ROWS` survives as a secondary bound only: it is the source read
 page and a ceiling on rows per transaction, no longer the safety property. A
 single row too large for any transaction is refused before submission, naming
