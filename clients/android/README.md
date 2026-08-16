@@ -19,8 +19,8 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `27` — native viewer parity across phone, foldable,
-> and TV. Build 27 makes the detail screen list every audio and subtitle track
+> Status: **v0.2.7**, build `28` — native viewer parity across phone, foldable,
+> and TV. Build 28 makes the detail screen list every audio and subtitle track
 > with the server's own default markers and its five-state preferred-language
 > verdict, and lets the viewer pick both — including Off — before pressing play;
 > the choice reaches the first `/decision` and any burn-in cost is disclosed
