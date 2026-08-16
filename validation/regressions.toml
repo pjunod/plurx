@@ -468,7 +468,19 @@ checks = ["cluster-auth"]
 reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
 
 [[coverage]]
+commits = ["a828a217", "ab10b2c7"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HLS regressions drive `http::hls::segment` and `exact_hls_context` against a published producer-less session, so they discriminate where segment bytes are counted rather than the tracker's arithmetic: `segment_bytes_are_counted_as_the_body_drains_not_at_open` requires the session delivery meter to read zero when the handler returns and the segment's full length only after the body is consumed, so restoring `session.delivery.note(len)` at open fails the first assertion and removing the counting body stream fails the second; `an_abandoned_segment_body_is_recorded_as_response_dropped` drops a partially consumed body and requires the `Drop`-only `response_dropped` classification naming delivered and expected bytes; `an_unreadable_segment_body_is_recorded_as_storage_read_error` fails the first read with EISDIR and requires exactly one `storage_read_error` terminal event; and the two `init` probe regressions require a playlist-time codec sniff to move no delivery bytes, to emit nothing for a bounded read that returned every byte it asked for, and to tag a failed internal read `\"purpose\":\"internal_probe\"` so it cannot be read as a client segment fetch."
+
+[[coverage]]
 commits = ["2d7b1443", "7d22cdf6"]
 points = ["cluster.membership", "persistence.upgrades"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The readdress regressions pin a settled trigger and a sole-voter guard read from replicated node records, the daemon-join contract pins concurrent token issuance, and the parameterized SIGKILL contract pins activated-node recovery for both advertised forms."
+
+[[coverage]]
+commits = ["417190e7"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web regressions execute the real `closePlayer()` and `playbackSelection()` to prove that a track choice belongs to an open playback rather than to the file: closing the player drops it, so the next cold start of the same file takes the detail-screen pickers the viewer is actually looking at, while an in-playback quality change still reproduces the tracks on screen. Reverting only the production correction fails `closing the player ends its track choice instead of arming the next play`, because `closePlayer()` does not replace `PLAYER` and the stale selection keeps matching after the playback ended."

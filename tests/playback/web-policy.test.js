@@ -19,17 +19,36 @@ const SHIPPED_UI = fs.readFileSync(
 // brace/string parsing is needed. A rename fails loudly rather than silently
 // testing nothing.
 const DECLARATIONS = ["\nfunction ", "\nasync function "];
+// A slice ends at the next top-level declaration of ANY kind, not only the next
+// function. A `const` table sitting between two functions would otherwise be
+// swallowed by whichever function precedes it, and a harness that also asks for
+// that table by name gets "already declared" — a confusing failure about the
+// slicer rather than about the code under test.
+// `window.`/`document.` are not declarations, but they are the other thing that
+// appears at column zero in this script: top-level listener registration. A
+// function followed by one (closePlayer is) would otherwise be sliced together
+// with every handler after it, and those RUN at build time — the harness fails
+// on an undefined `window` instead of on the function under test.
+const TERMINATORS = DECLARATIONS.concat([
+  "\nconst ",
+  "\nlet ",
+  "\nwindow.",
+  "\ndocument.",
+]);
+function sliceDeclaration(start) {
+  const rest = SHIPPED_UI.slice(start + 1);
+  const ends = TERMINATORS.map((kind) => rest.indexOf(kind, 1)).filter(
+    (at) => at !== -1,
+  );
+  const end = ends.length ? Math.min(...ends) : -1;
+  return (end === -1 ? rest : rest.slice(0, end)).trimEnd();
+}
 function shippedSource(name) {
   const start = DECLARATIONS.map((kind) =>
     SHIPPED_UI.indexOf(`${kind}${name}(`),
   ).find((at) => at !== -1);
   assert.notEqual(start, undefined, `index.html no longer declares ${name}`);
-  const rest = SHIPPED_UI.slice(start + 1);
-  const ends = DECLARATIONS.map((kind) => rest.indexOf(kind, 1)).filter(
-    (at) => at !== -1,
-  );
-  const end = ends.length ? Math.min(...ends) : -1;
-  return (end === -1 ? rest : rest.slice(0, end)).trimEnd();
+  return sliceDeclaration(start);
 }
 
 // Deliberately NOT `shippedSource`. The rescue-collision regression has to be
@@ -1436,6 +1455,491 @@ asyncTest("a burn session-open refusal reaches the persistent overlay", async ()
     "the persistent refusal must not be hidden after the rejected session open",
   );
   assert.equal(toasts.at(-1), "Playback failed");
+});
+
+// ---- detail-screen track facts + pre-play selection (issue #266) ----------
+//
+// Everything below runs the SHIPPED index.html functions. The detail screen is
+// generated JavaScript, so a Rust suite can be green while the page has stopped
+// naming a subtitle track or has started sending `audio=` on a request nobody
+// touched — and that last one silently downgrades a direct play.
+
+// A top-level data declaration, sliced the way shippedSource() slices a
+// function. The tests then exercise the shipped table rather than a copy that
+// drifts away from it.
+function shippedBinding(keyword, name) {
+  const at = SHIPPED_UI.indexOf(`\n${keyword} ${name}=`);
+  assert.notEqual(at, -1, `index.html no longer declares ${keyword} ${name}`);
+  return sliceDeclaration(at);
+}
+
+// The detail screen with no browser: format helpers that are not under test are
+// stubbed, everything that decides what a viewer READS is shipped code.
+function detailHarness({ decisions = {} } = {}) {
+  const requested = [];
+  const build = new Function(
+    "document",
+    "PlaybackPolicy",
+    "qualityForce",
+    "CAPS_Q",
+    "api",
+    "fmtSize",
+    "fmtDur",
+    "fmtMbps",
+    [
+      shippedSource("esc"),
+      shippedSource("fmtChannels"),
+      shippedSource("audioLabel"),
+      shippedBinding("const", "LANGS"),
+      shippedSource("langName"),
+      shippedSource("subNeedsBurn"),
+      shippedBinding("const", "SUB_FORMATS"),
+      shippedSource("subFormat"),
+      shippedSource("subFactLabel"),
+      shippedSource("audioFactLabel"),
+      shippedSource("trackChip"),
+      shippedSource("trackFactRow"),
+      shippedSource("preferredLanguageNote"),
+      shippedSource("specBlock"),
+      shippedBinding("let", "PREPLAY"),
+      shippedSource("prePlaySelection"),
+      shippedSource("clearPrePlay"),
+      shippedSource("prePlaySelectionQuery"),
+      shippedSource("decisionUrl"),
+      shippedSource("setPrePlay"),
+      shippedSource("prePlayPickers"),
+      shippedBinding("const", "PREPLAY_SCOPE_NOTE"),
+      shippedSource("prePlayBurnNeeded"),
+      shippedSource("prePlayApplication"),
+      shippedSource("prePlayPreview"),
+      "return {specBlock, prePlayPickers, setPrePlay, clearPrePlay," +
+        " prePlaySelection, decisionUrl, prePlayApplication, prePlayBurnNeeded," +
+        " preferredLanguageNote};",
+    ].join("\n"),
+  );
+  const shipped = build(
+    // No note element: setPrePlay's preview early-outs, which is what a click
+    // on a page this test never rendered would do.
+    { getElementById: () => null },
+    policy,
+    () => "auto",
+    "vcodec=h264&acodec=aac",
+    async (url) => {
+      requested.push(url);
+      const answer = decisions[url];
+      if (!answer) throw new Error(`no stubbed decision for ${url}`);
+      return answer;
+    },
+    () => "3.4 GB",
+    () => "1h 52m",
+    () => "8.1 Mb/s",
+  );
+  return { ...shipped, requested };
+}
+
+const MOVIE_FILE = {
+  id: 42,
+  filename: "Arrival.2016.mkv",
+  available: true,
+  container: "mkv",
+  video_codec: "hevc",
+  width: 3840,
+  height: 2160,
+  audio_streams: [
+    { index: 0, codec: "truehd", channels: 8, language: "eng", default: true },
+    { index: 1, codec: "ac3", channels: 6, language: "fra" },
+  ],
+  subtitle_streams: [
+    {
+      index: 0,
+      codec: "subrip",
+      language: "eng",
+      forced: true,
+      title: "Heptapod",
+    },
+    { index: 1, codec: "subrip", language: "eng", hearing_impaired: true },
+    { index: 2, codec: "hdmv_pgs_subtitle", language: "fra" },
+  ],
+  playback_defaults: {
+    audio: {
+      selected_index: 0,
+      preferred_language: "eng",
+      preferred_language_status: "selected",
+    },
+    subtitle: {
+      selected_index: 1,
+      preferred_language: "eng",
+      preferred_language_status: "selected",
+    },
+  },
+};
+
+test("the detail screen names every subtitle track, its format and its markers", () => {
+  const html = detailHarness().specBlock(MOVIE_FILE);
+  assert.match(html, /<dt>Subtitles<\/dt>/);
+  // Language · format · forced/SDH — the three facts criterion 1 asks for, for
+  // tracks that until now were invisible until playback started.
+  assert.match(html, /English · SRT · forced · Heptapod/);
+  assert.match(html, /English · SRT · SDH/);
+  assert.match(html, /French · PGS/);
+  // The server's chosen track, marked as such, from `playback_defaults` — not
+  // re-derived here from `default` flags or admin settings.
+  assert.match(
+    html,
+    /English · SRT · SDH · <span class="tdef">plays by default<\/span>/,
+  );
+  assert.equal(
+    (html.match(/plays by default/g) || []).length,
+    2,
+    "exactly one audio and one subtitle track carry the marker",
+  );
+});
+
+test("a file with no subtitle tracks says so instead of showing an empty row", () => {
+  const bare = {
+    ...MOVIE_FILE,
+    subtitle_streams: [],
+    playback_defaults: {
+      ...MOVIE_FILE.playback_defaults,
+      subtitle: {
+        selected_index: null,
+        preferred_language: "eng",
+        preferred_language_status: "no_tracks",
+      },
+    },
+  };
+  const html = detailHarness().specBlock(bare);
+  assert.match(html, /<dt>Subtitles<\/dt><dd><div class="trks">None<\/div>/);
+  // `no_tracks` must not also produce "no English subtitles": the row already
+  // said it, and saying it twice reads as two different problems.
+  assert.equal(html.includes("langnote"), false);
+});
+
+test("an audiobook part is not asked about subtitles it could never have", () => {
+  const part = {
+    id: 9,
+    filename: "book-01.m4b",
+    available: true,
+    container: "m4b",
+    audio_streams: [{ index: 0, codec: "aac", channels: 2, default: true }],
+    subtitle_streams: [],
+    playback_defaults: {
+      audio: {
+        selected_index: 0,
+        preferred_language: "eng",
+        preferred_language_status: "unknown",
+      },
+      subtitle: {
+        selected_index: null,
+        preferred_language: "eng",
+        preferred_language_status: "no_tracks",
+      },
+    },
+  };
+  const html = detailHarness().specBlock(part);
+  assert.equal(html.includes("<dt>Subtitles</dt>"), false);
+  assert.equal(html.includes("preplay"), false, "nothing to choose between");
+});
+
+test("the preferred-language sentence keeps `unknown` distinct from `missing`", () => {
+  const { preferredLanguageNote } = detailHarness();
+  const note = (status) =>
+    preferredLanguageNote("subtitles", {
+      preferred_language: "eng",
+      preferred_language_status: status,
+    });
+  assert.equal(note("missing"), "no English subtitles");
+  // The whole point of the fifth state: an untagged track means the absence of
+  // English cannot be claimed, so the page must not claim it.
+  assert.notEqual(note("unknown"), note("missing"));
+  assert.match(note("unknown"), /no language tag/);
+  assert.match(note("available"), /English subtitles available/);
+  assert.equal(note("selected"), "", "the marked chip already says this");
+  assert.equal(note("no_tracks"), "", "the row already says this");
+});
+
+test("a scanning viewer learns 'English audio, no English subtitles'", () => {
+  const html = detailHarness().specBlock({
+    ...MOVIE_FILE,
+    subtitle_streams: [{ index: 0, codec: "subrip", language: "fra" }],
+    playback_defaults: {
+      audio: {
+        selected_index: 0,
+        preferred_language: "eng",
+        preferred_language_status: "selected",
+      },
+      subtitle: {
+        selected_index: null,
+        preferred_language: "eng",
+        preferred_language_status: "missing",
+      },
+    },
+  });
+  assert.match(html, /English · TRUEHD/);
+  assert.match(html, /no English subtitles/);
+});
+
+test("both pickers offer the server default, every track, and Off", () => {
+  const html = detailHarness().prePlayPickers(MOVIE_FILE);
+  assert.match(html, /<select id="pp-a-42"/);
+  assert.match(html, /<select id="pp-s-42"/);
+  // "Default" is its own option and is what an untouched picker sends: see the
+  // request test below for why that distinction is load-bearing.
+  assert.match(html, /<option value="" selected>Default · English · TRUEHD · 7\.1</);
+  assert.match(html, /<option value="-1">Off<\/option>/);
+  assert.match(html, /<option value="2">French · PGS<\/option>/);
+  assert.match(html, /it doesn’t change your Playback defaults/);
+});
+
+test("an untouched picker changes the decision request by nothing at all", () => {
+  const h = detailHarness();
+  const legacy = "/files/42/decision?vcodec=h264&acodec=aac&force=auto";
+  assert.equal(h.decisionUrl(42, "auto", h.prePlaySelection(42)), legacy);
+  // Choosing, then choosing "Default" again, must return to the byte-for-byte
+  // legacy request — otherwise reverting a choice leaves a remux behind.
+  h.setPrePlay(42, "audio", "1");
+  assert.equal(
+    h.decisionUrl(42, "auto", h.prePlaySelection(42)),
+    `${legacy}&audio=1`,
+  );
+  h.setPrePlay(42, "audio", "");
+  assert.equal(h.decisionUrl(42, "auto", h.prePlaySelection(42)), legacy);
+  // Off is an explicit choice, and -1 is how it is spelled.
+  h.setPrePlay(42, "subtitle", "-1");
+  assert.equal(
+    h.decisionUrl(42, "auto", h.prePlaySelection(42)),
+    `${legacy}&subtitle=-1`,
+  );
+});
+
+test("a pre-play choice is per file and does not survive leaving the item", () => {
+  const h = detailHarness();
+  h.setPrePlay(42, "audio", "1");
+  assert.deepEqual(h.prePlaySelection(42), { audio: 1, subtitle: null });
+  // A multi-version item's other file is a different set of streams; one
+  // item-wide index would point into the wrong file.
+  assert.equal(h.prePlaySelection(43), null);
+  h.clearPrePlay();
+  assert.equal(
+    h.prePlaySelection(42),
+    null,
+    "a choice made on one item must not apply to the next",
+  );
+});
+
+// The cold-start half: what a selection does to the FIRST session open.
+const PGS_DECISION = {
+  method: "transcode",
+  delivered_dynamic_range: "sdr",
+  subtitles: [
+    { index: 0, codec: "subrip", text: true },
+    { index: 2, codec: "hdmv_pgs_subtitle", text: false },
+  ],
+  selection: {
+    audio_index: 0,
+    subtitle_index: 2,
+    subtitle_requires_burn_in: true,
+    subtitle_burn_in_blocked_by_hdr: false,
+  },
+};
+
+test("a pre-play burn rides the first session open rather than a restart", () => {
+  const applied = detailHarness().prePlayApplication(PGS_DECISION, {
+    audio: null,
+    subtitle: 2,
+  });
+  assert.deepEqual(applied, {
+    subtitle: 2,
+    blockedByHdr: false,
+    burnedSub: 2,
+    textSub: null,
+  });
+});
+
+test("a pre-play text subtitle is a <track>, not a second session", () => {
+  const applied = detailHarness().prePlayApplication(
+    {
+      method: "direct_play",
+      delivered_dynamic_range: "sdr",
+      subtitles: [{ index: 0, codec: "subrip", text: true }],
+      selection: {
+        audio_index: 0,
+        subtitle_index: 0,
+        subtitle_requires_burn_in: false,
+        subtitle_burn_in_blocked_by_hdr: false,
+      },
+    },
+    { audio: null, subtitle: 0 },
+  );
+  assert.equal(applied.burnedSub, null);
+  assert.equal(applied.textSub, 0, "applied locally, with no stream restart");
+});
+
+test("the HDR guard refuses a pre-play burn before the stream exists", () => {
+  const applied = detailHarness().prePlayApplication(
+    {
+      ...PGS_DECISION,
+      method: "remux",
+      delivered_dynamic_range: "dolby_vision",
+      selection: { ...PGS_DECISION.selection, subtitle_burn_in_blocked_by_hdr: true },
+    },
+    { audio: null, subtitle: 2 },
+  );
+  assert.equal(applied.blockedByHdr, true);
+  assert.equal(applied.burnedSub, null, "HDR is kept, exactly as in-player");
+  assert.equal(applied.textSub, null);
+});
+
+test("an audio-only choice never burns the subtitle the server merely echoed", () => {
+  // `selection.subtitle_index` is the POLICY default here — the request carried
+  // no `subtitle=`. Reading that echo as a choice would burn a bitmap track
+  // into a film the viewer only asked to hear in French.
+  const applied = detailHarness().prePlayApplication(PGS_DECISION, {
+    audio: 1,
+    subtitle: null,
+  });
+  assert.deepEqual(applied, {
+    subtitle: null,
+    blockedByHdr: false,
+    burnedSub: null,
+    textSub: null,
+  });
+});
+
+test("a burn this browser needs is honoured even when the plan omits it", () => {
+  // PGS with the application overlay enabled: the server plans a remux, because
+  // a native client would draw the overlay itself. This player has no overlay
+  // route, so following the plan would start a stream that cannot show the
+  // chosen track and replace it a moment later.
+  const overlayPlan = {
+    method: "remux",
+    delivered_dynamic_range: "sdr",
+    subtitles: [{ index: 2, codec: "hdmv_pgs_subtitle", text: false }],
+    selection: {
+      audio_index: 0,
+      subtitle_index: 2,
+      subtitle_requires_burn_in: false,
+      subtitle_burn_in_blocked_by_hdr: false,
+    },
+  };
+  const h = detailHarness();
+  assert.equal(h.prePlayBurnNeeded(overlayPlan, 2), true);
+  assert.equal(h.prePlayApplication(overlayPlan, { subtitle: 2 }).burnedSub, 2);
+});
+
+// ---- the carry ends with the playback (review finding 1 on PR #293) --------
+//
+// play() asks playbackSelection() which tracks to run with, and the answer
+// turns on one thing: is this still the playback that is already open? A
+// quality change is; the same file played again after the viewer closed the
+// player is not. closePlayer() does not replace PLAYER, so that distinction
+// exists only because closePlayer() drops `preplay` — without it the pickers on
+// the detail screen become decoration after a file's first playback.
+//
+// The whole scenario runs the SHIPPED closePlayer(), not a description of it.
+function carryHarness(player) {
+  const stubEl = () => ({
+    classList: { remove() {}, add() {} },
+    style: {},
+    dataset: {},
+    innerHTML: "",
+    querySelectorAll: () => [],
+    pause() {},
+    removeAttribute() {},
+    load() {},
+  });
+  const build = new Function(
+    "document",
+    "PLAYER",
+    "exitPresentationModes",
+    "reportProgress",
+    "releaseSession",
+    "stopPlayerTimers",
+    "clearInterval",
+    "STATS_TIMER",
+    "teardownHls",
+    "setLoading",
+    "location",
+    "setTimeout",
+    "prePlayPreview",
+    [
+      shippedBinding("let", "PREPLAY"),
+      shippedSource("prePlaySelection"),
+      shippedSource("clearPrePlay"),
+      shippedSource("playbackSelection"),
+      shippedSource("setPrePlay"),
+      shippedSource("rememberPlaybackSelection"),
+      shippedSource("closePlayer"),
+      "return {prePlaySelection, clearPrePlay, playbackSelection, setPrePlay," +
+        " rememberPlaybackSelection, closePlayer};",
+    ].join("\n"),
+  );
+  return build(
+    { getElementById: stubEl },
+    player,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    null,
+    () => {},
+    () => {},
+    // Not an item route: the deferred re-render is a different concern, and the
+    // test performs loadItem()'s picker reset explicitly where it happens.
+    { hash: "#/" },
+    () => {},
+    () => {},
+  );
+}
+
+test("closing the player ends its track choice instead of arming the next play", () => {
+  const player = { fileId: 42, preplay: { audio: 1, subtitle: null } };
+  const h = carryHarness(player);
+  // While it is open, this playback's own tracks are the answer — that is the
+  // carry a quality change depends on.
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 1, subtitle: null });
+  h.closePlayer();
+  // loadItem() empties the pickers on the way back to the detail screen, so
+  // "Default" is what the viewer now sees on both of them.
+  h.clearPrePlay();
+  assert.equal(
+    h.playbackSelection(player, 42),
+    null,
+    "a closed playback's tracks must not be reused by the next cold start, " +
+      "which the screen is showing as Default",
+  );
+});
+
+test("a picker changed after a playback is not overruled by that playback", () => {
+  const player = { fileId: 42, preplay: null };
+  const h = carryHarness(player);
+  // An in-player switch records itself the same way a pre-play choice does.
+  h.rememberPlaybackSelection("audio", 0);
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 0, subtitle: null });
+  h.closePlayer();
+  h.clearPrePlay();
+  // Back on the detail screen the viewer picks the French track instead.
+  h.setPrePlay(42, "audio", "1");
+  assert.deepEqual(
+    h.playbackSelection(player, 42),
+    { audio: 1, subtitle: null },
+    "the explicit choice on screen wins, not the previous playback's",
+  );
+});
+
+test("a quality change still reproduces the tracks that are playing", () => {
+  // The other half of the contract: ending the carry at close must not end it
+  // mid-playback, or changing quality would silently revert the viewer's tracks
+  // to the cold-start policy default.
+  const player = { fileId: 42, preplay: null };
+  const h = carryHarness(player);
+  h.rememberPlaybackSelection("audio", 1);
+  h.rememberPlaybackSelection("subtitle", 2);
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 1, subtitle: 2 });
+  // A different file is a cold start even while this one is open.
+  h.setPrePlay(43, "subtitle", "-1");
+  assert.deepEqual(h.playbackSelection(player, 43), { audio: null, subtitle: -1 });
 });
 
 // Drained last, in registration order, after every synchronous case has run.
