@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 use plurx_core::auth::hash_password;
 use plurx_core::store::{SqliteStore, UserStore};
 
+static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind test port")
@@ -96,6 +104,7 @@ async fn login_status(port: u16, username: &str, password: &str) -> reqwest::Sta
 
 #[test]
 fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("activation process fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(data.join("sessions/live-session")).expect("session fixture");
@@ -157,6 +166,7 @@ fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
 #[cfg(unix)]
 #[test]
 fn sigterm_is_registered_before_the_listener_can_become_reachable() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("shutdown registration fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -211,6 +221,7 @@ fn sigterm_is_registered_before_the_listener_can_become_reachable() {
 /// host makes voter startup fail before the failpoint can fire.
 #[test]
 fn m2_ignores_explicit_non_loopback_cluster_listener_hosts() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("listener host fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -266,6 +277,7 @@ fn m2_ignores_explicit_non_loopback_cluster_listener_hosts() {
 /// about the regression: reaching a reported error means TLS was negotiated.
 #[test]
 fn maintenance_commands_reach_tls_on_an_activated_node() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("maintenance TLS fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -338,6 +350,7 @@ fn maintenance_commands_reach_tls_on_an_activated_node() {
 
 #[test]
 fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("daemon activation fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -423,6 +436,7 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
 #[cfg(unix)]
 #[tokio::test]
 async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
+    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("SIGKILL recovery fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
