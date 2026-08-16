@@ -593,18 +593,31 @@ an untracked WAL sidecar beside immutable source material.
 
 `HiqliteAuthStore::import_sqlite_backup` accepts only a fresh bootstrapped
 target whose `instance.id` matches the source. It imports all 17 shared durable
-tables in foreign-key order and 16-row Raft transactions, preserving explicit
-ids, timestamps, nullable text, and integer values. `IMPORT_CHUNK_ROWS` is 16
-as a WAL-payload safety bound rather than a throughput choice: one chunk
-becomes one Raft transaction, `files.probe_json` holds whole ffprobe documents,
-and 64 rows of a real library serialized to 3,137,236 bytes — past the
-2,097,118-byte payload capacity of the production 2 MiB WAL, which panicked
-activation into unreplicated SQLite recovery. Raising it back for import
-throughput re-opens that crash; a byte-measured chunk builder is the real fix.
-Items compute their parent-first id order in one recursive source pass, then
-load each bounded chunk through indexed point reads; numeric id order cannot
-violate their self-reference, and large catalogues do not re-run and re-sort
-the full tree for every 16 rows. A v14 source contributes empty
+tables in foreign-key order and byte-measured Raft transactions, preserving
+explicit ids, timestamps, nullable text, and integer values. Both chunk
+producers — offset paging and the parent-first item-id path — feed rows through
+one transaction builder that accumulates their serialized size and submits
+before the next row would cross a byte budget: half the 2,097,118-byte payload
+capacity that the production `wal_size: 2 * 1024 * 1024` leaves after the
+segment header. A row count cannot bound this. One transaction becomes one Raft
+entry, `files.probe_json` holds whole ffprobe documents, and `hiqlite` panics
+its WAL writer on an entry past that capacity: 64 rows of a real library
+serialized to 3,137,236 bytes, and a 16-row bound still overflowed whenever 16
+adjacent rows averaged more than ~131 KB — which is how node `m6` exited
+mid-import and restarted into unreplicated SQLite while reporting healthy.
+`IMPORT_CHUNK_ROWS` survives as a secondary bound only: it is the source read
+page and a ceiling on rows per transaction, no longer the safety property. A
+single row too large for any transaction is refused before submission, naming
+the table, an identifier that is never imported payload, the measured size, and
+the limit — an operator-actionable refusal beats a crash into a silently
+unreplicated backend. The WAL tuning itself still lives in `start_local_voter`
+and is mirrored, not shared, by the importer and the store contract; #304
+retires that duplication and raises the WAL. Items compute their parent-first
+id order in one recursive source pass, then load each bounded page through
+indexed point reads; numeric id order cannot violate their self-reference, and
+large catalogues do not re-run and re-sort the full tree for every page. A
+parent-first run split across several transactions still submits in order, so a
+child never precedes its parent. A v14 source contributes empty
 scan-reconciliation tables and zero outbox claim deadlines; v15–v17 preserve
 their newer durable facts.
 `playback_events`, `items_fts`, and `offline_lease_guards` never cross the
@@ -617,7 +630,7 @@ and SHA-256 for each table only after parity. Source validation, row loading,
 and digest scans share one blocking worker, so synchronous SQLite work never
 occupies an async runtime worker. Row data crosses that boundary in bounded
 chunks; one parent-first item-id ordering remains O(items) so the importer does
-not rebuild and re-sort the full item tree for every 16 rows. Target parity
+not rebuild and re-sort the full item tree for every read page. Target parity
 advances through 64-row `PARITY_PAGE_ROWS` primary-key pages — a separate
 constant that stays 64 because parity pages are consistent reads that never
 enter a Raft transaction, so the WAL payload cap does not apply to them — and

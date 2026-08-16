@@ -23,20 +23,62 @@ use crate::error::StoreError;
 use crate::secrets::SealedSecret;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
-/// Rows per import `txn`, bounded by the production WAL rather than throughput.
+/// Raft WAL segment size configured for a production voter.
 ///
-/// One chunk becomes one Raft transaction, and `hiqlite` panics when a single
-/// transaction exceeds the WAL payload capacity: 2,097,118 bytes under the
-/// production `wal_size: 2 * 1024 * 1024`
-/// (`crates/plurx-core/src/cluster/migration.rs`). `files.probe_json` holds
-/// whole ffprobe documents, so a row-count bound is not a byte bound — 64 rows
-/// of a real library serialized to 3,137,236 bytes and crashed activation into
-/// unreplicated SQLite recovery.
+/// Mirrors `wal_size` in `start_local_voter`
+/// (`crates/plurx-core/src/cluster/migration.rs`), which is the production
+/// source of truth, and the contract voter in
+/// `crates/plurx-core/tests/store_contract.rs`. Retiring the three copies into
+/// one exported constant is issue #304; until then a retune there must be
+/// mirrored here, or every bound below silently computes the wrong margin.
+const PRODUCTION_WAL_SIZE_BYTES: usize = 2 * 1024 * 1024;
+/// Segment bytes `hiqlite-wal` reserves ahead of log payload, so the largest
+/// single entry it accepts is `wal_size` minus this: 34 under 0.14.0, whose
+/// writer computes `wal_size - offset_logs() - 2`. Exceeding it is a `panic!`
+/// on the WAL writer thread, which takes `plurxd` down mid-import.
+const WAL_SEGMENT_RESERVED_BYTES: usize = 34;
+/// Largest Raft entry the production WAL accepts: 2,097,118 bytes.
+const WAL_USABLE_PAYLOAD_BYTES: usize = PRODUCTION_WAL_SIZE_BYTES - WAL_SEGMENT_RESERVED_BYTES;
+/// Serialized bytes one import transaction accumulates to before it is
+/// submitted. This — not a row count — is what keeps a transaction inside the
+/// WAL, because `files.probe_json` holds whole ffprobe documents and adjacent
+/// rows vary by orders of magnitude.
 ///
-/// 16 keeps the worst observed library (~55 KB/row) well inside that cap, but
-/// the bound is still only a row count: 16 adjacent rows averaging more than
-/// ~131,069 bytes each still overflow. Raising this for import throughput
-/// re-opens that crash; a byte-measured chunk builder is the real fix.
+/// A quarter of the usable payload rather than all of it. Nothing forces a
+/// group of rows to travel together, so the budget can afford headroom that
+/// [`IMPORT_MAX_ROW_BYTES`] cannot, and it answers a second bound the WAL
+/// capacity says nothing about: every submission goes through the store's
+/// three-second `STORE_TIMEOUT`, and a transaction near the WAL cap has to
+/// replicate a megabyte to every voter inside it. A three-voter import of
+/// 200 KiB probe rows timed out at half the payload on a loaded host and
+/// completed at a quarter. The cost is more, smaller Raft entries — which a
+/// Raft log prefers anyway — for a bound that holds when the node is busy.
+const IMPORT_TXN_BUDGET_BYTES: usize = WAL_USABLE_PAYLOAD_BYTES / 4;
+/// Bytes charged to a transaction before any row, covering the Raft entry
+/// header and `QueryWrite` framing wrapped around the statements.
+const IMPORT_TXN_ENVELOPE_BYTES: usize = 256;
+/// Held back from every transaction against encoding drift: [`estimated_row_bytes`]
+/// is an upper bound on `hiqlite-wal` 0.14's `bincode` encoding, but a later
+/// version could widen a discriminant or add a field, and the cost of being
+/// wrong is a panicked node rather than a slower import.
+const WAL_ENCODING_RESERVE_BYTES: usize = 64 * 1024;
+/// A single row estimated above this is refused, because no transaction
+/// carrying it fits the WAL: submitting it panics the writer thread and
+/// restarts the node into `SelectedBackend::SqliteRecovery` — HTTP-healthy
+/// while serving unreplicated SQLite.
+///
+/// Deliberately just under what the WAL can hold rather than a fraction of it.
+/// A row this large has no smaller transaction to travel in, so every byte
+/// shaved off here refuses an import the WAL would have accepted.
+const IMPORT_MAX_ROW_BYTES: usize =
+    WAL_USABLE_PAYLOAD_BYTES - WAL_ENCODING_RESERVE_BYTES - IMPORT_TXN_ENVELOPE_BYTES;
+/// Rows per source read page, and the secondary ceiling on one import `txn`.
+///
+/// [`IMPORT_TXN_BUDGET_BYTES`] is the bound that keeps a transaction inside the
+/// WAL; this row count bounds how much of the source is resident at once.
+/// It stays small because a page is read whole before the byte budget can split
+/// it: 64 rows of a real library serialized to 3,137,236 bytes, so a large page
+/// of those costs memory whether or not the builder then splits them.
 const IMPORT_CHUNK_ROWS: i64 = 16;
 /// Rows per read-only parity page. Independent of [`IMPORT_CHUNK_ROWS`]: these
 /// pages are consistent reads that never enter a Raft transaction, so the WAL
@@ -644,6 +686,135 @@ const TABLES: &[TablePlan] = &[
     },
 ];
 
+/// Groups import rows into transactions bounded by serialized bytes.
+///
+/// Both chunk producers — the offset paging path and the parent-first item-id
+/// path — feed rows through one of these, so the WAL bound is enforced in one
+/// place rather than once per producer. The builder is deliberately free of any
+/// client: it decides *what* to submit, and the caller submits it, which is
+/// what lets the boundary cases be tested without a running voter.
+///
+/// Rows are emitted in the order they are pushed, so the parent-first ordering
+/// the items table depends on survives being split across transactions.
+struct ImportTransactionBuilder {
+    table: TablePlan,
+    /// Estimated bytes each statement adds beyond its parameters: the INSERT
+    /// text is repeated verbatim once per row inside the Raft entry.
+    statement_bytes: usize,
+    pending: Vec<hiqlite::Params>,
+    pending_bytes: usize,
+    /// 1-based position of the next row in the table's import order, used as a
+    /// safe identifier when a row has no integer primary key to name.
+    next_ordinal: u64,
+}
+
+impl ImportTransactionBuilder {
+    fn new(table: TablePlan, insert_sql: &str) -> Self {
+        Self {
+            table,
+            statement_bytes: insert_sql.len() + PER_STATEMENT_FRAMING_BYTES,
+            pending: Vec::new(),
+            pending_bytes: IMPORT_TXN_ENVELOPE_BYTES,
+            next_ordinal: 1,
+        }
+    }
+
+    /// Adds one row, returning the transaction that must be submitted first
+    /// when this row would push the pending one past its bounds.
+    ///
+    /// Refuses a row that no transaction could carry instead of handing it to
+    /// `txn`, where the WAL writer would panic the process.
+    fn push(&mut self, row: hiqlite::Params) -> Result<Option<Vec<hiqlite::Params>>, StoreError> {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or_else(|| import_error("import row ordinal overflow"))?;
+        let row_bytes = self.statement_bytes + estimated_row_bytes(&row);
+        if row_bytes > IMPORT_MAX_ROW_BYTES {
+            return Err(import_error(format!(
+                "table {} {} serializes to about {row_bytes} bytes, above the \
+                 {IMPORT_MAX_ROW_BYTES}-byte single-row import limit derived from the \
+                 {WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity; \
+                 import refuses this backup instead of crashing the node mid-import. \
+                 The source database is unchanged",
+                self.table.name,
+                self.row_identifier(&row, ordinal),
+            )));
+        }
+
+        let full = self.pending.len() >= IMPORT_CHUNK_ROWS as usize
+            || self.pending_bytes + row_bytes > IMPORT_TXN_BUDGET_BYTES;
+        let ready = if full { self.take() } else { None };
+        self.pending.push(row);
+        self.pending_bytes += row_bytes;
+        Ok(ready)
+    }
+
+    /// Returns the last partially filled transaction, if any.
+    fn finish(&mut self) -> Option<Vec<hiqlite::Params>> {
+        self.take()
+    }
+
+    fn take(&mut self) -> Option<Vec<hiqlite::Params>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.pending_bytes = IMPORT_TXN_ENVELOPE_BYTES;
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Names a row without quoting any imported value.
+    ///
+    /// Media paths, titles, and credential hashes are all first columns
+    /// somewhere in [`TABLES`], and none of them may reach a log line or an
+    /// operator-facing error. An integer primary key is safe and is what an
+    /// operator can actually look up; everything else falls back to the row's
+    /// position in the table's deterministic import order.
+    fn row_identifier(&self, row: &[Param], ordinal: u64) -> String {
+        match (self.table.columns.first(), row.first()) {
+            (Some(column), Some(Param::Integer(value))) => format!("row {column}={value}"),
+            _ => format!("row {ordinal} of the {} import order", self.table.order_by),
+        }
+    }
+}
+
+/// Bytes a statement costs inside a transaction beyond its SQL text and
+/// parameters: the `Query` length prefixes and the parameter vector header.
+const PER_STATEMENT_FRAMING_BYTES: usize = 32;
+
+/// Conservative upper bound on the bytes one row adds to a Raft entry.
+///
+/// `hiqlite-wal` encodes entries with `bincode::config::standard()`, whose
+/// integers and length prefixes are variable width. Rather than depend on that
+/// encoding, every field is charged its widest form: a mis-estimate then makes
+/// transactions smaller than necessary, never larger than the WAL.
+fn estimated_row_bytes(row: &[Param]) -> usize {
+    row.iter()
+        .map(|param| PER_PARAM_FRAMING_BYTES + param_payload_bytes(param))
+        .sum()
+}
+
+/// Enum discriminant plus the widest `bincode` varint a length or integer can
+/// occupy.
+const PER_PARAM_FRAMING_BYTES: usize = 11;
+
+fn param_payload_bytes(param: &Param) -> usize {
+    match param {
+        Param::Null => 0,
+        // Charged by the framing allowance above, which already covers the
+        // widest varint form of both.
+        Param::Integer(_) => 0,
+        Param::Real(_) => 8,
+        Param::Text(value) => value.len(),
+        Param::Blob(value) => value.len(),
+        // Import never builds statement-output references; charge the framing
+        // allowance and a name rather than assume a future one is free.
+        Param::StmtOutputIndexed(..) => 0,
+        Param::StmtOutputNamed(_, name) => name.len(),
+    }
+}
+
 impl HiqliteAuthStore {
     /// Import one immutable, content-addressed SQLite backup into a fresh
     /// Hiqlite target and prove exact row parity before returning evidence.
@@ -852,6 +1023,7 @@ impl HiqliteAuthStore {
         }
         let expected = source.count(table, true).await?;
         let insert_sql = insert_sql(table);
+        let mut transactions = ImportTransactionBuilder::new(table, &insert_sql);
         if table.parent_first {
             let ids = source.parent_first_item_ids().await?;
             let selected =
@@ -866,7 +1038,14 @@ impl HiqliteAuthStore {
                 let chunk = source
                     .import_chunk(table, schema_version, SourceChunk::ItemIds(ids.to_vec()))
                     .await?;
-                self.insert_import_chunk(table, &insert_sql, chunk).await?;
+                for row in chunk {
+                    if let Some(ready) = transactions.push(row)? {
+                        self.insert_import_chunk(table, &insert_sql, ready).await?;
+                    }
+                }
+            }
+            if let Some(ready) = transactions.finish() {
+                self.insert_import_chunk(table, &insert_sql, ready).await?;
             }
             return Ok(());
         }
@@ -881,8 +1060,15 @@ impl HiqliteAuthStore {
             }
             let chunk_len =
                 i64::try_from(chunk.len()).map_err(|error| import_error(error.to_string()))?;
-            self.insert_import_chunk(table, &insert_sql, chunk).await?;
+            for row in chunk {
+                if let Some(ready) = transactions.push(row)? {
+                    self.insert_import_chunk(table, &insert_sql, ready).await?;
+                }
+            }
             offset += chunk_len;
+        }
+        if let Some(ready) = transactions.finish() {
+            self.insert_import_chunk(table, &insert_sql, ready).await?;
         }
         if offset != expected {
             return Err(import_error(format!(
@@ -899,6 +1085,25 @@ impl HiqliteAuthStore {
         insert_sql: &str,
         chunk: Vec<hiqlite::Params>,
     ) -> Result<(), StoreError> {
+        // Last gate before the transaction becomes a Raft entry.
+        // `ImportTransactionBuilder` already keeps every chunk it emits well
+        // inside this, so reaching it means a caller bypassed the builder —
+        // still an error to return rather than a WAL writer panic to survive.
+        let estimated = IMPORT_TXN_ENVELOPE_BYTES
+            + chunk
+                .iter()
+                .map(|row| {
+                    insert_sql.len() + PER_STATEMENT_FRAMING_BYTES + estimated_row_bytes(row)
+                })
+                .sum::<usize>();
+        if estimated > WAL_USABLE_PAYLOAD_BYTES {
+            return Err(import_error(format!(
+                "table {} import transaction of {} row(s) serializes to about {estimated} bytes, \
+                 above the {WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity",
+                table.name,
+                chunk.len(),
+            )));
+        }
         let results = self
             .client()
             .txn(chunk.into_iter().map(|row| (insert_sql.to_owned(), row)))
@@ -1557,6 +1762,263 @@ mod tests {
         for table in TABLES {
             super::super::hiqlite::validate_sql(&insert_sql(*table))
                 .unwrap_or_else(|error| panic!("{} insert is invalid: {error}", table.name));
+        }
+    }
+
+    fn files_plan() -> TablePlan {
+        *TABLES
+            .iter()
+            .find(|table| table.name == "files")
+            .expect("files import plan")
+    }
+
+    /// A `files` row whose `probe_json` is padded to make the whole row
+    /// estimate `row_bytes`, so a test can sit a row deliberately either side
+    /// of a bound.
+    fn sized_files_row(id: i64, row_bytes: usize, statement_bytes: usize) -> hiqlite::Params {
+        let table = files_plan();
+        let mut row = vec![Param::Integer(id)];
+        row.extend(std::iter::repeat_n(Param::Null, table.columns.len() - 2));
+        row.push(Param::Text(String::new()));
+        let overhead = statement_bytes + estimated_row_bytes(&row);
+        let padding = row_bytes
+            .checked_sub(overhead)
+            .expect("requested row is smaller than its own framing");
+        let last = row.len() - 1;
+        row[last] = Param::Text("x".repeat(padding));
+        assert_eq!(statement_bytes + estimated_row_bytes(&row), row_bytes);
+        row
+    }
+
+    fn files_statement_bytes() -> usize {
+        insert_sql(files_plan()).len() + PER_STATEMENT_FRAMING_BYTES
+    }
+
+    /// The bound that replaced the row count: a run of rows small enough to
+    /// clear the row ceiling still splits once their bytes reach the budget.
+    #[test]
+    fn a_row_crossing_the_byte_budget_starts_a_new_transaction() {
+        let statement_bytes = files_statement_bytes();
+        let half = IMPORT_TXN_BUDGET_BYTES / 2;
+        let mut builder = ImportTransactionBuilder::new(files_plan(), &insert_sql(files_plan()));
+
+        assert!(
+            builder
+                .push(sized_files_row(1, half, statement_bytes))
+                .expect("first large row is accepted")
+                .is_none(),
+            "the first row cannot fill a transaction on its own"
+        );
+        let flushed = builder
+            .push(sized_files_row(2, half, statement_bytes))
+            .expect("second large row is accepted")
+            .expect("two rows summing past the budget must emit the first transaction");
+        assert_eq!(flushed.len(), 1, "the crossing row belongs to the next txn");
+        let last = builder.finish().expect("the crossing row is still pending");
+        assert_eq!(last.len(), 1);
+        assert!(
+            builder.finish().is_none(),
+            "finish must not re-emit rows already submitted"
+        );
+    }
+
+    /// Immediately below and immediately above the budget, measured on the
+    /// same rows the importer would submit.
+    #[test]
+    fn the_budget_boundary_splits_exactly_one_byte_late() {
+        let statement_bytes = files_statement_bytes();
+        let head = IMPORT_TXN_BUDGET_BYTES / 2;
+        let exact = IMPORT_TXN_BUDGET_BYTES - IMPORT_TXN_ENVELOPE_BYTES - head;
+
+        let mut fitting = ImportTransactionBuilder::new(files_plan(), &insert_sql(files_plan()));
+        fitting
+            .push(sized_files_row(1, head, statement_bytes))
+            .expect("head row");
+        assert!(
+            fitting
+                .push(sized_files_row(2, exact, statement_bytes))
+                .expect("row landing exactly on the budget")
+                .is_none(),
+            "a row filling the budget exactly still belongs to the same transaction"
+        );
+        assert_eq!(
+            fitting.finish().expect("pending transaction").len(),
+            2,
+            "both rows must be submitted together"
+        );
+
+        let mut crossing = ImportTransactionBuilder::new(files_plan(), &insert_sql(files_plan()));
+        crossing
+            .push(sized_files_row(1, head, statement_bytes))
+            .expect("head row");
+        assert!(
+            crossing
+                .push(sized_files_row(2, exact + 1, statement_bytes))
+                .expect("row landing one byte past the budget")
+                .is_some(),
+            "one byte past the budget must start a new transaction"
+        );
+    }
+
+    /// Small rows must not pay for the large ones: the byte budget only splits
+    /// where bytes demand it, and the row ceiling still bounds the rest.
+    #[test]
+    fn mixed_row_sizes_flush_on_bytes_and_on_the_row_ceiling() {
+        let statement_bytes = files_statement_bytes();
+        let table = files_plan();
+        let large = IMPORT_TXN_BUDGET_BYTES * 3 / 5;
+        let mut builder = ImportTransactionBuilder::new(table, &insert_sql(table));
+        let mut submitted = Vec::new();
+
+        for id in 0..40_i64 {
+            let row = if id % 10 == 0 {
+                sized_files_row(id, large, statement_bytes)
+            } else {
+                sized_files_row(id, statement_bytes + 512, statement_bytes)
+            };
+            if let Some(ready) = builder.push(row).expect("row within bounds") {
+                submitted.push(ready);
+            }
+        }
+        if let Some(ready) = builder.finish() {
+            submitted.push(ready);
+        }
+
+        assert_eq!(
+            submitted.iter().map(Vec::len).sum::<usize>(),
+            40,
+            "every row must be submitted exactly once"
+        );
+        assert!(
+            submitted.len() > 40 / IMPORT_CHUNK_ROWS as usize,
+            "large rows must force flushes the row ceiling alone would not: {} transactions",
+            submitted.len()
+        );
+        for transaction in &submitted {
+            assert!(
+                transaction.len() <= IMPORT_CHUNK_ROWS as usize,
+                "the row ceiling remains a secondary bound"
+            );
+            let bytes = IMPORT_TXN_ENVELOPE_BYTES
+                + transaction
+                    .iter()
+                    .map(|row| statement_bytes + estimated_row_bytes(row))
+                    .sum::<usize>();
+            assert!(
+                bytes <= WAL_USABLE_PAYLOAD_BYTES,
+                "no emitted transaction may exceed the WAL payload capacity: {bytes} bytes"
+            );
+        }
+    }
+
+    /// A row too large for the budget but small enough for the WAL is carried
+    /// alone rather than refused; refusing it would fail an import the WAL can
+    /// actually accept.
+    #[test]
+    fn a_row_above_the_budget_but_inside_the_wal_is_submitted_alone() {
+        let statement_bytes = files_statement_bytes();
+        let table = files_plan();
+        let mut builder = ImportTransactionBuilder::new(table, &insert_sql(table));
+        builder
+            .push(sized_files_row(1, statement_bytes + 512, statement_bytes))
+            .expect("small row");
+        let flushed = builder
+            .push(sized_files_row(2, IMPORT_MAX_ROW_BYTES, statement_bytes))
+            .expect("a row inside the single-row limit is accepted")
+            .expect("the small row is submitted first");
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(
+            builder.finish().expect("oversized row still pending").len(),
+            1,
+            "a row larger than the budget travels as its own transaction"
+        );
+    }
+
+    /// The failure #290 recorded in production, converted into a refusal: a row
+    /// no transaction can carry must never reach `txn`, where the WAL writer
+    /// panics and the node restarts into unreplicated SQLite recovery.
+    #[test]
+    fn a_row_larger_than_the_wal_is_refused_with_an_actionable_error() {
+        let statement_bytes = files_statement_bytes();
+        let table = files_plan();
+        let mut builder = ImportTransactionBuilder::new(table, &insert_sql(table));
+        let error = builder
+            .push(sized_files_row(
+                4321,
+                IMPORT_MAX_ROW_BYTES + 1,
+                statement_bytes,
+            ))
+            .expect_err("a row above the single-row limit must be refused");
+        let message = error.to_string();
+        assert!(message.contains("files"), "names the table: {message}");
+        assert!(message.contains("row id=4321"), "names the row: {message}");
+        assert!(
+            message.contains(&(IMPORT_MAX_ROW_BYTES + 1).to_string()),
+            "names the measured size: {message}"
+        );
+        assert!(
+            message.contains(&IMPORT_MAX_ROW_BYTES.to_string()),
+            "names the limit: {message}"
+        );
+        assert!(
+            !message.contains("xxxx"),
+            "an operator-facing error must not quote imported payload: {message}"
+        );
+        assert!(
+            builder.finish().is_none(),
+            "a refused row must not be left pending for submission"
+        );
+    }
+
+    /// Tables keyed by text — `tokens.token_hash`, `settings.key` — must fall
+    /// back to a position rather than quote the key itself.
+    #[test]
+    fn a_refusal_on_a_text_keyed_table_names_a_position_not_the_key() {
+        let table = *TABLES
+            .iter()
+            .find(|table| table.name == "tokens")
+            .expect("tokens import plan");
+        let insert = insert_sql(table);
+        let mut builder = ImportTransactionBuilder::new(table, &insert);
+        let mut row = vec![Param::Text("secret-token-hash".to_owned())];
+        row.extend(std::iter::repeat_n(Param::Null, table.columns.len() - 2));
+        row.push(Param::Text("y".repeat(IMPORT_MAX_ROW_BYTES)));
+        let message = builder
+            .push(row)
+            .expect_err("an oversized token row must be refused")
+            .to_string();
+        assert!(
+            !message.contains("secret-token-hash"),
+            "a credential hash must never reach an error message: {message}"
+        );
+        assert!(
+            message.contains("row 1 of the token_hash import order"),
+            "falls back to the deterministic import position: {message}"
+        );
+    }
+
+    /// The estimate exists to be an upper bound. If it ever under-counts the
+    /// encoder, every bound above it is decoration.
+    #[test]
+    fn the_row_estimate_stays_above_what_the_wal_encoder_produces() {
+        let rows: Vec<hiqlite::Params> = vec![
+            vec![Param::Null, Param::Integer(i64::MIN), Param::Real(-1.5)],
+            vec![
+                Param::Integer(i64::MAX),
+                Param::Text("☃".repeat(4096)),
+                Param::Text(String::new()),
+            ],
+            vec![Param::Blob(vec![0xab; 8192])],
+        ];
+        for row in rows {
+            let encoded = bincode::serde::encode_to_vec(&row, bincode::config::standard())
+                .expect("encode row the way hiqlite-wal does");
+            assert!(
+                estimated_row_bytes(&row) >= encoded.len(),
+                "estimate {} under-counted the {}-byte encoding",
+                estimated_row_bytes(&row),
+                encoded.len()
+            );
         }
     }
 }
