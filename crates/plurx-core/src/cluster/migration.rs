@@ -45,6 +45,12 @@ use hiqlite::{Client, Node, NodeConfig};
 #[cfg(feature = "hiqlite-store")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "hiqlite-store")]
+use super::membership::{
+    decode_join_token, join_token_digest, ClusterPeer, FinalizeJoinRequest, JoinPayload,
+    JoinSecrets, LocalMembership, MembershipManager, RedeemJoinRequest,
+};
+
 pub const SQLITE_FILENAME: &str = "plurx.db";
 pub const MIGRATION_DIRNAME: &str = "migration";
 pub const HIQLITE_INCOMING_DIRNAME: &str = "hiqlite.incoming";
@@ -65,6 +71,12 @@ const API_SECRET_FILENAME: &str = "secret_api";
 const HIQLITE_DATABASE_FILENAME: &str = "plurx.db";
 #[cfg(feature = "hiqlite-store")]
 const DAEMON_LOCK_FILENAME: &str = ".plurxd.lock";
+#[cfg(feature = "hiqlite-store")]
+const LOCAL_MEMBERSHIP_FILENAME: &str = "membership.json";
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_READDRESS_BACKUP_DIRNAME: &str = "hiqlite.before-readdress";
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_READDRESS_MARKER_FILENAME: &str = "hiqlite-readdress.json";
 #[cfg(feature = "hiqlite-store")]
 const HIQLITE_START_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(feature = "hiqlite-store")]
@@ -104,6 +116,19 @@ pub struct ActivationMarker {
     pub table_hashes: Vec<SqliteImportTableDigest>,
 }
 
+/// Crash-recovery record for the one-voter loopback-to-advertised transition.
+///
+/// Hiqlite 0.14 cannot replace a voter's address in-place. Before the first
+/// peer is admitted, plurx therefore snapshots the state machine and rebuilds
+/// only the single-node Raft metadata. This record makes the two directory
+/// renames recoverable without ever falling back to the stale legacy source.
+#[cfg(feature = "hiqlite-store")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReaddressRecord {
+    version: u32,
+    membership: LocalMembership,
+}
+
 /// Record that this data directory already activated, kept outside the target.
 ///
 /// The retained `plurx.db` is a rollback source, not a current one, and nothing
@@ -137,6 +162,7 @@ pub struct SelectedStore {
     /// Node-local key used only by outbound credential consumers.
     pub credential_key: Arc<CredentialKey>,
     pub backend: SelectedBackend,
+    membership: MembershipManager,
     local_client: Option<Client>,
     _daemon_lock: File,
 }
@@ -160,12 +186,21 @@ impl SelectedStore {
         }
     }
 
-    /// Flush and stop the selected local voter before the Tokio runtime exits.
+    /// Membership lifecycle and privacy-safe node health for the daemon API.
+    #[must_use]
+    pub fn membership_manager(&self) -> MembershipManager {
+        self.membership.clone()
+    }
+
+    /// Finish daemon shutdown before the Tokio runtime tears down the voter.
+    ///
+    /// Hiqlite 0.14 drains Raft, the WAL, and the SQL writer before it reaches
+    /// a known TLS-listener notification defect. `shutdown_voter` contains that
+    /// final panic only after matching its exact message; it never substitutes
+    /// process exit for the durable-writer drain.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
         if let Some(client) = &self.local_client {
-            client.shutdown().await.map_err(|error| {
-                StoreError::Database(format!("stopping one-voter Hiqlite: {error}"))
-            })?;
+            shutdown_voter(client, true).await?;
         }
         Ok(())
     }
@@ -227,16 +262,26 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
     std::fs::create_dir_all(&config.storage.data_dir)
         .map_err(|error| migration_io("creating", &config.storage.data_dir, error))?;
     let daemon_lock = acquire_daemon_lock(&config.storage.data_dir)?;
+    recover_interrupted_readdress(&config.storage.data_dir)?;
 
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     if path_exists(&active)? {
+        let pending_join = !config.cluster.join_token_file.as_os_str().is_empty()
+            && path_exists(&config.cluster.join_token_file)?
+            && !path_exists(&active.join(ACTIVATION_MARKER_FILENAME))?;
+        if pending_join {
+            return join_fresh_store(config, daemon_lock).await;
+        }
+        readdress_single_voter_if_needed(config)?;
         let selected = open_active_store(config, daemon_lock).await?;
+        finalize_pending_join_best_effort(config, &selected).await;
         // A crash immediately after rename may expose the target before its
         // parent-directory entry is durable. Observing it on recovery lets us
         // finish that durability boundary before clearing attempt artifacts.
         sync_directory(&config.storage.data_dir)?;
         remove_abandoned_incoming(&config.storage.data_dir)?;
         remove_activation_attempt(&config.storage.data_dir)?;
+        finish_readdress(&config.storage.data_dir)?;
         return Ok(selected);
     }
 
@@ -262,6 +307,10 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
         )));
     }
 
+    if !config.cluster.join_token_file.as_os_str().is_empty() {
+        return join_fresh_store(config, daemon_lock).await;
+    }
+
     ensure_sqlite_source(&config.storage.data_dir)?;
     // Future-schema refusal must precede cleanup or attempt-marker writes.
     inspect_sqlite_source(&config.storage.data_dir.join(SQLITE_FILENAME))?;
@@ -283,6 +332,7 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
             identity: legacy.identity,
             credential_key: legacy.credential_key,
             backend: SelectedBackend::SqliteRecovery,
+            membership: MembershipManager::unavailable(),
             local_client: None,
             _daemon_lock: daemon_lock,
         });
@@ -305,6 +355,330 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
     }
 }
 
+#[cfg(feature = "hiqlite-store")]
+async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<SelectedStore, StoreError> {
+    let source = config.storage.data_dir.join(SQLITE_FILENAME);
+    if path_exists(&source)? {
+        return Err(StoreError::Migration(format!(
+            "refusing to join with existing local database {}; a cluster join consumes a fresh \
+             data directory and never overwrites an installation's library",
+            source.display()
+        )));
+    }
+    let token = read_join_token_file(&config.cluster.join_token_file)?;
+    let payload = decode_join_token(&token)
+        .map_err(|error| StoreError::Migration(format!("{}: {}", error.code(), error)))?;
+    if payload.expires_at <= unix_time_millis()? {
+        return Err(StoreError::Migration(
+            "join_token_expired: join token expired before it was redeemed".to_owned(),
+        ));
+    }
+    if payload.schema_version != AUTH_SCHEMA_VERSION
+        || payload.protocol_version != crate::store::AUTH_PROTOCOL_VERSION
+    {
+        return Err(StoreError::Migration(
+            "join_incompatible: joining binary does not match the cluster schema/protocol"
+                .to_owned(),
+        ));
+    }
+    let remote = Client::remote(
+        payload
+            .bootstrap
+            .iter()
+            .map(|peer| peer.api_address.clone())
+            .collect(),
+        true,
+        true,
+        payload.secrets.api.clone(),
+        true,
+        None,
+    )
+    .await
+    .map_err(|error| {
+        StoreError::Database(format!("connecting to cluster for join preflight: {error}"))
+    })?;
+    HiqliteAuthStore::preflight_voter(&remote, crate::store::ClusterCompatibility::CURRENT).await?;
+
+    let existing_membership = read_local_membership(&config.storage.data_dir)?;
+    let identity = match &existing_membership {
+        Some(membership) => {
+            if membership.cluster_id != payload.cluster_id || membership.raft_id != payload.raft_id
+            {
+                return Err(StoreError::Identity(
+                    "join token does not match the interrupted local membership".to_owned(),
+                ));
+            }
+            super::ClusterIdentity {
+                cluster_id: membership.cluster_id.clone(),
+                node_id: membership.node_id.clone(),
+                raft_id: membership.raft_id,
+            }
+        }
+        None => super::initialize_join_identity(
+            &config.storage.data_dir,
+            &payload.cluster_id,
+            payload.raft_id,
+        )?,
+    };
+    let local = configured_local_peer(config, payload.raft_id)?;
+    let token_digest = join_token_digest(&token);
+    let membership = LocalMembership {
+        version: 1,
+        cluster_id: payload.cluster_id.clone(),
+        node_id: identity.node_id.clone(),
+        raft_id: payload.raft_id,
+        local: local.clone(),
+        bootstrap: payload.bootstrap.clone(),
+        join_token_digest: Some(token_digest.clone()),
+    };
+    redeem_remote_join(
+        &payload,
+        RedeemJoinRequest {
+            token_digest,
+            raft_id: payload.raft_id,
+            node_id: identity.node_id.clone(),
+            raft_address: local.raft_address.clone(),
+            api_address: local.api_address.clone(),
+            schema_version: AUTH_SCHEMA_VERSION,
+            protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+
+    persist_join_secret(
+        &config.storage.data_dir.join(RAFT_SECRET_FILENAME),
+        &payload.secrets.raft,
+    )?;
+    persist_join_secret(
+        &config.storage.data_dir.join(API_SECRET_FILENAME),
+        &payload.secrets.api,
+    )?;
+    persist_join_secret(
+        &config.cluster.credential_key_path(&config.storage.data_dir),
+        &payload.secrets.credential_key,
+    )?;
+    let secrets = read_existing_secrets(&config.storage.data_dir)?;
+    // A verified activation marker, not the directory name, is the commit bit.
+    // Hiqlite 0.14 cannot stop and rebind fully-TLS listeners in one process,
+    // so the joiner starts at its final path. A crash before the marker leaves
+    // the token and node id in place; the next boot re-enters this path, redeems
+    // idempotently for the same node, and resumes the partial voter.
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    std::fs::create_dir_all(&active).map_err(|error| migration_io("creating", &active, error))?;
+    sync_directory(&config.storage.data_dir)?;
+    let (client, _) = start_voter(
+        config,
+        &active,
+        &secrets,
+        &identity,
+        Some(&membership),
+        true,
+        false,
+    )
+    .await?;
+    let store = HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await?;
+    verify_store_identity(&store, &payload.cluster_id).await?;
+    write_activation_marker(&active, &payload.activation_marker)?;
+    write_local_membership(&config.storage.data_dir, &membership)?;
+    sync_directory(&active)?;
+    sync_directory(&config.storage.data_dir)?;
+    ensure_activated_source_record(&config.storage.data_dir, &payload.activation_marker)?;
+
+    // Keep the caught-up voter alive. Fully-TLS Hiqlite listeners have no
+    // graceful-shutdown handle, and no stop/rebind boundary is needed because
+    // every durable file already lives at the final path.
+    let credential_key = open_active_credential_key(config, &store).await?;
+    let store: Arc<dyn Store> = Arc::new(store);
+    let membership_manager = MembershipManager::replicated(
+        client.clone(),
+        Arc::clone(&store),
+        identity.clone(),
+        local,
+        configured_join_url(config)?,
+        JoinSecrets {
+            raft: secrets.raft,
+            api: secrets.api,
+            credential_key: read_secret(
+                &config.cluster.credential_key_path(&config.storage.data_dir),
+            )?,
+        },
+        payload.activation_marker,
+    )
+    .await
+    .map_err(|error| StoreError::Database(error.to_string()))?;
+    let selected = SelectedStore {
+        store,
+        identity,
+        credential_key,
+        backend: SelectedBackend::Replicated,
+        membership: membership_manager,
+        local_client: Some(client),
+        _daemon_lock: daemon_lock,
+    };
+    finalize_pending_join_best_effort(config, &selected).await;
+    Ok(selected)
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn finalize_pending_join_best_effort(config: &Config, selected: &SelectedStore) {
+    if let Err(error) = finalize_pending_join(config, selected).await {
+        // The voter and activation marker are already durable at this point.
+        // Finalization only consumes the coordinator's one-time record, so a
+        // temporarily unavailable coordinator must not take this voter back
+        // offline. The identity-bound token file remains for the next boot.
+        tracing::warn!(
+            error = %error,
+            "joined voter is healthy but token finalization is pending; startup will retry"
+        );
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn finalize_pending_join(
+    config: &Config,
+    selected: &SelectedStore,
+) -> Result<(), StoreError> {
+    let path = &config.cluster.join_token_file;
+    if path.as_os_str().is_empty() || !path_exists(path)? {
+        return Ok(());
+    }
+    let Some(membership) = read_local_membership(&config.storage.data_dir)? else {
+        tracing::warn!("join-token file is present but this node has no staged join; ignoring it");
+        return Ok(());
+    };
+    let Some(expected_digest) = membership.join_token_digest.as_deref() else {
+        tracing::warn!(
+            "join-token file is present on an initial voter that was never admitted; ignoring it"
+        );
+        return Ok(());
+    };
+    let token = read_join_token_file(path)?;
+    let token_digest = join_token_digest(&token);
+    if token_digest != expected_digest {
+        tracing::warn!("join-token file does not match this node's staged join; ignoring it");
+        return Ok(());
+    }
+    let payload = decode_join_token(&token)
+        .map_err(|error| StoreError::Migration(format!("{}: {}", error.code(), error)))?;
+    if payload.cluster_id != membership.cluster_id || payload.raft_id != membership.raft_id {
+        return Err(StoreError::Identity(
+            "staged join token does not match local membership identity".to_owned(),
+        ));
+    }
+    finalize_remote_join(
+        &payload,
+        FinalizeJoinRequest {
+            token_digest,
+            raft_id: membership.raft_id,
+            node_id: selected.identity.node_id.clone(),
+        },
+    )
+    .await?;
+    std::fs::remove_file(path)
+        .map_err(|error| migration_io("removing redeemed token", path, error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_join_token_file(path: &Path) -> Result<String, StoreError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| migration_io("reading join token", path, error))?;
+    let token = raw.trim();
+    if token.is_empty() || token.lines().count() != 1 {
+        return Err(StoreError::Migration(
+            "join_token_invalid: join-token file must contain exactly one token".to_owned(),
+        ));
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn persist_join_secret(path: &Path, secret: &str) -> Result<(), StoreError> {
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StoreError::Migration(
+            "join_token_invalid: encrypted cluster secret is malformed".to_owned(),
+        ));
+    }
+    if path_exists(path)? {
+        if read_secret(path)? != secret {
+            return Err(StoreError::Identity(
+                "join token secrets do not match the interrupted local join".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        StoreError::Migration("join secret path has no parent directory".to_owned())
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| migration_io("creating", parent, error))?;
+    write_private_file(path, format!("{secret}\n").as_bytes())?;
+    sync_directory(parent)
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn redeem_remote_join(
+    payload: &JoinPayload,
+    request: RedeemJoinRequest,
+) -> Result<(), StoreError> {
+    post_join_request(payload, "/api/v1/cluster/join/redeem", &request).await
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn finalize_remote_join(
+    payload: &JoinPayload,
+    request: FinalizeJoinRequest,
+) -> Result<(), StoreError> {
+    post_join_request(payload, "/api/v1/cluster/join/finalize", &request).await
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn post_join_request<T: Serialize>(
+    payload: &JoinPayload,
+    path: &str,
+    request: &T,
+) -> Result<(), StoreError> {
+    let response = reqwest::Client::new()
+        .post(format!("{}{path}", payload.bootstrap_http))
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| StoreError::Database(format!("contacting join coordinator: {error}")))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let error = response
+        .json::<JoinApiError>()
+        .await
+        .unwrap_or(JoinApiError {
+            code: "membership_internal".to_owned(),
+            message: "join coordinator refused the request".to_owned(),
+        });
+    Err(StoreError::Migration(format!(
+        "{}: {} (HTTP {status})",
+        error.code, error.message
+    )))
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[derive(Deserialize)]
+struct JoinApiError {
+    code: String,
+    message: String,
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn unix_time_millis() -> Result<i64, StoreError> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| StoreError::Database(error.to_string()))?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| StoreError::Database("clock overflow".to_owned()))
+}
+
 /// Connect a maintenance command to an already-running activated voter.
 ///
 /// This path never imports and never starts a second local voter. It is safe
@@ -321,19 +695,38 @@ pub async fn connect_activated_store(config: &Config) -> Result<Arc<dyn Store>, 
         )));
     }
     let marker = read_activation_marker(&active)?;
-    super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    let identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     let secret_api = read_secret(&config.storage.data_dir.join(API_SECRET_FILENAME))?;
-    let address = local_client_address(config.cluster.api_bind).to_string();
+    let address = local_voter_api_address(config, &identity)?;
     let client = Client::remote(vec![address], true, true, secret_api, true, None)
         .await
         .map_err(|error| {
             StoreError::Database(format!(
-                "connecting to the running one-voter Hiqlite store: {error}"
+                "connecting to the running local Hiqlite voter: {error}"
             ))
         })?;
     let store = HiqliteAuthStore::open(client, &active.join("telemetry.db")).await?;
     verify_store_identity(&store, &marker.cluster_id).await?;
     Ok(Arc::new(store))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn local_voter_api_address(
+    config: &Config,
+    identity: &super::ClusterIdentity,
+) -> Result<String, StoreError> {
+    match read_local_membership(&config.storage.data_dir)? {
+        Some(membership)
+            if membership.cluster_id == identity.cluster_id
+                && membership.node_id == identity.node_id =>
+        {
+            Ok(membership.local.api_address)
+        }
+        Some(_) => Err(StoreError::Identity(
+            "membership.json does not match activation.json and node.id".to_owned(),
+        )),
+        None => Ok(local_client_address(config.cluster.api_bind).to_string()),
+    }
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -362,11 +755,13 @@ async fn activate_fresh_store(
         return Err(cleanup_incoming_failure(&incoming, error));
     }
 
-    // The staging voter is process-local and never accepts a peer. Running it
-    // without TLS lets Hiqlite's graceful shutdown close both listeners before
-    // rename; the active voter below uses TLS for its exposed API transport.
-    let client = match start_local_voter(config, &incoming, &secrets, false).await {
-        Ok(client) => client,
+    // The temporary import voter always stays on loopback. This preserves the
+    // pre-M3 activation failpoints and lets cleartext staging shut down cleanly.
+    // Once the atomic active target exists, the closed-store readdress path
+    // below rebuilds sole-voter metadata with an explicitly advertised address.
+    let client = match start_voter(config, &incoming, &secrets, &identity, None, false, true).await
+    {
+        Ok((client, _)) => client,
         Err(error) => {
             remove_abandoned_incoming(&config.storage.data_dir)?;
             return Err(error);
@@ -380,7 +775,7 @@ async fn activate_fresh_store(
     .await
     {
         Ok(store) => store,
-        Err(error) => return abort_incoming(client, &incoming, error).await,
+        Err(error) => return abort_incoming(client, &incoming, error, false).await,
     };
     ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Incoming);
 
@@ -395,18 +790,18 @@ async fn activate_fresh_store(
         Ok(report) => report,
         Err(error) => {
             drop(store);
-            return abort_incoming(client, &incoming, error).await;
+            return abort_incoming(client, &incoming, error, false).await;
         }
     };
     let marker = ActivationMarker::from_report(&prepared.cluster_id, report);
     if let Err(error) = write_activation_marker(&incoming, &marker) {
         drop(store);
-        return abort_incoming(client, &incoming, error).await;
+        return abort_incoming(client, &incoming, error, false).await;
     }
     ActivationFailpoint::crash_if(failpoint, ActivationFailpoint::Marker);
 
     drop(store);
-    if let Err(error) = client.shutdown().await {
+    if let Err(error) = shutdown_voter(&client, false).await {
         drop(client);
         return Err(cleanup_incoming_failure(
             &incoming,
@@ -429,7 +824,10 @@ async fn activate_fresh_store(
     sync_directory(&config.storage.data_dir)?;
     remove_activation_attempt(&config.storage.data_dir)?;
 
-    open_active_store_with_key(config, daemon_lock, Some(credential_key)).await
+    readdress_single_voter_if_needed(config)?;
+    let selected = open_active_store_with_key(config, daemon_lock, Some(credential_key)).await?;
+    finish_readdress(&config.storage.data_dir)?;
+    Ok(selected)
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -495,6 +893,314 @@ fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Rebuild a sole voter's local Raft metadata around its unchanged state
+/// machine, for the two cases that need it before Hiqlite opens the target.
+///
+/// **Address change.** Openraft supports an atomic `SetNodes` address update,
+/// but Hiqlite 0.14 does not expose it. Rebuilding only the one-voter Raft
+/// metadata from Hiqlite's metadata-reset backup is safe while there is exactly
+/// one voter; doing the same after a peer exists would fork membership history
+/// and is refused.
+///
+/// **Ungraceful shutdown.** Hiqlite's `auto-heal` deletes the whole
+/// state-machine database whenever it finds its own lock file at startup, and
+/// expects the Raft log to rebuild it. Activation imports the operator's SQLite
+/// data straight into that database rather than through Raft, and nothing
+/// snapshots before `logs_until_snapshot`, so for an activated node that
+/// replay reconstructs nothing and the install is lost. Running first, while
+/// the database is still intact, turns that into an ordinary crash recovery:
+/// the committed state machine is preserved and only the one-voter Raft
+/// metadata is rebuilt around it. A sole voter acks a write only after applying
+/// it, so the discarded log tail holds nothing a client was told was durable.
+/// A node with peers is left to Hiqlite, whose catch-up from the leader is the
+/// correct recovery there and does not fork membership.
+#[cfg(feature = "hiqlite-store")]
+fn readdress_single_voter_if_needed(config: &Config) -> Result<(), StoreError> {
+    let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    let ungraceful_shutdown = path_exists(&active.join("state_machine").join("lock"))?;
+    let advertised = !config.cluster.advertise_host.trim().is_empty();
+    if !advertised && !ungraceful_shutdown {
+        return Ok(());
+    }
+    let existing_membership = read_local_membership(&config.storage.data_dir)?;
+    // Settle on whether the committed address already matches configuration,
+    // not on whether it looks like loopback. A loopback-literal advertise_host
+    // is a legitimate configuration - two daemons on one host, and the whole
+    // cluster harness - and testing loopback-ness there never reaches a fixed
+    // point, so every boot would rebuild the state machine and every joined
+    // follower would refuse to start.
+    let address_changed = match &existing_membership {
+        Some(membership) if advertised => {
+            membership.local != configured_local_peer(config, membership.raft_id)?
+        }
+        Some(_) => false,
+        None => advertised,
+    };
+    if !address_changed && !ungraceful_shutdown {
+        return Ok(());
+    }
+
+    let marker = read_activation_marker(&active)?;
+    let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    if let Some(membership) = &existing_membership {
+        if membership.cluster_id != marker.cluster_id || membership.node_id != identity.node_id {
+            return Err(StoreError::Identity(
+                "membership.json does not match activation.json and node.id".to_owned(),
+            ));
+        }
+        identity.raft_id = membership.raft_id;
+    }
+    // Decide sole-voter-ness from replicated cluster_nodes rows in the closed
+    // state machine, not from membership.json. redeem() writes an admitted peer
+    // there before it answers the joining node, whereas membership.json records
+    // the bootstrap list once and is never refreshed, so a coordinator that has
+    // since admitted a peer still reads as a lone voter and would rebuild
+    // one-node Raft metadata that silently ejects it.
+    let admitted_peers = admitted_peer_count(&active, identity.raft_id)?;
+    if admitted_peers > 0 {
+        if address_changed {
+            return Err(StoreError::Migration(format!(
+                "cluster.advertise_host cannot change after another voter or learner exists \
+                 ({admitted_peers} other node(s) are admitted); use a future online \
+                 membership-reconfiguration path instead"
+            )));
+        }
+        // Ungraceful shutdown with peers: rebuilding one-node Raft metadata
+        // here would eject them. Hiqlite rebuilds this node from the leader.
+        tracing::warn!(
+            admitted_peers,
+            "recovering from an ungraceful shutdown by catching up from the cluster"
+        );
+        return Ok(());
+    }
+    let desired = configured_local_peer(config, identity.raft_id)?;
+    let backup = config
+        .storage
+        .data_dir
+        .join(HIQLITE_READDRESS_BACKUP_DIRNAME);
+    if path_exists(&backup)? {
+        return Err(StoreError::Migration(format!(
+            "refusing readdress because recovery directory {} already exists",
+            backup.display()
+        )));
+    }
+
+    // The daemon lock proves no voter is running from this directory. Snapshot
+    // the closed SQLite state machine directly and clear only Hiqlite's private
+    // applied-log metadata, matching its own backup implementation. The next
+    // open initializes a new one-voter Raft log around unchanged application
+    // rows and validates instance.id before the old target is removed.
+    remove_abandoned_incoming(&config.storage.data_dir)?;
+    let incoming = config.storage.data_dir.join(HIQLITE_INCOMING_DIRNAME);
+    std::fs::create_dir_all(&incoming)
+        .map_err(|error| migration_io("creating", &incoming, error))?;
+    let state_target = incoming
+        .join("state_machine")
+        .join("db")
+        .join(HIQLITE_DATABASE_FILENAME);
+    if let Err(error) = snapshot_hiqlite_state_machine(
+        &active
+            .join("state_machine")
+            .join("db")
+            .join(HIQLITE_DATABASE_FILENAME),
+        &state_target,
+    ) {
+        let _ = remove_abandoned_incoming(&config.storage.data_dir);
+        return Err(error);
+    }
+
+    // telemetry.db is node-local, but it still contains useful continuity for
+    // status and should survive a membership-address repair.
+    let telemetry_target = incoming.join("telemetry.db");
+    if let Err(error) = snapshot_sqlite_file(&active.join("telemetry.db"), &telemetry_target) {
+        let _ = remove_abandoned_incoming(&config.storage.data_dir);
+        return Err(error);
+    }
+
+    write_activation_marker(&incoming, &marker)?;
+    verify_state_machine_snapshot_identity(&state_target, &marker.cluster_id)?;
+    let membership = LocalMembership {
+        version: 1,
+        cluster_id: identity.cluster_id.clone(),
+        node_id: identity.node_id.clone(),
+        raft_id: identity.raft_id,
+        local: desired.clone(),
+        bootstrap: vec![desired],
+        join_token_digest: existing_membership.and_then(|membership| membership.join_token_digest),
+    };
+    sync_directory(&incoming)?;
+
+    write_readdress_record(&config.storage.data_dir, &membership)?;
+    std::fs::rename(&active, &backup)
+        .map_err(|error| migration_io("parking pre-readdress target", &backup, error))?;
+    if let Err(error) = std::fs::rename(&incoming, &active) {
+        let restore = std::fs::rename(&backup, &active);
+        return Err(match restore {
+            Ok(()) => migration_io("activating readdressed target", &active, error),
+            Err(restore) => StoreError::Migration(format!(
+                "activating readdressed target {} failed: {error}; restoring {} also failed: \
+                 {restore}",
+                active.display(),
+                backup.display()
+            )),
+        });
+    }
+    sync_directory(&config.storage.data_dir)?;
+    write_local_membership(&config.storage.data_dir, &membership)?;
+    Ok(())
+}
+
+/// Count admitted cluster nodes other than this one, read directly from the
+/// closed replicated state machine.
+///
+/// The daemon lock proves no voter is running, so this is a consistent read of
+/// committed state: `redeem` inserts an admitted peer into `cluster_nodes`
+/// before answering the joining node, and `remove_voter` tombstones it with
+/// `removed_at`. A store activated before the membership schema existed has no
+/// such table, which means no peer was ever admitted.
+#[cfg(feature = "hiqlite-store")]
+fn admitted_peer_count(active: &Path, raft_id: u64) -> Result<u64, StoreError> {
+    let database = active
+        .join("state_machine")
+        .join("db")
+        .join(HIQLITE_DATABASE_FILENAME);
+    if !path_exists(&database)? {
+        return Ok(0);
+    }
+    let connection = Connection::open_with_flags(
+        &database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        StoreError::Migration(format!(
+            "opening state machine {} to check admitted nodes: {error}",
+            database.display()
+        ))
+    })?;
+    let table_exists = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cluster_nodes'",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            StoreError::Migration(format!("inspecting replicated membership schema: {error}"))
+        })?;
+    if table_exists == 0 {
+        return Ok(0);
+    }
+    let peers = connection
+        .query_row(
+            "SELECT COUNT(*) FROM cluster_nodes WHERE removed_at IS NULL AND raft_id != ?1",
+            [raft_id as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            StoreError::Migration(format!("reading replicated cluster node records: {error}"))
+        })?;
+    Ok(peers.max(0) as u64)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn snapshot_hiqlite_state_machine(source: &Path, target: &Path) -> Result<(), StoreError> {
+    snapshot_sqlite_file(source, target)?;
+    let connection = Connection::open(target).map_err(|error| {
+        StoreError::Migration(format!(
+            "opening readdressed state-machine snapshot {}: {error}",
+            target.display()
+        ))
+    })?;
+    connection
+        .execute("DELETE FROM _metadata", ())
+        .map_err(|error| {
+            StoreError::Migration(format!(
+                "resetting readdressed Raft state-machine metadata: {error}"
+            ))
+        })?;
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .map_err(|error| {
+            StoreError::Migration(format!(
+                "canonicalizing readdressed state-machine snapshot: {error}"
+            ))
+        })?;
+    drop(connection);
+    File::open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| migration_io("syncing", target, error))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn verify_state_machine_snapshot_identity(
+    snapshot: &Path,
+    expected: &str,
+) -> Result<(), StoreError> {
+    let connection = Connection::open_with_flags(
+        snapshot,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        StoreError::Migration(format!(
+            "opening readdressed state-machine snapshot {}: {error}",
+            snapshot.display()
+        ))
+    })?;
+    let actual = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'instance.id'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| {
+            StoreError::Migration(format!(
+                "reading instance.id from readdressed state-machine snapshot: {error}"
+            ))
+        })?;
+    if actual != expected {
+        return Err(StoreError::Identity(format!(
+            "readdressed state-machine instance.id is {actual}, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn snapshot_sqlite_file(source: &Path, target: &Path) -> Result<(), StoreError> {
+    let parent = target.parent().expect("SQLite snapshot target has parent");
+    std::fs::create_dir_all(parent).map_err(|error| migration_io("creating", parent, error))?;
+    let source_connection = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        StoreError::Migration(format!(
+            "opening node-local SQLite {}: {error}",
+            source.display()
+        ))
+    })?;
+    create_private_file(target)?;
+    let mut target_connection = Connection::open(target).map_err(|error| {
+        StoreError::Migration(format!(
+            "opening node-local snapshot {}: {error}",
+            target.display()
+        ))
+    })?;
+    {
+        let backup = Backup::new(&source_connection, &mut target_connection).map_err(|error| {
+            StoreError::Migration(format!("starting node-local SQLite snapshot: {error}"))
+        })?;
+        backup
+            .run_to_completion(256, Duration::from_millis(10), None)
+            .map_err(|error| {
+                StoreError::Migration(format!("copying node-local SQLite snapshot: {error}"))
+            })?;
+    }
+    drop(target_connection);
+    File::open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| migration_io("syncing", target, error))
+}
+
 #[cfg(feature = "hiqlite-store")]
 async fn open_active_store(
     config: &Config,
@@ -512,28 +1218,42 @@ async fn open_active_store_with_key(
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     require_real_directory(&active)?;
     let marker = read_activation_marker(&active)?;
-    let identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    let mut local_membership = read_local_membership(&config.storage.data_dir)?;
+    let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
+    if let Some(membership) = &local_membership {
+        if membership.cluster_id != marker.cluster_id || membership.node_id != identity.node_id {
+            return Err(StoreError::Identity(
+                "membership.json does not match activation.json and node.id".to_owned(),
+            ));
+        }
+        identity.raft_id = membership.raft_id;
+    }
     let secrets = read_existing_secrets(&config.storage.data_dir)?;
-    let client = start_local_voter(config, &active, &secrets, true).await?;
+    let force_loopback = should_force_loopback(config, local_membership.as_ref());
+    let (client, local) = start_voter(
+        config,
+        &active,
+        &secrets,
+        &identity,
+        local_membership.as_ref(),
+        true,
+        force_loopback,
+    )
+    .await?;
     let store = match HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await {
         Ok(store) => store,
-        Err(error) => {
-            let shutdown = client.shutdown().await.err();
-            return Err(with_shutdown_error(error, shutdown));
-        }
+        Err(error) => return Err(error),
     };
     if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
         drop(store);
-        let shutdown = client.shutdown().await.err();
-        return Err(with_shutdown_error(error, shutdown));
+        return Err(error);
     }
     // Written here rather than beside the rename so a crash in between still
     // converges: any boot that successfully opens an active target re-asserts
     // it, and this is the only place that can be reached without one.
     if let Err(error) = ensure_activated_source_record(&config.storage.data_dir, &marker) {
         drop(store);
-        let shutdown = client.shutdown().await.err();
-        return Err(with_shutdown_error(error, shutdown));
+        return Err(error);
     }
     let credential_key = match credential_key {
         Some(key) => key,
@@ -541,16 +1261,68 @@ async fn open_active_store_with_key(
             Ok(key) => key,
             Err(error) => {
                 drop(store);
-                let shutdown = client.shutdown().await.err();
-                return Err(with_shutdown_error(error, shutdown));
+                return Err(error);
             }
         },
     };
+    let store: Arc<dyn Store> = Arc::new(store);
+    let membership_file = match local_membership.take() {
+        Some(mut membership) => {
+            if membership.local != local {
+                membership.local = local.clone();
+                for peer in &mut membership.bootstrap {
+                    if peer.raft_id == local.raft_id {
+                        *peer = local.clone();
+                    }
+                }
+                write_local_membership(&config.storage.data_dir, &membership)?;
+            }
+            membership
+        }
+        None => {
+            let metrics = client.metrics_db().await.map_err(|error| {
+                StoreError::Database(format!("reading initial cluster membership: {error}"))
+            })?;
+            let membership = LocalMembership {
+                version: 1,
+                cluster_id: identity.cluster_id.clone(),
+                node_id: identity.node_id.clone(),
+                raft_id: identity.raft_id,
+                local: local.clone(),
+                bootstrap: metrics
+                    .membership_config
+                    .nodes()
+                    .map(|(_, node)| ClusterPeer::from(node))
+                    .collect(),
+                join_token_digest: None,
+            };
+            write_local_membership(&config.storage.data_dir, &membership)?;
+            membership
+        }
+    };
+    let credential_key_secret =
+        read_secret(&config.cluster.credential_key_path(&config.storage.data_dir))?;
+    let membership = MembershipManager::replicated(
+        client.clone(),
+        Arc::clone(&store),
+        identity.clone(),
+        membership_file.local,
+        configured_join_url(config)?,
+        JoinSecrets {
+            raft: secrets.raft,
+            api: secrets.api,
+            credential_key: credential_key_secret,
+        },
+        marker,
+    )
+    .await
+    .map_err(|error| StoreError::Database(error.to_string()))?;
     Ok(SelectedStore {
-        store: Arc::new(store),
+        store,
         identity,
         credential_key,
         backend: SelectedBackend::Replicated,
+        membership,
         local_client: Some(client),
         _daemon_lock: daemon_lock,
     })
@@ -579,16 +1351,6 @@ async fn open_active_credential_key(
         "opened the node-local credential key for the replicated store"
     );
     Ok(Arc::new(key))
-}
-
-#[cfg(feature = "hiqlite-store")]
-fn with_shutdown_error(error: StoreError, shutdown: Option<hiqlite::Error>) -> StoreError {
-    match shutdown {
-        Some(shutdown) => StoreError::Database(format!(
-            "{error}; additionally failed to stop one-voter Hiqlite: {shutdown}"
-        )),
-        None => error,
-    }
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -637,34 +1399,65 @@ fn load_or_create_secrets(data_dir: &Path) -> Result<ClusterSecrets, StoreError>
 }
 
 #[cfg(feature = "hiqlite-store")]
-async fn start_local_voter(
+async fn start_voter(
     config: &Config,
     target: &Path,
     secrets: &ClusterSecrets,
+    identity: &super::ClusterIdentity,
+    local_membership: Option<&LocalMembership>,
     active_transport: bool,
-) -> Result<Client, StoreError> {
-    let raft_address = local_client_address(config.cluster.raft_bind);
-    // Both listeners stay loopback-only for the same reason: M2 has no peer.
-    // The API listener's only consumer is `connect_activated_store` on this
-    // machine, which dials `local_client_address(api_bind)`, so binding the
-    // configured `0.0.0.0` default would open a LAN port on every existing
-    // single-node install at upgrade with nothing on the other end of it. M3
-    // opens it deliberately when membership gives it a peer to talk to.
-    let api_address = local_client_address(config.cluster.api_bind);
-    let node = Node {
-        id: super::SINGLE_VOTER_RAFT_ID,
-        // Besides removing an unnecessary exposed port, Hiqlite's plain
-        // listener receives its graceful-shutdown signal; M3 will replace both
-        // addresses when it adds authenticated membership.
-        addr_raft: raft_address.to_string(),
-        addr_api: api_address.to_string(),
+    force_loopback: bool,
+) -> Result<(Client, ClusterPeer), StoreError> {
+    let raft_bind = if force_loopback {
+        local_client_address(config.cluster.raft_bind)
+    } else {
+        config.cluster.raft_bind
     };
+    let api_bind = if force_loopback {
+        local_client_address(config.cluster.api_bind)
+    } else {
+        config.cluster.api_bind
+    };
+    validate_cluster_listener("raft", raft_bind, active_transport)?;
+    validate_cluster_listener("cluster API", api_bind, active_transport)?;
+
+    let local = match local_membership {
+        Some(membership) => {
+            if membership.version != 1
+                || membership.cluster_id != identity.cluster_id
+                || membership.node_id != identity.node_id
+                || membership.raft_id != identity.raft_id
+                || membership.local.raft_id != identity.raft_id
+            {
+                return Err(StoreError::Identity(
+                    "local cluster membership does not match node.id or activation marker"
+                        .to_owned(),
+                ));
+            }
+            configured_or_persisted_local_peer(config, membership, force_loopback)?
+        }
+        None if force_loopback => ClusterPeer {
+            raft_id: identity.raft_id,
+            raft_address: raft_bind.to_string(),
+            api_address: api_bind.to_string(),
+        },
+        None => configured_local_peer(config, identity.raft_id)?,
+    };
+    let mut nodes = local_membership
+        .map(|membership| membership.bootstrap.clone())
+        .unwrap_or_default();
+    nodes.retain(|peer| peer.raft_id != local.raft_id);
+    nodes.push(local.clone());
+    nodes.sort_by_key(|peer| peer.raft_id);
+    nodes.dedup_by_key(|peer| peer.raft_id);
+    let nodes = nodes.iter().map(Node::from).collect::<Vec<_>>();
+
     // The daemon lock guards one data directory, but these ports are host-wide
     // and default to fixed values, so two data directories on one host collide.
     // Without this check the node does not report a bind conflict: it reaches a
     // foreign voter's listener, retries the handshake for the full start
     // timeout, and then blames the migration. Check first and say which port.
-    for (role, address) in [("raft", raft_address), ("cluster API", api_address)] {
+    for (role, address) in [("raft", raft_bind), ("cluster API", api_bind)] {
         if let Err(error) = std::net::TcpListener::bind(address) {
             return Err(StoreError::Migration(format!(
                 "the {role} port {address} is not available: {error}. Another plurxd on \
@@ -674,15 +1467,15 @@ async fn start_local_voter(
         }
     }
     let node_config = NodeConfig {
-        node_id: super::SINGLE_VOTER_RAFT_ID,
-        nodes: vec![node],
-        listen_addr_api: Cow::Owned(api_address.ip().to_string()),
-        listen_addr_raft: Cow::Owned(raft_address.ip().to_string()),
+        node_id: identity.raft_id,
+        nodes,
+        listen_addr_api: Cow::Owned(api_bind.ip().to_string()),
+        listen_addr_raft: Cow::Owned(raft_bind.ip().to_string()),
         data_dir: Cow::Owned(target.to_string_lossy().into_owned()),
         filename_db: Cow::Borrowed(HIQLITE_DATABASE_FILENAME),
         secret_raft: secrets.raft.clone(),
         secret_api: secrets.api.clone(),
-        tls_raft: None,
+        tls_raft: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
         wal_size: 2 * 1024 * 1024,
@@ -691,17 +1484,279 @@ async fn start_local_voter(
     };
     let client = hiqlite::start_node(node_config)
         .await
-        .map_err(|error| StoreError::Database(format!("starting one-voter Hiqlite: {error}")))?;
+        .map_err(|error| StoreError::Database(format!("starting Hiqlite voter: {error}")))?;
     if tokio::time::timeout(HIQLITE_START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .is_err()
     {
-        let _ = client.shutdown().await;
+        let _ = shutdown_voter(&client, active_transport).await;
         return Err(StoreError::Database(format!(
-            "one-voter Hiqlite did not become healthy within {HIQLITE_START_TIMEOUT:?}"
+            "Hiqlite voter did not become healthy within {HIQLITE_START_TIMEOUT:?}"
         )));
     }
-    Ok(client)
+    let promotion_deadline = tokio::time::Instant::now() + HIQLITE_START_TIMEOUT;
+    loop {
+        let metrics = client
+            .metrics_db()
+            .await
+            .map_err(|error| StoreError::Database(format!("reading voter membership: {error}")))?;
+        if metrics
+            .membership_config
+            .voter_ids()
+            .any(|raft_id| raft_id == identity.raft_id)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= promotion_deadline {
+            let is_learner = metrics
+                .membership_config
+                .nodes()
+                .any(|(raft_id, _)| *raft_id == identity.raft_id);
+            let _ = shutdown_voter(&client, active_transport).await;
+            let reason = if is_learner {
+                "is still a learner and was not promoted before the start timeout"
+            } else {
+                "is absent from committed membership; it may have been removed"
+            };
+            return Err(StoreError::Identity(format!(
+                "node {} {reason} in cluster {}",
+                identity.node_id, identity.cluster_id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok((client, local))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn should_force_loopback(config: &Config, membership: Option<&LocalMembership>) -> bool {
+    if !config.cluster.advertise_host.trim().is_empty() {
+        return false;
+    }
+    membership.is_none_or(|membership| cluster_peer_is_loopback(&membership.local))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn configured_or_persisted_local_peer(
+    config: &Config,
+    membership: &LocalMembership,
+    force_loopback: bool,
+) -> Result<ClusterPeer, StoreError> {
+    if force_loopback {
+        return if cluster_peer_is_loopback(&membership.local) {
+            Ok(ClusterPeer {
+                raft_id: membership.raft_id,
+                raft_address: local_client_address(config.cluster.raft_bind).to_string(),
+                api_address: local_client_address(config.cluster.api_bind).to_string(),
+            })
+        } else {
+            // Fresh activation can bind its temporary staging listener on
+            // loopback while committing the explicitly advertised address.
+            Ok(membership.local.clone())
+        };
+    }
+
+    if cluster_peer_is_loopback(&membership.local) {
+        // Setting advertise_host is the explicit opt-in that opens an existing
+        // one-voter install to peers. The readdress path replaces its persisted
+        // loopback membership before the active voter reaches this function.
+        return configured_local_peer(config, membership.raft_id);
+    }
+
+    let raft_port = stored_peer_port("Raft", &membership.local.raft_address)?;
+    let api_port = stored_peer_port("cluster API", &membership.local.api_address)?;
+    if raft_port != config.cluster.raft_bind.port() || api_port != config.cluster.api_bind.port() {
+        return Err(StoreError::Migration(format!(
+            "cluster listener port drift: membership.json records Raft/API ports \
+             {raft_port}/{api_port}, but configuration requests {}/{}; changing a joined \
+             voter's ports requires a membership reconfiguration and is refused at startup",
+            config.cluster.raft_bind.port(),
+            config.cluster.api_bind.port()
+        )));
+    }
+
+    if config.cluster.advertise_host.trim().is_empty() {
+        return Ok(membership.local.clone());
+    }
+    let configured = configured_local_peer(config, membership.raft_id)?;
+    if configured != membership.local {
+        return Err(StoreError::Migration(
+            "cluster.advertise_host differs from membership.json; changing a joined voter's \
+             advertised address requires a membership reconfiguration and is refused at startup"
+                .to_owned(),
+        ));
+    }
+    Ok(configured)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn cluster_peer_is_loopback(peer: &ClusterPeer) -> bool {
+    [&peer.raft_address, &peer.api_address]
+        .into_iter()
+        .all(|address| {
+            address
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback())
+        })
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn stored_peer_port(role: &str, address: &str) -> Result<u16, StoreError> {
+    let port = if let Some(rest) = address.strip_prefix('[') {
+        rest.rsplit_once("]:").map(|(_, port)| port)
+    } else {
+        address.rsplit_once(':').map(|(_, port)| port)
+    };
+    port.and_then(|port| port.parse().ok()).ok_or_else(|| {
+        StoreError::Migration(format!(
+            "membership.json contains an invalid {role} address; refusing to guess a listener port"
+        ))
+    })
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn shutdown_voter(client: &Client, active_transport: bool) -> Result<(), StoreError> {
+    const TLS_SHUTDOWN_ASSERTION: &str =
+        "The global Hiqlite shutdown handler to always listen: SendError { .. }";
+
+    if !active_transport {
+        return client
+            .shutdown()
+            .await
+            .map_err(|error| StoreError::Database(format!("stopping Hiqlite voter: {error}")));
+    }
+
+    // The assertion is caught below, but Rust's default panic hook would still
+    // print a frightening backtrace during an otherwise clean daemon stop.
+    // Serialize the short process-global hook swap and suppress only the exact
+    // upstream assertion; every unrelated panic still reaches the prior hook.
+    static PANIC_HOOK_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _hook_guard = PANIC_HOOK_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let previous_hook = Arc::new(std::panic::take_hook());
+    let delegated_hook = Arc::clone(&previous_hook);
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+        if message == Some(TLS_SHUTDOWN_ASSERTION) {
+            return;
+        }
+        delegated_hook(info);
+    }));
+
+    let owned = client.clone();
+    let outcome = tokio::spawn(async move { owned.shutdown().await }).await;
+    drop(std::panic::take_hook());
+    let previous_hook = match Arc::try_unwrap(previous_hook) {
+        Ok(hook) => hook,
+        Err(_) => unreachable!("serialized panic-hook owner"),
+    };
+    std::panic::set_hook(previous_hook);
+
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(StoreError::Database(format!(
+            "stopping TLS Hiqlite voter: {error}"
+        ))),
+        Err(join_error) if join_error.is_panic() => {
+            let payload = join_error.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic");
+            if message == TLS_SHUTDOWN_ASSERTION {
+                // In 0.14 this exact assertion is after Raft shutdown, WAL
+                // drain, SQL-writer drain, and client-stream shutdown. TLS
+                // listeners own no receiver, so only their final notification
+                // is missing; runtime teardown closes those listener tasks.
+                tracing::debug!("contained Hiqlite 0.14 TLS listener shutdown assertion");
+                Ok(())
+            } else {
+                Err(StoreError::Database(format!(
+                    "TLS Hiqlite voter panicked during shutdown: {message}"
+                )))
+            }
+        }
+        Err(join_error) => Err(StoreError::Database(format!(
+            "TLS Hiqlite voter shutdown task failed: {join_error}"
+        ))),
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn validate_cluster_listener(role: &str, bind: SocketAddr, tls: bool) -> Result<(), StoreError> {
+    if !tls && !bind.ip().is_loopback() {
+        return Err(StoreError::Migration(format!(
+            "refusing public cleartext {role} bind {bind}; use the automatic cluster TLS \
+             transport or bind the listener to loopback"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn configured_local_peer(config: &Config, raft_id: u64) -> Result<ClusterPeer, StoreError> {
+    let host = configured_advertise_host(config)?;
+    Ok(ClusterPeer {
+        raft_id,
+        raft_address: host_port(&host, config.cluster.raft_bind.port()),
+        api_address: host_port(&host, config.cluster.api_bind.port()),
+    })
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn configured_advertise_host(config: &Config) -> Result<String, StoreError> {
+    let host = if !config.cluster.advertise_host.trim().is_empty() {
+        config.cluster.advertise_host.trim().to_owned()
+    } else if !config.cluster.api_bind.ip().is_unspecified() {
+        config.cluster.api_bind.ip().to_string()
+    } else if !config.server.bind.ip().is_unspecified() {
+        config.server.bind.ip().to_string()
+    } else {
+        "127.0.0.1".to_owned()
+    };
+    if host.contains("//") || host.contains('/') || host.contains(char::is_whitespace) {
+        return Err(StoreError::Migration(
+            "cluster.advertise_host must be a host or IP address, not a URL".to_owned(),
+        ));
+    }
+    Ok(host)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn configured_join_url(config: &Config) -> Result<String, StoreError> {
+    let configured = config.cluster.join_url.trim().trim_end_matches('/');
+    if !configured.is_empty() {
+        if !(configured.starts_with("http://") || configured.starts_with("https://")) {
+            return Err(StoreError::Migration(
+                "cluster.join_url must start with http:// or https://".to_owned(),
+            ));
+        }
+        return Ok(configured.to_owned());
+    }
+    Ok(format!(
+        "http://{}",
+        host_port(
+            &configured_advertise_host(config)?,
+            config.server.bind.port()
+        )
+    ))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -709,8 +1764,9 @@ async fn abort_incoming(
     client: Client,
     incoming: &Path,
     error: StoreError,
+    active_transport: bool,
 ) -> Result<SelectedStore, StoreError> {
-    let shutdown = client.shutdown().await.err();
+    let shutdown = shutdown_voter(&client, active_transport).await.err();
     drop(client);
     let mut message = error.to_string();
     if let Some(shutdown) = shutdown {
@@ -941,6 +1997,143 @@ fn write_activation_marker(target: &Path, marker: &ActivationMarker) -> Result<(
     })?;
     bytes.push(b'\n');
     write_atomic_private(target, ACTIVATION_MARKER_FILENAME, &bytes)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_local_membership(data_dir: &Path) -> Result<Option<LocalMembership>, StoreError> {
+    let path = data_dir.join(LOCAL_MEMBERSHIP_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(migration_io("reading", &path, error)),
+    };
+    let membership: LocalMembership = serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::Identity(format!(
+            "decoding local cluster membership {}: {error}",
+            path.display()
+        ))
+    })?;
+    if membership.version != 1
+        || membership.cluster_id.trim().is_empty()
+        || membership.node_id.trim().is_empty()
+        || membership.raft_id == 0
+    {
+        return Err(StoreError::Identity(format!(
+            "local cluster membership {} is incomplete",
+            path.display()
+        )));
+    }
+    Ok(Some(membership))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_local_membership(data_dir: &Path, membership: &LocalMembership) -> Result<(), StoreError> {
+    let mut bytes = serde_json::to_vec_pretty(membership).map_err(|error| {
+        StoreError::Identity(format!("serializing local cluster membership: {error}"))
+    })?;
+    bytes.push(b'\n');
+    write_atomic_private(data_dir, LOCAL_MEMBERSHIP_FILENAME, &bytes)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn write_readdress_record(data_dir: &Path, membership: &LocalMembership) -> Result<(), StoreError> {
+    let record = ReaddressRecord {
+        version: 1,
+        membership: membership.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        StoreError::Migration(format!("serializing voter-readdress record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    write_atomic_private(data_dir, HIQLITE_READDRESS_MARKER_FILENAME, &bytes)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn read_readdress_record(data_dir: &Path) -> Result<Option<ReaddressRecord>, StoreError> {
+    let path = data_dir.join(HIQLITE_READDRESS_MARKER_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(migration_io("reading", &path, error)),
+    };
+    let record: ReaddressRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::Migration(format!(
+            "decoding voter-readdress record {}: {error}",
+            path.display()
+        ))
+    })?;
+    if record.version != 1
+        || record.membership.version != 1
+        || record.membership.cluster_id.trim().is_empty()
+        || record.membership.node_id.trim().is_empty()
+        || record.membership.raft_id == 0
+    {
+        return Err(StoreError::Migration(format!(
+            "voter-readdress record {} is incomplete",
+            path.display()
+        )));
+    }
+    Ok(Some(record))
+}
+
+/// Recover the only non-atomic boundary in the one-voter directory swap.
+#[cfg(feature = "hiqlite-store")]
+fn recover_interrupted_readdress(data_dir: &Path) -> Result<(), StoreError> {
+    let Some(record) = read_readdress_record(data_dir)? else {
+        return Ok(());
+    };
+    let active = data_dir.join(HIQLITE_ACTIVE_DIRNAME);
+    let incoming = data_dir.join(HIQLITE_INCOMING_DIRNAME);
+    let backup = data_dir.join(HIQLITE_READDRESS_BACKUP_DIRNAME);
+    match (path_exists(&active)?, path_exists(&backup)?) {
+        // Both renames committed. Publish the matching local record before the
+        // replacement target is opened; cleanup waits for successful open.
+        (true, true) => write_local_membership(data_dir, &record.membership),
+        // The prepared target never replaced the authoritative directory.
+        (true, false) => {
+            remove_directory_if_present(&incoming)?;
+            remove_file_if_present(&data_dir.join(HIQLITE_READDRESS_MARKER_FILENAME))?;
+            sync_directory(data_dir)
+        }
+        // Crash between the two renames: restore the old authoritative target.
+        (false, true) => {
+            std::fs::rename(&backup, &active)
+                .map_err(|error| migration_io("restoring pre-readdress target", &active, error))?;
+            remove_directory_if_present(&incoming)?;
+            remove_file_if_present(&data_dir.join(HIQLITE_READDRESS_MARKER_FILENAME))?;
+            sync_directory(data_dir)
+        }
+        (false, false) => Err(StoreError::Migration(format!(
+            "{} exists but neither the active nor recovery Hiqlite target exists",
+            data_dir.join(HIQLITE_READDRESS_MARKER_FILENAME).display()
+        ))),
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn finish_readdress(data_dir: &Path) -> Result<(), StoreError> {
+    if read_readdress_record(data_dir)?.is_none() {
+        return Ok(());
+    }
+    remove_directory_if_present(&data_dir.join(HIQLITE_READDRESS_BACKUP_DIRNAME))?;
+    remove_file_if_present(&data_dir.join(HIQLITE_READDRESS_MARKER_FILENAME))?;
+    sync_directory(data_dir)
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn remove_directory_if_present(path: &Path) -> Result<(), StoreError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(migration_io("inspecting", path, error)),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::Migration(format!(
+            "refusing to recursively remove non-directory recovery path {}",
+            path.display()
+        )));
+    }
+    std::fs::remove_dir_all(path).map_err(|error| migration_io("removing", path, error))
 }
 
 /// Write the already-activated breadcrumb unless it is already correct.
@@ -1378,13 +2571,24 @@ mod tests {
     use super::*;
     use crate::store::{SettingsStore, SqliteStore};
 
-    /// M2 has no remote voter, so an operator's future-facing M3 host setting
-    /// must not expose either listener before membership exists. The port and
-    /// address family remain configurable so parallel and IPv6-only installs
-    /// still work.
+    #[cfg(feature = "hiqlite-store")]
+    use axum::extract::State;
+    #[cfg(feature = "hiqlite-store")]
+    use axum::http::StatusCode;
+    #[cfg(feature = "hiqlite-store")]
+    use axum::response::{IntoResponse, Response};
+    #[cfg(feature = "hiqlite-store")]
+    use axum::routing::post;
+    #[cfg(feature = "hiqlite-store")]
+    use axum::{Json, Router};
+    #[cfg(feature = "hiqlite-store")]
+    use serde_json::json;
+
+    /// Staging import never needs a remotely reachable address. Active M3
+    /// voters and maintenance clients use persisted membership addresses.
     #[cfg(feature = "hiqlite-store")]
     #[test]
-    fn m2_listener_addresses_ignore_explicitly_configured_hosts() {
+    fn staging_fallback_addresses_are_always_loopback() {
         let configured_v4: SocketAddr = "192.0.2.40:32401".parse().expect("IPv4 bind");
         assert_eq!(
             local_client_address(configured_v4),
@@ -1396,6 +2600,630 @@ mod tests {
             local_client_address(configured_v6),
             "[::1]:32402".parse().expect("IPv6 loopback")
         );
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn maintenance_uses_the_persisted_local_api_address() {
+        let data = tempfile::tempdir().expect("maintenance address dir");
+        let mut config = Config::default();
+        config.storage.data_dir = data.path().to_owned();
+        let identity = super::super::ClusterIdentity {
+            cluster_id: "cluster-a".to_owned(),
+            node_id: "node-a".to_owned(),
+            raft_id: 1,
+        };
+        write_local_membership(
+            data.path(),
+            &LocalMembership {
+                version: 1,
+                cluster_id: identity.cluster_id.clone(),
+                node_id: identity.node_id.clone(),
+                raft_id: identity.raft_id,
+                local: ClusterPeer {
+                    raft_id: 1,
+                    raft_address: "192.0.2.40:32401".to_owned(),
+                    api_address: "192.0.2.40:32402".to_owned(),
+                },
+                bootstrap: Vec::new(),
+                join_token_digest: None,
+            },
+        )
+        .expect("write local membership");
+        assert_eq!(
+            local_voter_api_address(&config, &identity).expect("maintenance address"),
+            "192.0.2.40:32402"
+        );
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn public_cleartext_cluster_listeners_are_refused() {
+        let public: SocketAddr = "0.0.0.0:32401".parse().expect("public bind");
+        let error = validate_cluster_listener("raft", public, false)
+            .expect_err("public cleartext must be refused");
+        assert!(error.to_string().contains("refusing public cleartext raft"));
+        validate_cluster_listener("raft", public, true).expect("public TLS is allowed");
+        validate_cluster_listener("raft", "127.0.0.1:32401".parse().expect("loopback"), false)
+            .expect("loopback cleartext is allowed for staging");
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn default_voters_stay_loopback_and_joined_port_drift_is_refused() {
+        let config = Config::default();
+        assert!(should_force_loopback(&config, None));
+
+        let mut enabled = config.clone();
+        enabled.cluster.advertise_host = "plurx-a.lan".to_owned();
+        assert!(!should_force_loopback(&enabled, None));
+
+        let membership = LocalMembership {
+            version: 1,
+            cluster_id: "cluster-a".to_owned(),
+            node_id: "node-a".to_owned(),
+            raft_id: 1,
+            local: ClusterPeer {
+                raft_id: 1,
+                raft_address: "plurx-a.lan:32401".to_owned(),
+                api_address: "plurx-a.lan:32402".to_owned(),
+            },
+            bootstrap: Vec::new(),
+            join_token_digest: None,
+        };
+        let mut drifted = enabled;
+        drifted.cluster.api_bind.set_port(32502);
+        let error = configured_or_persisted_local_peer(&drifted, &membership, false)
+            .expect_err("joined listener port drift must fail closed");
+        assert!(error.to_string().contains("listener port drift"), "{error}");
+    }
+
+    /// Build an activated data directory whose persisted membership is
+    /// `membership`, so readdress decisions can be exercised without a store.
+    #[cfg(feature = "hiqlite-store")]
+    fn activated_dir_for_readdress(membership: &LocalMembership) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("activated data dir");
+        let active = dir.path().join(HIQLITE_ACTIVE_DIRNAME);
+        std::fs::create_dir_all(&active).expect("active target");
+        write_activation_marker(
+            &active,
+            &ActivationMarker {
+                marker_version: ACTIVATION_MARKER_VERSION,
+                cluster_id: membership.cluster_id.clone(),
+                source_backup_sha256: "0".repeat(64),
+                source_schema_version: AUTH_SCHEMA_VERSION,
+                replicated_schema_version: AUTH_SCHEMA_VERSION,
+                imported_rows: 0,
+                table_hashes: vec![SqliteImportTableDigest {
+                    table: "settings".to_owned(),
+                    row_count: 0,
+                    sha256: "0".repeat(64),
+                }],
+            },
+        )
+        .expect("activation marker");
+        std::fs::write(
+            dir.path().join("node.id"),
+            format!("{}\n", membership.node_id),
+        )
+        .expect("node identity");
+        write_local_membership(dir.path(), membership).expect("persisted membership");
+        dir
+    }
+
+    /// A loopback-literal `advertise_host` is a legitimate configuration - two
+    /// daemons on one host - and must reach a fixed point. Deciding on
+    /// loopback-ness instead of on "differs from configured" never settles, so
+    /// a sole voter rebuilt its state machine on every boot and a joined
+    /// follower refused to start at all.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn readdress_is_a_no_op_once_the_committed_address_matches_configuration() {
+        for (raft_id, bootstrap_raft_id) in [(1_u64, 1_u64), (2, 1)] {
+            let dir = tempfile::tempdir().expect("port probe dir");
+            let config_probe = membership_test_config(dir.path());
+            let raft_port = config_probe.cluster.raft_bind.port();
+            let api_port = config_probe.cluster.api_bind.port();
+            let local = ClusterPeer {
+                raft_id,
+                raft_address: format!("127.0.0.1:{raft_port}"),
+                api_address: format!("127.0.0.1:{api_port}"),
+            };
+            let membership = LocalMembership {
+                version: 1,
+                cluster_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+                node_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                raft_id,
+                local: local.clone(),
+                // A joined follower carries the coordinator's bootstrap list,
+                // which is exactly what the old peer-existence guard rejected.
+                bootstrap: vec![ClusterPeer {
+                    raft_id: bootstrap_raft_id,
+                    raft_address: format!("127.0.0.1:{raft_port}"),
+                    api_address: format!("127.0.0.1:{api_port}"),
+                }],
+                join_token_digest: None,
+            };
+            let activated = activated_dir_for_readdress(&membership);
+            let mut config = membership_test_config(activated.path());
+            config.cluster.advertise_host = "127.0.0.1".to_owned();
+            config.cluster.raft_bind = format!("127.0.0.1:{raft_port}").parse().expect("Raft bind");
+            config.cluster.api_bind = format!("127.0.0.1:{api_port}")
+                .parse()
+                .expect("cluster API bind");
+
+            readdress_single_voter_if_needed(&config)
+                .unwrap_or_else(|error| panic!("raft_id {raft_id} must boot unchanged: {error}"));
+
+            assert_eq!(
+                read_local_membership(activated.path())
+                    .expect("read membership")
+                    .map(|membership| membership.local),
+                Some(local),
+                "raft_id {raft_id} committed address was rewritten"
+            );
+            assert!(
+                !activated
+                    .path()
+                    .join(HIQLITE_READDRESS_BACKUP_DIRNAME)
+                    .exists()
+                    && !activated.path().join(HIQLITE_INCOMING_DIRNAME).exists(),
+                "raft_id {raft_id} rebuilt its state machine with nothing to repair"
+            );
+        }
+    }
+
+    /// `membership.json` records the bootstrap list once and is never
+    /// refreshed, so a coordinator that has admitted a peer still reads as a
+    /// lone voter there. Deciding sole-voter-ness from that file let the
+    /// readdress rebuild one-node Raft metadata that silently ejected the peer.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn readdress_refuses_once_a_peer_is_admitted_even_if_local_membership_is_stale() {
+        let membership = LocalMembership {
+            version: 1,
+            cluster_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            node_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            raft_id: 1,
+            local: ClusterPeer {
+                raft_id: 1,
+                raft_address: "127.0.0.1:32401".to_owned(),
+                api_address: "127.0.0.1:32402".to_owned(),
+            },
+            // Written before the peer joined, and never updated since.
+            bootstrap: vec![ClusterPeer {
+                raft_id: 1,
+                raft_address: "127.0.0.1:32401".to_owned(),
+                api_address: "127.0.0.1:32402".to_owned(),
+            }],
+            join_token_digest: None,
+        };
+        let activated = activated_dir_for_readdress(&membership);
+        let database = activated
+            .path()
+            .join(HIQLITE_ACTIVE_DIRNAME)
+            .join("state_machine")
+            .join("db")
+            .join(HIQLITE_DATABASE_FILENAME);
+        std::fs::create_dir_all(database.parent().expect("state machine dir"))
+            .expect("state machine dir");
+        let connection = Connection::open(&database).expect("state machine");
+        connection
+            .execute_batch(
+                "CREATE TABLE cluster_nodes (node_id TEXT PRIMARY KEY, raft_id INTEGER NOT NULL, \
+                 raft_address TEXT NOT NULL, api_address TEXT NOT NULL, \
+                 last_seen_at INTEGER NOT NULL, removed_at INTEGER);\
+                 INSERT INTO cluster_nodes VALUES \
+                   ('node-a', 1, '127.0.0.1:32401', '127.0.0.1:32402', 1, NULL),\
+                   ('node-b', 2, '127.0.0.1:32411', '127.0.0.1:32412', 1, NULL);",
+            )
+            .expect("admitted peer record");
+        drop(connection);
+
+        let mut config = membership_test_config(activated.path());
+        config.cluster.advertise_host = "plurx-a.lan".to_owned();
+        config.cluster.raft_bind = "127.0.0.1:32401".parse().expect("Raft bind");
+        config.cluster.api_bind = "127.0.0.1:32402".parse().expect("cluster API bind");
+
+        let error = readdress_single_voter_if_needed(&config)
+            .expect_err("readdress must refuse once a peer is admitted");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot change after another voter or learner exists"),
+            "{error}"
+        );
+        assert!(
+            !activated
+                .path()
+                .join(HIQLITE_READDRESS_BACKUP_DIRNAME)
+                .exists()
+                && !activated.path().join(HIQLITE_INCOMING_DIRNAME).exists(),
+            "refused readdress still touched the active target"
+        );
+    }
+
+    /// A removed node is tombstoned rather than deleted, so it must stop
+    /// blocking a sole survivor's readdress while still reserving its Raft id.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn admitted_peer_count_ignores_tombstones_and_missing_schema() {
+        let dir = tempfile::tempdir().expect("state machine dir");
+        let active = dir.path().join(HIQLITE_ACTIVE_DIRNAME);
+        let database = active
+            .join("state_machine")
+            .join("db")
+            .join(HIQLITE_DATABASE_FILENAME);
+        std::fs::create_dir_all(database.parent().expect("db dir")).expect("db dir");
+
+        // A store activated before the membership schema existed never admitted
+        // a peer, and an absent state machine cannot contradict that either.
+        assert_eq!(admitted_peer_count(&active, 1).expect("absent database"), 0);
+        let connection = Connection::open(&database).expect("state machine");
+        assert_eq!(admitted_peer_count(&active, 1).expect("absent table"), 0);
+        connection
+            .execute_batch(
+                "CREATE TABLE cluster_nodes (node_id TEXT PRIMARY KEY, raft_id INTEGER NOT NULL, \
+                 raft_address TEXT NOT NULL, api_address TEXT NOT NULL, \
+                 last_seen_at INTEGER NOT NULL, removed_at INTEGER);\
+                 INSERT INTO cluster_nodes VALUES \
+                   ('node-a', 1, 'a:1', 'a:2', 1, NULL),\
+                   ('node-b', 2, 'b:1', 'b:2', 1, 99);",
+            )
+            .expect("tombstoned peer");
+        drop(connection);
+
+        assert_eq!(admitted_peer_count(&active, 1).expect("tombstoned peer"), 0);
+        assert_eq!(admitted_peer_count(&active, 2).expect("live peer"), 1);
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn readdress_directory_swap_recovers_both_crash_boundaries() {
+        let membership = LocalMembership {
+            version: 1,
+            cluster_id: "cluster-a".to_owned(),
+            node_id: "node-a".to_owned(),
+            raft_id: 1,
+            local: ClusterPeer {
+                raft_id: 1,
+                raft_address: "plurx-a.lan:32401".to_owned(),
+                api_address: "plurx-a.lan:32402".to_owned(),
+            },
+            bootstrap: Vec::new(),
+            join_token_digest: None,
+        };
+
+        let between = tempfile::tempdir().expect("between-renames recovery dir");
+        std::fs::create_dir(between.path().join(HIQLITE_READDRESS_BACKUP_DIRNAME))
+            .expect("old target");
+        std::fs::create_dir(between.path().join(HIQLITE_INCOMING_DIRNAME))
+            .expect("prepared target");
+        write_readdress_record(between.path(), &membership).expect("readdress marker");
+        recover_interrupted_readdress(between.path()).expect("restore old target");
+        assert!(between.path().join(HIQLITE_ACTIVE_DIRNAME).exists());
+        assert!(!between
+            .path()
+            .join(HIQLITE_READDRESS_BACKUP_DIRNAME)
+            .exists());
+        assert!(!between.path().join(HIQLITE_INCOMING_DIRNAME).exists());
+        assert!(!between
+            .path()
+            .join(HIQLITE_READDRESS_MARKER_FILENAME)
+            .exists());
+
+        let after = tempfile::tempdir().expect("after-renames recovery dir");
+        std::fs::create_dir(after.path().join(HIQLITE_ACTIVE_DIRNAME)).expect("new target");
+        std::fs::create_dir(after.path().join(HIQLITE_READDRESS_BACKUP_DIRNAME))
+            .expect("old recovery target");
+        write_readdress_record(after.path(), &membership).expect("readdress marker");
+        recover_interrupted_readdress(after.path()).expect("publish new membership");
+        assert_eq!(
+            read_local_membership(after.path()).expect("read membership"),
+            Some(membership)
+        );
+        assert!(after.path().join(HIQLITE_READDRESS_BACKUP_DIRNAME).exists());
+        finish_readdress(after.path()).expect("finish readdress cleanup");
+        assert!(!after.path().join(HIQLITE_READDRESS_BACKUP_DIRNAME).exists());
+        assert!(!after
+            .path()
+            .join(HIQLITE_READDRESS_MARKER_FILENAME)
+            .exists());
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    fn free_test_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind test port")
+            .local_addr()
+            .expect("test port address")
+            .port()
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    fn membership_test_config(data_dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.storage.data_dir = data_dir.to_owned();
+        config.cluster.raft_bind = format!("127.0.0.1:{}", free_test_port())
+            .parse()
+            .expect("Raft bind");
+        config.cluster.api_bind = format!("127.0.0.1:{}", free_test_port())
+            .parse()
+            .expect("cluster API bind");
+        // `localhost` is reachable on this machine but is not parsed as a
+        // loopback SocketAddr. Tests can therefore distinguish committed
+        // advertised membership from the old hard-coded 127.0.0.1 record.
+        config.cluster.advertise_host = "localhost".to_owned();
+        config
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    fn membership_http_error(error: super::super::membership::MembershipError) -> Response {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "code": error.code(), "message": error.to_string() })),
+        )
+            .into_response()
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    async fn redeem_join_for_test(
+        State(manager): State<MembershipManager>,
+        Json(request): Json<RedeemJoinRequest>,
+    ) -> Response {
+        match manager.redeem(&request).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => membership_http_error(error),
+        }
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    async fn finalize_join_for_test(
+        State(manager): State<MembershipManager>,
+        Json(request): Json<FinalizeJoinRequest>,
+    ) -> Response {
+        match manager.finalize(&request).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => membership_http_error(error),
+        }
+    }
+
+    /// Exercise the operator's actual daemon join entry point, including the
+    /// token file, public redeem/finalize wire, local membership state, and
+    /// fully-TLS voter startup. The in-process membership harness alone cannot
+    /// cover any of these pre-store decisions.
+    #[cfg(feature = "hiqlite-store")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization() {
+        install_default_crypto_provider();
+
+        let source_dir = tempfile::tempdir().expect("source data dir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("join coordinator listener");
+        let coordinator_addr = listener.local_addr().expect("coordinator address");
+        let mut source_config = membership_test_config(source_dir.path());
+        source_config.cluster.advertise_host.clear();
+        source_config.server.bind = coordinator_addr;
+        source_config.cluster.join_url = format!("http://{coordinator_addr}");
+        drop(SqliteStore::open(&source_dir.path().join(SQLITE_FILENAME)).expect("source SQLite"));
+        let source = select_daemon_store(&source_config)
+            .await
+            .expect("activate source voter");
+        let cluster_id = source.identity.cluster_id.clone();
+        source
+            .store
+            .put_setting("membership.readdress", "preserved")
+            .await
+            .expect("write state before readdress");
+        let original_metrics = source
+            .local_client
+            .as_ref()
+            .expect("source client")
+            .metrics_db()
+            .await
+            .expect("source membership");
+        let original = original_metrics
+            .membership_config
+            .nodes()
+            .find(|(raft_id, _)| **raft_id == 1)
+            .map(|(_, node)| node.clone())
+            .expect("source voter record");
+        assert!(original.addr_api.starts_with("127.0.0.1:"));
+        source.shutdown().await.expect("stop loopback source");
+        drop(source);
+
+        // This is the actual upgrade path: an already-running one-voter install
+        // opts into membership later. Its committed Raft address, not only
+        // membership.json, must become remotely usable without losing data.
+        // A real daemon restart drops the old runtime and frees these ports;
+        // this in-process test uses fresh ports because Hiqlite 0.14 leaves its
+        // TLS listener task alive until the test runtime itself exits.
+        source_config.cluster.raft_bind = format!("127.0.0.1:{}", free_test_port())
+            .parse()
+            .expect("readdressed Raft bind");
+        source_config.cluster.api_bind = format!("127.0.0.1:{}", free_test_port())
+            .parse()
+            .expect("readdressed cluster API bind");
+        source_config.cluster.advertise_host = "localhost".to_owned();
+        let source = select_daemon_store(&source_config)
+            .await
+            .expect("readdress existing source voter");
+        assert_eq!(source.identity.cluster_id, cluster_id);
+        assert_eq!(
+            source
+                .store
+                .get_setting("membership.readdress")
+                .await
+                .expect("read state after readdress")
+                .as_deref(),
+            Some("preserved")
+        );
+        let readdressed_metrics = source
+            .local_client
+            .as_ref()
+            .expect("readdressed source client")
+            .metrics_db()
+            .await
+            .expect("readdressed membership");
+        let readdressed = readdressed_metrics
+            .membership_config
+            .nodes()
+            .find(|(raft_id, _)| **raft_id == 1)
+            .map(|(_, node)| node.clone())
+            .expect("readdressed voter record");
+        assert!(
+            readdressed.addr_api.starts_with("localhost:"),
+            "committed membership remained loopback: {readdressed:?}"
+        );
+        assert!(!source_dir
+            .path()
+            .join(HIQLITE_READDRESS_BACKUP_DIRNAME)
+            .exists());
+        assert!(!source_dir
+            .path()
+            .join(HIQLITE_READDRESS_MARKER_FILENAME)
+            .exists());
+        let coordinator = source.membership_manager();
+        let app = Router::new()
+            .route("/api/v1/cluster/join/redeem", post(redeem_join_for_test))
+            .route(
+                "/api/v1/cluster/join/finalize",
+                post(finalize_join_for_test),
+            )
+            .with_state(coordinator.clone());
+        let http_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve join coordinator");
+        });
+
+        let occupied = tempfile::tempdir().expect("occupied join dir");
+        let occupied_token = occupied.path().join("join.token");
+        std::fs::write(&occupied_token, "unused\n").expect("occupied token file");
+        File::create(occupied.path().join(SQLITE_FILENAME)).expect("occupied SQLite path");
+        let mut occupied_config = membership_test_config(occupied.path());
+        occupied_config.cluster.join_token_file = occupied_token;
+        let occupied_error = select_daemon_store(&occupied_config)
+            .await
+            .err()
+            .expect("existing SQLite must refuse daemon join")
+            .to_string();
+        assert!(occupied_error.contains("refusing to join with existing local database"));
+
+        let expired = coordinator
+            .issue_token(Duration::from_secs(1))
+            .await
+            .expect("issue expiring token");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let expired_dir = tempfile::tempdir().expect("expired join dir");
+        let expired_path = expired_dir.path().join("join.token");
+        std::fs::write(&expired_path, format!("{}\n", expired.token)).expect("expired token file");
+        let mut expired_config = membership_test_config(expired_dir.path());
+        expired_config.cluster.join_token_file = expired_path;
+        let expired_error = select_daemon_store(&expired_config)
+            .await
+            .err()
+            .expect("expired token must refuse daemon join")
+            .to_string();
+        assert!(
+            expired_error.contains("join_token_expired"),
+            "{expired_error}"
+        );
+        assert!(!expired_dir.path().join(HIQLITE_ACTIVE_DIRNAME).exists());
+
+        let issued = coordinator
+            .issue_token(Duration::from_secs(120))
+            .await
+            .expect("issue daemon join token");
+        let joining_dir = tempfile::tempdir().expect("joining data dir");
+        let token_path = joining_dir.path().join("join.token");
+        std::fs::write(&token_path, format!("{}\n", issued.token)).expect("joining token file");
+        let mut joining_config = membership_test_config(joining_dir.path());
+        joining_config.cluster.join_token_file = token_path.clone();
+        let joined = select_daemon_store(&joining_config)
+            .await
+            .expect("join through daemon store selection");
+        assert_eq!(joined.identity.cluster_id, cluster_id);
+        assert_eq!(joined.identity.raft_id, issued.raft_id);
+        assert!(
+            !token_path.exists(),
+            "successful finalization removes the token"
+        );
+        let local = read_local_membership(joining_dir.path())
+            .expect("read joined local membership")
+            .expect("joined node persists local membership");
+        let issued_digest = join_token_digest(&issued.token);
+        assert_eq!(
+            local.join_token_digest.as_deref(),
+            Some(issued_digest.as_str())
+        );
+
+        // A crash after finalization but before unlink leaves exactly this
+        // shape: active target + membership.json + the original token. The
+        // retry is idempotent and removes it on the next pass.
+        std::fs::write(&token_path, format!("{}\n", issued.token))
+            .expect("restore interrupted-finalization token");
+        finalize_pending_join(&joining_config, &joined)
+            .await
+            .expect("resume finalized join");
+        assert!(!token_path.exists());
+
+        // An unrelated copied token is not this node's pending state. It is
+        // ignored rather than taking a healthy voter offline.
+        let foreign = coordinator
+            .issue_token(Duration::from_secs(120))
+            .await
+            .expect("issue foreign token");
+        std::fs::write(&token_path, format!("{}\n", foreign.token)).expect("foreign token file");
+        finalize_pending_join(&joining_config, &joined)
+            .await
+            .expect("foreign token is a warning, not a startup failure");
+        assert!(
+            token_path.exists(),
+            "foreign token remains for operator inspection"
+        );
+
+        // An operator staging two machines, or replacing a token they lost,
+        // must not be made to wait out the first token's TTL. Allocation walks
+        // past ids that live tokens are holding instead of recomputing the one
+        // id an outstanding token already reserved.
+        let concurrent = coordinator
+            .issue_token(Duration::from_secs(120))
+            .await
+            .expect("second token while the first is still outstanding");
+        assert_ne!(
+            concurrent.raft_id, foreign.raft_id,
+            "concurrent tokens reserved the same Raft id"
+        );
+
+        // Once voter state is durable, a coordinator outage may delay token
+        // consumption but must not take the healthy joined daemon offline.
+        std::fs::write(&token_path, format!("{}\n", issued.token))
+            .expect("restore own token before coordinator outage");
+        http_task.abort();
+        finalize_pending_join_best_effort(&joining_config, &joined).await;
+        assert!(
+            token_path.exists(),
+            "pending finalization keeps the identity-bound token for retry"
+        );
+
+        let local_client = joined.local_client.clone().expect("joined local client");
+        joined.shutdown().await.expect("drain joined voter");
+        let post_shutdown = tokio::time::timeout(
+            Duration::from_secs(2),
+            local_client.execute(
+                "CREATE TABLE IF NOT EXISTS shutdown_must_have_closed_writers (id INTEGER)",
+                hiqlite::macros::params!(),
+            ),
+        )
+        .await;
+        assert!(
+            !matches!(post_shutdown, Ok(Ok(_))),
+            "shutdown returned while the replicated writer still accepted work"
+        );
+
+        source.shutdown().await.expect("drain source voter");
     }
 
     #[tokio::test]
@@ -1755,6 +3583,7 @@ pub mod status {
         checked_at: i64,
     ) -> ReplicationStatus {
         let clustered = observation.voter_count > 1;
+        let two_voter_reconfiguration = observation.voter_count == 2;
         let local_lag = match (observation.last_log_index, observation.last_applied_index) {
             (Some(log), Some(applied)) => log.saturating_sub(applied),
             (Some(log), None) => log,
@@ -1793,6 +3622,7 @@ pub mod status {
 
         let degraded = !observation.running
             || !observation.leader_known
+            || two_voter_reconfiguration
             || local_lag > 0
             || peer_lag > 0
             || (observation.peer_matched_indexes.is_some() && unknown_peer);
@@ -1807,7 +3637,10 @@ pub mod status {
         } else {
             observation.last_applied_index
         };
-        let explanation = if !degraded && clustered && observation.peer_matched_indexes.is_some() {
+        let explanation = if two_voter_reconfiguration {
+            "Two voters are a degraded reconfiguration state, not supported HA. Keep both voters online and add a third before treating the cluster as redundant."
+                .to_owned()
+        } else if !degraded && clustered && observation.peer_matched_indexes.is_some() {
             "Watch progress is replicated; this node has applied the latest known change and every reporting peer has received it."
                 .to_owned()
         } else if !degraded && clustered {
@@ -1903,6 +3736,15 @@ pub mod status {
             assert_eq!(status.last_applied_index, Some(42));
             assert_eq!(status.last_converged_at, Some(100));
             assert!(status.explanation.contains("one-node cluster"));
+        }
+
+        #[test]
+        fn two_voters_are_degraded_reconfiguration_not_healthy_ha() {
+            let status = classify_replicated(&converged(2), None, 100);
+            assert_eq!(status.health, ReplicationHealth::Degraded);
+            assert!(status.clustered);
+            assert_eq!(status.behind_by, None);
+            assert!(status.explanation.contains("not supported HA"));
         }
 
         #[test]

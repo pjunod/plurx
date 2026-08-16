@@ -19,6 +19,8 @@ use crate::error::StoreError;
 use crate::secrets::{self, CredentialKey};
 use crate::store::{SettingsStore, SqliteStore, Store};
 
+#[cfg(feature = "hiqlite-store")]
+pub mod membership;
 pub mod migration;
 
 pub const NODE_ID_FILENAME: &str = "node.id";
@@ -149,6 +151,43 @@ pub fn initialize_identity(
         cluster_id: cluster_id.to_owned(),
         node_id,
         raft_id: SINGLE_VOTER_RAFT_ID,
+    })
+}
+
+/// Create the node-local identity for a fresh machine joining an existing
+/// logical server.
+///
+/// A joining directory has no legacy cache/offline ownership to preserve, so
+/// it must mint its own node id rather than copying the cluster's
+/// `instance.id`. The caller has already proved the directory is fresh and the
+/// Raft id came from a single-use admission token.
+#[cfg(feature = "hiqlite-store")]
+pub(crate) fn initialize_join_identity(
+    data_dir: &Path,
+    cluster_id: &str,
+    raft_id: u64,
+) -> Result<ClusterIdentity, StoreError> {
+    if raft_id == 0 {
+        return Err(StoreError::Identity(
+            "a joining node received Raft id zero".to_owned(),
+        ));
+    }
+    std::fs::create_dir_all(data_dir).map_err(|error| {
+        StoreError::Identity(format!(
+            "creating data directory {}: {error}",
+            data_dir.display()
+        ))
+    })?;
+    let path = data_dir.join(NODE_ID_FILENAME);
+    if !path.exists() {
+        create_node_id_noclobber(data_dir, &path, &uuid::Uuid::new_v4().to_string())?;
+    }
+    let raw_node_id = read_node_id(&path).map_err(|error| identity_io("reading", &path, error))?;
+    let node_id = normalize_node_id(&raw_node_id, &raw_node_id)?;
+    Ok(ClusterIdentity {
+        cluster_id: cluster_id.to_owned(),
+        node_id,
+        raft_id,
     })
 }
 
