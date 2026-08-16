@@ -263,6 +263,10 @@ fn read_password(input: &mut impl std::io::BufRead) -> std::io::Result<String> {
 
 async fn run(config: Config) -> anyhow::Result<()> {
     let logs = init_logging();
+    // Signal streams must exist before store activation, system probing, or
+    // any listener can make this process externally reachable. The returned
+    // future owns them until `boot` begins polling the graceful drain.
+    let shutdown = shutdown_signal();
 
     let selected = select_daemon_store(&config)
         .await
@@ -295,7 +299,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             system,
             logs,
         };
-        boot(config, parts, start_mdns_advertiser, shutdown_signal()).await
+        boot(config, parts, start_mdns_advertiser, shutdown).await
     };
     let result = serving.await;
     let shutdown = selected
@@ -365,6 +369,7 @@ async fn boot(
     let progress = Arc::clone(&state.progress);
     let app = http::router(state);
     let listener = bind_listener(config.server.bind).await?;
+    trigger_shutdown_registration_failpoint();
     let mdns = start_discovery(&config, &instance_id, advertiser);
 
     serve(listener, app, progress, mdns, shutdown).await
@@ -1264,28 +1269,63 @@ fn gdm_bind_port(value: Option<&str>) -> anyhow::Result<u16> {
         .with_context(|| format!("invalid PLURX_GDM_PORT {value:?}"))
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("installing Ctrl-C handler");
-    };
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    // Install both Unix streams before returning the future. The caller binds
+    // the listener before `serve` first polls its graceful-shutdown future, so
+    // creating either stream inside that future leaves a small interval where
+    // the process is externally reachable but the signal still has its default
+    // terminating action.
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing SIGTERM handler");
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("installing SIGINT handler");
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    async move {
+        #[cfg(unix)]
+        let ctrl_c = async move {
+            interrupt.recv().await;
+        };
+        #[cfg(not(unix))]
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("installing Ctrl-C handler");
+        };
+        #[cfg(unix)]
+        let terminate = async move {
+            terminate.recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+        tracing::info!("shutdown signal received, draining");
     }
-    tracing::info!("shutdown signal received, draining");
 }
+
+/// Deterministically exercise the otherwise sub-millisecond listener/first-poll
+/// boundary in the shipped binary. With lazy registration this signal uses its
+/// default action and the process exits with signal 15; with eager registration
+/// it is buffered for `shutdown_signal` and starts a clean drain.
+#[cfg(unix)]
+fn trigger_shutdown_registration_failpoint() {
+    if matches!(
+        std::env::var("PLURX_SHUTDOWN_REGISTRATION_FAILPOINT").as_deref(),
+        Ok("after-listener-bind")
+    ) {
+        // SAFETY: this path is opt-in test instrumentation, and
+        // `shutdown_signal` installed the process handler before startup.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    }
+}
+
+#[cfg(not(unix))]
+fn trigger_shutdown_registration_failpoint() {}
 
 /// Minimal HTTP/1.0 probe over std TcpStream — deliberately dependency-free.
 fn healthcheck(config: &Config) -> anyhow::Result<()> {

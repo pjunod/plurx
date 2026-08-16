@@ -104,6 +104,11 @@ shutdown makes one bounded drain attempt; a storage outage can still lose an
 unflushed intermediate beat, so this endpoint is the explicit exception to an
 HTTP-level acknowledged-write durability promise. Store-method success itself
 remains durable. Session state updates on segment boundaries, not per-chunk.
+On Unix, the SIGTERM and SIGINT streams are installed before store activation,
+hardware probing, and listener binding, then owned by the shutdown future until
+the server drains. A shipped-binary bind-boundary failpoint raises SIGTERM before
+that future is first polled, so restoring lazy registration fails
+deterministically instead of depending on a sub-millisecond race.
 This matters because raft commits every write to a quorum — a naive "save
 position on every timeupdate" would put hundreds of writes/second through
 consensus and melt it.
