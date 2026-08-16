@@ -451,9 +451,12 @@ checks = ["rust-gate"]
 reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
 
 [[coverage]]
-commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
+commits = [
+  "59ccda3a6e77e431e1e6c0caf934c7da4981ee85",
+  "c08a366705347575f73c7ea905a5e17d05402495",
+]
 points = ["persistence.upgrades", "cluster.auth"]
-checks = ["cluster-auth"]
+checks = ["cluster-auth", "rust-gate"]
 reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports two probe bands under the production 2 MiB WAL and verifies exact `probe_json` parity for both: the original 64 adjacent 48 KiB rows, plus 24 rows of 200 KiB whose 16 adjacent rows serialize past the 2,097,118-byte WAL payload capacity, which the test asserts as its own premise so a favourable row count cannot pass for byte safety. Import transactions are now bounded by measured serialized bytes, so the covered contract is byte safety rather than an average row size; reverting only the byte bound reproduces the writer panic node m6 hit in production. `a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node` covers the remaining case a byte bound cannot split: a single 2,100 KiB probe row is refused with the table, row id, measured size, and limit, and the voter still answers afterwards instead of restarting into unreplicated SQLite recovery. The importer's boundary arithmetic — the flush exactly on and one byte past the budget, mixed sizes forcing several flushes, a row above the budget carried alone, and the estimate proven an upper bound on the `bincode` encoding `hiqlite-wal` writes — is pinned by the `store::hiqlite_import` unit tests."
 
 [[coverage]]
