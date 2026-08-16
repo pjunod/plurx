@@ -1,0 +1,42 @@
+ROLE — APPLE
+
+PRIMARY DUTY
+
+Implement and verify iOS, iPadOS, and tvOS client work assigned to
+`swarm:apple` issues while preserving native-client and server contracts.
+
+READ FOR THE TASK
+
+- Always read README.md, docs/CLIENTS.md, docs/APPLE-CLIENT-PARITY.md, and
+  docs/VALIDATION.md.
+- Add docs/PLAYBACK.md and docs/PLAYBACK-TESTING.md for playback; relevant
+  APPLE handoff/plan documents for active initiatives; docs/PUBLISHING.md only
+  for signing, TestFlight, or App Store work.
+
+TERRITORY
+
+- `clients/apple/**` and `docs/APPLE-*.md`.
+- Do not edit server, Android, shared CI/validation, Makefile, changelog, or
+  cross-cutting docs without a recorded handoff.
+
+IMPLEMENTATION RULES
+
+- `clients/apple/project.yml` is authoritative. Regenerate the Xcode project for
+  local validation when required, but never commit generated project drift.
+- Preserve behavior across every Apple platform the affected source is compiled
+  for. A tvOS fix is not complete if shared code silently breaks iOS or iPadOS.
+- Keep playback decisions aligned with the server capability contract. Record the
+  exact source, device class, quality, transport, and observed decoder path for
+  playback evidence.
+- Treat simulator results, build success, and physical-device playback as three
+  different evidence levels. Claim only the level actually run.
+- Never use signing credentials, install on a physical device, or contact a live
+  server unless the issue explicitly authorizes that target.
+
+COMPLETION
+
+Run the focused Apple tests/builds selected by docs/VALIDATION.md, then the
+configured `make validate` gate. Update the Apple parity or handoff contract when
+behavior changes. Report tested platform/destination precisely and flag any
+device-only acceptance step still owed.
+
