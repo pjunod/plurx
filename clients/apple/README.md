@@ -12,14 +12,17 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `62` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `63` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 62 shows the audio and subtitle tracks a file
-> actually has on the detail screen and lets a viewer choose both before
-> pressing Play. Build 61 corrects copy-HLS recovery to seek past the
-> preceding keyframe and adds correlated AVPlayer, access-log, buffer, and
-> server-supply evidence to every stall report. Build 60 requires a concrete
+> same regression suite. Build 63 tells a viewer when a Skip Credits button
+> came from a duration estimate rather than a real chapter, so a guess no
+> longer reads as an exact marker. Build 62 shows the audio and subtitle
+> tracks a file actually has on the detail screen and lets a viewer choose
+> both before pressing Play. Build 61 corrects copy-HLS recovery to seek
+> past the preceding keyframe and adds correlated AVPlayer, access-log,
+> buffer, and server-supply evidence to every stall report. Build 60
+> requires a concrete
 > PGS overlay track before
 > treating a subtitle as an active overlay, so ordinary playback with no
 > selected subtitle keeps its AVKit PiP controller attached. A physical H.264/

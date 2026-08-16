@@ -479,13 +479,55 @@ struct PlayerTouchWideRow<Transport: View, Timeline: View, Options: View>: View 
 #endif
 
 /// The production marker content shared by the player and its layout tests.
+///
+/// A chapterless file still offers Skip Credits from a duration-based estimate,
+/// and the server marks that marker `chapter: false` so the UI can hedge
+/// (ARCHITECTURE.md §6). The hedge is the whole point: an estimate that looks
+/// exactly like a chapter-derived button reads as a bug rather than as the
+/// guess it is. A marker that is chapter-derived — or that omits the field, as
+/// an older server does — keeps the exact presentation.
+///
+/// The hedge leads rather than trails. This label is one line at every text
+/// size, so an accessibility size truncates its tail; a trailing "(est.)" would
+/// be the first thing to disappear at exactly the size that needs it most.
 struct PlayerMarkerButtonLabel: View {
     let title: String
+    var estimated: Bool = false
+
+    /// The hollow glyph is the second signal, for a viewer who reads the icon
+    /// before the text: an outline against the exact marker's solid fill.
+    static let exactSymbol = "forward.end.fill"
+    static let estimatedSymbol = "forward.end"
+    static let estimatedMark = "≈"
+
+    /// `chapter` is optional on the wire. Only an explicit `false` is an
+    /// estimate; a missing field is not evidence of one.
+    static func isEstimated(_ marker: Marker) -> Bool {
+        marker.chapter == false
+    }
+
+    static func symbol(estimated: Bool) -> String {
+        estimated ? estimatedSymbol : exactSymbol
+    }
+
+    static func displayTitle(_ title: String, estimated: Bool) -> String {
+        estimated ? "\(estimatedMark) \(title)" : title
+    }
+
+    /// VoiceOver reads neither the glyph nor the mark, so it gets the hedge in
+    /// words instead.
+    static func accessibilityLabel(_ title: String, estimated: Bool) -> String {
+        estimated ? "\(title), estimated" : title
+    }
 
     var body: some View {
-        Label(title, systemImage: "forward.end.fill")
-            .font(.system(.caption, design: .monospaced))
-            .lineLimit(1)
+        Label(
+            Self.displayTitle(title, estimated: estimated),
+            systemImage: Self.symbol(estimated: estimated)
+        )
+        .font(.system(.caption, design: .monospaced))
+        .lineLimit(1)
+        .accessibilityLabel(Self.accessibilityLabel(title, estimated: estimated))
     }
 }
 
@@ -1540,7 +1582,10 @@ struct PlayerView: View {
             controller.skipActiveMarker()
             revealControls()
         } label: {
-            PlayerMarkerButtonLabel(title: marker.label)
+            PlayerMarkerButtonLabel(
+                title: marker.label,
+                estimated: PlayerMarkerButtonLabel.isEstimated(marker)
+            )
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: true))

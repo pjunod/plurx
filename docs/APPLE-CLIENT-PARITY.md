@@ -9,10 +9,12 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-15): source is v0.2.7, Apple build 62. Native text
+> Status (2026-08-16): source is v0.2.7, Apple build 63. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 62 lists the audio and subtitle tracks a file actually has on
+> landed. Build 63 marks a duration-estimated Skip Credits button as an
+> estimate, so it no longer reads exactly like a chapter-derived one.
+> Build 62 lists the audio and subtitle tracks a file actually has on
 > the detail screen and lets a viewer choose both before pressing Play (§6).
 > Build 60 requires a concrete selected PGS track before treating the
 > overlay as active. Its physical non-PGS baseline reached active PiP and
@@ -90,7 +92,7 @@ Vision investigation are recorded in
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing. The server can now normalize a bound stall reopen and return its resolved height, but this client does not yet send that cause. | P1: carry `previous_session_id` + typed stall cause through the precedence-aware reopen queue, with a client-side retry budget at the ladder floor (the server repeats that rung and bounds nothing); continuous adaptation and an honest Original option when compatible |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery, and selected-subtitle route/state (`PGS overlay · preparing`, ready overlay, unavailable, native WebVTT, or burned in). Sustained and self-recovered stalls reach the bounded server log with HLS session and per-item attempt identity, contiguous loaded runway, AVPlayer wait/buffer flags, access-log request/transfer counters, and the aged last successful server supply snapshot; live ingest replaces it with fresher session state when possible. Recovery TTFF is a separate attempt. | Add frame presentation rate and build stamp; validate correlated stall ingest on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
-| Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
+| Intro/credits | Manual and automatic skip | Manual marker button that says which kind of marker it came from: a chapter-derived marker keeps the plain label and the solid `forward.end.fill` glyph, while the duration-based end-credits estimate the server flags `chapter: false` renders as `≈ Skip Credits` with the hollow `forward.end` glyph and the VoiceOver label "Skip Credits, estimated". The mark leads because this label is one line and an accessibility text size truncates its tail. A marker with no `chapter` field, as an older server sends, is treated as exact. | P1: persisted auto-skip and next-episode handling for end credits. The web reference does not yet distinguish an estimated marker, so this row is currently ahead of it |
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
