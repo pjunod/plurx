@@ -63,6 +63,7 @@ for that viewer and keeps server administration out of the comparison.
 | Detail-screen track facts | Every audio and subtitle track with language, format, and forced/SDH markers, the server's default markers, and its five-state preferred-language verdict |
 | Pre-play audio/subtitle choice | Both are chosen on the detail screen and applied on the first session open, with any burn-in cost disclosed before playback starts |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
+| Bound stall downgrade | Server contract available: one `request_id` can name its predecessor and typed stall cause, with the normalized height replayed. Android does not yet reopen from its passive stall detector. Adopting it requires sending `quality_auto` — `sessionHeight` posts the source height for any burn before it consults quality, so an Auto viewer with a burned subtitle is otherwise read as a sticky manual pick — plus a client-side retry budget, which the server deliberately does not bound at the ladder floor. |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
