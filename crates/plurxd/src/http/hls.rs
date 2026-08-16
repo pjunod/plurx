@@ -29,6 +29,14 @@ use super::extract::AuthUser;
 use crate::state::AppState;
 use crate::transcode::PlaylistError;
 
+/// How much of an `init.mp4` this module will ever read into memory.
+///
+/// Both readers of an initialization segment — the playlist-time `hvcC` sniff
+/// and the Apple High-tier rewrite in `segment` — are bounded by it, and both
+/// hold their delivery tracker to the same figure, so a larger init reports a
+/// skipped inspection rather than a truncated response.
+const INIT_INSPECTION_LIMIT_BYTES: u64 = 1024 * 1024;
+
 #[derive(Deserialize)]
 pub struct StartQuery {
     /// Target height (e.g. 1080, 720). Omitted means Auto (server-chosen).
@@ -750,9 +758,15 @@ async fn exact_hls_context(
     // Initialization segments are a few KiB. Bound malformed input so a
     // playlist request can never allocate without limit.
     let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
-    let mut delivery = opened.delivery;
+    // No response body exists here — this is the playlist generator reading
+    // `hvcC` for itself. Tag the tracker so its bytes stay out of the
+    // session's delivery meter and its events cannot be mistaken for a
+    // segment a player was waiting on, and hold it to the bound actually read
+    // so an init past the bound is not reported as a truncated response.
+    let mut delivery = opened.delivery.into_internal_probe();
+    delivery.expect_at_most(INIT_INSPECTION_LIMIT_BYTES);
     let started = Instant::now();
-    let mut reader = opened.file.take(1024 * 1024);
+    let mut reader = opened.file.take(INIT_INSPECTION_LIMIT_BYTES);
     match reader.read_to_end(&mut init).await {
         Ok(bytes) => {
             delivery.note_read(bytes as u64, started.elapsed());
@@ -1511,7 +1525,7 @@ pub async fn segment(
     State(state): State<AppState>,
     AxPath((session, seg)): AxPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    const APPLE_INIT_REWRITE_LIMIT_BYTES: u64 = 1024 * 1024;
+    const APPLE_INIT_REWRITE_LIMIT_BYTES: u64 = INIT_INSPECTION_LIMIT_BYTES;
 
     let opened = state
         .transcode
@@ -1523,9 +1537,19 @@ pub async fn segment(
         let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
         let mut delivery = opened.delivery;
         let started = Instant::now();
-        match opened.file.take(1024 * 1024).read_to_end(&mut init).await {
+        match opened
+            .file
+            .take(APPLE_INIT_REWRITE_LIMIT_BYTES)
+            .read_to_end(&mut init)
+            .await
+        {
             Ok(bytes) => {
                 delivery.note_read(bytes as u64, started.elapsed());
+                // The body is buffered, so delivery is complete here — the
+                // gate above guarantees the bound could not truncate it.
+                // Unlike the streamed path below, a client that abandons this
+                // response is still recorded as fully delivered; the
+                // asymmetry is documented in docs/PLAYBACK.md.
                 delivery.finish();
             }
             Err(error) => {
@@ -1566,18 +1590,26 @@ pub async fn segment(
     let opened_len = opened.len;
     let reader = tokio_util::io::ReaderStream::new(opened.file);
     let delivery = opened.delivery;
+    // The tracker rides the stream state rather than the handler, so it is
+    // dropped whether the body completes, errors, or is abandoned mid-flight —
+    // an abandoned body is the `response_dropped` case, and it is the only one
+    // nothing else observes.
     let stream = futures_util::stream::unfold(
-        (reader, delivery),
-        |(mut reader, mut delivery)| async move {
+        (Some(reader), delivery),
+        |(reader, mut delivery)| async move {
+            // `None` means a previous poll already reported a storage error.
+            // Re-polling a reader that just failed has no defined meaning, so
+            // the error is the last thing this body yields.
+            let mut reader = reader?;
             let started = Instant::now();
             match reader.next().await {
                 Some(Ok(bytes)) => {
                     delivery.note_read(bytes.len() as u64, started.elapsed());
-                    Some((Ok(bytes), (reader, delivery)))
+                    Some((Ok(bytes), (Some(reader), delivery)))
                 }
                 Some(Err(error)) => {
                     delivery.fail(&error);
-                    Some((Err(error), (reader, delivery)))
+                    Some((Err(error), (None, delivery)))
                 }
                 None => {
                     delivery.finish();
@@ -1628,6 +1660,265 @@ fn segment_content_type(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcode::HlsDeliveryFixture;
+
+    // ---- segment delivery, through the real response ------------------------
+    //
+    // These drive the handler, not `SegmentDelivery`. The correction under
+    // test is *where* bytes are counted — at open, or as the response body
+    // drains — and a test that calls `note_read` by hand cannot tell those
+    // apart.
+
+    /// The correction itself: a segment's bytes are counted as the response
+    /// body drains, not when the file opens.
+    ///
+    /// Counting at open credits a client that fetched a header and then
+    /// stalled with a whole segment's worth of throughput, which is precisely
+    /// the reading that makes a delivery freeze look like a healthy transfer.
+    /// Both halves are pinned: the meter is still at zero when the handler
+    /// returns, and reaches the segment's length only once the body is read.
+    #[tokio::test]
+    async fn segment_bytes_are_counted_as_the_body_drains_not_at_open() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "drain").await;
+        let body = vec![7_u8; 12 * 1024];
+        tokio::fs::write(dir.path().join("seg00001.m4s"), &body)
+            .await
+            .expect("segment bytes");
+
+        let response = segment(
+            State(fixture.state.clone()),
+            AxPath(("drain".to_owned(), "seg00001.m4s".to_owned())),
+        )
+        .await
+        .expect("segment response");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(body.len().to_string().as_str())
+        );
+        assert_eq!(
+            fixture.delivered_bytes(),
+            0,
+            "opening a segment delivers nothing: the client has only been handed a body"
+        );
+
+        let mut stream = response.into_body().into_data_stream();
+        let mut read = 0_usize;
+        while let Some(chunk) = stream.next().await {
+            read += chunk.expect("segment chunk").len();
+        }
+        assert_eq!(read, body.len(), "the whole segment reached the client");
+        assert_eq!(
+            fixture.delivered_bytes(),
+            body.len() as i64,
+            "the meter tracks bytes actually read out of the segment"
+        );
+        assert!(
+            fixture.settle().await.is_empty(),
+            "a complete delivery is not an incident"
+        );
+    }
+
+    /// A client that walks away mid-segment is the case nothing else observes:
+    /// the handler has already returned, the stream never reaches EOF, and no
+    /// error is raised. Only `Drop` can name it, which also makes it the
+    /// easiest classification to lose to a later refactor.
+    #[tokio::test]
+    async fn an_abandoned_segment_body_is_recorded_as_response_dropped() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "abandoned").await;
+        let body = vec![3_u8; 64 * 1024];
+        tokio::fs::write(dir.path().join("seg00002.m4s"), &body)
+            .await
+            .expect("segment bytes");
+
+        let response = segment(
+            State(fixture.state.clone()),
+            AxPath(("abandoned".to_owned(), "seg00002.m4s".to_owned())),
+        )
+        .await
+        .expect("segment response");
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream
+            .next()
+            .await
+            .expect("a first chunk")
+            .expect("a readable first chunk");
+        assert!(
+            first.len() < body.len(),
+            "the fixture must leave the body partially consumed"
+        );
+        drop(stream);
+
+        let events = fixture.delivery_events(1).await;
+        let dropped = events
+            .iter()
+            .find(|event| event.reason.as_deref() == Some("response_dropped"))
+            .expect("an abandoned body is attributed to the client, not to storage");
+        assert_eq!(dropped.event, "segment_delivery_incomplete");
+        let extra = dropped.extra.as_deref().unwrap_or_default();
+        assert!(
+            extra.contains("\"segment\":\"seg00002.m4s\"")
+                && extra.contains(&format!("\"expected_bytes\":{}", body.len()))
+                && extra.contains(&format!("\"delivered_bytes\":{}", first.len())),
+            "the event names the segment, what was owed, and what arrived: {extra}"
+        );
+        assert_eq!(
+            fixture.delivered_bytes(),
+            first.len() as i64,
+            "only the bytes the client actually took are delivery"
+        );
+    }
+
+    /// A storage error mid-body is its own classification, separate from an
+    /// abandoned response and from a short one. Nothing reached `fail()`
+    /// before this test, so `storage_read_error` could have stopped being
+    /// emitted with no check noticing.
+    #[tokio::test]
+    async fn an_unreadable_segment_body_is_recorded_as_storage_read_error() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "unreadable").await;
+        // A directory opens like a file and reports a length, then fails its
+        // first read with EISDIR — a storage failure the handler meets only
+        // after the response headers are already on the wire.
+        tokio::fs::create_dir(dir.path().join("seg00003.m4s"))
+            .await
+            .expect("unreadable segment");
+
+        let response = segment(
+            State(fixture.state.clone()),
+            AxPath(("unreadable".to_owned(), "seg00003.m4s".to_owned())),
+        )
+        .await
+        .expect("segment response");
+        let mut stream = response.into_body().into_data_stream();
+        assert!(
+            stream.next().await.is_some_and(|chunk| chunk.is_err()),
+            "the body surfaces the storage error to the client"
+        );
+        // The `unfold` stops rather than re-polling a failed reader. That is
+        // belt-and-braces — `ReaderStream` already drops its reader on error —
+        // so this pins the reachable contract (the body ends at the error)
+        // rather than the guard itself.
+        assert!(
+            stream.next().await.is_none(),
+            "the body ends at the storage error"
+        );
+
+        let events = fixture.delivery_events(1).await;
+        let failed = events
+            .iter()
+            .find(|event| event.reason.as_deref() == Some("storage_read_error"))
+            .expect("a failed storage read is reported as one");
+        assert_eq!(failed.event, "segment_delivery_incomplete");
+        assert!(
+            failed
+                .extra
+                .as_deref()
+                .is_some_and(|extra| extra.contains("\"error\"")),
+            "the operator gets the underlying error text"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "segment_delivery_incomplete")
+                .count(),
+            1,
+            "one response produces one terminal classification"
+        );
+    }
+
+    /// `exact_hls_context` opens `init.mp4` for the playlist generator, not
+    /// for a client: there is no response body on that path. Its bytes must
+    /// not move the session's delivery meter, and — because the read is
+    /// bounded well below a large init's real length — a bounded read that
+    /// returned everything it asked for must not be reported as a response
+    /// that ended early.
+    #[tokio::test]
+    async fn a_playlist_time_init_probe_is_not_client_delivery_and_never_a_short_response() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "probe").await;
+        // Past the inspection bound, so the read stops short of the file's
+        // advertised length by design.
+        let oversized = vec![0_u8; (INIT_INSPECTION_LIMIT_BYTES + 4_096) as usize];
+        tokio::fs::write(dir.path().join("init.mp4"), &oversized)
+            .await
+            .expect("oversized init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "hvc1.2.4.L150.B0,mp4a.40.2".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "probe", context.clone()).await;
+        assert_eq!(
+            resolved.codecs, context.codecs,
+            "an init with no hvcC leaves the advertised codecs alone"
+        );
+        assert_eq!(
+            fixture.delivered_bytes(),
+            0,
+            "a playlist-time codec sniff delivers nothing to anyone"
+        );
+        assert!(
+            fixture.settle().await.is_empty(),
+            "a bounded read that returned every byte it asked for is not a truncated response"
+        );
+    }
+
+    /// When a server-internal read *does* fail, the event still has to be
+    /// readable as internal. An untagged `segment_delivery_incomplete` for
+    /// `init.mp4` is indistinguishable from a client fetch that broke, which
+    /// is the availability/delivery conflation this telemetry exists to end.
+    #[tokio::test]
+    async fn a_failed_init_probe_is_tagged_as_internal_rather_than_a_client_fetch() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "probe-error").await;
+        tokio::fs::create_dir(dir.path().join("init.mp4"))
+            .await
+            .expect("unreadable init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "hvc1.2.4.L150.B0,mp4a.40.2".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        exact_hls_context(&fixture.state, "probe-error", context).await;
+
+        let events = fixture.delivery_events(1).await;
+        let failed = events
+            .iter()
+            .find(|event| event.reason.as_deref() == Some("storage_read_error"))
+            .expect("a failed internal read is still reported");
+        assert!(
+            failed
+                .extra
+                .as_deref()
+                .is_some_and(|extra| extra.contains("\"purpose\":\"internal_probe\"")),
+            "an operator reading a freeze can tell a codec sniff from a segment fetch: {:?}",
+            failed.extra
+        );
+        assert_eq!(
+            fixture.delivered_bytes(),
+            0,
+            "a failed internal read is not a partial delivery"
+        );
+    }
 
     #[test]
     fn bounded_admission_failure_is_a_retryable_503() {
