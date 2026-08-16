@@ -123,7 +123,7 @@ one.
 | `apple.transport-and-dv` | AVPlayer direct vs HLS | Execute the server mode, except normalize even a legacy direct Dolby Vision answer through preserving copy HLS. Overrides, audio changes, and subtitle needs decide whether that session copies or transcodes. | XCTest for legacy direct-DV normalization |
 | `apple.compatibility-fallback` | Apple startup decode failure recovery | Before real playback, a preserved DV stream with an HDR10/HLG base strips to that base first; only the next media rejection uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
-| `apple.buffering-recovery` | Sustained or self-recovered wait after playback began | Each newly opened item must advance for ≥5 s before six stagnant two-second samples during an explicit AVPlayer buffer wait may reopen the same delivery. The third sample first nudges Play; an immediate repeat stops with network-specific copy. Recovery actions report method, film position, and observed duration, while deltas from AVPlayer's access-log stall counter plus any sub-threshold stagnant interval ride the 10 s progress cadence to the same bounded client log. None of this is codec/HDR evidence. | XCTest per-item gate, monitor, retry-state, access-log delta, and beacon-payload suite; physical-iPad throttling pending |
+| `apple.buffering-recovery` | Sustained or self-recovered wait after playback began | Each newly opened item must advance for ≥5 s before six stagnant two-second samples during an explicit AVPlayer buffer wait may reopen the same delivery. The third sample first nudges Play; an immediate repeat stops with network-specific copy. Every report carries the HLS session, a per-item attempt, contiguous loaded runway, AVPlayer wait/buffer flags, access-log request/transfer counters, and the last polled server supply state; the server replaces that snapshot with a fresher live join when possible. Recovery TTFF is measured separately, and copy-HLS replacements seek forward from the preceding keyframe origin instead of replaying it. None of this is codec/HDR evidence. | XCTest recovery, runway, keyframe correction, status decode, and beacon-payload suite; Rust snapshot-race and live-join regressions; physical-iPad throttling pending |
 | `apple.item-end` | Temporary live edge vs completed item end | A premature end gets one reopen. If the replacement ends at the same playhead position, a growing or known-duration stream stops visibly instead of looping sessions; a direct/offline item with no usable duration finishes at that corroborated boundary. | XCTest duration/growing matrix + same-position retry bound |
 | `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer prefers a 60 s buffer on live copy/transcode sessions, but a physical iPad fetched about 120 s ahead; the preference is not a cap. The server therefore retains 180 s behind the download frontier: the measured 120 s lead plus 30 s of back buffer and 30 s for retry/reload. Direct files and completed cached HLS keep AVPlayer's default. | Rust retained/pruned segment-set regression + XCTest item-configuration guard |
 | `apple.player-system-chrome` | Custom iOS full-screen player chrome | In a full-screen iOS window, the status bar and Home indicator stay available while controls, playback info, a failure, a notice, or recovery/next progress is visible. They retire only after all player surfaces leave; a windowed iPad status bar remains system-owned. | Routing inventory pins the modifier application + iOS hosting-controller propagation XCTest |
@@ -598,10 +598,24 @@ Three details, each load-bearing:
   A hold is not proof that the producer starved the client. Ahead media is
   already published in the served playlist. If AVPlayer stops fetching while
   that reserve remains available, changing the release point produces more
-  media the client is still declining to request. The observed iPad fetch-loop
-  stop therefore remains open pending a device capture of `loadedTimeRanges`,
-  access-log segment counts, and the playlist header across the internal
-  EVENT-to-sliding-window transition.
+  media the client is still declining to request.
+
+- **Freeze attribution.** Session status exposes the last requested resource,
+  request idle age, current playlist shape, published and fetched segment
+  frontiers, time since producer progress, recent encode/remux speed,
+  configured input pacing, delivery rate, and suspend state. An Apple stall
+  beacon carries the snapshot age and last observed copy of that state
+  alongside its own contiguous runway, wait/buffer flags, and access-log
+  request and transfer counters. It must carry the copy because recovery can
+  delete the old session before the best-effort report arrives; the server
+  substitutes a fresher live join when the session still exists. A segment
+  request that waits at least 250 ms, loses its producer, or reaches the 20 s
+  delivery timeout is separately persisted with the wait and producer-idle
+  duration. A retry already behind the retained prefix returns immediately and
+  records `segment_pruned`; it never spends that 20 s waiting for bytes that
+  cannot reappear. Together those facts distinguish a client that stopped
+  requesting, a transport that drained its buffer, and a producer blocked on
+  encode or source/media I/O.
 
 **Playlist-envelope decision (2026-08-09): experiment, not yet adopted.** The
 default remains the established EVENT-then-sliding behavior until the batched
@@ -970,7 +984,9 @@ perf report are the same events server-side.
   it calculate `media origin + player-local time` as the true position. That
   distinction is load-bearing for copied video: a request between keyframes
   begins at the preceding keyframe after FFmpeg normalizes its timestamp to
-  zero. The progressive remux exposes the same value in
+  zero. Apple seeks a newly attached growing item forward by that origin delta,
+  so a stall recovery resumes at the requested film position instead of
+  replaying the preceding GOP. The progressive remux exposes the same value in
   `X-Plurx-Media-Origin-Ms`; direct play needs no offset because `currentTime`
   is already source time. Older clients, and new clients talking to an older
   server, fall back to the requested start.

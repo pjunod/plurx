@@ -212,3 +212,11 @@ source = "clients/apple/Sources/PlayerSurface.swift"
 source_anchor = "showUnavailableMessage(state.messageOnTap)"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPictureInPictureUnavailableMessageExpiresWithoutClearingARealFailure"
+
+[[fixes]]
+id = "apple.copy-hls-resume-position"
+commits = ["6feda24a"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "nonisolated static func sessionAttachSeekMs("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testLiveCopyRecoverySeeksPastThePrecedingKeyframe"

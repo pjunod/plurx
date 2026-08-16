@@ -10,6 +10,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Apple copy-HLS stall recovery no longer replays the preceding keyframe.**
+  A replacement session still opens on the keyframe before the requested film
+  position, but the client now seeks the attached item forward by that exact
+  origin delta before playback resumes. Each sustained or AVPlayer-observed
+  stall also records the HLS session, a per-item attempt, contiguous buffered
+  runway, wait/buffer state, access-log request and transfer counters, and the
+  last server supply snapshot. The server preserves that snapshot when
+  recovery has already superseded the session, joins fresher live state when
+  possible, and records segment waits and failures with producer progress so
+  future freezes distinguish an empty client buffer, stopped fetching, and a
+  starved producer. On Shameless' copy path that last class excludes video
+  encoding and narrows the fault to remux/media I/O. A retry for a segment
+  already behind the retention window now fails immediately and tells
+  telemetry it was pruned instead of waiting the full 20-second producer
+  deadline for bytes that cannot reappear.
+
 - **The mobile-build-claims gate no longer reads a historical build mention as
   a stale current claim.** `docs/STATUS.html` is prose, so every Apple build
   number in it is checked against `project.yml` — but the page also narrates

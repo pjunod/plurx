@@ -473,14 +473,25 @@ struct PlaybackSessionStatus: Codable {
     var speed: Double?
     var recentSpeed: Double?
     var outTimeMs: Int?
+    var progressIdleMs: Int?
+    var publishedEndMs: Int?
+    var fetchedEndMs: Int?
+    var fetchedSegment: Int?
+    var firstRetainedSegment: Int?
+    var playlistShape: String?
     var aheadSeconds: Int?
+    var aheadBytes: Int?
     var holdReason: String?
     var resumeBelowSeconds: Int?
     var resumeBelowBytes: Int?
     var deliveredBytes: Int?
     var deliveredBps: Int?
     var deliveredIdleMs: Int?
+    var readrate: Double?
     var suspended: Bool?
+    var suspendCount: Int?
+    var lastRequest: String?
+    var idleSeconds: Int?
 }
 
 // MARK: - Request bodies
