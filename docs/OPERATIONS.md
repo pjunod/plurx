@@ -181,9 +181,9 @@ Raft progress facts, never users, titles, media paths, tokens, or library data.
 | Surface | What it means | What to do |
 |---|---|---|
 | `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
-| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
+| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. Add or remove nodes from **Settings → Cluster**. |
 | `Replicated in sync` | This node has applied its latest known entry. On the leader, every reporting peer has matched that point; on a follower, only this node's catch-up is confirmed and the explanation points you to the leader for peer status. | No action. Read the plain-language explanation before treating a follower's local catch-up as a cluster-wide all-clear. |
-| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter. Do not stop either voter until three are present and in sync. |
+| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter from **Settings → Cluster**, which reports the same state as a reconfiguration in progress. Do not stop either voter until three are present and in sync. |
 | `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
 
 **How to read the numbers:** `applied term T, index I` is this node's latest
@@ -201,11 +201,48 @@ endpoint observes an in-sync sample. The Settings page samples this when you
 open it; the timestamp does not claim that an unseen convergence happened
 between visits.
 
-This row is status, not membership control. The admin-only cluster endpoints
-below list, join, and remove voters. Their `replication` member is this exact
-projection rather than a second answer for lag.
+This row is status, not membership control. **Settings → Cluster** is the
+membership surface, and the admin-only cluster endpoints below are the same
+operations from a terminal. Their `replication` member is this exact projection
+rather than a second answer for lag.
+
+### The Cluster tab
+
+**Settings → Cluster** does everything the endpoints below do, and it is the
+easier path when you have a browser open. It is admin-only, matching the
+endpoints' own gating; a non-admin never sees the tab or its data. The roster is
+read when you open the tab, not on every Settings visit.
+
+| What you see | What it means |
+|---|---|
+| `Not clustered` | This server is on unreplicated SQLite and has no membership. Normal and complete for a single machine; there is nothing to fix and no join control to press. |
+| `One node` | Replicated, one voter. A supported configuration, not a half-built cluster. |
+| `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
+| `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
+
+The node table carries only what `GET /api/v1/cluster/nodes` exposes: node id,
+Raft id, voter/learner role, reachability, and last-seen. Addresses, media
+paths, and token material are not in that payload and are not shown.
+
+**Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
+displays it exactly once, with a lifetime you pick between 10 minutes and 1
+hour. plurx keeps only its digest, so the browser is the only copy: the panel
+never writes it to browser storage, a URL, or a log, and it is dropped when you
+leave the tab. Everything after that — the owner-only file, `join_token_file`,
+the fresh data directory — is the terminal procedure below, unchanged. Treat the
+displayed token exactly as the runbook treats the `curl` response: anyone
+holding it can join a node to this cluster until it is redeemed or expires.
+
+**Remove** calls the removal endpoint and renders its refusal as a sentence with
+a next step rather than a code. `node_owns_offline_work` is the one you are most
+likely to meet; it tells you to clear or expire those downloads first. The
+confirmation states what the terminal path states below — the removed machine's
+data directory is tombstoned, and rejoining means discarding it.
 
 ### Joining and removing voters
+
+The rest of this section is the terminal path. It is the same three endpoints
+the Cluster tab drives, and is the right path for a scripted or headless setup.
 
 Use one, three, or more voters. Two voters are useful only while adding or
 removing a node: they require both processes for every write and survive no

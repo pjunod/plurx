@@ -584,6 +584,29 @@
   .log-DEBUG,.log-TRACE{color:var(--muted)}
   .verrow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0}
   .verrow+.verrow{border-top:1px solid var(--line)}
+  /* Cluster membership. The state banner is the most important thing on the
+     panel: two voters are a reconfiguration waypoint, and the one way this
+     screen could do real harm is by looking like a reassuring green tick when
+     the cluster survives no failure. The tone class is set from the state, and
+     `warn` is deliberately the two-voter case rather than an error case. */
+  .clstate{border:1px solid var(--line);border-left-width:3px;border-radius:10px;
+    background:var(--panel2);padding:12px 15px;margin:0 0 16px}
+  .clstate h3{margin:0 0 5px;font-size:15px;font-weight:700}
+  .clstate p{margin:0;font-size:13px;color:var(--prose,var(--muted));line-height:1.55}
+  .clstate.good{border-left-color:var(--good)} .clstate.good h3{color:var(--good)}
+  .clstate.warn{border-left-color:var(--warn,#fbbf24)} .clstate.warn h3{color:var(--warn,#fbbf24)}
+  .clstate.calm{border-left-color:var(--line)}
+  .clnode{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+  /* A join token is a complete cluster credential shown exactly once. It gets
+     its own loud box so nobody mistakes it for an id they can leave on screen,
+     and `user-select:all` makes copying it one gesture on a machine with no
+     clipboard API (plain HTTP over a LAN has no navigator.clipboard). */
+  .jointoken{display:block;margin:10px 0;padding:11px 13px;border:1px solid var(--warn,#fbbf24);border-radius:8px;
+    background:var(--panel2);font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:12px;line-height:1.5;word-break:break-all;user-select:all}
+  .clrefusal{border:1px solid var(--warn,#fbbf24);border-radius:8px;background:var(--panel2);
+    padding:11px 14px;margin-top:12px;font-size:13px;line-height:1.55}
+  .clrefusal b{display:block;margin-bottom:3px;color:var(--warn,#fbbf24)}
   /* Trakt device-link code: big, mono, unmissable — you type it on another screen */
   .traktcode{font-family:var(--font-mono);font-size:34px;font-weight:700;letter-spacing:.18em;color:var(--accent);margin:10px 0 2px;user-select:all}
   .syncnow{padding:6px 10px 2px;font-size:13px;font-weight:600}
@@ -2442,13 +2465,18 @@ async function api(path, {method="GET", body=null, raw=false}={}){
   // both, or a typed refusal — "this server's ffmpeg has no subtitles filter"
   // — reaches the viewer as the useless "request failed".
   if(!res.ok){
-    let m="request failed", responseBody="";
+    let m="request failed", responseBody="", code=null;
     try{
       responseBody=await res.text();
       const b=JSON.parse(responseBody);
       m=b.error||b.message||m;
+      code=b.code||null;
     }catch(e){}
     const error=new Error(m);
+    // The stable refusal code, when the route sent one. A caller that has a
+    // better sentence for a known cause needs to recognise the cause, and the
+    // human-readable message is not a contract it can match on.
+    error.code=code;
     // Preserve the wire refusal on the Error. Session creation can fail
     // before hls.js exists, so the XHR hook below will never see this body;
     // without carrying it through the rejected `openSession` promise the
@@ -8186,27 +8214,33 @@ async function viewSettings(){
     api("/trakt/status").catch(()=>null),
     api(`/system/playback-events?since=${since7d}&limit=2000`).catch(()=>[])]);
   SETTINGS=settings; TRAKT=trakt; TRAKT_EDIT=false;
-  SETTINGS_DATA={libs,settings,status,sys,users,trakt,playbackEvents};
+  // Re-entering Settings re-reads the roster and drops any token still held.
+  CLUSTER_LOADED=false; forgetJoinToken();
+  SETTINGS_DATA={libs,settings,status,sys,users,trakt,playbackEvents,cluster:null};
   renderSettings();
   setPageTimer(settingsTick, 2000);
 }
 // ---- settings tabs (grouped so the page isn't one long scroll) ------------
 let SETTINGS_DATA=null;
-const SET_TABS=[["libraries","Libraries"],["metadata","Metadata"],["playback","Playback"],["users","Users"],["system","System"]];
+const SET_TABS=[["libraries","Libraries"],["metadata","Metadata"],["playback","Playback"],["users","Users"],["system","System"],["cluster","Cluster"]];
 function settingsTab(){ let t="libraries"; try{ t=localStorage.getItem("plurx_settings_tab")||"libraries"; }catch(e){} return SET_TABS.some(x=>x[0]===t)?t:"libraries"; }
-function setSettingsTab(t){ try{ localStorage.setItem("plurx_settings_tab",t); }catch(e){} renderSettings(); }
+// Leaving the tab drops any minted join token: it is bearer material, and the
+// operator who switched away is done with it whether or not they said so.
+function setSettingsTab(t){ forgetJoinToken(); try{ localStorage.setItem("plurx_settings_tab",t); }catch(e){} renderSettings(); }
 function renderSettings(){
   const d=SETTINGS_DATA; if(!d) return;
   const tab=settingsTab();
   const bar=SET_TABS.map(([id,label])=>`<button class="settab${tab===id?' active':''}" onclick="setSettingsTab('${id}')">${label}</button>`).join("");
   document.getElementById("main").innerHTML=`<div class="settabs">${bar}</div><div class="adminwrap" id="setbody">${settingsPanel(tab,d)}</div>`;
   if(tab==="system") refreshLogs();     // the log box only exists on the System tab
+  if(tab==="cluster") loadCluster();    // the roster is fetched on first open, not with Settings
 }
 function settingsPanel(tab,d){
   if(tab==="metadata") return metadataPanel(d.settings,d.trakt);
   if(tab==="playback") return playbackPanel(d.settings);
   if(tab==="users")    return usersPanel(d.users);
   if(tab==="system")   return systemPanel(d.sys,d.playbackEvents);
+  if(tab==="cluster")  return clusterPanel(d);
   return librariesPanel(d.libs,d.status,d.settings);
 }
 // Intervals in minutes. Nothing under 15 — the server refuses it, because a
@@ -8660,6 +8694,238 @@ function systemPanel(sys,playbackEvents){
         <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="logauto" checked style="width:auto"> auto-refresh</label>
         <button class="ghost sm" onclick="refreshLogs()">Refresh</button></div>
       <div class="logbox" id="logbox">Loading…</div></div>`;
+}
+// ---- cluster membership --------------------------------------------------
+// The operator's whole view of who is in this cluster, over the admin-only node
+// API. It adds no endpoint and decides no membership policy: the server refuses
+// what it refuses, and this renders the refusal in words somebody can act on.
+//
+// The one thing this panel must never do is present two voters as redundancy.
+// docs/CLUSTERING-PLAN.md §7.2 makes two-node HA a stated non-goal because two
+// voters need *both* machines for every write and therefore survive no failure
+// — strictly worse than one node, while looking like an upgrade. A settings
+// screen is the surface most likely to imply otherwise, so the wording below is
+// the deliverable, not decoration around the API fields.
+//
+// Loaded only when this tab is opened. The overwhelmingly common install is one
+// SQLite box where the endpoint answers `membership_unavailable`; spending an
+// admin request on every Settings visit to learn that would be noise.
+let CLUSTER_LOADED=false;
+// The last removal refusal, held so its sentence stays readable. A toast is
+// 2.2 seconds and these answers are paragraphs.
+let CLUSTER_REFUSAL=null;
+// A minted join token lives here and nowhere else — never localStorage, never
+// the URL, never a log. Until it is redeemed or expires it is the complete
+// authority to join a node to this cluster (docs/SECURITY.md), so it is held
+// for exactly as long as the panel showing it is on screen, and dropped on tab
+// change and on every re-entry into Settings.
+let CLUSTER_TOKEN=null;
+function forgetJoinToken(){ CLUSTER_TOKEN=null; CLUSTER_REFUSAL=null; }
+async function loadCluster(){
+  if(CLUSTER_LOADED) return;
+  CLUSTER_LOADED=true;
+  let answer;
+  // A never-joined SQLite install refuses this with 409 `membership_unavailable`.
+  // That is a truthful answer about a healthy server, not an error to report.
+  try{ answer=await api("/cluster/nodes"); }
+  catch(e){ answer={unavailable:true,code:e.code,message:e.message}; }
+  if(SETTINGS_DATA) SETTINGS_DATA.cluster=answer;
+  if(settingsTab()==="cluster") renderSettings();
+}
+// A Raft majority is floor(n/2)+1, so the number of voters that may be lost is
+// n minus that majority: 1 of 3, 1 of 4, 2 of 5. Said once, here.
+function clusterQuorum(voters){
+  const majority=Math.floor(voters/2)+1;
+  return {majority, tolerates:Math.max(0,voters-majority)};
+}
+// The state banner as sentences rather than as an enum. Pure on purpose: the
+// promise this panel makes is the words, so the words are what gets tested.
+function clusterStateView(cluster){
+  if(!cluster||cluster.unavailable)
+    return {tone:"calm", title:"Not clustered",
+      body:"This server keeps watch state in its own database and is not part of a cluster. That is the "+
+        "normal setup for a single machine — nothing is missing here and nothing is misconfigured. "+
+        "Clustering is opt-in, and a second server is a deliberate step you can take later."};
+  const nodes=cluster.nodes||[];
+  const voters=nodes.filter(n=>n.role==="voter").length;
+  const learners=nodes.filter(n=>n.role==="learner").length;
+  // A learner is admitted but not yet voting, so it changes none of the
+  // arithmetic below. Saying so stops it reading as a voter that went missing.
+  const catching=learners?` ${learners===1?"One node is":`${learners} nodes are`} still catching up as `+
+    `${learners===1?"a learner":"learners"} and ${learners===1?"does":"do"} not vote yet; `+
+    `${learners===1?"it becomes a voter":"they become voters"} once caught up.`:"";
+  if(cluster.availability==="degraded_reconfiguration")
+    return {tone:"warn", title:"Reconfiguration in progress — not redundant",
+      body:"Two voters is a waypoint while a node is being added or removed, never a redundant pair. "+
+        "Both machines must be running and must agree on every write and every membership change, so "+
+        "this cluster survives no failure — it is less resilient than a single server, not more. "+
+        "Add a third node to finish the reconfiguration, and keep both of these running until three "+
+        "are present and in sync."+catching};
+  if(cluster.availability==="high_availability"){
+    const q=clusterQuorum(voters);
+    return {tone:"good", title:`Redundant — ${voters} voters`,
+      body:`${q.majority} of the ${voters} voters must agree on every write, so the cluster keeps serving `+
+        `and recording watch state while ${q.tolerates===1?"one node is":`${q.tolerates} nodes are`} down. `+
+        "Removing a node is accepted only while enough voters remain to keep that majority."+catching};
+  }
+  return {tone:"calm", title:"One node",
+    body:"This is the only node in this cluster. Watch state is durable here, and one node is a complete, "+
+      "supported configuration rather than a half-finished cluster. Add a second and a third node only "+
+      "if you want another machine carrying the same watch state."+catching};
+}
+// The refusals DELETE /cluster/nodes/{id} can return, as sentences that say
+// what to do next. `node_owns_offline_work` is expected to be the common one
+// until the offline-package resolution milestone lands, so it gets a route
+// forward rather than a statement of fact and a dead end.
+function membershipRefusalText(code,message){
+  const REFUSALS={
+    removal_would_lose_quorum:
+      "This cluster has two voters, and dropping to one is refused. Every membership change from two "+
+      "needs both machines, so plurx will not present an unproved downgrade as a rollback. Add a third "+
+      "node first, then remove the one you don't want.",
+    node_owns_offline_work:
+      "This node still owns offline downloads — packages that are queued, preparing, ready, or failed. "+
+      "A shared source path does not prove another node can reach the same files, so plurx will not "+
+      "silently move them to a machine that may not have them. On the devices holding those downloads, "+
+      "delete them or let them expire, then remove this node again.",
+    cluster_leader_removal_refused:
+      "This node is the cluster's current leader, and a leader cannot remove itself. Leadership moves to "+
+      "another voter on its own when this node restarts or stops being reachable; wait for that, then "+
+      "try the removal again.",
+    cluster_node_not_found:
+      "This node is not in the cluster's current membership — it may already have been removed from "+
+      "another browser or another server. Reopen this tab to read the current roster.",
+    membership_unavailable:
+      "This server is not running a replicated store, so it has no cluster membership to change.",
+  };
+  if(REFUSALS[code]) return REFUSALS[code];
+  return message?`The server refused this removal: ${message}`
+                :"The server refused this removal and gave no reason.";
+}
+// last_seen_at is Unix MILLISECONDS (docs/OPERATIONS.md); fmtAgo takes seconds.
+// Feeding it milliseconds prints a healthy node as decades stale.
+function clusterNodeRow(n){
+  const voter=n.role==="voter";
+  const role=voter
+    ? `<span class="pill" style="color:var(--accent);border-color:var(--accent)">voter</span>`
+    : `<span class="pill" title="Admitted and catching up. A learner does not vote and is not counted toward quorum.">learner</span>`;
+  const reach=n.reachable
+    ? `<span style="color:var(--good)">reachable</span>`
+    : `<span style="color:var(--bad)">not reachable</span>`;
+  const seen=n.last_seen_at?esc(fmtAgo(Math.floor(n.last_seen_at/1000))):`<span class="muted">never</span>`;
+  return `<tr><td class="libname clnode">${esc(n.node_id)}</td>
+    <td data-label="Raft id" class="muted">${esc(String(n.raft_id))}</td>
+    <td data-label="Role">${role}</td>
+    <td data-label="Reachable">${reach}</td>
+    <td data-label="Last seen" class="muted">${seen}</td>
+    <td class="row rowactions" style="justify-content:flex-end">
+      <button class="ghost sm" onclick='removeNode(${esc(JSON.stringify(n.node_id))})'>Remove</button></td></tr>`;
+}
+function clusterPanel(d){
+  // Belt and braces: viewSettings already turns a non-admin away at the door,
+  // and the endpoints behind this are admin-only on their own account.
+  if(!ME||!ME.is_admin) return "";
+  const cluster=d.cluster;
+  if(!cluster) return `<div class="card"><h2 class="section" style="margin-top:0">Cluster</h2>
+    <div class="empty">Loading…</div></div>`;
+  const state=clusterStateView(cluster);
+  const clustered=!cluster.unavailable;
+  const nodes=clustered?(cluster.nodes||[]):[];
+  // One lag answer, not a second competing one: this is the same projection and
+  // the same renderer as Settings → System.
+  const replication=(clustered&&cluster.replication)||(d.sys&&d.sys.replication);
+  const roster=nodes.length
+    ? `<table><thead><tr><th>Node</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
+       <tbody>${nodes.map(clusterNodeRow).join("")}</tbody></table>`
+    : clustered?`<div class="empty">No node records yet.</div>`:"";
+  return `<div class="card"><h2 class="section" style="margin-top:0">Cluster</h2>
+    <div class="clstate ${state.tone}"><h3>${esc(state.title)}</h3><p>${esc(state.body)}</p></div>
+    ${roster}
+    <div class="hint">Watch state: ${replication?replicationText(replication):"status unavailable"}
+      — the same reading as the Server card on the System tab.</div>
+    ${clusterRefusalHtml()}
+    ${clustered?joinPanel():""}</div>`;
+}
+function clusterRefusalHtml(){
+  if(!CLUSTER_REFUSAL) return "";
+  return `<div class="clrefusal"><b>${esc(CLUSTER_REFUSAL.node_id)} was not removed</b>${
+    esc(membershipRefusalText(CLUSTER_REFUSAL.code,CLUSTER_REFUSAL.message))}</div>`;
+}
+// Minting is separated from showing because the token exists exactly once: the
+// server hands back the only copy and keeps nothing but its digest.
+function joinPanel(){
+  if(CLUSTER_TOKEN) return joinTokenHtml(CLUSTER_TOKEN);
+  return `<h2 class="section">Add a node</h2>
+    <div class="row" style="gap:10px;align-items:center">
+      <span class="schedpair">Token valid for
+        <select id="clttl" style="max-width:130px;font-size:12px;padding:3px 6px">
+          <option value="600" selected>10 minutes</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600">1 hour</option></select></span>
+      <button onclick="mintJoinToken(this)">Create a join token</button></div>
+    <div class="hint">A join token is single-use and short-lived, and it is shown once. Create it when the
+      other machine is ready to start, not before.</div>`;
+}
+// Deliberately loud. Anyone holding the complete token can join a node to this
+// cluster until it is redeemed or expires, so this says that plainly rather
+// than presenting it as an identifier to leave on a screen.
+function joinTokenHtml(issued){
+  const mins=Math.max(0,Math.round((issued.expires_at-Date.now())/60000));
+  return `<h2 class="section">Add a node</h2>
+    <div class="jointoken" id="cltoken">${esc(issued.token)}</div>
+    <div class="hint"><b>Shown once.</b> plurx keeps only this token's digest, so closing this is the end of
+      it — create another if you lose it. Until it is redeemed or expires it carries the complete authority
+      to join a node to this cluster: treat it like a password, and do not paste it into a chat, an issue, or
+      a shell transcript. It expires in about ${mins} minute${mins===1?"":"s"}
+      and admits exactly one node as Raft id ${esc(String(issued.raft_id))}.</div>
+    <div class="hint">On the new machine — a fresh data directory with no existing plurx database — save this
+      into an owner-only file, point <code>cluster.join_token_file</code> at it, give that node its own
+      reachable <code>cluster.advertise_host</code>, and start plurxd. It joins on its own and deletes the
+      file once it has finished. Full runbook: docs/OPERATIONS.md.</div>
+    <div class="row" style="gap:10px;margin-top:10px">
+      <button class="ghost sm" onclick="copyJoinToken()">Copy</button>
+      <button class="ghost sm" onclick="clearJoinToken()">Done — clear it</button></div>`;
+}
+async function mintJoinToken(btn){
+  const sel=document.getElementById("clttl");
+  const expires_in_seconds=sel?Number(sel.value):600;
+  const was=btn.textContent; btn.disabled=true; btn.textContent="Creating…";
+  try{
+    CLUSTER_TOKEN=await api("/cluster/join-tokens",{method:"POST",body:{expires_in_seconds}});
+    CLUSTER_REFUSAL=null;
+    renderSettings();
+  }catch(e){
+    btn.disabled=false; btn.textContent=was;
+    toast(e.message||"Couldn't create a join token");
+  }
+}
+function clearJoinToken(){ forgetJoinToken(); renderSettings(); }
+async function copyJoinToken(){
+  if(!CLUSTER_TOKEN) return;
+  try{
+    await navigator.clipboard.writeText(CLUSTER_TOKEN.token);
+    toast("Join token copied");
+  }catch(e){
+    // Plain HTTP is not a secure context, so a LAN install has no clipboard
+    // API at all. Say which gesture works instead of failing quietly.
+    toast("This browser won't copy over plain HTTP — click the token to select it");
+  }
+}
+// Removal is not reversible for the machine on the other end: its data
+// directory is tombstoned and rejoining means discarding it. The confirm says
+// so, because the roster gives no other hint that Remove is that heavy.
+async function removeNode(nodeId){
+  if(!confirm(`Remove ${nodeId} from this cluster?\n\nThat machine's plurx data directory is tombstoned. `+
+    `Bringing it back means stopping it, discarding that directory, and joining it again with a new token. `+
+    `Media files are not touched.`)) return;
+  CLUSTER_REFUSAL=null;
+  try{
+    if(SETTINGS_DATA) SETTINGS_DATA.cluster=await api(`/cluster/nodes/${encodeURIComponent(nodeId)}`,{method:"DELETE"});
+    toast("Node removed");
+  }catch(e){
+    CLUSTER_REFUSAL={node_id:nodeId, code:e.code, message:e.message};
+  }
+  renderSettings();
 }
 // Inline library editor: the row becomes an editable form (name · kind · paths).
 function editLib(id){
