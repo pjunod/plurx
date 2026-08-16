@@ -68,8 +68,9 @@ class ResourceMonitor:
 
 def resource_delta(
     before: dict[str, float | int | None], after: dict[str, float | int | None]
-) -> dict[str, float | int | None]:
-    result: dict[str, float | int | None] = {}
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    anomalies: list[str] = []
     for field in ("cpu_percent", "gpu_percent"):
         samples = [value for value in (before.get(field), after.get(field)) if value is not None]
         result[field] = sum(samples) / len(samples) if samples else None
@@ -82,7 +83,14 @@ def resource_delta(
         "network_tx_bytes",
     ):
         first, last = before.get(field), after.get(field)
-        result[field] = max(0, last - first) if first is not None and last is not None else None
+        if first is None or last is None:
+            result[field] = None
+        elif last < first:
+            result[field] = None
+            anomalies.append(f"{field}_counter_reset")
+        else:
+            result[field] = last - first
+    result["resource_anomalies"] = anomalies
     return result
 
 

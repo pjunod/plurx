@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -43,9 +44,13 @@ RAW_REQUIRED_FIELDS = (
     "output_video_codec",
     "output_audio_codec",
     "output_bitrate_kbps",
+    "output_height",
     "output_bitrate_basis",
     "advertised_output_bitrate_kbps",
     "advertised_output_codecs",
+    "advertised_output_resolution",
+    "output_contract_verified",
+    "output_contract_basis",
     "operation",
     "operation_variant",
     "measurement_scope",
@@ -57,6 +62,10 @@ RAW_REQUIRED_FIELDS = (
     "storage_write_bytes",
     "network_rx_bytes",
     "network_tx_bytes",
+    "resource_anomalies",
+    "pair_sequence",
+    "pair_server_order",
+    "server_order_index",
     "success",
 )
 
@@ -86,12 +95,81 @@ def validate_run_readiness(config: BenchmarkConfig) -> None:
         )
 
 
+def validate_selection(
+    config: BenchmarkConfig,
+    only_servers: set[str] | None,
+    only_scenarios: set[str] | None,
+) -> None:
+    for label, selected, available in (
+        ("--server", only_servers, set(config.servers)),
+        ("--scenario", only_scenarios, {item["id"] for item in config.scenarios}),
+    ):
+        if selected is None:
+            continue
+        if not selected:
+            raise ConfigError(f"{label} selection must not be empty")
+        unknown = selected - available
+        if unknown:
+            raise ConfigError(f"unknown {label} values: {', '.join(sorted(unknown))}")
+
+
+def validate_cold_readiness(
+    config: BenchmarkConfig,
+    only_servers: set[str] | None,
+    only_scenarios: set[str] | None,
+) -> None:
+    selected_servers = only_servers if only_servers is not None else set(config.servers)
+    for scenario in config.scenarios:
+        if only_scenarios is not None and scenario["id"] not in only_scenarios:
+            continue
+        if scenario["cache_state"] != "cold":
+            continue
+        missing = [
+            key
+            for key in selected_servers
+            if not config.servers[key].get("before_trial_command")
+        ]
+        if missing:
+            raise HarnessError(
+                f"cold scenario {scenario['id']!r} requires before_trial_command for "
+                + ", ".join(sorted(missing))
+            )
+
+
+def balanced_server_order(server_keys: list[str], pair_sequence: int) -> list[str]:
+    order = list(server_keys)
+    if pair_sequence % 2:
+        order.reverse()
+    return order
+
+
 def validate_measurement_row(row: dict[str, Any]) -> None:
     missing = [field for field in RAW_REQUIRED_FIELDS if field not in row]
     if missing:
         raise HarnessError("measurement row is missing: " + ", ".join(missing))
-    if row.get("success") and not isinstance(row.get("latency_ms"), (int, float)):
-        raise HarnessError("a successful measurement row requires numeric latency_ms")
+    latency = row.get("latency_ms")
+    if row.get("success") and (
+        isinstance(latency, bool)
+        or not isinstance(latency, (int, float))
+        or not math.isfinite(latency)
+        or latency < 0
+    ):
+        raise HarnessError("a successful measurement row requires finite non-negative latency_ms")
+    if not isinstance(row.get("output_contract_verified"), bool):
+        raise HarnessError("measurement row output_contract_verified must be boolean")
+    if not isinstance(row.get("resource_anomalies"), list):
+        raise HarnessError("measurement row resource_anomalies must be an array")
+    order = row.get("pair_server_order")
+    order_index = row.get("server_order_index")
+    if (
+        not isinstance(order, list)
+        or isinstance(order_index, bool)
+        or not isinstance(order_index, int)
+        or order_index < 0
+        or order_index >= len(order)
+        or order[order_index] != row.get("server")
+    ):
+        raise HarnessError("measurement row has an invalid pair server order")
 
 
 def _now() -> str:
@@ -111,6 +189,107 @@ def _safe_error(error: BaseException, secrets: list[str]) -> str:
         if secret:
             detail = detail.replace(secret, "<redacted>")
     return detail[:2000]
+
+
+def safe_manifest_config(config: BenchmarkConfig) -> dict[str, Any]:
+    """Return artifact-safe config without hook argv or accidental secret fields."""
+    document = json.loads(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run": config.run,
+                "client": config.client,
+                "servers": config.servers,
+                "media": list(config.media.values()),
+                "scenarios": list(config.scenarios),
+            }
+        )
+    )
+    command_fields = ("monitor_command", "before_trial_command", "after_trial_command")
+    for server in document.get("servers", {}).values():
+        for field in command_fields:
+            command = server.get(field)
+            if command is not None:
+                server[field] = {
+                    "configured": True,
+                    "argument_count": len(command),
+                    "argv_redacted": True,
+                }
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned: dict[str, Any] = {}
+            for key, item in value.items():
+                lowered = key.lower()
+                if key != "token_env" and any(
+                    marker in lowered
+                    for marker in ("token", "password", "secret", "credential", "api_key")
+                ):
+                    cleaned[key] = "<redacted>"
+                else:
+                    cleaned[key] = scrub(item)
+            return cleaned
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(document)
+
+
+def validate_output_contract(
+    server: str,
+    scenario: dict[str, Any],
+    stream: StreamHandle,
+    readiness: dict[str, Any],
+    probe: dict[str, Any],
+) -> dict[str, Any]:
+    expected_height = scenario["output_height"]
+    expected_bitrate = scenario["output_bitrate_kbps"]
+    tolerance_percent = scenario["output_bitrate_tolerance_percent"]
+    actual_height = probe.get("probed_output_height")
+    video_codec = _codec(probe.get("probed_output_video_codec"))
+    audio_codec = _codec(probe.get("probed_output_audio_codec"))
+    if actual_height != expected_height:
+        raise HarnessError(
+            f"{server}/{scenario['id']} delivered height {actual_height!r}, "
+            f"expected {expected_height}"
+        )
+    if video_codec != "h264" or audio_codec != "aac":
+        raise HarnessError(
+            f"{server}/{scenario['id']} delivered codecs {video_codec!r}/{audio_codec!r}, "
+            "expected h264/aac"
+        )
+    advertised_bitrate = readiness.get("advertised_output_bitrate_kbps")
+    if advertised_bitrate is None:
+        advertised_bitrate = stream.details.get("advertised_output_bitrate_kbps")
+    if not isinstance(advertised_bitrate, (int, float)) or isinstance(
+        advertised_bitrate, bool
+    ):
+        raise HarnessError(
+            f"{server}/{scenario['id']} did not advertise an output bitrate"
+        )
+    tolerance = expected_bitrate * tolerance_percent / 100
+    if abs(float(advertised_bitrate) - expected_bitrate) > tolerance:
+        raise HarnessError(
+            f"{server}/{scenario['id']} advertised {advertised_bitrate:g} kb/s, expected "
+            f"{expected_bitrate} kb/s ±{tolerance_percent:g}%"
+        )
+    return {
+        "output_height": actual_height,
+        "output_video_codec": video_codec,
+        "output_audio_codec": audio_codec,
+        "output_bitrate_kbps": expected_bitrate,
+        "output_bitrate_basis": "requested_transcode_contract",
+        "advertised_output_bitrate_kbps": advertised_bitrate,
+        "advertised_output_codecs": readiness.get("advertised_output_codecs"),
+        "advertised_output_resolution": readiness.get("advertised_output_resolution"),
+        "output_contract_verified": True,
+        "output_contract_basis": stream.details.get(
+            "output_contract_basis", "hls_metadata_and_ffprobe"
+        ),
+        "output_bitrate_tolerance_percent": tolerance_percent,
+        **probe,
+    }
 
 
 def _operation_variant(
@@ -222,15 +401,17 @@ class BenchmarkHarness:
         self.progress = progress
         self.run_id = str(uuid.uuid4())
         validate_run_readiness(config)
+        validate_selection(config, only_servers, only_scenarios)
+        validate_cold_readiness(config, only_servers, only_scenarios)
         self.http = HttpClient(config.run["timeout_seconds"])
-        self.runners = build_runners(config, self.http)
-        if only_servers is not None:
-            unknown = only_servers - set(self.runners)
-            if unknown:
-                raise ConfigError(f"unknown --server values: {', '.join(sorted(unknown))}")
-            self.runners = {key: value for key, value in self.runners.items() if key in only_servers}
+        self.runners = build_runners(config, self.http, only_servers)
         secrets = [runner.token for runner in self.runners.values()]
-        self.client = FfmpegClient(config.client["ffmpeg"], config.run["timeout_seconds"], secrets)
+        self.client = FfmpegClient(
+            config.client["ffmpeg"],
+            config.run["timeout_seconds"],
+            secrets,
+            config.client["ffprobe"],
+        )
         self.secrets = secrets
         self.identities = {key: runner.identity() for key, runner in self.runners.items()}
         self.discovered = verify_corpus(config, self.runners)
@@ -238,7 +419,72 @@ class BenchmarkHarness:
             key: ResourceMonitor(runner.config.get("monitor_command"), config.run["timeout_seconds"])
             for key, runner in self.runners.items()
         }
+        self.output_contracts = self._verify_output_contracts()
         self.writer = RawWriter(output_dir / "raw.jsonl")
+
+    def _selected_scenarios(self) -> list[dict[str, Any]]:
+        return [
+            scenario
+            for scenario in self.config.scenarios
+            if self.only_scenarios is None or scenario["id"] in self.only_scenarios
+        ]
+
+    def _verify_output_contracts(self) -> dict[str, dict[str, dict[str, Any]]]:
+        contracts: dict[str, dict[str, dict[str, Any]]] = {}
+        preflight_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for scenario in self._selected_scenarios():
+            medium = self.config.media[scenario["media"]]
+            contracts[scenario["id"]] = {}
+            for server, runner in self.runners.items():
+                if scenario["playback_mode"] == "direct_play":
+                    contracts[scenario["id"]][server] = {
+                        "output_height": medium["height"],
+                        "output_video_codec": _codec(medium["video_codec"]),
+                        "output_audio_codec": _codec(medium["audio_codec"]),
+                        "output_bitrate_kbps": medium["bitrate_kbps"],
+                        "output_bitrate_basis": "source_catalog",
+                        "advertised_output_bitrate_kbps": medium["bitrate_kbps"],
+                        "advertised_output_codecs": None,
+                        "advertised_output_resolution": (
+                            f"{medium['width']}x{medium['height']}"
+                        ),
+                        "output_contract_verified": True,
+                        "output_contract_basis": "verified_source_catalog",
+                        "output_bitrate_tolerance_percent": medium.get(
+                            "bitrate_tolerance_percent", 15
+                        ),
+                    }
+                    continue
+                cache_key = (
+                    server,
+                    medium["id"],
+                    scenario["output_height"],
+                    scenario["output_bitrate_kbps"],
+                    scenario["output_bitrate_tolerance_percent"],
+                )
+                contract = preflight_cache.get(cache_key)
+                if contract is None:
+                    stream: StreamHandle | None = None
+                    try:
+                        stream = runner.prepare_stream(
+                            medium,
+                            scenario,
+                            0,
+                            f"contract-preflight-{uuid.uuid4()}",
+                        )
+                        readiness = runner.wait_ready(
+                            stream, self.config.run["timeout_seconds"]
+                        )
+                        probe = self.client.probe_stream(stream)
+                        contract = validate_output_contract(
+                            server, scenario, stream, readiness, probe
+                        )
+                    finally:
+                        if stream is not None:
+                            runner.close_stream(stream)
+                    preflight_cache[cache_key] = contract
+                contracts[scenario["id"]][server] = dict(contract)
+        return contracts
 
     def _base_row(
         self,
@@ -251,14 +497,21 @@ class BenchmarkHarness:
         target: dict[str, Any] | None,
         *,
         concurrency_index: int | None = None,
+        pair_sequence: int,
+        pair_server_order: list[str],
+        server_order_index: int,
     ) -> dict[str, Any]:
         identity = self.identities[server]
         actual = self.discovered[medium["id"]][server]
+        contract = self.output_contracts[scenario["id"]][server]
         row: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "record_type": "measurement",
             "run_id": self.run_id,
             "pair_id": pair_id,
+            "pair_sequence": pair_sequence,
+            "pair_server_order": pair_server_order,
+            "server_order_index": server_order_index,
             "recorded_at": _now(),
             **identity,
             "server_runner": self.runners[server].config["runner"],
@@ -279,26 +532,21 @@ class BenchmarkHarness:
             "source_width": actual.get("source_width"),
             "source_height": actual.get("source_height"),
             "playback_mode": scenario["playback_mode"],
-            "output_video_codec": (
-                medium["video_codec"] if scenario["playback_mode"] == "direct_play" else "h264"
-            ),
-            "output_audio_codec": (
-                medium["audio_codec"] if scenario["playback_mode"] == "direct_play" else "aac"
-            ),
-            "output_bitrate_kbps": (
-                medium["bitrate_kbps"]
-                if scenario["playback_mode"] == "direct_play"
-                else scenario["output_bitrate_kbps"]
-            ),
-            "output_bitrate_basis": (
-                "source_catalog"
-                if scenario["playback_mode"] == "direct_play"
-                else "requested_transcode_contract"
-            ),
-            "advertised_output_bitrate_kbps": (
-                medium["bitrate_kbps"] if scenario["playback_mode"] == "direct_play" else None
-            ),
-            "advertised_output_codecs": None,
+            "output_video_codec": contract["output_video_codec"],
+            "output_audio_codec": contract["output_audio_codec"],
+            "output_bitrate_kbps": contract["output_bitrate_kbps"],
+            "output_height": contract["output_height"],
+            "output_bitrate_basis": contract["output_bitrate_basis"],
+            "advertised_output_bitrate_kbps": contract[
+                "advertised_output_bitrate_kbps"
+            ],
+            "advertised_output_codecs": contract["advertised_output_codecs"],
+            "advertised_output_resolution": contract["advertised_output_resolution"],
+            "output_contract_verified": contract["output_contract_verified"],
+            "output_contract_basis": contract["output_contract_basis"],
+            "output_bitrate_tolerance_percent": contract[
+                "output_bitrate_tolerance_percent"
+            ],
             "scenario_id": scenario["id"],
             "operation": scenario["operation"],
             "operation_variant": _operation_variant(scenario, target),
@@ -316,6 +564,7 @@ class BenchmarkHarness:
             "error": None,
             "resource_scope": "batch" if scenario["operation"] == "concurrent_transcodes" else "trial",
             **{field: None for field in RESOURCE_FIELDS},
+            "resource_anomalies": [],
             "details": {},
         }
         return row
@@ -344,6 +593,38 @@ class BenchmarkHarness:
             "cache_state": row["cache_state"],
         }
 
+    @staticmethod
+    def _apply_runtime_contract(
+        row: dict[str, Any], stream: StreamHandle, scenario: dict[str, Any]
+    ) -> None:
+        row["details"].update(stream.details)
+        if scenario["playback_mode"] != "transcode":
+            return
+        row["output_contract_verified"] = False
+        if stream.output_height != scenario["output_height"]:
+            raise HarnessError(
+                f"{row['server']}/{scenario['id']} prepared height {stream.output_height!r}, "
+                f"expected {scenario['output_height']}"
+            )
+        advertised = row["details"].get("advertised_output_bitrate_kbps")
+        if advertised is not None:
+            expected = scenario["output_bitrate_kbps"]
+            tolerance_percent = scenario["output_bitrate_tolerance_percent"]
+            tolerance = expected * tolerance_percent / 100
+            if not isinstance(advertised, (int, float)) or isinstance(advertised, bool):
+                raise HarnessError("advertised output bitrate must be numeric")
+            if abs(float(advertised) - expected) > tolerance:
+                raise HarnessError(
+                    f"{row['server']}/{scenario['id']} advertised {advertised:g} kb/s, "
+                    f"expected {expected} kb/s ±{tolerance_percent:g}%"
+                )
+            row["advertised_output_bitrate_kbps"] = advertised
+        for field in ("advertised_output_codecs", "advertised_output_resolution"):
+            value = row["details"].get(field)
+            if value is not None:
+                row[field] = value
+        row["output_contract_verified"] = True
+
     def _single(
         self,
         server: str,
@@ -353,9 +634,23 @@ class BenchmarkHarness:
         iteration: int,
         pair_id: str,
         target: dict[str, Any] | None,
+        pair_sequence: int,
+        pair_server_order: list[str],
+        server_order_index: int,
     ) -> dict[str, Any]:
         runner = self.runners[server]
-        row = self._base_row(server, medium, scenario, scope, iteration, pair_id, target)
+        row = self._base_row(
+            server,
+            medium,
+            scenario,
+            scope,
+            iteration,
+            pair_id,
+            target,
+            pair_sequence=pair_sequence,
+            pair_server_order=pair_server_order,
+            server_order_index=server_order_index,
+        )
         context = self._context(row, "before")
         stream: StreamHandle | None = None
         before = {field: None for field in RESOURCE_FIELDS}
@@ -393,13 +688,7 @@ class BenchmarkHarness:
             else:
                 row["details"].update(self.client.decode_first_frame(stream))
                 row["latency_ms"] = (time.monotonic() - started) * 1000
-            row["details"].update(stream.details)
-            row["advertised_output_bitrate_kbps"] = row["details"].get(
-                "advertised_output_bitrate_kbps", row["advertised_output_bitrate_kbps"]
-            )
-            row["advertised_output_codecs"] = row["details"].get(
-                "advertised_output_codecs"
-            )
+            self._apply_runtime_contract(row, stream, scenario)
             row["success"] = True
         except Exception as error:
             row["error_type"] = type(error).__name__
@@ -419,6 +708,7 @@ class BenchmarkHarness:
                 row["success"] = False
                 row["error_type"] = type(error).__name__
                 row["error"] = _safe_error(error, self.secrets)
+                row["resource_anomalies"] = ["resource_monitor_failed"]
         return row
 
     def _concurrent(
@@ -429,6 +719,9 @@ class BenchmarkHarness:
         scope: str,
         iteration: int,
         pair_id: str,
+        pair_sequence: int,
+        pair_server_order: list[str],
+        server_order_index: int,
     ) -> list[dict[str, Any]]:
         runner = self.runners[server]
         count = scenario["concurrency"]
@@ -442,6 +735,9 @@ class BenchmarkHarness:
                 pair_id,
                 None,
                 concurrency_index=index,
+                pair_sequence=pair_sequence,
+                pair_server_order=pair_server_order,
+                server_order_index=server_order_index,
             )
             for index in range(count)
         ]
@@ -473,13 +769,7 @@ class BenchmarkHarness:
                         measured.pop("first_frame_monotonic") - started
                     ) * 1000
                     row["details"].update(measured)
-                row["details"].update(stream.details)
-                row["advertised_output_bitrate_kbps"] = row["details"].get(
-                    "advertised_output_bitrate_kbps", row["advertised_output_bitrate_kbps"]
-                )
-                row["advertised_output_codecs"] = row["details"].get(
-                    "advertised_output_codecs"
-                )
+                self._apply_runtime_contract(row, stream, scenario)
                 row["success"] = True
             except Exception as error:
                 row["error_type"] = type(error).__name__
@@ -515,7 +805,10 @@ class BenchmarkHarness:
                 self.config.run["timeout_seconds"],
             )
         except Exception as error:
-            resources = {field: None for field in RESOURCE_FIELDS}
+            resources = {
+                **{field: None for field in RESOURCE_FIELDS},
+                "resource_anomalies": ["resource_monitor_failed"],
+            }
             batch_error = error
         for row in rows:
             row.update(resources)
@@ -540,15 +833,17 @@ class BenchmarkHarness:
             "status": status,
             "recorded_at": _now(),
             "config_path": str(self.config.path),
-            "config": self.config.document,
+            "config": safe_manifest_config(self.config),
             "controller": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "pid": os.getpid(),
                 "ffmpeg": self.client.version,
+                "ffprobe": self.client.probe_version,
             },
             "servers": self.identities,
             "discovered_media": self.discovered,
+            "verified_output_contracts": self.output_contracts,
             "measurement_rows": measurement_rows,
             "raw_results": "raw.jsonl",
         }
@@ -581,16 +876,17 @@ class BenchmarkHarness:
                 medium = self.config.media[scenario["media"]]
                 iterations = self.iterations_override or scenario["iterations"]
                 targets = self._scenario_targets(scenario, medium)
+                pair_sequence = 0
                 for iteration in range(iterations):
-                    server_order = list(self.runners)
-                    if iteration % 2:
-                        server_order.reverse()
                     for scope in scenario["measurement_scopes"]:
                         for target_index, target in enumerate(targets):
+                            server_order = balanced_server_order(
+                                list(self.runners), pair_sequence
+                            )
                             pair_id = (
                                 f"{self.run_id}:{scenario['id']}:{iteration}:{scope}:{target_index}"
                             )
-                            for server in server_order:
+                            for server_order_index, server in enumerate(server_order):
                                 label = (
                                     f"{scenario['id']} · {scope} · iteration {iteration + 1}/{iterations} "
                                     f"· {server}"
@@ -606,6 +902,9 @@ class BenchmarkHarness:
                                         scope,
                                         iteration,
                                         pair_id,
+                                        pair_sequence,
+                                        server_order,
+                                        server_order_index,
                                     )
                                 else:
                                     rows = [
@@ -617,6 +916,9 @@ class BenchmarkHarness:
                                             iteration,
                                             pair_id,
                                             target,
+                                            pair_sequence,
+                                            server_order,
+                                            server_order_index,
                                         )
                                     ]
                                 for row in rows:
@@ -625,6 +927,7 @@ class BenchmarkHarness:
                                 cooldown = self.config.run["cooldown_seconds"]
                                 if cooldown:
                                     time.sleep(cooldown)
+                            pair_sequence += 1
             self._write_manifest("complete", measurement_rows)
         except Exception:
             self._write_manifest("failed", measurement_rows)

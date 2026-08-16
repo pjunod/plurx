@@ -23,6 +23,7 @@ class StreamHandle:
     output_video_codec: str | None
     output_audio_codec: str | None
     output_bitrate_kbps: int | None
+    output_height: int | None
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -148,6 +149,7 @@ class CinemaRunner(ServerRunner):
                 output_video_codec=medium["video_codec"],
                 output_audio_codec=medium["audio_codec"],
                 output_bitrate_kbps=medium["bitrate_kbps"],
+                output_height=medium["height"],
             )
 
         response = self.http.json(
@@ -182,6 +184,7 @@ class CinemaRunner(ServerRunner):
             output_video_codec="h264",
             output_audio_codec="aac",
             output_bitrate_kbps=scenario["output_bitrate_kbps"],
+            output_height=scenario["output_height"],
             details={
                 "encoder": response.get("encoder"),
                 "media_origin_ms": response.get("media_origin_ms"),
@@ -189,6 +192,10 @@ class CinemaRunner(ServerRunner):
                 "advertised_output_bitrate_kbps": (
                     rung.get("total_kbps") if rung is not None else None
                 ),
+                "advertised_output_height": (
+                    rung.get("height") if rung is not None else None
+                ),
+                "output_contract_basis": "session_ladder_and_ffprobe",
             },
         )
 
@@ -214,6 +221,11 @@ class PlexRunner(ServerRunner):
             "X-Plex-Product": "Cinema Plex Benchmark",
             "X-Plex-Version": "1.0",
             "X-Plex-Platform": "Python",
+            "X-Plex-Client-Profile-Name": "Cinema Plex Benchmark",
+            "X-Plex-Client-Profile-Extra": (
+                "add-transcode-target(type=videoProfile&context=streaming&protocol=hls"
+                "&container=mpegts&videoCodec=h264&audioCodec=aac&replace=true)"
+            ),
         }
 
     def _xml(self, path: str) -> ET.Element:
@@ -296,6 +308,7 @@ class PlexRunner(ServerRunner):
                 output_video_codec=medium["video_codec"],
                 output_audio_codec=medium["audio_codec"],
                 output_bitrate_kbps=medium["bitrate_kbps"],
+                output_height=medium["height"],
             )
 
         session_id = f"cinema-plex-bench-{trial_id}-{uuid.uuid4()}"
@@ -327,6 +340,8 @@ class PlexRunner(ServerRunner):
             output_video_codec="h264",
             output_audio_codec="aac",
             output_bitrate_kbps=scenario["output_bitrate_kbps"],
+            output_height=scenario["output_height"],
+            details={"output_contract_basis": "hls_master_and_ffprobe"},
         )
 
     def close_stream(self, stream: StreamHandle) -> None:
@@ -364,9 +379,13 @@ def _milliseconds_attr(value: Any) -> float | None:
     return _seconds(value)
 
 
-def build_runners(config: Any, http: HttpClient) -> dict[str, ServerRunner]:
+def build_runners(
+    config: Any, http: HttpClient, only_servers: set[str] | None = None
+) -> dict[str, ServerRunner]:
     runners: dict[str, ServerRunner] = {}
     for key, server in config.servers.items():
+        if only_servers is not None and key not in only_servers:
+            continue
         token = os.environ.get(server["token_env"])
         if not token:
             raise ConfigError(

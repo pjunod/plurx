@@ -44,6 +44,8 @@ def percentile(values: Iterable[float], percent: float) -> float | None:
 
 
 def load_rows(path: str | Path) -> list[dict[str, Any]]:
+    from .harness import HarnessError, validate_measurement_row
+
     rows: list[dict[str, Any]] = []
     source = Path(path)
     try:
@@ -61,6 +63,10 @@ def load_rows(path: str | Path) -> list[dict[str, Any]]:
             raise ReportError(f"{source}:{line_number} has an unsupported schema")
         if row.get("record_type") != "measurement":
             continue
+        try:
+            validate_measurement_row(row)
+        except HarnessError as error:
+            raise ReportError(f"{source}:{line_number} has an invalid measurement: {error}") from error
         rows.append(row)
     if not rows:
         raise ReportError(f"{source} contains no measurement rows")
@@ -97,6 +103,9 @@ def summarize(rows: list[dict[str, Any]], source: str | None = None) -> dict[str
                 "failures": failures,
                 "failure_rate": failures / len(samples),
                 "error_rate": failures / len(samples),
+                "output_contract_verified": all(
+                    row.get("output_contract_verified") is True for row in samples
+                ),
                 "latency_ms": {
                     "p50": percentile(successful, 50),
                     "p95": percentile(successful, 95),
@@ -114,6 +123,8 @@ def summarize(rows: list[dict[str, Any]], source: str | None = None) -> dict[str
         if set(pair) != {"cinema", "plex"}:
             continue
         cinema, plex = pair["cinema"], pair["plex"]
+        if not cinema["output_contract_verified"] or not plex["output_contract_verified"]:
+            continue
         ratios: dict[str, float | None] = {}
         speedups: dict[str, float | None] = {}
         for percentile_name in ("p50", "p95", "p99"):

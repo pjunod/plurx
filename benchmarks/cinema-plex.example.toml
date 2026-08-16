@@ -1,6 +1,6 @@
 # Cinema/plurx-vs-Plex benchmark contract. Copy this file, replace every
 # placeholder media identity and server address, then validate before running.
-schema_version = 1
+schema_version = 2
 
 [run]
 iterations = 30
@@ -13,6 +13,7 @@ name = "ffmpeg-common-decoder"
 version = "auto"
 host = "REPLACE_WITH_CONTROLLER_HOST"
 ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
 
 [servers.cinema]
 runner = "cinema"
@@ -100,6 +101,9 @@ media = "1080p-h264"
 playback_mode = "transcode"
 output_height = 1080
 output_bitrate_kbps = 8000
+# The harness compares each server's advertised wire rate with this request.
+# Five percent admits container/audio overhead but rejects a different rung.
+output_bitrate_tolerance_percent = 5
 measurement_scopes = ["server_engine", "end_to_end"]
 cache_state = "warm"
 

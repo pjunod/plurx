@@ -18,6 +18,56 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 OPERATIONS = {"startup", "seek", "random_seeks", "pause_resume", "concurrent_transcodes"}
 PLAYBACK_MODES = {"direct_play", "transcode"}
 MEASUREMENT_SCOPES = {"server_engine", "end_to_end"}
+TOP_LEVEL_FIELDS = {"schema_version", "run", "client", "servers", "media", "scenarios"}
+RUN_FIELDS = {"iterations", "timeout_seconds", "cooldown_seconds", "output_dir"}
+CLIENT_FIELDS = {"name", "version", "host", "ffmpeg", "ffprobe"}
+SERVER_FIELDS = {
+    "runner",
+    "base_url",
+    "token_env",
+    "commit",
+    "label",
+    "monitor_command",
+    "before_trial_command",
+    "after_trial_command",
+}
+MEDIA_FIELDS = {
+    "id",
+    "title",
+    "duration_seconds",
+    "width",
+    "height",
+    "container",
+    "video_codec",
+    "audio_codec",
+    "bitrate_kbps",
+    "bitrate_tolerance_percent",
+    "sha256",
+    "bindings",
+}
+SCENARIO_FIELDS = {
+    "id",
+    "operation",
+    "media",
+    "playback_mode",
+    "iterations",
+    "measurement_scopes",
+    "cache_state",
+    "output_height",
+    "output_bitrate_kbps",
+    "output_bitrate_tolerance_percent",
+    "concurrency",
+    "seek_count",
+    "seed",
+    "baseline_position_seconds",
+    "warmup_seconds",
+    "pause_seconds",
+    "observe_seconds",
+    "seek_min_seconds",
+    "seek_max_seconds",
+    "seek_deltas_seconds",
+    "seek_positions_seconds",
+}
 
 
 class ConfigError(ValueError):
@@ -39,6 +89,12 @@ def _object(value: Any, where: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{where} must be a TOML table")
     return value
+
+
+def _reject_unknown(table: dict[str, Any], allowed: set[str], where: str) -> None:
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise ConfigError(f"{where} contains unknown field(s): {', '.join(unknown)}")
 
 
 def _name(value: Any, where: str) -> str:
@@ -99,6 +155,7 @@ def _optional_string(table: dict[str, Any], key: str, where: str) -> None:
 def _validate_server(key: str, value: Any) -> dict[str, Any]:
     where = f"servers.{key}"
     server = dict(_object(value, where))
+    _reject_unknown(server, SERVER_FIELDS, where)
     runner = server.get("runner", key)
     if runner not in ("cinema", "plex"):
         raise ConfigError(f"{where}.runner must be 'cinema' or 'plex'")
@@ -117,9 +174,12 @@ def _validate_server(key: str, value: Any) -> dict[str, Any]:
     return server
 
 
-def _validate_media(value: Any, index: int, server_keys: set[str]) -> dict[str, Any]:
+def _validate_media(
+    value: Any, index: int, servers: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
     where = f"media[{index}]"
     medium = dict(_object(value, where))
+    _reject_unknown(medium, MEDIA_FIELDS, where)
     medium["id"] = _name(medium.get("id"), f"{where}.id")
     medium["title"] = _string(medium.get("title", medium["id"]), f"{where}.title")
     medium["duration_seconds"] = _number(
@@ -132,25 +192,49 @@ def _validate_media(value: Any, index: int, server_keys: set[str]) -> dict[str, 
     if not re.fullmatch(r"[0-9a-f]{64}", medium["sha256"]):
         raise ConfigError(f"{where}.sha256 must be a lowercase SHA-256 digest")
 
+    if "bitrate_tolerance_percent" in medium:
+        medium["bitrate_tolerance_percent"] = _number(
+            medium["bitrate_tolerance_percent"],
+            f"{where}.bitrate_tolerance_percent",
+            minimum=0,
+            strict=False,
+        )
+
     bindings = _object(medium.get("bindings"), f"{where}.bindings")
+    server_keys = set(servers)
     missing = server_keys - set(bindings)
     if missing:
         raise ConfigError(f"{where}.bindings is missing server(s): {', '.join(sorted(missing))}")
-    for server_key in server_keys:
-        binding = _object(bindings[server_key], f"{where}.bindings.{server_key}")
-        runner = binding.get("runner")
-        if runner == "cinema" or "file_id" in binding:
-            _integer(binding.get("file_id"), f"{where}.bindings.{server_key}.file_id")
-        elif runner == "plex" or "rating_key" in binding:
-            _string(str(binding.get("rating_key", "")), f"{where}.bindings.{server_key}.rating_key")
+    extra = set(bindings) - server_keys
+    if extra:
+        raise ConfigError(
+            f"{where}.bindings contains unknown server(s): {', '.join(sorted(extra))}"
+        )
+    normalized_bindings: dict[str, dict[str, Any]] = {}
+    for server_key, server in servers.items():
+        binding_where = f"{where}.bindings.{server_key}"
+        binding = dict(_object(bindings[server_key], binding_where))
+        if server["runner"] == "cinema":
+            _reject_unknown(binding, {"file_id"}, binding_where)
+            binding["file_id"] = _integer(binding.get("file_id"), f"{binding_where}.file_id")
+        else:
+            _reject_unknown(
+                binding,
+                {"rating_key", "media_index", "part_index", "part_key"},
+                binding_where,
+            )
+            rating_key = binding.get("rating_key")
+            if isinstance(rating_key, bool) or not isinstance(rating_key, (str, int)):
+                raise ConfigError(f"{binding_where}.rating_key must be a string or integer")
+            binding["rating_key"] = _string(str(rating_key), f"{binding_where}.rating_key")
             for field in ("media_index", "part_index"):
                 if field in binding:
-                    _integer(binding[field], f"{where}.bindings.{server_key}.{field}", minimum=0)
-            _optional_string(binding, "part_key", f"{where}.bindings.{server_key}")
-        else:
-            raise ConfigError(
-                f"{where}.bindings.{server_key} needs file_id (Cinema) or rating_key (Plex)"
-            )
+                    binding[field] = _integer(
+                        binding[field], f"{binding_where}.{field}", minimum=0
+                    )
+            _optional_string(binding, "part_key", binding_where)
+        normalized_bindings[server_key] = binding
+    medium["bindings"] = normalized_bindings
     return medium
 
 
@@ -173,6 +257,7 @@ def _validate_scenario(
 ) -> dict[str, Any]:
     where = f"scenarios[{index}]"
     scenario = dict(_object(value, where))
+    _reject_unknown(scenario, SCENARIO_FIELDS, where)
     scenario["id"] = _name(scenario.get("id"), f"{where}.id")
     operation = scenario.get("operation")
     if operation not in OPERATIONS:
@@ -253,6 +338,12 @@ def _validate_scenario(
         scenario["output_bitrate_kbps"] = _integer(
             scenario.get("output_bitrate_kbps"), f"{where}.output_bitrate_kbps"
         )
+        scenario["output_bitrate_tolerance_percent"] = _number(
+            scenario.get("output_bitrate_tolerance_percent", 5),
+            f"{where}.output_bitrate_tolerance_percent",
+            minimum=0,
+            strict=False,
+        )
     return scenario
 
 
@@ -264,8 +355,10 @@ def load_config(path: str | Path) -> BenchmarkConfig:
         raise ConfigError(f"cannot read {config_path}: {error}") from error
     if document.get("schema_version") != SCHEMA_VERSION:
         raise ConfigError(f"schema_version must be {SCHEMA_VERSION}")
+    _reject_unknown(document, TOP_LEVEL_FIELDS, "configuration")
 
     run = dict(_object(document.get("run", {}), "run"))
+    _reject_unknown(run, RUN_FIELDS, "run")
     run["iterations"] = _integer(run.get("iterations", 30), "run.iterations")
     run["timeout_seconds"] = _number(run.get("timeout_seconds", 120), "run.timeout_seconds")
     run["cooldown_seconds"] = _number(
@@ -274,10 +367,12 @@ def load_config(path: str | Path) -> BenchmarkConfig:
     run["output_dir"] = _string(run.get("output_dir", "target/cinema-plex-bench"), "run.output_dir")
 
     client = dict(_object(document.get("client", {}), "client"))
+    _reject_unknown(client, CLIENT_FIELDS, "client")
     client["name"] = _string(client.get("name", "ffmpeg"), "client.name")
     client["version"] = _string(client.get("version", "auto"), "client.version")
     client["host"] = _string(client.get("host", "controller"), "client.host")
     client["ffmpeg"] = _string(client.get("ffmpeg", "ffmpeg"), "client.ffmpeg")
+    client["ffprobe"] = _string(client.get("ffprobe", "ffprobe"), "client.ffprobe")
 
     raw_servers = _object(document.get("servers"), "servers")
     if len(raw_servers) != 2:
@@ -290,7 +385,7 @@ def load_config(path: str | Path) -> BenchmarkConfig:
     raw_media = document.get("media")
     if not isinstance(raw_media, list) or not raw_media:
         raise ConfigError("media must be a non-empty array of tables")
-    media_list = [_validate_media(value, i, set(servers)) for i, value in enumerate(raw_media)]
+    media_list = [_validate_media(value, i, servers) for i, value in enumerate(raw_media)]
     media = {medium["id"]: medium for medium in media_list}
     if len(media) != len(media_list):
         raise ConfigError("media ids must be unique")

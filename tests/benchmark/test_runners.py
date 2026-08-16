@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -10,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from cinema_plex_bench.monitoring import resource_delta  # noqa: E402
-from cinema_plex_bench.runners import CinemaRunner, PlexRunner  # noqa: E402
+from cinema_plex_bench.runners import (  # noqa: E402
+    CinemaRunner,
+    PlexRunner,
+    build_runners,
+)
 
 
 MEDIUM = {
@@ -115,6 +121,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(["1920x1080"], query["videoResolution"])
         self.assertNotIn("top-secret", stream.url)
         self.assertEqual("top-secret", stream.headers["X-Plex-Token"])
+        self.assertIn("videoCodec=h264", stream.headers["X-Plex-Client-Profile-Extra"])
+        self.assertIn("audioCodec=aac", stream.headers["X-Plex-Client-Profile-Extra"])
 
     def test_resource_counters_become_trial_deltas(self):
         before = {
@@ -141,6 +149,34 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(150, measured["rss_bytes"])
         self.assertEqual(600, measured["storage_read_bytes"])
         self.assertEqual(700, measured["network_tx_bytes"])
+        self.assertEqual([], measured["resource_anomalies"])
+
+    def test_counter_reset_is_null_and_explicit_instead_of_fabricated_zero(self):
+        measured = resource_delta(
+            {"storage_read_bytes": 1000},
+            {"storage_read_bytes": 100},
+        )
+        self.assertIsNone(measured["storage_read_bytes"])
+        self.assertIn("storage_read_bytes_counter_reset", measured["resource_anomalies"])
+
+    def test_single_server_build_requires_only_the_selected_token(self):
+        config = SimpleNamespace(
+            servers={
+                "cinema": {
+                    "runner": "cinema",
+                    "base_url": "http://cinema:32400",
+                    "token_env": "ONLY_CINEMA_TOKEN",
+                },
+                "plex": {
+                    "runner": "plex",
+                    "base_url": "http://plex:32400",
+                    "token_env": "MISSING_PLEX_TOKEN",
+                },
+            }
+        )
+        with patch.dict("os.environ", {"ONLY_CINEMA_TOKEN": "secret"}, clear=True):
+            runners = build_runners(config, object(), {"cinema"})
+        self.assertEqual(["cinema"], list(runners))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from cinema_plex_bench.harness import (  # noqa: E402
     validate_measurement_row,
 )
 from cinema_plex_bench.reporting import (  # noqa: E402
+    ReportError,
+    load_rows,
     markdown_report,
     percentile,
     summarize,
@@ -25,7 +27,7 @@ from cinema_plex_bench.reporting import (  # noqa: E402
 
 def row(server, runner, latency, success=True):
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "record_type": "measurement",
         "server": server,
         "server_runner": runner,
@@ -40,9 +42,13 @@ def row(server, runner, latency, success=True):
         "output_video_codec": "h264",
         "output_audio_codec": "aac",
         "output_bitrate_kbps": 8000,
+        "output_height": 1080,
         "output_bitrate_basis": "requested_transcode_contract",
         "advertised_output_bitrate_kbps": 8160,
         "advertised_output_codecs": "avc1.640028,mp4a.40.2",
+        "advertised_output_resolution": "1920x1080",
+        "output_contract_verified": True,
+        "output_contract_basis": "fixture",
         "scenario_id": "startup-4k-to-1080p-transcode",
         "operation": "startup",
         "operation_variant": "startup",
@@ -56,6 +62,10 @@ def row(server, runner, latency, success=True):
         "storage_write_bytes": None,
         "network_rx_bytes": None,
         "network_tx_bytes": None,
+        "resource_anomalies": [],
+        "pair_sequence": 0,
+        "pair_server_order": ["cinema", "plex"],
+        "server_order_index": 0 if server == "cinema" else 1,
         "success": success,
     }
     validate_measurement_row(document)
@@ -111,6 +121,27 @@ class ReportingTests(unittest.TestCase):
     def test_markdown_does_not_invent_a_ratio_when_one_side_failed(self):
         summary = summarize([row("cinema", "cinema", None, False), row("plex", "plex", 200)])
         self.assertIn("| — | — | — |", markdown_report(summary))
+
+    def test_unverified_output_contract_suppresses_ratios(self):
+        cinema = row("cinema", "cinema", 100)
+        cinema["output_contract_verified"] = False
+        summary = summarize([cinema, row("plex", "plex", 200)])
+        self.assertEqual([], summary["comparisons"])
+
+    def test_successful_nonfinite_latency_is_rejected(self):
+        document = row("cinema", "cinema", 10)
+        document["latency_ms"] = float("nan")
+        with self.assertRaisesRegex(HarnessError, "finite non-negative"):
+            validate_measurement_row(document)
+
+    def test_schema_one_rows_have_an_explicit_version_boundary(self):
+        document = row("cinema", "cinema", 10)
+        document["schema_version"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "old.jsonl"
+            raw.write_text(json.dumps(document) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ReportError, "unsupported schema"):
+                load_rows(raw)
 
 
 if __name__ == "__main__":

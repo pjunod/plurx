@@ -10,7 +10,13 @@ import sys
 from typing import Any
 
 from .config import BenchmarkConfig, ConfigError, load_config, seek_targets
-from .harness import BenchmarkHarness, HarnessError, validate_run_readiness
+from .harness import (
+    BenchmarkHarness,
+    HarnessError,
+    validate_cold_readiness,
+    validate_run_readiness,
+    validate_selection,
+)
 from .reporting import ReportError, write_report
 
 
@@ -95,7 +101,12 @@ def validation_document(config: BenchmarkConfig) -> dict[str, Any]:
 def _csv_set(values: list[str] | None) -> set[str] | None:
     if not values:
         return None
-    return {item for value in values for item in value.split(",") if item}
+    return {
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    }
 
 
 def _default_output(config: BenchmarkConfig) -> Path:
@@ -156,13 +167,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.iterations is not None and args.iterations < 1:
             raise ConfigError("--iterations must be >= 1")
         validate_run_readiness(config)
+        only_servers = _csv_set(args.server)
+        only_scenarios = _csv_set(args.scenario)
+        validate_selection(config, only_servers, only_scenarios)
+        validate_cold_readiness(config, only_servers, only_scenarios)
         output = Path(args.output_dir) if args.output_dir else _default_output(config)
         output.mkdir(parents=True, exist_ok=False)
         harness = BenchmarkHarness(
             config,
             output,
-            only_servers=_csv_set(args.server),
-            only_scenarios=_csv_set(args.scenario),
+            only_servers=only_servers,
+            only_scenarios=only_scenarios,
             iterations_override=args.iterations,
         )
         raw_path = harness.run()

@@ -5,6 +5,10 @@ Companion to [PLAYBACK.md](PLAYBACK.md) (how plurx chooses a delivery path) and
 the controlled A/B performance suite. It runs the same media, controller,
 operation, output rung, and trial order against Cinema/plurx and Plex, then
 writes raw JSONL plus p50/p95/p99, failure rates, and Cinema-to-Plex ratios.
+Before timing begins, it opens each unique transcode contract once and uses
+FFprobe plus server/HLS metadata to prove both products delivered the requested
+height, H.264/AAC codecs, and bitrate tolerance. A mismatch aborts the run; an
+unverified contract never earns a ratio.
 
 The harness does not contain benchmark results. Numbers enter the repository
 only when you run it against real servers and media; the default output is
@@ -86,9 +90,12 @@ Before a publishable run:
    record the Plex version. Plex often does not expose a commit; leave
    `server_commit` null rather than inventing one.
 2. **Match the transcode contract.** Both products must produce H.264/AAC at the
-   configured height and bitrate. Confirm hardware acceleration is either on
-   for both or off for both. Record exceptions such as tone mapping — they are
-   part of the engine being compared, not a reason to relabel the result.
+   configured height and within `output_bitrate_tolerance_percent` of the
+   requested bitrate. The harness probes the delivered streams and rejects a
+   different codec, height, or bitrate rung before it writes measurements.
+   Confirm hardware acceleration is either on for both or off for both. Record
+   exceptions such as tone mapping — they are part of the engine being
+   compared, not a reason to relabel the result.
 3. **Remove unrelated work.** Stop scans, thumbnail generation, backup jobs,
    downloads, and other streams. Disable Plex Relay and test on the LAN so a
    cloud path cannot enter one side.
@@ -98,9 +105,13 @@ Before a publishable run:
    `cold` is rejected unless both servers configure `before_trial_command`.
    Those hooks must implement equivalent cache/transcode cleanup and should be
    preserved with the result.
-6. **Let the harness alternate order.** Even iterations run the configured
-   server order; odd iterations reverse it. This balances thermal drift and
-   background load. `cooldown_seconds` separates each side of a pair.
+6. **Let the harness alternate every pair.** Pair zero runs the configured
+   server order; pair one reverses it, and the pattern continues across scopes
+   and seek targets. At each scope, the 50-seek case therefore has 25
+   Cinema-first and 25 Plex-first pairs instead of putting one product first
+   every time.
+   `pair_sequence`, `pair_server_order`, and `server_order_index` preserve that
+   order in every raw row. `cooldown_seconds` separates each side of a pair.
 
 Do not clear the OS page cache on one side and only delete a product transcode
 cache on the other. “Cold” is a protocol, not a feeling.
@@ -123,11 +134,18 @@ scripts/cinema-plex-bench validate \
   --require-v1                               # expands targets; contacts no server
 ```
 
-The config rejects credentials embedded in URLs. Tokens are not written to the
-manifest, raw rows, reports, or errors. For end-to-end direct/Plex HLS decoding,
-FFmpeg receives the authorization header as a process argument, so run the
-controller on a trusted account where other users cannot inspect its process
-list.
+`client.ffmpeg` owns timed decode work; `client.ffprobe` owns the untimed
+output-contract preflight. Pin both executables from the same toolchain so the
+manifest and delivered-stream proof describe one controller environment.
+
+The config rejects credentials embedded in URLs and rejects unknown fields such
+as a plaintext `token` or `password`. Tokens are not written to the manifest,
+raw rows, reports, or errors. Hook and monitor argv are redacted from the
+manifest; it records only that they were configured and their argument count.
+Archive a reviewed, secret-free copy of those helpers beside any published
+result. For direct/Plex HLS work, FFmpeg and FFprobe receive the authorization
+header as a process argument, so run the controller on a trusted account where
+other users cannot inspect its process list.
 
 Each server table accepts optional hook and monitor argv arrays. Arrays are
 executed directly — never through a shell — and receive a credential-free trial
@@ -160,6 +178,9 @@ run, configure a server-side sampler that prints exactly one JSON object:
 CPU and GPU are instantaneous percentages; the report row uses the mean of the
 before/after values. RSS is a gauge; the row uses the larger endpoint. Storage
 and network values are monotonic counters; the row stores `after - before`.
+If a counter moves backward after a process, container, or host restart, its
+delta is `null` and `resource_anomalies` names the reset. A reset is unknown
+usage, never zero usage.
 Sample the product's whole process tree or container/cgroup, because the
 transcoder is a child process. Host-wide network counters are acceptable only
 on an otherwise quiet host and must be labeled as such with the archived
@@ -176,6 +197,13 @@ Start with one direct and one transcode scenario at one iteration. An exact
 `--output-dir` must not already exist, which prevents a second run from
 overwriting evidence.
 
+Before the first timed row, the harness starts one stream for each unique
+server/media/height/bitrate contract. FFprobe verifies delivered codecs and
+dimensions; the Cinema session ladder or Plex HLS master supplies the
+advertised bitrate. This intentionally establishes a warm contract. Every
+`cold` trial still runs its mandatory `before_trial_command`, so the preflight
+cannot silently turn a cold claim into a warm one.
+
 ```bash
 scripts/cinema-plex-bench run \
   --config target/cinema-plex.toml \
@@ -188,17 +216,24 @@ scripts/cinema-plex-bench run --config target/cinema-plex.toml
 ```
 
 You can restrict a diagnostic pass with `--server cinema` or repeat/comma-
-separate `--scenario`. A single-server run is useful for repair, but it cannot
+separate `--scenario`. A single-server run requires only that server's token.
+Unknown or empty selectors fail before an output directory is created or a
+server is contacted. A single-server run is useful for repair, but it cannot
 produce Cinema-vs-Plex ratios and is not an A/B result.
 
 Every successful run contains:
 
 | Artifact | Job |
 |---|---|
-| `manifest.json` | Config copy, controller fingerprint, discovered server/media facts, completion status. |
+| `manifest.json` | Redacted config, controller fingerprint, discovered media, verified output contracts, completion status. |
 | `raw.jsonl` | One append-and-flush measurement per attempt; survives an interrupted run. |
 | `summary.json` | Machine-readable groups, p50/p95/p99, failure rates, and both ratio directions. |
 | `report.md` | Human table plus the scope and ratio interpretation. |
+
+Config, manifest, and raw evidence currently use `schema_version = 2`. The
+adversarial-review fields changed the raw contract, so schema-1 evidence is
+rejected explicitly instead of being guessed into a modern ratio. Keep the
+harness revision with archived results when long-term regeneration matters.
 
 An interrupted run keeps its raw rows and a `failed` or `running` manifest. Do
 not merge partial rows with a later run: the order balance and environment may
@@ -212,10 +247,10 @@ Every measurement row includes these fields even when a value is `null`:
 |---|---|
 | Identity | `run_id` · `pair_id` · server/name/product/version/commit/instance |
 | Client/media | client/name/version/host · media/title/SHA-256 · source dimensions/container |
-| Codecs/rates | source and output video/audio codecs · requested/basis/advertised kb/s |
-| Operation | scenario · operation/variant · scope · mode · cache state · iteration · seek target/delta |
+| Codecs/rates | source and probed output codecs · output height · requested/basis/advertised kb/s · verification basis |
+| Operation | scenario · operation/variant · scope · mode · cache state · iteration · seek target/delta · pair order |
 | Result | `latency_ms` · `success` · typed/redacted error · operation details |
-| Resources | CPU · GPU · RSS · storage read/write · network receive/transmit · resource scope |
+| Resources | CPU · GPU · RSS · storage read/write · network receive/transmit · resource scope · reset anomalies |
 
 Sessions and authorization URLs are deliberately absent. A failed attempt is a
 row, not an exception that disappears from the denominator.
