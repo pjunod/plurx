@@ -92,6 +92,32 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **The Apple clients step the quality ladder down when a stream stalls.** A
+  sustained freeze or buffering wait on a growing HLS session no longer rebuilds
+  the rung that just starved. The replacement create names the exact
+  `previous_session_id` with `reopen_reason: "stall"` under one `request_id`
+  minted for that stall, so the server resolves it one rung down and a transport
+  replay returns that same persisted answer rather than stepping the ladder
+  twice. Every create now also states `quality_auto`, which is the viewer's
+  answer to the quality menu and not an inference from whether a height was
+  posted — without it the source height a subtitle burn sends as a promise about
+  the output reads as a sticky manual pick, and that session could never be
+  stepped down again. The bound at the ladder floor is the client's, because the
+  server answers a floor session with the rung it is already on every time and
+  deliberately counts nothing: two consecutive reopens that fail to buy a
+  strictly lower rung now end in the ordinary stall failure instead of looping,
+  and a height the server could not state — `0` for a remux of an unprobed
+  source, or absent from an older server — counts as no step down. That bound
+  covers one starvation episode rather than the whole film: a minute of
+  recovered playback clears it, so a brief blip cannot leave the rest of a title
+  with no automatic recovery. Direct play,
+  VOD, and offline recovery stay unbound; a stall ticket is dropped once a seek
+  or track change has superseded the session it names, so a racing viewer
+  command is deterministic and never posts a create the server is bound to
+  refuse; and a bound create refused with `400` is re-posted once unbound under
+  a fresh id, which is what a claim normalized just before a retryable failure
+  looks like on replay.
+
 - **The playback lab can now drive a session through a bandwidth cliff.**
   `scripts/playback-lab run --suite stall-recovery --network-profile
   8mbps-to-1.5mbps --json <artifact>` meters everything the browser pulls
