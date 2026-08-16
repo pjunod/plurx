@@ -1,8 +1,8 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 through M2 are complete; one-voter Hiqlite activates
-after verified import, while M3 membership, health, and singleton fencing are
-next
+**Status:** executing — M0 through M3a are complete; Hiqlite now activates,
+grows, and safely removes a follower, while the remaining M3 discovery,
+offline-work resolution, activity aggregation, and singleton fencing are next
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
 2026-08-15
@@ -120,7 +120,8 @@ existing `[server]\nnmae = "typo"` rejection remains unchanged.
 [cluster]
 raft_bind = "0.0.0.0:32401"      # raft replication, adjacent to public 32400
 api_bind = "0.0.0.0:32402"       # authenticated node-to-node requests
-advertise_host = ""              # empty derives this node's reachable address
+advertise_host = ""              # empty keeps a never-joined voter on loopback
+join_url = ""                    # empty derives the public API URL above
 join_token_file = ""             # absent bootstraps/reopens one voter
 trusted_network = ""             # required if transport is not TLS
 ```
@@ -134,6 +135,20 @@ SQL. A single-use join token contains cluster id,
 bootstrap addresses, expiry, the new raft id, and an encrypted envelope for
 those secrets; the one-time token secret wraps the envelope and is invalidated
 after membership commits.
+
+**Delivered 2026-08-15 (M3a).** The admin API mints an opaque token whose
+payload is authenticated and encrypted with XChaCha20-Poly1305. Replicated SQL
+keeps only its SHA-256 digest, expiry, assigned Raft id, and redemption state.
+The joining daemon reads the token from `join_token_file`, creates a distinct
+`node.id`, enters through Hiqlite's authenticated learner-to-voter path, and
+deletes the token file only after voter membership and token finalization both
+commit. Expired and finalized tokens have the stable, distinct codes
+`join_token_expired` and `join_token_reused`; token material is absent from
+logs, status, node records, and TOML. The joining node opens the complete token
+locally and sends only its SHA-256 digest to redeem/finalize, so the secrets in
+the envelope never cross the public HTTP request. `membership.json` keeps that
+digest as the local crash-resume gate; a foreign leftover token warns and is
+ignored on an already healthy voter.
 
 Trakt is the exception to the otherwise hash-only credential rows: its access
 and refresh tokens are live bearer secrets. Replicating plaintext would copy
@@ -673,12 +688,13 @@ commit and byte budgets. No §6.6 activation blocker remains outstanding.
 
 Before M3 introduces peers, both cluster listeners are loopback-only; no
 replication traffic exists to expose and no remote consumer exists to serve.
-The API listener keeps automatic TLS and its authenticating secret, but it
-ignores a non-loopback `api_bind` and `advertise_host`: its only consumer is a
-maintenance command on the same machine, so honouring the `0.0.0.0` default
-would open a LAN port on every single-node install at upgrade with nothing on
-the other end. M3 opens it deliberately, with membership, when a peer exists to
-talk to.
+The API listener keeps automatic TLS and its authenticating secret, but before
+M3 it ignored a non-loopback `api_bind` and `advertise_host`: its only consumer
+was a maintenance command on the same machine, so honouring the `0.0.0.0`
+default would have opened a LAN port on every single-node install at upgrade
+with nothing on the other end. M3 keeps that default closed and opens the
+listeners only when the operator sets `advertise_host` as the explicit first
+step toward admitting a peer.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
@@ -686,13 +702,33 @@ Add single-use join, add/remove, health, server-name replication, node-specific
 mDNS/GDM, and the admin membership surface. Two voters are a visible degraded
 reconfiguration state, never supported HA.
 
+**M3a delivered 2026-08-15.** A running voter can issue a bounded, single-use
+join token; a fresh daemon consumes it to join as a real voter without changing
+the replicated `instance.id`. The admin-only membership API exposes
+privacy-safe node id, Raft id, voter/learner role, reachability, and last-seen,
+then embeds the existing §6.6/#233 replication projection as its only lag
+answer. Both remote cluster listeners use automatic TLS, and the listener
+policy refuses a public cleartext bind. A never-joined installation remains on
+loopback until the operator sets `advertise_host`; a sole voter then rebuilds
+only its one-node Raft metadata from a verified Hiqlite snapshot so the
+committed address, not merely `membership.json`, becomes reachable. The
+transition is refused after a learner or peer exists, and later remote listener
+host or port drift is refused rather than validating one address and silently
+binding another. Follower removal is allowed only from three or more voters;
+the resulting two-voter set reports `degraded_reconfiguration`, and any 2→1
+removal is deliberately refused with `removal_would_lose_quorum` until a later
+milestone proves a downgrade protocol.
+
 Node removal must also resolve offline work owned by that node. A `preparing`
 package cannot be silently re-homed because its replicated `source_path` does
 not prove the survivor has the same mount. Before removal commits, M3 must
 either verify an equivalent source and explicitly requeue on a chosen node, or
 mark the package failed with a stable `node_removed` code so its reservation is
 released and the client can retry. Leaving it preparing until seven-day expiry
-is an activation blocker.
+is an activation blocker. M3a takes the conservative first step: it refuses
+removal with `node_owns_offline_work` when any queued, preparing, ready, or
+failed package belongs to the target. A later M3 child owns the explicit
+re-home/fail policy; silent reassignment remains forbidden.
 
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
@@ -773,22 +809,26 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M2 activates one voter; M3 owns membership
+## 8. Handoff checkpoint — M3a owns voters; M3 still owns discovery and fencing
 
 M0 through M2 provide the complete one-voter path: exact import parity, a
 durable activation marker, atomic target selection, failure-injected SQLite
 recovery, replicated daemon startup, and credential sealing before the immutable
 source backup is published. The post-coalescer compacted-growth and credential
-encryption gates are closed. Node removal is not a one-voter activation gate: it
-belongs to M3, where a survivor exists and offline work can otherwise be stranded
-or re-homed incorrectly. The next implementation boundary is membership, health,
-and singleton fencing in §6.7.
+encryption gates are closed. M3a adds bounded single-use admission, real
+learner-to-voter growth, replicated privacy-safe node records, health, and safe
+follower removal. It refuses removal while the target owns offline work rather
+than guessing that another mount contains the same bytes. The remaining §6.7
+boundaries are server-name/discovery parity, activity aggregation, deliberate
+offline-work resolution, and singleton fencing.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
-make cluster-check            # M1b-M2 durable state, import, FTS, and loss gate
+make cluster-check            # M1b-M3a state, membership, import, and loss gate
 make cluster-growth           # 10,000-beat compacted growth + raw control
+cargo run --locked -p plurx-cluster-check -- membership
+                              # focused real-process 1 -> 3 -> 2 lifecycle
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```
