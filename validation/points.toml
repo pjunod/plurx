@@ -11,6 +11,7 @@ audit_paths = [
   "Cargo.toml",
   "Dockerfile",
   "Makefile",
+  "benchmarks/**",
   "clients/**",
   "crates/**",
   "deploy/**",
@@ -48,6 +49,15 @@ title = "Deploy, CI, container, and client shipping contracts"
 command = "python3 -m unittest discover -s tests/operations -p 'test_*.py'"
 profiles = ["commit", "ci", "full", "nightly"]
 requires = ["bash", "make", "python3", "sh"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
+id = "benchmark-contract"
+title = "Cinema-vs-Plex benchmark config, runners, raw schema, and reports"
+command = "make benchmark-check"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["make", "python3"]
 missing = "fail"
 timeout_seconds = 120
 
@@ -428,6 +438,20 @@ paths = [
 ]
 checks = ["rust-gate", "user-journey"]
 depends_on = ["core.media", "server.api", "library.catalog"]
+
+[[points]]
+id = "playback.benchmark"
+title = "Cinema-vs-Plex controlled A/B benchmark"
+contract = "The same corpus, operations, output contract, and client clock produce credential-safe raw evidence, distributions, failure rates, and directionally explicit ratios for Cinema and Plex."
+paths = [
+  "benchmarks/**",
+  "docs/BENCHMARKING.md",
+  "scripts/cinema-plex-bench",
+  "scripts/cinema_plex_bench/**",
+  "tests/benchmark/**",
+]
+checks = ["benchmark-contract"]
+depends_on = ["playback.pipeline"]
 
 [[points]]
 id = "offline.viewing"
