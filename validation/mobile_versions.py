@@ -156,6 +156,7 @@ def validate_versions(
     current: MobileVersions,
     *,
     baseline: MobileVersions | None = None,
+    scope_baseline: MobileVersions | None = None,
     changed_paths: tuple[str, ...] = (),
     baseline_label: str | None = None,
 ) -> tuple[str, ...]:
@@ -192,7 +193,14 @@ def validate_versions(
     if baseline is None:
         return tuple(errors)
 
-    workspace_changed = current.workspace != baseline.workspace
+    # "Did this branch bump the release?" is a property of the branch, so it is
+    # answered against the branch point even when the counters are answered
+    # against the merge target. Reading it off the target instead conflates "the
+    # branch released" with "the target released", which reds every open branch
+    # the moment a release lands and tells each one to bump counters it never
+    # touched.
+    scope = baseline if scope_baseline is None else scope_baseline
+    workspace_changed = current.workspace != scope.workspace
     apple_changed = workspace_changed or any(
         _matches_release_path(path, APPLE_RELEASE_PATHS, APPLE_RELEASE_FILES)
         for path in changed_paths
@@ -270,6 +278,10 @@ def check_repository(
     target has not moved; once it has, only the target tip answers the question
     the store cares about, which is whether the counter is still an increase if
     this merged right now.
+
+    Scope is the whole of scope: both the changed paths and the workspace-version
+    comparison are read against ``base``. Only the counters move to
+    ``merge_target``.
     """
     if merge_target and mode != "changed-from":
         raise MobileVersionError(
@@ -278,6 +290,7 @@ def check_repository(
         )
 
     baseline_label: str | None = None
+    scope_baseline: MobileVersions | None = None
     if mode == "staged":
         changed = _changed_paths(root, "--cached", "HEAD")
         current = read_versions(_git_reader(root, ""))
@@ -287,12 +300,15 @@ def check_repository(
             raise MobileVersionError("changed-from validation requires a Git base")
         changed = _changed_paths(root, f"{base}...HEAD")
         current = read_versions(_git_reader(root, "HEAD"))
-        # A missing or unreadable merge target fails the check rather than
-        # falling back to the branch point. Failing open here reproduces the
-        # exact defect this baseline exists to catch: a green result on a tree
-        # that cannot ship.
-        baseline = read_versions(_git_reader(root, merge_target or base))
-        baseline_label = merge_target
+        baseline = scope_baseline = read_versions(_git_reader(root, base))
+        if merge_target:
+            # Scope stays on the branch point read above; only the counters move
+            # to the target. A missing or unreadable merge target fails the check
+            # rather than falling back to the branch point. Failing open here
+            # reproduces the exact defect this baseline exists to catch: a green
+            # result on a tree that cannot ship.
+            baseline = read_versions(_git_reader(root, merge_target))
+            baseline_label = merge_target
     elif mode in {"all", "paths", "point"}:
         changed = ()
         current = read_versions(_filesystem_reader(root))
@@ -303,6 +319,7 @@ def check_repository(
     return validate_versions(
         current,
         baseline=baseline,
+        scope_baseline=scope_baseline,
         changed_paths=changed,
         baseline_label=baseline_label,
     )
