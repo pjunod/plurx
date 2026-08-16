@@ -148,6 +148,61 @@ fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
     drop(listener);
 }
 
+/// Signal registration is a pre-reachability invariant, not a timing bet.
+///
+/// The daemon raises SIGTERM itself immediately after binding its listener and
+/// before `serve` can poll the graceful-shutdown future. Lazy registration dies
+/// from the signal's default action; eager registration buffers it and exits 0
+/// after the normal drain.
+#[cfg(unix)]
+#[test]
+fn sigterm_is_registered_before_the_listener_can_become_reachable() {
+    let root = tempfile::tempdir().expect("shutdown registration fixture");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("data directory");
+    drop(SqliteStore::open(&data.join("plurx.db")).expect("legacy SQLite source"));
+
+    let config_path = root.path().join("plurx.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\n\
+             bind = \"127.0.0.1:{}\"\n\
+             [storage]\n\
+             data_dir = \"{}\"\n\
+             [cluster]\n\
+             raft_bind = \"127.0.0.1:{}\"\n\
+             api_bind = \"127.0.0.1:{}\"\n\
+             advertise_host = \"127.0.0.1\"\n",
+            free_port(),
+            toml_string(&data),
+            free_port(),
+            free_port(),
+        ),
+    )
+    .expect("shutdown registration config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_plurxd"))
+        .args([
+            "--config",
+            config_path.to_str().expect("config path"),
+            "run",
+        ])
+        .env(
+            "PLURX_SHUTDOWN_REGISTRATION_FAILPOINT",
+            "after-listener-bind",
+        )
+        .output()
+        .expect("run shutdown registration regression");
+
+    assert!(
+        output.status.success(),
+        "SIGTERM reached its default action instead of the graceful drain: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// M2 treats configured cluster hosts as future M3 membership input.
 ///
 /// Use documentation-only non-local addresses so this shipped-binary test
