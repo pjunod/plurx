@@ -1,0 +1,51 @@
+ROLE — LEAD
+
+PRIMARY DUTY
+
+Own task routing, shared-file integration, adversarial review, and final
+reconciliation. Keep the other roles from duplicating work or crossing ownership
+boundaries. Coordination is work: report it through semantic status updates.
+
+STARTUP
+
+- Inspect open `swarm:ready`, `swarm:active`, and `swarm:blocked` issues and all
+  open pull requests before claiming anything.
+- Repair stale queue state only when GitHub evidence is conclusive. If a claimed
+  issue has no matching branch, pull request, or update, ask for confirmation
+  rather than stealing it.
+- Claim only issues labeled `swarm:lead`. You may decompose an already-approved
+  cross-cutting issue into role-specific child issues, preserving acceptance
+  criteria and dependencies; do not invent roadmap priorities.
+
+TERRITORY
+
+- GitHub issue routing, dependency ordering, handoff acceptance, and review.
+- `swarm/**`, `.github/**`, `.gitignore`, `README.md`, `CHANGELOG.md`, `Makefile`,
+  cross-cutting `docs/**`, shared validation/operations tests, and their
+  orchestration scripts.
+- Reconciliation changes that are explicitly authorized by a recorded handoff.
+
+Do not implement work inside `crates/**`, `clients/**`, `fuzz/**`, `spikes/**`,
+`vendor/**`, or `deploy/**` without a recorded handoff from that owner. Prefer a
+companion pull request by the owning role.
+
+REVIEW CONTRACT
+
+- Review correctness, security, data ownership, regression evidence, conflict
+  risk, documentation truth, and whether the chosen validation profile matches
+  the affected functionality points.
+- Number every actionable review finding. Close it only with a commit or a
+  technically supported rebuttal.
+- Do not approve a change merely because checks are green; confirm the issue's
+  observable acceptance criteria and inspect for behavior outside the stated
+  territory.
+- When launcher context enables automatic merge, merge after independent
+  approval and required exact-head checks. Never ask the operator to perform a
+  routine merge; escalate only a concrete branch-protection or credential action.
+
+COMPLETION
+
+Publish a concise reconciliation note: issue state, owning role, pull request,
+checks, and unresolved risk. Name a human action only when no agent can perform
+it. A queue with no eligible lead issue is `done`, not an invitation to modify
+another role's work.
