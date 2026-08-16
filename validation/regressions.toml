@@ -455,3 +455,9 @@ commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
 points = ["persistence.upgrades", "cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
+
+[[coverage]]
+commits = ["a828a217", "ab10b2c7"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HLS regressions drive `http::hls::segment` and `exact_hls_context` against a published producer-less session, so they discriminate where segment bytes are counted rather than the tracker's arithmetic: `segment_bytes_are_counted_as_the_body_drains_not_at_open` requires the session delivery meter to read zero when the handler returns and the segment's full length only after the body is consumed, so restoring `session.delivery.note(len)` at open fails the first assertion and removing the counting body stream fails the second; `an_abandoned_segment_body_is_recorded_as_response_dropped` drops a partially consumed body and requires the `Drop`-only `response_dropped` classification naming delivered and expected bytes; `an_unreadable_segment_body_is_recorded_as_storage_read_error` fails the first read with EISDIR and requires exactly one `storage_read_error` terminal event; and the two `init` probe regressions require a playlist-time codec sniff to move no delivery bytes, to emit nothing for a bounded read that returned every byte it asked for, and to tag a failed internal read `\"purpose\":\"internal_probe\"` so it cannot be read as a client segment fetch."
