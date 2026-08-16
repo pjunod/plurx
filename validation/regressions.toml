@@ -211,10 +211,11 @@ commits = [
   "552e3449",
   "7868f4da",
   "ea7862f6",
+  "9e649050",
 ]
 points = []
 checks = []
-reason = "These commits only correct documentation, comments, record a review, or change ignored generated cache state; they introduce no executable behavior."
+reason = "These commits only correct documentation, comments, record a review, change ignored generated cache state, or configure the repo-local external swarm harness; they introduce no executable application behavior."
 ignore = true
 
 [[coverage]]
