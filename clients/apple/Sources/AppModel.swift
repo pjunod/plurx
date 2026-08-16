@@ -758,9 +758,14 @@ final class AppModel: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
-    func decision(fileId: Int) async throws -> Decision {
+    /// `selection` is the viewer's pre-play track choice and is empty for every
+    /// ordinary play, which keeps that request byte-for-byte what it was.
+    func decision(fileId: Int, selection: PrePlaySelection = .none) async throws -> Decision {
         do {
-            return try await requireAPI().decision(fileId: fileId, caps: caps())
+            return try await requireAPI().decision(
+                fileId: fileId,
+                caps: caps() + selection.queryItems
+            )
         } catch {
             noteAuthFailure(error)
             throw error
