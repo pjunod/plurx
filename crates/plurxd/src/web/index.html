@@ -587,14 +587,20 @@
   /* Cluster membership. The state banner is the most important thing on the
      panel: two voters are a reconfiguration waypoint, and the one way this
      screen could do real harm is by looking like a reassuring green tick when
-     the cluster survives no failure. The tone class is set from the state, and
-     `warn` is deliberately the two-voter case rather than an error case. */
+     the cluster survives no failure. `warn` is therefore the two-voter case
+     rather than an error case.
+
+     The tone rides on the left border, never on the text colour. Two themes
+     only just clear AA for --warn on --panel2 (scripts/contrast-allow.txt lists
+     that pair), and this is the one paragraph on the screen that has to be
+     legible everywhere. Colour is redundant here anyway: it says "not
+     redundant" in words. */
   .clstate{border:1px solid var(--line);border-left-width:3px;border-radius:10px;
     background:var(--panel2);padding:12px 15px;margin:0 0 16px}
-  .clstate h3{margin:0 0 5px;font-size:15px;font-weight:700}
-  .clstate p{margin:0;font-size:13px;color:var(--prose,var(--muted));line-height:1.55}
-  .clstate.good{border-left-color:var(--good)} .clstate.good h3{color:var(--good)}
-  .clstate.warn{border-left-color:var(--warn,#fbbf24)} .clstate.warn h3{color:var(--warn,#fbbf24)}
+  .clstate h3{margin:0 0 5px;font-size:15px;font-weight:700;color:var(--text)}
+  .clstate p{margin:0;font-size:13px;color:var(--text);line-height:1.55}
+  .clstate.good{border-left-color:var(--good)}
+  .clstate.warn{border-left-color:var(--warn,#fbbf24)}
   .clstate.calm{border-left-color:var(--line)}
   .clnode{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
   /* A join token is a complete cluster credential shown exactly once. It gets
@@ -606,7 +612,7 @@
     font-size:12px;line-height:1.5;word-break:break-all;user-select:all}
   .clrefusal{border:1px solid var(--warn,#fbbf24);border-radius:8px;background:var(--panel2);
     padding:11px 14px;margin-top:12px;font-size:13px;line-height:1.55}
-  .clrefusal b{display:block;margin-bottom:3px;color:var(--warn,#fbbf24)}
+  .clrefusal b{display:block;margin-bottom:3px;color:var(--text)}
   /* Trakt device-link code: big, mono, unmissable — you type it on another screen */
   .traktcode{font-family:var(--font-mono);font-size:34px;font-weight:700;letter-spacing:.18em;color:var(--accent);margin:10px 0 2px;user-select:all}
   .syncnow{padding:6px 10px 2px;font-size:13px;font-weight:600}

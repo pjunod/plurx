@@ -1799,7 +1799,7 @@ catalog|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
 catalog|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 catalog|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 catalog|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
-catalog|settings@1280x860|dom|div.settabs > button.settab[text]|4
+catalog|settings@1280x860|dom|div.settabs > button.settab[text]|5
 catalog|settings@1280x860|dom|div.setwarn[text] > a[text]|1
 catalog|settings@1280x860|dom|div.setwarn[text] > b[text]|2
 catalog|settings@1280x860|dom|label.schedpair[text] > input#job-boot[type=checkbox]|1
@@ -1885,44 +1885,45 @@ catalog|settings@1280x860|focus|010|button.settab "Metadata"
 catalog|settings@1280x860|focus|011|button.settab "Playback"
 catalog|settings@1280x860|focus|012|button.settab "Users"
 catalog|settings@1280x860|focus|013|button.settab "System"
-catalog|settings@1280x860|focus|014|button.ghost.sm "Scan every library for new & changed files"
-catalog|settings@1280x860|focus|015|button.ghost.sm "Re-fetch metadata & artwork for every libra
-catalog|settings@1280x860|focus|016|select#sched-scan-2 "How often to look for new & changed fil
-catalog|settings@1280x860|focus|017|select#sched-ref-2 "How often to re-fetch metadata for every
-catalog|settings@1280x860|focus|018|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|019|button.ghost.sm "Scan"
-catalog|settings@1280x860|focus|020|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@1280x860|focus|021|button.ghost.sm "Edit"
-catalog|settings@1280x860|focus|022|button.ghost.sm "Delete"
-catalog|settings@1280x860|focus|023|select#sched-scan-1 "How often to look for new & changed fil
-catalog|settings@1280x860|focus|024|select#sched-ref-1 "How often to re-fetch metadata for every
-catalog|settings@1280x860|focus|025|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|026|button.ghost.sm "Scan"
-catalog|settings@1280x860|focus|027|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@1280x860|focus|028|button.ghost.sm "Edit"
-catalog|settings@1280x860|focus|029|button.ghost.sm "Delete"
-catalog|settings@1280x860|focus|030|select#sched-scan-3 "How often to look for new & changed fil
-catalog|settings@1280x860|focus|031|select#sched-ref-3 "How often to re-fetch metadata for every
-catalog|settings@1280x860|focus|032|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|033|button.ghost.sm "Scan"
-catalog|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@1280x860|focus|035|button.ghost.sm "Edit"
-catalog|settings@1280x860|focus|036|button.ghost.sm "Delete"
-catalog|settings@1280x860|focus|037|input#ln "Library name"
-catalog|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-catalog|settings@1280x860|focus|039|input#lp "Media paths"
-catalog|settings@1280x860|focus|040|button "Add & scan"
-catalog|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
-catalog|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
-catalog|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
-catalog|settings@1280x860|focus|044|input#job-boot
-catalog|settings@1280x860|focus|045|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
-catalog|settings@1280x860|focus|047|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
-catalog|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
-catalog|settings@1280x860|focus|050|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|051|<wrap>
+catalog|settings@1280x860|focus|014|button.settab "Cluster"
+catalog|settings@1280x860|focus|015|button.ghost.sm "Scan every library for new & changed files"
+catalog|settings@1280x860|focus|016|button.ghost.sm "Re-fetch metadata & artwork for every libra
+catalog|settings@1280x860|focus|017|select#sched-scan-2 "How often to look for new & changed fil
+catalog|settings@1280x860|focus|018|select#sched-ref-2 "How often to re-fetch metadata for every
+catalog|settings@1280x860|focus|019|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|020|button.ghost.sm "Scan"
+catalog|settings@1280x860|focus|021|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@1280x860|focus|022|button.ghost.sm "Edit"
+catalog|settings@1280x860|focus|023|button.ghost.sm "Delete"
+catalog|settings@1280x860|focus|024|select#sched-scan-1 "How often to look for new & changed fil
+catalog|settings@1280x860|focus|025|select#sched-ref-1 "How often to re-fetch metadata for every
+catalog|settings@1280x860|focus|026|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|027|button.ghost.sm "Scan"
+catalog|settings@1280x860|focus|028|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@1280x860|focus|029|button.ghost.sm "Edit"
+catalog|settings@1280x860|focus|030|button.ghost.sm "Delete"
+catalog|settings@1280x860|focus|031|select#sched-scan-3 "How often to look for new & changed fil
+catalog|settings@1280x860|focus|032|select#sched-ref-3 "How often to re-fetch metadata for every
+catalog|settings@1280x860|focus|033|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|034|button.ghost.sm "Scan"
+catalog|settings@1280x860|focus|035|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@1280x860|focus|036|button.ghost.sm "Edit"
+catalog|settings@1280x860|focus|037|button.ghost.sm "Delete"
+catalog|settings@1280x860|focus|038|input#ln "Library name"
+catalog|settings@1280x860|focus|039|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+catalog|settings@1280x860|focus|040|input#lp "Media paths"
+catalog|settings@1280x860|focus|041|button "Add & scan"
+catalog|settings@1280x860|focus|042|select#job-probe "Re-run ffprobe on files whose media detail
+catalog|settings@1280x860|focus|043|select#job-art "Re-fetch posters for items a provider matche
+catalog|settings@1280x860|focus|044|select#job-clean "Delete leftover transcode working director
+catalog|settings@1280x860|focus|045|input#job-boot
+catalog|settings@1280x860|focus|046|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|047|select#telemetry-retain "How long node-local playback measur
+catalog|settings@1280x860|focus|048|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|049|select#cache-produce "How often to check what's worth encodi
+catalog|settings@1280x860|focus|050|select#cache-gb "How much disk finished pre-transcodes may o
+catalog|settings@1280x860|focus|051|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|052|<wrap>
 catalog|settings@1280x860|req|GET /api/v1/activity|2
 catalog|settings@1280x860|req|GET /api/v1/libraries|1
 catalog|settings@1280x860|req|GET /api/v1/me|1
@@ -1999,7 +2000,7 @@ catalog|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
 catalog|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 catalog|settings@390x780|dom|div.sched > span.schedpair[text]|9
 catalog|settings@390x780|dom|div.settabs > button.active.settab[text]|1
-catalog|settings@390x780|dom|div.settabs > button.settab[text]|4
+catalog|settings@390x780|dom|div.settabs > button.settab[text]|5
 catalog|settings@390x780|dom|div.setwarn[text] > a[text]|1
 catalog|settings@390x780|dom|div.setwarn[text] > b[text]|2
 catalog|settings@390x780|dom|label.schedpair[text] > input#job-boot[type=checkbox]|1
@@ -2082,48 +2083,49 @@ catalog|settings@390x780|focus|007|button.settab "Metadata"
 catalog|settings@390x780|focus|008|button.settab "Playback"
 catalog|settings@390x780|focus|009|button.settab "Users"
 catalog|settings@390x780|focus|010|button.settab "System"
-catalog|settings@390x780|focus|011|button.ghost.sm "Scan every library for new & changed files"
-catalog|settings@390x780|focus|012|button.ghost.sm "Re-fetch metadata & artwork for every libra
-catalog|settings@390x780|focus|013|select#sched-scan-2 "How often to look for new & changed fil
-catalog|settings@390x780|focus|014|select#sched-ref-2 "How often to re-fetch metadata for every
-catalog|settings@390x780|focus|015|button.ghost.sm "Save"
-catalog|settings@390x780|focus|016|button.ghost.sm "Scan"
-catalog|settings@390x780|focus|017|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@390x780|focus|018|button.ghost.sm "Edit"
-catalog|settings@390x780|focus|019|button.ghost.sm "Delete"
-catalog|settings@390x780|focus|020|select#sched-scan-1 "How often to look for new & changed fil
-catalog|settings@390x780|focus|021|select#sched-ref-1 "How often to re-fetch metadata for every
-catalog|settings@390x780|focus|022|button.ghost.sm "Save"
-catalog|settings@390x780|focus|023|button.ghost.sm "Scan"
-catalog|settings@390x780|focus|024|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@390x780|focus|025|button.ghost.sm "Edit"
-catalog|settings@390x780|focus|026|button.ghost.sm "Delete"
-catalog|settings@390x780|focus|027|select#sched-scan-3 "How often to look for new & changed fil
-catalog|settings@390x780|focus|028|select#sched-ref-3 "How often to re-fetch metadata for every
-catalog|settings@390x780|focus|029|button.ghost.sm "Save"
-catalog|settings@390x780|focus|030|button.ghost.sm "Scan"
-catalog|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-catalog|settings@390x780|focus|032|button.ghost.sm "Edit"
-catalog|settings@390x780|focus|033|button.ghost.sm "Delete"
-catalog|settings@390x780|focus|034|input#ln "Library name"
-catalog|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-catalog|settings@390x780|focus|036|input#lp "Media paths"
-catalog|settings@390x780|focus|037|button "Add & scan"
-catalog|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
-catalog|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a provider matche
-catalog|settings@390x780|focus|040|select#job-clean "Delete leftover transcode working director
-catalog|settings@390x780|focus|041|input#job-boot
-catalog|settings@390x780|focus|042|button.ghost.sm "Save"
-catalog|settings@390x780|focus|043|select#telemetry-retain "How long node-local playback measur
-catalog|settings@390x780|focus|044|button.ghost.sm "Save"
-catalog|settings@390x780|focus|045|select#cache-produce "How often to check what's worth encodi
-catalog|settings@390x780|focus|046|select#cache-gb "How much disk finished pre-transcodes may o
-catalog|settings@390x780|focus|047|button.ghost.sm "Save"
-catalog|settings@390x780|focus|048|a.px-tab "Home"
-catalog|settings@390x780|focus|049|button.px-tab "Libraries"
-catalog|settings@390x780|focus|050|button.px-tab "Search"
-catalog|settings@390x780|focus|051|a.px-tab "Activity"
-catalog|settings@390x780|focus|052|<wrap>
+catalog|settings@390x780|focus|011|button.settab "Cluster"
+catalog|settings@390x780|focus|012|button.ghost.sm "Scan every library for new & changed files"
+catalog|settings@390x780|focus|013|button.ghost.sm "Re-fetch metadata & artwork for every libra
+catalog|settings@390x780|focus|014|select#sched-scan-2 "How often to look for new & changed fil
+catalog|settings@390x780|focus|015|select#sched-ref-2 "How often to re-fetch metadata for every
+catalog|settings@390x780|focus|016|button.ghost.sm "Save"
+catalog|settings@390x780|focus|017|button.ghost.sm "Scan"
+catalog|settings@390x780|focus|018|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@390x780|focus|019|button.ghost.sm "Edit"
+catalog|settings@390x780|focus|020|button.ghost.sm "Delete"
+catalog|settings@390x780|focus|021|select#sched-scan-1 "How often to look for new & changed fil
+catalog|settings@390x780|focus|022|select#sched-ref-1 "How often to re-fetch metadata for every
+catalog|settings@390x780|focus|023|button.ghost.sm "Save"
+catalog|settings@390x780|focus|024|button.ghost.sm "Scan"
+catalog|settings@390x780|focus|025|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@390x780|focus|026|button.ghost.sm "Edit"
+catalog|settings@390x780|focus|027|button.ghost.sm "Delete"
+catalog|settings@390x780|focus|028|select#sched-scan-3 "How often to look for new & changed fil
+catalog|settings@390x780|focus|029|select#sched-ref-3 "How often to re-fetch metadata for every
+catalog|settings@390x780|focus|030|button.ghost.sm "Save"
+catalog|settings@390x780|focus|031|button.ghost.sm "Scan"
+catalog|settings@390x780|focus|032|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+catalog|settings@390x780|focus|033|button.ghost.sm "Edit"
+catalog|settings@390x780|focus|034|button.ghost.sm "Delete"
+catalog|settings@390x780|focus|035|input#ln "Library name"
+catalog|settings@390x780|focus|036|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+catalog|settings@390x780|focus|037|input#lp "Media paths"
+catalog|settings@390x780|focus|038|button "Add & scan"
+catalog|settings@390x780|focus|039|select#job-probe "Re-run ffprobe on files whose media detail
+catalog|settings@390x780|focus|040|select#job-art "Re-fetch posters for items a provider matche
+catalog|settings@390x780|focus|041|select#job-clean "Delete leftover transcode working director
+catalog|settings@390x780|focus|042|input#job-boot
+catalog|settings@390x780|focus|043|button.ghost.sm "Save"
+catalog|settings@390x780|focus|044|select#telemetry-retain "How long node-local playback measur
+catalog|settings@390x780|focus|045|button.ghost.sm "Save"
+catalog|settings@390x780|focus|046|select#cache-produce "How often to check what's worth encodi
+catalog|settings@390x780|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
+catalog|settings@390x780|focus|048|button.ghost.sm "Save"
+catalog|settings@390x780|focus|049|a.px-tab "Home"
+catalog|settings@390x780|focus|050|button.px-tab "Libraries"
+catalog|settings@390x780|focus|051|button.px-tab "Search"
+catalog|settings@390x780|focus|052|a.px-tab "Activity"
+catalog|settings@390x780|focus|053|<wrap>
 catalog|settings@390x780|req|GET /api/v1/activity|2
 catalog|settings@390x780|req|GET /api/v1/libraries|1
 catalog|settings@390x780|req|GET /api/v1/me|1
@@ -3366,7 +3368,7 @@ classic|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
 classic|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 classic|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 classic|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
-classic|settings@1280x860|dom|div.settabs > button.settab[text]|4
+classic|settings@1280x860|dom|div.settabs > button.settab[text]|5
 classic|settings@1280x860|dom|div.setwarn[text] > a[text]|1
 classic|settings@1280x860|dom|div.setwarn[text] > b[text]|2
 classic|settings@1280x860|dom|div.topctl > div|4
@@ -3453,44 +3455,45 @@ classic|settings@1280x860|focus|010|button.settab "Metadata"
 classic|settings@1280x860|focus|011|button.settab "Playback"
 classic|settings@1280x860|focus|012|button.settab "Users"
 classic|settings@1280x860|focus|013|button.settab "System"
-classic|settings@1280x860|focus|014|button.ghost.sm "Scan every library for new & changed files"
-classic|settings@1280x860|focus|015|button.ghost.sm "Re-fetch metadata & artwork for every libra
-classic|settings@1280x860|focus|016|select#sched-scan-2 "How often to look for new & changed fil
-classic|settings@1280x860|focus|017|select#sched-ref-2 "How often to re-fetch metadata for every
-classic|settings@1280x860|focus|018|button.ghost.sm "Save"
-classic|settings@1280x860|focus|019|button.ghost.sm "Scan"
-classic|settings@1280x860|focus|020|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@1280x860|focus|021|button.ghost.sm "Edit"
-classic|settings@1280x860|focus|022|button.ghost.sm "Delete"
-classic|settings@1280x860|focus|023|select#sched-scan-1 "How often to look for new & changed fil
-classic|settings@1280x860|focus|024|select#sched-ref-1 "How often to re-fetch metadata for every
-classic|settings@1280x860|focus|025|button.ghost.sm "Save"
-classic|settings@1280x860|focus|026|button.ghost.sm "Scan"
-classic|settings@1280x860|focus|027|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@1280x860|focus|028|button.ghost.sm "Edit"
-classic|settings@1280x860|focus|029|button.ghost.sm "Delete"
-classic|settings@1280x860|focus|030|select#sched-scan-3 "How often to look for new & changed fil
-classic|settings@1280x860|focus|031|select#sched-ref-3 "How often to re-fetch metadata for every
-classic|settings@1280x860|focus|032|button.ghost.sm "Save"
-classic|settings@1280x860|focus|033|button.ghost.sm "Scan"
-classic|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@1280x860|focus|035|button.ghost.sm "Edit"
-classic|settings@1280x860|focus|036|button.ghost.sm "Delete"
-classic|settings@1280x860|focus|037|input#ln "Library name"
-classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-classic|settings@1280x860|focus|039|input#lp "Media paths"
-classic|settings@1280x860|focus|040|button "Add & scan"
-classic|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
-classic|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
-classic|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
-classic|settings@1280x860|focus|044|input#job-boot
-classic|settings@1280x860|focus|045|button.ghost.sm "Save"
-classic|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
-classic|settings@1280x860|focus|047|button.ghost.sm "Save"
-classic|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
-classic|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
-classic|settings@1280x860|focus|050|button.ghost.sm "Save"
-classic|settings@1280x860|focus|051|<wrap>
+classic|settings@1280x860|focus|014|button.settab "Cluster"
+classic|settings@1280x860|focus|015|button.ghost.sm "Scan every library for new & changed files"
+classic|settings@1280x860|focus|016|button.ghost.sm "Re-fetch metadata & artwork for every libra
+classic|settings@1280x860|focus|017|select#sched-scan-2 "How often to look for new & changed fil
+classic|settings@1280x860|focus|018|select#sched-ref-2 "How often to re-fetch metadata for every
+classic|settings@1280x860|focus|019|button.ghost.sm "Save"
+classic|settings@1280x860|focus|020|button.ghost.sm "Scan"
+classic|settings@1280x860|focus|021|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@1280x860|focus|022|button.ghost.sm "Edit"
+classic|settings@1280x860|focus|023|button.ghost.sm "Delete"
+classic|settings@1280x860|focus|024|select#sched-scan-1 "How often to look for new & changed fil
+classic|settings@1280x860|focus|025|select#sched-ref-1 "How often to re-fetch metadata for every
+classic|settings@1280x860|focus|026|button.ghost.sm "Save"
+classic|settings@1280x860|focus|027|button.ghost.sm "Scan"
+classic|settings@1280x860|focus|028|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@1280x860|focus|029|button.ghost.sm "Edit"
+classic|settings@1280x860|focus|030|button.ghost.sm "Delete"
+classic|settings@1280x860|focus|031|select#sched-scan-3 "How often to look for new & changed fil
+classic|settings@1280x860|focus|032|select#sched-ref-3 "How often to re-fetch metadata for every
+classic|settings@1280x860|focus|033|button.ghost.sm "Save"
+classic|settings@1280x860|focus|034|button.ghost.sm "Scan"
+classic|settings@1280x860|focus|035|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@1280x860|focus|036|button.ghost.sm "Edit"
+classic|settings@1280x860|focus|037|button.ghost.sm "Delete"
+classic|settings@1280x860|focus|038|input#ln "Library name"
+classic|settings@1280x860|focus|039|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+classic|settings@1280x860|focus|040|input#lp "Media paths"
+classic|settings@1280x860|focus|041|button "Add & scan"
+classic|settings@1280x860|focus|042|select#job-probe "Re-run ffprobe on files whose media detail
+classic|settings@1280x860|focus|043|select#job-art "Re-fetch posters for items a provider matche
+classic|settings@1280x860|focus|044|select#job-clean "Delete leftover transcode working director
+classic|settings@1280x860|focus|045|input#job-boot
+classic|settings@1280x860|focus|046|button.ghost.sm "Save"
+classic|settings@1280x860|focus|047|select#telemetry-retain "How long node-local playback measur
+classic|settings@1280x860|focus|048|button.ghost.sm "Save"
+classic|settings@1280x860|focus|049|select#cache-produce "How often to check what's worth encodi
+classic|settings@1280x860|focus|050|select#cache-gb "How much disk finished pre-transcodes may o
+classic|settings@1280x860|focus|051|button.ghost.sm "Save"
+classic|settings@1280x860|focus|052|<wrap>
 classic|settings@1280x860|req|GET /api/v1/activity|2
 classic|settings@1280x860|req|GET /api/v1/libraries|1
 classic|settings@1280x860|req|GET /api/v1/me|1
@@ -3540,7 +3543,7 @@ classic|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
 classic|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 classic|settings@390x780|dom|div.sched > span.schedpair[text]|9
 classic|settings@390x780|dom|div.settabs > button.active.settab[text]|1
-classic|settings@390x780|dom|div.settabs > button.settab[text]|4
+classic|settings@390x780|dom|div.settabs > button.settab[text]|5
 classic|settings@390x780|dom|div.setwarn[text] > a[text]|1
 classic|settings@390x780|dom|div.setwarn[text] > b[text]|2
 classic|settings@390x780|dom|div.topctl > div|4
@@ -3627,44 +3630,45 @@ classic|settings@390x780|focus|010|button.settab "Metadata"
 classic|settings@390x780|focus|011|button.settab "Playback"
 classic|settings@390x780|focus|012|button.settab "Users"
 classic|settings@390x780|focus|013|button.settab "System"
-classic|settings@390x780|focus|014|button.ghost.sm "Scan every library for new & changed files"
-classic|settings@390x780|focus|015|button.ghost.sm "Re-fetch metadata & artwork for every libra
-classic|settings@390x780|focus|016|select#sched-scan-2 "How often to look for new & changed fil
-classic|settings@390x780|focus|017|select#sched-ref-2 "How often to re-fetch metadata for every
-classic|settings@390x780|focus|018|button.ghost.sm "Save"
-classic|settings@390x780|focus|019|button.ghost.sm "Scan"
-classic|settings@390x780|focus|020|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@390x780|focus|021|button.ghost.sm "Edit"
-classic|settings@390x780|focus|022|button.ghost.sm "Delete"
-classic|settings@390x780|focus|023|select#sched-scan-1 "How often to look for new & changed fil
-classic|settings@390x780|focus|024|select#sched-ref-1 "How often to re-fetch metadata for every
-classic|settings@390x780|focus|025|button.ghost.sm "Save"
-classic|settings@390x780|focus|026|button.ghost.sm "Scan"
-classic|settings@390x780|focus|027|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@390x780|focus|028|button.ghost.sm "Edit"
-classic|settings@390x780|focus|029|button.ghost.sm "Delete"
-classic|settings@390x780|focus|030|select#sched-scan-3 "How often to look for new & changed fil
-classic|settings@390x780|focus|031|select#sched-ref-3 "How often to re-fetch metadata for every
-classic|settings@390x780|focus|032|button.ghost.sm "Save"
-classic|settings@390x780|focus|033|button.ghost.sm "Scan"
-classic|settings@390x780|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-classic|settings@390x780|focus|035|button.ghost.sm "Edit"
-classic|settings@390x780|focus|036|button.ghost.sm "Delete"
-classic|settings@390x780|focus|037|input#ln "Library name"
-classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-classic|settings@390x780|focus|039|input#lp "Media paths"
-classic|settings@390x780|focus|040|button "Add & scan"
-classic|settings@390x780|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
-classic|settings@390x780|focus|042|select#job-art "Re-fetch posters for items a provider matche
-classic|settings@390x780|focus|043|select#job-clean "Delete leftover transcode working director
-classic|settings@390x780|focus|044|input#job-boot
-classic|settings@390x780|focus|045|button.ghost.sm "Save"
-classic|settings@390x780|focus|046|select#telemetry-retain "How long node-local playback measur
-classic|settings@390x780|focus|047|button.ghost.sm "Save"
-classic|settings@390x780|focus|048|select#cache-produce "How often to check what's worth encodi
-classic|settings@390x780|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
-classic|settings@390x780|focus|050|button.ghost.sm "Save"
-classic|settings@390x780|focus|051|<wrap>
+classic|settings@390x780|focus|014|button.settab "Cluster"
+classic|settings@390x780|focus|015|button.ghost.sm "Scan every library for new & changed files"
+classic|settings@390x780|focus|016|button.ghost.sm "Re-fetch metadata & artwork for every libra
+classic|settings@390x780|focus|017|select#sched-scan-2 "How often to look for new & changed fil
+classic|settings@390x780|focus|018|select#sched-ref-2 "How often to re-fetch metadata for every
+classic|settings@390x780|focus|019|button.ghost.sm "Save"
+classic|settings@390x780|focus|020|button.ghost.sm "Scan"
+classic|settings@390x780|focus|021|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@390x780|focus|022|button.ghost.sm "Edit"
+classic|settings@390x780|focus|023|button.ghost.sm "Delete"
+classic|settings@390x780|focus|024|select#sched-scan-1 "How often to look for new & changed fil
+classic|settings@390x780|focus|025|select#sched-ref-1 "How often to re-fetch metadata for every
+classic|settings@390x780|focus|026|button.ghost.sm "Save"
+classic|settings@390x780|focus|027|button.ghost.sm "Scan"
+classic|settings@390x780|focus|028|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@390x780|focus|029|button.ghost.sm "Edit"
+classic|settings@390x780|focus|030|button.ghost.sm "Delete"
+classic|settings@390x780|focus|031|select#sched-scan-3 "How often to look for new & changed fil
+classic|settings@390x780|focus|032|select#sched-ref-3 "How often to re-fetch metadata for every
+classic|settings@390x780|focus|033|button.ghost.sm "Save"
+classic|settings@390x780|focus|034|button.ghost.sm "Scan"
+classic|settings@390x780|focus|035|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+classic|settings@390x780|focus|036|button.ghost.sm "Edit"
+classic|settings@390x780|focus|037|button.ghost.sm "Delete"
+classic|settings@390x780|focus|038|input#ln "Library name"
+classic|settings@390x780|focus|039|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+classic|settings@390x780|focus|040|input#lp "Media paths"
+classic|settings@390x780|focus|041|button "Add & scan"
+classic|settings@390x780|focus|042|select#job-probe "Re-run ffprobe on files whose media detail
+classic|settings@390x780|focus|043|select#job-art "Re-fetch posters for items a provider matche
+classic|settings@390x780|focus|044|select#job-clean "Delete leftover transcode working director
+classic|settings@390x780|focus|045|input#job-boot
+classic|settings@390x780|focus|046|button.ghost.sm "Save"
+classic|settings@390x780|focus|047|select#telemetry-retain "How long node-local playback measur
+classic|settings@390x780|focus|048|button.ghost.sm "Save"
+classic|settings@390x780|focus|049|select#cache-produce "How often to check what's worth encodi
+classic|settings@390x780|focus|050|select#cache-gb "How much disk finished pre-transcodes may o
+classic|settings@390x780|focus|051|button.ghost.sm "Save"
+classic|settings@390x780|focus|052|<wrap>
 classic|settings@390x780|req|GET /api/v1/activity|2
 classic|settings@390x780|req|GET /api/v1/libraries|1
 classic|settings@390x780|req|GET /api/v1/me|1
@@ -5008,7 +5012,7 @@ theater|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
 theater|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 theater|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 theater|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
-theater|settings@1280x860|dom|div.settabs > button.settab[text]|4
+theater|settings@1280x860|dom|div.settabs > button.settab[text]|5
 theater|settings@1280x860|dom|div.setwarn[text] > a[text]|1
 theater|settings@1280x860|dom|div.setwarn[text] > b[text]|2
 theater|settings@1280x860|dom|div.th-ctl > div.th-pop|4
@@ -5105,44 +5109,45 @@ theater|settings@1280x860|focus|010|button.settab "Metadata"
 theater|settings@1280x860|focus|011|button.settab "Playback"
 theater|settings@1280x860|focus|012|button.settab "Users"
 theater|settings@1280x860|focus|013|button.settab "System"
-theater|settings@1280x860|focus|014|button.ghost.sm "Scan every library for new & changed files"
-theater|settings@1280x860|focus|015|button.ghost.sm "Re-fetch metadata & artwork for every libra
-theater|settings@1280x860|focus|016|select#sched-scan-2 "How often to look for new & changed fil
-theater|settings@1280x860|focus|017|select#sched-ref-2 "How often to re-fetch metadata for every
-theater|settings@1280x860|focus|018|button.ghost.sm "Save"
-theater|settings@1280x860|focus|019|button.ghost.sm "Scan"
-theater|settings@1280x860|focus|020|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@1280x860|focus|021|button.ghost.sm "Edit"
-theater|settings@1280x860|focus|022|button.ghost.sm "Delete"
-theater|settings@1280x860|focus|023|select#sched-scan-1 "How often to look for new & changed fil
-theater|settings@1280x860|focus|024|select#sched-ref-1 "How often to re-fetch metadata for every
-theater|settings@1280x860|focus|025|button.ghost.sm "Save"
-theater|settings@1280x860|focus|026|button.ghost.sm "Scan"
-theater|settings@1280x860|focus|027|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@1280x860|focus|028|button.ghost.sm "Edit"
-theater|settings@1280x860|focus|029|button.ghost.sm "Delete"
-theater|settings@1280x860|focus|030|select#sched-scan-3 "How often to look for new & changed fil
-theater|settings@1280x860|focus|031|select#sched-ref-3 "How often to re-fetch metadata for every
-theater|settings@1280x860|focus|032|button.ghost.sm "Save"
-theater|settings@1280x860|focus|033|button.ghost.sm "Scan"
-theater|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@1280x860|focus|035|button.ghost.sm "Edit"
-theater|settings@1280x860|focus|036|button.ghost.sm "Delete"
-theater|settings@1280x860|focus|037|input#ln "Library name"
-theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-theater|settings@1280x860|focus|039|input#lp "Media paths"
-theater|settings@1280x860|focus|040|button "Add & scan"
-theater|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
-theater|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
-theater|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
-theater|settings@1280x860|focus|044|input#job-boot
-theater|settings@1280x860|focus|045|button.ghost.sm "Save"
-theater|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
-theater|settings@1280x860|focus|047|button.ghost.sm "Save"
-theater|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
-theater|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
-theater|settings@1280x860|focus|050|button.ghost.sm "Save"
-theater|settings@1280x860|focus|051|<wrap>
+theater|settings@1280x860|focus|014|button.settab "Cluster"
+theater|settings@1280x860|focus|015|button.ghost.sm "Scan every library for new & changed files"
+theater|settings@1280x860|focus|016|button.ghost.sm "Re-fetch metadata & artwork for every libra
+theater|settings@1280x860|focus|017|select#sched-scan-2 "How often to look for new & changed fil
+theater|settings@1280x860|focus|018|select#sched-ref-2 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|019|button.ghost.sm "Save"
+theater|settings@1280x860|focus|020|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|021|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|022|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|023|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|024|select#sched-scan-1 "How often to look for new & changed fil
+theater|settings@1280x860|focus|025|select#sched-ref-1 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|026|button.ghost.sm "Save"
+theater|settings@1280x860|focus|027|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|028|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|029|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|030|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|031|select#sched-scan-3 "How often to look for new & changed fil
+theater|settings@1280x860|focus|032|select#sched-ref-3 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|033|button.ghost.sm "Save"
+theater|settings@1280x860|focus|034|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|035|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|036|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|037|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|038|input#ln "Library name"
+theater|settings@1280x860|focus|039|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+theater|settings@1280x860|focus|040|input#lp "Media paths"
+theater|settings@1280x860|focus|041|button "Add & scan"
+theater|settings@1280x860|focus|042|select#job-probe "Re-run ffprobe on files whose media detail
+theater|settings@1280x860|focus|043|select#job-art "Re-fetch posters for items a provider matche
+theater|settings@1280x860|focus|044|select#job-clean "Delete leftover transcode working director
+theater|settings@1280x860|focus|045|input#job-boot
+theater|settings@1280x860|focus|046|button.ghost.sm "Save"
+theater|settings@1280x860|focus|047|select#telemetry-retain "How long node-local playback measur
+theater|settings@1280x860|focus|048|button.ghost.sm "Save"
+theater|settings@1280x860|focus|049|select#cache-produce "How often to check what's worth encodi
+theater|settings@1280x860|focus|050|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@1280x860|focus|051|button.ghost.sm "Save"
+theater|settings@1280x860|focus|052|<wrap>
 theater|settings@1280x860|req|GET /api/v1/activity|2
 theater|settings@1280x860|req|GET /api/v1/libraries|1
 theater|settings@1280x860|req|GET /api/v1/me|1
@@ -5185,7 +5190,7 @@ theater|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
 theater|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 theater|settings@390x780|dom|div.sched > span.schedpair[text]|9
 theater|settings@390x780|dom|div.settabs > button.active.settab[text]|1
-theater|settings@390x780|dom|div.settabs > button.settab[text]|4
+theater|settings@390x780|dom|div.settabs > button.settab[text]|5
 theater|settings@390x780|dom|div.setwarn[text] > a[text]|1
 theater|settings@390x780|dom|div.setwarn[text] > b[text]|2
 theater|settings@390x780|dom|div.th-ctl > div.th-pop|4
@@ -5279,47 +5284,48 @@ theater|settings@390x780|focus|007|button.settab "Metadata"
 theater|settings@390x780|focus|008|button.settab "Playback"
 theater|settings@390x780|focus|009|button.settab "Users"
 theater|settings@390x780|focus|010|button.settab "System"
-theater|settings@390x780|focus|011|button.ghost.sm "Scan every library for new & changed files"
-theater|settings@390x780|focus|012|button.ghost.sm "Re-fetch metadata & artwork for every libra
-theater|settings@390x780|focus|013|select#sched-scan-2 "How often to look for new & changed fil
-theater|settings@390x780|focus|014|select#sched-ref-2 "How often to re-fetch metadata for every
-theater|settings@390x780|focus|015|button.ghost.sm "Save"
-theater|settings@390x780|focus|016|button.ghost.sm "Scan"
-theater|settings@390x780|focus|017|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@390x780|focus|018|button.ghost.sm "Edit"
-theater|settings@390x780|focus|019|button.ghost.sm "Delete"
-theater|settings@390x780|focus|020|select#sched-scan-1 "How often to look for new & changed fil
-theater|settings@390x780|focus|021|select#sched-ref-1 "How often to re-fetch metadata for every
-theater|settings@390x780|focus|022|button.ghost.sm "Save"
-theater|settings@390x780|focus|023|button.ghost.sm "Scan"
-theater|settings@390x780|focus|024|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@390x780|focus|025|button.ghost.sm "Edit"
-theater|settings@390x780|focus|026|button.ghost.sm "Delete"
-theater|settings@390x780|focus|027|select#sched-scan-3 "How often to look for new & changed fil
-theater|settings@390x780|focus|028|select#sched-ref-3 "How often to re-fetch metadata for every
-theater|settings@390x780|focus|029|button.ghost.sm "Save"
-theater|settings@390x780|focus|030|button.ghost.sm "Scan"
-theater|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
-theater|settings@390x780|focus|032|button.ghost.sm "Edit"
-theater|settings@390x780|focus|033|button.ghost.sm "Delete"
-theater|settings@390x780|focus|034|input#ln "Library name"
-theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
-theater|settings@390x780|focus|036|input#lp "Media paths"
-theater|settings@390x780|focus|037|button "Add & scan"
-theater|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
-theater|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a provider matche
-theater|settings@390x780|focus|040|select#job-clean "Delete leftover transcode working director
-theater|settings@390x780|focus|041|input#job-boot
-theater|settings@390x780|focus|042|button.ghost.sm "Save"
-theater|settings@390x780|focus|043|select#telemetry-retain "How long node-local playback measur
-theater|settings@390x780|focus|044|button.ghost.sm "Save"
-theater|settings@390x780|focus|045|select#cache-produce "How often to check what's worth encodi
-theater|settings@390x780|focus|046|select#cache-gb "How much disk finished pre-transcodes may o
-theater|settings@390x780|focus|047|button.ghost.sm "Save"
-theater|settings@390x780|focus|048|a "Home"
-theater|settings@390x780|focus|049|a "Activity"
-theater|settings@390x780|focus|050|a.on "Settings"
-theater|settings@390x780|focus|051|<wrap>
+theater|settings@390x780|focus|011|button.settab "Cluster"
+theater|settings@390x780|focus|012|button.ghost.sm "Scan every library for new & changed files"
+theater|settings@390x780|focus|013|button.ghost.sm "Re-fetch metadata & artwork for every libra
+theater|settings@390x780|focus|014|select#sched-scan-2 "How often to look for new & changed fil
+theater|settings@390x780|focus|015|select#sched-ref-2 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|016|button.ghost.sm "Save"
+theater|settings@390x780|focus|017|button.ghost.sm "Scan"
+theater|settings@390x780|focus|018|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|019|button.ghost.sm "Edit"
+theater|settings@390x780|focus|020|button.ghost.sm "Delete"
+theater|settings@390x780|focus|021|select#sched-scan-1 "How often to look for new & changed fil
+theater|settings@390x780|focus|022|select#sched-ref-1 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|023|button.ghost.sm "Save"
+theater|settings@390x780|focus|024|button.ghost.sm "Scan"
+theater|settings@390x780|focus|025|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|026|button.ghost.sm "Edit"
+theater|settings@390x780|focus|027|button.ghost.sm "Delete"
+theater|settings@390x780|focus|028|select#sched-scan-3 "How often to look for new & changed fil
+theater|settings@390x780|focus|029|select#sched-ref-3 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|030|button.ghost.sm "Save"
+theater|settings@390x780|focus|031|button.ghost.sm "Scan"
+theater|settings@390x780|focus|032|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|033|button.ghost.sm "Edit"
+theater|settings@390x780|focus|034|button.ghost.sm "Delete"
+theater|settings@390x780|focus|035|input#ln "Library name"
+theater|settings@390x780|focus|036|select#lk "Movies TV Shows Anime Books & audiobooks Home vid
+theater|settings@390x780|focus|037|input#lp "Media paths"
+theater|settings@390x780|focus|038|button "Add & scan"
+theater|settings@390x780|focus|039|select#job-probe "Re-run ffprobe on files whose media detail
+theater|settings@390x780|focus|040|select#job-art "Re-fetch posters for items a provider matche
+theater|settings@390x780|focus|041|select#job-clean "Delete leftover transcode working director
+theater|settings@390x780|focus|042|input#job-boot
+theater|settings@390x780|focus|043|button.ghost.sm "Save"
+theater|settings@390x780|focus|044|select#telemetry-retain "How long node-local playback measur
+theater|settings@390x780|focus|045|button.ghost.sm "Save"
+theater|settings@390x780|focus|046|select#cache-produce "How often to check what's worth encodi
+theater|settings@390x780|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@390x780|focus|048|button.ghost.sm "Save"
+theater|settings@390x780|focus|049|a "Home"
+theater|settings@390x780|focus|050|a "Activity"
+theater|settings@390x780|focus|051|a.on "Settings"
+theater|settings@390x780|focus|052|<wrap>
 theater|settings@390x780|req|GET /api/v1/activity|2
 theater|settings@390x780|req|GET /api/v1/libraries|1
 theater|settings@390x780|req|GET /api/v1/me|1
