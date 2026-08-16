@@ -15,7 +15,9 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
 use plurx_core::domain::{MediaFile, SubtitleStream};
@@ -748,9 +750,18 @@ async fn exact_hls_context(
     // Initialization segments are a few KiB. Bound malformed input so a
     // playlist request can never allocate without limit.
     let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
+    let mut delivery = opened.delivery;
+    let started = Instant::now();
     let mut reader = opened.file.take(1024 * 1024);
-    if reader.read_to_end(&mut init).await.is_err() {
-        return context;
+    match reader.read_to_end(&mut init).await {
+        Ok(bytes) => {
+            delivery.note_read(bytes as u64, started.elapsed());
+            delivery.finish();
+        }
+        Err(error) => {
+            delivery.fail(&error);
+            return context;
+        }
     }
     let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
         return context;
@@ -1510,12 +1521,18 @@ pub async fn segment(
     let content_type = segment_content_type(&seg);
     if seg == "init.mp4" && opened.len <= APPLE_INIT_REWRITE_LIMIT_BYTES {
         let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
-        opened
-            .file
-            .take(1024 * 1024)
-            .read_to_end(&mut init)
-            .await
-            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let mut delivery = opened.delivery;
+        let started = Instant::now();
+        match opened.file.take(1024 * 1024).read_to_end(&mut init).await {
+            Ok(bytes) => {
+                delivery.note_read(bytes as u64, started.elapsed());
+                delivery.finish();
+            }
+            Err(error) => {
+                delivery.fail(&error);
+                return Err(ApiError::Internal(error.to_string()));
+            }
+        }
         if let Ok((_, file)) = session_file(&state, &session).await {
             if normalize_high_tier_hevc_init(&file, &mut init) {
                 tracing::info!(
@@ -1546,11 +1563,34 @@ pub async fn segment(
             "skipped Apple HEVC tier normalization because init.mp4 exceeds the inspection bound"
         );
     }
+    let opened_len = opened.len;
+    let reader = tokio_util::io::ReaderStream::new(opened.file);
+    let delivery = opened.delivery;
+    let stream = futures_util::stream::unfold(
+        (reader, delivery),
+        |(mut reader, mut delivery)| async move {
+            let started = Instant::now();
+            match reader.next().await {
+                Some(Ok(bytes)) => {
+                    delivery.note_read(bytes.len() as u64, started.elapsed());
+                    Some((Ok(bytes), (reader, delivery)))
+                }
+                Some(Err(error)) => {
+                    delivery.fail(&error);
+                    Some((Err(error), (reader, delivery)))
+                }
+                None => {
+                    delivery.finish();
+                    None
+                }
+            }
+        },
+    );
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, content_type.to_owned()),
-            (header::CONTENT_LENGTH, opened.len.to_string()),
+            (header::CONTENT_LENGTH, opened_len.to_string()),
             // A finished segment never changes: ffmpeg writes `.tmp` and
             // renames, and nothing rewrites the final name. The URI carries a
             // session id, so the bytes behind it are unique to this session and
@@ -1565,7 +1605,7 @@ pub async fn segment(
         // Streamed rather than buffered: a 4K copy segment is ~35 MB, and
         // reading it into memory before the first byte goes out is an
         // allocation and a copy per request for data on its way to a socket.
-        Body::from_stream(tokio_util::io::ReaderStream::new(opened.file)),
+        Body::from_stream(stream),
     )
         .into_response())
 }
