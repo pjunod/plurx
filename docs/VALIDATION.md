@@ -109,6 +109,24 @@ XCTest, regardless of strictness.
 CI fetches full Git history and selects from the pull-request base. The
 fast policy preflight runs mobile release hygiene first when applicable, then
 the history audit, catalog and validation unit tests, and operations contracts.
+
+Mobile release hygiene reads two different refs, and the distinction is
+load-bearing. `PLURX_VALIDATION_BASE` is the recorded pull-request base sha and
+scopes *which* release inputs the branch touched; it is the branch point.
+`PLURX_VALIDATION_MERGE_TARGET` is `origin/<base ref>` re-fetched when the job
+runs, and supplies the counters the branch has to clear, because that is what
+the branch actually merges into. They name the same commit only until the base
+moves. Two branches that bump a build counter to the same value auto-merge with
+no conflict marker and produce no `BEHIND` signal in this job, so a branch
+measured only against its branch point stays green forever once an unrelated
+release bump lands that same counter on the base. Re-baselining means a pull
+request can go red without its own head moving; that is correct, and the
+failure names the base ref and both counters so the fix is unambiguous without
+reading the workflow. An unreadable merge target fails the check rather than
+falling back to the branch point: scope selection fails open because a bad diff
+base only costs time, but a missing counter baseline would report green on a
+tree that cannot ship. A local `--changed-from` run passes one ref and uses it
+for both roles, which is right for a branch measured against a fixed point.
 Every expensive fan-out job in the main CI workflow waits for that preflight.
 A documentation-only pull request stops after those executable documentation
 contracts; it does not compile the Rust workspace or provision browsers and
