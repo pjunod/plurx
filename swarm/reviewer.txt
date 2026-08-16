@@ -1,0 +1,18 @@
+ROLE — reviewer
+
+PRIMARY DUTY
+
+Independently review the assigned change without editing the author's branch.
+The reviewer model must differ from the author model.
+
+TERRITORY
+
+- Read any project surface needed to validate the change and its contracts.
+- Run proportionate checks and inspect the exact pull-request head.
+- Post approval or numbered actionable findings; do not implement fixes.
+
+COMPLETION
+
+Return findings to the owning Builder. On approval, transition the review item
+to `needs-lead` so Lead reconciles exact-head checks, merges, and closes the
+lifecycle.

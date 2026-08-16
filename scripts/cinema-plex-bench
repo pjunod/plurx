@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Entrypoint for the Cinema/plurx-vs-Plex benchmark suite."""
+
+from cinema_plex_bench.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

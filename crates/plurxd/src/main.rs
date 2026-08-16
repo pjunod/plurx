@@ -263,6 +263,10 @@ fn read_password(input: &mut impl std::io::BufRead) -> std::io::Result<String> {
 
 async fn run(config: Config) -> anyhow::Result<()> {
     let logs = init_logging();
+    // Signal streams must exist before store activation, system probing, or
+    // any listener can make this process externally reachable. The returned
+    // future owns them until `boot` begins polling the graceful drain.
+    let shutdown = shutdown_signal();
 
     let selected = select_daemon_store(&config)
         .await
@@ -283,11 +287,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let serving = async {
         let store = Arc::clone(&selected.store);
         let replication = selected.replication_monitor();
+        let membership = selected.membership_manager();
         let dirs = create_dirs(&config.storage.data_dir)?;
         let (encoder_caps, system) = probe_system(&config, &store, &dirs.transcode).await?;
         let parts = Boot {
             store,
             replication,
+            membership,
             identity: selected.identity.clone(),
             credential_key: Arc::clone(&selected.credential_key),
             dirs,
@@ -295,7 +301,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             system,
             logs,
         };
-        boot(config, parts, start_mdns_advertiser, shutdown_signal()).await
+        boot(config, parts, start_mdns_advertiser, shutdown).await
     };
     let result = serving.await;
     let shutdown = selected
@@ -309,6 +315,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 struct Boot {
     store: Arc<dyn plurx_core::store::Store>,
     replication: plurx_core::cluster::migration::status::ReplicationMonitor,
+    membership: plurx_core::cluster::membership::MembershipManager,
     identity: plurx_core::cluster::ClusterIdentity,
     /// Resolved before the store is handed on, so a node that cannot open its
     /// existing Trakt rows fails here rather than at the first sync.
@@ -335,6 +342,7 @@ async fn boot(
     let Boot {
         store,
         replication,
+        membership,
         identity,
         credential_key,
         dirs,
@@ -350,6 +358,7 @@ async fn boot(
         identity.node_id,
         credential_key,
         replication,
+        membership,
         store,
         dirs,
         encoder_caps,
@@ -365,6 +374,7 @@ async fn boot(
     let progress = Arc::clone(&state.progress);
     let app = http::router(state);
     let listener = bind_listener(config.server.bind).await?;
+    trigger_shutdown_registration_failpoint();
     let mdns = start_discovery(&config, &instance_id, advertiser);
 
     serve(listener, app, progress, mdns, shutdown).await
@@ -640,6 +650,7 @@ fn build_state(
     node_id: String,
     credential_key: Arc<plurx_core::secrets::CredentialKey>,
     replication: plurx_core::cluster::migration::status::ReplicationMonitor,
+    membership: plurx_core::cluster::membership::MembershipManager,
     store: Arc<dyn plurx_core::store::Store>,
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
@@ -653,6 +664,7 @@ fn build_state(
             scan_prune_percent: config.storage.scan_prune_percent,
             credential_key,
             replication,
+            membership,
         },
         store,
         dirs,
@@ -668,6 +680,7 @@ fn build_state(
 /// that is down must not stall anything a viewer is waiting on — so each of
 /// these owns its own timing rather than riding on traffic.
 fn spawn_background_loops(state: &AppState) {
+    tokio::spawn(state.membership.clone().heartbeat_loop());
     tokio::spawn(std::sync::Arc::clone(&state.transcode).rate_control_refresh_loop());
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
@@ -1264,28 +1277,63 @@ fn gdm_bind_port(value: Option<&str>) -> anyhow::Result<u16> {
         .with_context(|| format!("invalid PLURX_GDM_PORT {value:?}"))
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("installing Ctrl-C handler");
-    };
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    // Install both Unix streams before returning the future. The caller binds
+    // the listener before `serve` first polls its graceful-shutdown future, so
+    // creating either stream inside that future leaves a small interval where
+    // the process is externally reachable but the signal still has its default
+    // terminating action.
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing SIGTERM handler");
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("installing SIGINT handler");
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    async move {
+        #[cfg(unix)]
+        let ctrl_c = async move {
+            interrupt.recv().await;
+        };
+        #[cfg(not(unix))]
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("installing Ctrl-C handler");
+        };
+        #[cfg(unix)]
+        let terminate = async move {
+            terminate.recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+        tracing::info!("shutdown signal received, draining");
     }
-    tracing::info!("shutdown signal received, draining");
 }
+
+/// Deterministically exercise the otherwise sub-millisecond listener/first-poll
+/// boundary in the shipped binary. With lazy registration this signal uses its
+/// default action and the process exits with signal 15; with eager registration
+/// it is buffered for `shutdown_signal` and starts a clean drain.
+#[cfg(unix)]
+fn trigger_shutdown_registration_failpoint() {
+    if matches!(
+        std::env::var("PLURX_SHUTDOWN_REGISTRATION_FAILPOINT").as_deref(),
+        Ok("after-listener-bind")
+    ) {
+        // SAFETY: this path is opt-in test instrumentation, and
+        // `shutdown_signal` installed the process handler before startup.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    }
+}
+
+#[cfg(not(unix))]
+fn trigger_shutdown_registration_failpoint() {}
 
 /// Minimal HTTP/1.0 probe over std TcpStream — deliberately dependency-free.
 fn healthcheck(config: &Config) -> anyhow::Result<()> {
@@ -2091,6 +2139,7 @@ mod startup_tests {
             "test-node".to_owned(),
             Arc::new(plurx_core::secrets::CredentialKey::generate()),
             plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
+            plurx_core::cluster::membership::MembershipManager::unavailable(),
             store_in(dir),
             create_dirs(dir).expect("dirs"),
             Default::default(),
@@ -2366,6 +2415,7 @@ mod startup_tests {
             Boot {
                 store: handle.store,
                 replication: plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
+                membership: plurx_core::cluster::membership::MembershipManager::unavailable(),
                 identity: handle.identity,
                 credential_key: handle.credential_key,
                 dirs: create_dirs(tmp.path()).expect("dirs"),
