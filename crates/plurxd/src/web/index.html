@@ -4192,6 +4192,23 @@ let PREPLAY={};
 // to notice that a later change superseded the answer it is holding.
 function prePlaySelection(fileId){ return PREPLAY[fileId]||null; }
 function clearPrePlay(){ PREPLAY={}; }
+// Which selection a play() call runs with. An internal reopen — a quality
+// change, a subtitles-off restart — is still THIS playback, and it keeps the
+// tracks already on screen rather than falling back to the cold-start policy
+// default. Anything else is a cold start and takes the detail screen's pickers.
+//
+// "Still this playback" is the whole predicate, and closing the player ends it.
+// closePlayer() deliberately does not replace PLAYER, so without its matching
+// `preplay=null` the identity check below would keep matching after the player
+// was closed: playing the same file again would silently reuse the last
+// playback's tracks while both pickers on the detail screen — reset by
+// loadItem() — read Default, and an explicitly changed picker would be ignored
+// for the rest of the session. The carry belongs to an open playback, not to
+// the file.
+function playbackSelection(player, fileId){
+  return (player&&player.fileId===fileId&&player.preplay)
+    ? player.preplay : prePlaySelection(fileId);
+}
 function prePlaySelectionQuery(sel){
   if(!sel) return "";
   return (sel.audio!=null?"&audio="+sel.audio:"")+(sel.subtitle!=null?"&subtitle="+sel.subtitle:"");
@@ -5401,12 +5418,9 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
         outgoingEstimateBps:PLAYER.hls&&PLAYER.hls.bandwidthEstimate,
         priorKbps:PLAYER.priorKbps})
     : null;
-  // The track choice this playback runs with. A cold start takes the detail
-  // screen's pickers; an internal reopen (a quality change) takes what the
-  // playback is already using, so changing quality reproduces what is on screen
-  // rather than falling back to the cold-start policy default.
-  const selection=(PLAYER&&PLAYER.fileId===fileId&&PLAYER.preplay)
-    ? PLAYER.preplay : prePlaySelection(fileId);
+  // The track choice this playback runs with: the detail screen's pickers on a
+  // cold start, what is already playing on an internal reopen.
+  const selection=playbackSelection(PLAYER, fileId);
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   // Stamp the click, not the decision: time-to-first-frame is what the person
@@ -8293,6 +8307,13 @@ function closePlayer(){
   // by fetching; a browser that has closed the player is not going to.
   if(PLAYER && PLAYER.sessionId){ releaseSession(PLAYER.sessionId); PLAYER.sessionId=null; }
   if(PLAYER) PLAYER.aoffset=0;
+  // Same reason, same scope: the track choice was this playback's, and this
+  // playback is over. PLAYER survives the close, so leaving `preplay` set would
+  // make playbackSelection() keep matching on the next cold start of the same
+  // file — replaying it would reuse these tracks while the detail screen's
+  // pickers, which loadItem() has just reset, say Default, and a viewer who
+  // changed a picker would be overruled by a choice they had moved on from.
+  if(PLAYER) PLAYER.preplay=null;
   stopPlayerTimers();
   clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
   setLoading(false);

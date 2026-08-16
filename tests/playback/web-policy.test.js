@@ -24,7 +24,17 @@ const DECLARATIONS = ["\nfunction ", "\nasync function "];
 // swallowed by whichever function precedes it, and a harness that also asks for
 // that table by name gets "already declared" — a confusing failure about the
 // slicer rather than about the code under test.
-const TERMINATORS = DECLARATIONS.concat(["\nconst ", "\nlet "]);
+// `window.`/`document.` are not declarations, but they are the other thing that
+// appears at column zero in this script: top-level listener registration. A
+// function followed by one (closePlayer is) would otherwise be sliced together
+// with every handler after it, and those RUN at build time — the harness fails
+// on an undefined `window` instead of on the function under test.
+const TERMINATORS = DECLARATIONS.concat([
+  "\nconst ",
+  "\nlet ",
+  "\nwindow.",
+  "\ndocument.",
+]);
 function sliceDeclaration(start) {
   const rest = SHIPPED_UI.slice(start + 1);
   const ends = TERMINATORS.map((kind) => rest.indexOf(kind, 1)).filter(
@@ -1815,6 +1825,121 @@ test("a burn this browser needs is honoured even when the plan omits it", () => 
   const h = detailHarness();
   assert.equal(h.prePlayBurnNeeded(overlayPlan, 2), true);
   assert.equal(h.prePlayApplication(overlayPlan, { subtitle: 2 }).burnedSub, 2);
+});
+
+// ---- the carry ends with the playback (review finding 1 on PR #293) --------
+//
+// play() asks playbackSelection() which tracks to run with, and the answer
+// turns on one thing: is this still the playback that is already open? A
+// quality change is; the same file played again after the viewer closed the
+// player is not. closePlayer() does not replace PLAYER, so that distinction
+// exists only because closePlayer() drops `preplay` — without it the pickers on
+// the detail screen become decoration after a file's first playback.
+//
+// The whole scenario runs the SHIPPED closePlayer(), not a description of it.
+function carryHarness(player) {
+  const stubEl = () => ({
+    classList: { remove() {}, add() {} },
+    style: {},
+    dataset: {},
+    innerHTML: "",
+    querySelectorAll: () => [],
+    pause() {},
+    removeAttribute() {},
+    load() {},
+  });
+  const build = new Function(
+    "document",
+    "PLAYER",
+    "exitPresentationModes",
+    "reportProgress",
+    "releaseSession",
+    "stopPlayerTimers",
+    "clearInterval",
+    "STATS_TIMER",
+    "teardownHls",
+    "setLoading",
+    "location",
+    "setTimeout",
+    "prePlayPreview",
+    [
+      shippedBinding("let", "PREPLAY"),
+      shippedSource("prePlaySelection"),
+      shippedSource("clearPrePlay"),
+      shippedSource("playbackSelection"),
+      shippedSource("setPrePlay"),
+      shippedSource("rememberPlaybackSelection"),
+      shippedSource("closePlayer"),
+      "return {prePlaySelection, clearPrePlay, playbackSelection, setPrePlay," +
+        " rememberPlaybackSelection, closePlayer};",
+    ].join("\n"),
+  );
+  return build(
+    { getElementById: stubEl },
+    player,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    null,
+    () => {},
+    () => {},
+    // Not an item route: the deferred re-render is a different concern, and the
+    // test performs loadItem()'s picker reset explicitly where it happens.
+    { hash: "#/" },
+    () => {},
+    () => {},
+  );
+}
+
+test("closing the player ends its track choice instead of arming the next play", () => {
+  const player = { fileId: 42, preplay: { audio: 1, subtitle: null } };
+  const h = carryHarness(player);
+  // While it is open, this playback's own tracks are the answer — that is the
+  // carry a quality change depends on.
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 1, subtitle: null });
+  h.closePlayer();
+  // loadItem() empties the pickers on the way back to the detail screen, so
+  // "Default" is what the viewer now sees on both of them.
+  h.clearPrePlay();
+  assert.equal(
+    h.playbackSelection(player, 42),
+    null,
+    "a closed playback's tracks must not be reused by the next cold start, " +
+      "which the screen is showing as Default",
+  );
+});
+
+test("a picker changed after a playback is not overruled by that playback", () => {
+  const player = { fileId: 42, preplay: null };
+  const h = carryHarness(player);
+  // An in-player switch records itself the same way a pre-play choice does.
+  h.rememberPlaybackSelection("audio", 0);
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 0, subtitle: null });
+  h.closePlayer();
+  h.clearPrePlay();
+  // Back on the detail screen the viewer picks the French track instead.
+  h.setPrePlay(42, "audio", "1");
+  assert.deepEqual(
+    h.playbackSelection(player, 42),
+    { audio: 1, subtitle: null },
+    "the explicit choice on screen wins, not the previous playback's",
+  );
+});
+
+test("a quality change still reproduces the tracks that are playing", () => {
+  // The other half of the contract: ending the carry at close must not end it
+  // mid-playback, or changing quality would silently revert the viewer's tracks
+  // to the cold-start policy default.
+  const player = { fileId: 42, preplay: null };
+  const h = carryHarness(player);
+  h.rememberPlaybackSelection("audio", 1);
+  h.rememberPlaybackSelection("subtitle", 2);
+  assert.deepEqual(h.playbackSelection(player, 42), { audio: 1, subtitle: 2 });
+  // A different file is a cold start even while this one is open.
+  h.setPrePlay(43, "subtitle", "-1");
+  assert.deepEqual(h.playbackSelection(player, 43), { audio: null, subtitle: -1 });
 });
 
 // Drained last, in registration order, after every synchronous case has run.
