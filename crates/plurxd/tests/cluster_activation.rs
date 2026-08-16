@@ -7,12 +7,10 @@ use std::time::{Duration, Instant};
 use plurx_core::auth::hash_password;
 use plurx_core::store::{SqliteStore, UserStore};
 
-static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    PROCESS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn process_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    PROCESS_TEST_LOCK.blocking_lock()
 }
 
 fn free_port() -> u16 {
@@ -436,7 +434,7 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
 #[cfg(unix)]
 #[tokio::test]
 async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
-    let _process_test = process_test_guard();
+    let _process_test = PROCESS_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("SIGKILL recovery fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
