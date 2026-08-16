@@ -1,0 +1,269 @@
+# Cinema/plurx-vs-Plex benchmark contract. Copy this file, replace every
+# placeholder media identity and server address, then validate before running.
+schema_version = 2
+
+[run]
+iterations = 30
+timeout_seconds = 120
+cooldown_seconds = 2
+output_dir = "target/cinema-plex-bench"
+
+[client]
+name = "ffmpeg-common-decoder"
+version = "auto"
+host = "REPLACE_WITH_CONTROLLER_HOST"
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+[servers.cinema]
+runner = "cinema"
+label = "Cinema/plurx"
+base_url = "http://cinema-host:32400"
+token_env = "CINEMA_BENCH_TOKEN"
+# Optional cumulative resource sampler. It receives trial context as JSON on
+# stdin and prints the fields documented in docs/BENCHMARKING.md as one JSON
+# object. Keep argv split into an array; the harness never invokes a shell.
+# monitor_command = ["ssh", "cinema-host", "/opt/bench/sample-plurx"]
+# A cold-cache claim requires this hook on both servers. Omit it for warm runs.
+# before_trial_command = ["ssh", "cinema-host", "/opt/bench/prepare-cold"]
+
+[servers.plex]
+runner = "plex"
+label = "Plex"
+base_url = "http://plex-host:32400"
+token_env = "PLEX_BENCH_TOKEN"
+# commit = "REPLACE_IF_YOUR_PLEX_BUILD_HAS_A_COMMIT_ID"
+# monitor_command = ["ssh", "plex-host", "/opt/bench/sample-plex"]
+# before_trial_command = ["ssh", "plex-host", "/opt/bench/prepare-cold"]
+
+[[media]]
+id = "1080p-h264"
+title = "REPLACE_WITH_1080P_CORPUS_TITLE"
+duration_seconds = 1800
+width = 1920
+height = 1080
+container = "mp4"
+video_codec = "h264"
+audio_codec = "aac"
+bitrate_kbps = 8000
+# All zeroes are an unmistakable placeholder, not a measured corpus digest.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[media.bindings.cinema]
+file_id = 1001
+
+[media.bindings.plex]
+rating_key = "1001"
+media_index = 0
+part_index = 0
+
+[[media]]
+id = "4k-hevc"
+title = "REPLACE_WITH_4K_CORPUS_TITLE"
+duration_seconds = 3600
+width = 3840
+height = 2160
+container = "mkv"
+video_codec = "hevc"
+audio_codec = "eac3"
+bitrate_kbps = 60000
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[media.bindings.cinema]
+file_id = 1002
+
+[media.bindings.plex]
+rating_key = "1002"
+media_index = 0
+part_index = 0
+
+# Startup: both server/engine readiness and common-client first decoded frame.
+[[scenarios]]
+id = "startup-1080p-direct"
+operation = "startup"
+media = "1080p-h264"
+playback_mode = "direct_play"
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "startup-4k-direct"
+operation = "startup"
+media = "4k-hevc"
+playback_mode = "direct_play"
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "startup-1080p-transcode"
+operation = "startup"
+media = "1080p-h264"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+# The harness compares each server's advertised wire rate with this request.
+# Five percent admits container/audio overhead but rejects a different rung.
+output_bitrate_tolerance_percent = 5
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "startup-4k-to-1080p-transcode"
+operation = "startup"
+media = "4k-hevc"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+# Seeks: direct and transcode stay separate because they exercise different
+# engines. Every target is absolute in the raw row; deltas remain reviewable.
+[[scenarios]]
+id = "seek-30s-direct"
+operation = "seek"
+media = "1080p-h264"
+playback_mode = "direct_play"
+baseline_position_seconds = 300
+seek_deltas_seconds = [-30, 30]
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "seek-30s-transcode"
+operation = "seek"
+media = "1080p-h264"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+baseline_position_seconds = 300
+seek_deltas_seconds = [-30, 30]
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "seek-5m-direct"
+operation = "seek"
+media = "1080p-h264"
+playback_mode = "direct_play"
+baseline_position_seconds = 600
+seek_deltas_seconds = [-300, 300]
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "seek-5m-transcode"
+operation = "seek"
+media = "1080p-h264"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+baseline_position_seconds = 600
+seek_deltas_seconds = [-300, 300]
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "seek-random-50-direct"
+operation = "random_seeks"
+media = "1080p-h264"
+playback_mode = "direct_play"
+seek_count = 50
+seed = 20260815
+seek_min_seconds = 30
+seek_max_seconds = 1770
+iterations = 1
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "seek-random-50-transcode"
+operation = "random_seeks"
+media = "1080p-h264"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+seek_count = 50
+seed = 20260815
+seek_min_seconds = 30
+seek_max_seconds = 1770
+iterations = 1
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+# Pause/resume is inherently end to end; there is no honest server-only frame.
+[[scenarios]]
+id = "pause-resume-direct"
+operation = "pause_resume"
+media = "1080p-h264"
+playback_mode = "direct_play"
+warmup_seconds = 5
+pause_seconds = 5
+measurement_scopes = ["end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "pause-resume-transcode"
+operation = "pause_resume"
+media = "1080p-h264"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+warmup_seconds = 5
+pause_seconds = 5
+measurement_scopes = ["end_to_end"]
+cache_state = "warm"
+
+# Concurrency reports one row per stream. CPU/GPU/RSS/storage/network deltas are
+# batch-scoped and therefore intentionally repeated with resource_scope=batch.
+[[scenarios]]
+id = "transcodes-1"
+operation = "concurrent_transcodes"
+media = "4k-hevc"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+concurrency = 1
+observe_seconds = 8
+iterations = 5
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "transcodes-2"
+operation = "concurrent_transcodes"
+media = "4k-hevc"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+concurrency = 2
+observe_seconds = 8
+iterations = 5
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "transcodes-4"
+operation = "concurrent_transcodes"
+media = "4k-hevc"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+concurrency = 4
+observe_seconds = 8
+iterations = 5
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"
+
+[[scenarios]]
+id = "transcodes-8"
+operation = "concurrent_transcodes"
+media = "4k-hevc"
+playback_mode = "transcode"
+output_height = 1080
+output_bitrate_kbps = 8000
+concurrency = 8
+observe_seconds = 8
+iterations = 5
+measurement_scopes = ["server_engine", "end_to_end"]
+cache_state = "warm"

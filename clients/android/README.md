@@ -19,7 +19,7 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `26` — native viewer parity across phone, foldable,
+> Status: **v0.2.7**, build `27` — native viewer parity across phone, foldable,
 > and TV. Build 26 adds first-class audiobook details and playback through the
 > shared audio player and progress path; physical-device acceptance remains
 > pending. Build 17 added app-managed offline viewing on phones and tablets;
