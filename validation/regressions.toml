@@ -211,10 +211,11 @@ commits = [
   "552e3449",
   "7868f4da",
   "ea7862f6",
+  "9e649050",
 ]
 points = []
 checks = []
-reason = "These commits only correct documentation, comments, record a review, or change ignored generated cache state; they introduce no executable behavior."
+reason = "These commits only correct documentation, comments, record a review, change ignored generated cache state, or configure the repo-local external swarm harness; they introduce no executable application behavior."
 ignore = true
 
 [[coverage]]
@@ -445,10 +446,21 @@ checks = ["rust-gate"]
 reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."
 
 [[coverage]]
-commits = ["f6d795a2", "5c31885a", "2dbd7d02", "1c60f0da"]
+commits = [
+  "f6d795a2deabf9513a1af7ff59d7aa1f416b260b",
+  "5c31885ad0ab58bb561a2f818eb9220ffee8eb92",
+  "2dbd7d02a4583f6f758b8d5fc53bde1b4612422b",
+  "1c60f0daa64fa71d445ad152af24f376354ca4e3",
+]
 points = ["persistence.upgrades", "server.api", "validation.framework"]
 checks = ["rust-gate"]
-reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
+reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. That test now waits on a bounded child rather than `Command::output()` and requires the `shutdown signal received, draining` line in the child's captured logs, so a failpoint that never fires fails on its deadline instead of hanging, and an unrelated clean exit cannot stand in for a drain. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
+
+[[coverage]]
+commits = ["8382dad0b18765ef5c06475cdfce4f1358bd6090"]
+points = ["persistence.upgrades", "server.api", "validation.framework"]
+checks = ["rust-gate"]
+reason = "The shipped-binary regression `a_signal_during_startup_stops_the_daemon_before_it_boots` raises SIGTERM the moment store activation returns, which is before `boot` runs and long before any listener exists, then requires the daemon to exit 0 having recorded the startup-window signal and never logged `plurxd starting`. Watching the eagerly installed signal streams for the whole of startup stops the daemon at its next cancel-safe boundary; reverting only the production correction so the future is again handed straight to `boot` restores the buffer-until-serve behavior, and the daemon probes hardware, binds, serves and drains, so `plurxd starting` appears and the test fails. The covered guarantee starts after `select_daemon_store`, which renames directories and fsyncs activation markers in a fixed order and is deliberately never cancelled midway."
 
 [[coverage]]
 commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
@@ -457,7 +469,19 @@ checks = ["cluster-auth"]
 reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
 
 [[coverage]]
+commits = ["a828a217", "ab10b2c7"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HLS regressions drive `http::hls::segment` and `exact_hls_context` against a published producer-less session, so they discriminate where segment bytes are counted rather than the tracker's arithmetic: `segment_bytes_are_counted_as_the_body_drains_not_at_open` requires the session delivery meter to read zero when the handler returns and the segment's full length only after the body is consumed, so restoring `session.delivery.note(len)` at open fails the first assertion and removing the counting body stream fails the second; `an_abandoned_segment_body_is_recorded_as_response_dropped` drops a partially consumed body and requires the `Drop`-only `response_dropped` classification naming delivered and expected bytes; `an_unreadable_segment_body_is_recorded_as_storage_read_error` fails the first read with EISDIR and requires exactly one `storage_read_error` terminal event; and the two `init` probe regressions require a playlist-time codec sniff to move no delivery bytes, to emit nothing for a bounded read that returned every byte it asked for, and to tag a failed internal read `\"purpose\":\"internal_probe\"` so it cannot be read as a client segment fetch."
+
+[[coverage]]
 commits = ["2d7b1443", "7d22cdf6"]
 points = ["cluster.membership", "persistence.upgrades"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The readdress regressions pin a settled trigger and a sole-voter guard read from replicated node records, the daemon-join contract pins concurrent token issuance, and the parameterized SIGKILL contract pins activated-node recovery for both advertised forms."
+
+[[coverage]]
+commits = ["417190e7"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web regressions execute the real `closePlayer()` and `playbackSelection()` to prove that a track choice belongs to an open playback rather than to the file: closing the player drops it, so the next cold start of the same file takes the detail-screen pickers the viewer is actually looking at, while an in-playback quality change still reproduces the tracks on screen. Reverting only the production correction fails `closing the player ends its track choice instead of arming the next play`, because `closePlayer()` does not replace `PLAYER` and the stale selection keeps matching after the playback ended."
