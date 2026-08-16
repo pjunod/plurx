@@ -1414,6 +1414,15 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testAppleBufferingStallLogCarriesPositionMethodAndDuration() throws {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = 90_000
+        snapshot.runway = 0.4
+        snapshot.timeControlStatus = "waiting"
+        snapshot.waitingReason = "AVPlayerWaitingToMinimizeStallsReason"
+        snapshot.playbackBufferEmpty = true
+        snapshot.mediaRequests = 17
+        snapshot.bytesTransferred = 8_192
+        snapshot.observedBitrateBps = 12_345_000
         let payload = ApplePlaybackStallLog(
             kind: .buffering,
             outcome: .reopen,
@@ -1423,7 +1432,10 @@ final class AppleClientTests: XCTestCase {
             title: "Fortune Feimster",
             fileId: 42,
             vcodec: "h264",
-            encoder: "copy"
+            encoder: "copy",
+            sessionId: "session-17",
+            attempt: "attempt-2",
+            snapshot: snapshot
         )
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
@@ -1435,6 +1447,14 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(object["ms"] as? Int, 12_000)
         XCTAssertEqual(object["file_id"] as? Int, 42)
         XCTAssertEqual(object["encoder"] as? String, "copy")
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "attempt-2")
+        XCTAssertEqual(object["reason"] as? String, "stall-buffering")
+        let encodedSnapshot = try XCTUnwrap(object["snapshot"] as? [String: Any])
+        XCTAssertEqual(encodedSnapshot["runway"] as? Double, 0.4)
+        XCTAssertEqual(encodedSnapshot["time_control_status"] as? String, "waiting")
+        XCTAssertEqual(encodedSnapshot["media_requests"] as? Int, 17)
+        XCTAssertEqual(encodedSnapshot["observed_bitrate_bps"] as? Double, 12_345_000)
         XCTAssertEqual(
             object["detail"] as? String,
             "kind=buffering · position_ms=90000 · outcome=reopen"
@@ -1442,6 +1462,9 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testAppleObservedStallLogCarriesDeltaWithoutCapabilityData() throws {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = 90_000
+        snapshot.runway = 8
         let payload = ApplePlaybackObservedStallLog(
             delta: 2,
             positionMs: 90_000,
@@ -1450,7 +1473,10 @@ final class AppleClientTests: XCTestCase {
             title: "Fortune Feimster",
             fileId: 42,
             vcodec: "h264",
-            encoder: "copy"
+            encoder: "copy",
+            sessionId: "session-17",
+            attempt: "attempt-2",
+            snapshot: snapshot
         )
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
@@ -1459,12 +1485,116 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(object["event"] as? String, "stall")
         XCTAssertEqual(object["ms"] as? Int, 8_000)
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "attempt-2")
+        XCTAssertEqual(object["reason"] as? String, "self-recovered")
         XCTAssertEqual(
             object["detail"] as? String,
             "kind=access_log · position_ms=90000 · stall_delta=2 · outcome=self_recovered"
         )
         XCTAssertNil(object["url"])
         XCTAssertNil(object["token"])
+    }
+
+    func testAppleBufferedRunwayStopsAtTheFirstGap() {
+        XCTAssertEqual(
+            PlayerController.bufferedRunwaySeconds(
+                playheadSeconds: 10,
+                ranges: [0...15, 15.1...25]
+            ),
+            15,
+            accuracy: 0.001,
+            "timestamp rounding should not split one contiguous buffer"
+        )
+        XCTAssertEqual(
+            PlayerController.bufferedRunwaySeconds(
+                playheadSeconds: 10,
+                ranges: [0...15, 18...30]
+            ),
+            5,
+            accuracy: 0.001,
+            "a later buffered island is not playable runway"
+        )
+        XCTAssertEqual(
+            PlayerController.bufferedRunwaySeconds(
+                playheadSeconds: 16,
+                ranges: [0...15, 18...30]
+            ),
+            0,
+            accuracy: 0.001
+        )
+    }
+
+    func testLiveCopyRecoverySeeksPastThePrecedingKeyframe() {
+        XCTAssertEqual(
+            PlayerController.sessionAttachSeekMs(
+                requestedStartMs: 10_500,
+                mediaOriginMs: 10_000
+            ),
+            500
+        )
+        XCTAssertNil(PlayerController.sessionAttachSeekMs(
+            requestedStartMs: 10_050,
+            mediaOriginMs: 10_000
+        ))
+        XCTAssertNil(PlayerController.sessionAttachSeekMs(
+            requestedStartMs: 10_000,
+            mediaOriginMs: 10_000
+        ))
+        XCTAssertNil(PlayerController.sessionAttachSeekMs(
+            requestedStartMs: 10_000,
+            mediaOriginMs: 10_500
+        ))
+    }
+
+    func testAppleSessionStatusDecodesFreezeAttributionFields() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var status = try decoder.decode(
+            PlaybackSessionStatus.self,
+            from: Data(#"""
+            {
+                "id": "session-17",
+                "progress_idle_ms": 11000,
+                "published_end_ms": 125000,
+                "fetched_end_ms": 121000,
+                "fetched_segment": 60,
+                "first_retained_segment": 12,
+                "playlist_shape": "sliding",
+                "ahead_seconds": 4,
+                "ahead_bytes": 8192,
+                "readrate": 0.7,
+                "suspend_count": 2,
+                "last_request": "segment",
+                "idle_seconds": 1
+            }
+            """#.utf8)
+        )
+
+        XCTAssertEqual(status.progressIdleMs, 11_000)
+        XCTAssertEqual(status.publishedEndMs, 125_000)
+        XCTAssertEqual(status.fetchedEndMs, 121_000)
+        XCTAssertEqual(status.fetchedSegment, 60)
+        XCTAssertEqual(status.firstRetainedSegment, 12)
+        XCTAssertEqual(status.playlistShape, "sliding")
+        XCTAssertEqual(status.aheadSeconds, 4)
+        XCTAssertEqual(status.aheadBytes, 8_192)
+        XCTAssertEqual(status.readrate, 0.7)
+        XCTAssertEqual(status.suspendCount, 2)
+        XCTAssertEqual(status.lastRequest, "segment")
+        XCTAssertEqual(status.idleSeconds, 1)
+
+        let snapshot = ApplePlaybackServerSnapshot(status, observedAgeMs: 2_345)
+        let encoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(snapshot))
+                as? [String: Any]
+        )
+        XCTAssertEqual(encoded["observed_age_ms"] as? Int, 2_345)
+        XCTAssertEqual(encoded["progress_idle_ms"] as? Int, 11_000)
+        XCTAssertEqual(encoded["playlist_shape"] as? String, "sliding")
+
+        status.idleSeconds = Int.max
+        XCTAssertEqual(ApplePlaybackServerSnapshot(status).lastRequestIdleMs, Int.max)
     }
 
     @MainActor

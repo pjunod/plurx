@@ -367,6 +367,56 @@ fn bounded_playback_query(query: PlaybackEventsQuery) -> PlaybackEventQuery {
 /// unless the user opens dev tools. Forwarding the browser's own error here puts
 /// it in the same log the admin already reads. All fields optional so the client
 /// can send only what's relevant; everything is length-clipped before logging.
+/// Server telemetry the Apple client last polled before a freeze. The server
+/// replaces these values with a live join when the named session still
+/// exists; keeping the snapshot closes the race where recovery supersedes the
+/// session before this best-effort beacon arrives.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ClientServerSnapshot {
+    pub observed_age_ms: Option<i64>,
+    pub recent_speed: Option<f64>,
+    pub ahead_seconds: Option<i64>,
+    pub ahead_bytes: Option<i64>,
+    pub suspended: Option<bool>,
+    pub hold_reason: Option<String>,
+    pub delivered_bps: Option<i64>,
+    pub delivered_idle_ms: Option<i64>,
+    pub readrate: Option<f64>,
+    pub suspend_count: Option<i64>,
+    pub progress_idle_ms: Option<i64>,
+    pub published_end_ms: Option<i64>,
+    pub fetched_end_ms: Option<i64>,
+    pub fetched_segment: Option<i64>,
+    pub first_retained_segment: Option<i64>,
+    pub playlist_shape: Option<String>,
+    pub last_request: Option<String>,
+    pub last_request_idle_ms: Option<i64>,
+}
+
+/// AVPlayer and access-log state captured at the same monotonic sample that
+/// declared a stall. All fields are optional because direct files, older OS
+/// releases, and a not-yet-started HLS item expose different subsets.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ClientPlaybackSnapshot {
+    pub position_ms: Option<i64>,
+    pub runway: Option<f64>,
+    pub time_control_status: Option<String>,
+    pub waiting_reason: Option<String>,
+    pub playback_buffer_empty: Option<bool>,
+    pub playback_likely_to_keep_up: Option<bool>,
+    pub playback_buffer_full: Option<bool>,
+    pub media_requests: Option<i64>,
+    pub downloaded_duration: Option<f64>,
+    pub bytes_transferred: Option<i64>,
+    pub transfer_duration: Option<f64>,
+    pub observed_bitrate_bps: Option<f64>,
+    pub indicated_bitrate_bps: Option<f64>,
+    pub access_stalls: Option<i64>,
+    pub server: Option<ClientServerSnapshot>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct ClientLog {
@@ -432,6 +482,8 @@ pub struct ClientLog {
     /// historically call this `session`; the alias keeps that field additive.
     #[serde(alias = "session")]
     pub session_id: Option<String>,
+    /// Correlated AVPlayer and last-polled server state for stall attribution.
+    pub snapshot: Option<ClientPlaybackSnapshot>,
 }
 
 /// Sustained rate and burst allowance for `/client-log`, in reports per minute.
@@ -601,6 +653,37 @@ fn join_session_truth(event: &mut PlaybackEvent, info: &crate::transcode::Sessio
     });
     event.delivered_bps = info.delivered_bps;
     event.readrate = Some(info.readrate);
+    let mut extra = event
+        .extra
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    extra.insert(
+        "server".to_owned(),
+        serde_json::json!({
+            "recent_speed": info.recent_speed,
+            "ahead_seconds": info.ahead_seconds,
+            "ahead_bytes": info.ahead_bytes,
+            "suspended": info.suspended,
+            "hold_reason": info.hold_reason,
+            "delivered_bps": info.delivered_bps,
+            "delivered_idle_ms": info.delivered_idle_ms,
+            "readrate": info.readrate,
+            "suspend_count": info.suspend_count,
+            "progress_idle_ms": info.progress_idle_ms,
+            "published_end_ms": info.published_end_ms,
+            "fetched_end_ms": info.fetched_end_ms,
+            "fetched_segment": info.fetched_segment,
+            "first_retained_segment": info.first_retained_segment,
+            "playlist_shape": info.playlist_shape,
+            "last_request": info.last_request,
+            "last_request_idle_ms": i64::try_from(info.idle_seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000)
+        }),
+    );
+    event.extra = Some(serde_json::Value::Object(extra).to_string());
 }
 
 fn emit_client_playback_event(
@@ -646,6 +729,118 @@ fn client_playback_event(ev: &ClientLog, user_id: i64) -> PlaybackEvent {
     if let Some(value) = ev.decode_smooth {
         extra.insert("decode_smooth".into(), value.into());
     }
+    let snapshot = ev.snapshot.as_ref();
+    let server = snapshot.and_then(|snapshot| snapshot.server.as_ref());
+    if let Some(snapshot) = snapshot {
+        let finite = |value: Option<f64>| value.filter(|value| value.is_finite() && *value >= 0.0);
+        let mut client = serde_json::Map::new();
+        for (key, value) in [
+            ("position_ms", snapshot.position_ms),
+            ("media_requests", snapshot.media_requests),
+            ("bytes_transferred", snapshot.bytes_transferred),
+            ("access_stalls", snapshot.access_stalls),
+        ] {
+            if let Some(value) = value.filter(|value| *value >= 0) {
+                client.insert(key.to_owned(), value.into());
+            }
+        }
+        for (key, value) in [
+            ("runway", finite(snapshot.runway)),
+            ("downloaded_duration", finite(snapshot.downloaded_duration)),
+            ("transfer_duration", finite(snapshot.transfer_duration)),
+            (
+                "observed_bitrate_bps",
+                finite(snapshot.observed_bitrate_bps),
+            ),
+            (
+                "indicated_bitrate_bps",
+                finite(snapshot.indicated_bitrate_bps),
+            ),
+        ] {
+            if let Some(value) = value {
+                client.insert(key.to_owned(), value.into());
+            }
+        }
+        for (key, value) in [
+            (
+                "time_control_status",
+                clipped(&snapshot.time_control_status, 48),
+            ),
+            ("waiting_reason", clipped(&snapshot.waiting_reason, 80)),
+        ] {
+            if let Some(value) = value {
+                client.insert(key.to_owned(), value.into());
+            }
+        }
+        for (key, value) in [
+            ("playback_buffer_empty", snapshot.playback_buffer_empty),
+            (
+                "playback_likely_to_keep_up",
+                snapshot.playback_likely_to_keep_up,
+            ),
+            ("playback_buffer_full", snapshot.playback_buffer_full),
+        ] {
+            if let Some(value) = value {
+                client.insert(key.to_owned(), value.into());
+            }
+        }
+        if let Some(server) = server {
+            let mut status = serde_json::Map::new();
+            for (key, value) in [
+                ("observed_age_ms", server.observed_age_ms),
+                ("ahead_seconds", server.ahead_seconds),
+                ("ahead_bytes", server.ahead_bytes),
+                ("delivered_bps", server.delivered_bps),
+                ("delivered_idle_ms", server.delivered_idle_ms),
+                ("suspend_count", server.suspend_count),
+                ("progress_idle_ms", server.progress_idle_ms),
+                ("published_end_ms", server.published_end_ms),
+                ("fetched_end_ms", server.fetched_end_ms),
+                ("fetched_segment", server.fetched_segment),
+                ("first_retained_segment", server.first_retained_segment),
+                ("last_request_idle_ms", server.last_request_idle_ms),
+            ] {
+                if let Some(value) = value.filter(|value| *value >= 0) {
+                    status.insert(key.to_owned(), value.into());
+                }
+            }
+            for (key, value) in [
+                ("recent_speed", server.recent_speed),
+                ("readrate", server.readrate),
+            ] {
+                if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
+                    status.insert(key.to_owned(), value.into());
+                }
+            }
+            if let Some(value) = server.suspended {
+                status.insert("suspended".to_owned(), value.into());
+            }
+            for (key, value) in [
+                ("hold_reason", clipped(&server.hold_reason, 16)),
+                ("playlist_shape", clipped(&server.playlist_shape, 16)),
+                ("last_request", clipped(&server.last_request, 24)),
+            ] {
+                if let Some(value) = value {
+                    status.insert(key.to_owned(), value.into());
+                }
+            }
+            if !status.is_empty() {
+                client.insert("server".to_owned(), status.into());
+            }
+        }
+        if !client.is_empty() {
+            extra.insert("client".to_owned(), client.into());
+        }
+    }
+    let runway = ev
+        .runway
+        .or_else(|| snapshot.and_then(|snapshot| snapshot.runway));
+    let bandwidth = ev.bandwidth.or_else(|| {
+        snapshot
+            .and_then(|snapshot| snapshot.observed_bitrate_bps)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| (value / 1_000.0).round().min(i64::MAX as f64) as i64)
+    });
     PlaybackEvent {
         at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -660,11 +855,24 @@ fn client_playback_event(ev: &ClientLog, user_id: i64) -> PlaybackEvent {
         encoder: clipped(&ev.encoder, 32),
         height: ev.height.filter(|value| *value > 0),
         ms: ev.ms.filter(|value| *value >= 0),
-        runway_ds: ev
-            .runway
+        runway_ds: runway
             .filter(|value| value.is_finite() && *value >= 0.0)
             .map(|value| (value * 10.0).round().min(i64::MAX as f64) as i64),
-        bandwidth_kbps: ev.bandwidth.filter(|value| *value > 0),
+        bandwidth_kbps: bandwidth.filter(|value| *value > 0),
+        speed_recent: server
+            .and_then(|server| server.recent_speed)
+            .filter(|value| value.is_finite() && *value >= 0.0),
+        ahead_seconds: server
+            .and_then(|server| server.ahead_seconds)
+            .filter(|value| *value >= 0),
+        suspended: server.and_then(|server| server.suspended),
+        hold_reason: server.and_then(|server| clipped(&server.hold_reason, 16)),
+        delivered_bps: server
+            .and_then(|server| server.delivered_bps)
+            .filter(|value| *value >= 0),
+        readrate: server
+            .and_then(|server| server.readrate)
+            .filter(|value| value.is_finite() && *value >= 0.0),
         detail: clipped(&ev.detail, 200),
         attempt: clipped(&ev.attempt, 24),
         reason: clipped(&ev.reason, 24),
@@ -756,10 +964,20 @@ fn client_log_line(ev: &ClientLog, suppressed: u64) -> String {
         };
         line.push_str(&format!(" {name}={ms}"));
     }
-    if let Some(r) = ev.runway.filter(|v| v.is_finite() && *v >= 0.0) {
+    let snapshot = ev.snapshot.as_ref();
+    let runway = ev
+        .runway
+        .or_else(|| snapshot.and_then(|snapshot| snapshot.runway));
+    let bandwidth = ev.bandwidth.or_else(|| {
+        snapshot
+            .and_then(|snapshot| snapshot.observed_bitrate_bps)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| (value / 1_000.0).round().min(i64::MAX as f64) as i64)
+    });
+    if let Some(r) = runway.filter(|v| v.is_finite() && *v >= 0.0) {
         line.push_str(&format!(" runway={r:.1}s"));
     }
-    if let Some(b) = ev.bandwidth.filter(|v| *v > 0) {
+    if let Some(b) = bandwidth.filter(|v| *v > 0) {
         line.push_str(&format!(" bw={b}kbps"));
     }
     if let Some(t) = field(&ev.title, 120) {
@@ -2125,6 +2343,7 @@ mod tests {
             decode_hw: None,
             decode_smooth: None,
             session_id: None,
+            snapshot: None,
         }
     }
 
@@ -2323,9 +2542,16 @@ mod tests {
             encoder: "qsv",
             started_unix: 0,
             idle_seconds: 0,
+            last_request: "segment",
             speed: Some(2.0),
             recent_speed: Some(1.7),
             out_time_ms: Some(10_000),
+            progress_idle_ms: 15,
+            published_end_ms: Some(44_000),
+            fetched_end_ms: 10_000,
+            fetched_segment: Some(4),
+            first_retained_segment: Some(1),
+            playlist_shape: "sliding",
             ahead_seconds: Some(34),
             hold_reason: Some(crate::transcode::AheadHoldReason::Time),
             resume_below_seconds: Some(30),
@@ -2367,6 +2593,65 @@ mod tests {
         assert_eq!(row.hold_reason.as_deref(), Some("time"));
         assert_eq!(row.delivered_bps, Some(8_000_000));
         assert_eq!(row.readrate, Some(2.0));
+        let extra: serde_json::Value =
+            serde_json::from_str(row.extra.as_deref().expect("joined status JSON"))
+                .expect("valid joined status JSON");
+        assert_eq!(extra["server"]["progress_idle_ms"], 15);
+        assert_eq!(extra["server"]["published_end_ms"], 44_000);
+        assert_eq!(extra["server"]["fetched_segment"], 4);
+        assert_eq!(extra["server"]["playlist_shape"], "sliding");
+        assert_eq!(extra["server"]["last_request"], "segment");
+    }
+
+    #[test]
+    fn client_stall_snapshot_survives_a_superseded_session() {
+        let mut event = beacon("stall", 12_000);
+        event.session_id = Some("gone-session".into());
+        event.snapshot = Some(ClientPlaybackSnapshot {
+            position_ms: Some(90_000),
+            runway: Some(0.4),
+            time_control_status: Some("waiting".into()),
+            waiting_reason: Some("AVPlayerWaitingToMinimizeStallsReason".into()),
+            playback_buffer_empty: Some(true),
+            media_requests: Some(17),
+            bytes_transferred: Some(8_192),
+            observed_bitrate_bps: Some(12_345_000.0),
+            server: Some(ClientServerSnapshot {
+                observed_age_ms: Some(2_345),
+                recent_speed: Some(0.7),
+                ahead_seconds: Some(4),
+                delivered_bps: Some(6_000_000),
+                readrate: Some(0.8),
+                progress_idle_ms: Some(11_000),
+                published_end_ms: Some(125_000),
+                fetched_end_ms: Some(121_000),
+                playlist_shape: Some("sliding".into()),
+                last_request: Some("segment".into()),
+                ..ClientServerSnapshot::default()
+            }),
+            ..ClientPlaybackSnapshot::default()
+        });
+
+        let persisted = client_playback_event(&event, 7);
+        assert_eq!(persisted.runway_ds, Some(4));
+        assert_eq!(persisted.bandwidth_kbps, Some(12_345));
+        assert_eq!(persisted.speed_recent, Some(0.7));
+        assert_eq!(persisted.ahead_seconds, Some(4));
+        assert_eq!(persisted.delivered_bps, Some(6_000_000));
+        assert_eq!(persisted.readrate, Some(0.8));
+        let extra: serde_json::Value =
+            serde_json::from_str(persisted.extra.as_deref().expect("client snapshot JSON"))
+                .expect("valid client snapshot JSON");
+        assert_eq!(extra["client"]["position_ms"], 90_000);
+        assert_eq!(extra["client"]["time_control_status"], "waiting");
+        assert_eq!(extra["client"]["media_requests"], 17);
+        assert_eq!(extra["client"]["server"]["observed_age_ms"], 2_345);
+        assert_eq!(extra["client"]["server"]["progress_idle_ms"], 11_000);
+        assert_eq!(extra["client"]["server"]["playlist_shape"], "sliding");
+
+        let line = client_log_line(&event, 0);
+        assert!(line.contains("runway=0.4s"), "{line}");
+        assert!(line.contains("bw=12345kbps"), "{line}");
     }
 
     #[test]
