@@ -3672,7 +3672,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .expect("claim after reset")
             .expect("package after reset");
         assert!(store
-            .requeue_offline_package(&first.id)
+            .requeue_offline_package(&first.id, "offline-node")
             .await
             .expect("requeue"));
         store
@@ -3695,7 +3695,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             Some("offline-recipe")
         );
         assert!(store
-            .update_offline_progress(&first.id, "video", 500)
+            .update_offline_progress(&first.id, "offline-node", "video", 500)
             .await
             .expect("progress"));
         let progressing = store

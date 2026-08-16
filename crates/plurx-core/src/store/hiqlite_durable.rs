@@ -1565,13 +1565,17 @@ impl OfflinePackageStore for HiqliteAuthStore {
         Ok(one_package(rows))
     }
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError> {
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError> {
         let now = self.now()?;
         Ok(self
             .execute(
                 "UPDATE offline_packages SET state = 'queued', phase = 'waiting_for_encoder', \
-                 updated_at = $1 WHERE id = $2 AND state = 'preparing'",
-                params!(now, package_id),
+                 updated_at = $1 WHERE id = $2 AND node_id = $3 AND state = 'preparing'",
+                params!(now, package_id, node_id),
             )
             .await?
             > 0)
@@ -1597,6 +1601,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError> {
@@ -1605,8 +1610,14 @@ impl OfflinePackageStore for HiqliteAuthStore {
             .execute(
                 "UPDATE offline_packages SET phase = $1, \
                  progress_millis = MAX(progress_millis, $2), updated_at = $3 \
-                 WHERE id = $4 AND state = 'preparing'",
-                params!(phase, progress_millis.clamp(0, 999), now, package_id),
+                 WHERE id = $4 AND node_id = $5 AND state = 'preparing'",
+                params!(
+                    phase,
+                    progress_millis.clamp(0, 999),
+                    now,
+                    package_id,
+                    node_id
+                ),
             )
             .await?
             > 0)
@@ -2071,10 +2082,13 @@ impl OfflinePackageStore for HiqliteAuthStore {
         for (entry, result) in plan.iter().zip(results) {
             let changed = result.map_err(database_error)?;
             if changed == 0 {
-                // The whole transaction committed or none of it did, so a
-                // no-op row means the package moved underneath the plan. Say
-                // so instead of reporting a resolution that did not happen:
-                // removal treats this as unresolved and refuses.
+                // A no-op row means the package moved underneath the plan.
+                // This is not a rollback — hiqlite rolls back on a statement
+                // error, and matching no row is not an error, so the other
+                // entries stayed applied. Reporting it is still the honest
+                // and safe answer: every entry that did apply is a complete
+                // resolution on its own, the membership change does not
+                // commit, and the operator's retry re-reads what is left.
                 return Err(StoreError::Database(format!(
                     "offline package {} changed while its removal plan was being applied",
                     entry.package_id

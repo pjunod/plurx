@@ -1015,7 +1015,15 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         node_id: &str,
     ) -> Result<Option<OfflinePackage>, StoreError>;
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError>;
+    /// `node_id` fences the yield back to the queue to the current owner, for
+    /// the same reason [`Self::fail_offline_package`] is fenced: a re-homed
+    /// package the survivor has already claimed must not be knocked back to
+    /// `queued` by the departing node's producer finishing its last part.
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError>;
 
     /// Bind the content-addressed recipe as soon as production starts. The
     /// completed cache entry must become offline-owned before subtitle
@@ -1026,9 +1034,13 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         recipe_hash: &str,
     ) -> Result<bool, StoreError>;
 
+    /// `node_id` fences progress to the current owner so a doomed producer on
+    /// a departing node cannot flap the phase and percentage a survivor is
+    /// reporting for the same package.
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError>;
@@ -1157,9 +1169,17 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         requested_since: i64,
     ) -> Result<Vec<String>, StoreError>;
 
-    /// Apply one whole removal plan atomically. A half-applied plan would
-    /// leave exactly the orphaned work §6.7 calls an activation blocker, so
-    /// this either resolves every listed package or changes nothing.
+    /// Apply one whole removal plan in a single transaction, and report an
+    /// error if any entry did not apply.
+    ///
+    /// The error is not a rollback, and this deliberately does not claim to be
+    /// one: the transaction rolls back on a statement *error*, but an UPDATE
+    /// that matches no row succeeds, so a package that moved underneath the
+    /// plan leaves the rest of the plan applied. What keeps that safe is the
+    /// caller, not the transaction — the membership change never commits on an
+    /// error, the entries that did apply are individually correct resolutions
+    /// (requeued work is claimable, failed work has released its reservation),
+    /// and the operator's retry re-reads and finishes the job.
     ///
     /// Failing a package clears its reservation and completed size in the same
     /// statement: the bytes it accounted for lived on the departing node and

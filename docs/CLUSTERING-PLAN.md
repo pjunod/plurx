@@ -762,15 +762,31 @@ serve; the client's retry creates a fresh package with a fresh URL. An already
 `failed` package is terminal, holds no reservation, and no longer blocks
 removal at all.
 
+One snapshot is not enough, because the departing node keeps serving its API
+until the change commits and a package is created owned by whichever node
+answered the request. A download requested during the bounded probe wait would
+exit a single-pass removal owned by a tombstone, holding its reservation until
+the seven-day expiry — the exact stranded state this section calls an
+activation blocker. So the removal re-reads the node's work after applying a
+plan and resolves again, for a bounded number of rounds; a node admitting new
+downloads faster than they can be resolved gets a refusal naming that reason
+rather than an unbounded wait. Anything created inside the last narrow window,
+between the final re-read and the committed change, is failed `node_removed`
+once the node is out of the roster: it was never probed, re-homing it would
+guess at a mount, and the membership change can no longer be refused.
+
 The refusal survives, narrowed to what the policy genuinely cannot resolve: a
 download in flight from that node right now. Cutting it off is neither allowed
 outcome, so removal refuses and names the count so the operator can wait or
 delete. Lifting the blanket refusal must not become "removal always succeeds".
 
-Re-homing also fences the old producer. `fail_offline_package` and
-`mark_offline_package_ready` take the owning node id, because the departing
+Re-homing also fences the old producer. `fail_offline_package`,
+`mark_offline_package_ready`, `requeue_offline_package`, and
+`update_offline_progress` all take the owning node id, because the departing
 node's encoder may still be running when ownership moves; without that guard
-its late write would terminate or publish work a survivor has taken over.
+its late write would terminate or publish work a survivor has taken over, yield
+a survivor's claimed package back to the queue, or flap the progress the
+survivor is reporting.
 
 None of this exists on a single-node SQLite install. There is no node to
 remove, no survivor to re-home onto, and no SQLite table backs the probe
@@ -784,8 +800,10 @@ preserving quorum. Removing a node that owns offline work succeeds and resolves
 every package by the rule above: a verified source requeues and then completes
 on its new owner, an unverifiable one fails `node_removed` with its reservation
 released, a `ready` one stops advertising itself, and the departing node can no
-longer publish work a survivor has taken over. An in-flight transfer still
-refuses, with the reason visible to the operator. The activity page aggregates
+longer publish work a survivor has taken over. A download requested on that
+node *while the removal is resolving* is resolved too, not stranded by the
+opening snapshot. An in-flight transfer still refuses, with the reason visible
+to the operator. The activity page aggregates
 direct-play and session rows from all healthy nodes instead of exposing only
 the process that answered the request.
 

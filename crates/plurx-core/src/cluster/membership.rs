@@ -41,6 +41,10 @@ const PROBE_REQUEST_TTL: i64 = 300;
 /// Matches the activity surface's notion of a transfer in progress: a lease
 /// touched this recently is a downloader that is still fetching.
 const TRANSFER_ACTIVE_SECONDS: i64 = 60;
+/// How many times a removal re-reads and resolves newly created offline work
+/// before it refuses instead. Each round costs at most one [`PROBE_WAIT`], so
+/// this bounds the operator's wait as well as the loop.
+const OFFLINE_RESOLVE_ROUNDS: u32 = 3;
 
 const MEMBERSHIP_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_membership_meta (\
@@ -691,7 +695,7 @@ impl MembershipManager {
         // after. A removal that half-commits leaves packages owned by a node
         // that no longer exists, which `CLUSTERING-PLAN.md` §6.7 calls an
         // activation blocker and which is strictly worse than refusing.
-        let resolved = self.resolve_offline_work(node_id).await?;
+        let mut resolved = self.settle_offline_work(node_id).await?;
         let remaining = voters
             .into_iter()
             .filter(|id| *id != target.raft_id)
@@ -712,6 +716,18 @@ impl MembershipManager {
                 params!(unix_ms()?, node_id),
             )
             .await?;
+        // The membership change has committed, so refusing is no longer an
+        // available answer for anything that slipped through the last
+        // re-read. Fail it instead of leaving a row owned by a node that is
+        // now a tombstone.
+        match self.fail_offline_work_left_behind(node_id).await {
+            Ok(failed) => resolved.failed += failed,
+            Err(error) => tracing::error!(
+                %error,
+                "offline work created while a node removal committed is still owned by the \
+                 removed node and will hold its reservation until it expires"
+            ),
+        }
         if resolved.requeued + resolved.failed > 0 {
             tracing::info!(
                 requeued = resolved.requeued,
@@ -720,6 +736,83 @@ impl MembershipManager {
             );
         }
         self.status().await
+    }
+
+    /// Resolve the node's offline work, then keep going until a fresh read
+    /// finds nothing left to resolve.
+    ///
+    /// One snapshot only describes the work that existed when the plan was
+    /// drawn. The departing node keeps serving its HTTP API throughout, and a
+    /// package is created owned by whichever node answered the request — so a
+    /// download requested during the bounded probe wait would exit the removal
+    /// owned by a node that no longer exists, holding its reservation until
+    /// the seven-day expiry. That is precisely the stranded state §6.7 calls
+    /// an activation blocker, so the plan is re-read rather than trusted.
+    ///
+    /// Rounds are bounded because each one is itself bounded by [`PROBE_WAIT`]:
+    /// a node that keeps admitting new downloads faster than they can be
+    /// resolved gets a refusal naming that reason, not an unbounded wait.
+    async fn settle_offline_work(
+        &self,
+        node_id: &str,
+    ) -> Result<OfflineRemovalReport, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let mut total = OfflineRemovalReport::default();
+        let mut round = 0_u32;
+        loop {
+            let report = self.resolve_offline_work(node_id).await?;
+            total.requeued += report.requeued;
+            total.failed += report.failed;
+            round += 1;
+            let remaining = inner
+                .store
+                .unresolved_offline_packages(node_id)
+                .await
+                .map_err(|error| MembershipError::Internal(error.to_string()))?
+                .len();
+            if remaining == 0 {
+                return Ok(total);
+            }
+            if round >= OFFLINE_RESOLVE_ROUNDS {
+                return Err(MembershipError::OfflineWork(format!(
+                    "{remaining} offline download(s) were requested on this node while its \
+                     existing work was being resolved; stop sending it new downloads and retry \
+                     the removal"
+                )));
+            }
+        }
+    }
+
+    /// The last narrow window: a package created between the final re-read and
+    /// the committed membership change.
+    ///
+    /// It cannot be requeued — no survivor was ever asked about its source, and
+    /// asking now would re-home on an unproven mount, which §6.7 forbids. So it
+    /// gets the same `node_removed` failure an unverifiable package gets, which
+    /// releases its reservation and lets the client ask again. The removed node
+    /// cannot create more: it is out of the roster before this runs.
+    async fn fail_offline_work_left_behind(&self, node_id: &str) -> Result<u64, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let plan = inner
+            .store
+            .unresolved_offline_packages(node_id)
+            .await
+            .map_err(|error| MembershipError::Internal(error.to_string()))?
+            .into_iter()
+            .map(|package| OfflineRemovalPlanEntry {
+                package_id: package.id,
+                requeue_to: None,
+            })
+            .collect::<Vec<_>>();
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        inner
+            .store
+            .resolve_offline_packages_for_removal(node_id, &plan, unix_seconds()?)
+            .await
+            .map(|report| report.failed)
+            .map_err(|error| MembershipError::Internal(error.to_string()))
     }
 
     /// Resolve every offline package the departing node owns, per §6.7.
@@ -820,8 +913,9 @@ impl MembershipManager {
             .await
             .map_err(|error| {
                 MembershipError::OfflineWork(format!(
-                    "could not resolve this node's offline work atomically, so the removal was \
-                     refused rather than leaving it stranded: {error}"
+                    "this node's offline work changed while it was being resolved, so the \
+                     removal was refused rather than committing on a stale plan; retry it: \
+                     {error}"
                 ))
             })
     }

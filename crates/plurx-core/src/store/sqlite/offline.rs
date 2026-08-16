@@ -426,14 +426,18 @@ impl OfflinePackageStore for SqliteStore {
         .await
     }
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError> {
-        let id = package_id.to_owned();
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError> {
+        let (id, node) = (package_id.to_owned(), node_id.to_owned());
         self.with_conn(move |conn| {
             Ok(conn.execute(
                 "UPDATE offline_packages SET state = 'queued', \
                  phase = 'waiting_for_encoder', updated_at = unixepoch() \
-                 WHERE id = ?1 AND state = 'preparing'",
-                [id],
+                 WHERE id = ?1 AND node_id = ?2 AND state = 'preparing'",
+                params![id, node],
             )? > 0)
         })
         .await
@@ -459,16 +463,18 @@ impl OfflinePackageStore for SqliteStore {
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError> {
-        let (id, phase) = (package_id.to_owned(), phase.to_owned());
+        let (id, node, phase) = (package_id.to_owned(), node_id.to_owned(), phase.to_owned());
         self.with_conn(move |conn| {
             Ok(conn.execute(
-                "UPDATE offline_packages SET phase = ?2, \
-                 progress_millis = MAX(progress_millis, ?3), \
-                 updated_at = unixepoch() WHERE id = ?1 AND state = 'preparing'",
-                params![id, phase, progress_millis.clamp(0, 999)],
+                "UPDATE offline_packages SET phase = ?3, \
+                 progress_millis = MAX(progress_millis, ?4), \
+                 updated_at = unixepoch() \
+                 WHERE id = ?1 AND node_id = ?2 AND state = 'preparing'",
+                params![id, node, phase, progress_millis.clamp(0, 999)],
             )? > 0)
         })
         .await
@@ -1026,11 +1032,11 @@ mod tests {
         assert_eq!(claimed.state, "preparing");
         assert_eq!(claimed.effective_rate_control, "vbr");
         store
-            .update_offline_progress(&package.id, "transcoding", 600)
+            .update_offline_progress(&package.id, "node-a", "transcoding", 600)
             .await
             .expect("progress");
         store
-            .update_offline_progress(&package.id, "transcoding", 200)
+            .update_offline_progress(&package.id, "node-a", "transcoding", 200)
             .await
             .expect("stale progress");
         let current = store

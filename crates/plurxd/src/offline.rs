@@ -520,7 +520,7 @@ impl OfflineManager {
         };
         let _ = self
             .store
-            .update_offline_progress(&package.id, "transcoding", 1)
+            .update_offline_progress(&package.id, &self.node_id, "transcoding", 1)
             .await;
         let outcome = self
             .transcode
@@ -653,7 +653,11 @@ impl OfflineManager {
     }
 
     async fn requeue(&self, package: &OfflinePackage, work_started: Instant) {
-        match self.store.requeue_offline_package(&package.id).await {
+        match self
+            .store
+            .requeue_offline_package(&package.id, &self.node_id)
+            .await
+        {
             Ok(true) => self
                 .metrics
                 .accumulate_work(&package.id, work_started.elapsed()),
@@ -1065,7 +1069,7 @@ mod tests {
         let mut package = claimed_package(&fixture, "changed-source", "none", None).await;
         assert!(fixture
             .store
-            .requeue_offline_package(&package.id)
+            .requeue_offline_package(&package.id, "test-node")
             .await
             .expect("requeue"));
         package.source_mtime += 1;

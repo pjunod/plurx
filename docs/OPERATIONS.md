@@ -326,7 +326,10 @@ curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
 
 Removal resolves the departing node's offline packages before the membership
 change commits, so nothing is left owned by a machine that no longer exists.
-You do not have to drain them by hand first.
+You do not have to drain them by hand first, and you do not have to stop that
+node from serving downloads while you do it: it keeps answering requests until
+the change commits, and removal re-reads its work and resolves the new arrivals
+before committing rather than acting on the list it started with.
 
 Before it commits, the cluster asks every other node whether it can actually
 read each package's source file — not whether the path looks the same, but
@@ -354,8 +357,18 @@ fix is always the same — ask for it again.
 
 The removal still refuses while a client is downloading from that node right
 now, and the error says how many transfers are in flight. Wait for them to
-finish or delete those packages, then retry. This is the only offline reason a
-removal refuses; everything else resolves.
+finish or delete those packages, then retry.
+
+Two other offline refusals exist, and both are "retry this", not "drain it by
+hand". A node that keeps admitting new downloads faster than the removal can
+resolve them refuses after a bounded number of rounds and says so; point those
+clients elsewhere and retry. A package that changes state while its resolution
+is being applied — a producer finishing at exactly the wrong moment — also
+refuses, because the removal will not commit on a plan it could not finish
+applying. In both cases the packages that were resolved stay resolved: moved
+work is claimable on its new node, failed work has already released its
+reservation, and the retry picks up whatever is left. Nothing is left half
+owned.
 
 `cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
 `node_owns_offline_work` are operator-facing refusal codes. After a successful
