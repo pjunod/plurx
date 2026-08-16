@@ -153,6 +153,18 @@ following restart retries activation. After rename, the completed target wins.
 The variable is evaluated only while activation is pending, so a stale value
 cannot take an already-activated node offline.
 
+**Stopping the daemon while it is still starting.** SIGTERM and SIGINT are
+answered from the first moment of startup, not only once the server is
+listening, so `docker stop` during hardware probing or listener setup exits
+cleanly without ever becoming reachable. The one exception is the import and
+activation sequence above: it renames directories and fsyncs markers in a fixed
+order and is never interrupted partway, so a signal arriving inside it takes
+effect at the boundary immediately after. Give a container a stop grace period
+longer than one activation — that sequence is bounded by library size, and a
+grace period shorter than it means the runtime kills the process mid-activation.
+That is recoverable rather than damaging: the next boot consumes one
+unchanged-SQLite recovery boot and retries, exactly as for the failpoints above.
+
 After activation, an ungraceful death may leave Hiqlite's state-machine lock.
 The next boot automatically discards and rebuilds that derived state machine
 from the one voter's retained local Raft log and snapshot, including

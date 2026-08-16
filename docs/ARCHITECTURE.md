@@ -105,10 +105,22 @@ unflushed intermediate beat, so this endpoint is the explicit exception to an
 HTTP-level acknowledged-write durability promise. Store-method success itself
 remains durable. Session state updates on segment boundaries, not per-chunk.
 On Unix, the SIGTERM and SIGINT streams are installed before store activation,
-hardware probing, and listener binding, then owned by the shutdown future until
-the server drains. A shipped-binary bind-boundary failpoint raises SIGTERM before
-that future is first polled, so restoring lazy registration fails
-deterministically instead of depending on a sub-millisecond race.
+hardware probing, and listener binding, then watched for the whole of startup
+rather than only from the point `serve` first polls the drain. Installing the
+streams keeps a signal off its default action; watching them is what lets
+startup answer one. A signal observed before the server is built stops startup
+at its next cancel-safe boundary and exits cleanly instead of binding a listener
+the operator has already asked to go away. One stage is deliberately not
+cancellable: `select_daemon_store` renames directories and fsyncs activation
+markers in a fixed order, so a signal arriving inside it is acted on at the
+boundary immediately after it rather than interrupting it, and an operator stop
+grace period shorter than a single activation is still resolved by killing the
+process — which the next boot recovers as an interrupted activation. Two
+shipped-binary failpoints hold both halves: one raises SIGTERM after the
+listener binds but before the drain future is first polled, so restoring lazy
+registration fails deterministically instead of depending on a sub-millisecond
+race; the other raises it as activation returns, so restoring the
+buffer-until-serve behavior is caught by the daemon booting anyway.
 This matters because raft commits every write to a quorum — a naive "save
 position on every timeupdate" would put hundreds of writes/second through
 consensus and melt it.

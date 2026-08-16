@@ -264,9 +264,12 @@ fn read_password(input: &mut impl std::io::BufRead) -> std::io::Result<String> {
 async fn run(config: Config) -> anyhow::Result<()> {
     let logs = init_logging();
     // Signal streams must exist before store activation, system probing, or
-    // any listener can make this process externally reachable. The returned
-    // future owns them until `boot` begins polling the graceful drain.
-    let shutdown = shutdown_signal();
+    // any listener can make this process externally reachable. Installing them
+    // is only half of it: nothing polls that future until `serve` first polls
+    // its graceful-drain argument, so watching the streams from here is what
+    // lets the startup stages below answer a signal instead of finishing every
+    // one of them first.
+    let shutdown = ShutdownWatch::observing(shutdown_signal());
 
     let selected = select_daemon_store(&config)
         .await
@@ -284,11 +287,34 @@ async fn run(config: Config) -> anyhow::Result<()> {
              this boot is not replicated and the next restart retries the import"
         ),
     }
+    trigger_shutdown_registration_failpoint("after-store-activation");
+
     let serving = async {
+        // `select_daemon_store` renames directories and fsyncs activation
+        // markers in a fixed order, so it is the one startup stage that has to
+        // finish rather than be cancelled midway. Answer the signal at the
+        // boundary just after it instead: no listener exists yet, so stopping
+        // here is indistinguishable from never having been asked to start.
+        if shutdown.is_signalled() {
+            tracing::info!("shutdown signal received during store activation; not serving");
+            return Ok(());
+        }
         let store = Arc::clone(&selected.store);
         let replication = selected.replication_monitor();
         let dirs = create_dirs(&config.storage.data_dir)?;
-        let (encoder_caps, system) = probe_system(&config, &store, &dirs.transcode).await?;
+        // Probing only measures ffmpeg and the host, so cancelling it leaves
+        // nothing half-written. Racing it is what keeps `docker stop` during a
+        // slow probe from waiting out its grace period while this process
+        // finishes measuring hardware it is about to stop using.
+        let probed = tokio::select! {
+            biased;
+            () = shutdown.clone().signalled() => None,
+            probed = probe_system(&config, &store, &dirs.transcode) => Some(probed?),
+        };
+        let Some((encoder_caps, system)) = probed else {
+            tracing::info!("shutdown signal received during system probing; not serving");
+            return Ok(());
+        };
         let parts = Boot {
             store,
             replication,
@@ -299,7 +325,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             system,
             logs,
         };
-        boot(config, parts, start_mdns_advertiser, shutdown).await
+        boot(config, parts, start_mdns_advertiser, shutdown.signalled()).await
     };
     let result = serving.await;
     let shutdown = selected
@@ -369,7 +395,7 @@ async fn boot(
     let progress = Arc::clone(&state.progress);
     let app = http::router(state);
     let listener = bind_listener(config.server.bind).await?;
-    trigger_shutdown_registration_failpoint();
+    trigger_shutdown_registration_failpoint("after-listener-bind");
     let mdns = start_discovery(&config, &instance_id, advertiser);
 
     serve(listener, app, progress, mdns, shutdown).await
@@ -1269,6 +1295,59 @@ fn gdm_bind_port(value: Option<&str>) -> anyhow::Result<u16> {
         .with_context(|| format!("invalid PLURX_GDM_PORT {value:?}"))
 }
 
+/// Records a terminate or interrupt signal from the moment startup begins,
+/// rather than from the moment something first polls the drain.
+///
+/// [`shutdown_signal`] installs the OS handlers before this process can become
+/// reachable, but installing is not observing. Nothing polls the returned
+/// future until `serve` first polls its graceful-shutdown argument, so a signal
+/// arriving during store activation or hardware probing stayed buffered in the
+/// stream while every remaining startup stage ran to completion. An operator
+/// stopping a container midway through activation got no drain and no early
+/// exit — just a daemon that kept starting until the grace period ran out and
+/// the runtime killed it. Driving the streams from a task started here means
+/// the signal is recorded when it arrives, and startup can stop at its next
+/// cancel-safe boundary.
+///
+/// This does not weaken the registration invariant: the handlers are still
+/// installed by [`shutdown_signal`] before the future is handed over, so the
+/// window between reachability and registration stays closed.
+#[derive(Clone)]
+struct ShutdownWatch(tokio::sync::watch::Receiver<bool>);
+
+impl ShutdownWatch {
+    /// Takes an already-installed signal future and starts polling it now.
+    fn observing(signal: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            signal.await;
+            // Every receiver being gone means the process is already past the
+            // point where a recorded signal could change anything.
+            let _ = sender.send(true);
+        });
+        Self(receiver)
+    }
+
+    /// Whether a signal has already been observed. For the startup boundaries
+    /// that must not be cancelled mid-stage.
+    fn is_signalled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once a signal has been observed, including one that arrived
+    /// before this future was first polled.
+    async fn signalled(mut self) {
+        while !*self.0.borrow_and_update() {
+            if self.0.changed().await.is_err() {
+                // The driver only ends after sending, so a closed channel with
+                // nothing recorded means no signal is ever coming. Never
+                // resolving matches what an unsignalled process should do.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     // Install both Unix streams before returning the future. The caller binds
     // the listener before `serve` first polls its graceful-shutdown future, so
@@ -1308,15 +1387,23 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     }
 }
 
-/// Deterministically exercise the otherwise sub-millisecond listener/first-poll
-/// boundary in the shipped binary. With lazy registration this signal uses its
-/// default action and the process exits with signal 15; with eager registration
-/// it is buffered for `shutdown_signal` and starts a clean drain.
+/// Raise SIGTERM at a named startup boundary in the shipped binary, so two
+/// otherwise unobservable windows can be tested rather than argued about.
+///
+/// `after-listener-bind` hits the sub-millisecond gap between the listener
+/// becoming reachable and `serve` first polling the drain: with lazy
+/// registration the signal takes its default action and the process dies from
+/// signal 15, with eager registration it drains and exits 0.
+///
+/// `after-store-activation` hits the much wider window before `boot` runs at
+/// all: without a watcher observing the installed streams the signal only sits
+/// buffered, so the daemon probes hardware and binds a listener anyway and
+/// `plurxd starting` appears in its log. With one, startup stops before `boot`.
 #[cfg(unix)]
-fn trigger_shutdown_registration_failpoint() {
+fn trigger_shutdown_registration_failpoint(stage: &str) {
     if matches!(
         std::env::var("PLURX_SHUTDOWN_REGISTRATION_FAILPOINT").as_deref(),
-        Ok("after-listener-bind")
+        Ok(configured) if configured == stage
     ) {
         // SAFETY: this path is opt-in test instrumentation, and
         // `shutdown_signal` installed the process handler before startup.
@@ -1325,7 +1412,7 @@ fn trigger_shutdown_registration_failpoint() {
 }
 
 #[cfg(not(unix))]
-fn trigger_shutdown_registration_failpoint() {}
+fn trigger_shutdown_registration_failpoint(_stage: &str) {}
 
 /// Minimal HTTP/1.0 probe over std TcpStream — deliberately dependency-free.
 fn healthcheck(config: &Config) -> anyhow::Result<()> {
