@@ -40,7 +40,11 @@ A pre-play choice goes back to `/decision` as `audio=<index>` and
 plan **as given** — it does not add the selected audio index itself. The plan
 already carries it: a remux plan's `url` ends in `?audio=<index>`, and remux
 and transcode plans repeat it in `delivery.audio` for the HLS session-create
-body. A client that reuses a bare `/stream.mp4` instead gets the server's
+body. **The plan carries the audio selection only.** A selected subtitle is not
+in it and must not be looked for there: a burn-in travels in the HLS
+session-create body as `subtitle_burn`, and a text track is fetched as a sidecar
+(`/files/{id}/subs/{index}`) and applied by the client itself. A client that
+reuses a bare `/stream.mp4` instead gets the server's
 language default, not the viewer's choice. Selecting a track other than the
 container's own default also means the plan will not be `direct` — the raw
 file has no audio selector — so a client must not assume its verdict is stable
@@ -51,9 +55,21 @@ ASS/SSA and `mov_text` require a burn on native HLS even though the server can
 extract them as sidecars. A true
 `selection.subtitle_burn_in_blocked_by_hdr` means the existing HDR guard kept
 the current delivery instead of replacing it with SDR. The choice belongs to
-one playback only; no client writes Playback defaults as a side effect. The
-server contract is shipped. Web, Apple, and Android rendering land in their
-platform follow-ups rather than inventing placeholder policy in the meantime.
+one playback only; no client writes Playback defaults as a side effect.
+
+`selection.subtitle_requires_burn_in` describes the *server's plan*, and it is
+false when the PGS application overlay is enabled — a delivery only the native
+clients implement. A client without that route (the web player) must still burn
+such a track, so it honours whichever of the two authorities says a burn is
+needed. Following the plan there would start a stream that cannot show the
+chosen track and replace it a moment later, which is exactly the re-buffer a
+pre-play choice exists to avoid.
+
+The server contract is shipped, and the **web** client renders it: the item
+detail screen lists both track sets with the selected one marked, and offers
+pre-play Audio and Subtitles pickers whose choice reaches `/decision` and the
+first session open. Apple and Android rendering land in their platform
+follow-ups rather than inventing placeholder policy in the meantime.
 
 ## 2. Per-platform notes
 
