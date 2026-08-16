@@ -431,10 +431,24 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
 /// unlinking the lock would skip the reconstruction. The password change is
 /// acknowledged after activation, so reading it after restart proves the
 /// rebuild preserved state newer than the retained pre-activation SQLite file.
+///
+/// Both advertised forms are covered. A loopback literal and a real hostname
+/// took different startup paths for as long as the repair triggered on
+/// "the committed address looks like loopback" rather than on "it differs from
+/// the configured one": the loopback form rebuilt on every boot and so
+/// recovered by accident, while a node advertising a routable name settled
+/// after its first restart and then had no repair left to run.
 #[cfg(unix)]
 #[tokio::test]
 async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
     let _process_test = PROCESS_TEST_LOCK.lock().await;
+    for advertise_host in ["127.0.0.1", "localhost"] {
+        sigkill_recovery_preserves_acknowledged_writes(advertise_host).await;
+    }
+}
+
+#[cfg(unix)]
+async fn sigkill_recovery_preserves_acknowledged_writes(advertise_host: &str) {
     let root = tempfile::tempdir().expect("SIGKILL recovery fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -461,7 +475,7 @@ async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
              [cluster]\n\
              raft_bind = \"127.0.0.1:{}\"\n\
              api_bind = \"127.0.0.1:{}\"\n\
-             advertise_host = \"127.0.0.1\"\n",
+             advertise_host = \"{advertise_host}\"\n",
             toml_string(&data),
             free_port(),
             free_port(),
