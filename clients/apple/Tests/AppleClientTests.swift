@@ -3279,16 +3279,16 @@ final class AppleClientTests: XCTestCase {
 
     func testInitialHlsSessionCarriesTheDecisionsAudioTrack() {
         XCTAssertEqual(
-            PlayerController.sessionAudioIndex(explicit: nil, selected: 2),
+            PlayerController.sessionAudioIndex(explicit: nil, plan: nil, selected: 2),
             2,
             "cold start must carry the track whose checkmark the decision supplied"
         )
         XCTAssertEqual(
-            PlayerController.sessionAudioIndex(explicit: 3, selected: 2),
+            PlayerController.sessionAudioIndex(explicit: 3, plan: nil, selected: 2),
             3,
             "a viewer's manual selection must still win on a reopen"
         )
-        XCTAssertNil(PlayerController.sessionAudioIndex(explicit: nil, selected: nil))
+        XCTAssertNil(PlayerController.sessionAudioIndex(explicit: nil, plan: nil, selected: nil))
     }
 
     /// The playback-info panel says the same thing in a sentence, and prefers
@@ -5610,4 +5610,517 @@ final class AppleClientTests: XCTestCase {
         surface.applyPGSOverlay(nil, to: nil)
         XCTAssertEqual(surface.pgsOverlayNodeCount, 0)
     }
+
+    // MARK: - Detail-screen track facts and pre-play selection (#288)
+
+    /// Criterion 1: every subtitle track is listed with language, format, and
+    /// its forced / SDH markers. A file with none says so rather than showing
+    /// an empty box.
+    func testSubtitleFactsListLanguageFormatAndMarkers() {
+        let file = Self.trackFactsFile(
+            subtitles: [
+                SubtitleStream(
+                    index: 0, codec: "subrip", language: "eng", title: "English",
+                    default: true, forced: false, hearingImpaired: false
+                ),
+                SubtitleStream(
+                    index: 1, codec: "hdmv_pgs_subtitle", language: "jpn", title: "Signs [Forced]",
+                    default: false, forced: false, hearingImpaired: nil
+                ),
+                SubtitleStream(
+                    index: 2, codec: "ass", language: nil, title: nil,
+                    default: false, forced: false, hearingImpaired: true
+                ),
+            ]
+        )
+
+        let rows = TrackFacts.subtitleRows(file)
+        XCTAssertEqual(rows.map(\.label), [
+            "English · SubRip · English",
+            "Japanese · PGS · Signs [Forced]",
+            "Untagged · ASS",
+        ])
+        // The forced marker survives on the title alone — the container flag is
+        // false on 1 — and SDH comes off the disposition on 2.
+        XCTAssertEqual(rows.map(\.markers), [[], ["Forced"], ["SDH"]])
+        XCTAssertEqual(rows.map(\.isServerDefault), [true, false, false])
+
+        let none = Self.trackFactsFile(subtitles: [])
+        XCTAssertTrue(TrackFacts.subtitleRows(none).isEmpty)
+        XCTAssertEqual(
+            TrackFacts.statusLine(none.playbackDefaults?.subtitle, isSubtitle: true),
+            TrackFacts.noSubtitleTracksLine
+        )
+    }
+
+    /// Criterion 2: all five `preferred_language_status` states are rendered,
+    /// and `unknown` is "can't tell" — never folded into `missing`, which is a
+    /// claim the server explicitly declined to make.
+    func testEveryPreferredLanguageStatusIsWordedDistinctly() {
+        func line(_ status: PreferredLanguageStatus, isSubtitle: Bool) -> String {
+            TrackFacts.statusLine(
+                PlaybackTrackDefault(
+                    selectedIndex: 0,
+                    preferredLanguage: "eng",
+                    preferredLanguageStatus: status
+                ),
+                isSubtitle: isSubtitle
+            ) ?? ""
+        }
+
+        let audio = PreferredLanguageStatus.allFive.map { line($0, isSubtitle: false) }
+        let subtitle = PreferredLanguageStatus.allFive.map { line($0, isSubtitle: true) }
+        XCTAssertEqual(Set(audio).count, 5, "each audio status needs its own sentence")
+        XCTAssertEqual(Set(subtitle).count, 5, "each subtitle status needs its own sentence")
+
+        XCTAssertEqual(line(.selected, isSubtitle: false), "English audio is selected.")
+        XCTAssertEqual(line(.missing, isSubtitle: true), "No English subtitles.")
+        // The example from the issue: the viewer learns both halves at once.
+        XCTAssertEqual(line(.selected, isSubtitle: false), "English audio is selected.")
+
+        let unknown = line(.unknown, isSubtitle: true)
+        XCTAssertTrue(unknown.contains("Can't tell"), unknown)
+        XCTAssertFalse(unknown.hasPrefix("No English"), unknown)
+        XCTAssertNotEqual(unknown, line(.missing, isSubtitle: true))
+
+        // An unrecognized future state decodes as "can't tell" for the same
+        // reason: absence must not be claimed on a status this build cannot read.
+        XCTAssertEqual(
+            try JSONDecoder().decode(PreferredLanguageStatus.self, from: Data("\"invented\"".utf8)),
+            .unknown
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(PreferredLanguageStatus.self, from: Data("\"no_tracks\"".utf8)),
+            .noTracks
+        )
+    }
+
+    /// Criterion 3: the choice reaches `/decision` as `audio=` and `subtitle=`,
+    /// with `-1` for Off — and an unmade choice adds nothing at all, so an
+    /// ordinary play still sends the request it always sent.
+    func testPrePlaySelectionTravelsAsDecisionQueryParameters() {
+        XCTAssertTrue(PrePlaySelection.none.queryItems.isEmpty)
+        XCTAssertTrue(PrePlaySelection.none.isEmpty)
+
+        let picked = PrePlaySelection(audioIndex: 2, subtitleIndex: 5)
+        XCTAssertEqual(
+            picked.queryItems.map { "\($0.name)=\($0.value ?? "")" },
+            ["audio=2", "subtitle=5"]
+        )
+
+        let off = PrePlaySelection(audioIndex: nil, subtitleIndex: PrePlaySelection.subtitleOff)
+        XCTAssertEqual(off.queryItems.map { "\($0.name)=\($0.value ?? "")" }, ["subtitle=-1"])
+        XCTAssertFalse(off.isEmpty, "Off is a choice, not the absence of one")
+    }
+
+    /// Criterion 5: the plan carries the audio, so the session-create body uses
+    /// `delivery.audio` rather than a client-side re-derivation — and a later
+    /// in-player change still outranks the plan it was decided before.
+    func testSessionAudioComesFromTheDeliveryPlanBeforeThePolicyDefault() {
+        XCTAssertEqual(
+            PlayerController.sessionAudioIndex(explicit: nil, plan: 3, selected: 0),
+            3
+        )
+        XCTAssertEqual(
+            PlayerController.sessionAudioIndex(explicit: 7, plan: 3, selected: 0),
+            7
+        )
+        // No selection was requested, so no plan audio exists: unchanged.
+        XCTAssertEqual(
+            PlayerController.sessionAudioIndex(explicit: nil, plan: nil, selected: 0),
+            0
+        )
+        XCTAssertNil(PlayerController.sessionAudioIndex(explicit: nil, plan: nil, selected: nil))
+    }
+
+    /// Criteria 3 and 4: a pre-play subtitle is what the first open applies. It
+    /// outranks the device's Off setting and the never-auto-burn veto, because
+    /// both of those govern *automatic* selection and this is the viewer.
+    @MainActor
+    func testPrePlaySubtitleChoiceOutranksAutomaticSelectionVetoes() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: nil,
+                default: true, forced: false, text: true, native: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "jpn", title: nil,
+                default: false, forced: false, text: false, native: false
+            ),
+        ]
+
+        // Off in Settings does not overrule a choice made two screens later.
+        XCTAssertEqual(
+            PlayerController.initialSubtitleIndex(
+                prePlay: 0,
+                serverSelection: DecisionSelection(audioIndex: nil, subtitleIndex: 0),
+                tracks: tracks,
+                deviceSubtitlesOff: true
+            ),
+            0
+        )
+        // A bitmap track automatic selection would refuse is honored when the
+        // viewer picks it by hand.
+        XCTAssertEqual(
+            PlayerController.initialSubtitleIndex(
+                prePlay: 1,
+                serverSelection: DecisionSelection(audioIndex: nil, subtitleIndex: 1),
+                tracks: tracks,
+                deviceSubtitlesOff: false
+            ),
+            1
+        )
+        // Off is honored as a choice, not read as "no choice made".
+        XCTAssertNil(
+            PlayerController.initialSubtitleIndex(
+                prePlay: PrePlaySelection.subtitleOff,
+                serverSelection: DecisionSelection(audioIndex: nil, subtitleIndex: nil),
+                tracks: tracks,
+                deviceSubtitlesOff: false
+            )
+        )
+        // A server predating the selection contract sends no echo; the choice
+        // still applies rather than silently reverting to the server's pick.
+        XCTAssertEqual(
+            PlayerController.initialSubtitleIndex(
+                prePlay: 1,
+                serverSelection: nil,
+                tracks: tracks,
+                deviceSubtitlesOff: false
+            ),
+            1
+        )
+        // With no pre-play choice, nothing about the existing path moves.
+        XCTAssertEqual(
+            PlayerController.initialSubtitleIndex(
+                prePlay: nil,
+                serverSelection: nil,
+                tracks: tracks,
+                deviceSubtitlesOff: false
+            ),
+            PlayerController.automaticSubtitleIndex(tracks)
+        )
+        XCTAssertNil(
+            PlayerController.initialSubtitleIndex(
+                prePlay: nil,
+                serverSelection: nil,
+                tracks: tracks,
+                deviceSubtitlesOff: true
+            )
+        )
+    }
+
+    /// Criterion 6: a bitmap pre-play choice discloses the burn before playback
+    /// starts. Text tracks that ride along as renditions cost nothing and say
+    /// nothing.
+    func testBitmapPrePlayChoiceDisclosesItsBurnInCost() {
+        let file = Self.trackFactsFile(
+            subtitles: [
+                SubtitleStream(
+                    index: 0, codec: "subrip", language: "eng", title: nil,
+                    default: true, forced: false, hearingImpaired: nil
+                ),
+                SubtitleStream(
+                    index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: nil,
+                    default: false, forced: false, hearingImpaired: nil
+                ),
+                SubtitleStream(
+                    index: 2, codec: "ass", language: "eng", title: nil,
+                    default: false, forced: false, hearingImpaired: nil
+                ),
+            ]
+        )
+
+        XCTAssertNil(TrackFacts.burnInWarning(file, chosen: nil))
+        XCTAssertNil(TrackFacts.burnInWarning(file, chosen: PrePlaySelection.subtitleOff))
+        XCTAssertNil(TrackFacts.burnInWarning(file, chosen: 0))
+        // Styled ASS contains text and still cannot be a WebVTT rendition, and
+        // nothing can rescue it, so the burn is stated flatly.
+        let styled = TrackFacts.burnInWarning(file, chosen: 2) ?? ""
+        XCTAssertTrue(styled.contains("re-encode"), styled)
+        XCTAssertFalse(styled.contains("Unless"), styled)
+        // PGS has one escape the detail screen cannot see — the server's
+        // `pgs-v1` overlay — so the cost is disclosed without claiming a burn
+        // the server may avoid.
+        let pgs = TrackFacts.burnInWarning(file, chosen: 1) ?? ""
+        XCTAssertTrue(pgs.contains("re-encode"), pgs)
+        XCTAssertTrue(pgs.hasPrefix("Unless"), pgs)
+    }
+
+    /// Criterion 7: the choice belongs to one playback. A selection recorded
+    /// against one file is never spent on another's stream indices.
+    func testPrePlaySelectionDoesNotLeakToAnotherFile() {
+        let chosen = PrePlaySelection(audioIndex: 4, subtitleIndex: 2)
+
+        XCTAssertEqual(TrackFacts.selection(chosen, carriedFrom: 11, to: 11), chosen)
+        XCTAssertEqual(TrackFacts.selection(chosen, carriedFrom: 11, to: 12), .none)
+        XCTAssertEqual(TrackFacts.selection(chosen, carriedFrom: nil, to: 12), .none)
+        // Autoplay's next episode builds its own context and inherits nothing.
+        XCTAssertEqual(
+            PlayContext(itemId: 1, fileId: 2, startMs: 0, durationMs: 0, title: "Next").selection,
+            .none
+        )
+    }
+
+    /// Criterion 3, and review finding 2: "Start over" must carry the pre-play
+    /// choice in *every* layout. The compact iPhone button built its own
+    /// `PlayContext` by hand and omitted `selection:`, so a viewer who picked
+    /// tracks and tapped Start over on an iPhone silently got the server
+    /// defaults while the same tap honored the choice on iPad and tvOS. Both
+    /// buttons now share `startOverContext`, which is what this pins.
+    func testStartOverCarriesThePrePlaySelectionInEveryLayout() {
+        let item = Item(id: 7, kind: "movie", title: "Feature")
+        var file = MediaFile(id: 42)
+        file.durationMs = 90_000
+        let chosen = PrePlaySelection(audioIndex: 1, subtitleIndex: 3)
+
+        let context = DetailView.startOverContext(
+            item: item,
+            file: file,
+            durationMs: 90_000,
+            files: [file],
+            subtitle: nil,
+            pendingSelection: chosen,
+            pendingSelectionFileId: file.id
+        )
+        XCTAssertEqual(context.selection, chosen)
+        XCTAssertEqual(context.fileId, 42)
+        XCTAssertEqual(context.startMs, 0, "Start over still starts over")
+
+        // The file-id guard governs this path like every other: a choice made
+        // against another file is discarded rather than spent here.
+        XCTAssertEqual(
+            DetailView.startOverContext(
+                item: item,
+                file: file,
+                durationMs: 90_000,
+                files: [file],
+                subtitle: nil,
+                pendingSelection: chosen,
+                pendingSelectionFileId: 41
+            ).selection,
+            .none
+        )
+    }
+
+    /// Review finding 3: `/decision` emits its `selection` block whenever
+    /// *either* parameter was sent, and the `subtitle_burn_in_blocked_by_hdr`
+    /// it carries is computed from the **policy** subtitle against the
+    /// **source** range. On an audio-only request that describes a burn the
+    /// server never applied — `apply_selected_subtitle` is gated on
+    /// `subtitle=` — so reading the flag there turned off a forced track the
+    /// no-choice path starts happily.
+    @MainActor
+    func testAudioOnlyPrePlayChoiceDoesNotInheritThePolicySubtitleHDRRefusal() {
+        // Forced PGS signs: the server's automatic pick, burn-only.
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: nil,
+                default: true, forced: true, text: false, native: false
+            ),
+        ]
+        // HDR source, tone-mapped to SDR for an SDR-only device — so the burn
+        // the client cares about costs nothing, and the signs must stay on.
+        let refusedForThePolicyPick = DecisionSelection(
+            audioIndex: 2,
+            subtitleIndex: 0,
+            subtitleRequiresBurnIn: true,
+            subtitleBurnInBlockedByHdr: true
+        )
+        XCTAssertFalse(
+            PlayerController.startingSubtitleBlockedByHDR(
+                prePlaySubtitle: nil,
+                wanted: 0,
+                serverSelection: refusedForThePolicyPick,
+                tracks: tracks,
+                deliveredRange: "sdr"
+            ),
+            "an audio-only choice must not turn off the automatic subtitle"
+        )
+        // With a subtitle choice the server genuinely ruled on the burn, and
+        // its refusal is the authority.
+        XCTAssertTrue(
+            PlayerController.startingSubtitleBlockedByHDR(
+                prePlaySubtitle: 0,
+                wanted: 0,
+                serverSelection: refusedForThePolicyPick,
+                tracks: tracks,
+                deliveredRange: "sdr"
+            )
+        )
+        // The client's own predicate is unchanged and still vetoes an
+        // automatic burn that would actually replace HDR delivery.
+        XCTAssertTrue(
+            PlayerController.startingSubtitleBlockedByHDR(
+                prePlaySubtitle: nil,
+                wanted: 0,
+                serverSelection: nil,
+                tracks: tracks,
+                deliveredRange: "hdr10"
+            )
+        )
+    }
+
+    /// Review finding 4: the SDH title sniff must be the server's, because the
+    /// same track reading as SDH on the detail screen but not on the HLS
+    /// rendition is two answers to one question. A bare `cc` substring also
+    /// matched ordinary words.
+    func testSDHTitleSniffMirrorsTheServerMarkerListWithoutOverMatching() {
+        func markers(_ title: String?, hearingImpaired: Bool? = nil) -> [String] {
+            TrackFacts.subtitleMarkers(
+                SubtitleStream(
+                    index: 0, codec: "subrip", language: "eng", title: title,
+                    default: false, forced: false, hearingImpaired: hearingImpaired
+                )
+            )
+        }
+
+        // Every marker crates/plurxd/src/http/hls.rs `subtitle_characteristics`
+        // recognizes, and nothing it does not.
+        for title in ["SDH", "English (Closed Caption)", "closed-caption",
+                      "Hard of Hearing", "Non Udenti"] {
+            XCTAssertEqual(markers(title), ["SDH"], "\(title) is an SDH marker on the server")
+        }
+        // The words a bare `cc` used to swallow.
+        for title in ["Tracce", "Piccadilly", "Soccer Commentary"] {
+            XCTAssertEqual(markers(title), [], "\(title) is not an SDH claim")
+        }
+        // The container disposition still outranks any title.
+        XCTAssertEqual(markers("English", hearingImpaired: true), ["SDH"])
+    }
+
+    /// The control summaries read from `playback_defaults` until the viewer
+    /// overrides them, so the detail screen shows the server's answer first.
+    func testTrackControlSummariesPreferTheViewerChoiceOverTheServerDefault() {
+        let file = Self.trackFactsFile(
+            audio: [
+                AudioTrack(index: 0, codec: "eac3", channels: 6, language: "jpn", title: nil, default: true),
+                AudioTrack(index: 1, codec: "aac", channels: 2, language: "eng", title: nil, default: false),
+            ],
+            subtitles: [
+                SubtitleStream(
+                    index: 0, codec: "subrip", language: "eng", title: nil,
+                    default: true, forced: false, hearingImpaired: nil
+                ),
+            ],
+            audioDefaultIndex: 0,
+            subtitleDefaultIndex: 0
+        )
+
+        XCTAssertEqual(
+            TrackFacts.audioSummary(file, chosen: nil),
+            "Japanese · Dolby Digital Plus · 5.1"
+        )
+        XCTAssertEqual(TrackFacts.audioSummary(file, chosen: 1), "English · AAC · Stereo")
+        XCTAssertEqual(TrackFacts.subtitleSummary(file, chosen: nil), "English · SubRip")
+        XCTAssertEqual(
+            TrackFacts.subtitleSummary(file, chosen: PrePlaySelection.subtitleOff),
+            "Off"
+        )
+
+        // A file whose server default is Off reads Off, not the first track.
+        let offByDefault = Self.trackFactsFile(
+            subtitles: [
+                SubtitleStream(
+                    index: 0, codec: "subrip", language: "fra", title: nil,
+                    default: false, forced: false, hearingImpaired: nil
+                ),
+            ],
+            subtitleDefaultIndex: nil
+        )
+        XCTAssertEqual(TrackFacts.subtitleSummary(offByDefault, chosen: nil), "Off")
+        XCTAssertEqual(TrackFacts.subtitleSummary(offByDefault, chosen: 0), "French · SubRip")
+    }
+
+    /// The shared fixture's track facts decode through the production models,
+    /// which is the boundary that catches a server-side rename.
+    func testSharedFixtureDecodesTrackFactsAndSelectionFields() throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: AppleClientTests.self).url(
+                forResource: "native-api",
+                withExtension: "json"
+            )
+        )
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fixture = try decoder.decode(
+            NativeAPIContractFixture.self,
+            from: Data(contentsOf: fixtureURL)
+        )
+
+        let file = try XCTUnwrap(fixture.itemDetail.files?.first)
+        XCTAssertEqual(file.subtitleStreams?.map(\.index), [2])
+        XCTAssertEqual(file.subtitleStreams?.first?.codec, "subrip")
+        XCTAssertEqual(file.playbackDefaults?.audio?.selectedIndex, 1)
+        XCTAssertEqual(file.playbackDefaults?.audio?.preferredLanguage, "eng")
+        XCTAssertEqual(file.playbackDefaults?.audio?.preferredLanguageStatus, .selected)
+        XCTAssertEqual(file.playbackDefaults?.subtitle?.selectedIndex, 2)
+        XCTAssertEqual(file.playbackDefaults?.subtitle?.preferredLanguageStatus, .selected)
+        XCTAssertEqual(TrackFacts.subtitleRows(file).map(\.isServerDefault), [true])
+    }
+
+    /// The whole `selection` block decodes, including the HDR refusal that
+    /// criterion 6 forbids reporting as subtitles-on.
+    func testDecisionSelectionBlockDecodesIncludingTheHDRRefusal() throws {
+        let json = """
+        {
+          "file_id": 1, "method": "transcode", "play_url": "/x",
+          "delivery": {"mode": "transcode", "sessions_url": "/s", "audio": 4},
+          "selection": {
+            "audio_index": 4,
+            "subtitle_index": 3,
+            "subtitle_requires_burn_in": true,
+            "subtitle_burn_in_blocked_by_hdr": true
+          }
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let decision = try decoder.decode(Decision.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decision.delivery?.audio, 4)
+        XCTAssertEqual(decision.selection?.audioIndex, 4)
+        XCTAssertEqual(decision.selection?.subtitleIndex, 3)
+        XCTAssertEqual(decision.selection?.subtitleRequiresBurnIn, true)
+        XCTAssertEqual(decision.selection?.subtitleBurnInBlockedByHdr, true)
+
+        // An unselected request still decodes with no selection block at all.
+        let plain = """
+        {"file_id": 1, "method": "direct_play", "play_url": "/x"}
+        """
+        XCTAssertNil(try decoder.decode(Decision.self, from: Data(plain.utf8)).selection)
+    }
+
+    private static func trackFactsFile(
+        audio: [AudioTrack] = [
+            AudioTrack(index: 0, codec: "eac3", channels: 6, language: "eng", title: nil, default: true)
+        ],
+        subtitles: [SubtitleStream] = [],
+        audioDefaultIndex: Int? = 0,
+        subtitleDefaultIndex: Int? = 0
+    ) -> MediaFile {
+        var file = MediaFile(id: 1)
+        file.audioStreams = audio
+        file.subtitleStreams = subtitles
+        file.playbackDefaults = PlaybackDefaults(
+            audio: PlaybackTrackDefault(
+                selectedIndex: audio.isEmpty ? nil : audioDefaultIndex,
+                preferredLanguage: "eng",
+                preferredLanguageStatus: audio.isEmpty ? .noTracks : .selected
+            ),
+            subtitle: PlaybackTrackDefault(
+                selectedIndex: subtitles.isEmpty ? nil : subtitleDefaultIndex,
+                preferredLanguage: "eng",
+                preferredLanguageStatus: subtitles.isEmpty ? .noTracks : .selected
+            )
+        )
+        return file
+    }
+}
+
+private extension PreferredLanguageStatus {
+    /// Named rather than derived: `CaseIterable` on a wire enum invites a sixth
+    /// state to be added without anyone deciding how it should read.
+    static let allFive: [PreferredLanguageStatus] =
+        [.selected, .available, .missing, .unknown, .noTracks]
 }
