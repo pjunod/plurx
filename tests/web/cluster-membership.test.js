@@ -232,6 +232,36 @@ test("a never-joined install is offered no roster and no join control", () => {
   assert.match(html, /SQLite single-node/);
 });
 
+test("a failed roster read never claims a clustered node is not clustered", () => {
+  const ui = sandbox();
+  for (const cluster of [
+    {
+      unavailable: true,
+      code: "membership_internal",
+      message: "cluster membership query failed",
+    },
+    {
+      unavailable: true,
+      code: null,
+      message: "network request failed",
+    },
+  ]) {
+    const view = ui.clusterStateView(cluster);
+    assert.equal(view.tone, "warn");
+    assert.match(view.title, /status unavailable/i);
+    assert.match(view.body, /does not mean this server has left its cluster/i);
+    assert.equal(view.body.includes("nothing is missing"), false);
+
+    const html = ui.clusterPanel({
+      cluster,
+      sys: { replication: REPLICATION },
+    });
+    assert.match(html, /Retry roster/);
+    assert.equal(html.includes("Not clustered"), false);
+    assert.equal(html.includes("Create a join token"), false);
+  }
+});
+
 test("a replicated one-node install says one node is a complete configuration", () => {
   const ui = sandbox();
   const view = ui.clusterStateView(
@@ -280,6 +310,19 @@ test("each removal refusal renders as an actionable sentence, not a code", () =>
     assert.ok(text.length > 80, `${code} has no real explanation: ${text}`);
     assert.match(text, /\.$/, `${code} is not a sentence: ${text}`);
   }
+});
+
+test("a stale-node refusal refreshes the roster it says is stale", () => {
+  const ui = sandbox();
+  const text = ui.membershipRefusalText("cluster_node_not_found", "");
+  assert.match(text, /current roster is being refreshed/i);
+
+  const removeNode = shippedSource("removeNode");
+  assert.match(
+    removeNode,
+    /if\(e\.code==="cluster_node_not_found"\) CLUSTER_LOADED=false/,
+  );
+  assert.match(removeNode, /renderSettings\(\)/);
 });
 
 test("node_owns_offline_work tells the operator what to do next", () => {
@@ -436,6 +479,14 @@ test("clearing the token removes it from the rendered panel", () => {
   assert.match(html, /Create a join token/);
 });
 
+test("routing away from Settings drops the in-memory join token", () => {
+  const render = shippedSource("render");
+  assert.match(
+    render,
+    /if\(h!=="#\/settings"&&h!=="#\/admin"\) forgetJoinToken\(\)/,
+  );
+});
+
 // ---- wiring ---------------------------------------------------------------
 
 test("the Cluster tab is registered and dispatched", () => {
@@ -449,6 +500,25 @@ test("the Cluster tab is registered and dispatched", () => {
     false,
     "the roster is fetched eagerly with the rest of Settings",
   );
+});
+
+test("late cluster work can repaint only a live Settings route", () => {
+  // loadCluster, token minting, and removal all resolve after a network await.
+  // Their shared render choke point must reject a stale completion after the
+  // user has navigated elsewhere, even though the selected tab remains in
+  // localStorage.
+  const renderSettings = shippedSource("renderSettings");
+  assert.match(
+    renderSettings,
+    /const h=location\.hash;\s*if\(h!=="#\/settings"&&h!=="#\/admin"\) return/,
+  );
+  for (const handler of ["loadCluster", "mintJoinToken", "removeNode"]) {
+    assert.match(
+      shippedSource(handler),
+      /renderSettings\(\)/,
+      `${handler} no longer renders through the guarded Settings choke point`,
+    );
+  }
 });
 
 test("this panel adds no endpoint beyond the three the node API already ships", () => {

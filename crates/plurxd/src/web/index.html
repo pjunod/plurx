@@ -8234,6 +8234,11 @@ function settingsTab(){ let t="libraries"; try{ t=localStorage.getItem("plurx_se
 // operator who switched away is done with it whether or not they said so.
 function setSettingsTab(t){ forgetJoinToken(); try{ localStorage.setItem("plurx_settings_tab",t); }catch(e){} renderSettings(); }
 function renderSettings(){
+  // Settings work resolves asynchronously. The selected tab survives in
+  // localStorage after navigation, so it cannot prove this route is still on
+  // screen; a late cluster read or mutation must not repaint another page.
+  const h=location.hash;
+  if(h!=="#/settings"&&h!=="#/admin") return;
   const d=SETTINGS_DATA; if(!d) return;
   const tab=settingsTab();
   const bar=SET_TABS.map(([id,label])=>`<button class="settab${tab===id?' active':''}" onclick="setSettingsTab('${id}')">${label}</button>`).join("");
@@ -8747,11 +8752,16 @@ function clusterQuorum(voters){
 // The state banner as sentences rather than as an enum. Pure on purpose: the
 // promise this panel makes is the words, so the words are what gets tested.
 function clusterStateView(cluster){
-  if(!cluster||cluster.unavailable)
+  if(cluster&&cluster.unavailable&&cluster.code==="membership_unavailable")
     return {tone:"calm", title:"Not clustered",
       body:"This server keeps watch state in its own database and is not part of a cluster. That is the "+
         "normal setup for a single machine — nothing is missing here and nothing is misconfigured. "+
         "Clustering is opt-in, and a second server is a deliberate step you can take later."};
+  if(!cluster||cluster.unavailable)
+    return {tone:"warn", title:"Cluster status unavailable",
+      body:"The current membership roster could not be read. This does not mean this server has left its "+
+        "cluster. Keep the available nodes running and retry the roster; if it still fails, read the "+
+        "replication status on the System tab and inspect the server logs before restarting anything."};
   const nodes=cluster.nodes||[];
   const voters=nodes.filter(n=>n.role==="voter").length;
   const learners=nodes.filter(n=>n.role==="learner").length;
@@ -8800,7 +8810,7 @@ function membershipRefusalText(code,message){
       "try the removal again.",
     cluster_node_not_found:
       "This node is not in the cluster's current membership — it may already have been removed from "+
-      "another browser or another server. Reopen this tab to read the current roster.",
+      "another browser or another server. The current roster is being refreshed now.",
     membership_unavailable:
       "This server is not running a replicated store, so it has no cluster membership to change.",
   };
@@ -8836,6 +8846,7 @@ function clusterPanel(d){
     <div class="empty">Loading…</div></div>`;
   const state=clusterStateView(cluster);
   const clustered=!cluster.unavailable;
+  const statusFailure=cluster.unavailable&&cluster.code!=="membership_unavailable";
   const nodes=clustered?(cluster.nodes||[]):[];
   // One lag answer, not a second competing one: this is the same projection and
   // the same renderer as Settings → System.
@@ -8849,8 +8860,14 @@ function clusterPanel(d){
     ${roster}
     <div class="hint">Watch state: ${replication?replicationText(replication):"status unavailable"}
       — the same reading as the Server card on the System tab.</div>
+    ${statusFailure?`<div class="row" style="margin-top:10px"><button class="ghost sm" onclick="retryCluster()">Retry roster</button></div>`:""}
     ${clusterRefusalHtml()}
     ${clustered?joinPanel():""}</div>`;
+}
+function retryCluster(){
+  CLUSTER_LOADED=false;
+  if(SETTINGS_DATA) SETTINGS_DATA.cluster=null;
+  renderSettings();
 }
 function clusterRefusalHtml(){
   if(!CLUSTER_REFUSAL) return "";
@@ -8930,6 +8947,10 @@ async function removeNode(nodeId){
     toast("Node removed");
   }catch(e){
     CLUSTER_REFUSAL={node_id:nodeId, code:e.code, message:e.message};
+    // The refusal means the rendered roster lost a race. Let the guarded
+    // render below start a fresh read immediately instead of telling the
+    // operator to act on stale rows.
+    if(e.code==="cluster_node_not_found") CLUSTER_LOADED=false;
   }
   renderSettings();
 }
@@ -10480,6 +10501,9 @@ async function render(){
   clearInterval(PAGE_TIMER);
   if(!ACT_TIMER) ACT_TIMER=setInterval(pollActivity,4000);
   const h=location.hash||"#/";
+  // A join token is bearer authority, so leaving Settings drops the only
+  // in-memory copy even before a later Settings visit clears it again.
+  if(h!=="#/settings"&&h!=="#/admin") forgetJoinToken();
   // Item pages inherit the list you arrived from; everything else replaces it
   // (the list views re-set it as they render) or drops it.
   if(!h.startsWith("#/item/")) NAV_ORIGIN=null;
