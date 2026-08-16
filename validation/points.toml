@@ -11,6 +11,7 @@ audit_paths = [
   "Cargo.toml",
   "Dockerfile",
   "Makefile",
+  "benchmarks/**",
   "clients/**",
   "crates/**",
   "deploy/**",
@@ -48,6 +49,15 @@ title = "Deploy, CI, container, and client shipping contracts"
 command = "python3 -m unittest discover -s tests/operations -p 'test_*.py'"
 profiles = ["commit", "ci", "full", "nightly"]
 requires = ["bash", "make", "python3", "sh"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
+id = "benchmark-contract"
+title = "Cinema-vs-Plex benchmark config, runners, raw schema, and reports"
+command = "make benchmark-check"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["make", "python3"]
 missing = "fail"
 timeout_seconds = 120
 
@@ -226,7 +236,7 @@ timeout_seconds = 300
 [[checks]]
 id = "security-boundaries"
 title = "Authentication, administration, and scoped-key boundaries"
-command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact"
+command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact && cargo test -p plurxd http::tests::cluster_membership_controls_are_admin_only_and_sqlite_is_explicit -- --exact"
 profiles = ["full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
@@ -321,6 +331,17 @@ paths = [
 ]
 checks = ["rust-gate", "cluster-auth"]
 depends_on = ["core.media", "identity.access"]
+
+[[points]]
+id = "cluster.membership"
+title = "Cluster membership lifecycle and node health"
+contract = "An admin issues an encrypted single-use join token whose cleartext is absent from status, logs, configuration, and redemption/finalization requests; those requests carry only its SHA-256 digest, and stable refusal codes distinguish expired, reused, reserved, and invalid or tampered tokens. A fresh daemon refuses an existing SQLite install, resumes its own staged join, ignores a foreign token on a healthy voter, and joins as a voter without changing instance.id, growing one voter to three. Never-joined voters keep cluster listeners on loopback; an opted-in sole voter crash-safely commits its advertised address from a metadata-reset snapshot, while remote listeners use TLS and refuse later host or port drift. Follower removal preserves quorum or refuses a leader, a quorum-losing change, and a node that owns offline work with an operator-visible reason; two voters remain degraded reconfiguration rather than healthy HA. Replicated node records expose only node identity, role, reachability, and last-seen, remain readable during quorum loss, preserve removed-node tombstones, and consume the canonical replication projection for lag. SQLite reports membership unavailable."
+paths = [
+  "crates/plurx-core/src/cluster/membership.rs",
+  "crates/plurxd/src/http/cluster.rs",
+]
+checks = ["rust-gate", "cluster-auth", "security-boundaries"]
+depends_on = ["cluster.auth", "identity.access"]
 
 [[points]]
 id = "server.api"
@@ -428,6 +449,20 @@ paths = [
 ]
 checks = ["rust-gate", "user-journey"]
 depends_on = ["core.media", "server.api", "library.catalog"]
+
+[[points]]
+id = "playback.benchmark"
+title = "Cinema-vs-Plex controlled A/B benchmark"
+contract = "The same corpus, operations, output contract, and client clock produce credential-safe raw evidence, distributions, failure rates, and directionally explicit ratios for Cinema and Plex."
+paths = [
+  "benchmarks/**",
+  "docs/BENCHMARKING.md",
+  "scripts/cinema-plex-bench",
+  "scripts/cinema_plex_bench/**",
+  "tests/benchmark/**",
+]
+checks = ["benchmark-contract"]
+depends_on = ["playback.pipeline"]
 
 [[points]]
 id = "offline.viewing"

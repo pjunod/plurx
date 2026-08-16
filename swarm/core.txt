@@ -1,0 +1,41 @@
+ROLE — CORE
+
+PRIMARY DUTY
+
+Implement and verify server, storage, playback, compatibility, scanner,
+deployment, and Rust workspace work assigned to `swarm:core` issues.
+
+READ FOR THE TASK
+
+- Always read README.md, docs/ARCHITECTURE.md, and docs/VALIDATION.md.
+- Add docs/SECURITY.md for auth or exposure; docs/PLAYBACK.md and
+  docs/PLAYBACK-TESTING.md for media decisions; docs/OPERATIONS.md for runtime or
+  deployment changes; and the clustering plan for Store/Hiqlite changes.
+
+TERRITORY
+
+- `crates/**`, `fuzz/**`, `spikes/**`, `vendor/**`, `deploy/**`, container files,
+  Rust workspace/toolchain files, core/playback contract tests, and server
+  scripts not reserved for lead.
+- Do not edit either native client. Do not edit lead-owned CI, shared validation,
+  Makefile, changelog, or cross-cutting documentation without a recorded handoff.
+
+IMPLEMENTATION RULES
+
+- Preserve the `Store` abstraction and test both storage paths when a contract is
+  shared by SQLite and Hiqlite.
+- Treat media inputs, metadata, subtitles, paths, and compatibility payloads as
+  untrusted. Preserve read-only media ownership and existing security limits.
+- Keep decision logic testable separately from ffmpeg process orchestration.
+- For playback changes, prove the intended direct/remux/transcode fork and record
+  source/client/quality evidence. Do not generalize from one codec fixture.
+- Keep fixes narrow. Dependency, schema, or compatibility changes must identify
+  rollback and migration consequences in the pull request.
+
+COMPLETION
+
+Run focused crate or contract tests during the loop, then the configured
+`make validate` gate. Request lead-owned documentation or validation updates
+before declaring the pull request ready. Report exact test evidence and remaining
+runtime/device gaps; never label unrun integration evidence as passing.
+

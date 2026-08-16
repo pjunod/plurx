@@ -41,6 +41,10 @@ reuse roadmap. Then
 become a stream — every direct/remux/transcode fork and the per-browser
 transport choice behind it. [docs/PLAYBACK-TESTING.md](docs/PLAYBACK-TESTING.md)
 turns that map into an automated source × quality × operation matrix, with
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md) defining the controlled
+Cinema/plurx-vs-Plex A/B suite — identical corpus, separate engine and decoded-
+frame clocks, raw evidence, percentiles, failure rates, and ratio direction —
+and with
 [docs/PGS_OVERLAY_PLAN.md](docs/PGS_OVERLAY_PLAN.md) defining the proposed
 Dolby Vision-safe bitmap-subtitle path and
 [docs/PGS-OVERLAY-M0-FEASIBILITY.md](docs/PGS-OVERLAY-M0-FEASIBILITY.md)
@@ -214,6 +218,7 @@ make validate-full # browser, native clients, device (opt-in), and container run
 make validate-nightly # exhaustive playback/recovery/resource-bound tier
 make hooks        # validate functionality points affected by each staged commit
 make playback-smoke # real-browser matrix; Chrome default, Safari/Edge/Firefox targets available
+make benchmark-check # validate A/B matrix and raw/report contracts; contacts no server
 ```
 
 Everything goes through the `Makefile`; `make` with no target lists them all

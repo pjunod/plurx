@@ -445,7 +445,19 @@ checks = ["rust-gate"]
 reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."
 
 [[coverage]]
+commits = ["f6d795a2", "5c31885a", "2dbd7d02", "1c60f0da"]
+points = ["persistence.upgrades", "server.api", "validation.framework"]
+checks = ["rust-gate"]
+reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
+
+[[coverage]]
 commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
 points = ["persistence.upgrades", "cluster.auth"]
 checks = ["cluster-auth"]
 reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
+
+[[coverage]]
+commits = ["2d7b1443", "7d22cdf6"]
+points = ["cluster.membership", "persistence.upgrades"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The readdress regressions pin a settled trigger and a sole-voter guard read from replicated node records, the daemon-join contract pins concurrent token issuance, and the parameterized SIGKILL contract pins activated-node recovery for both advertised forms."

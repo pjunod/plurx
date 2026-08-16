@@ -83,6 +83,9 @@ pub struct ClusterConfig {
     pub api_bind: SocketAddr,
     /// Reachable address advertised to peers; empty means derive it locally.
     pub advertise_host: String,
+    /// Public plurxd base URL a joining node uses to redeem its one-time
+    /// credential. Empty derives `http://<advertise_host>:<server port>`.
+    pub join_url: String,
     /// Single-use join-token file; empty means bootstrap/reopen one voter.
     pub join_token_file: PathBuf,
     /// Required network boundary when inter-node transport is not using TLS.
@@ -106,6 +109,7 @@ impl Default for ClusterConfig {
             raft_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_RAFT_PORT)),
             api_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_CLUSTER_API_PORT)),
             advertise_host: String::new(),
+            join_url: String::new(),
             join_token_file: PathBuf::new(),
             trusted_network: String::new(),
             credential_key_file: PathBuf::new(),
@@ -209,6 +213,7 @@ mod tests {
         );
         assert_eq!(config.cluster.raft_bind.port(), DEFAULT_RAFT_PORT);
         assert_eq!(config.cluster.api_bind.port(), DEFAULT_CLUSTER_API_PORT);
+        assert!(config.cluster.join_url.is_empty());
     }
 
     #[test]
