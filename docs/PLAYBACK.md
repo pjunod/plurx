@@ -617,6 +617,50 @@ Three details, each load-bearing:
   requesting, a transport that drained its buffer, and a producer blocked on
   encode or source/media I/O.
 
+- **Delivery is measured through the response body, not at the open.**
+  Availability ends when the segment file opens; storage and transport can
+  still stall for the whole time the body is draining. `delivered_bytes` and
+  `delivered_bps` therefore mean *bytes actually read out of the segment*, not
+  bytes the client committed to by asking for it. The older reading credited a
+  client that fetched a header and then stalled with a full segment's worth of
+  throughput, which is exactly the shape a delivery freeze has — the meter said
+  the transfer was healthy while nothing was moving.
+
+  A response that does not complete is attributed to one of four causes, and
+  never to more than one. `segment_delivery_wait` / `storage_read_slow` fires
+  once per response when a single read off storage takes at least 250 ms — the
+  same threshold as the availability wait, so the two are comparable.
+  `segment_delivery_incomplete` carries the terminal cause:
+  `storage_read_error` (the read failed), `storage_unexpected_eof` (storage
+  returned fewer bytes than the advertised length), or `response_dropped` (the
+  client abandoned the body mid-segment). Each event names the segment, the
+  bytes delivered, and the bytes expected. Distinguishing them is the point:
+  `response_dropped` is a client that stopped requesting, `storage_read_*` is
+  source I/O, and neither is producer starvation — which is what folding all of
+  them into the availability wait used to imply.
+
+  Two asymmetries are deliberate and are contract, not accident.
+
+  - **A buffered `init.mp4` is complete when it is buffered.** `init.mp4` at or
+    below the 1 MiB inspection bound is read into memory so the Apple HEVC
+    tier record can be rewritten, and delivery is settled at that point —
+    before the bytes are handed to the HTTP layer. A client that abandons an
+    init response is recorded as fully delivered and never as
+    `response_dropped`. An init segment is a few KiB and is not where a freeze
+    lives, so the streamed path's precision is not worth buffering twice for;
+    but the two paths do not report the same way and an operator comparing
+    them should know it.
+  - **A server-internal read is not delivery.** Master-playlist generation
+    opens `init.mp4` itself to read the exact HEVC tier out of `hvcC`. There is
+    no response body on that path, so its bytes never reach the delivery meter
+    and every event it emits carries `"purpose": "internal_probe"` — client
+    responses carry `"purpose": "client_response"`. Without the tag a
+    playlist-time codec sniff is indistinguishable from a segment the player
+    was waiting on. That read is also bounded by the same 1 MiB inspection
+    limit, and its completion expectation is bounded with it: an `init.mp4`
+    larger than the bound returns every byte that was asked for, and is
+    reported as a skipped inspection rather than as a truncated response.
+
 **Playlist-envelope decision (2026-08-09): experiment, not yet adopted.** The
 default remains the established EVENT-then-sliding behavior until the batched
 physical-iPad run compares a long control playback with the gated variant.
