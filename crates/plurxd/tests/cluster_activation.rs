@@ -73,6 +73,58 @@ impl Drop for Daemon {
     }
 }
 
+/// What a bounded child run leaves behind: how it ended, and everything it said.
+struct BoundedRun {
+    status: ExitStatus,
+    logs: String,
+}
+
+/// Wait for a child that is expected to exit on its own, without ever blocking
+/// forever on one that does not.
+///
+/// `Command::output()` is the obvious call here and the wrong one: a daemon
+/// whose failpoint never fires simply serves, so `output()` waits for the heat
+/// death of the test runner and the failure reads as a hang rather than as the
+/// broken assertion it is. Both pipes are drained on their own threads because
+/// a bounded wait that never reads them deadlocks as soon as startup logging
+/// fills the pipe buffer.
+fn wait_bounded(mut child: Child, timeout: Duration) -> BoundedRun {
+    let mut stdout_pipe = child.stdout.take().expect("piped child stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped child stderr");
+    let read = |pipe: &mut dyn std::io::Read| {
+        let mut buffer = String::new();
+        let _ = pipe.read_to_string(&mut buffer);
+        buffer
+    };
+    let stdout = std::thread::spawn(move || read(&mut stdout_pipe));
+    let stderr = std::thread::spawn(move || read(&mut stderr_pipe));
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("child status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().expect("wait for killed child");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let logs = format!(
+        "{}{}",
+        stdout.join().expect("read child stdout"),
+        stderr.join().expect("read child stderr")
+    );
+    assert!(
+        !timed_out,
+        "child never exited within {timeout:?} and was killed; logs: {logs}"
+    );
+    BoundedRun { status, logs }
+}
+
 fn wait_for_bind(daemon: &mut Daemon, port: u16) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -164,13 +216,68 @@ fn migration_quiescence_precedes_directory_cleanup_probes_and_http_bind() {
 #[cfg(unix)]
 #[test]
 fn sigterm_is_registered_before_the_listener_can_become_reachable() {
-    let _process_test = process_test_guard();
     let root = tempfile::tempdir().expect("shutdown registration fixture");
-    let data = root.path().join("data");
+    let run = run_to_completion_with_failpoint(root.path(), "after-listener-bind");
+
+    assert!(
+        run.status.success(),
+        "SIGTERM reached its default action instead of the graceful drain: {}; logs: {}",
+        run.status,
+        run.logs
+    );
+    // Exit 0 alone would also be produced by a failpoint that never fired, or
+    // by any early startup return that happens to be clean. Requiring the
+    // drain log is what keeps this a proof that the signal was received and
+    // handled rather than a proof that the process ended tidily.
+    assert!(
+        run.logs.contains("shutdown signal received, draining"),
+        "daemon exited 0 without draining on the injected SIGTERM; logs: {}",
+        run.logs
+    );
+}
+
+/// Registering a signal is not the same as answering one.
+///
+/// The daemon raises SIGTERM the moment store activation returns, which is
+/// before `boot` runs and long before anything can bind. Installing the streams
+/// early only keeps the signal off its default action; nothing polls them until
+/// `serve` first polls the drain, so on its own the signal sits buffered while
+/// the daemon probes hardware and binds a listener the operator has already
+/// asked to go away. `log_startup` is the first thing `boot` does, so `plurxd
+/// starting` in the log is exactly the evidence that startup ran on regardless.
+#[cfg(unix)]
+#[test]
+fn a_signal_during_startup_stops_the_daemon_before_it_boots() {
+    let root = tempfile::tempdir().expect("startup shutdown fixture");
+    let run = run_to_completion_with_failpoint(root.path(), "after-store-activation");
+
+    assert!(
+        run.status.success(),
+        "daemon did not exit cleanly on a signal received during startup: {}; logs: {}",
+        run.status,
+        run.logs
+    );
+    assert!(
+        run.logs.contains("shutdown signal received during"),
+        "daemon exited 0 without recording the startup-window signal; logs: {}",
+        run.logs
+    );
+    assert!(
+        !run.logs.contains("plurxd starting"),
+        "daemon booted and served despite a signal received before boot; logs: {}",
+        run.logs
+    );
+}
+
+/// Run the shipped daemon under a shutdown failpoint until it exits on its own.
+#[cfg(unix)]
+fn run_to_completion_with_failpoint(root: &std::path::Path, failpoint: &str) -> BoundedRun {
+    let _process_test = process_test_guard();
+    let data = root.join("data");
     std::fs::create_dir_all(&data).expect("data directory");
     drop(SqliteStore::open(&data.join("plurx.db")).expect("legacy SQLite source"));
 
-    let config_path = root.path().join("plurx.toml");
+    let config_path = root.join("plurx.toml");
     std::fs::write(
         &config_path,
         format!(
@@ -188,27 +295,21 @@ fn sigterm_is_registered_before_the_listener_can_become_reachable() {
             free_port(),
         ),
     )
-    .expect("shutdown registration config");
+    .expect("shutdown failpoint config");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_plurxd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_plurxd"))
         .args([
             "--config",
             config_path.to_str().expect("config path"),
             "run",
         ])
-        .env(
-            "PLURX_SHUTDOWN_REGISTRATION_FAILPOINT",
-            "after-listener-bind",
-        )
-        .output()
-        .expect("run shutdown registration regression");
+        .env("PLURX_SHUTDOWN_REGISTRATION_FAILPOINT", failpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run shutdown failpoint regression");
 
-    assert!(
-        output.status.success(),
-        "SIGTERM reached its default action instead of the graceful drain: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    wait_bounded(child, Duration::from_secs(60))
 }
 
 /// M2 treats configured cluster hosts as future M3 membership input.
@@ -431,10 +532,24 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
 /// unlinking the lock would skip the reconstruction. The password change is
 /// acknowledged after activation, so reading it after restart proves the
 /// rebuild preserved state newer than the retained pre-activation SQLite file.
+///
+/// Both advertised forms are covered. A loopback literal and a real hostname
+/// took different startup paths for as long as the repair triggered on
+/// "the committed address looks like loopback" rather than on "it differs from
+/// the configured one": the loopback form rebuilt on every boot and so
+/// recovered by accident, while a node advertising a routable name settled
+/// after its first restart and then had no repair left to run.
 #[cfg(unix)]
 #[tokio::test]
 async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
     let _process_test = PROCESS_TEST_LOCK.lock().await;
+    for advertise_host in ["127.0.0.1", "localhost"] {
+        sigkill_recovery_preserves_acknowledged_writes(advertise_host).await;
+    }
+}
+
+#[cfg(unix)]
+async fn sigkill_recovery_preserves_acknowledged_writes(advertise_host: &str) {
     let root = tempfile::tempdir().expect("SIGKILL recovery fixture");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data directory");
@@ -461,7 +576,7 @@ async fn activated_one_voter_rebuilds_current_state_after_sigkill() {
              [cluster]\n\
              raft_bind = \"127.0.0.1:{}\"\n\
              api_bind = \"127.0.0.1:{}\"\n\
-             advertise_host = \"127.0.0.1\"\n",
+             advertise_host = \"{advertise_host}\"\n",
             toml_string(&data),
             free_port(),
             free_port(),
