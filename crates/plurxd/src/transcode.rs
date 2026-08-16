@@ -77,6 +77,10 @@ pub const MAX_HEIGHT: i64 = 2160;
 /// How long a segment request waits for ffmpeg to produce a not-yet-written
 /// segment before giving up.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
+/// A live HLS segment that was named by a playlist should already exist.
+/// Record any material wait so a client-side freeze can be joined to producer
+/// starvation instead of being inferred from a later timeout.
+const SEGMENT_WAIT_EVENT_MIN: Duration = Duration::from_millis(250);
 /// Hold the first live transcode playlist until it has both two complete
 /// segments and this much published media. The first playlist used to expose
 /// one ~2 s segment while ffmpeg was already writing the rest; hls.js reached
@@ -1770,7 +1774,18 @@ async fn session_info(
     global_live_bytes: i64,
     global_ahead_bytes: i64,
 ) -> SessionInfo {
-    let ahead = s.ahead().await;
+    let (ahead, first_retained_segment, published_end_ms) = {
+        let index = s.segments.lock().await;
+        (
+            ahead_of(&index, s.fetched_end_ms.load(Relaxed).max(0)),
+            index.first_retained_index(),
+            index.produced_playable_end_ms(),
+        )
+    };
+    let last_request = s.last_request.lock().await;
+    let idle_seconds = last_request.at.elapsed().as_secs();
+    let last_request_kind = last_request.kind;
+    drop(last_request);
     let suspended = s.suspended.load(Relaxed);
     let hold = if suspended {
         ahead.and_then(|ahead| {
@@ -1788,10 +1803,23 @@ async fn session_info(
         target_height: s.target_height,
         encoder: *s.encoder_label.lock().await,
         started_unix: s.started_unix,
-        idle_seconds: s.last_request.lock().await.at.elapsed().as_secs(),
+        idle_seconds,
+        last_request: last_request_kind,
         speed: s.progress.speed(),
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
+        progress_idle_ms: s.progress.stalled_for().as_millis().min(i64::MAX as u128) as i64,
+        published_end_ms,
+        fetched_end_ms: s.fetched_end_ms.load(Relaxed),
+        fetched_segment: Some(s.high_segment.load(Relaxed)).filter(|index| *index >= 0),
+        first_retained_segment,
+        playlist_shape: if s.cached {
+            "vod"
+        } else if s.typeless_sliding || first_retained_segment.is_some_and(|index| index > 0) {
+            "sliding"
+        } else {
+            "event"
+        },
         ahead_seconds: ahead.map(|a| a.seconds),
         hold_reason: hold.map(|hold| hold.reason),
         resume_below_seconds: hold
@@ -2164,6 +2192,10 @@ pub struct SessionInfo {
     pub encoder: &'static str,
     pub started_unix: i64,
     pub idle_seconds: u64,
+    /// Last capability-authenticated resource this viewer requested. A stalled
+    /// client that keeps polling playlists is different from one that stopped
+    /// making requests altogether, even when both have the same idle age.
+    pub last_request: &'static str,
     /// Cumulative encode rate as a multiple of realtime, as ffmpeg reports it.
     pub speed: Option<f64>,
     /// Rate over the last few seconds. This is the one that answers "is the
@@ -2173,6 +2205,22 @@ pub struct SessionInfo {
     pub recent_speed: Option<f64>,
     /// Content produced so far, in ms from this session's start offset.
     pub out_time_ms: Option<i64>,
+    /// Wall time since ffmpeg's output timestamp last advanced. Unlike
+    /// `recent_speed`, this remains decisive when the producer has stopped
+    /// emitting samples entirely.
+    pub progress_idle_ms: i64,
+    /// End of the newest complete, fetchable segment on the session timeline.
+    pub published_end_ms: Option<i64>,
+    /// End of the highest segment the client has requested.
+    pub fetched_end_ms: i64,
+    /// Highest segment ordinal requested by the client.
+    pub fetched_segment: Option<i64>,
+    /// First segment still present after retention pruning.
+    pub first_retained_segment: Option<i64>,
+    /// `event` before legacy retention advances, `sliding` afterwards (or
+    /// from the first response under the experiment), and `vod` for a cache
+    /// hit. This makes the EVENT-to-sliding transition visible at a freeze.
+    pub playlist_shape: &'static str,
     /// Published media beyond the client's download frontier — the reserve a
     /// hiccup gets to spend. Not measured from the playhead: the client has
     /// usually fetched further than it is showing.
@@ -6044,11 +6092,78 @@ impl TranscodeManager {
         let session = self.touch(session_id, "segment").await?;
         let path = session.dir.join(name);
         let idx = segment_index(name);
+        let first_retained = session.segments.lock().await.first_retained_index();
+        if segment_was_pruned(idx, first_retained) {
+            tracing::warn!(
+                session = %session_id,
+                segment = name,
+                first_retained_segment = ?first_retained,
+                "HLS segment request fell behind the retained playlist window"
+            );
+            self.emit_session_event(
+                session_id,
+                &session,
+                "segment_unavailable",
+                SessionEventFields {
+                    reason: Some("segment_pruned"),
+                    ms: Some(0),
+                    extra: Some(
+                        serde_json::json!({
+                            "segment": name,
+                            "requested_segment": idx,
+                            "first_retained_segment": first_retained
+                        })
+                        .to_string(),
+                    ),
+                    ..SessionEventFields::default()
+                },
+            )
+            .await;
+            return None;
+        }
 
+        let started_waiting = Instant::now();
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             if let Ok(file) = tokio::fs::File::open(&path).await {
                 let len = file.metadata().await.ok()?.len();
+                let waited = started_waiting.elapsed();
+                if idx.is_some() && waited >= SEGMENT_WAIT_EVENT_MIN {
+                    let waited_ms = waited.as_millis().min(i64::MAX as u128) as i64;
+                    tracing::warn!(
+                        session = %session_id,
+                        segment = name,
+                        waited_ms,
+                        progress_idle_ms = session
+                            .progress
+                            .stalled_for()
+                            .as_millis()
+                            .min(i64::MAX as u128) as i64,
+                        "HLS segment became available after the client had to wait"
+                    );
+                    self.emit_session_event(
+                        session_id,
+                        &session,
+                        "segment_wait",
+                        SessionEventFields {
+                            reason: Some("producer_late"),
+                            ms: Some(waited_ms),
+                            extra: Some(
+                                serde_json::json!({
+                                    "segment": name,
+                                    "progress_idle_ms": session
+                                        .progress
+                                        .stalled_for()
+                                        .as_millis()
+                                        .min(i64::MAX as u128) as i64
+                                })
+                                .to_string(),
+                            ),
+                            ..SessionEventFields::default()
+                        },
+                    )
+                    .await;
+                }
                 // Counted on open rather than as the body drains: the client
                 // has committed to this many bytes, the meter's window is far
                 // longer than one fetch takes, and threading a counter through
@@ -6073,6 +6188,38 @@ impl TranscodeManager {
             // Give up if the session was declared dead, or ffmpeg has exited and
             // the file still isn't there.
             if session.failed.load(Relaxed) {
+                let failure = session.failure_reason();
+                let waited_ms = started_waiting.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                tracing::error!(
+                    session = %session_id,
+                    segment = name,
+                    waited_ms,
+                    reason = failure.code(),
+                    "HLS segment request ended because its producer failed"
+                );
+                self.emit_session_event(
+                    session_id,
+                    &session,
+                    "segment_unavailable",
+                    SessionEventFields {
+                        reason: Some(failure.code()),
+                        ms: Some(waited_ms),
+                        extra: Some(
+                            serde_json::json!({
+                                "segment": name,
+                                "failure": failure.message(),
+                                "progress_idle_ms": session
+                                    .progress
+                                    .stalled_for()
+                                    .as_millis()
+                                    .min(i64::MAX as u128) as i64
+                            })
+                            .to_string(),
+                        ),
+                        ..SessionEventFields::default()
+                    },
+                )
+                .await;
                 return None;
             }
             let exited = {
@@ -6081,7 +6228,48 @@ impl TranscodeManager {
                     .as_mut()
                     .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
             };
-            if exited || Instant::now() >= deadline {
+            let timed_out = Instant::now() >= deadline;
+            if exited || timed_out {
+                let waited_ms = started_waiting.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                let reason = if exited {
+                    "producer_exited"
+                } else {
+                    "producer_timeout"
+                };
+                tracing::error!(
+                    session = %session_id,
+                    segment = name,
+                    waited_ms,
+                    reason,
+                    progress_idle_ms = session
+                        .progress
+                        .stalled_for()
+                        .as_millis()
+                        .min(i64::MAX as u128) as i64,
+                    "HLS segment was not available within the delivery window"
+                );
+                self.emit_session_event(
+                    session_id,
+                    &session,
+                    "segment_unavailable",
+                    SessionEventFields {
+                        reason: Some(reason),
+                        ms: Some(waited_ms),
+                        extra: Some(
+                            serde_json::json!({
+                                "segment": name,
+                                "progress_idle_ms": session
+                                    .progress
+                                    .stalled_for()
+                                    .as_millis()
+                                    .min(i64::MAX as u128) as i64
+                            })
+                            .to_string(),
+                        ),
+                        ..SessionEventFields::default()
+                    },
+                )
+                .await;
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6425,6 +6613,13 @@ fn segment_index(name: &str) -> Option<i64> {
         })
         .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|d| d.parse::<i64>().ok())
+}
+
+/// A segment behind the retained prefix cannot reappear. Waiting for ffmpeg's
+/// normal production deadline in that case turns an ordinary playlist reload
+/// into a 20-second transport stall.
+fn segment_was_pruned(index: Option<i64>, first_retained: Option<i64>) -> bool {
+    matches!((index, first_retained), (Some(index), Some(first)) if index < first)
 }
 
 /// Delete published segments that have fallen out of the retention window.
@@ -8174,6 +8369,15 @@ mod tests {
         assert_eq!(segment_index("init.mp4"), None);
         assert_eq!(segment_index("index.m3u8"), None);
         assert_eq!(segment_index("seg.ts"), None);
+    }
+
+    #[test]
+    fn a_pruned_segment_never_waits_for_a_producer_that_cannot_restore_it() {
+        assert!(segment_was_pruned(Some(41), Some(42)));
+        assert!(!segment_was_pruned(Some(42), Some(42)));
+        assert!(!segment_was_pruned(Some(43), Some(42)));
+        assert!(!segment_was_pruned(Some(41), None));
+        assert!(!segment_was_pruned(None, Some(42)));
     }
 
     #[tokio::test]
