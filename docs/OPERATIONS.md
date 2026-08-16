@@ -325,11 +325,21 @@ curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
 #### What removal does to the node's offline downloads
 
 Removal resolves the departing node's offline packages before the membership
-change commits, so nothing is left owned by a machine that no longer exists.
+change commits, so it leaves nothing owned by a machine that no longer exists.
 You do not have to drain them by hand first, and you do not have to stop that
 node from serving downloads while you do it: it keeps answering requests until
 the change commits, and removal re-reads its work and resolves the new arrivals
 before committing rather than acting on the list it started with.
+
+**Stop the removed node once the removal returns**, or repoint its clients at a
+surviving server. Removal takes the machine out of the cluster roster; it does
+not switch the machine off, and a removed plurxd that is still running and still
+reachable can still accept a download request and record the package against
+itself. Nothing resolves those: the removal that would have failed or moved them
+has already finished. They hold their reservation against the requesting user's
+byte budget until the seven-day expiry, and a package that reaches `ready` on a
+node you later switch off will not download. This is the only offline case
+removal does not clean up for you.
 
 Before it commits, the cluster asks every other node whether it can actually
 read each package's source file — not whether the path looks the same, but

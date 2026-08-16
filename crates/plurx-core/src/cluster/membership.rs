@@ -789,8 +789,17 @@ impl MembershipManager {
     /// It cannot be requeued — no survivor was ever asked about its source, and
     /// asking now would re-home on an unproven mount, which §6.7 forbids. So it
     /// gets the same `node_removed` failure an unverifiable package gets, which
-    /// releases its reservation and lets the client ask again. The removed node
-    /// cannot create more: it is out of the roster before this runs.
+    /// releases its reservation and lets the client ask again.
+    ///
+    /// This is the removal's last act, not a permanent fence. Leaving the raft
+    /// roster does not stop the node's writes: hiqlite forwards a non-leader
+    /// client's write to the leader on the shared API secret, which removal does
+    /// not rotate, and [`crate::store::OfflinePackageStore::create_offline_package`]
+    /// consults no tombstone. A removed node still running and still answering
+    /// download requests can therefore create packages owned by a tombstone,
+    /// after every refusal and failure path this removal has run. Those are
+    /// outside the removal's guarantee until the operator stops that process or
+    /// repoints its clients, which `docs/OPERATIONS.md` tells them to do.
     async fn fail_offline_work_left_behind(&self, node_id: &str) -> Result<u64, MembershipError> {
         let inner = self.replicated_inner()?;
         let plan = inner

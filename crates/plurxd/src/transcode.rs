@@ -4077,9 +4077,6 @@ impl TranscodeManager {
         )
     }
 
-    /// Prepare the exact mobile package requested by an authenticated user.
-    /// Unlike speculative production, this preserves the file's A/V offset,
-    /// accepts explicit tracks, and forces SDR even on a passthrough node.
     /// The node id a package produced here is owned by, for the fenced
     /// package writes. Offline production requires a cache, so a manager
     /// without one owns no package and its fenced writes correctly match
@@ -4090,6 +4087,9 @@ impl TranscodeManager {
             .map_or("", |cache| cache.node_id.as_str())
     }
 
+    /// Prepare the exact mobile package requested by an authenticated user.
+    /// Unlike speculative production, this preserves the file's A/V offset,
+    /// accepts explicit tracks, and forces SDR even on a passthrough node.
     pub async fn ensure_offline(
         &self,
         package_id: &str,
