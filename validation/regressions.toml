@@ -445,10 +445,21 @@ checks = ["rust-gate"]
 reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` holds the live HLS session to the same track policy as item detail, `/decision`, and the offline quote, comparing the session's selected audio against the advertised default rather than a literal index so a later policy change moves all four together; reverting only the production correction restores the session's own case-sensitive anime predicate, so a `JPN` dual-audio file advertised as Japanese by every descriptive surface is played as its container-default English track."
 
 [[coverage]]
-commits = ["f6d795a2", "5c31885a", "2dbd7d02", "1c60f0da"]
+commits = [
+  "f6d795a2deabf9513a1af7ff59d7aa1f416b260b",
+  "5c31885ad0ab58bb561a2f818eb9220ffee8eb92",
+  "2dbd7d02a4583f6f758b8d5fc53bde1b4612422b",
+  "1c60f0daa64fa71d445ad152af24f376354ca4e3",
+]
 points = ["persistence.upgrades", "server.api", "validation.framework"]
 checks = ["rust-gate"]
-reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
+reason = "The shipped-binary regression `sigterm_is_registered_before_the_listener_can_become_reachable` raises SIGTERM immediately after the daemon binds its HTTP listener but before `serve` can first poll the graceful-shutdown future; eager SIGTERM/SIGINT registration buffers that signal and the daemon drains with exit 0, while reverting only the production registration correction restores the default SIGTERM action and the child exits from signal 15. That test now waits on a bounded child rather than `Command::output()` and requires the `shutdown signal received, draining` line in the child's captured logs, so a failpoint that never fires fails on its deadline instead of hanging, and an unrelated clean exit cannot stand in for a drain. The retained `subsequent_plurxd_run_reopens_the_completed_replicated_target` separately proves ordinary activated and reopened daemons still drain cleanly."
+
+[[coverage]]
+commits = ["8382dad0b18765ef5c06475cdfce4f1358bd6090"]
+points = ["persistence.upgrades", "server.api", "validation.framework"]
+checks = ["rust-gate"]
+reason = "The shipped-binary regression `a_signal_during_startup_stops_the_daemon_before_it_boots` raises SIGTERM the moment store activation returns, which is before `boot` runs and long before any listener exists, then requires the daemon to exit 0 having recorded the startup-window signal and never logged `plurxd starting`. Watching the eagerly installed signal streams for the whole of startup stops the daemon at its next cancel-safe boundary; reverting only the production correction so the future is again handed straight to `boot` restores the buffer-until-serve behavior, and the daemon probes hardware, binds, serves and drains, so `plurxd starting` appears and the test fails. The covered guarantee starts after `select_daemon_store`, which renames directories and fsyncs activation markers in a fixed order and is deliberately never cancelled midway."
 
 [[coverage]]
 commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
