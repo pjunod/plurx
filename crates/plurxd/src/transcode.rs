@@ -1863,6 +1863,256 @@ async fn session_info(
 pub struct SegmentFile {
     pub file: tokio::fs::File,
     pub len: u64,
+    pub(crate) delivery: SegmentDelivery,
+}
+
+/// Who is reading the segment behind a [`SegmentDelivery`].
+///
+/// Almost every open is a client fetch, but `exact_hls_context` opens
+/// `init.mp4` during master-playlist generation to read the exact HEVC tier
+/// out of `hvcC`. No response body exists on that path, so its bytes are not
+/// delivery and a stall on it is not a client-visible freeze. Folding the two
+/// together is exactly the availability/delivery conflation this tracker
+/// exists to remove, so the purpose travels with the tracker: it decides
+/// whether the session's delivery meter moves, and it is stamped on every
+/// event so an operator reading a freeze can tell a playlist-time codec sniff
+/// from a segment the player was waiting on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryPurpose {
+    /// Bytes on their way to a client response body.
+    ClientResponse,
+    /// A server-internal read with no response behind it.
+    InternalProbe,
+}
+
+impl DeliveryPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientResponse => "client_response",
+            Self::InternalProbe => "internal_probe",
+        }
+    }
+}
+
+/// Per-response HLS delivery accounting.
+///
+/// Segment availability ends when the file opens; storage and transport can
+/// still stall while the response body is being read. Keeping this tracker in
+/// the body stream makes `delivered_bps` describe bytes actually read from the
+/// segment, and gives slow/error reads their own telemetry instead of folding
+/// them into producer starvation.
+pub(crate) struct SegmentDelivery {
+    store: Arc<dyn Store>,
+    session: Arc<Session>,
+    session_id: String,
+    segment: String,
+    method: &'static str,
+    encoder: String,
+    purpose: DeliveryPurpose,
+    expected_bytes: u64,
+    delivered_bytes: u64,
+    started_at: Instant,
+    slow_read_reported: bool,
+    terminal: bool,
+}
+
+impl SegmentDelivery {
+    fn new(
+        store: Arc<dyn Store>,
+        session: Arc<Session>,
+        session_id: &str,
+        segment: &str,
+        encoder: String,
+        expected_bytes: u64,
+    ) -> Self {
+        let method = match session.method {
+            crate::delivery::Method::Direct => "direct_play",
+            crate::delivery::Method::Remux | crate::delivery::Method::HlsCopy => "remux",
+            crate::delivery::Method::Transcode => "transcode",
+        };
+        Self {
+            store,
+            session,
+            session_id: session_id.to_owned(),
+            segment: segment.to_owned(),
+            method,
+            encoder,
+            purpose: DeliveryPurpose::ClientResponse,
+            expected_bytes,
+            delivered_bytes: 0,
+            started_at: Instant::now(),
+            slow_read_reported: false,
+            terminal: false,
+        }
+    }
+
+    /// Re-label this tracker as a server-internal read.
+    ///
+    /// The bytes stop feeding the session's delivery meter — nothing is being
+    /// delivered — and every event this tracker emits carries the purpose.
+    pub(crate) fn into_internal_probe(mut self) -> Self {
+        self.purpose = DeliveryPurpose::InternalProbe;
+        self
+    }
+
+    /// Lower the completion expectation to the bytes the caller will actually
+    /// ask storage for.
+    ///
+    /// A reader bounded below the segment's real length (an `init.mp4` past
+    /// the inspection bound, say) returns every byte it was asked for and then
+    /// stops. Without this, `finish()` compares that short read against the
+    /// full file length and reports `storage_unexpected_eof` for a read that
+    /// completed exactly as requested.
+    pub(crate) fn expect_at_most(&mut self, bytes: u64) {
+        self.expected_bytes = self.expected_bytes.min(bytes);
+    }
+
+    fn emit(&self, event: &str, reason: &str, ms: i64, mut extra: serde_json::Value) {
+        // Stamped centrally rather than at each call site: an untagged
+        // `segment_delivery_*` row is indistinguishable from a client fetch,
+        // which is the whole failure this field exists to prevent.
+        if let Some(fields) = extra.as_object_mut() {
+            fields.insert(
+                "purpose".to_owned(),
+                serde_json::Value::from(self.purpose.as_str()),
+            );
+        }
+        crate::telemetry::emit(
+            Arc::clone(&self.store),
+            PlaybackEvent {
+                at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+                session_id: Some(self.session_id.clone()),
+                file_id: Some(self.session.file_id),
+                event: event.to_owned(),
+                method: Some(self.method.to_owned()),
+                encoder: Some(self.encoder.clone()),
+                height: Some(self.session.target_height),
+                ms: Some(ms),
+                speed_recent: self.session.progress.recent_speed(),
+                suspended: Some(self.session.suspended.load(Relaxed)),
+                delivered_bps: self.session.delivery.recent_bps().map(|bytes| bytes * 8),
+                readrate: Some(self.session.readrate),
+                reason: Some(reason.to_owned()),
+                extra: Some(extra.to_string()),
+                ..PlaybackEvent::default()
+            },
+        );
+    }
+
+    pub(crate) fn note_read(&mut self, bytes: u64, elapsed: Duration) {
+        self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
+        if self.purpose == DeliveryPurpose::ClientResponse {
+            self.session.delivery.note(bytes);
+        }
+        if elapsed < SEGMENT_WAIT_EVENT_MIN || self.slow_read_reported {
+            return;
+        }
+        self.slow_read_reported = true;
+        let waited_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+        tracing::warn!(
+            session = %self.session_id,
+            segment = %self.segment,
+            waited_ms,
+            delivered_bytes = self.delivered_bytes,
+            expected_bytes = self.expected_bytes,
+            "HLS segment body read stalled on storage"
+        );
+        self.emit(
+            "segment_delivery_wait",
+            "storage_read_slow",
+            waited_ms,
+            serde_json::json!({
+                "segment": self.segment,
+                "delivered_bytes": self.delivered_bytes,
+                "expected_bytes": self.expected_bytes
+            }),
+        );
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        if self.delivered_bytes >= self.expected_bytes {
+            return;
+        }
+        let elapsed_ms = self.started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        tracing::warn!(
+            session = %self.session_id,
+            segment = %self.segment,
+            delivered_bytes = self.delivered_bytes,
+            expected_bytes = self.expected_bytes,
+            "HLS segment response reached EOF before its advertised length"
+        );
+        self.emit(
+            "segment_delivery_incomplete",
+            "storage_unexpected_eof",
+            elapsed_ms,
+            serde_json::json!({
+                "segment": self.segment,
+                "delivered_bytes": self.delivered_bytes,
+                "expected_bytes": self.expected_bytes
+            }),
+        );
+    }
+
+    pub(crate) fn fail(&mut self, error: &std::io::Error) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        let elapsed_ms = self.started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        tracing::error!(
+            session = %self.session_id,
+            segment = %self.segment,
+            delivered_bytes = self.delivered_bytes,
+            expected_bytes = self.expected_bytes,
+            %error,
+            "HLS segment response failed while reading storage"
+        );
+        self.emit(
+            "segment_delivery_incomplete",
+            "storage_read_error",
+            elapsed_ms,
+            serde_json::json!({
+                "segment": self.segment,
+                "delivered_bytes": self.delivered_bytes,
+                "expected_bytes": self.expected_bytes,
+                "error": error.to_string()
+            }),
+        );
+    }
+}
+
+impl Drop for SegmentDelivery {
+    fn drop(&mut self) {
+        if self.terminal || self.delivered_bytes >= self.expected_bytes {
+            return;
+        }
+        self.terminal = true;
+        let elapsed_ms = self.started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        tracing::warn!(
+            session = %self.session_id,
+            segment = %self.segment,
+            delivered_bytes = self.delivered_bytes,
+            expected_bytes = self.expected_bytes,
+            "HLS segment response was dropped before delivery completed"
+        );
+        self.emit(
+            "segment_delivery_incomplete",
+            "response_dropped",
+            elapsed_ms,
+            serde_json::json!({
+                "segment": self.segment,
+                "delivered_bytes": self.delivered_bytes,
+                "expected_bytes": self.expected_bytes
+            }),
+        );
+    }
 }
 
 /// The source timeline behind one capability-authenticated HLS session.
@@ -6428,11 +6678,6 @@ impl TranscodeManager {
                     )
                     .await;
                 }
-                // Counted on open rather than as the body drains: the client
-                // has committed to this many bytes, the meter's window is far
-                // longer than one fetch takes, and threading a counter through
-                // the response stream would buy a precision nobody reads.
-                session.delivery.note(len);
                 // The client's download frontier just advanced. Resolve it
                 // against the index's real EXTINF bounds — the fetched
                 // segment's own end time, not an index times a nominal
@@ -6447,7 +6692,20 @@ impl TranscodeManager {
                         self.flow_control(&session, session_id).await;
                     }
                 }
-                return Some(SegmentFile { file, len });
+                let encoder = (*session.encoder_label.lock().await).to_owned();
+                let delivery = SegmentDelivery::new(
+                    Arc::clone(&self.store),
+                    Arc::clone(&session),
+                    session_id,
+                    name,
+                    encoder,
+                    len,
+                );
+                return Some(SegmentFile {
+                    file,
+                    len,
+                    delivery,
+                });
             }
             // Give up if the session was declared dead, or ffmpeg has exited and
             // the file still isn't there.
@@ -6731,6 +6989,17 @@ impl TranscodeManager {
     #[cfg(test)]
     fn forget_cached_limits(&self) {
         *self.cached_limits.write().expect("limits lock") = None;
+    }
+
+    /// Publish a session under `session_id` without starting a producer, so a
+    /// test can drive the real `segment` path — and the HTTP handler above it
+    /// — against files on disk instead of against ffmpeg.
+    #[cfg(test)]
+    async fn register_session_for_test(&self, session_id: &str, session: Arc<Session>) {
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_owned(), session);
     }
 
     /// Both byte views across every live session, from their cached figures —
@@ -7099,6 +7368,216 @@ pub fn snap_height(height: i64) -> i64 {
         .copied()
         .min_by_key(|rung| ((rung - height).abs(), *rung))
         .unwrap_or(top)
+}
+
+/// A live HLS session published into a real [`TranscodeManager`], plus the
+/// [`AppState`](crate::state::AppState) in front of it.
+///
+/// Delivery accounting spans two modules: the tracker and its classifications
+/// live here, and the response body that drives them lives in `http::hls`. A
+/// test of the tracker alone pins arithmetic, not the correction — so the HTTP
+/// layer needs a way to stand a session up without ffmpeg. `Session` stays
+/// private; this hands out only the two facts a delivery test reads.
+#[cfg(test)]
+pub(crate) struct HlsDeliveryFixture {
+    pub(crate) store: Arc<dyn Store>,
+    pub(crate) state: crate::state::AppState,
+    session: Arc<Session>,
+}
+
+#[cfg(test)]
+impl HlsDeliveryFixture {
+    /// Publish a producer-less session under `session_id`, serving whatever
+    /// files the caller writes into `dir`.
+    pub(crate) async fn publish(dir: &std::path::Path, session_id: &str) -> Self {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let library = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        let file_id = store
+            .upsert_file(
+                item,
+                "/media/Heat.mkv",
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(6_000_000),
+                    ..ProbeResult::default()
+                },
+            )
+            .await
+            .expect("file");
+
+        let mut raw_session = test_session(dir.to_path_buf());
+        raw_session.file_id = file_id;
+        let session = Arc::new(raw_session);
+        let state = crate::state::AppState::new(
+            "test".into(),
+            Arc::clone(&store),
+            crate::state::Dirs {
+                artwork: dir.join("artwork"),
+                transcode: dir.join("transcode"),
+                cache: dir.join("cache"),
+                subs: dir.join("subs"),
+            },
+            "test-node".into(),
+            EncoderCaps::default(),
+            Default::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(64)),
+        );
+        state
+            .transcode
+            .register_session_for_test(session_id, Arc::clone(&session))
+            .await;
+        Self {
+            store,
+            state,
+            session,
+        }
+    }
+
+    /// What this session's delivery meter has recorded — the figure behind
+    /// `delivered_bps` in status and in every playback event.
+    pub(crate) fn delivered_bytes(&self) -> i64 {
+        self.session.delivery.total_bytes()
+    }
+
+    /// Every `segment_delivery_*` row recorded so far, once at least `want` of
+    /// them have landed. Telemetry is written off the request path.
+    pub(crate) async fn delivery_events(&self, want: usize) -> Vec<PlaybackEvent> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events: Vec<_> = self
+                    .store
+                    .playback_events(&plurx_core::domain::PlaybackEventQuery {
+                        since_ms: None,
+                        event: None,
+                        limit: 50,
+                    })
+                    .await
+                    .expect("delivery telemetry query")
+                    .into_iter()
+                    .filter(|event| event.event.starts_with("segment_delivery_"))
+                    .collect();
+                if events.len() >= want {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("delivery telemetry persisted")
+    }
+
+    /// The same read, after giving any pending telemetry a chance to land —
+    /// for asserting that a path recorded *nothing*.
+    pub(crate) async fn settle(&self) -> Vec<PlaybackEvent> {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        self.store
+            .playback_events(&plurx_core::domain::PlaybackEventQuery {
+                since_ms: None,
+                event: None,
+                limit: 50,
+            })
+            .await
+            .expect("delivery telemetry query")
+            .into_iter()
+            .filter(|event| event.event.starts_with("segment_delivery_"))
+            .collect()
+    }
+}
+
+/// A session with no encoder behind it, for exercising the index, the
+/// retention window and the pruner without spawning ffmpeg. The child is a
+/// real (idle) process because `Session` owns one; nothing here signals it.
+#[cfg(test)]
+fn test_session(dir: PathBuf) -> Session {
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn placeholder child");
+    Session {
+        dir,
+        child: Mutex::new(Some(child)),
+        child_transition: Mutex::new(()),
+        watchdog_active: AtomicBool::new(false),
+        replacing_child: AtomicBool::new(false),
+        retired: AtomicBool::new(false),
+        #[cfg(test)]
+        replacement_pause: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        watchdog_verdict_pause: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        watchdog_transition_pause: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        retirement_started: AtomicBool::new(false),
+        cached: false,
+        _cache_reader: None,
+        last_request: Mutex::new(LastRequest::now("test-start")),
+        file_id: 1,
+        item_id: 1,
+        item_title: "T".into(),
+        user_name: "paul".into(),
+        playback_id: "pb-test".into(),
+        // The steppable shape: server-chosen height, and a kind that agrees
+        // with `method` and `target_height` below. A stall reopen bound to
+        // this session may move it down the ladder, so a test that wants the
+        // sticky case has to say so by overriding `automatic`.
+        automatic: true,
+        kind: SessionKind::Transcode { height: 720 },
+        method: crate::delivery::Method::Transcode,
+        start_seconds: 0.0,
+        media_origin_seconds: 0.0,
+        hls_codecs: "avc1.640034,mp4a.40.2".into(),
+        hls_supplemental_codecs: None,
+        target_height: 720,
+        encoder_label: Mutex::new("test"),
+        started_unix: 0,
+        failed: AtomicBool::new(false),
+        failure: std::sync::Mutex::new(None),
+        playlist_published: AtomicBool::new(false),
+        high_segment: AtomicI64::new(-1),
+        fetched_end_ms: AtomicI64::new(0),
+        segments: Mutex::new(SegmentIndex::default()),
+        ahead_bytes: AtomicI64::new(0),
+        live_bytes: AtomicI64::new(0),
+        progress: Arc::new(Progress::new()),
+        class: std::sync::Mutex::new(String::new()),
+        hw_slot: std::sync::Mutex::new(None),
+        sw_permit: std::sync::Mutex::new(None),
+        delivery: Meter::new(),
+        readrate: 0.0,
+        suspended: AtomicBool::new(false),
+        suspended_at: Mutex::new(None),
+        suspend_count: AtomicU64::new(0),
+        typeless_sliding: false,
+        first_slide_logged: AtomicBool::new(false),
+    }
 }
 
 #[cfg(test)]
@@ -8739,71 +9218,73 @@ mod tests {
         );
     }
 
-    /// A session with no encoder behind it, for exercising the index, the
-    /// retention window and the pruner without spawning ffmpeg. The child is a
-    /// real (idle) process because `Session` owns one; nothing here signals it.
-    fn test_session(dir: PathBuf) -> Session {
-        let child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn placeholder child");
-        Session {
-            dir,
-            child: Mutex::new(Some(child)),
-            child_transition: Mutex::new(()),
-            watchdog_active: AtomicBool::new(false),
-            replacing_child: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
-            #[cfg(test)]
-            replacement_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            watchdog_verdict_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            watchdog_transition_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            retirement_started: AtomicBool::new(false),
-            cached: false,
-            _cache_reader: None,
-            last_request: Mutex::new(LastRequest::now("test-start")),
-            file_id: 1,
-            item_id: 1,
-            item_title: "T".into(),
-            user_name: "paul".into(),
-            playback_id: "pb-test".into(),
-            automatic: true,
-            kind: SessionKind::Transcode { height: 720 },
-            method: crate::delivery::Method::Transcode,
-            start_seconds: 0.0,
-            media_origin_seconds: 0.0,
-            hls_codecs: "avc1.640034,mp4a.40.2".into(),
-            hls_supplemental_codecs: None,
-            target_height: 720,
-            encoder_label: Mutex::new("test"),
-            started_unix: 0,
-            failed: AtomicBool::new(false),
-            failure: std::sync::Mutex::new(None),
-            playlist_published: AtomicBool::new(false),
-            high_segment: AtomicI64::new(-1),
-            fetched_end_ms: AtomicI64::new(0),
-            segments: Mutex::new(SegmentIndex::default()),
-            ahead_bytes: AtomicI64::new(0),
-            live_bytes: AtomicI64::new(0),
-            progress: Arc::new(Progress::new()),
-            class: std::sync::Mutex::new(String::new()),
-            hw_slot: std::sync::Mutex::new(None),
-            sw_permit: std::sync::Mutex::new(None),
-            delivery: Meter::new(),
-            readrate: 0.0,
-            suspended: AtomicBool::new(false),
-            suspended_at: Mutex::new(None),
-            suspend_count: AtomicU64::new(0),
-            typeless_sliding: false,
-            first_slide_logged: AtomicBool::new(false),
-        }
+    #[tokio::test]
+    async fn segment_delivery_counts_reads_and_names_incomplete_storage() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let dir = tempfile::tempdir().expect("segment-delivery directory");
+        let mut raw_session = test_session(dir.path().to_path_buf());
+        raw_session.file_id = file_id;
+        let session = Arc::new(raw_session);
+        let mut delivery = SegmentDelivery::new(
+            Arc::clone(&store),
+            Arc::clone(&session),
+            "delivery-test",
+            "seg00001.m4s",
+            "test".to_owned(),
+            1_024,
+        );
+
+        delivery.note_read(512, Duration::from_millis(300));
+        delivery.note_read(128, Duration::from_millis(350));
+        delivery.finish();
+
+        assert_eq!(session.delivery.total_bytes(), 640);
+        let events = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = store
+                    .playback_events(&plurx_core::domain::PlaybackEventQuery {
+                        since_ms: None,
+                        event: None,
+                        limit: 20,
+                    })
+                    .await
+                    .expect("segment-delivery telemetry query");
+                if events.len() >= 2 {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("segment-delivery telemetry persisted");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "segment_delivery_wait")
+                .count(),
+            1,
+            "only the first slow storage read is reported"
+        );
+        let incomplete = events
+            .iter()
+            .find(|event| event.event == "segment_delivery_incomplete")
+            .expect("incomplete delivery event");
+        assert_eq!(incomplete.reason.as_deref(), Some("storage_unexpected_eof"));
+        assert!(incomplete
+            .extra
+            .as_deref()
+            .is_some_and(|extra| extra.contains("\"delivered_bytes\":640")));
+        assert!(
+            incomplete
+                .extra
+                .as_deref()
+                .is_some_and(|extra| extra.contains("\"purpose\":\"client_response\"")),
+            "every delivery event names who was reading"
+        );
     }
 
     fn reopen_request(
