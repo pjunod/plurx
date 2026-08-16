@@ -300,25 +300,113 @@ struct LibraryCollection: Identifiable, Hashable {
 
 struct MediaFile: Codable, Identifiable {
     let id: Int
-    var filename: String?
-    var size: Int?
-    var durationMs: Int?
-    var container: String?
-    var videoCodec: String?
-    var videoProfile: String?
-    var width: Int?
-    var height: Int?
-    var bitDepth: Int?
+    var filename: String? = nil
+    var size: Int? = nil
+    var durationMs: Int? = nil
+    var container: String? = nil
+    var videoCodec: String? = nil
+    var videoProfile: String? = nil
+    var width: Int? = nil
+    var height: Int? = nil
+    var bitDepth: Int? = nil
     /// Coarse source grade — `"dolby_vision" | "hdr10" | "hlg"` — and the rich
     /// display label ("Dolby Vision · Profile 7 (HDR10-compatible)"). Both have
     /// always been on `FileDto`; the detail screen now shows them.
-    var hdr: String?
-    var hdrFormat: String?
-    var bitrate: Int?
+    var hdr: String? = nil
+    var hdrFormat: String? = nil
+    var bitrate: Int? = nil
     var audioStreams: [AudioTrack]? = nil
+    var subtitleStreams: [SubtitleStream]? = nil
+    /// The server's cold-start track outcome for this file. Absent from servers
+    /// that predate the shared track-facts contract, in which case the detail
+    /// screen shows the tracks without marking a default or a language status.
+    var playbackDefaults: PlaybackDefaults? = nil
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+}
+
+/// One subtitle stream exactly as item detail reports it (`FileDto`'s
+/// `subtitle_streams`, i.e. plurx-core's `SubtitleStream`).
+///
+/// Deliberately *not* `SubtitleTrack`: that one is `/decision`'s playable track
+/// and carries the HLS-rendition and overlay classifications a decision made.
+/// A detail screen has no session to ask about, so it renders the container's
+/// own facts and nothing more.
+struct SubtitleStream: Codable, Identifiable, Hashable {
+    var id: Int { index }
+    let index: Int
+    let codec: String
+    var language: String?
+    var title: String?
+    var `default`: Bool
+    var forced: Bool
+    /// The container's `hearing_impaired` disposition — SDH. Optional because a
+    /// server (or the shared contract fixture) that predates the field omits
+    /// it, and because absence is not the same claim as `false`.
+    var hearingImpaired: Bool?
+}
+
+/// How the configured preferred language relates to one file's tracks and to
+/// the track policy actually selected — the five states of
+/// `playback_defaults.*.preferred_language_status` (docs/CLIENTS.md §1).
+///
+/// `unknown` is not `missing`. An untagged track means the server cannot claim
+/// the preferred language is absent, so neither may this client; an
+/// unrecognized future state decodes here for the same reason.
+enum PreferredLanguageStatus: String, Codable, Hashable {
+    case selected
+    case available
+    case missing
+    case unknown
+    case noTracks = "no_tracks"
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = PreferredLanguageStatus(rawValue: raw) ?? .unknown
+    }
+}
+
+struct PlaybackTrackDefault: Codable, Hashable {
+    var selectedIndex: Int?
+    var preferredLanguage: String?
+    var preferredLanguageStatus: PreferredLanguageStatus?
+}
+
+struct PlaybackDefaults: Codable, Hashable {
+    var audio: PlaybackTrackDefault?
+    var subtitle: PlaybackTrackDefault?
+}
+
+/// A viewer's pre-play audio/subtitle choice, made on the detail screen and
+/// spent on exactly one playback.
+///
+/// `nil` on a side means "no explicit choice" — the server's own policy default
+/// stands, and `/decision` is asked exactly as it was before this type existed.
+/// Nothing here is ever written to the server's Playback defaults: the choice
+/// belongs to one playback (docs/CLIENTS.md §1).
+struct PrePlaySelection: Equatable {
+    var audioIndex: Int?
+    /// `subtitleOff` is Off. The wire spells it `-1`, and so does this, because
+    /// "the viewer said no subtitles" and "the viewer said nothing" are
+    /// different requests and the server answers them differently.
+    var subtitleIndex: Int?
+
+    static let subtitleOff = -1
+    static let none = PrePlaySelection()
+
+    var isEmpty: Bool { audioIndex == nil && subtitleIndex == nil }
+
+    var queryItems: [URLQueryItem] {
+        var items: [URLQueryItem] = []
+        if let audioIndex {
+            items.append(URLQueryItem(name: "audio", value: String(audioIndex)))
+        }
+        if let subtitleIndex {
+            items.append(URLQueryItem(name: "subtitle", value: String(subtitleIndex)))
+        }
+        return items
+    }
 }
 
 struct BookChapter: Codable, Hashable {
@@ -419,6 +507,28 @@ struct Delivery: Codable {
     var sessionsUrl: String?    // POST target for a copy or transcode session
     var aac: Bool?              // remux: the copy session must re-encode audio
     var preserveDolbyVision: Bool?
+    /// The audio stream index this plan carries when the caller selected one.
+    /// It is already applied to `url`; the HLS transport takes it in the
+    /// session-create body instead, which is why the plan repeats it. A client
+    /// executes this rather than re-adding its own index (docs/CLIENTS.md §1).
+    var audio: Int?
+}
+
+/// `/decision`'s answer about a request-local track choice. Present only when
+/// the request carried `audio=` or `subtitle=`, so an unselected request keeps
+/// the response shape it has always had.
+struct DecisionSelection: Codable {
+    var audioIndex: Int?
+    /// The effective subtitle. `nil` means Off — either because the caller
+    /// asked for `-1` or because policy selected none.
+    var subtitleIndex: Int?
+    /// The selected subtitle is bitmap data with no application-overlay route,
+    /// so showing it means drawing it into a video transcode.
+    var subtitleRequiresBurnIn: Bool?
+    /// The HDR guard refused that burn rather than silently replacing HDR or
+    /// Dolby Vision with SDR — so the delivery is unchanged and the subtitle is
+    /// *not* on. Reporting this as subtitles-on would be a lie.
+    var subtitleBurnInBlockedByHdr: Bool?
 }
 
 struct Decision: Codable {
@@ -432,6 +542,7 @@ struct Decision: Codable {
     var source: SourceSummary?
     var audio: [AudioTrack]?
     var subtitles: [SubtitleTrack]?
+    var selection: DecisionSelection?
     var markers: [Marker]?
     var audioOffsetMs: Int?
     var declaredOffsetMs: Int?

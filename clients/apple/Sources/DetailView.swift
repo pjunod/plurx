@@ -437,6 +437,10 @@ struct PlayContext: Identifiable {
     var year: Int? = nil
     var airDate: String? = nil
     var overview: String? = nil
+    /// The pre-play audio/subtitle choice made on the detail screen. Empty by
+    /// default — including for the next episode autoplay hands over, which is
+    /// how a choice stays confined to the playback it was made for.
+    var selection: PrePlaySelection = .none
 }
 
 enum AudiobookTimeline {
@@ -681,6 +685,11 @@ struct DetailView: View {
     @State private var loadError: String?
     @State private var watchBusy = false
     @State private var actionError: String?
+    /// The viewer's pre-play track choice and the file it was made against.
+    /// Keeping the file id beside it is what makes the choice per playback: a
+    /// choice made for one file is never spent on another's stream indices.
+    @State private var pendingTrackSelection = PrePlaySelection.none
+    @State private var pendingTrackSelectionFileId: Int?
     #if os(iOS)
     @State private var downloadBusy = false
     #endif
@@ -770,6 +779,7 @@ struct DetailView: View {
                        itemDurationMs: ctx.itemDurationMs,
                        subtitle: ctx.subtitle, year: ctx.year, airDate: ctx.airDate,
                        overview: ctx.overview,
+                       selection: ctx.selection,
                        onPlayNext: { play = $0 },
                        onPlaybackStopped: { positionMs in
                            updateVisibleProgress(
@@ -783,6 +793,100 @@ struct DetailView: View {
                        })
                 .id(ctx.id)
                 .environmentObject(model)
+        }
+    }
+
+    /// The pre-play choice as it applies to `file`. A choice recorded against
+    /// a different file reads as no choice at all, so a stale index can never
+    /// travel to a stream it does not describe.
+    private func trackSelection(for file: MediaFile) -> PrePlaySelection {
+        TrackFacts.selection(
+            pendingTrackSelection,
+            carriedFrom: pendingTrackSelectionFileId,
+            to: file.id
+        )
+    }
+
+    /// The "Start over" play context, built once for every layout.
+    ///
+    /// The wide and compact buttons each assembled this by hand, and the
+    /// compact copy omitted `selection:` — so an iPhone-portrait viewer's
+    /// pre-play choice was dropped while the identical tap honored it
+    /// everywhere else. Criterion 3 says the chosen selection is what plays,
+    /// and it cannot mean two different things per layout; one constructor is
+    /// what stops the two from drifting apart again.
+    ///
+    /// The selection is resolved against the file that is actually about to
+    /// play, which for an audiobook is the first part rather than the resume
+    /// part — so a choice made against a different file is discarded here by
+    /// the same file-id guard that governs every other path.
+    static func startOverContext(
+        item: Item,
+        file: MediaFile,
+        durationMs: Int,
+        files: [MediaFile],
+        subtitle: String?,
+        pendingSelection: PrePlaySelection,
+        pendingSelectionFileId: Int?
+    ) -> PlayContext {
+        let startFile = item.isAudiobook
+            ? (files.first(where: { $0.available != false }) ?? file)
+            : file
+        let partOffset = item.isAudiobook ? (startFile.partOffsetMs ?? 0) : 0
+        return PlayContext(
+            itemId: item.id,
+            fileId: startFile.id,
+            startMs: 0,
+            durationMs: startFile.durationMs ?? durationMs,
+            progressOffsetMs: partOffset,
+            itemDurationMs: item.isAudiobook ? durationMs : nil,
+            title: item.title,
+            subtitle: subtitle,
+            year: item.year,
+            airDate: item.airDate,
+            overview: item.overview,
+            selection: TrackFacts.selection(
+                pendingSelection,
+                carriedFrom: pendingSelectionFileId,
+                to: startFile.id
+            )
+        )
+    }
+
+    private func trackSelectionBinding(for file: MediaFile) -> Binding<PrePlaySelection> {
+        Binding(
+            get: { trackSelection(for: file) },
+            set: { chosen in
+                pendingTrackSelection = chosen
+                pendingTrackSelectionFileId = file.id
+            }
+        )
+    }
+
+    /// Both halves of the pre-play control: the two menus and the burn-in
+    /// disclosure that a bitmap choice owes the viewer before playback starts.
+    @ViewBuilder
+    private func trackChoiceControls(_ file: MediaFile) -> some View {
+        TrackChoiceControls(file: file, selection: trackSelectionBinding(for: file))
+    }
+
+    @ViewBuilder
+    private func trackChoiceRow(item: Item, file: MediaFile?) -> some View {
+        if let file, item.isPlayable, !item.isBook {
+            HStack(spacing: 10) {
+                trackChoiceControls(file)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func trackFacts(item: Item, file: MediaFile?) -> some View {
+        if let file, item.isMovieOrEpisode || item.kind == "video" {
+            VStack(alignment: .leading, spacing: 10) {
+                TrackFactsSection(file: file)
+                TrackChoiceCostNotice(file: file, selection: trackSelection(for: file))
+            }
         }
     }
 
@@ -919,6 +1023,8 @@ struct DetailView: View {
                         canResume: canResume
                     )
 
+                    trackChoiceRow(item: item, file: file)
+
                     if let actionError {
                         Text(actionError)
                             .font(.caption)
@@ -941,6 +1047,8 @@ struct DetailView: View {
                     }
 
                     episodeMediaInfo(item: item, file: file)
+
+                    trackFacts(item: item, file: file)
                 }
             }
             .padding(.top, 10)
@@ -1090,6 +1198,8 @@ struct DetailView: View {
                     watchButton(detail)
                     #endif
 
+                    trackChoiceRow(item: item, file: file)
+
                     if let actionError {
                         Text(actionError)
                             .font(.caption)
@@ -1106,6 +1216,8 @@ struct DetailView: View {
                     }
 
                     episodeMediaInfo(item: item, file: file)
+
+                    trackFacts(item: item, file: file)
                 }
             }
             #if os(iOS)
@@ -1199,6 +1311,14 @@ struct DetailView: View {
                     }
                     .padding(.top, 3)
 
+                    // Beside Play, not only in the list below: the choice has
+                    // to be reachable before the viewer presses the button.
+                    if let file, item.isPlayable, !item.isBook {
+                        HStack(spacing: 16) {
+                            trackChoiceControls(file)
+                        }
+                    }
+
                     if let actionError {
                         Text(actionError)
                             .font(.caption)
@@ -1214,6 +1334,11 @@ struct DetailView: View {
             .clipped()
             .containerRelativeFrame(.vertical, alignment: .center)
             .tvNavigationFocusSection()
+
+            DetailBodyFrame {
+                trackFacts(item: item, file: file)
+            }
+            .padding(.top, 24)
 
             audiobookContents(detail)
 
@@ -1621,7 +1746,8 @@ struct DetailView: View {
             subtitle: chapter ?? playbackSubtitle(item),
             year: item.year,
             airDate: item.airDate,
-            overview: item.overview
+            overview: item.overview,
+            selection: trackSelection(for: file)
         )
     }
 
@@ -1989,23 +2115,15 @@ struct DetailView: View {
         file: MediaFile,
         durationMs: Int
     ) -> some View {
-        let startFile = item.isAudiobook
-            ? ((detail?.files ?? []).first(where: { $0.available != false }) ?? file)
-            : file
-        let partOffset = item.isAudiobook ? (startFile.partOffsetMs ?? 0) : 0
-        return Button {
-            play = PlayContext(
-                itemId: item.id,
-                fileId: startFile.id,
-                startMs: 0,
-                durationMs: startFile.durationMs ?? durationMs,
-                progressOffsetMs: partOffset,
-                itemDurationMs: item.isAudiobook ? durationMs : nil,
-                title: item.title,
+        Button {
+            play = Self.startOverContext(
+                item: item,
+                file: file,
+                durationMs: durationMs,
+                files: detail?.files ?? [],
                 subtitle: playbackSubtitle(item),
-                year: item.year,
-                airDate: item.airDate,
-                overview: item.overview
+                pendingSelection: pendingTrackSelection,
+                pendingSelectionFileId: pendingTrackSelectionFileId
             )
         } label: {
             Image(systemName: "arrow.counterclockwise")
@@ -2253,28 +2371,21 @@ struct DetailView: View {
             subtitle: playbackSubtitle(item),
             year: item.year,
             airDate: item.airDate,
-            overview: item.overview
+            overview: item.overview,
+            selection: trackSelection(for: file)
         )
     }
 
     private func startOverButton(item: Item, file: MediaFile, durationMs: Int) -> some View {
-        let startFile = item.isAudiobook
-            ? ((detail?.files ?? []).first(where: { $0.available != false }) ?? file)
-            : file
-        let partOffset = item.isAudiobook ? (startFile.partOffsetMs ?? 0) : 0
-        return Button {
-            play = PlayContext(
-                itemId: item.id,
-                fileId: startFile.id,
-                startMs: 0,
-                durationMs: startFile.durationMs ?? durationMs,
-                progressOffsetMs: partOffset,
-                itemDurationMs: item.isAudiobook ? durationMs : nil,
-                title: item.title,
+        Button {
+            play = Self.startOverContext(
+                item: item,
+                file: file,
+                durationMs: durationMs,
+                files: detail?.files ?? [],
                 subtitle: playbackSubtitle(item),
-                year: item.year,
-                airDate: item.airDate,
-                overview: item.overview
+                pendingSelection: pendingTrackSelection,
+                pendingSelectionFileId: pendingTrackSelectionFileId
             )
         } label: {
             #if os(tvOS)

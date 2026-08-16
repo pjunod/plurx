@@ -938,6 +938,12 @@ final class PlayerController: ObservableObject {
     private var offlineAssetURL: URL?
     #endif
     private var audioOverride: Int?
+    /// The detail screen's pre-play choice for *this* playback. It travels to
+    /// `/decision`, so the server's verdict and delivery plan already account
+    /// for it — which is exactly why it is not an `audioOverride`: overriding
+    /// would force a copy session onto a choice the server judged direct-
+    /// playable, downgrading delivery past what the verdict states.
+    private var prePlaySelection = PrePlaySelection.none
     private weak var model: AppModel?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
@@ -1196,7 +1202,8 @@ final class PlayerController: ObservableObject {
         durationMs: Int,
         progressOffsetMs: Int = 0,
         itemDurationMs: Int? = nil,
-        title: String
+        title: String,
+        selection: PrePlaySelection = .none
     ) {
         guard !started else { return }
         started = true
@@ -1212,6 +1219,8 @@ final class PlayerController: ObservableObject {
         self.knownDurationMs = durationMs
         self.currentMs = max(0, startMs)
         self.title = title
+        self.prePlaySelection = selection
+        audioOverride = nil
         finished = false
         playbackFailureTitle = Self.playbackStartFailureTitle
         subtitleReadiness = model.subtitleReadiness
@@ -1706,30 +1715,48 @@ final class PlayerController: ObservableObject {
     private func load(startMs: Int) async {
         guard let model else { return }
         do {
-            let decision = try await model.decision(fileId: fileId)
+            let decision = try await model.decision(
+                fileId: fileId,
+                selection: prePlaySelection
+            )
             guard started else { return }
             self.decision = decision
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
             // `default` on a decision track is the server's own shared-policy
             // pick, not the muxer's flag (crates/plurxd http/stream.rs
-            // overwrites both lists from `select_tracks`).
+            // overwrites both lists from `select_tracks`) — and for a
+            // selection-aware request it is the *effective* pick, so a pre-play
+            // audio choice already arrives marked here.
             selectedAudio = decision.audio?.first(where: { $0.default })?.index
-            // "Off" in this device's settings is the viewer saying never, so
-            // it is honored before the server's pick is even looked at. It is
-            // the viewer's instruction rather than a second copy of the
-            // selection rule, which lives on the server alone.
-            let automaticSubtitle = model.subLang == "off"
-                ? nil
-                : Self.automaticSubtitleIndex(decision.subtitles ?? [])
-            // A forced bitmap track may be the server's automatic pick, but a
-            // cold-start preference still must not trade an HDR plan for an
-            // SDR burn without the viewer asking. Manual selection is guarded
-            // by the same predicate in `selectSubtitle`.
-            selectedSubtitle = Self.subtitleBurnWouldDiscardHDR(
-                automaticSubtitle,
+            let wantedSubtitle = Self.initialSubtitleIndex(
+                prePlay: prePlaySelection.subtitleIndex,
+                serverSelection: decision.selection,
+                tracks: decision.subtitles ?? [],
+                deviceSubtitlesOff: model.subLang == "off"
+            )
+            let blockedByHDR = Self.startingSubtitleBlockedByHDR(
+                prePlaySubtitle: prePlaySelection.subtitleIndex,
+                wanted: wantedSubtitle,
+                serverSelection: decision.selection,
                 tracks: decision.subtitles ?? [],
                 deliveredRange: decision.deliveredDynamicRange
-            ) ? nil : automaticSubtitle
+            )
+            selectedSubtitle = blockedByHDR ? nil : wantedSubtitle
+            // Say so rather than starting silently with no subtitles: the
+            // viewer asked for these on the detail screen.
+            if blockedByHDR, prePlaySelection.subtitleIndex != nil {
+                showPlaybackNotice(Self.hdrSubtitleNotice)
+            }
+            // A native pre-play choice enters the session on this very open, so
+            // record it the way `selectSubtitle` does — otherwise turning
+            // subtitles off later would drop back to direct play and charge the
+            // next selection a restart this path already paid for. Scoped to
+            // the pre-play arm so the automatic path keeps its behaviour.
+            if prePlaySelection.subtitleIndex != nil,
+               let selectedSubtitle,
+               !Self.subtitleRequiresBurn(selectedSubtitle, in: decision.subtitles ?? []) {
+                wantsNativeSubtitleRenditions = true
+            }
             updatePGSOverlaySelection(selectedSubtitle)
             // Use the same drain as later replacements. A remote command can
             // arrive while the decision request or first item is preparing;
@@ -1896,6 +1923,7 @@ final class PlayerController: ObservableObject {
             // A viewer's later explicit choice remains the stronger value.
             let chosenAudio = Self.sessionAudioIndex(
                 explicit: audioOverride,
+                plan: decision.delivery?.audio,
                 selected: selectedAudio
             )
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
@@ -3069,6 +3097,37 @@ final class PlayerController: ObservableObject {
         return subtitleRequiresBurn(index, in: tracks)
     }
 
+    /// Whether the subtitle a starting playback wants must be dropped because
+    /// drawing it would have traded the HDR picture away.
+    ///
+    /// Two vetoes, and the server's counts **only when a subtitle choice
+    /// actually traveled**. `/decision` emits its `selection` block whenever
+    /// *either* parameter was sent (`selection_requested` is
+    /// `audio.is_some() || subtitle.is_some()`, crates/plurxd/src/http/stream.rs),
+    /// and the `subtitle_burn_in_blocked_by_hdr` it carries is computed from
+    /// the *policy* subtitle against the *source* range. On an audio-only
+    /// request that describes a burn the server never even considered applying
+    /// — `apply_selected_subtitle` is gated on `subtitle=`. Reading the flag
+    /// there would silently drop a forced track the no-choice path starts
+    /// happily, e.g. an HDR source tone-mapped to SDR for an SDR-only device
+    /// whose policy pick is forced PGS signs: picking only a Japanese audio
+    /// track would turn the signs off.
+    ///
+    /// The client's own predicate reads the *delivered* range, so it answers
+    /// for whatever is actually about to play and applies to both arms.
+    static func startingSubtitleBlockedByHDR(
+        prePlaySubtitle: Int?,
+        wanted: Int?,
+        serverSelection: DecisionSelection?,
+        tracks: [SubtitleTrack],
+        deliveredRange: String?
+    ) -> Bool {
+        let serverRefused = prePlaySubtitle != nil
+            && serverSelection?.subtitleBurnInBlockedByHdr == true
+        return serverRefused
+            || subtitleBurnWouldDiscardHDR(wanted, tracks: tracks, deliveredRange: deliveredRange)
+    }
+
     static func shouldPreserveEstablishedHDRDelivery(
         deliveredRange: String?,
         establishedPlayback: Bool
@@ -3504,10 +3563,54 @@ final class PlayerController: ObservableObject {
         Self.languageSpellings(code)
     }
 
-    /// The audio index an HLS session must carry. `selected` is the server's
-    /// automatic answer from `/decision`; `explicit` is a later viewer choice.
-    nonisolated static func sessionAudioIndex(explicit: Int?, selected: Int?) -> Int? {
-        explicit ?? selected
+    /// The audio index an HLS session must carry, in falling order of
+    /// authority: `explicit` is a later in-player choice, `plan` is what the
+    /// server put in the delivery plan for a selection-aware `/decision`, and
+    /// `selected` is the server's automatic answer.
+    ///
+    /// `plan` outranks `selected` because the contract says to execute the plan
+    /// as given (docs/CLIENTS.md §1); it sits *below* `explicit` because the
+    /// plan was decided before the viewer changed their mind mid-playback, and
+    /// a reopen replays that stale plan otherwise.
+    nonisolated static func sessionAudioIndex(
+        explicit: Int?,
+        plan: Int?,
+        selected: Int?
+    ) -> Int? {
+        explicit ?? plan ?? selected
+    }
+
+    /// The subtitle a starting playback shows.
+    ///
+    /// A pre-play choice is the viewer speaking, so it outranks both this
+    /// device's "subtitles off" setting and the never-start-a-burn veto that
+    /// governs *automatic* selection — picking a bitmap track on the detail
+    /// screen is exactly the viewer asking for it. Off (`-1`) is a choice too,
+    /// and the server echoes it as no effective subtitle.
+    ///
+    /// With no pre-play choice this is unchanged: the device's Off setting is
+    /// honored first, then the server's own pick via `automaticSubtitleIndex`.
+    static func initialSubtitleIndex(
+        prePlay: Int?,
+        serverSelection: DecisionSelection?,
+        tracks: [SubtitleTrack],
+        deviceSubtitlesOff: Bool
+    ) -> Int? {
+        if let prePlay {
+            // The echo is authoritative when there is one — `subtitle_index`
+            // null then means Off. A server predating the selection contract
+            // sends no `selection` block at all, so fall back to what was asked
+            // for, minus the Off sentinel.
+            guard let serverSelection else {
+                return prePlay == PrePlaySelection.subtitleOff ? nil : prePlay
+            }
+            return serverSelection.subtitleIndex
+        }
+        // "Off" in this device's settings is the viewer saying never, so it is
+        // honored before the server's pick is even looked at. It is the
+        // viewer's instruction rather than a second copy of the selection rule,
+        // which lives on the server alone.
+        return deviceSubtitlesOff ? nil : automaticSubtitleIndex(tracks)
     }
 
     /// Every spelling of a language preference AVFoundation might have to
@@ -3563,7 +3666,7 @@ final class PlayerController: ObservableObject {
     /// reject it when the preceding word negates it; "Unforced" and
     /// "Reinforced" fall out for free because the letter in front of them is
     /// not a boundary. Plain "Forced" keeps working — that is 5615's contract.
-    static func titleMarksForced(_ title: String) -> Bool {
+    nonisolated static func titleMarksForced(_ title: String) -> Bool {
         let lower = title.lowercased()
         var searchStart = lower.startIndex
         while let found = lower.range(of: "forced", range: searchStart..<lower.endIndex) {
@@ -3583,7 +3686,7 @@ final class PlayerController: ObservableObject {
     /// Replica of the server's `negated_before`: the word immediately in front
     /// of a "forced" occurrence, when it turns the claim around. Separators are
     /// skipped, so "non-forced", "non forced", and "not forced" share a rule.
-    private static func negatedBefore(_ prefix: String) -> Bool {
+    nonisolated private static func negatedBefore(_ prefix: String) -> Bool {
         let word = prefix
             .split(whereSeparator: { !isAlphanumeric($0) })
             .last
@@ -3591,7 +3694,7 @@ final class PlayerController: ObservableObject {
         return ["non", "not", "no", "never"].contains(word)
     }
 
-    private static func isAlphanumeric(_ character: Character) -> Bool {
+    nonisolated private static func isAlphanumeric(_ character: Character) -> Bool {
         character.isLetter || character.isNumber
     }
 

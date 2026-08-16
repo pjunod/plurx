@@ -631,6 +631,8 @@ struct PlayerView: View {
     var airDate: String? = nil
     var overview: String? = nil
     var offlineItem: OfflineItem? = nil
+    /// The detail screen's pre-play track choice, spent on this playback only.
+    var selection: PrePlaySelection = .none
     var onPlayNext: ((PlayContext) -> Void)?
     /// Hands the owning detail screen the last on-screen position immediately.
     /// The server progress write is intentionally best-effort and asynchronous;
@@ -787,7 +789,8 @@ struct PlayerView: View {
                     durationMs: durationMs,
                     progressOffsetMs: progressOffsetMs,
                     itemDurationMs: itemDurationMs,
-                    title: title
+                    title: title,
+                    selection: selection
                 )
             }
             #else
@@ -799,7 +802,8 @@ struct PlayerView: View {
                 durationMs: durationMs,
                 progressOffsetMs: progressOffsetMs,
                 itemDurationMs: itemDurationMs,
-                title: title
+                title: title,
+                selection: selection
             )
             #endif
             #if os(tvOS)
