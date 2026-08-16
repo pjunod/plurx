@@ -609,6 +609,40 @@ pub struct OfflinePackageStats {
     pub pinned_bytes: i64,
 }
 
+/// The stable failure code a package carries when the node that owned it left
+/// the cluster and no survivor could prove it reads the same source.
+///
+/// Clients treat this exactly like any other terminal failure: the package is
+/// gone, its reservation is released, and creating a fresh request is the
+/// retry. It is a distinct code so a client can say "the server that was
+/// preparing this went away" rather than blaming the media.
+pub const OFFLINE_NODE_REMOVED_CODE: &str = "node_removed";
+
+/// What node removal decided about one package the departing node owned.
+///
+/// `CLUSTERING-PLAN.md` §6.7 allows exactly two outcomes, and this type makes
+/// the caller name one of them. There is deliberately no "leave it alone"
+/// variant: a package left owned by a node that no longer exists is the
+/// stranded work the milestone exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineRemovalPlanEntry {
+    pub package_id: String,
+    /// `Some(node)` requeues on a survivor that positively verified it can
+    /// read this package's exact snapshotted source. `None` fails the package
+    /// with [`OFFLINE_NODE_REMOVED_CODE`] and releases its reservation.
+    ///
+    /// A replicated `source_path` is not that proof, so this field may only be
+    /// filled from an answered source probe.
+    pub requeue_to: Option<String>,
+}
+
+/// What one removal actually did to the departing node's offline work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfflineRemovalReport {
+    pub requeued: u64,
+    pub failed: u64,
+}
+
 /// Validated values inserted as one transaction with idempotency and quota
 /// checks. Source identity is copied so a rescan cannot silently retarget a
 /// queued job at different bytes.

@@ -47,8 +47,9 @@ use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
     MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
     NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, PlaybackEvent, PlaybackEventQuery,
-    ProbeResult, RecentItem, TraktAuth, User, WatchRollup, WatchState,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
+    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, RecentItem, TraktAuth,
+    User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -1032,9 +1033,14 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         progress_millis: i64,
     ) -> Result<bool, StoreError>;
 
+    /// `node_id` fences the write to the current owner. Re-homing a package
+    /// during node removal changes its owner while the old node's producer may
+    /// still be running; without this guard that doomed producer's late
+    /// failure would terminate work a survivor has already taken over.
     async fn fail_offline_package(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         code: &str,
         message: &str,
@@ -1057,9 +1063,14 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         renewed_expires_at: i64,
     ) -> Result<Option<OfflinePackage>, StoreError>;
 
+    /// `node_id` fences publication to the current owner for the same reason
+    /// [`OfflinePackageStore::fail_offline_package`] does. A package re-homed
+    /// mid-production must not be advertised ready by bytes that live on the
+    /// node that just left.
     async fn mark_offline_package_ready(
         &self,
         package_id: &str,
+        node_id: &str,
         recipe_hash: &str,
         actual_bytes: i64,
         duration_ms: i64,
@@ -1072,6 +1083,93 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
 
     async fn expire_offline_packages(&self, now: i64) -> Result<u64, StoreError>;
+
+    // --- Node removal (`CLUSTERING-PLAN.md` §6.7) -------------------------
+    //
+    // Removing a node must resolve the offline work it owns before the
+    // membership change commits. A package's `source_path` replicates, but a
+    // mount does not, so re-homing is only allowed against a survivor that
+    // answered a probe by actually reading the snapshotted source. Everything
+    // below exists to make that proof durable rather than assumed.
+    //
+    // The single-node SQLite backend has no removal path at all. Its
+    // implementations are deliberately inert, and no SQLite table backs them.
+
+    /// Every package the node still owns that removal has to resolve —
+    /// `queued`, `preparing`, and `ready`. `failed` rows are terminal, hold no
+    /// reservation, and are left for the ordinary expiry sweep.
+    async fn unresolved_offline_packages(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<OfflinePackage>, StoreError>;
+
+    /// How many of the node's `ready` packages a client is fetching right now,
+    /// measured the way the activity surface measures it. Removal refuses
+    /// while a transfer is in flight rather than cutting a download off.
+    async fn offline_transfers_in_flight(
+        &self,
+        node_id: &str,
+        now: i64,
+        active_since: i64,
+    ) -> Result<i64, StoreError>;
+
+    /// Ask each candidate node to prove it can read each package's source.
+    /// Re-asking resets any previous answer: a mount that worked last week is
+    /// not evidence about this removal.
+    async fn request_offline_source_probes(
+        &self,
+        package_ids: &[String],
+        node_ids: &[String],
+        now: i64,
+    ) -> Result<u64, StoreError>;
+
+    /// Packages this node has been asked about and has not answered yet. The
+    /// full package row travels because the answer requires its snapshotted
+    /// path, size, and mtime — the probe row itself stores no media path.
+    async fn pending_offline_source_probes(
+        &self,
+        node_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<OfflinePackage>, StoreError>;
+
+    async fn answer_offline_source_probe(
+        &self,
+        package_id: &str,
+        node_id: &str,
+        readable: bool,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Probes asked at or after `requested_at` that nobody has answered yet.
+    /// Removal waits on this reaching zero rather than on a particular node
+    /// saying yes, so a unanimous "no" ends the wait immediately instead of
+    /// burning the whole timeout on a package no survivor can take.
+    async fn outstanding_offline_source_probes(&self, requested_at: i64)
+        -> Result<i64, StoreError>;
+
+    /// Nodes that answered "yes" to a probe asked at or after
+    /// `requested_since`. Scoped by when the question was asked rather than
+    /// when it was answered, because the asking node and the answering node
+    /// keep different clocks and only the former's is consistent here.
+    async fn verified_offline_source_nodes(
+        &self,
+        package_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Apply one whole removal plan atomically. A half-applied plan would
+    /// leave exactly the orphaned work §6.7 calls an activation blocker, so
+    /// this either resolves every listed package or changes nothing.
+    ///
+    /// Failing a package clears its reservation and completed size in the same
+    /// statement: the bytes it accounted for lived on the departing node and
+    /// reporting them as held would be a lie the operator cannot act on.
+    async fn resolve_offline_packages_for_removal(
+        &self,
+        node_id: &str,
+        plan: &[OfflineRemovalPlanEntry],
+        now: i64,
+    ) -> Result<OfflineRemovalReport, StoreError>;
 }
 
 /// Node-local playback telemetry.

@@ -16,6 +16,7 @@ use hiqlite::{Client, Node, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::domain::{OfflinePackage, OfflineRemovalPlanEntry, OfflineRemovalReport};
 use crate::store::{Store, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 
 use super::migration::status::{ReplicationMonitor, ReplicationStatus};
@@ -28,6 +29,18 @@ const JOIN_TOKEN_VERSION: u32 = 1;
 const MEMBERSHIP_SCHEMA_VERSION: i64 = 1;
 const NODE_REACHABLE_WINDOW_MS: i64 = 30_000;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a removal waits for survivors to answer a source probe before
+/// treating silence as "cannot prove it". Long enough for a healthy node's
+/// poll plus a `stat` on a sleeping NAS; short enough that an operator gets an
+/// answer rather than a hung request.
+const PROBE_WAIT: Duration = Duration::from_secs(15);
+const PROBE_POLL: Duration = Duration::from_millis(500);
+/// A probe nobody answered stops being worth answering. This bounds how far
+/// back a node looks so an abandoned removal cannot leave work queued forever.
+const PROBE_REQUEST_TTL: i64 = 300;
+/// Matches the activity surface's notion of a transfer in progress: a lease
+/// touched this recently is a downloader that is still fetching.
+const TRANSFER_ACTIVE_SECONDS: i64 = 60;
 
 const MEMBERSHIP_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_membership_meta (\
@@ -70,8 +83,12 @@ pub enum MembershipError {
     LeaderRemoval,
     #[error("removal would leave fewer than two voters and lose the reconfiguration quorum")]
     QuorumLoss,
-    #[error("node owns offline work; remove or expire its offline packages before removing it")]
-    OfflineWork,
+    /// The removal was refused because this node's offline work could not be
+    /// resolved by the §6.7 rule. The payload is the operator-visible reason;
+    /// lifting the blanket refusal must not turn removal into "always
+    /// succeeds", so what stopped it has to be sayable.
+    #[error("node owns offline work that could not be resolved: {0}")]
+    OfflineWork(String),
     #[error("cluster membership operation failed: {0}")]
     Internal(String),
 }
@@ -89,7 +106,7 @@ impl MembershipError {
             Self::NodeNotFound => "cluster_node_not_found",
             Self::LeaderRemoval => "cluster_leader_removal_refused",
             Self::QuorumLoss => "removal_would_lose_quorum",
-            Self::OfflineWork => "node_owns_offline_work",
+            Self::OfflineWork(_) => "node_owns_offline_work",
             Self::Internal(_) => "membership_internal",
         }
     }
@@ -670,14 +687,11 @@ impl MembershipManager {
         if voters.len() < 3 {
             return Err(MembershipError::QuorumLoss);
         }
-        let offline = inner
-            .store
-            .offline_package_stats(node_id, unix_seconds()?)
-            .await
-            .map_err(|error| MembershipError::Internal(error.to_string()))?;
-        if offline.queued + offline.preparing + offline.ready + offline.failed > 0 {
-            return Err(MembershipError::OfflineWork);
-        }
+        // Offline work is resolved before the membership change commits, never
+        // after. A removal that half-commits leaves packages owned by a node
+        // that no longer exists, which `CLUSTERING-PLAN.md` §6.7 calls an
+        // activation blocker and which is strictly worse than refusing.
+        let resolved = self.resolve_offline_work(node_id).await?;
         let remaining = voters
             .into_iter()
             .filter(|id| *id != target.raft_id)
@@ -698,8 +712,247 @@ impl MembershipManager {
                 params!(unix_ms()?, node_id),
             )
             .await?;
+        if resolved.requeued + resolved.failed > 0 {
+            tracing::info!(
+                requeued = resolved.requeued,
+                failed = resolved.failed,
+                "resolved offline packages owned by a removed node"
+            );
+        }
         self.status().await
     }
+
+    /// Resolve every offline package the departing node owns, per §6.7.
+    ///
+    /// The rule has exactly two allowed outcomes and one allowed refusal:
+    ///
+    /// * **Requeue** a `queued` or `preparing` package on a survivor that
+    ///   answered a source probe by actually opening the snapshotted bytes.
+    /// * **Fail** it with `node_removed` when no survivor proved that, which
+    ///   releases the reservation so the client can simply ask again.
+    /// * **Refuse** the removal while a client is mid-transfer, because
+    ///   cutting a download off is neither of the two outcomes above.
+    ///
+    /// A `ready` package is never requeued. Its bytes exist only in the
+    /// departing node's cache, and §7 non-goal 4 explicitly declines to
+    /// promise byte-identical transcodes across mixed encoders — so a
+    /// re-produced package behind the same stable lease URL could hand a
+    /// resuming downloader a different generation's bytes. Failing it stops
+    /// the cluster advertising a promise it can no longer keep, and the
+    /// client's retry gets a fresh package with a fresh URL.
+    async fn resolve_offline_work(
+        &self,
+        node_id: &str,
+    ) -> Result<OfflineRemovalReport, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let now = unix_seconds()?;
+        let packages = inner
+            .store
+            .unresolved_offline_packages(node_id)
+            .await
+            .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        if packages.is_empty() {
+            return Ok(OfflineRemovalReport::default());
+        }
+
+        let in_flight = inner
+            .store
+            .offline_transfers_in_flight(node_id, now, now - TRANSFER_ACTIVE_SECONDS)
+            .await
+            .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        if in_flight > 0 {
+            return Err(MembershipError::OfflineWork(format!(
+                "{in_flight} offline download(s) are still transferring from this node; \
+                 retry the removal once they finish or delete those packages"
+            )));
+        }
+
+        // Only `queued` and `preparing` work can move, so only that work is
+        // worth asking about. Candidates are the other nodes still in the
+        // roster; the departing node is excluded because its answer is about
+        // to stop being true.
+        let movable = packages
+            .iter()
+            .filter(|package| package.state == "queued" || package.state == "preparing")
+            .map(|package| package.id.clone())
+            .collect::<Vec<_>>();
+        let candidates = self
+            .status()
+            .await?
+            .nodes
+            .iter()
+            .filter(|node| node.node_id != node_id && node.reachable)
+            .map(|node| node.node_id.clone())
+            .collect::<Vec<_>>();
+
+        let requested_at = unix_seconds()?;
+        if !movable.is_empty() && !candidates.is_empty() {
+            inner
+                .store
+                .request_offline_source_probes(&movable, &candidates, requested_at)
+                .await
+                .map_err(|error| MembershipError::Internal(error.to_string()))?;
+            self.await_source_probes(requested_at).await?;
+        }
+
+        let mut plan = Vec::with_capacity(packages.len());
+        for package in &packages {
+            let requeue_to = if movable.contains(&package.id) {
+                inner
+                    .store
+                    .verified_offline_source_nodes(&package.id, requested_at)
+                    .await
+                    .map_err(|error| MembershipError::Internal(error.to_string()))?
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            };
+            plan.push(OfflineRemovalPlanEntry {
+                package_id: package.id.clone(),
+                requeue_to,
+            });
+        }
+
+        inner
+            .store
+            .resolve_offline_packages_for_removal(node_id, &plan, unix_seconds()?)
+            .await
+            .map_err(|error| {
+                MembershipError::OfflineWork(format!(
+                    "could not resolve this node's offline work atomically, so the removal was \
+                     refused rather than leaving it stranded: {error}"
+                ))
+            })
+    }
+
+    /// Give the surviving nodes a bounded window to answer, then stop waiting.
+    ///
+    /// Not answering is a valid answer: a node that is wedged, busy, or simply
+    /// does not have the mount fails to prove anything, and an unproven node
+    /// is not a re-homing target. The wait exists to give a healthy node time
+    /// to reply, not to keep the operator hanging until every node agrees.
+    async fn await_source_probes(&self, requested_at: i64) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        let deadline = tokio::time::Instant::now() + PROBE_WAIT;
+        loop {
+            let outstanding = inner
+                .store
+                .outstanding_offline_source_probes(requested_at)
+                .await
+                .map_err(|error| MembershipError::Internal(error.to_string()))?;
+            if outstanding == 0 || tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(PROBE_POLL).await;
+        }
+    }
+
+    /// The node-side half of the removal protocol: answer every source probe
+    /// addressed to this node by actually reading the bytes.
+    ///
+    /// Every node runs this continuously, not just during a removal, because
+    /// the asking node cannot reach into a peer's filesystem and a probe is
+    /// only useful if somebody is listening when it is asked.
+    pub async fn answer_offline_source_probes(&self) -> Result<u64, MembershipError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(0);
+        };
+        let now = unix_seconds()?;
+        let pending = inner
+            .store
+            .pending_offline_source_probes(&inner.identity.node_id, now - PROBE_REQUEST_TTL)
+            .await
+            .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        let mut answered = 0;
+        for package in pending {
+            let package_id = package.id.clone();
+            let readable = tokio::task::spawn_blocking(move || source_is_readable(&package))
+                .await
+                .map_err(|error| MembershipError::Internal(error.to_string()))?;
+            if inner
+                .store
+                .answer_offline_source_probe(
+                    &package_id,
+                    &inner.identity.node_id,
+                    readable,
+                    unix_seconds()?,
+                )
+                .await
+                .map_err(|error| MembershipError::Internal(error.to_string()))?
+            {
+                answered += 1;
+            }
+        }
+        Ok(answered)
+    }
+
+    /// Poll for source probes far more often than the heartbeat ticks.
+    ///
+    /// A removal blocks an operator while it waits for these answers, so the
+    /// cadence is the responsiveness of node removal itself, not a background
+    /// housekeeping interval. Idle passes cost one indexed lookup that
+    /// normally returns nothing.
+    pub async fn offline_source_probe_loop(self) {
+        if self.inner.is_none() {
+            return;
+        }
+        loop {
+            tokio::time::sleep(PROBE_POLL).await;
+            match self.answer_offline_source_probes().await {
+                Ok(0) => {}
+                Ok(answered) => {
+                    tracing::info!(
+                        answered,
+                        "answered offline source probes for a node removal"
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!(code = error.code(), "offline source probe pass failed")
+                }
+            }
+        }
+    }
+}
+
+/// Positive proof that *this* machine can read a package's exact source.
+///
+/// The whole point of the probe protocol is that a replicated `source_path` is
+/// a string, not a mount. So this opens the file and reads from it rather than
+/// asking whether the path exists: a stale automount entry, a directory, and a
+/// permission-denied share all "exist".
+///
+/// Size and mtime must match the snapshot the package took at request time for
+/// the same reason [`crate::store::OfflinePackageStore::create_offline_package`]
+/// snapshots them: a survivor holding a *different* file at the same path is
+/// not an equivalent source, and re-homing onto it would silently prepare
+/// different media than the traveller asked for.
+///
+/// Blocking. Callers hand it to a blocking pool — a dead NAS can hold an
+/// `open` for a long time, and that must not stall an async runtime.
+#[must_use]
+pub fn source_is_readable(package: &OfflinePackage) -> bool {
+    use std::io::Read as _;
+
+    let Ok(metadata) = std::fs::metadata(&package.source_path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != package.source_size as u64 {
+        return false;
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_secs());
+    if modified != Some(package.source_mtime as u64) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(&package.source_path) else {
+        return false;
+    };
+    let mut probe = [0_u8; 1];
+    file.read(&mut probe).is_ok()
 }
 
 pub fn decode_join_token(token: &str) -> Result<JoinPayload, MembershipError> {

@@ -623,6 +623,7 @@ impl OfflineManager {
             .store
             .mark_offline_package_ready(
                 &package.id,
+                &self.node_id,
                 &produced.recipe,
                 actual_bytes,
                 produced.duration_ms,
@@ -674,7 +675,7 @@ impl OfflineManager {
     ) {
         match self
             .store
-            .fail_offline_package(&package.id, phase, code, message)
+            .fail_offline_package(&package.id, &self.node_id, phase, code, message)
             .await
         {
             Ok(true) => self

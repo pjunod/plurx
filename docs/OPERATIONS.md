@@ -314,15 +314,48 @@ curl -fsS "$PLURX/api/v1/cluster/nodes" \
 ```
 
 **Remove a follower from three or more voters.** Use the node id from the
-roster, not its Raft id. The request refuses the current leader, any change
-that would leave fewer than two voters, and any node with queued, preparing,
-ready, or failed offline packages. That last refusal is conservative: a
-replicated source path does not prove another node mounts the same bytes.
+roster, not its Raft id. The request refuses the current leader and any change
+that would leave fewer than two voters.
 
 ```bash
 curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
   -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
 ```
+
+#### What removal does to the node's offline downloads
+
+Removal resolves the departing node's offline packages before the membership
+change commits, so nothing is left owned by a machine that no longer exists.
+You do not have to drain them by hand first.
+
+Before it commits, the cluster asks every other node whether it can actually
+read each package's source file — not whether the path looks the same, but
+whether opening it returns the same bytes, size, and modification time the
+request recorded. That question is asked and answered for real, because a
+replicated source path does not prove another node mounts the same media.
+
+| The package was | What removal does |
+|---|---|
+| queued or preparing, and another node proved it reads the source | Moved to that node and prepared there. The download continues; nothing is lost. |
+| queued or preparing, and no node could prove it | Failed with `node_removed`. Its reservation is released immediately. |
+| ready | Failed with `node_removed`. Its bytes only ever existed on the removed node. |
+| already failed | Left alone. It holds nothing and expires normally. |
+
+A ready package is failed rather than moved on purpose. The prepared bytes
+lived only on the departing node, and plurx does not promise byte-identical
+transcodes across machines with different encoders — so re-preparing it behind
+the same download URL could hand a partly-finished download a different set of
+bytes. Failing it is honest: the user's client sees the package is gone and
+requesting it again prepares a fresh one on a remaining server.
+
+`node_removed` is a stable code. Nothing is wrong with the media and nothing is
+wrong with the server: the machine that was preparing that download left. The
+fix is always the same — ask for it again.
+
+The removal still refuses while a client is downloading from that node right
+now, and the error says how many transfers are in flight. Wait for them to
+finish or delete those packages, then retry. This is the only offline reason a
+removal refuses; everything else resolves.
 
 `cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
 `node_owns_offline_work` are operator-facing refusal codes. After a successful
