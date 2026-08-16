@@ -66,7 +66,7 @@ operations-check: ## Verify deploy, CI, container, and client shipping contracts
 	@python3 -m unittest discover -s tests/operations -p 'test_*.py'
 
 .PHONY: check
-check: validation-lint history-check operations-check rust-check ## History + operations + catalog + Rust baseline
+check: validation-lint history-check operations-check benchmark-check rust-check ## History + operations + catalog + benchmark + Rust baseline
 
 .PHONY: hiqlite-spike
 hiqlite-spike: ## Run the isolated M0 raft/SQLite semantic proof
@@ -175,6 +175,23 @@ playback-smoke-firefox: ## Run the playback smoke matrix in Firefox (needs gecko
 .PHONY: playback-full
 playback-full: ## Run every fixture x quality plus playback restart cases
 	@scripts/playback-lab run --suite full
+
+## ---- Cinema vs Plex benchmark ------------------------------------------
+
+BENCHMARK_CONFIG ?= benchmarks/cinema-plex.example.toml
+
+.PHONY: benchmark-check
+benchmark-check: ## Test benchmark config, runners, raw schema, percentiles, and ratios
+	@python3 -m unittest discover -s tests/benchmark -p 'test_*.py'
+	@scripts/cinema-plex-bench validate --config $(BENCHMARK_CONFIG) --require-v1 >/dev/null
+
+.PHONY: benchmark-plan
+benchmark-plan: ## Expand the selected A/B corpus and scenario plan without contacting servers
+	@scripts/cinema-plex-bench validate --config $(BENCHMARK_CONFIG) --require-v1
+
+.PHONY: benchmark-run
+benchmark-run: ## Run the selected real Cinema/Plex A/B config (tokens come from its env names)
+	@scripts/cinema-plex-bench run --config $(BENCHMARK_CONFIG)
 
 ## ---- web UI baseline ---------------------------------------------------
 

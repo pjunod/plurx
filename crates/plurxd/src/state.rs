@@ -89,6 +89,8 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     /// Read-only projection of the selected backend's watch-state convergence.
     pub replication: plurx_core::cluster::migration::status::ReplicationMonitor,
+    /// Join/add/remove lifecycle and privacy-safe per-node health.
+    pub membership: plurx_core::cluster::membership::MembershipManager,
     pub server_name: String,
     /// Stable identity of the node that owns local transcode/offline bytes.
     pub node_id: String,
@@ -165,6 +167,7 @@ impl AppState {
                 // it is expected to outlive the process.
                 credential_key: Arc::new(CredentialKey::generate()),
                 replication: plurx_core::cluster::migration::status::ReplicationMonitor::sqlite(),
+                membership: plurx_core::cluster::membership::MembershipManager::unavailable(),
             },
             store,
             dirs,
@@ -188,6 +191,7 @@ impl AppState {
             scan_prune_percent,
             credential_key,
             replication,
+            membership,
         } = config;
         let Dirs {
             artwork: artwork_dir,
@@ -232,6 +236,7 @@ impl AppState {
         AppState {
             store,
             replication,
+            membership,
             server_name,
             node_id,
             artwork_dir,
@@ -272,6 +277,7 @@ pub struct AppConfig {
     pub credential_key: Arc<CredentialKey>,
     /// Actual backend selected before HTTP starts; tests default to SQLite.
     pub replication: plurx_core::cluster::migration::status::ReplicationMonitor,
+    pub membership: plurx_core::cluster::membership::MembershipManager,
 }
 
 /// Status of the most recent (or in-flight) scan for one library.

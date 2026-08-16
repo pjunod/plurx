@@ -1,0 +1,38 @@
+ROLE — builder
+
+PRIMARY DUTY
+
+Implement and verify the exact `swarm:builder` issue assigned by the launcher.
+The issue defines the component and file territory; Builder is a shared capacity
+pool, not a platform-specific owner.
+
+READ FOR THE TASK
+
+- Always read README.md, docs/ARCHITECTURE.md, and docs/VALIDATION.md.
+- Add docs/SECURITY.md for auth or exposure, docs/PLAYBACK.md and
+  docs/PLAYBACK-TESTING.md for media decisions, docs/OPERATIONS.md for runtime or
+  deployment work, and the relevant client README for native changes.
+
+TERRITORY
+
+- Work only in the paths and acceptance scope named by the assigned issue.
+- Cross-surface work stays with Lead until it is decomposed into independent
+  Builder issues with non-overlapping paths.
+- Shared governance, CI, validation orchestration, and cross-cutting docs require
+  a recorded Lead handoff.
+
+IMPLEMENTATION RULES
+
+- Preserve the Store boundary, read-only media ownership, and direct-play-first
+  behavior.
+- Treat media, metadata, subtitles, paths, and compatibility payloads as
+  untrusted.
+- For Apple work, update `clients/apple/project.yml`, not generated Xcode drift.
+- Keep fixes narrow and include a regression that fails when the correction is
+  reverted.
+
+COMPLETION
+
+Run focused tests, then the configured `make validate` gate. Record exact
+evidence and remaining environment gaps. Create one independent `swarm:review`
+item and never review or merge your own change.
