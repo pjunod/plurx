@@ -1,0 +1,157 @@
+PROJECT CONTRACT — PLURX
+
+Project: plurx
+Repository: https://github.com/pjunod/plurx
+
+PURPOSE AND AUTHORITY
+
+Plurx is a self-hosted media server and native-client project. GitHub issues,
+pull requests, reviews, and required checks are authoritative. The repo-local
+.swarm state is operational telemetry only; never use it as a task queue or as
+evidence that an issue is complete.
+
+If a GitHub issue conflicts with a checked-in product, architecture, security,
+or validation contract, stop and report the conflict. Do not silently reinterpret
+the contract to fit the requested implementation.
+
+READ BEFORE CHANGING CODE
+
+- README.md for scope, development entry points, and non-goals.
+- docs/REQUIREMENTS.md and docs/ROADMAP.md for product scope and sequencing.
+- docs/ARCHITECTURE.md for subsystem boundaries and load-bearing decisions.
+- docs/VALIDATION.md for path ownership, required evidence, and gate profiles.
+- docs/SECURITY.md for auth, exposure, and trust-boundary work.
+- docs/PLAYBACK.md and docs/PLAYBACK-TESTING.md for playback changes.
+- docs/CLIENTS.md plus the relevant client parity document for native clients.
+- The complete issue and its discussion, linked plans, existing pull requests,
+  and review threads for the claimed work.
+
+TASK QUEUE AND CLAIM PROTOCOL
+
+An operator adds broad new work with `swarm:intake` only. No role label and no
+`swarm:ready` are required. The lead claims the parent, analyzes the outcome and
+existing evidence, and decomposes only independently executable work. This is
+the path for multi-stage investigations such as playback performance and for
+importing a planned body of work such as cinema clustering.
+
+An implementation issue is eligible only when it is open and has `swarm:ready`
+plus exactly one role label: `swarm:lead` or `swarm:builder`. Priority favors
+explicit dependencies first, then older and less recently active work so stale
+items cannot remain indefinitely. Do not mine TODO comments or invent product
+priorities when the eligible queue is empty.
+
+An operator-created project adoption enters coordinator intake before the ready
+queue. The lead reads the captured visible transcript and Git snapshot, checks
+whether an issue or pull request already owns the acceptance criteria, and
+records only work that genuinely remains. Existing completed or review-ready
+work is reconciled instead of duplicated.
+
+During intake, lead owns routing rather than product implementation. Reconcile
+or create one parent issue, then create role-owned child issues only when the
+remaining work is independently executable. Each child records the adoption ID,
+source branch and commit, exact file territory, dependencies, acceptance
+evidence, and one role label plus `swarm:ready`. If nothing remains, create no
+children and report the existing issue or pull request as the routing result.
+Normal workers start only after lead reports that the authoritative queue fully
+represents the remainder.
+
+An explicit `swarmctl adopt --role <role>` is the narrower exception for work
+that should continue as one role-bound worker without decomposition. That worker
+must reconcile or create its matching issue before new implementation, add its
+role plus `swarm:active`, and record the adoption ID and original task link. It
+owns only its captured branch, path scope, and acceptance criteria.
+
+Before editing:
+
+1. Confirm no open pull request, active issue comment, or branch already owns the
+   same acceptance criteria.
+2. Comment `CLAIMED: <agent> / <SWARM_SESSION_ID> / <planned branch>` on the
+   issue.
+3. Remove `swarm:ready`, add `swarm:active`, and create
+   `agent/<role>/issue-<number>-<short-slug>` from current `origin/main`.
+4. Report the issue number, phase, and next concrete action through `swarmctl
+   progress`.
+
+Open a draft pull request once the implementation direction and affected files
+are known. Use `Closes #<number>` only when the pull request satisfies the whole
+issue. Record test commands and results in the pull request; link rather than
+copying large raw logs.
+
+When the implementation and required gate are ready, create exactly one review
+issue carrying `swarm:review` and no ready or role label. Link the pull request,
+implementation issue, acceptance evidence, commands run, and known risk. Include
+the exact line `Swarm-Author-LLM: <provider>/<model>` from launcher context. The
+supervisor assigns an independent Reviewer whose model differs from the author;
+an idle Builder may review only after Builder work is exhausted and only under
+the same model-separation rule. Review is read-only against the author's branch
+and ends with a recorded approval or numbered change requests. The author
+answers findings and requests re-review. On approval the Reviewer transitions
+the item to `needs-lead`; Lead then verifies the exact head, marks drafts ready,
+merges automatically, and reconciles issues. Only branch protection, failed
+checks, or changes-requested review may stop that merge.
+
+When blocked, comment with the symptom, evidence, attempts, and exact unblocker;
+replace `swarm:active` with `swarm:blocked`; report `swarmctl block`; then release
+the task. When a task returns to the queue, a human or lead replaces
+`swarm:blocked` with `swarm:ready`.
+
+No eligible issue means report the queue as empty with `swarmctl done` and exit.
+Do not create speculative changes merely to keep a session busy.
+
+OWNERSHIP — ONE PRIMARY WRITER PER CHANGE
+
+- lead: intake, decomposition, dependency ordering, lifecycle reconciliation,
+  governance changes, and final merge.
+- builder: implementation within the exact component, paths, and acceptance
+  criteria recorded on the assigned issue.
+- reviewer: read-only independent review; never edits or merges the author's
+  change.
+
+An issue spanning server, Apple, Android, or shared-governance surfaces belongs
+to Lead until it is decomposed into non-overlapping Builder issues. Only one
+Builder may own a path for an active change. A Builder may touch a shared file
+only when the issue explicitly names it and Lead records the handoff. Generated
+lockfile changes stay with the Builder whose dependency change produced them and
+must be called out in the pull request.
+
+INVARIANTS NO AGENT MAY WEAKEN
+
+- Plurx never writes, renames, organizes, or deletes operator-owned media.
+- There is no cloud account or phone-home dependency; LAN-only operation remains
+  valid.
+- Direct play remains first choice; remux/transcode occurs only for demonstrated
+  client incompatibility.
+- The `Store` boundary remains the single durable-state abstraction; do not add
+  storage bypasses that make SQLite and clustered operation diverge.
+- The web UI remains embedded in the one server binary and must be rebuilt before
+  UI behavior is evaluated.
+- Secrets, tokens, signing material, media paths, and private library data never
+  enter git, issue comments, pull requests, swarm status, or logs.
+- Never deploy to, mutate, or restart a live server or physical device unless the
+  issue explicitly authorizes that exact target. Never claim device evidence from
+  a simulator or static inspection.
+- The Apple Xcode project is generated from `clients/apple/project.yml`; do not
+  commit generated project drift.
+- Use separate full clones only. Never create a git worktree.
+
+QUALITY AND COMPLETION
+
+- Use focused tests during implementation, then run `make validate` before every
+  ready-for-review request. Run `make validate-full` when the issue or reviewer
+  requires native-device, browser, packaging, or risky cross-surface evidence.
+- A corrective change includes a regression that passes with the fix and fails
+  when only the production correction is reverted. New behavior updates its
+  checked-in contract documentation in the same change.
+- Rebase on current `origin/main`, re-read affected contracts, and rerun the
+  required checks immediately before requesting final review.
+- A pull request is ready only when its issue acceptance criteria are accounted
+  for, the diff contains no unrelated change, required checks are green, docs are
+  honest, and remaining risk is explicit.
+- Ordinary corrective bugs require a regression, the relevant automated gate,
+  and independent approval. Manual, physical-device, deployment, or long-running
+  campaign evidence becomes a separate follow-up unless the issue explicitly
+  names it as a safety-critical merge gate; unavailable hardware must not leave
+  an otherwise finished bug pull request draft for hours.
+- When launcher context enables Lead automatic merge, Lead merges approved green
+  pull requests and reconciles their issues. Human merge approval is not
+  required. The issue and task become `done` only after merge and issue closure.

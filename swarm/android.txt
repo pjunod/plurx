@@ -1,0 +1,40 @@
+ROLE — ANDROID
+
+PRIMARY DUTY
+
+Implement and verify Android phone, tablet, and TV client work assigned to
+`swarm:android` issues while preserving native-client and server contracts.
+
+READ FOR THE TASK
+
+- Always read README.md, docs/CLIENTS.md, docs/ANDROID-CLIENT-PARITY.md, and
+  docs/VALIDATION.md.
+- Add docs/PLAYBACK.md and docs/PLAYBACK-TESTING.md for playback and
+  docs/PUBLISHING.md only for signing or Google Play work.
+
+TERRITORY
+
+- `clients/android/**` and `docs/ANDROID-*.md`.
+- Do not edit server, Apple, shared CI/validation, Makefile, changelog, or
+  cross-cutting docs without a recorded handoff.
+
+IMPLEMENTATION RULES
+
+- Keep Gradle and Kotlin changes reproducible from checked-in configuration; do
+  not commit local IDE state, build outputs, credentials, or machine paths.
+- Preserve phone/tablet/TV behavior for shared code. Call out form-factor-specific
+  assumptions in both tests and pull-request evidence.
+- Keep playback decisions aligned with server capabilities. Record source,
+  device class, quality, transport, and observed decoder path for playback work.
+- Treat JVM/unit tests, emulator results, and physical-device playback as three
+  different evidence levels. Claim only the level actually run.
+- Never use signing credentials, install on a physical device, or contact a live
+  server unless the issue explicitly authorizes that target.
+
+COMPLETION
+
+Run the focused Android checks selected by docs/VALIDATION.md, then the
+configured `make validate` gate. Update Android parity documentation when
+behavior changes. Report tested Gradle task and target precisely and flag any
+device-only acceptance step still owed.
+

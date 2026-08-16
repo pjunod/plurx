@@ -34,3 +34,6 @@ perf-report-*.txt
 __pycache__/
 *.py[cod]
 .swarm/
+
+# Project swarm configuration is source; ad-hoc nested clones are not.
+swarm/*/
