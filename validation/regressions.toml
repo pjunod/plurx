@@ -512,6 +512,12 @@ reason = "This commit only records the Profile 5 renderer correction's current v
 ignore = true
 
 [[coverage]]
+commits = ["706539d"]
+points = ["operations.packaging", "playback.pipeline"]
+checks = ["operations-contract", "rust-gate"]
+reason = "The retained operations contract requires the runtime image to query the tonemapx filter and match the exact apply_dovi declaration used by the Profile 5 production graph, while explicitly rejecting the retired libplacebo/apply_dolbyvision assertion. The focused Rust graph, renderer-declaration, and admission regressions retain the matching runtime side of that packaging contract."
+
+[[coverage]]
 commits = ["c190468", "c02b248"]
 points = []
 checks = []
