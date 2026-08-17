@@ -25,6 +25,8 @@ import kotlinx.coroutines.launch
 import tv.plurx.app.data.Caps
 import tv.plurx.app.player.PlayerScreen
 import tv.plurx.app.player.OfflinePlayerScreen
+import tv.plurx.app.player.preplayRouteQuery
+import tv.plurx.app.player.preplayTracksFromRoute
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.ConnectScreen
 import tv.plurx.app.ui.DetailScreen
@@ -122,7 +124,9 @@ private fun MainNav(vm: AppViewModel) {
             DetailScreen(
                 vm = vm,
                 itemId = entry.arguments!!.getLong("id"),
-                onPlay = { itemId, fileId, startMs -> nav.navigate("player/$itemId/$fileId/$startMs") },
+                onPlay = { itemId, fileId, startMs, tracks ->
+                    nav.navigate("player/$itemId/$fileId/$startMs" + preplayRouteQuery(tracks))
+                },
                 onOpenItem = { id -> nav.navigate("detail/$id") },
                 onViewPhoto = { id -> nav.navigate("photo/$id") },
                 onBack = { nav.popBackStack() },
@@ -157,11 +161,25 @@ private fun MainNav(vm: AppViewModel) {
             )
         }
         composable(
-            "player/{itemId}/{fileId}/{startMs}",
+            // `audio` and `subtitle` are the viewer's pre-play choice and are
+            // optional: an ordinary Play navigates to exactly the route it
+            // always did, and the next episode below carries neither — the
+            // choice belongs to one playback, not to the queue.
+            "player/{itemId}/{fileId}/{startMs}?audio={audio}&subtitle={subtitle}",
             arguments = listOf(
                 navArgument("itemId") { type = NavType.LongType },
                 navArgument("fileId") { type = NavType.LongType },
                 navArgument("startMs") { type = NavType.LongType },
+                navArgument("audio") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
+                navArgument("subtitle") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
             ),
         ) { entry ->
             val a = entry.arguments!!
@@ -170,6 +188,10 @@ private fun MainNav(vm: AppViewModel) {
                 itemId = a.getLong("itemId"),
                 fileId = a.getLong("fileId"),
                 startMs = a.getLong("startMs"),
+                preplayTracks = preplayTracksFromRoute(
+                    audio = a.getString("audio"),
+                    subtitle = a.getString("subtitle"),
+                ),
                 onPlayNext = { target ->
                     nav.navigate("detail/${target.itemId}") { popUpTo("home") }
                     nav.navigate("player/${target.itemId}/${target.fileId}/${target.startMs}")

@@ -118,6 +118,30 @@ bump may break compatibility and a **patch** bump never does.
   a fresh id, which is what a claim normalized just before a retryable failure
   looks like on replay.
 
+- **Android answers "does this have my audio and subtitles?" before anything
+  plays, and lets you pick both.** Each media card on the detail screen now
+  lists every audio and subtitle track — language, title, channels or format,
+  and the forced and SDH markers — with a **Default** chip on the tracks the
+  server itself selected and one sentence for its preferred-language verdict.
+  All five states of that verdict stay distinct: an untagged track reads
+  "can't tell", never "missing", and a file with no subtitles says so rather
+  than leaving a gap. Tapping a row, including **Off**, chooses that track for
+  the next playback only: the choice rides the player route, reaches the
+  *first* `/decision`, and is therefore already in the plan that comes back —
+  no start-then-restart and no re-buffer to apply it. The returned plan is
+  executed as given, with the remux URL's own `?audio=` normalized rather than
+  appended to so a later in-player switch cannot put two of them on the wire,
+  and with the subtitle carried in the HLS session body. Direct play is the one
+  transport that hands Media3 the whole container, so the chosen audio track is
+  pinned there by a track-selection override matched on language and order
+  within it, because ExoPlayer's own language preference can otherwise disagree
+  with the track the screen marks. A subtitle that would cost a burn-in says so
+  before playback starts, priced by the server's own selection-aware answer
+  rather than a codec table, and a burn the HDR guard refused is reported as
+  "will not be shown" instead of as subtitles-on. Nothing here writes a
+  Playback setting: the next item, the next episode, and Play-next all start
+  from their own defaults.
+
 - **The playback lab can now drive a session through a bandwidth cliff.**
   `scripts/playback-lab run --suite stall-recovery --network-profile
   8mbps-to-1.5mbps --json <artifact>` meters everything the browser pulls

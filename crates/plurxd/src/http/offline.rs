@@ -382,8 +382,15 @@ pub async fn create(
     let output_size = plurx_core::transcode::output_size(&file, rung.height);
     let effective_rate_control = state
         .transcode
-        .effective_rate_control_for_new_offline_package()
+        .effective_rate_control_for_new_offline_package(&file)
         .await
+        .map_err(|message| {
+            typed(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_media",
+                message,
+            )
+        })?
         .snapshot_value();
     let new = NewOfflinePackage {
         id: uuid::Uuid::new_v4().to_string(),
