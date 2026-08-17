@@ -62,6 +62,9 @@ pub struct SystemInfo {
     /// (a 4K film quietly playing at the Auto rung in Chrome and perfectly in
     /// Safari) is otherwise unattributable from outside the machine.
     pub dovi_rpu: bool,
+    /// Whether this exact ffmpeg can run the software-decode → Vulkan
+    /// libplacebo Dolby Vision reshape → software-encode graph.
+    pub dovi_reshape: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -215,6 +218,7 @@ impl AppState {
                 system.tone_map.selected(),
             )
             .with_dv_strippable(system.dovi_rpu)
+            .with_dovi_reshape(system.dovi_reshape)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),

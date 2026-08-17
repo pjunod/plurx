@@ -585,25 +585,6 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
         return with_subtitles(chain, opts, source_path);
     }
 
-    // Dolby Vision Profile 5 carries a full-range IPTPQc2 base and commonly
-    // arrives from hardware decode with every color field unset.  Supplying
-    // zscale's `*in` options below is not enough in that case: the preceding
-    // scale/format negotiation still sees an unspecified frame and zimg
-    // rejects it with "no path between colorspaces" before producing the
-    // first HLS segment.  Stamp the transport facts on the frame before any
-    // conversion.  Keep this Profile-5-only; ordinary HDR10/HLG sources are
-    // limited range and must retain their existing route.
-    if source.hdr.as_deref() == Some("dolby_vision")
-        && crate::playback::dolby_vision_profile(source) == Some(5)
-        && opts.tone_map != ToneMap::None
-    {
-        chain.push(
-            "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:\
-             colorspace=bt2020nc"
-                .to_owned(),
-        );
-    }
-
     // Downscale to target height, keep aspect, even dims, never upscale.
     chain.push(format!("scale=-2:'min({h},ih)'", h = opts.target_height));
 
@@ -853,7 +834,9 @@ pub fn hls_args(
     // the `PLURX_HWDECODE=off` escape hatch for Dolby Vision profiles that
     // hardware-decode to garbage).
     let pipeline_decode = opts.pipeline.decode_args();
-    let (decode_args, hwdownload) = if pipeline_decode.is_empty() {
+    let (decode_args, hwdownload) = if opts.pipeline.requires_software_decode() {
+        (Vec::new(), None)
+    } else if pipeline_decode.is_empty() {
         decode_setup(encoder, source)
     } else {
         (pipeline_decode, None)
@@ -1711,38 +1694,48 @@ mod tests {
     }
 
     #[test]
-    fn profile5_tonemap_stamps_full_range_color_before_scaling() {
+    fn profile5_tonemap_applies_dolby_vision_metadata_before_sdr_mapping() {
         let mut source = file(Some("dolby_vision"));
         source.hdr_format = Some("Dolby Vision · Profile 5".into());
+        let opts = TranscodeOptions {
+            tone_map: ToneMap::Libplacebo,
+            pipeline: Pipeline::DoviLibplacebo,
+            ..Default::default()
+        };
         let args = hls_args(
             &source,
-            Encoder::Qsv,
-            &TranscodeOptions::default(),
+            Encoder::Software,
+            &opts,
             Pacing::unpaced(),
             "/tmp/s",
         );
         let joined = args.join(" ");
-        let stamp =
-            "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc";
-        assert!(joined.contains(stamp), "{joined}");
-        let stamp_at = joined.find(stamp).expect("Profile 5 color stamp");
-        let scale_at = joined.find("scale=-2").expect("scale filter");
-        assert!(
-            stamp_at < scale_at,
-            "Profile 5 color facts must be present before scale/zscale: {joined}"
-        );
+        assert!(joined.contains("-init_hw_device vulkan=vk"), "{joined}");
+        assert!(joined.contains("-filter_hw_device vk"), "{joined}");
+        assert!(joined.contains("format=p010le,hwupload"), "{joined}");
+        assert!(joined.contains("apply_dolbyvision=1"), "{joined}");
+        assert!(joined.contains("tonemapping=bt.2390"), "{joined}");
+        assert!(joined.contains("colorspace=bt709"), "{joined}");
+        assert!(joined.contains("color_primaries=bt709"), "{joined}");
+        assert!(joined.contains("color_trc=bt709"), "{joined}");
+        assert!(joined.contains("range=tv"), "{joined}");
+        assert!(!joined.contains("setparams="), "{joined}");
+        assert!(!joined.contains("zscale="), "{joined}");
+        assert!(!joined.contains("-hwaccel qsv"), "{joined}");
 
         let mut compatible = source;
         compatible.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
+        let opts = TranscodeOptions::default();
         let joined = hls_args(
             &compatible,
             Encoder::Qsv,
-            &TranscodeOptions::default(),
+            &opts,
             Pacing::unpaced(),
             "/tmp/s",
         )
         .join(" ");
-        assert!(!joined.contains(stamp), "{joined}");
+        assert!(!joined.contains("apply_dolbyvision=1"), "{joined}");
+        assert!(joined.contains("zscale="), "{joined}");
     }
 
     #[test]

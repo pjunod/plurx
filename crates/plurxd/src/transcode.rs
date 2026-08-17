@@ -3141,6 +3141,9 @@ pub struct TranscodeManager {
     /// whatever ffmpeg it was running, leave the DV configuration in every
     /// remux, and have browsers that cannot decode DV refuse the stream.
     dv_strippable: bool,
+    /// Whether boot proved the exact software/Vulkan/libplacebo/software
+    /// renderer used for non-backward-compatible Dolby Vision.
+    dovi_reshape: bool,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -3199,6 +3202,7 @@ impl TranscodeManager {
             background_producer: Mutex::new(()),
             offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
+            dovi_reshape: false,
             cached_limits: std::sync::RwLock::new(None),
             #[cfg(test)]
             playlist_wait_override_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3217,6 +3221,11 @@ impl TranscodeManager {
     /// not the cache's.
     pub fn with_dv_strippable(mut self, dv_strippable: bool) -> Self {
         self.dv_strippable = dv_strippable;
+        self
+    }
+
+    pub fn with_dovi_reshape(mut self, dovi_reshape: bool) -> Self {
+        self.dovi_reshape = dovi_reshape;
         self
     }
 
@@ -3291,7 +3300,6 @@ impl TranscodeManager {
         Some(PipelineDigest {
             ffmpeg_build: cache.ffmpeg_build.clone(),
             encoder: Encoder::Software, // replaced per lookup
-            pipeline: self.pipeline,
         })
     }
 
@@ -3398,6 +3406,53 @@ impl TranscodeManager {
         self.select_tracks(file, None, None).await.audio_index
     }
 
+    /// Whether this file needs RPU-driven reshaping rather than the ordinary
+    /// HDR10 base-layer route. Unknown and unsupported non-compatible
+    /// profiles are refused instead of being guessed through zscale.
+    fn needs_dovi_reshape(file: &plurx_core::domain::MediaFile) -> Result<bool, String> {
+        if file.hdr.as_deref() != Some("dolby_vision") {
+            return Ok(false);
+        }
+        if file.hdr_format.as_deref().is_some_and(|label| {
+            label.contains("HDR10-compatible") || label.contains("HLG-compatible")
+        }) {
+            return Ok(false);
+        }
+        match plurx_core::playback::dolby_vision_profile(file) {
+            Some(5) => Ok(true),
+            Some(profile) => Err(unsupported_build_error(format!(
+                "Dolby Vision Profile {profile} has no compatible base and no proven renderer; rescan after upgrading ffprobe or use a compatible source"
+            ))),
+            None => Err(unsupported_build_error(
+                "Dolby Vision profile/base compatibility is unknown; rescan after upgrading ffprobe rather than producing untrusted colors",
+            )),
+        }
+    }
+
+    fn require_dovi_renderer(&self, file: &plurx_core::domain::MediaFile) -> Result<bool, String> {
+        let required = Self::needs_dovi_reshape(file)?;
+        if required && !self.dovi_reshape {
+            return Err(unsupported_build_error(
+                "this ffmpeg did not prove the Vulkan libplacebo Dolby Vision renderer required for Profile 5",
+            ));
+        }
+        Ok(required)
+    }
+
+    async fn encoder_for_file(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<Encoder, String> {
+        if self.require_dovi_renderer(file)? {
+            // This is the only pairing boot probes. Software decode preserves
+            // the RPU AVFrame side data and software encode avoids mixing a
+            // Vulkan filter device with QSV/VAAPI filter devices.
+            Ok(Encoder::Software)
+        } else {
+            Ok(self.encoder().await)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn options_for_tone_map(
         &self,
@@ -3411,6 +3466,7 @@ impl TranscodeManager {
         tone_map: ToneMap,
     ) -> TranscodeOptions {
         let subtitle_file = self.subtitle_file(file, subtitle_burn.as_ref());
+        let dovi_reshape = Self::needs_dovi_reshape(file).unwrap_or(false);
         TranscodeOptions {
             target_height,
             software_threads,
@@ -3418,7 +3474,11 @@ impl TranscodeManager {
             effective_rate_control: self.effective_rate_control(encoder),
             audio_index,
             start_seconds,
-            tone_map,
+            tone_map: if dovi_reshape {
+                ToneMap::Libplacebo
+            } else {
+                tone_map
+            },
             // The node proved a graph; this session may still not be entitled
             // to it (HLG, non-compatible Dolby Vision, a light source, an
             // encoder it cannot feed). Deciding once, here,
@@ -3428,13 +3488,17 @@ impl TranscodeManager {
             // HDR10-compatible is an hdr10 stream to a tone-map, and a bitmap
             // subtitle burn keeps the GPU graph (it downloads once for
             // libass/overlay after the expensive scale + tone-map is done).
-            pipeline: Pipeline::for_session(
-                self.pipeline,
-                encoder,
-                transcode::routing_hdr(file),
-                transcode::heavy_source(file),
-                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
-            ),
+            pipeline: if dovi_reshape {
+                Pipeline::DoviLibplacebo
+            } else {
+                Pipeline::for_session(
+                    self.pipeline,
+                    encoder,
+                    transcode::routing_hdr(file),
+                    transcode::heavy_source(file),
+                    subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
+                )
+            },
             subtitle_burn,
             subtitle_file,
             // Only where the startup probe proved this build takes it. A
@@ -3789,7 +3853,7 @@ impl TranscodeManager {
         let mut playback_file = file.clone();
         playback_file.audio_offset_ms = 0;
         let file = &playback_file;
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         // Through the same track selection a real playback uses. Not an
         // optimisation — the tracks are part of the recipe, so producing with
         // "no audio track chosen" makes an entry named for a session that will
@@ -3863,7 +3927,7 @@ impl TranscodeManager {
         if cancelled.is_cancelled() {
             return Ok(OfflineProduceOutcome::Yielded);
         }
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         let subtitle_burn = match spec.subtitle {
             OfflineSubtitle::Burn(index) => {
                 let stream = file
@@ -4690,8 +4754,11 @@ impl TranscodeManager {
 
     /// Capture the exact effective mode selected for a new resumable package.
     /// Callers persist this value before queueing any encoder work.
-    pub async fn effective_rate_control_for_new_offline_package(&self) -> EffectiveRateControl {
-        self.effective_rate_control(self.encoder().await)
+    pub async fn effective_rate_control_for_new_offline_package(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<EffectiveRateControl, String> {
+        Ok(self.effective_rate_control(self.encoder_for_file(file).await?))
     }
 
     #[cfg(test)]
@@ -5312,7 +5379,7 @@ impl TranscodeManager {
         // hardware slot and no place in the queue — the work is already done,
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
-        let mut encoder = self.encoder().await;
+        let mut encoder = self.encoder_for_file(&file).await?;
         let opts = self.live_lookup_options(
             rate_control,
             encoder,
@@ -5683,7 +5750,19 @@ impl TranscodeManager {
         };
         let mut retry_opts = opts.clone();
         if downgrade_pipeline {
-            retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+            let Some(fallback) = opts.pipeline.fallback() else {
+                tracing::error!(
+                    session = %sid,
+                    pipeline = opts.pipeline.name(),
+                    "renderer stalled and has no color-safe fallback; refusing to retry through a different color transform"
+                );
+                session.kill_child().await;
+                session.fail(PlaylistError::SessionFailed(
+                    "the Dolby Vision renderer stopped; no color-safe fallback is available".into(),
+                ));
+                return opts.effective_rate_control;
+            };
+            retry_opts.pipeline = fallback;
         } else {
             // A family-tuned default is part of the effective identity. A
             // VideoToolbox value, for example, is not a valid x264 CRF merely
@@ -7583,6 +7662,95 @@ fn test_session(dir: PathBuf) -> Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile5_file() -> plurx_core::domain::MediaFile {
+        plurx_core::domain::MediaFile {
+            id: 5,
+            item_id: 1,
+            path: PathBuf::from("/media/profile5.mkv"),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(1_000),
+            container: Some("matroska".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main 10".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            hdr: Some("dolby_vision".into()),
+            hdr_format: Some("Dolby Vision · Profile 5".into()),
+            bitrate: Some(20_000_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        }
+    }
+
+    #[test]
+    fn noncompatible_dolby_vision_is_never_guessed_through_zscale() {
+        let profile5 = profile5_file();
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&profile5), Ok(true));
+
+        let mut compatible = profile5.clone();
+        compatible.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&compatible), Ok(false));
+
+        let mut unknown = profile5.clone();
+        unknown.hdr_format = Some("Dolby Vision".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unknown)
+            .expect_err("unknown profile must be refused")
+            .contains("unknown"));
+
+        let mut unsupported = profile5;
+        unsupported.hdr_format = Some("Dolby Vision · Profile 4".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unsupported)
+            .expect_err("unproven non-compatible profile must be refused")
+            .contains("Profile 4"));
+    }
+
+    #[tokio::test]
+    async fn profile5_requires_the_probed_software_renderer_pair() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let dir = tempfile::tempdir().expect("work");
+        let caps = EncoderCaps {
+            qsv: true,
+            ..EncoderCaps::default()
+        };
+        let manager = TranscodeManager::new(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            caps.clone(),
+            Pipeline::VppQsv,
+        );
+        let file = profile5_file();
+        assert!(manager
+            .encoder_for_file(&file)
+            .await
+            .expect_err("an unproved renderer must refuse before spawn")
+            .contains("did not prove"));
+
+        let manager =
+            TranscodeManager::new(store, dir.path().join("proved"), caps, Pipeline::VppQsv)
+                .with_dovi_reshape(true);
+        let encoder = manager.encoder_for_file(&file).await.expect("proved route");
+        assert_eq!(encoder, Encoder::Software);
+        let opts = manager.options_for_tone_map(
+            encoder,
+            &file,
+            1080,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+        );
+        assert_eq!(opts.pipeline, Pipeline::DoviLibplacebo);
+        assert_eq!(opts.tone_map, ToneMap::Libplacebo);
+    }
 
     #[test]
     fn ffmpeg_gets_the_app_owned_runtime_cache() {

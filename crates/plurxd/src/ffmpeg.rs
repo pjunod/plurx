@@ -38,12 +38,24 @@ pub struct PacingCaps {
 
 static PACING: tokio::sync::OnceCell<PacingCaps> = tokio::sync::OnceCell::const_new();
 static DOVI_RPU: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static DOVI_RESHAPE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Does this build carry a given bitstream filter? Matched on a whole line of
 /// `ffmpeg -bsfs`, which lists exactly one filter per line — a substring
 /// search would report `dovi_rpu` for anything merely mentioning it.
 fn declares_bsf(list: &str, name: &str) -> bool {
     list.lines().any(|l| l.trim() == name)
+}
+
+/// libplacebo help is option-oriented rather than one-name-per-line. Match
+/// the declaration token so a prose mention cannot admit a renderer whose
+/// installed filter does not actually expose Dolby Vision reshaping.
+fn declares_filter_option(help: &str, name: &str) -> bool {
+    help.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|token| token == name)
+    })
 }
 
 /// Help and filter listings go to stdout on modern builds and to stderr on
@@ -113,6 +125,66 @@ fn dovi_from_probe(probe: Result<String, String>) -> bool {
 pub async fn has_dovi_rpu() -> bool {
     *DOVI_RPU
         .get_or_init(|| async { dovi_from_probe(probe_ffmpeg(&["-hide_banner", "-bsfs"]).await) })
+        .await
+}
+
+/// Can the exact software-decode/Vulkan/libplacebo/software-encode route used
+/// for non-backward-compatible Dolby Vision start on this build?
+///
+/// The option declaration is necessary but not sufficient: Vulkan device
+/// creation, upload/download formats, and libx264 must also work together.
+/// Probe one synthetic frame through the production graph. The real Profile 5
+/// validation remains responsible for proving that RPU side data changes the
+/// pixels; this boot probe gates whether the renderer can be attempted at all.
+pub async fn has_dovi_reshape() -> bool {
+    *DOVI_RESHAPE
+        .get_or_init(|| async {
+            let help = probe_ffmpeg(&["-hide_banner", "-h", "filter=libplacebo"]).await;
+            let declared = help
+                .as_ref()
+                .is_ok_and(|text| declares_filter_option(text, "apply_dolbyvision"));
+            if !declared {
+                tracing::warn!(
+                    "ffmpeg libplacebo has no apply_dolbyvision option; non-compatible Dolby Vision transcodes will be refused"
+                );
+                return false;
+            }
+            let args = [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-init_hw_device",
+                "vulkan=vk",
+                "-filter_hw_device",
+                "vk",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=64x64:rate=1:color=black",
+                "-frames:v",
+                "1",
+                "-vf",
+                "format=p010le,hwupload,libplacebo=w=64:h=64:apply_dolbyvision=1:tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=nv12,hwdownload,format=nv12",
+                "-c:v",
+                "libx264",
+                "-f",
+                "null",
+                "-",
+            ];
+            let passed = tokio::process::Command::new(ffmpeg_bin())
+                .args(args)
+                .status()
+                .await
+                .is_ok_and(|status| status.success());
+            if passed {
+                tracing::info!("ffmpeg proved the Dolby Vision libplacebo renderer");
+            } else {
+                tracing::warn!(
+                    "ffmpeg could not run the Dolby Vision libplacebo renderer; non-compatible Dolby Vision transcodes will be refused"
+                );
+            }
+            passed
+        })
         .await
 }
 
@@ -261,6 +333,22 @@ mod tests {
         assert!(!dovi_from_probe(Ok(
             "Bitstream filters:\n  dovi_r".to_owned()
         )));
+    }
+
+    #[test]
+    fn a_dolby_vision_renderer_option_is_matched_as_a_declaration() {
+        assert!(declares_filter_option(
+            "   apply_dolbyvision <boolean> ..FV....... apply Dolby Vision metadata (default true)\n",
+            "apply_dolbyvision"
+        ));
+        assert!(!declares_filter_option(
+            "   tonemapping <int> ..FV....... used with apply_dolbyvision\n",
+            "apply_dolbyvision"
+        ));
+        assert!(!declares_filter_option(
+            "   apply_dolbyvision_legacy <boolean> ..FV.......\n",
+            "apply_dolbyvision"
+        ));
     }
 
     /// Same rule for pacing: an ffmpeg that could not be probed gets the
