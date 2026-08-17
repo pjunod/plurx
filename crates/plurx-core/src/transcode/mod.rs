@@ -411,6 +411,9 @@ pub enum ToneMap {
     Zscale,
     /// libplacebo (Vulkan) — higher quality on a capable GPU; opt-in.
     Libplacebo,
+    /// Jellyfin FFmpeg's SIMD software mapper, used for Dolby Vision RPU
+    /// reshaping when a non-compatible Dolby Vision profile requires it.
+    Tonemapx,
     /// No tone-mapping: pass HDR through to 8-bit (looks washed on an SDR
     /// screen, but plays). An escape hatch + a diagnostic — if a file that
     /// grayed out now plays, the tone-map was the culprit.
@@ -593,6 +596,11 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
             ToneMap::Libplacebo => chain.push(
                 "libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
                  color_trc=bt709:format=yuv420p"
+                    .to_owned(),
+            ),
+            ToneMap::Tonemapx => chain.push(
+                "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:\
+                 primaries=bt709:range=tv:format=yuv420p:apply_dovi=1"
                     .to_owned(),
             ),
             ToneMap::Zscale => {
@@ -1704,8 +1712,8 @@ mod tests {
         let mut source = file(Some("dolby_vision"));
         source.hdr_format = Some("Dolby Vision · Profile 5".into());
         let opts = TranscodeOptions {
-            tone_map: ToneMap::Libplacebo,
-            pipeline: Pipeline::DoviLibplacebo,
+            tone_map: ToneMap::Tonemapx,
+            pipeline: Pipeline::DoviTonemapx,
             ..Default::default()
         };
         let args = hls_args(
@@ -1716,15 +1724,21 @@ mod tests {
             "/tmp/s",
         );
         let joined = args.join(" ");
-        assert!(joined.contains("-init_hw_device vulkan=vk"), "{joined}");
-        assert!(joined.contains("-filter_hw_device vk"), "{joined}");
-        assert!(joined.contains("format=p010le,hwupload"), "{joined}");
-        assert!(joined.contains("apply_dolbyvision=1"), "{joined}");
-        assert!(joined.contains("tonemapping=bt.2390"), "{joined}");
-        assert!(joined.contains("colorspace=bt709"), "{joined}");
-        assert!(joined.contains("color_primaries=bt709"), "{joined}");
-        assert!(joined.contains("color_trc=bt709"), "{joined}");
+        assert!(!joined.contains("-init_hw_device vulkan"), "{joined}");
+        assert!(!joined.contains("-filter_hw_device"), "{joined}");
+        assert!(!joined.contains("hwupload"), "{joined}");
+        assert!(joined.contains("tonemapx=tonemap=bt2390"), "{joined}");
+        assert!(joined.contains("apply_dovi=1"), "{joined}");
+        assert!(joined.contains("transfer=bt709"), "{joined}");
+        assert!(joined.contains("matrix=bt709"), "{joined}");
+        assert!(joined.contains("primaries=bt709"), "{joined}");
         assert!(joined.contains("range=tv"), "{joined}");
+        let tonemap_at = joined.find("tonemapx=").expect("tonemapx filter");
+        let scale_at = joined.find("scale=1920:1080").expect("scale filter");
+        assert!(
+            tonemap_at < scale_at,
+            "RPU reshape must precede scale: {joined}"
+        );
         assert!(!joined.contains("setparams="), "{joined}");
         assert!(!joined.contains("zscale="), "{joined}");
         assert!(!joined.contains("-hwaccel qsv"), "{joined}");
@@ -1740,7 +1754,7 @@ mod tests {
             "/tmp/s",
         )
         .join(" ");
-        assert!(!joined.contains("apply_dolbyvision=1"), "{joined}");
+        assert!(!joined.contains("apply_dovi=1"), "{joined}");
         assert!(joined.contains("zscale="), "{joined}");
 
         let mut hlg_compatible = compatible;
