@@ -1429,7 +1429,7 @@ async fn acquire_daemon_lock_within(data_dir: &Path, window: Duration) -> Result
     loop {
         match file.try_lock() {
             Ok(()) => {
-                record_daemon_lock_holder(&mut file, &path)?;
+                record_daemon_lock_holder(&mut file, &path);
                 return Ok(file);
             }
             Err(std::fs::TryLockError::WouldBlock) if waited < window => {
@@ -1456,16 +1456,27 @@ async fn acquire_daemon_lock_within(data_dir: &Path, window: Duration) -> Result
 
 /// Record this process as the owner, so a later contender's refusal can name
 /// it. Written under the lock we just took, so no two writers race here.
+///
+/// Best effort on purpose. The record only ever improves somebody else's error
+/// message, and the lock — which is the thing that actually protects the data
+/// directory — is already held by the time this runs. Refusing startup because
+/// a seven-byte cosmetic write failed would trade a working server for a nicer
+/// diagnostic; a contender falls back to
+/// [`DaemonLockHolder::Unidentified`] instead.
 #[cfg(feature = "hiqlite-store")]
-fn record_daemon_lock_holder(file: &mut File, path: &Path) -> Result<(), StoreError> {
-    file.set_len(0)
-        .map_err(|error| migration_io("truncating", path, error))?;
-    file.rewind()
-        .map_err(|error| migration_io("rewinding", path, error))?;
-    writeln!(file, "{}", std::process::id())
-        .map_err(|error| migration_io("recording the owner of", path, error))?;
-    file.flush()
-        .map_err(|error| migration_io("recording the owner of", path, error))
+fn record_daemon_lock_holder(file: &mut File, path: &Path) {
+    if let Err(error) = file
+        .set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|_| writeln!(file, "{}", std::process::id()))
+        .and_then(|()| file.flush())
+    {
+        tracing::debug!(
+            path = %path.display(),
+            %error,
+            "could not record this process as the data-directory lock owner"
+        );
+    }
 }
 
 /// Read the recorded owner without taking the lock. Every failure is
