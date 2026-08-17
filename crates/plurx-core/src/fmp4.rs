@@ -133,11 +133,11 @@ pub struct Track {
 
 /// `ftyp` + `moov`: the initialization segment, normally kept verbatim.
 ///
-/// The one intentional exception is [`promote_hdr10_static_metadata`]. ffmpeg
-/// can leave HDR10's mastering-display and content-light SEIs only in the
-/// first media sample. Apple HLS requires those decoder-wide records in the
-/// HEVC configuration carried by this segment, so the copy session may add
-/// those exact NAL units to `hvcC` before publishing it. Sample data is never
+/// The intentional exceptions are [`promote_hevc_parameter_sets`] and
+/// [`promote_hdr10_static_metadata`]. ffmpeg can leave decoder-wide HEVC
+/// records only in the first media sample. Apple HLS requires them in the
+/// configuration carried by this segment, so the copy session may add those
+/// exact NAL units to `hvcC` before publishing it. Sample data is never
 /// rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Init {
@@ -698,8 +698,132 @@ fn parse_stbl(payload: &[u8], track: &mut Track) -> Result<(), Fmp4Error> {
 }
 
 // ---------------------------------------------------------------------------
-// HDR10 initialization metadata
+// HEVC initialization metadata
 // ---------------------------------------------------------------------------
+
+/// Promote in-band HEVC VPS/SPS/PPS units into the decoder configuration.
+///
+/// A few WEB-DL Matroska sources carry the 23-byte minimum hvcC record (zero
+/// NAL arrays) and put all three parameter sets in their first sample. That is
+/// decodable as an in-band `hev1`/`dvhe` stream, but a `hvc1`/`dvh1` HLS sample
+/// entry promises the decoder configuration in hvcC. AVPlayer validates that
+/// promise before fetching media and rejects the empty record. The copy
+/// segmenter already holds the init until this first sample arrives, so copy
+/// the authored units into hvcC without changing the encoded picture or Dolby
+/// Vision RPU data.
+pub fn promote_hevc_parameter_sets(init: &mut Init, first: &Fragment) -> Result<bool, Fmp4Error> {
+    let Some(video) = init.video() else {
+        return Ok(false);
+    };
+    if video.codec != Some(VideoCodec::Hevc) || video.nal_length_size == 0 {
+        return Ok(false);
+    }
+
+    let Some(sample) = first_video_sample(first, video) else {
+        return Ok(false);
+    };
+    let candidate_nals = hevc_parameter_set_nals(sample, video.nal_length_size);
+    if candidate_nals.is_empty() {
+        return Ok(false);
+    }
+
+    let Some(location) = locate_hvcc(&init.bytes)? else {
+        return Err(Fmp4Error::Unsupported(
+            "the HEVC video sample entry has no hvcC box to enrich".into(),
+        ));
+    };
+    let record = &init.bytes[location.payload.clone()];
+    let present = hvcc_nal_array_types(record)?;
+    let mut appended = Vec::new();
+    let mut added_arrays = 0u8;
+    for kind in 32u8..=34 {
+        if present.contains(&kind) {
+            continue;
+        }
+        let mut nals: Vec<&[u8]> = candidate_nals
+            .iter()
+            .copied()
+            .filter(|nal| hevc_nal_type(nal) == Some(kind))
+            .collect();
+        nals.dedup();
+        if nals.is_empty() {
+            continue;
+        }
+        let count = u16::try_from(nals.len()).map_err(|_| {
+            Fmp4Error::Unsupported(format!("too many HEVC type-{kind} parameter sets for hvcC"))
+        })?;
+        // array_completeness=1: every parameter set of this type found in the
+        // authored opening access unit is carried in this sample entry.
+        appended.push(0x80 | kind);
+        appended.extend_from_slice(&count.to_be_bytes());
+        for nal in nals {
+            let len = u16::try_from(nal.len()).map_err(|_| {
+                Fmp4Error::Unsupported(format!(
+                    "an HEVC type-{kind} parameter set exceeds hvcC's u16 length"
+                ))
+            })?;
+            appended.extend_from_slice(&len.to_be_bytes());
+            appended.extend_from_slice(nal);
+        }
+        added_arrays = added_arrays.checked_add(1).ok_or_else(|| {
+            Fmp4Error::Unsupported("too many HEVC parameter-set arrays for hvcC".into())
+        })?;
+    }
+    if appended.is_empty() {
+        return Ok(false);
+    }
+
+    let arrays_offset = location.payload.start + 22;
+    let new_count = init.bytes[arrays_offset]
+        .checked_add(added_arrays)
+        .ok_or_else(|| Fmp4Error::Unsupported("hvcC already declares 255 NAL arrays".into()))?;
+    let delta = appended.len();
+    init.bytes
+        .splice(location.payload.end..location.payload.end, appended);
+    init.bytes[arrays_offset] = new_count;
+    for &box_at in &location.ancestors {
+        grow_box(&mut init.bytes, box_at, delta)?;
+    }
+    Ok(true)
+}
+
+fn hevc_parameter_set_nals(sample: &[u8], length_size: u8) -> Vec<&[u8]> {
+    length_prefixed_nals(sample, length_size)
+        .into_iter()
+        .filter(|nal| matches!(hevc_nal_type(nal), Some(32..=34)))
+        .collect()
+}
+
+fn hevc_nal_type(nal: &[u8]) -> Option<u8> {
+    (nal.len() >= 2).then(|| (nal[0] >> 1) & 0x3f)
+}
+
+fn length_prefixed_nals(sample: &[u8], length_size: u8) -> Vec<&[u8]> {
+    let lsz = length_size as usize;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while lsz > 0 && pos.checked_add(lsz).is_some_and(|end| end <= sample.len()) {
+        let mut len = 0usize;
+        for byte in &sample[pos..pos + lsz] {
+            len = (len << 8) | *byte as usize;
+        }
+        let Some(start) = pos.checked_add(lsz) else {
+            break;
+        };
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        let Some(nal) = sample.get(start..end) else {
+            break;
+        };
+        out.push(nal);
+        if len == 0 {
+            break;
+        }
+        pos = end;
+    }
+    out
+}
 
 /// Put HDR10's static metadata where an HLS decoder can see it before opening
 /// the first media fragment.
@@ -855,32 +979,10 @@ fn first_video_sample<'a>(fragment: &'a Fragment, video: &Track) -> Option<&'a [
 /// Prefix-SEI NALs from one length-prefixed HEVC sample that carry at least
 /// one HDR10 static-metadata message.
 fn hdr10_prefix_sei_nals(sample: &[u8], length_size: u8) -> Vec<&[u8]> {
-    let lsz = length_size as usize;
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while lsz > 0 && pos.checked_add(lsz).is_some_and(|end| end <= sample.len()) {
-        let mut len = 0usize;
-        for byte in &sample[pos..pos + lsz] {
-            len = (len << 8) | *byte as usize;
-        }
-        let Some(start) = pos.checked_add(lsz) else {
-            break;
-        };
-        let Some(end) = start.checked_add(len) else {
-            break;
-        };
-        let Some(nal) = sample.get(start..end) else {
-            break;
-        };
-        if nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == 39 && !hdr10_sei_types(nal).is_empty() {
-            out.push(nal);
-        }
-        if len == 0 {
-            break;
-        }
-        pos = end;
-    }
-    out
+    length_prefixed_nals(sample, length_size)
+        .into_iter()
+        .filter(|nal| hevc_nal_type(nal) == Some(39) && !hdr10_sei_types(nal).is_empty())
+        .collect()
 }
 
 /// HDR10 static-metadata payload types carried by one HEVC SEI NAL.
@@ -1103,6 +1205,40 @@ fn hvcc_hdr10_sei_types(record: &[u8]) -> Result<Vec<u16>, Fmp4Error> {
                 }
             }
             pos = end;
+        }
+    }
+    if pos != record.len() {
+        return malformed("hvcC has trailing bytes after its NAL arrays");
+    }
+    Ok(found)
+}
+
+fn hvcc_nal_array_types(record: &[u8]) -> Result<Vec<u8>, Fmp4Error> {
+    if record.len() < 23 {
+        return malformed("hvcC too short for its NAL arrays");
+    }
+    let mut found = Vec::new();
+    let mut pos = 23usize;
+    for _ in 0..record[22] {
+        if pos + 3 > record.len() {
+            return malformed("hvcC NAL array header runs past the record");
+        }
+        let array_type = record[pos] & 0x3f;
+        let count = u16::from_be_bytes([record[pos + 1], record[pos + 2]]) as usize;
+        pos += 3;
+        for _ in 0..count {
+            if pos + 2 > record.len() {
+                return malformed("hvcC NAL length runs past the record");
+            }
+            let len = u16::from_be_bytes([record[pos], record[pos + 1]]) as usize;
+            pos += 2;
+            pos = pos
+                .checked_add(len)
+                .filter(|end| *end <= record.len())
+                .ok_or_else(|| Fmp4Error::Malformed("hvcC NAL runs past the record".into()))?;
+        }
+        if !found.contains(&array_type) {
+            found.push(array_type);
         }
     }
     if pos != record.len() {
@@ -2576,6 +2712,72 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn in_band_hevc_parameter_sets_fill_an_empty_dolby_vision_hvcc() {
+        let feed = pipe("open-gop");
+        let (mut init, _, _) = read_all(&feed);
+        let video = init.video().expect("HEVC video").clone();
+
+        // Reproduce the Dexter WEB-DL shape: a valid 23-byte hvcC header with
+        // zero NAL arrays, while VPS/SPS/PPS live only in the first sample.
+        let location = locate_hvcc(&init.bytes)
+            .expect("locating hvcC")
+            .expect("hvcC");
+        let arrays_start = location.payload.start + 23;
+        let delta = location.payload.end - arrays_start;
+        init.bytes.drain(arrays_start..location.payload.end);
+        init.bytes[location.payload.start + 22] = 0;
+        for at in location.ancestors {
+            match at.header_len {
+                8 => {
+                    let size = be_u32(&init.bytes, at.start) as usize - delta;
+                    init.bytes[at.start..at.start + 4]
+                        .copy_from_slice(&(size as u32).to_be_bytes());
+                }
+                16 => {
+                    let size = be_u64(&init.bytes, at.start + 8) - delta as u64;
+                    init.bytes[at.start + 8..at.start + 16].copy_from_slice(&size.to_be_bytes());
+                }
+                _ => panic!("unexpected box header"),
+            }
+        }
+        init.tracks
+            .iter_mut()
+            .find(|track| track.id == video.id)
+            .expect("video track")
+            .dolby_vision_config = true;
+
+        let vps = [0x40, 0x01, 0x0c];
+        let sps = [0x42, 0x01, 0x01];
+        let pps = [0x44, 0x01, 0xc0];
+        let rpu = [0x7c, 0x01, 0x19];
+        let vcl = [0x26, 0x01, 0x80];
+        let fragment = fragment_with_first_video_sample(
+            video.id,
+            length_prefixed_hevc_nals(&[&vps, &sps, &pps, &rpu, &vcl]),
+        );
+
+        assert!(promote_hevc_parameter_sets(&mut init, &fragment).expect("promotion"));
+        let enriched = locate_hvcc(&init.bytes)
+            .expect("locating enriched hvcC")
+            .expect("hvcC");
+        let mut types =
+            hvcc_nal_array_types(&init.bytes[enriched.payload]).expect("reading arrays");
+        types.sort_unstable();
+        assert_eq!(types, vec![32, 33, 34]);
+
+        // The init stays structurally valid and a second pass is idempotent.
+        let once = init.bytes.clone();
+        assert!(!promote_hevc_parameter_sets(&mut init, &fragment).expect("second promotion"));
+        assert_eq!(init.bytes, once);
+        let mut reader = FragmentReader::new();
+        reader.push(&init.bytes);
+        assert!(matches!(
+            reader.next_unit().expect("re-parsing enriched init"),
+            Some(Unit::Init(_))
+        ));
     }
 
     #[test]
