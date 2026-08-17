@@ -499,6 +499,12 @@ checks = ["rust-gate"]
 reason = "The retained graph regressions pin software decode, Vulkan initialization, explicit RPU application before any scale/color transform, BT.709 output arguments, even no-upscale dimensions, the independently named software-only renderer, and the absence of setparams/zscale or a CPU fallback while proving HDR10- and HLG-compatible Profile 8 inputs keep the correct base transfer. Manager regressions refuse unknown/unproven profiles, cap Profile 5 Auto at the software rung, and admit only the proved renderer/encoder pair; runtime admission additionally compares real-source frame hashes with RPU application enabled and disabled and refuses identical output. The recipe property test proves the effective session pipeline changes cache identity under cache format v2."
 
 [[coverage]]
+commits = ["8a4fff7"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained Profile 5 graph regression requires the Dolby-aware tonemapx filter with apply_dovi enabled before the even, no-upscale resize, BT.709 limited-range output, software decode and encode, a distinct dovi_tonemapx cache identity, and no Vulkan upload, libplacebo transform, zscale relabel, or unsafe fallback. The daemon capability regression matches the exact apply_dovi declaration, the manager regression admits only the proved software renderer pair, and the real-source mutation gate still refuses a source whose decoded pixels do not change when RPU application is disabled. Restoring the former dovi_libplacebo graph fails these assertions."
+
+[[coverage]]
 commits = ["c190468", "c02b248"]
 points = []
 checks = []
