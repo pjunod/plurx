@@ -146,6 +146,12 @@ private data class Plan(
     override val aac: Boolean,
     override val preserveDolbyVision: Boolean,
     override val deliveredDynamicRange: String?,
+    /**
+     * `delivery.audio` — the audio index this plan already carries. Executed as
+     * given rather than re-derived: it is what the server actually applied to
+     * the remux URL, and what the HLS session body has to repeat.
+     */
+    val deliveryAudio: Long?,
     val markers: List<Marker>,
     val reasons: List<String>,
     val videoWidth: Int?,
@@ -164,9 +170,18 @@ private data class Plan(
     val progressDurationMs: Long get() = itemDurationMs ?: durationMs
 }
 
-private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan? = try {
+private suspend fun loadPlan(
+    vm: AppViewModel,
+    itemId: Long,
+    fileId: Long,
+    tracks: PreplayTracks,
+): Plan? = try {
     val detail = vm.itemDetail(itemId)
-    val decision: Decision = vm.decision(fileId)
+    // The pre-play choice reaches the *first* decision, so the plan that comes
+    // back already carries it. Starting on the policy default and switching
+    // afterwards is what criterion 4 forbids: it is a visible re-buffer to
+    // apply something the viewer chose before playback began.
+    val decision: Decision = vm.decision(fileId, tracks)
     val file = detail.files.firstOrNull { it.id == fileId } ?: detail.files.firstOrNull()
     val mode = decision.delivery?.mode ?: when (decision.method) {
         "direct_play" -> "direct"
@@ -195,6 +210,7 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         preserveDolbyVision = decision.delivery?.preserve_dolby_vision
             ?: decision.preserve_dolby_vision,
         deliveredDynamicRange = decision.delivered_dynamic_range,
+        deliveryAudio = decision.delivery?.audio,
         markers = decision.markers,
         reasons = decision.reasons,
         videoWidth = file?.width?.toInt(),
@@ -362,6 +378,12 @@ fun PlayerScreen(
     itemId: Long,
     fileId: Long,
     startMs: Long,
+    /**
+     * What the viewer chose on the detail screen, before pressing play. It is a
+     * property of this one playback: nothing here writes a server setting, and
+     * the next item starts from its own route with no memory of it.
+     */
+    preplayTracks: PreplayTracks = PreplayTracks.NONE,
     onPlayNext: (PlaybackTarget) -> Unit,
     onExit: () -> Unit,
 ) {
@@ -377,8 +399,13 @@ fun PlayerScreen(
     // reloads the plan and rebuilds the controller, and the viewer's audio and
     // subtitle picks must come back with them.
     var playbackAudioOffset by remember(itemId, fileId) { mutableLongStateOf(0) }
-    var playbackAudio by remember(itemId, fileId) { mutableStateOf<Long?>(null) }
-    var playbackSubtitle by remember(itemId, fileId) { mutableStateOf<SubtitleChoice?>(null) }
+    // Seeded from the pre-play choice, so a quality change mid-playback keeps
+    // the tracks the viewer picked on the detail screen rather than falling
+    // back to the server's policy default.
+    var playbackAudio by remember(itemId, fileId) { mutableStateOf(preplayTracks.audio) }
+    var playbackSubtitle by remember(itemId, fileId) {
+        mutableStateOf(preplayTracks.subtitle)
+    }
 
     ImmersivePlaybackEffect()
 
@@ -388,7 +415,12 @@ fun PlayerScreen(
         // Android equivalent of the web click timestamp, not merely decoder
         // preparation latency.
         attemptOpenedAtMs = monotonicNowMs()
-        val loaded = loadPlan(vm, itemId, fileId)
+        val loaded = loadPlan(
+            vm,
+            itemId,
+            fileId,
+            PreplayTracks(audio = playbackAudio, subtitle = playbackSubtitle),
+        )
         if (loaded == null) failed = true else plan = loaded
     }
 
@@ -415,7 +447,10 @@ fun PlayerScreen(
                 attemptOpenedAtMs = attemptOpenedAtMs,
                 audioOffsetMs = playbackAudioOffset,
                 onAudioOffsetChanged = { playbackAudioOffset = it },
-                retainedAudio = playbackAudio,
+                // The plan's own answer wins over the request that produced it:
+                // `delivery.audio` is the index the server actually applied,
+                // and the HLS session body has to repeat exactly that.
+                retainedAudio = plan!!.deliveryAudio ?: playbackAudio,
                 onAudioChanged = { playbackAudio = it },
                 retainedSubtitle = playbackSubtitle,
                 onSubtitleChanged = { playbackSubtitle = SubtitleChoice(it) },

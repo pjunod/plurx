@@ -272,16 +272,11 @@ internal fun embeddedTextTrackIndex(
     serverIndex: Long,
     serverTracks: List<SubTrack>,
     embeddedLanguages: List<String?>,
-): Int? {
-    val position = serverTracks.indexOfFirst { it.index == serverIndex }
-    if (position < 0) return null
-    val language = normalizedLanguage(serverTracks[position].language)
-    val rank = serverTracks.take(position).count { normalizedLanguage(it.language) == language }
-    return embeddedLanguages.withIndex()
-        .filter { normalizedLanguage(it.value) == language }
-        .getOrNull(rank)
-        ?.index
-}
+): Int? = embeddedTrackOrdinal(
+    serverIndex,
+    serverTracks.map { it.index to it.language },
+    embeddedLanguages,
+)
 
 /**
  * ISO 639-2/T for comparison, because the two sides spell languages
