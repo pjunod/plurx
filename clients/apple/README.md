@@ -19,9 +19,10 @@ only what this hardware genuinely can't play.
 > HLS session stalls: the replacement create names its exact predecessor with
 > `reopen_reason: "stall"`, states `quality_auto` so a subtitle burn's promise
 > height is not read as a sticky manual pick, and bounds retries at the ladder
-> floor, which the server deliberately leaves to the client. Build 62 shows the audio and subtitle tracks a file
-> actually has on the detail screen and lets a viewer choose both before
-> pressing Play. Build 61 corrects copy-HLS recovery to seek past the
+> floor, which the server deliberately leaves to the client. Build 62 shows
+> the audio and subtitle tracks a file actually has on the detail screen and
+> lets a viewer choose both before pressing Play. Build 61 corrects
+> copy-HLS recovery to seek past the
 > preceding keyframe and adds correlated AVPlayer, access-log, buffer, and
 > server-supply evidence to every stall report. Build 60 requires a concrete
 > PGS overlay track before
