@@ -114,3 +114,32 @@ internal fun dolbyVisionCaps(profiles: List<Int>, displaySupportsDolbyVision: Bo
     } else {
         mapOf("dv" to "1", "dvprofile" to profiles.joinToString(","))
     }
+
+/**
+ * Compact capability evidence carried with `/decision` and surfaced by the
+ * server log. A remote playback failure is otherwise indistinguishable from
+ * an old APK, a missing decoder, or a display route with Dolby Vision off.
+ * These fields are diagnostic only and never affect the delivery decision.
+ */
+internal fun capabilityDiagnostics(
+    version: String,
+    hdrTypes: Set<Int>,
+    decoderNames: List<String>,
+    rawProfiles: List<Int>,
+    claimedProfiles: List<Int>,
+): Map<String, String> {
+    val status = when {
+        HdrType.DOLBY_VISION !in hdrTypes -> "display-no-dv"
+        decoderNames.isEmpty() -> "decoder-missing"
+        rawProfiles.isEmpty() -> "decoder-no-profiles"
+        claimedProfiles.isEmpty() -> "unsupported-profiles"
+        else -> "ready"
+    }
+    return mapOf(
+        "capver" to version,
+        "hdrtypes" to hdrTypes.sorted().joinToString(","),
+        "dvdecoders" to decoderNames.joinToString(",").take(512),
+        "dvraw" to rawProfiles.sorted().joinToString(","),
+        "dvstatus" to status,
+    )
+}
