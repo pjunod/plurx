@@ -779,6 +779,16 @@ fn language_tag(raw: Option<&str>) -> &str {
 /// `hvcC` record (`H150`), and AVPlayer treats the only HDR variant as
 /// unsupported. The init segment is the canonical description of the bytes
 /// this session actually publishes, including any Dolby Vision stripping.
+///
+/// A `dvh1`/`dvhe` sample entry is NOT described by the HEVC form. Dolby
+/// Vision's HLS identifier is `dvh1.PP.LL` — two-digit profile, two-digit
+/// level — and the `hvcC` beside it describes only the base layer, so reading
+/// the tier out of it and emitting `dvh1.2.4.L150.90` produces a string no
+/// player can resolve. AVPlayer rejected exactly that on a Profile 5 title
+/// while the same session's media playlist, which carries no CODECS at all,
+/// played. Dolby Vision therefore reads its own `dvcC`/`dvvC` configuration
+/// record, which is also the canonical answer when the library row's probe
+/// carried no DOVI side data and the advertised codec came through bare.
 async fn exact_hls_context(
     state: &AppState,
     session: &str,
@@ -816,7 +826,12 @@ async fn exact_hls_context(
             return context;
         }
     }
-    let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
+    let derived = if matches!(sample_entry, "dvh1" | "dvhe") {
+        dolby_vision_codec_from_init(&init, sample_entry)
+    } else {
+        hevc_codec_from_init(&init, sample_entry)
+    };
+    let Some(video) = derived else {
         return context;
     };
     context.codecs = match context.codecs.split_once(',') {
@@ -824,6 +839,44 @@ async fn exact_hls_context(
         _ => video,
     };
     context
+}
+
+/// Apple's Dolby Vision HLS identifier from the `DOVIDecoderConfigurationRecord`.
+///
+/// The record is carried by `dvcC` (profiles up to 7) or `dvvC` (profiles 8
+/// and 9) inside the sample entry. Its payload begins with two version bytes
+/// and then packs the two fields the playlist needs across two more:
+///
+/// ```text
+/// byte 2: dv_profile (7 bits) | dv_level high bit
+/// byte 3: dv_level low 5 bits | rpu_present | el_present | bl_present
+/// ```
+///
+/// Apple's form is `dvh1.PP.LL` with both fields zero-padded to two digits —
+/// no tier letter, no constraint bytes, and nothing from `hvcC`.
+fn dolby_vision_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
+    let type_at = [b"dvcC", b"dvvC"]
+        .into_iter()
+        .find_map(|name| init.windows(4).position(|window| window == name))?;
+    let box_start = type_at.checked_sub(4)?;
+    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
+    let box_end = box_start.checked_add(box_size)?;
+    // 8-byte header plus the 24-byte record.
+    if box_size < 32 || box_end > init.len() {
+        return None;
+    }
+    let payload = init.get(type_at + 4..box_end)?;
+    if payload.len() < 4 {
+        return None;
+    }
+    let profile = payload[2] >> 1;
+    let level = ((payload[2] & 0x01) << 5) | (payload[3] >> 3);
+    // Profile 0 is not assigned and level 0 is not a real declaration; either
+    // means the record was not what this parser assumed.
+    if profile == 0 || level == 0 {
+        return None;
+    }
+    Some(format!("{sample_entry}.{profile:02}.{level:02}"))
 }
 
 /// RFC 6381 identifier from the HEVCDecoderConfigurationRecord in `hvcC`.
@@ -2495,6 +2548,148 @@ mod tests {
             Some("hvc1.2.4.H150.B0")
         );
         assert!(hevc_codec_from_init(&init[..12], "hvc1").is_none());
+    }
+
+    /// A `dvcC` record laid out the way the Dexter Profile 5 title's init
+    /// segment carries it: version 1.0, profile 5, level 6, RPU and BL
+    /// present, no enhancement layer, compatibility id 0.
+    fn dolby_vision_init(profile: u8, level: u8) -> Vec<u8> {
+        let mut init = vec![0, 0, 0, 32];
+        init.extend_from_slice(b"dvcC");
+        init.extend_from_slice(&[
+            1,
+            0,
+            (profile << 1) | (level >> 5),
+            ((level & 0x1f) << 3) | 0b101,
+            0,
+        ]);
+        init.extend_from_slice(&[0; 19]);
+        init
+    }
+
+    #[test]
+    fn dolby_vision_codec_is_read_from_its_own_configuration_record() {
+        let init = dolby_vision_init(5, 6);
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvh1").as_deref(),
+            Some("dvh1.05.06")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvhe").as_deref(),
+            Some("dvhe.05.06")
+        );
+        // Profile 8 level 10 exercises the level's high bit, which lives in
+        // the profile's byte.
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(8, 10), "dvh1").as_deref(),
+            Some("dvh1.08.10")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(7, 33), "dvh1").as_deref(),
+            Some("dvh1.07.33")
+        );
+        // Truncated, absent and empty records decline rather than guess.
+        assert!(dolby_vision_codec_from_init(&init[..16], "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(b"nothing here at all", "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(0, 6), "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(5, 0), "dvh1").is_none());
+    }
+
+    /// The regression this milestone exists for. A preserved Profile 5 init
+    /// carries `dvh1` + `hvcC` + `dvcC`; reading the tier out of `hvcC` and
+    /// publishing `dvh1.2.4.L150.90` is what AVPlayer refused with CoreMedia
+    /// -15517 while the same session's CODECS-free media playlist played.
+    #[tokio::test]
+    async fn a_preserved_dolby_vision_master_keeps_its_dolby_vision_identifier() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv").await;
+        // The sample entry's `hvcC` describes the base layer only: Main 10,
+        // High tier, level 150 — the record the HEVC reader would have used.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        init.extend_from_slice(&dolby_vision_init(5, 6));
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv", context).await;
+        assert_eq!(
+            resolved.codecs, "dvh1.05.06,ec-3",
+            "a Dolby Vision master must not be rewritten into HEVC shape"
+        );
+    }
+
+    /// The same probe also heals the other half of the failure: when the
+    /// library row carried no DOVI side data, `copied_hls_codecs` advertises a
+    /// bare `dvh1`, which the code's own comment calls fatal during asset
+    /// preparation. The init knows the answer.
+    #[tokio::test]
+    async fn a_bare_dolby_vision_declaration_is_completed_from_the_init() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-bare").await;
+        tokio::fs::write(dir.path().join("init.mp4"), dolby_vision_init(5, 6))
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-bare", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    /// And a Dolby Vision init with no configuration record at all leaves the
+    /// advertised string alone rather than falling back to the HEVC reader.
+    #[tokio::test]
+    async fn a_dolby_vision_init_without_a_configuration_record_changes_nothing() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-nodvcc").await;
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("init without dvcC");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-nodvcc", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    #[test]
+    fn a_profile_5_master_declares_dolby_vision_without_a_supplemental_codec() {
+        let file = hls_file(vec![]);
+        let profile5 = hls_context("dvh1.05.06,ec-3", None);
+        let master = master_playlist(&file, None, &profile5);
+
+        // Profile 5 has no compatible base layer to declare, so the master
+        // stays at version 7 — SUPPLEMENTAL-CODECS would drag it to 10, which
+        // this code already documents as rejection-prone.
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master.contains("CODECS=\"dvh1.05.06,ec-3\""));
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"));
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
