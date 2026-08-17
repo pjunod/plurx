@@ -220,3 +220,11 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "nonisolated static func sessionAttachSeekMs("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testLiveCopyRecoverySeeksPastThePrecedingKeyframe"
+
+[[fixes]]
+id = "android.google-tv-dolby-vision-detection"
+commits = ["eff7118d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/Caps.kt"
+source_anchor = "private fun decoderDolbyVisionProbe()"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed"

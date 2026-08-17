@@ -185,6 +185,14 @@ pub struct Caps {
     /// `1` when supported DV profiles need a normalized copy-video HLS
     /// envelope instead of raw progressive direct play.
     pub dvhls: Option<u8>,
+    /// Android capability probe evidence. Diagnostic only: these fields are
+    /// logged so a remote SDR decision can be distinguished from an old app,
+    /// missing decoder, or non-DV display route.
+    pub capver: Option<String>,
+    pub hdrtypes: Option<String>,
+    pub dvdecoders: Option<String>,
+    pub dvraw: Option<String>,
+    pub dvstatus: Option<String>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
     /// Request-local audio choice (`a:{index}`). Absent keeps the shared
@@ -994,6 +1002,11 @@ pub async fn decision(
         dv = q.dv.unwrap_or_default(),
         dvprofile = q.dvprofile.as_deref().unwrap_or(""),
         dvhls = q.dvhls.unwrap_or_default(),
+        capver = q.capver.as_deref().unwrap_or(""),
+        hdrtypes = q.hdrtypes.as_deref().unwrap_or(""),
+        dvdecoders = q.dvdecoders.as_deref().unwrap_or(""),
+        dvraw = q.dvraw.as_deref().unwrap_or(""),
+        dvstatus = q.dvstatus.as_deref().unwrap_or(""),
         force = q.force.as_deref().unwrap_or("auto"),
         audio = selected_audio,
         subtitle = selected_subtitle,
@@ -1317,6 +1330,11 @@ impl StreamQuery {
             dv: self.dv,
             dvprofile: self.dvprofile.clone(),
             dvhls: self.dvhls,
+            capver: None,
+            hdrtypes: None,
+            dvdecoders: None,
+            dvraw: None,
+            dvstatus: None,
             force: self.force.clone(),
             audio: None,
             subtitle: None,
