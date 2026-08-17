@@ -676,6 +676,16 @@
   .specs .trk{border:1px solid var(--line);border-radius:999px;padding:2px 9px;line-height:1.5}
   .specs .trk.on{border-color:var(--accent);color:var(--accent)}
   .specs .trk .tdef{font-weight:600}
+  /* Large subtitle inventories stay out of the way until they are wanted.
+     Native details/summary keeps the disclosure keyboard-accessible without
+     adding another page-level state machine. The server-selected track is the
+     one line that remains visible while the disclosure is closed. */
+  .specs .trkfold summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;width:max-content;max-width:100%}
+  .specs .trkfold summary::-webkit-details-marker{display:none}
+  .specs .trkfold summary::after{content:"▸";color:var(--muted);font-size:11px;transition:transform .12s}
+  .specs .trkfold[open] summary::after{transform:rotate(90deg)}
+  .specs .trkfold .trkmore{color:var(--muted);font-size:12px;white-space:nowrap}
+  .specs .trkfold .trkrest{margin-top:6px}
   .specs .langnote{color:var(--muted);font-size:12px;margin-top:4px}
   /* Pre-play pickers. Deliberately inside the version block: the tracks belong
      to one file, and a multi-version item must not offer one item-wide choice
@@ -4143,10 +4153,21 @@ function audioFactLabel(a){
   return [langName(a.language)||"Untagged", a.codec&&a.codec.toUpperCase(),
           fmtChannels(a.channels), a.title].filter(Boolean).join(" · ");
 }
-function trackFactRow(label, tracks, selectedIndex, chip, note){
-  const chips=tracks.length
-    ? `<div class="trks">${tracks.map(t=>chip(t, t.index===selectedIndex)).join("")}</div>`
-    : `<div class="trks">None</div>`;
+function trackFactRow(label, tracks, selectedIndex, chip, note, collapse=false){
+  let chips=`<div class="trks">None</div>`;
+  if(tracks.length){
+    if(collapse&&tracks.length>1){
+      // Lead with what actually plays, rather than assuming the container's
+      // first subtitle is the useful one. The remaining source-ordered tracks
+      // stay present in the document and are one click/tap away.
+      const primary=tracks.find(t=>t.index===selectedIndex)||tracks[0];
+      const rest=tracks.filter(t=>t!==primary);
+      chips=`<details class="trkfold"><summary>${chip(primary,primary.index===selectedIndex)}<span class="trkmore">${rest.length} more</span></summary><div class="trks trkrest">${
+        rest.map(t=>chip(t,t.index===selectedIndex)).join("")}</div></details>`;
+    }else{
+      chips=`<div class="trks">${tracks.map(t=>chip(t,t.index===selectedIndex)).join("")}</div>`;
+    }
+  }
   return `<dt>${label}</dt><dd>${chips}${note?`<div class="langnote">${esc(note)}</div>`:""}</dd>`;
 }
 function specBlock(f){
@@ -4172,7 +4193,7 @@ function specBlock(f){
   const subRow=(!subs.length && !f.video_codec) ? ""
     : trackFactRow("Subtitles", subs, sd&&sd.selected_index!=null?sd.selected_index:-1,
         (s,on)=>trackChip(subFactLabel(s),on),
-        subs.length?preferredLanguageNote("subtitles",sd):"");
+        subs.length?preferredLanguageNote("subtitles",sd):"", true);
   return `<dl class="specs">
     ${vid||!auds.length?`<dt>Video</dt><dd>${esc(vid||"—")}</dd>`:''}
     ${audRow}

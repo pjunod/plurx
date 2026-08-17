@@ -589,6 +589,7 @@ async fn probe_system(
         ffmpeg_version: ffmpeg_version(&ffmpeg).await,
         pacing: crate::ffmpeg::pacing_caps().await,
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
+        dovi_reshape: crate::ffmpeg::has_dovi_reshape().await,
         encoder_selected,
         tone_map,
     };
@@ -601,6 +602,7 @@ struct Measured {
     ffmpeg_version: Option<String>,
     pacing: crate::ffmpeg::PacingCaps,
     dovi_rpu: bool,
+    dovi_reshape: bool,
     encoder_selected: String,
     tone_map: pipeprobe::PipelineReport,
 }
@@ -629,6 +631,7 @@ fn system_info(
         tone_map: measured.tone_map,
         pacing: measured.pacing,
         dovi_rpu: measured.dovi_rpu,
+        dovi_reshape: measured.dovi_reshape,
     }
 }
 
@@ -2550,6 +2553,7 @@ mod startup_tests {
                     initial_burst: true,
                 },
                 dovi_rpu: true,
+                dovi_reshape: true,
                 encoder_selected: selected.clone(),
                 tone_map: pipeprobe::PipelineReport::cpu_only("not probed"),
             },
@@ -2560,6 +2564,7 @@ mod startup_tests {
         assert_eq!(system.encoder_selected, selected);
         assert_eq!(system.hwaccel_pref, "auto");
         assert!(system.dovi_rpu);
+        assert!(system.dovi_reshape);
         assert!(system.pacing.readrate);
         // The tone-map answer a session consults is the one that was measured.
         assert_eq!(
