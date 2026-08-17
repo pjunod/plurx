@@ -69,6 +69,109 @@ class ModelContractTest {
         assertEquals(20L, fixture.page.items.single().rollup!!.leaves)
         assertEquals("remux", fixture.decision.delivery!!.mode)
         assertEquals("dolby_vision", fixture.decision.delivered_dynamic_range)
+
+        // The shared track facts every first-party detail screen renders.
+        val defaults = checkNotNull(fixture.item_detail.files.single().playback_defaults)
+        assertEquals(1L, defaults.audio.selected_index)
+        assertEquals("selected", defaults.audio.preferred_language_status)
+        assertEquals(2L, defaults.subtitle.selected_index)
+        assertEquals("eng", defaults.subtitle.preferred_language)
+    }
+
+    /**
+     * docs/CLIENTS.md §"Shared track facts": the detail screen marks
+     * [PlaybackDefaults] and renders the status; it does not fetch admin
+     * settings or re-run `select_tracks`. All five states have to survive the
+     * wire, and `unknown` must arrive as itself rather than as `missing`.
+     */
+    @Test
+    fun itemDetailCarriesTheServersOwnTrackDefaultsAndSubtitleFacts() {
+        val detail = json.decodeFromString<ItemDetail>(
+            """{
+              "item": {"id": 7, "kind": "movie", "title": "Dual audio"},
+              "files": [{
+                "id": 70, "filename": "anime.mkv",
+                "audio_streams": [
+                  {"index": 0, "codec": "aac", "language": "eng", "default": true},
+                  {"index": 1, "codec": "flac", "language": "jpn"}
+                ],
+                "subtitle_streams": [
+                  {"index": 0, "codec": "subrip", "language": "eng", "hearing_impaired": true},
+                  {"index": 1, "codec": "ass", "forced": true}
+                ],
+                "playback_defaults": {
+                  "audio": {
+                    "selected_index": 1, "preferred_language": "eng",
+                    "preferred_language_status": "available"
+                  },
+                  "subtitle": {
+                    "selected_index": 0, "preferred_language": "eng",
+                    "preferred_language_status": "selected"
+                  }
+                }
+              }]
+            }""".trimIndent(),
+        )
+
+        val file = detail.files.single()
+        // The anime case the contract is written around: Japanese original
+        // audio selected, the English dub still reported as available.
+        assertEquals(1L, file.playback_defaults!!.audio.selected_index)
+        assertEquals("available", file.playback_defaults.audio.preferred_language_status)
+        // SDH and forced are per-stream facts the detail screen marks.
+        assertTrue(file.subtitle_streams.first().hearing_impaired)
+        assertTrue(file.subtitle_streams.last().forced)
+        assertFalse(file.subtitle_streams.last().hearing_impaired)
+
+        // An older server omits the whole block; the file still decodes and
+        // the screen lists tracks without claiming which one plays.
+        val old = json.decodeFromString<ItemDetail>(
+            """{
+              "item": {"id": 8, "kind": "movie", "title": "Old server"},
+              "files": [{"id": 80, "filename": "a.mkv"}]
+            }""".trimIndent(),
+        )
+        assertNull(old.files.single().playback_defaults)
+        assertEquals(emptyList<SubtitleStream>(), old.files.single().subtitle_streams)
+    }
+
+    /**
+     * The selection-aware `/decision`: the plan carries the audio index the
+     * server actually applied, and `selection` prices the subtitle before
+     * playback starts. Both are absent for an unselected request, which keeps
+     * the response older clients get byte-for-byte.
+     */
+    @Test
+    fun decisionCarriesThePlansAudioAndTheSelectionPreflight() {
+        val selected = json.decodeFromString<Decision>(
+            """{
+              "file_id": 9, "method": "remux", "play_url": "/stream.mp4?audio=3",
+              "delivery": {
+                "mode": "remux", "url": "/stream.mp4?audio=3",
+                "sessions_url": "/hls/sessions", "aac": false,
+                "preserve_dolby_vision": false, "audio": 3
+              },
+              "selection": {
+                "audio_index": 3, "subtitle_index": 2,
+                "subtitle_requires_burn_in": true,
+                "subtitle_burn_in_blocked_by_hdr": true
+              }
+            }""".trimIndent(),
+        )
+        assertEquals(3L, selected.delivery!!.audio)
+        assertEquals(3L, selected.selection!!.audio_index)
+        assertEquals(2L, selected.selection.subtitle_index)
+        assertTrue(selected.selection.subtitle_requires_burn_in)
+        assertTrue(selected.selection.subtitle_burn_in_blocked_by_hdr)
+
+        val unselected = json.decodeFromString<Decision>(
+            """{
+              "file_id": 9, "method": "remux", "play_url": "/stream.mp4",
+              "delivery": {"mode": "remux", "url": "/stream.mp4", "sessions_url": "/hls/sessions"}
+            }""".trimIndent(),
+        )
+        assertNull(unselected.selection)
+        assertNull(unselected.delivery!!.audio)
     }
 
     @Test

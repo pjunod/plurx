@@ -65,11 +65,24 @@ fn unsupported_build_error(message: impl AsRef<str>) -> String {
 pub(crate) fn unsupported_build_reason(error: &str) -> Option<&str> {
     error.strip_prefix(UNSUPPORTED_BUILD_PREFIX)
 }
+
+/// Stable classification for a malformed or stale bound reopen. The HTTP
+/// layer returns this as a client error without exposing unrelated internals.
+const INVALID_REOPEN_PREFIX: &str = "invalid stall reopen: ";
+
+fn invalid_reopen_error(reason: &str) -> String {
+    format!("{INVALID_REOPEN_PREFIX}{reason}")
+}
+
+pub(crate) fn invalid_reopen_reason(error: &str) -> Option<&str> {
+    error.strip_prefix(INVALID_REOPEN_PREFIX)
+}
+
 /// What "Auto" resolves to — see [`TranscodeManager::auto_height`].
 const AUTO_SOFTWARE_HEIGHT: i64 = 720;
 const AUTO_HARDWARE_MAX_HEIGHT: i64 = 1080;
 /// Floor for any requested rung. Below this there is no picture worth the
-/// session, and the ladder's lowest step is 480p anyway.
+/// session; the adaptive ladder itself bottoms out at 360p.
 pub const MIN_HEIGHT: i64 = 144;
 /// Ceiling for an explicitly requested rung. Auto never reaches it; the
 /// quality menu can.
@@ -1374,6 +1387,14 @@ struct Session {
     user_name: String,
     /// The player instance that owns this session — the supersession key.
     playback_id: String,
+    /// Whether this session's height came from server Auto policy. A manual
+    /// height is sticky across a stall reopen; only Auto sessions may move
+    /// down the ladder without another viewer choice.
+    automatic: bool,
+    /// The normalized delivery kind that created this session. A stall reopen
+    /// bound to a manual session repeats this exact route instead of silently
+    /// turning an Original/copy delivery into a transcode.
+    kind: SessionKind,
     /// Re-encoding the picture, or only repackaging it. Immutable, unlike
     /// `encoder_label`: what this session *is* does not change when the
     /// encoder behind it does, and the activity page must not relabel a copy
@@ -2418,6 +2439,13 @@ pub struct StartInfo {
     /// accurate transcode begins at the requested position, and a cached VOD
     /// begins at zero. Clients use this value for progress and timed overlays.
     pub media_origin_seconds: f64,
+    /// The resolved output height. This is the server's persisted answer for
+    /// an Auto request and is repeated unchanged on an idempotent recovery.
+    pub target_height: i64,
+    /// The normalized route that actually created the session. A stall reopen
+    /// may turn an Auto copy session into a lower transcode rung, so callers
+    /// must report this answer rather than the pre-normalization request.
+    pub kind: SessionKind,
     pub encoder: &'static str,
     /// Served from the cache: every segment already exists, so this is a VOD
     /// asset rather than a stream being written.
@@ -2516,6 +2544,17 @@ pub struct SessionRequest {
     pub playback_id: String,
     /// Optional idempotency key for one creation attempt.
     pub request_id: Option<String>,
+    /// True when the VIEWER chose Auto and left the rung to server policy.
+    /// The resolved numeric height alone cannot distinguish Auto from a
+    /// viewer's sticky manual pick, and neither can the presence of `height`
+    /// on the wire — a subtitle burn sends the source height as a promise
+    /// about the output, not as a quality answer. `CreateSession::quality_auto`
+    /// carries the real intent; wire presence is only the fallback.
+    pub automatic: bool,
+    /// The exact predecessor a recovery is bound to. Present only with a
+    /// typed [`ReopenReason`].
+    pub previous_session_id: Option<String>,
+    pub reopen_reason: Option<ReopenReason>,
     pub kind: SessionKind,
     pub start_seconds: f64,
     pub audio_index: Option<i64>,
@@ -2532,7 +2571,7 @@ pub struct SessionRequest {
     pub audio_offset_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Transcode {
         height: i64,
@@ -2544,33 +2583,74 @@ pub enum SessionKind {
     },
 }
 
+/// Why a client is replacing an existing session. This is deliberately typed
+/// even while `stall` is the only server-normalized cause: an unknown future
+/// value must be refused, not accidentally treated as ordinary create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReopenReason {
+    Stall,
+}
+
+impl ReopenReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stall => "stall",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CopySessionOptions {
     transcode_audio: bool,
     preserve_dolby_vision: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SessionOwner<'a> {
+    user_name: &'a str,
+    playback_id: &'a str,
+    automatic: bool,
+}
+
 impl SessionRequest {
-    /// A stable description of the output this request would produce. Start
-    /// position is included: two creates at different offsets are different
-    /// streams, and answering the second with the first would silently seek
-    /// the viewer somewhere they didn't ask to be.
-    fn fingerprint(&self) -> String {
+    /// The client's request intent before server-owned Auto normalization.
+    /// This is the only idempotency identity: it is what `claim_request`
+    /// compares when a `request_id` is replayed, so every field that changes
+    /// the output bytes has to be in here. Start position is included — two
+    /// creates at different offsets are different streams, and answering the
+    /// second with the first would silently seek the viewer somewhere they
+    /// didn't ask to be.
+    ///
+    /// For an Auto transcode the numeric height is excluded on purpose: a
+    /// network-prior refresh between transport attempts may recompute it, but
+    /// the same `request_id` must still recover the first persisted answer.
+    fn intent_fingerprint(&self, user_name: &str) -> String {
         let kind = match self.kind {
+            SessionKind::Transcode { height: _ } if self.automatic => "ta".to_owned(),
             SessionKind::Transcode { height } => format!("t{height}"),
             SessionKind::Copy {
                 aac,
                 preserve_dolby_vision,
             } => format!("c{}d{}", u8::from(aac), u8::from(preserve_dolby_vision)),
         };
-        format!(
-            "{}:{kind}:{:.3}:{}:{}:{}",
+        // These strings are client-controlled. A typed JSON tuple keeps a
+        // colon inside a username, playback id, or session id from producing
+        // the same fingerprint as a different set of fields.
+        serde_json::json!([
+            user_name,
             self.file_id,
-            self.start_seconds,
-            self.audio_index.unwrap_or(-1),
-            self.subtitle_burn.unwrap_or(-1),
-            self.audio_offset_ms
-        )
+            self.playback_id,
+            u8::from(self.automatic),
+            kind,
+            format!("{:.3}", self.start_seconds),
+            self.audio_index,
+            self.subtitle_burn,
+            self.audio_offset_ms,
+            self.previous_session_id,
+            self.reopen_reason.map(ReopenReason::as_str),
+        ])
+        .to_string()
     }
 }
 
@@ -2582,6 +2662,16 @@ enum RequestState {
     InFlight,
     /// The create finished, and this is the session it made.
     Ready(String),
+}
+
+/// One idempotency-key record. `target_height` is written while the request is
+/// still claimed and before session creation can supersede its predecessor.
+/// Keeping the normalized answer in this existing map is the N4 contract; a
+/// second retry store would let the two lifecycles disagree.
+struct RequestEntry {
+    intent_fingerprint: String,
+    target_height: Option<i64>,
+    state: RequestState,
 }
 
 /// How long a create will wait on an identical in-flight one before calling
@@ -2601,9 +2691,8 @@ const INFLIGHT_POLL: Duration = Duration::from_millis(100);
 /// the session and defuses the guard; `Drop` covers every other exit by
 /// clearing the reservation so the next attempt starts fresh.
 struct RequestClaim<'a> {
-    requests: &'a std::sync::Mutex<HashMap<String, (String, RequestState)>>,
+    requests: &'a std::sync::Mutex<HashMap<String, RequestEntry>>,
     key: Option<String>,
-    fingerprint: String,
 }
 
 impl RequestClaim<'_> {
@@ -2614,17 +2703,24 @@ impl RequestClaim<'_> {
     fn complete(mut self, session_id: &str, live: &std::collections::HashSet<String>) {
         let Some(key) = self.key.take() else { return };
         let mut requests = self.requests.lock().expect("requests mutex");
-        requests.retain(|_, (_, state)| match state {
+        requests.retain(|_, entry| match &entry.state {
             RequestState::InFlight => true,
             RequestState::Ready(sid) => live.contains(sid),
         });
-        requests.insert(
-            key,
-            (
-                std::mem::take(&mut self.fingerprint),
-                RequestState::Ready(session_id.to_owned()),
-            ),
-        );
+        if let Some(entry) = requests.get_mut(&key) {
+            entry.state = RequestState::Ready(session_id.to_owned());
+        } else {
+            // Unreachable as written: our own entry is `InFlight`, so the
+            // retain above keeps it. If it ever is missing, the create
+            // persists no `Ready` record and the next replay of this
+            // `request_id` spawns a duplicate encoder — too quiet a failure
+            // to leave unsaid.
+            debug_assert!(false, "completed claim lost its own reservation");
+            tracing::warn!(
+                session = session_id,
+                "request claim vanished before completion; a replay may duplicate this session"
+            );
+        }
     }
 }
 
@@ -2636,7 +2732,13 @@ impl Drop for RequestClaim<'_> {
             // `InFlight` entry, so finding one under our key means it is
             // ours; a `Ready` entry is a completed create and belongs to
             // the map.
-            if matches!(requests.get(&key), Some((_, RequestState::InFlight))) {
+            if matches!(
+                requests.get(&key),
+                Some(RequestEntry {
+                    state: RequestState::InFlight,
+                    ..
+                })
+            ) {
                 requests.remove(&key);
             }
         }
@@ -2646,7 +2748,7 @@ impl Drop for RequestClaim<'_> {
 /// What claiming a `request_id` resolved to.
 enum Claimed<'a> {
     /// This call owns the create; the claim must be completed or dropped.
-    Mine(RequestClaim<'a>),
+    Mine(RequestClaim<'a>, SessionRequest),
     /// An identical create already made this session.
     Recovered(StartInfo),
 }
@@ -3013,7 +3115,8 @@ pub struct TranscodeManager {
     /// Creation requests by `request_id` — reserved *before* work starts, so
     /// two concurrent creates with the same id cannot both pass the check and
     /// spawn two encoders (the check-then-act race this map used to have).
-    /// Values are `(fingerprint, state)`. Small by construction — a `Ready`
+    /// Each value carries client intent, the normalized stall target, and the
+    /// create state. Small by construction — a `Ready`
     /// entry is dropped as soon as its session is gone, an `InFlight` one the
     /// moment its create resolves or is abandoned, and one player instance
     /// has one in flight at a time.
@@ -3021,7 +3124,7 @@ pub struct TranscodeManager {
     /// A `std` mutex rather than tokio's, never held across an await: the
     /// abandoned-create cleanup runs in a `Drop` impl, and `Drop` cannot
     /// await.
-    requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
+    requests: std::sync::Mutex<HashMap<String, RequestEntry>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
     /// Scheduled and user-requested cache producers share one writer. A queued
@@ -3038,6 +3141,10 @@ pub struct TranscodeManager {
     /// whatever ffmpeg it was running, leave the DV configuration in every
     /// remux, and have browsers that cannot decode DV refuse the stream.
     dv_strippable: bool,
+    /// Whether boot proved the exact software/tonemapx/software renderer used
+    /// for non-backward-compatible Dolby Vision.
+    dovi_reshape: bool,
+    dovi_proofs: std::sync::Mutex<HashMap<String, bool>>,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -3096,6 +3203,8 @@ impl TranscodeManager {
             background_producer: Mutex::new(()),
             offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
+            dovi_reshape: false,
+            dovi_proofs: std::sync::Mutex::new(HashMap::new()),
             cached_limits: std::sync::RwLock::new(None),
             #[cfg(test)]
             playlist_wait_override_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3114,6 +3223,11 @@ impl TranscodeManager {
     /// not the cache's.
     pub fn with_dv_strippable(mut self, dv_strippable: bool) -> Self {
         self.dv_strippable = dv_strippable;
+        self
+    }
+
+    pub fn with_dovi_reshape(mut self, dovi_reshape: bool) -> Self {
+        self.dovi_reshape = dovi_reshape;
         self
     }
 
@@ -3188,7 +3302,6 @@ impl TranscodeManager {
         Some(PipelineDigest {
             ffmpeg_build: cache.ffmpeg_build.clone(),
             encoder: Encoder::Software, // replaced per lookup
-            pipeline: self.pipeline,
         })
     }
 
@@ -3295,6 +3408,83 @@ impl TranscodeManager {
         self.select_tracks(file, None, None).await.audio_index
     }
 
+    /// Whether this file needs RPU-driven reshaping rather than the ordinary
+    /// HDR10 base-layer route. Unknown and unsupported non-compatible
+    /// profiles are refused instead of being guessed through zscale.
+    fn needs_dovi_reshape(file: &plurx_core::domain::MediaFile) -> Result<bool, String> {
+        if file.hdr.as_deref() != Some("dolby_vision") {
+            return Ok(false);
+        }
+        if file.hdr_format.as_deref().is_some_and(|label| {
+            label.contains("HDR10-compatible") || label.contains("HLG-compatible")
+        }) {
+            return Ok(false);
+        }
+        match plurx_core::playback::dolby_vision_profile(file) {
+            Some(5) => Ok(true),
+            Some(profile) => Err(unsupported_build_error(format!(
+                "Dolby Vision Profile {profile} has no compatible base and no proven renderer; rescan after upgrading ffprobe or use a compatible source"
+            ))),
+            None => Err(unsupported_build_error(
+                "Dolby Vision profile/base compatibility is unknown; rescan after upgrading ffprobe rather than producing untrusted colors",
+            )),
+        }
+    }
+
+    fn dovi_proof_key(file: &plurx_core::domain::MediaFile) -> String {
+        format!("{}:{}:{}", file.path.display(), file.size, file.mtime)
+    }
+
+    async fn require_dovi_renderer(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<bool, String> {
+        let required = Self::needs_dovi_reshape(file)?;
+        if required && !self.dovi_reshape {
+            return Err(unsupported_build_error(
+                "this ffmpeg did not prove the Dolby-aware tonemapx renderer required for Profile 5",
+            ));
+        }
+        if required {
+            let key = Self::dovi_proof_key(file);
+            let cached = self
+                .dovi_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied();
+            let proved = match cached {
+                Some(proved) => proved,
+                None => {
+                    let proved = crate::ffmpeg::dovi_reshape_changes_pixels(file).await;
+                    self.dovi_proofs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, proved);
+                    proved
+                }
+            };
+            if !proved {
+                return Err(unsupported_build_error("this source did not prove that Dolby Vision RPU application changes pixels through the production renderer"));
+            }
+        }
+        Ok(required)
+    }
+
+    async fn encoder_for_file(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<Encoder, String> {
+        if self.require_dovi_renderer(file).await? {
+            // This is the only pairing boot probes. Software decode preserves
+            // the RPU AVFrame side data and feeds the proved system-memory
+            // tonemapx graph.
+            Ok(Encoder::Software)
+        } else {
+            Ok(self.encoder().await)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn options_for_tone_map(
         &self,
@@ -3308,6 +3498,7 @@ impl TranscodeManager {
         tone_map: ToneMap,
     ) -> TranscodeOptions {
         let subtitle_file = self.subtitle_file(file, subtitle_burn.as_ref());
+        let dovi_reshape = Self::needs_dovi_reshape(file).unwrap_or(false);
         TranscodeOptions {
             target_height,
             software_threads,
@@ -3315,7 +3506,11 @@ impl TranscodeManager {
             effective_rate_control: self.effective_rate_control(encoder),
             audio_index,
             start_seconds,
-            tone_map,
+            tone_map: if dovi_reshape {
+                ToneMap::Tonemapx
+            } else {
+                tone_map
+            },
             // The node proved a graph; this session may still not be entitled
             // to it (HLG, non-compatible Dolby Vision, a light source, an
             // encoder it cannot feed). Deciding once, here,
@@ -3325,13 +3520,17 @@ impl TranscodeManager {
             // HDR10-compatible is an hdr10 stream to a tone-map, and a bitmap
             // subtitle burn keeps the GPU graph (it downloads once for
             // libass/overlay after the expensive scale + tone-map is done).
-            pipeline: Pipeline::for_session(
-                self.pipeline,
-                encoder,
-                transcode::routing_hdr(file),
-                transcode::heavy_source(file),
-                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
-            ),
+            pipeline: if dovi_reshape {
+                Pipeline::DoviTonemapx
+            } else {
+                Pipeline::for_session(
+                    self.pipeline,
+                    encoder,
+                    transcode::routing_hdr(file),
+                    transcode::heavy_source(file),
+                    subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
+                )
+            },
             subtitle_burn,
             subtitle_file,
             // Only where the startup probe proved this build takes it. A
@@ -3493,8 +3692,7 @@ impl TranscodeManager {
         opts: &TranscodeOptions,
         encoder: Encoder,
         item_title: &str,
-        user_name: &str,
-        playback_id: &str,
+        owner: SessionOwner<'_>,
     ) -> Option<StartInfo> {
         let cache = self.cache.as_ref()?;
         let mut digest = self.digest()?;
@@ -3563,8 +3761,12 @@ impl TranscodeManager {
             file_id: file.id,
             item_id: file.item_id,
             item_title: item_title.to_owned(),
-            user_name: user_name.to_owned(),
-            playback_id: playback_id.to_owned(),
+            user_name: owner.user_name.to_owned(),
+            playback_id: owner.playback_id.to_owned(),
+            automatic: owner.automatic,
+            kind: SessionKind::Transcode {
+                height: opts.target_height,
+            },
             // A cache hit only ever answers a transcode request (`serve_cached`
             // is reached from the transcode path alone); the encoder label goes to
             // "cached" here, which is exactly why the method is not read off it.
@@ -3628,6 +3830,10 @@ impl TranscodeManager {
             // there is no encoder and nothing to tell.
             start_seconds: 0.0,
             media_origin_seconds: 0.0,
+            target_height: opts.target_height,
+            kind: SessionKind::Transcode {
+                height: opts.target_height,
+            },
             encoder: "cached",
             vod: true,
         })
@@ -3679,7 +3885,7 @@ impl TranscodeManager {
         let mut playback_file = file.clone();
         playback_file.audio_offset_ms = 0;
         let file = &playback_file;
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         // Through the same track selection a real playback uses. Not an
         // optimisation — the tracks are part of the recipe, so producing with
         // "no audio track chosen" makes an entry named for a session that will
@@ -3753,7 +3959,7 @@ impl TranscodeManager {
         if cancelled.is_cancelled() {
             return Ok(OfflineProduceOutcome::Yielded);
         }
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         let subtitle_burn = match spec.subtitle {
             OfflineSubtitle::Burn(index) => {
                 let stream = file
@@ -4222,13 +4428,33 @@ impl TranscodeManager {
         req: &SessionRequest,
         user_name: &str,
     ) -> Result<StartInfo, String> {
-        let fingerprint = req.fingerprint();
+        match (&req.previous_session_id, req.reopen_reason) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => {
+                return Err(invalid_reopen_error(
+                    "previous_session_id and reopen_reason must be sent together",
+                ))
+            }
+        }
+        if req.reopen_reason.is_some() && req.request_id.is_none() {
+            return Err(invalid_reopen_error(
+                "a stall reopen requires request_id so its target can be replayed",
+            ));
+        }
         let claim = match req.request_id.as_deref() {
-            Some(key) => match self.claim_request(key, &fingerprint).await? {
+            Some(key) => match self.claim_request(key, req, user_name).await? {
                 Claimed::Recovered(info) => return Ok(info),
-                Claimed::Mine(claim) => Some(claim),
+                Claimed::Mine(claim, normalized) => Some((claim, normalized)),
             },
             None => None,
+        };
+        let normalized;
+        let (claim, req) = match claim {
+            Some((claim, request)) => {
+                normalized = request;
+                (Some(claim), &normalized)
+            }
+            None => (None, req),
         };
 
         let info = match req.kind {
@@ -4242,6 +4468,7 @@ impl TranscodeManager {
                     req.audio_offset_ms,
                     user_name,
                     &req.playback_id,
+                    req.automatic,
                 )
                 .await?
             }
@@ -4260,6 +4487,7 @@ impl TranscodeManager {
                     },
                     user_name,
                     &req.playback_id,
+                    req.automatic,
                 )
                 .await?
             }
@@ -4273,10 +4501,18 @@ impl TranscodeManager {
     }
 
     /// Resolve a `request_id` to either a reservation this call owns or the
-    /// session an identical create already made. Errors on a fingerprint
-    /// mismatch (same id, different stream) and on a reservation that outlives
-    /// [`INFLIGHT_WAIT`].
-    async fn claim_request(&self, key: &str, fingerprint: &str) -> Result<Claimed<'_>, String> {
+    /// session an identical create already made. A new claim normalizes a
+    /// bound stall reopen and records its resolved height in the claim before
+    /// returning to the caller; session creation (and therefore predecessor
+    /// supersession) cannot begin earlier. Replays compare client intent and
+    /// recover the stored result without reading the predecessor again.
+    async fn claim_request(
+        &self,
+        key: &str,
+        request: &SessionRequest,
+        user_name: &str,
+    ) -> Result<Claimed<'_>, String> {
+        let intent_fingerprint = request.intent_fingerprint(user_name);
         let deadline = Instant::now() + INFLIGHT_WAIT;
         loop {
             // What the map says right now, decided under one lock so there is
@@ -4284,22 +4520,33 @@ impl TranscodeManager {
             enum Step {
                 Reserved,
                 Wait,
-                Recover(String),
+                Recover(String, Option<i64>),
             }
             let step = {
                 let mut requests = self.requests.lock().expect("requests mutex");
                 match requests.get(key) {
-                    Some((seen, _)) if seen != fingerprint => {
+                    Some(entry) if entry.intent_fingerprint != intent_fingerprint => {
                         return Err(format!(
                             "request {key} was already used for a different stream"
                         ));
                     }
-                    Some((_, RequestState::InFlight)) => Step::Wait,
-                    Some((_, RequestState::Ready(session_id))) => Step::Recover(session_id.clone()),
+                    Some(RequestEntry {
+                        state: RequestState::InFlight,
+                        ..
+                    }) => Step::Wait,
+                    Some(RequestEntry {
+                        state: RequestState::Ready(session_id),
+                        target_height,
+                        ..
+                    }) => Step::Recover(session_id.clone(), *target_height),
                     None => {
                         requests.insert(
                             key.to_owned(),
-                            (fingerprint.to_owned(), RequestState::InFlight),
+                            RequestEntry {
+                                intent_fingerprint: intent_fingerprint.clone(),
+                                target_height: None,
+                                state: RequestState::InFlight,
+                            },
                         );
                         Step::Reserved
                     }
@@ -4307,14 +4554,34 @@ impl TranscodeManager {
             };
             match step {
                 Step::Reserved => {
-                    return Ok(Claimed::Mine(RequestClaim {
+                    let claim = RequestClaim {
                         requests: &self.requests,
                         key: Some(key.to_owned()),
-                        fingerprint: fingerprint.to_owned(),
-                    }))
+                    };
+                    let (normalized, target_height) =
+                        match self.normalize_claimed_request(request, user_name).await {
+                            Ok(normalized) => normalized,
+                            Err(error) => {
+                                drop(claim);
+                                return Err(error);
+                            }
+                        };
+                    {
+                        let mut requests = self.requests.lock().expect("requests mutex");
+                        let Some(entry) = requests.get_mut(key) else {
+                            return Err("the request claim disappeared during normalization".into());
+                        };
+                        entry.target_height = target_height;
+                    }
+                    return Ok(Claimed::Mine(claim, normalized));
                 }
-                Step::Recover(session_id) => {
+                Step::Recover(session_id, persisted_target) => {
                     if let Some(info) = self.recover(&session_id).await {
+                        if persisted_target.is_some_and(|height| height != info.target_height) {
+                            return Err(format!(
+                                "request {key} resolved to a target that differs from its session"
+                            ));
+                        }
                         tracing::debug!(%session_id, request_id = key, "idempotent create: same session");
                         return Ok(Claimed::Recovered(info));
                     }
@@ -4323,7 +4590,7 @@ impl TranscodeManager {
                     // a peer may have re-reserved the key meanwhile — and
                     // re-decide from the top.
                     let mut requests = self.requests.lock().expect("requests mutex");
-                    if matches!(requests.get(key), Some((_, RequestState::Ready(sid))) if *sid == session_id)
+                    if matches!(requests.get(key), Some(RequestEntry { state: RequestState::Ready(sid), .. }) if *sid == session_id)
                     {
                         requests.remove(key);
                     }
@@ -4340,6 +4607,65 @@ impl TranscodeManager {
                 }
             }
         }
+    }
+
+    /// Resolve one bound stall request from the exact predecessor session.
+    /// All predecessor facts are copied under one session-map lock, so the
+    /// rung is observed once even if a seek or another device supersedes that
+    /// session immediately after this read.
+    async fn normalize_claimed_request(
+        &self,
+        request: &SessionRequest,
+        user_name: &str,
+    ) -> Result<(SessionRequest, Option<i64>), String> {
+        let Some(previous_session_id) = request.previous_session_id.as_deref() else {
+            let target_height = match request.kind {
+                SessionKind::Transcode { height } => Some(height),
+                SessionKind::Copy { .. } => None,
+            };
+            return Ok((request.clone(), target_height));
+        };
+        let Some(ReopenReason::Stall) = request.reopen_reason else {
+            return Err(invalid_reopen_error("unsupported reopen reason"));
+        };
+        let (previous_user, previous_playback, previous_file, previous_height, automatic, kind) = {
+            let sessions = self.sessions.lock().await;
+            let previous = sessions
+                .get(previous_session_id)
+                .ok_or_else(|| invalid_reopen_error("the previous session is no longer running"))?;
+            (
+                previous.user_name.clone(),
+                previous.playback_id.clone(),
+                previous.file_id,
+                previous.target_height,
+                previous.automatic,
+                previous.kind,
+            )
+        };
+        if previous_user != user_name
+            || previous_playback != request.playback_id
+            || previous_file != request.file_id
+        {
+            return Err(invalid_reopen_error(
+                "the previous session does not belong to this user, playback, and file",
+            ));
+        }
+
+        let mut normalized = request.clone();
+        normalized.automatic = automatic;
+        normalized.kind = if automatic {
+            SessionKind::Transcode {
+                height: one_rung_below(previous_height),
+            }
+        } else {
+            kind
+        };
+
+        let target_height = match normalized.kind {
+            SessionKind::Transcode { height } => height,
+            SessionKind::Copy { .. } => previous_height,
+        };
+        Ok((normalized, Some(target_height)))
     }
 
     /// Describe a session that already exists, for an idempotent re-create.
@@ -4362,6 +4688,8 @@ impl TranscodeManager {
             duration_ms,
             start_seconds: session.start_seconds,
             media_origin_seconds: session.media_origin_seconds,
+            target_height: session.target_height,
+            kind: session.kind,
             encoder,
             vod: session.cached,
         })
@@ -4458,8 +4786,11 @@ impl TranscodeManager {
 
     /// Capture the exact effective mode selected for a new resumable package.
     /// Callers persist this value before queueing any encoder work.
-    pub async fn effective_rate_control_for_new_offline_package(&self) -> EffectiveRateControl {
-        self.effective_rate_control(self.encoder().await)
+    pub async fn effective_rate_control_for_new_offline_package(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<EffectiveRateControl, String> {
+        Ok(self.effective_rate_control(self.encoder_for_file(file).await?))
     }
 
     #[cfg(test)]
@@ -4817,6 +5148,23 @@ impl TranscodeManager {
         auto_height_from_prior(current, source_height, prior, unix_ms())
     }
 
+    pub async fn auto_height_for_file(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+        prior: Option<&plurx_core::domain::NetworkPrior>,
+    ) -> i64 {
+        let source_height = file.and_then(|file| file.height);
+        if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
+            let current = source_height
+                .filter(|height| *height > 0)
+                .unwrap_or(AUTO_SOFTWARE_HEIGHT)
+                .clamp(MIN_HEIGHT, AUTO_SOFTWARE_HEIGHT);
+            auto_height_from_prior(current, source_height, prior, unix_ms())
+        } else {
+            self.auto_height(source_height, prior).await
+        }
+    }
+
     /// The admin's playback language preferences (Settings → Playback
     /// defaults), falling back to English/English/Auto.
     pub async fn lang_prefs(&self) -> plurx_core::tracks::LangPrefs {
@@ -4911,6 +5259,7 @@ impl TranscodeManager {
             0,
             user_name,
             playback_id,
+            false,
         )
         .await
     }
@@ -5036,6 +5385,7 @@ impl TranscodeManager {
         audio_offset_ms: i64,
         user_name: &str,
         playback_id: &str,
+        automatic: bool,
     ) -> Result<StartInfo, String> {
         let rate_control = self.rate_control_snapshot();
         // Before spawning, not after: the point is to never have two encoders
@@ -5078,7 +5428,7 @@ impl TranscodeManager {
         // hardware slot and no place in the queue — the work is already done,
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
-        let mut encoder = self.encoder().await;
+        let mut encoder = self.encoder_for_file(&file).await?;
         let opts = self.live_lookup_options(
             rate_control,
             encoder,
@@ -5090,7 +5440,17 @@ impl TranscodeManager {
             None,
         );
         if let Some(info) = self
-            .serve_cached(&file, &opts, encoder, &item_title, user_name, playback_id)
+            .serve_cached(
+                &file,
+                &opts,
+                encoder,
+                &item_title,
+                SessionOwner {
+                    user_name,
+                    playback_id,
+                    automatic,
+                },
+            )
             .await
         {
             return Ok(info);
@@ -5216,6 +5576,10 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
+            automatic,
+            kind: SessionKind::Transcode {
+                height: target_height,
+            },
             method: crate::delivery::Method::Transcode,
             start_seconds,
             // A transcode seeks accurately, so its media begins exactly where
@@ -5389,6 +5753,10 @@ impl TranscodeManager {
             duration_ms: file.duration_ms,
             start_seconds,
             media_origin_seconds: start_seconds,
+            target_height,
+            kind: SessionKind::Transcode {
+                height: target_height,
+            },
             encoder: encoder.label(),
             vod: false,
         })
@@ -5431,7 +5799,19 @@ impl TranscodeManager {
         };
         let mut retry_opts = opts.clone();
         if downgrade_pipeline {
-            retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+            let Some(fallback) = opts.pipeline.fallback() else {
+                tracing::error!(
+                    session = %sid,
+                    pipeline = opts.pipeline.name(),
+                    "renderer stalled and has no color-safe fallback; refusing to retry through a different color transform"
+                );
+                session.kill_child().await;
+                session.fail(PlaylistError::SessionFailed(
+                    "the Dolby Vision renderer stopped; no color-safe fallback is available".into(),
+                ));
+                return opts.effective_rate_control;
+            };
+            retry_opts.pipeline = fallback;
         } else {
             // A family-tuned default is part of the effective identity. A
             // VideoToolbox value, for example, is not a valid x264 CRF merely
@@ -5538,6 +5918,7 @@ impl TranscodeManager {
             options,
             user_name,
             playback_id,
+            false,
         )
         .await
     }
@@ -5552,6 +5933,7 @@ impl TranscodeManager {
         options: CopySessionOptions,
         user_name: &str,
         playback_id: &str,
+        automatic: bool,
     ) -> Result<StartInfo, String> {
         // Same reasoning as `start`; the copy path matters more if anything,
         // since an abandoned remux reads the source as fast as the disk allows.
@@ -5714,6 +6096,11 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
+            automatic,
+            kind: SessionKind::Copy {
+                aac: options.transcode_audio,
+                preserve_dolby_vision: options.preserve_dolby_vision,
+            },
             method: crate::delivery::Method::HlsCopy,
             start_seconds,
             media_origin_seconds,
@@ -5891,6 +6278,11 @@ impl TranscodeManager {
             duration_ms: file.duration_ms,
             start_seconds,
             media_origin_seconds,
+            target_height: file.height.unwrap_or(0),
+            kind: SessionKind::Copy {
+                aac: options.transcode_audio,
+                preserve_dolby_vision: options.preserve_dolby_vision,
+            },
             encoder: "copy",
             vod: false,
         })
@@ -6976,6 +7368,33 @@ fn bitrate_for_height(height: i64) -> u32 {
 /// height, a promise nothing here may downgrade.
 pub const LADDER_HEIGHTS: [i64; 4] = [360, 480, 720, 1080];
 
+/// Resolve exactly one step below a session's already-normalized height.
+/// Heights between published rungs land on the next lower rung; a session
+/// already at or below the ladder floor repeats the rung it is on, so the
+/// native client's own recovery budget owns the terminal outcome rather than
+/// a new server error path.
+///
+/// The floor is `current`, never `LADDER_HEIGHTS[0]`. An Auto session's
+/// resolved rung is not ladder-constrained below 360: `auto_height` follows a
+/// sub-360 source, and `auto_height_from_prior` settles at [`MIN_HEIGHT`] on
+/// exactly the starved links that stall and reopen. Answering those with 360
+/// would step the viewer *up* — onto a rung the server's own stored verdict
+/// recorded as starving — and would promise a rung a sub-360 source cannot
+/// feed, which is the advertised-vs-delivered defect `auto_height` already
+/// fixed once.
+fn one_rung_below(current: i64) -> i64 {
+    LADDER_HEIGHTS
+        .iter()
+        .rev()
+        .copied()
+        .find(|height| *height < current)
+        .unwrap_or(current)
+        // The same lower bound every other height in the system takes. A
+        // predecessor recorded at 0 — a remux of an unprobed source — must
+        // not normalize into a zero-height transcode.
+        .max(MIN_HEIGHT)
+}
+
 /// One advertised rung of the ladder.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Rung {
@@ -7253,6 +7672,12 @@ fn test_session(dir: PathBuf) -> Session {
         item_title: "T".into(),
         user_name: "paul".into(),
         playback_id: "pb-test".into(),
+        // The steppable shape: server-chosen height, and a kind that agrees
+        // with `method` and `target_height` below. A stall reopen bound to
+        // this session may move it down the ladder, so a test that wants the
+        // sticky case has to say so by overriding `automatic`.
+        automatic: true,
+        kind: SessionKind::Transcode { height: 720 },
         method: crate::delivery::Method::Transcode,
         start_seconds: 0.0,
         media_origin_seconds: 0.0,
@@ -7286,6 +7711,101 @@ fn test_session(dir: PathBuf) -> Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile5_file() -> plurx_core::domain::MediaFile {
+        plurx_core::domain::MediaFile {
+            id: 5,
+            item_id: 1,
+            path: PathBuf::from("/media/profile5.mkv"),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(1_000),
+            container: Some("matroska".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main 10".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            hdr: Some("dolby_vision".into()),
+            hdr_format: Some("Dolby Vision · Profile 5".into()),
+            bitrate: Some(20_000_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        }
+    }
+
+    #[test]
+    fn noncompatible_dolby_vision_is_never_guessed_through_zscale() {
+        let profile5 = profile5_file();
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&profile5), Ok(true));
+
+        let mut compatible = profile5.clone();
+        compatible.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&compatible), Ok(false));
+
+        let mut unknown = profile5.clone();
+        unknown.hdr_format = Some("Dolby Vision".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unknown)
+            .expect_err("unknown profile must be refused")
+            .contains("unknown"));
+
+        let mut unsupported = profile5;
+        unsupported.hdr_format = Some("Dolby Vision · Profile 4".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unsupported)
+            .expect_err("unproven non-compatible profile must be refused")
+            .contains("Profile 4"));
+    }
+
+    #[tokio::test]
+    async fn profile5_requires_the_probed_software_renderer_pair() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let dir = tempfile::tempdir().expect("work");
+        let caps = EncoderCaps {
+            qsv: true,
+            ..EncoderCaps::default()
+        };
+        let manager = TranscodeManager::new(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            caps.clone(),
+            Pipeline::VppQsv,
+        );
+        let file = profile5_file();
+        assert!(manager
+            .encoder_for_file(&file)
+            .await
+            .expect_err("an unproved renderer must refuse before spawn")
+            .contains("did not prove"));
+
+        let manager =
+            TranscodeManager::new(store, dir.path().join("proved"), caps, Pipeline::VppQsv)
+                .with_dovi_reshape(true);
+        manager
+            .dovi_proofs
+            .lock()
+            .expect("proof cache")
+            .insert(TranscodeManager::dovi_proof_key(&file), true);
+        let encoder = manager.encoder_for_file(&file).await.expect("proved route");
+        assert_eq!(encoder, Encoder::Software);
+        let opts = manager.options_for_tone_map(
+            encoder,
+            &file,
+            1080,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+        );
+        assert_eq!(opts.pipeline, Pipeline::DoviTonemapx);
+        assert_eq!(opts.tone_map, ToneMap::Tonemapx);
+        assert_eq!(manager.auto_height_for_file(Some(&file), None).await, 720);
+    }
 
     #[test]
     fn ffmpeg_gets_the_app_owned_runtime_cache() {
@@ -8990,6 +9510,60 @@ mod tests {
         );
     }
 
+    fn reopen_request(
+        file_id: i64,
+        playback_id: &str,
+        request_id: &str,
+        previous_session_id: &str,
+    ) -> SessionRequest {
+        SessionRequest {
+            file_id,
+            playback_id: playback_id.into(),
+            request_id: Some(request_id.into()),
+            automatic: true,
+            previous_session_id: Some(previous_session_id.into()),
+            reopen_reason: Some(ReopenReason::Stall),
+            // The handler's first Auto answer is intentionally not authority
+            // for a stall reopen; claim normalization replaces this from the
+            // named predecessor's already-resolved height.
+            kind: SessionKind::Transcode { height: 1080 },
+            start_seconds: 12.0,
+            audio_index: None,
+            subtitle_burn: None,
+            audio_offset_ms: 0,
+        }
+    }
+
+    struct ReopenFixture<'a> {
+        session_id: &'a str,
+        dir: PathBuf,
+        user_name: &'a str,
+        playback_id: &'a str,
+        file_id: i64,
+        target_height: i64,
+        automatic: bool,
+        kind: SessionKind,
+    }
+
+    async fn insert_reopen_fixture(manager: &TranscodeManager, fixture: ReopenFixture<'_>) {
+        let mut session = test_session(fixture.dir);
+        session.user_name = fixture.user_name.into();
+        session.playback_id = fixture.playback_id.into();
+        session.file_id = fixture.file_id;
+        session.target_height = fixture.target_height;
+        session.automatic = fixture.automatic;
+        session.kind = fixture.kind;
+        session.method = match fixture.kind {
+            SessionKind::Transcode { .. } => crate::delivery::Method::Transcode,
+            SessionKind::Copy { .. } => crate::delivery::Method::HlsCopy,
+        };
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert(fixture.session_id.into(), Arc::new(session));
+    }
+
     /// Build a session directory with a real playlist and real files, so the
     /// index, the retention window and the pruner are all exercised against
     /// what ffmpeg actually writes.
@@ -10513,6 +11087,8 @@ mod tests {
             item_title: "Watchdog Fixture".into(),
             user_name: "paul".into(),
             playback_id: "pb-watchdog".into(),
+            automatic: true,
+            kind: SessionKind::Transcode { height: 1080 },
             method: crate::delivery::Method::Transcode,
             start_seconds: 0.0,
             media_origin_seconds: 0.0,
@@ -11151,7 +11727,19 @@ mod tests {
         let encoder = mgr.encoder().await;
         let opts =
             mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
-        let look = || mgr.serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1");
+        let look = || {
+            mgr.serve_cached(
+                &file,
+                &opts,
+                encoder,
+                "Heat",
+                SessionOwner {
+                    user_name: "paul",
+                    playback_id: "pb-1",
+                    automatic: true,
+                },
+            )
+        };
 
         // Nothing claimed yet.
         assert!(look().await.is_none(), "an unknown recipe is a miss");
@@ -12143,7 +12731,17 @@ mod tests {
         let opts =
             mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
         assert!(mgr
-            .serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1")
+            .serve_cached(
+                &file,
+                &opts,
+                encoder,
+                "Heat",
+                SessionOwner {
+                    user_name: "paul",
+                    playback_id: "pb-1",
+                    automatic: true,
+                },
+            )
             .await
             .is_none());
     }
@@ -12373,6 +12971,9 @@ mod tests {
             file_id,
             playback_id: "pb-1".into(),
             request_id: Some("req-1".into()),
+            automatic: false,
+            previous_session_id: None,
+            reopen_reason: None,
             kind: SessionKind::Transcode { height: 720 },
             start_seconds: 0.0,
             audio_index: None,
@@ -12380,14 +12981,34 @@ mod tests {
             audio_offset_ms: 0,
         };
 
+        // The idempotency identity is `intent_fingerprint`, so that is what
+        // these guards have to name. Asserting against anything else lets a
+        // field silently leave the real key while the test stays green.
         let shifted = SessionRequest {
             audio_offset_ms: 250,
             ..request.clone()
         };
         assert_ne!(
-            shifted.fingerprint(),
-            request.fingerprint(),
+            shifted.intent_fingerprint("paul"),
+            request.intent_fingerprint("paul"),
             "session-scoped audio sync must identify different output bytes"
+        );
+        // `user_name` and `playback_id` are in the key too: one `request_id`
+        // reused by two viewers, or by two players on one account, must not
+        // recover each other's session.
+        assert_ne!(
+            request.intent_fingerprint("someone-else"),
+            request.intent_fingerprint("paul"),
+            "one request id reused by two users must not collide"
+        );
+        let other_player = SessionRequest {
+            playback_id: "pb-2".into(),
+            ..request.clone()
+        };
+        assert_ne!(
+            other_player.intent_fingerprint("paul"),
+            request.intent_fingerprint("paul"),
+            "one request id reused by two players must not collide"
         );
 
         let first = mgr.create_session(&request, "paul").await.expect("create");
@@ -12453,6 +13074,9 @@ mod tests {
             file_id,
             playback_id: "pb-race".into(),
             request_id: Some("req-race".into()),
+            automatic: false,
+            previous_session_id: None,
+            reopen_reason: None,
             kind: SessionKind::Transcode { height: 720 },
             start_seconds: 0.0,
             audio_index: None,
@@ -12496,6 +13120,9 @@ mod tests {
             file_id: 999_999, // nothing has this id, so the create fails
             playback_id: "pb-fail".into(),
             request_id: Some("req-fail".into()),
+            automatic: false,
+            previous_session_id: None,
+            reopen_reason: None,
             kind: SessionKind::Transcode { height: 720 },
             start_seconds: 0.0,
             audio_index: None,
@@ -12513,6 +13140,488 @@ mod tests {
             .await
             .expect("a failed attempt must not bind its request id");
         assert!(mgr.stop_session(&info.session_id, "test").await);
+    }
+
+    /// N4 server acceptance: the first stall reopen resolves one rung from the
+    /// predecessor, persists that answer in the idempotency claim, and a wire
+    /// replay cannot resolve again after the predecessor has been superseded.
+    #[tokio::test]
+    async fn transport_replay_of_a_stall_reopen_returns_one_session_and_one_target() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        store
+            .put_setting(keys::SW_POOL_THREADS, "64")
+            .await
+            .expect("pool headroom");
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        let original = SessionRequest {
+            file_id,
+            playback_id: "native-replay".into(),
+            request_id: Some("native-original".into()),
+            automatic: true,
+            previous_session_id: None,
+            reopen_reason: None,
+            kind: SessionKind::Transcode { height: 1080 },
+            start_seconds: 0.0,
+            audio_index: None,
+            subtitle_burn: None,
+            audio_offset_ms: 0,
+        };
+        let previous = mgr
+            .create_session(&original, "paul")
+            .await
+            .expect("original Auto session");
+
+        let reopen = reopen_request(
+            file_id,
+            "native-replay",
+            "native-stall-attempt",
+            &previous.session_id,
+        );
+        let first = mgr
+            .create_session(&reopen, "paul")
+            .await
+            .expect("stall reopen");
+        assert_eq!(first.target_height, 720);
+        assert_eq!(first.kind, SessionKind::Transcode { height: 720 });
+
+        // Simulate a transport replay after mutable Auto inputs changed. The
+        // body is still Auto, so its initial pre-claim numeric answer is not
+        // allowed to create a conflict or become a second ladder step.
+        let replay = SessionRequest {
+            kind: SessionKind::Transcode { height: 360 },
+            ..reopen
+        };
+        let again = mgr
+            .create_session(&replay, "paul")
+            .await
+            .expect("transport replay");
+        assert_eq!(again.session_id, first.session_id);
+        assert_eq!(again.target_height, 720);
+        assert_eq!(mgr.active_sessions().await, 1);
+        assert!(mgr.stop_session(&first.session_id, "test").await);
+    }
+
+    /// A queued user seek may replace the playback while the stall request is
+    /// being claimed. The stall's answer remains a function of its named
+    /// predecessor, never whichever same-playback session is newest later.
+    #[tokio::test]
+    async fn a_queued_seek_racing_a_stall_does_not_step_from_the_seek() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let old_dir = tempfile::tempdir().expect("old session");
+        let seek_dir = tempfile::tempdir().expect("seek session");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "stalled-session",
+                dir: old_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "shared-player",
+                file_id: 41,
+                target_height: 1080,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 1080 },
+            },
+        )
+        .await;
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "queued-seek-session",
+                dir: seek_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "shared-player",
+                file_id: 41,
+                target_height: 480,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 480 },
+            },
+        )
+        .await;
+
+        let request = reopen_request(41, "shared-player", "stall-vs-seek", "stalled-session");
+        let Claimed::Mine(claim, normalized) = mgr
+            .claim_request("stall-vs-seek", &request, "paul")
+            .await
+            .expect("bound claim")
+        else {
+            panic!("new request owns its claim")
+        };
+        assert_eq!(normalized.kind, SessionKind::Transcode { height: 720 });
+        assert_ne!(normalized.kind, SessionKind::Transcode { height: 360 });
+        assert_eq!(
+            mgr.requests
+                .lock()
+                .expect("requests")
+                .get("stall-vs-seek")
+                .and_then(|entry| entry.target_height),
+            Some(720),
+            "the target is stored before either session can be superseded"
+        );
+        drop(claim);
+    }
+
+    /// Track intent is orthogonal to height normalization. A stall claim keeps
+    /// the chosen audio/subtitle fields, while a later user track action that
+    /// omits the stall cause follows the ordinary (unstepped) create path.
+    #[tokio::test]
+    async fn an_audio_or_subtitle_change_during_a_stall_keeps_its_own_request() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let previous_dir = tempfile::tempdir().expect("previous session");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "track-stall",
+                dir: previous_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "track-player",
+                file_id: 52,
+                target_height: 1080,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 1080 },
+            },
+        )
+        .await;
+
+        let request = SessionRequest {
+            audio_index: Some(2),
+            subtitle_burn: Some(5),
+            ..reopen_request(52, "track-player", "stall-track", "track-stall")
+        };
+        let Claimed::Mine(stall_claim, normalized) = mgr
+            .claim_request("stall-track", &request, "paul")
+            .await
+            .expect("stall claim")
+        else {
+            panic!("new request owns its claim")
+        };
+        assert_eq!(normalized.kind, SessionKind::Transcode { height: 720 });
+        assert_eq!(normalized.audio_index, Some(2));
+        assert_eq!(normalized.subtitle_burn, Some(5));
+        drop(stall_claim);
+
+        let track_change = SessionRequest {
+            request_id: Some("user-track-change".into()),
+            previous_session_id: None,
+            reopen_reason: None,
+            kind: SessionKind::Transcode { height: 1080 },
+            ..request
+        };
+        let Claimed::Mine(track_claim, ordinary) = mgr
+            .claim_request("user-track-change", &track_change, "paul")
+            .await
+            .expect("ordinary track claim")
+        else {
+            panic!("new request owns its claim")
+        };
+        assert_eq!(ordinary.kind, SessionKind::Transcode { height: 1080 });
+        assert_eq!(ordinary.audio_index, Some(2));
+        assert_eq!(ordinary.subtitle_burn, Some(5));
+        drop(track_claim);
+    }
+
+    /// The ladder floor is a same-rung result, not a fifth hidden rung and not
+    /// a new server terminal error. The server repeats the rung every time and
+    /// bounds nothing: the client's own recovery budget owns the retry count
+    /// and the eventual visible failure. Nothing here asserts "once", because
+    /// no code in this repo implements a "once" — the reopens below prove the
+    /// repeat is unconditional.
+    #[tokio::test]
+    async fn a_stall_at_the_floor_repeats_the_same_rung() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let previous_dir = tempfile::tempdir().expect("previous session");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "floor-session",
+                dir: previous_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "floor-player",
+                file_id: 63,
+                target_height: 360,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 360 },
+            },
+        )
+        .await;
+        // Three separate attempts, each with its own request id: the server
+        // answers 360 every time and never produces a terminal refusal of its
+        // own. That is the whole server half of "one retry, then the existing
+        // terminal surface" — the count lives in the client.
+        for attempt in ["floor-retry-1", "floor-retry-2", "floor-retry-3"] {
+            let request = reopen_request(63, "floor-player", attempt, "floor-session");
+            let Claimed::Mine(claim, normalized) = mgr
+                .claim_request(attempt, &request, "paul")
+                .await
+                .expect("floor claim")
+            else {
+                panic!("new request owns its claim")
+            };
+            assert_eq!(normalized.kind, SessionKind::Transcode { height: 360 });
+            assert_eq!(
+                mgr.requests
+                    .lock()
+                    .expect("requests")
+                    .get(attempt)
+                    .and_then(|entry| entry.target_height),
+                Some(360)
+            );
+            drop(claim);
+        }
+    }
+
+    /// An Auto session's resolved rung is NOT ladder-constrained below 360:
+    /// `auto_height` follows a sub-360 source, and `auto_height_from_prior`
+    /// settles at `MIN_HEIGHT` on a starved link — which is exactly the
+    /// population that stalls and reopens. The way down must never hand such a
+    /// session a HIGHER rung. Reverting `one_rung_below`'s `unwrap_or(current)`
+    /// to `unwrap_or(LADDER_HEIGHTS[0])` fails every case here.
+    #[tokio::test]
+    async fn a_stall_below_the_ladder_floor_never_steps_up() {
+        use plurx_core::store::SqliteStore;
+
+        // The unit the defect lived in, across the whole sub-floor range.
+        assert_eq!(one_rung_below(MIN_HEIGHT), MIN_HEIGHT);
+        assert_eq!(one_rung_below(240), 240);
+        assert_eq!(one_rung_below(288), 288);
+        assert_eq!(one_rung_below(360), 360);
+        assert_eq!(one_rung_below(480), 360, "an on-ladder step still steps");
+        // A remux of an unprobed source records target_height 0; normalizing
+        // that must not produce a zero-height transcode.
+        assert_eq!(one_rung_below(0), MIN_HEIGHT);
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+
+        // 144 is where a starved-rung prior puts a client; 240 is a 240p
+        // source's honest Auto answer. Both used to normalize to 360.
+        for (index, height) in [MIN_HEIGHT, 240].into_iter().enumerate() {
+            let session_id = format!("sub-floor-{height}");
+            let playback_id = format!("sub-floor-player-{height}");
+            let dir = tempfile::tempdir().expect("previous session");
+            insert_reopen_fixture(
+                &mgr,
+                ReopenFixture {
+                    session_id: &session_id,
+                    dir: dir.path().to_path_buf(),
+                    user_name: "paul",
+                    playback_id: &playback_id,
+                    file_id: 64 + index as i64,
+                    target_height: height,
+                    automatic: true,
+                    kind: SessionKind::Transcode { height },
+                },
+            )
+            .await;
+            let attempt = format!("sub-floor-retry-{height}");
+            let request = reopen_request(64 + index as i64, &playback_id, &attempt, &session_id);
+            let Claimed::Mine(claim, normalized) = mgr
+                .claim_request(&attempt, &request, "paul")
+                .await
+                .expect("sub-floor claim")
+            else {
+                panic!("new request owns its claim")
+            };
+            assert_eq!(
+                normalized.kind,
+                SessionKind::Transcode { height },
+                "a {height}p Auto stall reopen must repeat {height}p, not step up to a ladder rung"
+            );
+            assert_eq!(
+                mgr.requests
+                    .lock()
+                    .expect("requests")
+                    .get(&attempt)
+                    .and_then(|entry| entry.target_height),
+                Some(height),
+                "the persisted target must match the answer the client gets"
+            );
+            drop(claim);
+        }
+    }
+
+    /// `playback_id` is a supersession key, not sufficient identity for a
+    /// recovery. The exact session id plus user and file decide which device's
+    /// rung is eligible even if two clients accidentally reuse that key.
+    #[tokio::test]
+    async fn two_devices_sharing_a_playback_id_bind_reopens_to_the_named_session() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let a_dir = tempfile::tempdir().expect("device a");
+        let b_dir = tempfile::tempdir().expect("device b");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "device-a-session",
+                dir: a_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "duplicated-player-id",
+                file_id: 74,
+                target_height: 1080,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 1080 },
+            },
+        )
+        .await;
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "device-b-session",
+                dir: b_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "duplicated-player-id",
+                file_id: 74,
+                target_height: 480,
+                automatic: true,
+                kind: SessionKind::Transcode { height: 480 },
+            },
+        )
+        .await;
+
+        let request = reopen_request(
+            74,
+            "duplicated-player-id",
+            "device-a-reopen",
+            "device-a-session",
+        );
+        let Claimed::Mine(claim, normalized) = mgr
+            .claim_request("device-a-reopen", &request, "paul")
+            .await
+            .expect("device A claim")
+        else {
+            panic!("new request owns its claim")
+        };
+        assert_eq!(normalized.kind, SessionKind::Transcode { height: 720 });
+        drop(claim);
+
+        let device_b = SessionRequest {
+            request_id: Some("device-b-reopen".into()),
+            previous_session_id: Some("device-b-session".into()),
+            ..request.clone()
+        };
+        let Claimed::Mine(device_b_claim, device_b_normalized) = mgr
+            .claim_request("device-b-reopen", &device_b, "paul")
+            .await
+            .expect("device B claim")
+        else {
+            panic!("the other device owns its claim")
+        };
+        assert_eq!(
+            device_b_normalized.kind,
+            SessionKind::Transcode { height: 360 },
+            "the exact predecessor, not the shared playback id, chooses the rung"
+        );
+        drop(device_b_claim);
+
+        let foreign_user = SessionRequest {
+            request_id: Some("foreign-user-reopen".into()),
+            ..request
+        };
+        assert!(mgr
+            .claim_request("foreign-user-reopen", &foreign_user, "other-user")
+            .await
+            .is_err_and(|error| error.contains("does not belong")));
+    }
+
+    /// The previous session's normalized mode is authoritative. A client that
+    /// accidentally labels a manual-height retry as Auto still receives the
+    /// viewer's chosen rung rather than one below it.
+    #[tokio::test]
+    async fn a_manual_height_session_is_not_stepped() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let previous_dir = tempfile::tempdir().expect("previous session");
+        let mgr = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        insert_reopen_fixture(
+            &mgr,
+            ReopenFixture {
+                session_id: "manual-session",
+                dir: previous_dir.path().to_path_buf(),
+                user_name: "paul",
+                playback_id: "manual-player",
+                file_id: 85,
+                target_height: 720,
+                automatic: false,
+                kind: SessionKind::Transcode { height: 720 },
+            },
+        )
+        .await;
+        let request = reopen_request(85, "manual-player", "manual-retry", "manual-session");
+        let Claimed::Mine(claim, normalized) = mgr
+            .claim_request("manual-retry", &request, "paul")
+            .await
+            .expect("manual claim")
+        else {
+            panic!("new request owns its claim")
+        };
+        assert!(!normalized.automatic);
+        assert_eq!(normalized.kind, SessionKind::Transcode { height: 720 });
+        assert_eq!(
+            mgr.requests
+                .lock()
+                .expect("requests")
+                .get("manual-retry")
+                .and_then(|entry| entry.target_height),
+            Some(720)
+        );
+        drop(claim);
     }
 
     #[tokio::test]
