@@ -562,14 +562,12 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
     // realtime while the GPU graph measured 4.9× (PERF-PLAN §5).
     let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
     let text_burn = opts.subtitle_burn.as_ref().is_some_and(|b| !b.bitmap);
-    let burn_size = if bitmap_burn {
-        output_size(source, opts.target_height)
-    } else {
-        None
-    };
+    // Always give GPU scalers the same explicit even, no-upscale dimensions
+    // the CPU path promises. `w=-1` can resolve to an odd NV12 width.
+    let gpu_size = output_size(source, opts.target_height);
     if let Some(gpu) = opts.pipeline.filters(
-        burn_size.map(|(w, _)| w),
-        burn_size.map_or(opts.target_height, |(_, h)| h),
+        gpu_size.map(|(w, _)| w),
+        gpu_size.map_or(opts.target_height, |(_, h)| h),
         source.hdr.as_deref(),
     ) {
         if (bitmap_burn || text_burn)
@@ -604,7 +602,7 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
                 // hwdownload, so an inferred `t=linear` mis-maps the PQ signal to
                 // a flat gray picture — the exact 4K-HDR/DV symptom. HDR is
                 // BT.2020; PQ (HDR10/HDR10+/DV) vs HLG differ only in transfer.
-                let tin = if source.hdr.as_deref() == Some("hlg") {
+                let tin = if routing_hdr(source) == Some("hlg") {
                     "arib-std-b67"
                 } else {
                     "smpte2084"
@@ -701,6 +699,14 @@ pub fn routing_hdr(file: &MediaFile) -> Option<&str> {
                 .is_some_and(|f| f.contains("HDR10-compatible")) =>
         {
             Some("hdr10")
+        }
+        Some("dolby_vision")
+            if file
+                .hdr_format
+                .as_deref()
+                .is_some_and(|f| f.contains("HLG-compatible")) =>
+        {
+            Some("hlg")
         }
         other => other,
     }
@@ -1736,6 +1742,19 @@ mod tests {
         .join(" ");
         assert!(!joined.contains("apply_dolbyvision=1"), "{joined}");
         assert!(joined.contains("zscale="), "{joined}");
+
+        let mut hlg_compatible = compatible;
+        hlg_compatible.hdr_format = Some("Dolby Vision · Profile 8 (HLG-compatible)".into());
+        let joined = hls_args(
+            &hlg_compatible,
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(joined.contains("tin=arib-std-b67"), "{joined}");
+        assert!(!joined.contains("tin=smpte2084"), "{joined}");
     }
 
     #[test]
@@ -1817,7 +1836,7 @@ mod tests {
 
         assert!(
             joined.contains(
-                "vpp_qsv=w=-1:h=1080:tonemap=1:format=nv12,hwdownload,format=nv12,subtitles='/cache/scary-forced.vtt',hwupload=extra_hw_frames=64,format=qsv"
+                "vpp_qsv=w=1920:h=1080:tonemap=1:format=nv12,hwdownload,format=nv12,subtitles='/cache/scary-forced.vtt',hwupload=extra_hw_frames=64,format=qsv"
             ),
             "{joined}"
         );

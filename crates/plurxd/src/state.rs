@@ -1694,7 +1694,7 @@ impl JobManager {
             // The rung a viewer would actually be given, so the entry matches
             // what a real playback looks up. Asking the manager rather than
             // assuming is what keeps the two in step when Auto's policy moves.
-            let height = transcode.auto_height(file.height, None).await;
+            let height = transcode.auto_height_for_file(Some(&file), None).await;
             match transcode.produce(&file, height, deadline).await {
                 Ok(Some(made)) => {
                     produced += 1;

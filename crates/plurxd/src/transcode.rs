@@ -3144,6 +3144,7 @@ pub struct TranscodeManager {
     /// Whether boot proved the exact software/Vulkan/libplacebo/software
     /// renderer used for non-backward-compatible Dolby Vision.
     dovi_reshape: bool,
+    dovi_proofs: std::sync::Mutex<HashMap<String, bool>>,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -3203,6 +3204,7 @@ impl TranscodeManager {
             offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
             dovi_reshape: false,
+            dovi_proofs: std::sync::Mutex::new(HashMap::new()),
             cached_limits: std::sync::RwLock::new(None),
             #[cfg(test)]
             playlist_wait_override_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3429,12 +3431,42 @@ impl TranscodeManager {
         }
     }
 
-    fn require_dovi_renderer(&self, file: &plurx_core::domain::MediaFile) -> Result<bool, String> {
+    fn dovi_proof_key(file: &plurx_core::domain::MediaFile) -> String {
+        format!("{}:{}:{}", file.path.display(), file.size, file.mtime)
+    }
+
+    async fn require_dovi_renderer(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<bool, String> {
         let required = Self::needs_dovi_reshape(file)?;
         if required && !self.dovi_reshape {
             return Err(unsupported_build_error(
                 "this ffmpeg did not prove the Vulkan libplacebo Dolby Vision renderer required for Profile 5",
             ));
+        }
+        if required {
+            let key = Self::dovi_proof_key(file);
+            let cached = self
+                .dovi_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied();
+            let proved = match cached {
+                Some(proved) => proved,
+                None => {
+                    let proved = crate::ffmpeg::dovi_reshape_changes_pixels(file).await;
+                    self.dovi_proofs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, proved);
+                    proved
+                }
+            };
+            if !proved {
+                return Err(unsupported_build_error("this source did not prove that Dolby Vision RPU application changes pixels through the production renderer"));
+            }
         }
         Ok(required)
     }
@@ -3443,7 +3475,7 @@ impl TranscodeManager {
         &self,
         file: &plurx_core::domain::MediaFile,
     ) -> Result<Encoder, String> {
-        if self.require_dovi_renderer(file)? {
+        if self.require_dovi_renderer(file).await? {
             // This is the only pairing boot probes. Software decode preserves
             // the RPU AVFrame side data and software encode avoids mixing a
             // Vulkan filter device with QSV/VAAPI filter devices.
@@ -5114,6 +5146,23 @@ impl TranscodeManager {
             .unwrap_or(max)
             .clamp(MIN_HEIGHT, max);
         auto_height_from_prior(current, source_height, prior, unix_ms())
+    }
+
+    pub async fn auto_height_for_file(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+        prior: Option<&plurx_core::domain::NetworkPrior>,
+    ) -> i64 {
+        let source_height = file.and_then(|file| file.height);
+        if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
+            let current = source_height
+                .filter(|height| *height > 0)
+                .unwrap_or(AUTO_SOFTWARE_HEIGHT)
+                .clamp(MIN_HEIGHT, AUTO_SOFTWARE_HEIGHT);
+            auto_height_from_prior(current, source_height, prior, unix_ms())
+        } else {
+            self.auto_height(source_height, prior).await
+        }
     }
 
     /// The admin's playback language preferences (Settings → Playback
@@ -7736,6 +7785,11 @@ mod tests {
         let manager =
             TranscodeManager::new(store, dir.path().join("proved"), caps, Pipeline::VppQsv)
                 .with_dovi_reshape(true);
+        manager
+            .dovi_proofs
+            .lock()
+            .expect("proof cache")
+            .insert(TranscodeManager::dovi_proof_key(&file), true);
         let encoder = manager.encoder_for_file(&file).await.expect("proved route");
         assert_eq!(encoder, Encoder::Software);
         let opts = manager.options_for_tone_map(
@@ -7750,6 +7804,7 @@ mod tests {
         );
         assert_eq!(opts.pipeline, Pipeline::DoviLibplacebo);
         assert_eq!(opts.tone_map, ToneMap::Libplacebo);
+        assert_eq!(manager.auto_height_for_file(Some(&file), None).await, 720);
     }
 
     #[test]

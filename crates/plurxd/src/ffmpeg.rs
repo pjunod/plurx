@@ -6,7 +6,10 @@
 //! it in one place, once per process, is what keeps the answer consistent —
 //! and keeps a stream from failing to start because one path guessed.
 
-use plurx_core::transcode::Pacing;
+use std::time::Duration;
+
+use plurx_core::domain::MediaFile;
+use plurx_core::transcode::{output_size, Pacing, Pipeline};
 
 /// An override wins only when it names something. An empty `PLURX_FFMPEG=` is
 /// what a Compose file produces for an unset variable, and treating that as a
@@ -171,11 +174,11 @@ pub async fn has_dovi_reshape() -> bool {
                 "null",
                 "-",
             ];
-            let passed = tokio::process::Command::new(ffmpeg_bin())
-                .args(args)
-                .status()
+            let mut command = tokio::process::Command::new(ffmpeg_bin());
+            command.args(args).kill_on_drop(true);
+            let passed = tokio::time::timeout(Duration::from_secs(15), command.status())
                 .await
-                .is_ok_and(|status| status.success());
+                .is_ok_and(|result| result.is_ok_and(|status| status.success()));
             if passed {
                 tracing::info!("ffmpeg proved the Dolby Vision libplacebo renderer");
             } else {
@@ -186,6 +189,72 @@ pub async fn has_dovi_reshape() -> bool {
             passed
         })
         .await
+}
+
+async fn dovi_probe_output(file: &MediaFile, apply: bool) -> Result<Vec<String>, String> {
+    let seek = file
+        .duration_ms
+        .map(|duration| (duration / 5).saturating_sub(1_000) as f64 / 1_000.0)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let (width, height) = output_size(file, 720)
+        .ok_or_else(|| "Dolby Vision pixel probe has no valid output size".to_owned())?;
+    let filter = Pipeline::DoviLibplacebo
+        .filters(Some(width), height, Some("dolby_vision"))
+        .ok_or_else(|| "Dolby Vision renderer produced no filter graph".to_owned())?
+        .replace(
+            "apply_dolbyvision=1",
+            &format!("apply_dolbyvision={}", u8::from(apply)),
+        );
+    let mut command = tokio::process::Command::new(ffmpeg_bin());
+    command
+        .kill_on_drop(true)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"])
+        .args(["-ss", &format!("{seek:.3}"), "-i"])
+        .arg(&file.path)
+        .args(["-map", "0:v:0", "-frames:v", "3", "-an", "-vf"])
+        .arg(filter)
+        .args(["-f", "framemd5", "-"]);
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "Dolby Vision pixel probe timed out".to_owned())?
+        .map_err(|error| format!("starting Dolby Vision pixel probe: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Dolby Vision pixel probe exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let frames: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!frames.is_empty())
+        .then_some(frames)
+        .ok_or_else(|| "Dolby Vision pixel probe produced no frame hashes".to_owned())
+}
+
+/// Prove, on the requested Profile 5 source, that the decoder exports RPU side
+/// data through the production upload and that libplacebo changes pixels when
+/// Dolby Vision application is enabled. A mere option/Vulkan probe cannot make
+/// that claim because a frame with no DOVI metadata makes the option a no-op.
+pub async fn dovi_reshape_changes_pixels(file: &MediaFile) -> bool {
+    let enabled = dovi_probe_output(file, true).await;
+    let disabled = dovi_probe_output(file, false).await;
+    match (enabled, disabled) {
+        (Ok(enabled), Ok(disabled)) if enabled != disabled => true,
+        (Ok(_), Ok(_)) => {
+            tracing::warn!(file = %file.path.display(), "Dolby Vision RPU mutation did not change sampled pixels");
+            false
+        }
+        (enabled, disabled) => {
+            tracing::warn!(file = %file.path.display(), ?enabled, ?disabled, "could not prove Dolby Vision RPU pixel reshaping");
+            false
+        }
+    }
 }
 
 /// Scan `ffmpeg -h full` for the pacing options.
