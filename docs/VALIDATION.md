@@ -159,8 +159,8 @@ proved and nothing was found broken. The production deadline stays at three
 seconds because it is a server safety bound, so the suite absorbs load by
 re-attempting a deadlined step from a reset target instead of by relaxing it.
 
-**How to tell it from a real regression.** The two failures look different at
-the client, and the check now says which one it saw:
+**How to tell it from a real regression.** The failures look different at the
+client, and the check now says which of these three it saw:
 
 - A **replicated deadline** names itself, states that the bound was neither
   proved nor violated, and points back at this section. Rerun `make
