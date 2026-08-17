@@ -48,6 +48,11 @@ pub enum Pipeline {
     /// download after the map — `tonemap_opencl` outputs OpenCL surfaces the
     /// H.264 encoders cannot take directly.
     TonemapOpencl,
+    /// Dolby Vision RPU reshaping through Jellyfin FFmpeg's SIMD software
+    /// filter. This is intentionally separate from the ordinary HDR10
+    /// candidate list: it has a different decode contract and must never fall
+    /// back to the non-Dolby-aware CPU zscale graph.
+    DoviTonemapx,
     /// hwdownload → CPU float tone-map → the encoder's own hwupload. Always
     /// available, always correct, and slow in exactly the case that matters.
     Cpu,
@@ -70,12 +75,17 @@ impl Pipeline {
             Pipeline::TonemapVaapi => "tonemap_vaapi",
             Pipeline::Libplacebo => "libplacebo",
             Pipeline::TonemapOpencl => "tonemap_opencl",
+            Pipeline::DoviTonemapx => "dovi_tonemapx",
             Pipeline::Cpu => "cpu",
         }
     }
 
     pub fn parse(s: &str) -> Option<Pipeline> {
-        CANDIDATES.iter().copied().find(|p| p.name() == s)
+        CANDIDATES
+            .iter()
+            .copied()
+            .chain(std::iter::once(Pipeline::DoviTonemapx))
+            .find(|p| p.name() == s)
     }
 
     /// Human label for the overlay and the admin log.
@@ -85,13 +95,14 @@ impl Pipeline {
             Pipeline::TonemapVaapi => "GPU tone-map (VA-API)",
             Pipeline::Libplacebo => "GPU tone-map (Vulkan)",
             Pipeline::TonemapOpencl => "GPU tone-map (OpenCL)",
+            Pipeline::DoviTonemapx => "Dolby Vision reshape (tonemapx)",
             Pipeline::Cpu => "CPU tone-map",
         }
     }
 
     /// True when frames stay on the GPU from decode to encode.
     pub fn on_gpu(self) -> bool {
-        self != Pipeline::Cpu
+        !matches!(self, Pipeline::Cpu | Pipeline::DoviTonemapx)
     }
 
     /// Can this pipeline pair with `encoder`?
@@ -107,6 +118,10 @@ impl Pipeline {
             Pipeline::VppQsv => encoder == Encoder::Qsv,
             Pipeline::TonemapVaapi => encoder == Encoder::Vaapi,
             Pipeline::Libplacebo | Pipeline::TonemapOpencl => encoder != Encoder::Software,
+            // The proved implementation deliberately uses software decode and
+            // encode. That keeps DOVI frame side data attached and gives the
+            // SIMD filter ordinary system-memory frames.
+            Pipeline::DoviTonemapx => encoder == Encoder::Software,
             Pipeline::Cpu => true,
         }
     }
@@ -124,6 +139,8 @@ impl Pipeline {
     pub fn handles(self, hdr_format: Option<&str>) -> bool {
         match (self, hdr_format) {
             (Pipeline::Cpu, _) => true,
+            (Pipeline::DoviTonemapx, Some("dolby_vision")) => true,
+            (Pipeline::DoviTonemapx, _) => false,
             // Nothing to map. The graph is still allowed — its scaler is the
             // reason — and the tone-map step simply drops out.
             (_, None) => true,
@@ -153,7 +170,10 @@ impl Pipeline {
             // caller's existing decode choice stands, and the filter chain
             // uploads. Deriving decode flags here would fight `decode_setup`,
             // which knows things this type does not (source codec, bit depth).
-            Pipeline::Libplacebo | Pipeline::TonemapOpencl | Pipeline::Cpu => Vec::new(),
+            Pipeline::Libplacebo
+            | Pipeline::TonemapOpencl
+            | Pipeline::DoviTonemapx
+            | Pipeline::Cpu => Vec::new(),
         }
     }
 
@@ -259,7 +279,22 @@ impl Pipeline {
                     format!("{scale},format=nv12")
                 }
             }
+            Pipeline::DoviTonemapx => {
+                let h = height.max(2);
+                format!(
+                    "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:\
+                     primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,\
+                     scale={w}:{h},format=yuv420p"
+                )
+            }
         })
+    }
+
+    /// Whether the renderer requires software-decoded frames. Dolby Vision
+    /// metadata is parsed onto AVFrames by the HEVC decoder; an inherited
+    /// hardware decode/download path is not allowed to drop it silently.
+    pub fn requires_software_decode(self) -> bool {
+        self == Pipeline::DoviTonemapx
     }
 
     /// The pipeline this session actually gets, given the one the node proved
@@ -358,7 +393,10 @@ impl Pipeline {
     /// viewer is waiting; the second attempt should be the one that always
     /// works.
     pub fn fallback(self) -> Option<Pipeline> {
-        (self != Pipeline::Cpu).then_some(Pipeline::Cpu)
+        match self {
+            Pipeline::Cpu | Pipeline::DoviTonemapx => None,
+            _ => Some(Pipeline::Cpu),
+        }
     }
 }
 
@@ -376,6 +414,46 @@ mod tests {
         assert_eq!(Pipeline::parse("gpu-magic"), None);
         // A stored preference from a future version must not panic anything.
         assert_eq!(Pipeline::parse(""), None);
+        assert_eq!(
+            Pipeline::parse("dovi_tonemapx"),
+            Some(Pipeline::DoviTonemapx)
+        );
+        assert!(
+            !CANDIDATES.contains(&Pipeline::DoviTonemapx),
+            "the Profile 5 renderer must be probed/admitted independently"
+        );
+    }
+
+    #[test]
+    fn profile5_renderer_has_one_safe_pairing_and_no_unsafe_fallback() {
+        let p = Pipeline::DoviTonemapx;
+        assert!(p.pairs_with(Encoder::Software));
+        for encoder in [
+            Encoder::Nvenc,
+            Encoder::Qsv,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            assert!(!p.pairs_with(encoder), "unprobed pairing: {encoder:?}");
+        }
+        assert!(p.handles(Some("dolby_vision")));
+        assert!(!p.handles(Some("hdr10")));
+        assert!(p.requires_software_decode());
+        assert_eq!(p.fallback(), None);
+
+        let graph = p
+            .filters(Some(1920), 1080, Some("dolby_vision"))
+            .expect("Profile 5 graph");
+        let reshape = graph.find("tonemapx=").expect("tonemapx transform");
+        assert_eq!(reshape, 0, "Dolby reshape must precede scale: {graph}");
+        assert!(graph.contains("apply_dovi=1"), "{graph}");
+        assert!(graph.contains("scale=1920:1080"), "{graph}");
+        assert!(graph.ends_with("format=yuv420p"), "{graph}");
+        assert!(!graph.contains("hwupload"), "{graph}");
+        assert!(!graph.contains("libplacebo"), "{graph}");
+        assert!(!graph.contains("setparams"), "{graph}");
+        assert!(!graph.contains("zscale"), "{graph}");
+        assert!(!graph[..reshape].contains("scale"), "{graph}");
     }
 
     /// The CPU chain is the floor: it pairs with everything, handles

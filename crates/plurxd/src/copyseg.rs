@@ -336,6 +336,18 @@ pub async fn run<R: AsyncRead + Unpin>(
                                 "a fragment arrived before the moov".into(),
                             );
                         };
+                        match fmp4::promote_hevc_parameter_sets(&mut init, &fragment) {
+                            Ok(true) => tracing::info!(
+                                session = %session_id,
+                                "promoted in-band HEVC parameter sets into the HLS init segment"
+                            ),
+                            Ok(false) => {}
+                            Err(e) => {
+                                return Outcome::Unsupported(format!(
+                                    "preparing the HLS init segment: {e}"
+                                ));
+                            }
+                        }
                         match fmp4::promote_hdr10_static_metadata(&mut init, &fragment) {
                             Ok(true) => tracing::info!(
                                 session = %session_id,

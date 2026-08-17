@@ -127,6 +127,36 @@ data class SubtitleStream(
     val title: String? = null,
     val default: Boolean = false,
     val forced: Boolean = false,
+    /**
+     * The container's `hearing_impaired` disposition — the SDH track that also
+     * transcribes the door slam. Absent on a library probed before the server
+     * learned to read the flag, which is indistinguishable from "not SDH" and
+     * is why the detail screen only ever *adds* the marker.
+     */
+    val hearing_impaired: Boolean = false,
+)
+
+/**
+ * One half of `playback_defaults` — the server's cold-start answer for a file's
+ * audio or subtitle tracks (`PlaybackTrackDefaultDto`, crates/plurxd
+ * http/dto.rs). Clients mark [selected_index] and render
+ * [preferred_language_status]; they do not fetch admin settings or re-run
+ * `select_tracks`. See docs/CLIENTS.md §"Shared track facts".
+ */
+@Serializable
+data class PlaybackTrackDefault(
+    /** The policy-selected stream index, or null for none (subtitles Off). */
+    val selected_index: Long? = null,
+    /** The configured preferred language, as a wire code ("eng"). */
+    val preferred_language: String = "",
+    /** `selected` | `available` | `missing` | `unknown` | `no_tracks`. */
+    val preferred_language_status: String = "",
+)
+
+@Serializable
+data class PlaybackDefaults(
+    val audio: PlaybackTrackDefault = PlaybackTrackDefault(),
+    val subtitle: PlaybackTrackDefault = PlaybackTrackDefault(),
 )
 
 @Serializable
@@ -146,6 +176,13 @@ data class MediaFileDto(
     val bitrate: Long? = null,
     val audio_streams: List<AudioStream> = emptyList(),
     val subtitle_streams: List<SubtitleStream> = emptyList(),
+    /**
+     * The server's own track outcome for this file. Null on a server that
+     * predates the shared contract — the detail screen then lists the tracks
+     * without claiming which one plays, rather than inventing a policy of its
+     * own.
+     */
+    val playback_defaults: PlaybackDefaults? = null,
     val part_offset_ms: Long = 0,
     val chapters: List<BookChapter> = emptyList(),
     val available: Boolean = true,
@@ -257,6 +294,39 @@ data class Delivery(
      * stream its DV layer — the server decided this, the client repeats it.
      */
     val preserve_dolby_vision: Boolean = false,
+    /**
+     * The audio stream index this plan carries, when the caller selected one.
+     * It is **already applied** to [url] (`stream.mp4?audio=<index>`); it is
+     * repeated here because the HLS transport takes it in the session-create
+     * body instead of a query. Execute it as given — a client that re-derives
+     * the index, or reuses a bare `/stream.mp4`, gets the server's language
+     * default rather than the viewer's choice.
+     */
+    val audio: Long? = null,
+)
+
+/**
+ * `DecisionResponse.selection` — the effective request-local choices, present
+ * only when the request carried `audio=` or `subtitle=`. This is what lets the
+ * detail screen price a pre-play subtitle *before* playback starts instead of
+ * re-deriving burn-in policy from the codec.
+ */
+@Serializable
+data class DecisionSelection(
+    val audio_index: Long? = null,
+    /** Null means Off — either the request's `-1`, or no track selected. */
+    val subtitle_index: Long? = null,
+    /**
+     * The selected subtitle is bitmap data with no enabled overlay route, so
+     * showing it costs a video re-encode. Text tracks stay false here and are
+     * priced by [SubTrack.isNativeHls] instead.
+     */
+    val subtitle_requires_burn_in: Boolean = false,
+    /**
+     * The HDR guard refused that burn rather than replacing HDR with SDR, so
+     * the current delivery was kept and the subtitle is *not* being shown.
+     */
+    val subtitle_burn_in_blocked_by_hdr: Boolean = false,
 )
 
 /**
@@ -305,6 +375,8 @@ data class Decision(
     val preserve_dolby_vision: Boolean = false,
     val audio: List<AudioTrack> = emptyList(),
     val subtitles: List<SubTrack> = emptyList(),
+    /** Present only for a selection-aware request; see [DecisionSelection]. */
+    val selection: DecisionSelection? = null,
     val markers: List<Marker> = emptyList(),
     val ladder: List<Rung> = emptyList(),
     val audio_offset_ms: Long = 0,

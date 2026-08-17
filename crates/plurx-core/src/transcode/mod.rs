@@ -302,14 +302,18 @@ pub fn hevc_copy_tag_for_format(
     hdr_format: Option<&str>,
     preserve_dolby_vision: bool,
 ) -> &'static str {
-    let compatible_base = hdr_format.is_some_and(|format| {
-        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
-    });
+    let compatible_base = dolby_vision_has_compatible_base(hdr_format);
     if hdr == Some("dolby_vision") && preserve_dolby_vision && !compatible_base {
         "dvh1"
     } else {
         "hvc1"
     }
+}
+
+fn dolby_vision_has_compatible_base(hdr_format: Option<&str>) -> bool {
+    hdr_format.is_some_and(|format| {
+        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
+    })
 }
 
 /// Whether this ffmpeg has the `dovi_rpu` bitstream filter (landed in 7.1).
@@ -411,6 +415,9 @@ pub enum ToneMap {
     Zscale,
     /// libplacebo (Vulkan) — higher quality on a capable GPU; opt-in.
     Libplacebo,
+    /// Jellyfin FFmpeg's SIMD software mapper, used for Dolby Vision RPU
+    /// reshaping when a non-compatible Dolby Vision profile requires it.
+    Tonemapx,
     /// No tone-mapping: pass HDR through to 8-bit (looks washed on an SDR
     /// screen, but plays). An escape hatch + a diagnostic — if a file that
     /// grayed out now plays, the tone-map was the culprit.
@@ -562,14 +569,12 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
     // realtime while the GPU graph measured 4.9× (PERF-PLAN §5).
     let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
     let text_burn = opts.subtitle_burn.as_ref().is_some_and(|b| !b.bitmap);
-    let burn_size = if bitmap_burn {
-        output_size(source, opts.target_height)
-    } else {
-        None
-    };
+    // Always give GPU scalers the same explicit even, no-upscale dimensions
+    // the CPU path promises. `w=-1` can resolve to an odd NV12 width.
+    let gpu_size = output_size(source, opts.target_height);
     if let Some(gpu) = opts.pipeline.filters(
-        burn_size.map(|(w, _)| w),
-        burn_size.map_or(opts.target_height, |(_, h)| h),
+        gpu_size.map(|(w, _)| w),
+        gpu_size.map_or(opts.target_height, |(_, h)| h),
         source.hdr.as_deref(),
     ) {
         if (bitmap_burn || text_burn)
@@ -597,6 +602,11 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
                  color_trc=bt709:format=yuv420p"
                     .to_owned(),
             ),
+            ToneMap::Tonemapx => chain.push(
+                "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:\
+                 primaries=bt709:range=tv:format=yuv420p:apply_dovi=1"
+                    .to_owned(),
+            ),
             ToneMap::Zscale => {
                 // Declare the input transfer/primaries/matrix explicitly instead
                 // of letting zscale read them off the frame. Hardware decode
@@ -604,7 +614,7 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
                 // hwdownload, so an inferred `t=linear` mis-maps the PQ signal to
                 // a flat gray picture — the exact 4K-HDR/DV symptom. HDR is
                 // BT.2020; PQ (HDR10/HDR10+/DV) vs HLG differ only in transfer.
-                let tin = if source.hdr.as_deref() == Some("hlg") {
+                let tin = if routing_hdr(source) == Some("hlg") {
                     "arib-std-b67"
                 } else {
                     "smpte2084"
@@ -701,6 +711,14 @@ pub fn routing_hdr(file: &MediaFile) -> Option<&str> {
                 .is_some_and(|f| f.contains("HDR10-compatible")) =>
         {
             Some("hdr10")
+        }
+        Some("dolby_vision")
+            if file
+                .hdr_format
+                .as_deref()
+                .is_some_and(|f| f.contains("HLG-compatible")) =>
+        {
+            Some("hlg")
         }
         other => other,
     }
@@ -834,7 +852,9 @@ pub fn hls_args(
     // the `PLURX_HWDECODE=off` escape hatch for Dolby Vision profiles that
     // hardware-decode to garbage).
     let pipeline_decode = opts.pipeline.decode_args();
-    let (decode_args, hwdownload) = if pipeline_decode.is_empty() {
+    let (decode_args, hwdownload) = if opts.pipeline.requires_software_decode() {
+        (Vec::new(), None)
+    } else if pipeline_decode.is_empty() {
         decode_setup(encoder, source)
     } else {
         (pipeline_decode, None)
@@ -1189,12 +1209,26 @@ fn copy_input_args(
             args.push("-strict".into());
             args.push("unofficial".into());
         }
-        args.push("-bsf:v".into());
-        args.push(hevc_copy_bsf_for_client(
-            source.hdr.as_deref(),
-            have_dovi_bsf,
-            preserve_dolby_vision,
-        ));
+        // A non-backward-compatible Dolby Vision stream is tagged `dvh1`, so
+        // its VPS/SPS/PPS must be present in hvcC before AVPlayer opens the
+        // first fragment. Some WEB-DL Matroska files carry a minimal, empty
+        // hvcC and repeat those parameter sets only in-band. Stripping them
+        // here made an initialization record with no decoder configuration;
+        // tvOS rejected it with CoreMedia -15517. Leave the parameter sets in
+        // the pipe so the GOP-aware segmenter can promote them into hvcC from
+        // the first sample. Compatible Profile 8 and ordinary HEVC keep the
+        // existing hvc1 normalization.
+        let promote_profile5_parameter_sets = source.hdr.as_deref() == Some("dolby_vision")
+            && preserve_dolby_vision
+            && !dolby_vision_has_compatible_base(source.hdr_format.as_deref());
+        if !promote_profile5_parameter_sets {
+            args.push("-bsf:v".into());
+            args.push(hevc_copy_bsf_for_client(
+                source.hdr.as_deref(),
+                have_dovi_bsf,
+                preserve_dolby_vision,
+            ));
+        }
     }
 
     if transcode_audio {
@@ -1692,6 +1726,70 @@ mod tests {
     }
 
     #[test]
+    fn profile5_tonemap_applies_dolby_vision_metadata_before_sdr_mapping() {
+        let mut source = file(Some("dolby_vision"));
+        source.hdr_format = Some("Dolby Vision · Profile 5".into());
+        let opts = TranscodeOptions {
+            tone_map: ToneMap::Tonemapx,
+            pipeline: Pipeline::DoviTonemapx,
+            ..Default::default()
+        };
+        let args = hls_args(
+            &source,
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        let joined = args.join(" ");
+        assert!(!joined.contains("-init_hw_device vulkan"), "{joined}");
+        assert!(!joined.contains("-filter_hw_device"), "{joined}");
+        assert!(!joined.contains("hwupload"), "{joined}");
+        assert!(joined.contains("tonemapx=tonemap=bt2390"), "{joined}");
+        assert!(joined.contains("apply_dovi=1"), "{joined}");
+        assert!(joined.contains("transfer=bt709"), "{joined}");
+        assert!(joined.contains("matrix=bt709"), "{joined}");
+        assert!(joined.contains("primaries=bt709"), "{joined}");
+        assert!(joined.contains("range=tv"), "{joined}");
+        let tonemap_at = joined.find("tonemapx=").expect("tonemapx filter");
+        let scale_at = joined.find("scale=1920:1080").expect("scale filter");
+        assert!(
+            tonemap_at < scale_at,
+            "RPU reshape must precede scale: {joined}"
+        );
+        assert!(!joined.contains("setparams="), "{joined}");
+        assert!(!joined.contains("zscale="), "{joined}");
+        assert!(!joined.contains("-hwaccel qsv"), "{joined}");
+
+        let mut compatible = source;
+        compatible.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
+        let opts = TranscodeOptions::default();
+        let joined = hls_args(
+            &compatible,
+            Encoder::Qsv,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(!joined.contains("apply_dovi=1"), "{joined}");
+        assert!(joined.contains("zscale="), "{joined}");
+
+        let mut hlg_compatible = compatible;
+        hlg_compatible.hdr_format = Some("Dolby Vision · Profile 8 (HLG-compatible)".into());
+        let joined = hls_args(
+            &hlg_compatible,
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(joined.contains("tin=arib-std-b67"), "{joined}");
+        assert!(!joined.contains("tin=smpte2084"), "{joined}");
+    }
+
+    #[test]
     fn tonemap_none_passes_hdr_through() {
         // PLURX_TONEMAP=off → no tone-map filter, HDR just normalized to yuv420p.
         let opts = TranscodeOptions {
@@ -1770,7 +1868,7 @@ mod tests {
 
         assert!(
             joined.contains(
-                "vpp_qsv=w=-1:h=1080:tonemap=1:format=nv12,hwdownload,format=nv12,subtitles='/cache/scary-forced.vtt',hwupload=extra_hw_frames=64,format=qsv"
+                "vpp_qsv=w=1920:h=1080:tonemap=1:format=nv12,hwdownload,format=nv12,subtitles='/cache/scary-forced.vtt',hwupload=extra_hw_frames=64,format=qsv"
             ),
             "{joined}"
         );
@@ -1970,6 +2068,11 @@ mod tests {
         )
         .join(" ");
         assert!(profile5.contains("-tag:v dvh1"));
+        assert!(profile5.contains("-strict unofficial"));
+        assert!(
+            !profile5.contains("-bsf:v"),
+            "Profile 5 parameter sets must reach the segmenter for hvcC promotion"
+        );
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.
