@@ -302,14 +302,18 @@ pub fn hevc_copy_tag_for_format(
     hdr_format: Option<&str>,
     preserve_dolby_vision: bool,
 ) -> &'static str {
-    let compatible_base = hdr_format.is_some_and(|format| {
-        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
-    });
+    let compatible_base = dolby_vision_has_compatible_base(hdr_format);
     if hdr == Some("dolby_vision") && preserve_dolby_vision && !compatible_base {
         "dvh1"
     } else {
         "hvc1"
     }
+}
+
+fn dolby_vision_has_compatible_base(hdr_format: Option<&str>) -> bool {
+    hdr_format.is_some_and(|format| {
+        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
+    })
 }
 
 /// Whether this ffmpeg has the `dovi_rpu` bitstream filter (landed in 7.1).
@@ -1205,12 +1209,26 @@ fn copy_input_args(
             args.push("-strict".into());
             args.push("unofficial".into());
         }
-        args.push("-bsf:v".into());
-        args.push(hevc_copy_bsf_for_client(
-            source.hdr.as_deref(),
-            have_dovi_bsf,
-            preserve_dolby_vision,
-        ));
+        // A non-backward-compatible Dolby Vision stream is tagged `dvh1`, so
+        // its VPS/SPS/PPS must be present in hvcC before AVPlayer opens the
+        // first fragment. Some WEB-DL Matroska files carry a minimal, empty
+        // hvcC and repeat those parameter sets only in-band. Stripping them
+        // here made an initialization record with no decoder configuration;
+        // tvOS rejected it with CoreMedia -15517. Leave the parameter sets in
+        // the pipe so the GOP-aware segmenter can promote them into hvcC from
+        // the first sample. Compatible Profile 8 and ordinary HEVC keep the
+        // existing hvc1 normalization.
+        let promote_profile5_parameter_sets = source.hdr.as_deref() == Some("dolby_vision")
+            && preserve_dolby_vision
+            && !dolby_vision_has_compatible_base(source.hdr_format.as_deref());
+        if !promote_profile5_parameter_sets {
+            args.push("-bsf:v".into());
+            args.push(hevc_copy_bsf_for_client(
+                source.hdr.as_deref(),
+                have_dovi_bsf,
+                preserve_dolby_vision,
+            ));
+        }
     }
 
     if transcode_audio {
@@ -2050,6 +2068,11 @@ mod tests {
         )
         .join(" ");
         assert!(profile5.contains("-tag:v dvh1"));
+        assert!(profile5.contains("-strict unofficial"));
+        assert!(
+            !profile5.contains("-bsf:v"),
+            "Profile 5 parameter sets must reach the segmenter for hvcC promotion"
+        );
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.

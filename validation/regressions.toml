@@ -523,3 +523,9 @@ points = []
 checks = []
 reason = "These commits only record the Profile 5 correction's current validation evidence; they do not change runtime behavior."
 ignore = true
+
+[[coverage]]
+commits = ["9b34877b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained core regression `in_band_hevc_parameter_sets_fill_an_empty_dolby_vision_hvcc` reproduces the Dexter Profile 5 source's 23-byte hvcC with no VPS/SPS/PPS arrays, promotes the in-band parameter sets into a valid initialization record, reparses the result, and proves promotion is idempotent. The copy-argument regression requires non-backward-compatible Profile 5 to retain those units for the segmenter while ordinary HEVC and compatible-base Dolby Vision keep their existing normalization path; reverting only the production correction either leaves Apple TV without decoder configuration or regresses the established compatible-copy contract."
