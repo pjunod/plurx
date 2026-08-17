@@ -3141,8 +3141,8 @@ pub struct TranscodeManager {
     /// whatever ffmpeg it was running, leave the DV configuration in every
     /// remux, and have browsers that cannot decode DV refuse the stream.
     dv_strippable: bool,
-    /// Whether boot proved the exact software/Vulkan/libplacebo/software
-    /// renderer used for non-backward-compatible Dolby Vision.
+    /// Whether boot proved the exact software/tonemapx/software renderer used
+    /// for non-backward-compatible Dolby Vision.
     dovi_reshape: bool,
     dovi_proofs: std::sync::Mutex<HashMap<String, bool>>,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
@@ -3477,8 +3477,8 @@ impl TranscodeManager {
     ) -> Result<Encoder, String> {
         if self.require_dovi_renderer(file).await? {
             // This is the only pairing boot probes. Software decode preserves
-            // the RPU AVFrame side data and software encode avoids mixing a
-            // Vulkan filter device with QSV/VAAPI filter devices.
+            // the RPU AVFrame side data and feeds the proved system-memory
+            // tonemapx graph.
             Ok(Encoder::Software)
         } else {
             Ok(self.encoder().await)

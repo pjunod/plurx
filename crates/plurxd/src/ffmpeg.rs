@@ -230,9 +230,9 @@ async fn dovi_probe_output(file: &MediaFile, apply: bool) -> Result<Vec<String>,
 }
 
 /// Prove, on the requested Profile 5 source, that the decoder exports RPU side
-/// data through the production upload and that libplacebo changes pixels when
-/// Dolby Vision application is enabled. A mere option/Vulkan probe cannot make
-/// that claim because a frame with no DOVI metadata makes the option a no-op.
+/// data through the production graph and that tonemapx changes pixels when
+/// Dolby Vision application is enabled. A mere option probe cannot make that
+/// claim because a frame with no DOVI metadata makes the option a no-op.
 pub async fn dovi_reshape_changes_pixels(file: &MediaFile) -> bool {
     let enabled = dovi_probe_output(file, true).await;
     let disabled = dovi_probe_output(file, false).await;
