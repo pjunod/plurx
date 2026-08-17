@@ -812,6 +812,16 @@ fn plausible_credits_tail_ms(duration_ms: i64) -> i64 {
 const INTRO_MAX_START_PCT: i64 = 50;
 const CREDITS_MIN_START_PCT: i64 = 70;
 
+/// One chapter of the probed file, kept whether or not its title classified.
+/// An unclassified span still carries the boundary that places the credits.
+#[derive(Clone, Copy)]
+struct ChapterSpan {
+    start_ms: i64,
+    end_ms: i64,
+    /// The `(kind, label)` its title named, if any.
+    class: Option<(&'static str, &'static str)>,
+}
+
 /// Turn an ffprobe `chapters` array into skippable intro/credits markers.
 /// Pure, so the classification and the bounds checks are testable without a
 /// file or a subprocess.
@@ -826,7 +836,7 @@ fn markers_from_chapters(chapters: &[serde_json::Value], duration_ms: Option<i64
     // Every chapter with a sane span, classified or not. The unclassified ones
     // are not noise: the last boundary among them is the only positional
     // evidence a chaptered file offers when no title says "credits".
-    let mut spans: Vec<(i64, i64, Option<(&'static str, &'static str)>)> = Vec::new();
+    let mut spans: Vec<ChapterSpan> = Vec::new();
     for ch in chapters {
         let title = ch
             .get("tags")
@@ -835,22 +845,31 @@ fn markers_from_chapters(chapters: &[serde_json::Value], duration_ms: Option<i64
             .unwrap_or("");
         if let (Some(start_ms), Some(end_ms)) = (at(ch, "start_time"), at(ch, "end_time")) {
             if end_ms > start_ms {
-                spans.push((start_ms, end_ms, classify_chapter(title)));
+                spans.push(ChapterSpan {
+                    start_ms,
+                    end_ms,
+                    class: classify_chapter(title),
+                });
             }
         }
     }
-    spans.sort_by_key(|s| s.0);
+    spans.sort_by_key(|s| s.start_ms);
 
     // The runtime is the yardstick for every bound below. A file probed without
     // one still has the chapters' own extent, which is close enough to place a
     // marker as a fraction. With neither there is nothing to place and nothing
     // to guess from.
-    let Some(timeline_ms) = duration_ms.or_else(|| spans.iter().map(|s| s.1).max()) else {
+    let Some(timeline_ms) = duration_ms.or_else(|| spans.iter().map(|s| s.end_ms).max()) else {
         return Vec::new();
     };
 
     let mut out = Vec::new();
-    for &(start_ms, end_ms, class) in &spans {
+    for &ChapterSpan {
+        start_ms,
+        end_ms,
+        class,
+    } in &spans
+    {
         let Some((kind, label)) = class else { continue };
         let in_bounds = if kind == "intro" {
             start_ms * 100 <= timeline_ms * INTRO_MAX_START_PCT
@@ -888,7 +907,7 @@ fn markers_from_chapters(chapters: &[serde_json::Value], duration_ms: Option<i64
             // becoming the button.
             let boundary = spans
                 .last()
-                .map(|s| s.0)
+                .map(|s| s.start_ms)
                 .filter(|start| (15_000..=tail * 2).contains(&(dur - start)));
             out.push(Marker {
                 kind: "credits".to_owned(),
