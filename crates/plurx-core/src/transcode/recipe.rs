@@ -173,6 +173,7 @@ fn tone_map_name(t: ToneMap) -> &'static str {
     match t {
         ToneMap::Zscale => "zscale",
         ToneMap::Libplacebo => "libplacebo",
+        ToneMap::Tonemapx => "tonemapx",
         ToneMap::None => "none",
     }
 }
