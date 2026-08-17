@@ -595,6 +595,74 @@ struct PlayerAttachmentRecoveryState: Equatable {
     }
 }
 
+/// A decoder that accepts the stream and renders nothing is invisible to every
+/// other detector here: audio advances the film clock, so both stall detectors
+/// reset on each sample, AVPlayer's stall counter never moves, and no NSError
+/// is ever produced. The one piece of evidence is `AVPlayerItem.presentationSize`,
+/// which stays `.zero` until a frame has actually been decoded. Dolby Vision
+/// Profile 5 on a device with no Profile 5 decoder fails exactly this way.
+///
+/// This deliberately does not reuse `PlayerAttachmentRecoveryState`: that gate
+/// arms after five seconds of clock progress whether or not a picture ever
+/// appeared, which is *below* this threshold, so it would disarm the watchdog
+/// before it could ever fire. A rendered frame is what establishes video here,
+/// and the first non-zero presentation size retires the watchdog for good.
+struct BlackFrameWatchdog: Equatable {
+    private(set) var lastPositionMs: Int?
+    private(set) var blackMs = 0
+    private(set) var presentedVideo = false
+    private(set) var fired = false
+
+    mutating func opened() {
+        lastPositionMs = nil
+        blackMs = 0
+        presentedVideo = false
+        fired = false
+    }
+
+    /// True exactly once, on the sample that proves the film clock ran for
+    /// `PlayerController.blackFrameDecodeFailureMs` with nothing on screen.
+    ///
+    /// `hasVideoSource` keeps audiobooks and other audio-only playbacks out:
+    /// their presentation size is legitimately `.zero` forever.
+    @MainActor
+    mutating func observe(
+        positionMs: Int,
+        presentationSize: CGSize,
+        hasVideoSource: Bool,
+        playing: Bool
+    ) -> Bool {
+        guard !fired, !presentedVideo else { return false }
+        if presentationSize.width > 0 && presentationSize.height > 0 {
+            presentedVideo = true
+            lastPositionMs = nil
+            blackMs = 0
+            return false
+        }
+        guard hasVideoSource, playing else {
+            lastPositionMs = nil
+            return false
+        }
+        guard let lastPositionMs else {
+            self.lastPositionMs = positionMs
+            return false
+        }
+        let delta = positionMs - lastPositionMs
+        self.lastPositionMs = positionMs
+        // Only elapsed film time counts. A seek, an item replacement, or any
+        // other discontinuity larger than one sampling interval can explain is
+        // a new baseline rather than more of the same black screen.
+        guard delta >= 0, delta <= PlayerController.blackFrameSampleCeilingMs else {
+            blackMs = 0
+            return false
+        }
+        blackMs += delta
+        guard blackMs >= PlayerController.blackFrameDecodeFailureMs else { return false }
+        fired = true
+        return true
+    }
+}
+
 struct PlaybackStallObservation: Equatable {
     let delta: Int
     let stagnantDurationMs: Int
@@ -636,6 +704,31 @@ enum PlaybackCompatibilityFallback: Equatable {
     case none
     case hdrBase
     case transcode
+
+    /// Names the rung in the client failure log, so a device log says which
+    /// recovery a failure actually bought rather than only that it happened.
+    var telemetryName: String {
+        switch self {
+        case .none: return "none"
+        case .hdrBase: return "hdr-base"
+        case .transcode: return "transcode"
+        }
+    }
+}
+
+/// What put a playback into the compatibility ladder. Only `itemFailure`
+/// carries an AVFoundation error; the other two are client-observed verdicts
+/// with no NSError to print, which is exactly why they need naming.
+enum PlaybackCompatibilityLadderCause: String, Equatable {
+    case itemFailure = "item-failed"
+    case readinessTimeout = "readiness-timeout"
+    case blackFrames = "black-frames"
+}
+
+/// One ladder decision, recorded in `ApplePlaybackFailureLog.detail`.
+struct PlaybackCompatibilityLadderStep: Equatable {
+    let cause: PlaybackCompatibilityLadderCause
+    let fallback: PlaybackCompatibilityFallback
 }
 
 /// Monotonic elapsed-time sampling policy for AVPlayer's silent-wait failure mode. A
@@ -842,12 +935,47 @@ final class PlayerController: ObservableObject {
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
     static let repeatedEndToleranceMs = 250
     static let naturalEndToleranceMs = 15_000
+    /// How long an attached item may sit at `.unknown` before the wait is
+    /// spent. A resume has always been bounded by this because it had to seek;
+    /// a fresh start was not bounded at all, which is what let a title AVPlayer
+    /// neither readies nor fails hold the open forever behind a black screen.
+    static let itemReadinessDeadlineSeconds = 15
+    /// Film time that may pass on a black screen before the picture is judged
+    /// undecodable. Above `PlayerAttachmentRecoveryState`'s five-second
+    /// establishment window on purpose: audio-only progress must not be able
+    /// to certify a playback that has never drawn a frame.
+    static let blackFrameDecodeFailureMs = 6_000
+    /// The most film time one periodic sample may contribute to that total.
+    /// The observer runs twice a second, so anything past this is a seek or an
+    /// item replacement, not playback — and must not be counted as black.
+    static let blackFrameSampleCeilingMs = 2_000
     static let gracefulRepeatedEndFraction = 0.95
     static let playbackStartFailureTitle = "Couldn't start playback."
     static let playbackStoppedFailureTitle = "Playback stopped."
     static let earlyEndFailureTitle = "Playback stopped early."
     static let repeatedEarlyEndMessage =
         "Playback ended early at the same position after retrying the stream."
+    static let readinessTimeoutMessage =
+        "The stream never became ready to play."
+    static let blackFrameFailureMessage =
+        "The film clock advanced with no decoded picture."
+
+    /// A fresh start hands `seekWhenReady` nothing to wait on, so before this
+    /// only a resume was bounded. Bound the completed-VOD/direct cold start the
+    /// same way.
+    ///
+    /// Two exclusions, both because the wait is then somebody else's: a growing
+    /// session may still be filling the server's publish gate, and a reopen
+    /// that lands paused is not a viewer sitting in front of a black screen —
+    /// it is an item deliberately prepared at rate 0.
+    nonisolated static func shouldBoundFreshStartReadiness(
+        isVOD: Bool,
+        startMs: Int,
+        seeksAfterAttach: Bool,
+        resumesPlayback: Bool
+    ) -> Bool {
+        isVOD && startMs <= 0 && !seeksAfterAttach && resumesPlayback
+    }
 
     static func configureBuffering(_ item: AVPlayerItem, growingHLS: Bool) {
         item.preferredForwardBufferDuration = growingHLS
@@ -965,6 +1093,9 @@ final class PlayerController: ObservableObject {
     /// that the device rejected HDR. Rebuild the same delivery once instead of
     /// silently replacing a picture the viewer has already watched with SDR.
     private var attachmentRecovery = PlayerAttachmentRecoveryState()
+    /// The only evidence a decoder is producing nothing while the film clock
+    /// runs. Scoped to one attached item, exactly like `attachmentRecovery`.
+    private var blackFrameWatchdog = BlackFrameWatchdog()
     private var establishedHDRRetryAttempted = false
     private var ttffMeasurement = ApplePlaybackTTFFState()
     private var ttffReason = "cold-start"
@@ -1234,6 +1365,7 @@ final class PlayerController: ObservableObject {
         ttffReason = currentMs > 0 ? "resume" : "cold-start"
         ttffMeasurement.opened(at: currentMs)
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         establishedHDRRetryAttempted = false
         stallObservation.reset()
         lastUncorroboratedEndMs = nil
@@ -1300,6 +1432,7 @@ final class PlayerController: ObservableObject {
         decision = Self.offlineDecision(offline)
         wantsPlayback = true
         attachmentRecovery.opened(at: currentMs)
+        blackFrameWatchdog.opened()
         stallObservation.reset()
         lastUncorroboratedEndMs = nil
         player.appliesMediaSelectionCriteriaAutomatically = false
@@ -1392,6 +1525,7 @@ final class PlayerController: ObservableObject {
         isPlaying = true
         failed = false
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         updateNowPlaying()
     }
 
@@ -1832,6 +1966,7 @@ final class PlayerController: ObservableObject {
         let attemptId = UUID().uuidString
         finished = false
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         isChangingStream = true
         failed = false
         playbackError = nil
@@ -2076,6 +2211,33 @@ final class PlayerController: ObservableObject {
                     await handleItemFailure(item)
                     return
                 }
+                throw error
+            }
+        } else if Self.shouldBoundFreshStartReadiness(
+            isVOD: isVOD,
+            startMs: startMs,
+            seeksAfterAttach: seekAfterAttach != nil,
+            resumesPlayback: resumesPlayback
+        ) {
+            // A fresh start has no seek to wait behind, so nothing used to
+            // bound its wait for a first frame at all. An item AVFoundation
+            // neither readies nor fails — Dolby Vision Profile 5 on a device
+            // that cannot decode it — held this open forever, which is the
+            // black screen viewers reported.
+            do {
+                try await awaitItemReady(item)
+            } catch {
+                if isSuperseded(generation) { return }
+                if item.status == .failed {
+                    isChangingStream = false
+                    await handleItemFailure(item)
+                    return
+                }
+                // Only the deadline expiring is a verdict about the media. A
+                // cancelled task says nothing about the picture.
+                if let preparation = error as? PlaybackPreparationError,
+                   case .timedOut = preparation,
+                   await retryAfterReadinessTimeout(at: startMs) { return }
                 throw error
             }
         }
@@ -2549,6 +2711,19 @@ final class PlayerController: ObservableObject {
                     at: observedPosition,
                     playing: isActuallyPlaying
                 )
+                // Sampled outside the playing branch so a picture that arrives
+                // while paused still retires the watchdog.
+                if self.blackFrameWatchdog.observe(
+                    positionMs: observedPosition,
+                    presentationSize: self.presentationSize,
+                    hasVideoSource: self.decision?.source?.videoCodec != nil,
+                    playing: isActuallyPlaying
+                ) {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.handleBlackFrameDecodeFailure(at: observedPosition)
+                    }
+                }
                 if isActuallyPlaying {
                     self.preferredRate = self.player.rate
                     self.attachmentRecovery.observe(
@@ -2713,7 +2888,29 @@ final class PlayerController: ObservableObject {
     /// genuinely failed replacement is still handled.
     private func handleItemFailure(_ item: AVPlayerItem) async {
         guard player.currentItem === item, !isChangingStream else { return }
-        reportPlaybackFailure(item)
+        let event = item.errorLog()?.events.last
+        let isCompatibilityFailure = Self.isCompatibilityPlaybackFailure(
+            error: item.error as NSError?,
+            eventDomain: event?.errorDomain,
+            eventStatus: event?.errorStatusCode,
+            eventComment: event?.errorComment
+        )
+        // Evaluated before anything recovers, because the log has to go out
+        // before the ladder's own reopen replaces this item. An established
+        // HDR delivery reconnects itself instead of descending, so it buys no
+        // rung — say so rather than naming one that never ran.
+        let reconnectsEstablishedHDR = Self.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: deliveredRange,
+            establishedPlayback: attachmentRecovery.establishedPlayback
+        )
+        let fallback: PlaybackCompatibilityFallback =
+            started && isCompatibilityFailure && !reconnectsEstablishedHDR
+                ? plannedCompatibilityFallback
+                : PlaybackCompatibilityFallback.none
+        reportPlaybackFailure(
+            item,
+            step: PlaybackCompatibilityLadderStep(cause: .itemFailure, fallback: fallback)
+        )
         if started {
             // P2-6: this item is already dead, so its `currentTime()`
             // is 0 or invalid and a VOD/direct retry would silently
@@ -2723,13 +2920,8 @@ final class PlayerController: ObservableObject {
             // paused when the item failed stays paused.
             let position = Self.compatibilityRetryPositionMs(lastObservedMs: currentMs)
             if await retryEstablishedHDRDelivery(at: position) { return }
-            let event = item.errorLog()?.events.last
-            if Self.isCompatibilityPlaybackFailure(
-                error: item.error as NSError?,
-                eventDomain: event?.errorDomain,
-                eventStatus: event?.errorStatusCode,
-                eventComment: event?.errorComment
-            ), await retryWithNextCompatibilityFallback(at: position) { return }
+            if isCompatibilityFailure,
+               await retryWithNextCompatibilityFallback(at: position) { return }
         }
         player.pause()
         isPlaying = false
@@ -2743,7 +2935,10 @@ final class PlayerController: ObservableObject {
             ?? PlaybackPreparationError.failed.localizedDescription
     }
 
-    private func reportPlaybackFailure(_ item: AVPlayerItem) {
+    private func reportPlaybackFailure(
+        _ item: AVPlayerItem,
+        step: PlaybackCompatibilityLadderStep
+    ) {
         #if os(iOS)
         if offlineId != nil { return }
         #endif
@@ -2761,10 +2956,37 @@ final class PlayerController: ObservableObject {
                 error: failure,
                 eventDomain: event?.errorDomain,
                 eventStatus: event?.errorStatusCode,
-                eventComment: event?.errorComment
+                eventComment: event?.errorComment,
+                ladderStep: step
             )
         )
         postClientLog(payload)
+    }
+
+    /// A ladder entry the client decided on its own: no AVFoundation error
+    /// exists to describe it, so the log carries only the cause and the rung.
+    private func reportCompatibilityLadderFailure(
+        message: String,
+        step: PlaybackCompatibilityLadderStep
+    ) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        postClientLog(ApplePlaybackFailureLog(
+            message: message,
+            method: clientLogMethod,
+            code: nil,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            detail: Self.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: step
+            )
+        ))
     }
 
     private func reportEarlyEndFailure(
@@ -2871,11 +3093,16 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    /// `ladderStep` names the recovery this failure bought, so a device log
+    /// shows which rung was chosen and what chose it — including for the two
+    /// client-observed verdicts (a readiness timeout, a black picture) that
+    /// carry no AVFoundation error at all.
     static func playbackFailureDetail(
         error: NSError?,
         eventDomain: String?,
         eventStatus: Int?,
-        eventComment: String?
+        eventComment: String?,
+        ladderStep: PlaybackCompatibilityLadderStep? = nil
     ) -> String {
         var fields: [String] = []
         if let error {
@@ -2895,6 +3122,10 @@ final class PlayerController: ObservableObject {
         }
         if let eventComment, !eventComment.isEmpty {
             fields.append("comment=\(eventComment)")
+        }
+        if let ladderStep {
+            fields.append("cause=\(ladderStep.cause.rawValue)")
+            fields.append("ladder=\(ladderStep.fallback.telemetryName)")
         }
         return fields.joined(separator: " · ")
     }
@@ -3197,6 +3428,57 @@ final class PlayerController: ObservableObject {
         return true
     }
 
+    /// The rung the ladder would choose right now. Read before the ladder runs
+    /// so the failure log can name the step the viewer actually got, and so a
+    /// client-observed verdict with no rung left changes nothing at all.
+    private var plannedCompatibilityFallback: PlaybackCompatibilityFallback {
+        Self.nextCompatibilityFallback(
+            canRetryWithHDRBase: canRetryCurrentItemWithHDRBase,
+            hdrBaseAlreadyAttempted: dolbyVisionFallbackAttempted,
+            canRetryWithTranscode: canRetryCurrentItemWithTranscode,
+            transcodeAlreadyAttempted: compatibilityFallbackAttempted
+        )
+    }
+
+    /// A fresh start that never reached `.readyToPlay` is a media verdict, not
+    /// a transport fault: AVFoundation neither failed the item nor readied it,
+    /// which is what a Dolby Vision Profile 5 track with an empty `hvcC` does
+    /// on a device that cannot decode it. Spend one rung instead of stopping.
+    /// Returning false leaves the caller's original timeout to surface.
+    private func retryAfterReadinessTimeout(at position: Int) async -> Bool {
+        let fallback = plannedCompatibilityFallback
+        guard fallback != .none else { return false }
+        reportCompatibilityLadderFailure(
+            message: Self.readinessTimeoutMessage,
+            step: PlaybackCompatibilityLadderStep(
+                cause: .readinessTimeout,
+                fallback: fallback
+            )
+        )
+        return await retryWithNextCompatibilityFallback(at: position)
+    }
+
+    /// Six seconds of film clock with nothing decoded. Nothing was ever
+    /// established here — no frame has been presented for this item — so the
+    /// established-HDR policy does not apply and the pre-start ladder does.
+    /// With no rung left this deliberately does nothing: audio is still
+    /// playing, and there is no better delivery left to try.
+    private func handleBlackFrameDecodeFailure(at position: Int) async {
+        guard started, !isChangingStream, player.currentItem != nil else { return }
+        let fallback = plannedCompatibilityFallback
+        guard fallback != .none else { return }
+        reportCompatibilityLadderFailure(
+            message: Self.blackFrameFailureMessage,
+            step: PlaybackCompatibilityLadderStep(
+                cause: .blackFrames,
+                fallback: fallback
+            )
+        )
+        _ = await retryWithNextCompatibilityFallback(
+            at: Self.compatibilityRetryPositionMs(lastObservedMs: position)
+        )
+    }
+
     private func report(_ position: Int) {
         guard position > 0 else { return }
         let globalPosition = AudiobookTimeline.globalPosition(
@@ -3221,15 +3503,17 @@ final class PlayerController: ObservableObject {
         Task { await model?.reportProgress(itemId: itemId, positionMs: globalPosition, durationMs: duration) }
     }
 
-    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {
-        // AVPlayerItem's KVO publisher is not guaranteed to deliver another
-        // value when a tvOS network request stalls. The old unbounded
-        // `for await` consequently held the initial `play()` forever and left
-        // the transport looking paused. Poll the authoritative status with a
-        // finite deadline so playback either resumes or surfaces a useful
-        // connection error.
+    /// Wait for the attached item to reach `.readyToPlay`, or give up.
+    ///
+    /// AVPlayerItem's KVO publisher is not guaranteed to deliver another
+    /// value when a tvOS network request stalls. The old unbounded
+    /// `for await` consequently held the initial `play()` forever and left
+    /// the transport looking paused. Poll the authoritative status with a
+    /// finite deadline so playback either resumes or surfaces a useful
+    /// connection error.
+    private func awaitItemReady(_ item: AVPlayerItem) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(15))
+        let deadline = clock.now.advanced(by: .seconds(Self.itemReadinessDeadlineSeconds))
         while item.status == .unknown {
             try Task.checkCancellation()
             guard clock.now < deadline else { throw PlaybackPreparationError.timedOut }
@@ -3240,6 +3524,10 @@ final class PlayerController: ObservableObject {
             throw item.error ?? PlaybackPreparationError.failed
         }
         guard item.status == .readyToPlay else { throw PlaybackPreparationError.failed }
+    }
+
+    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {
+        try await awaitItemReady(item)
 
         _ = await player.seek(
             to: CMTime(seconds: Double(ms) / 1000.0, preferredTimescale: 600),

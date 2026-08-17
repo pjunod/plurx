@@ -636,6 +636,184 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    /// A resume was bounded only because it had a seek to run afterwards. A
+    /// fresh start had nothing to wait on and so waited forever — the exact
+    /// shape of the reported black screen.
+    @MainActor
+    func testApplePlayerBoundsAFreshStartsWaitForReadiness() {
+        XCTAssertEqual(PlayerController.itemReadinessDeadlineSeconds, 15)
+
+        XCTAssertTrue(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a VOD cold start has to give up eventually too"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 30_000,
+                seeksAfterAttach: true,
+                resumesPlayback: true
+            ),
+            "a resume is already bounded by the seek's own deadline"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: false,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a growing session may still be filling its publish gate"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: false
+            ),
+            "an item deliberately prepared at rate 0 is nobody's black screen"
+        )
+    }
+
+    /// Audio advancing over a black screen is invisible to every other
+    /// detector: the film clock moves, so both stall detectors reset on each
+    /// sample and AVPlayer never reports a stall. The presentation size is the
+    /// only evidence that nothing was decoded.
+    @MainActor
+    func testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded() {
+        XCTAssertEqual(PlayerController.blackFrameDecodeFailureMs, 6_000)
+
+        var black = BlackFrameWatchdog()
+        black.opened()
+        for step in 0...11 {
+            XCTAssertFalse(
+                black.observe(
+                    positionMs: step * 500,
+                    presentationSize: .zero,
+                    hasVideoSource: true,
+                    playing: true
+                ),
+                "five and a half seconds of black is still inside the threshold"
+            )
+        }
+        XCTAssertTrue(black.observe(
+            positionMs: 6_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(
+            black.observe(
+                positionMs: 6_500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: true
+            ),
+            "one item enters the ladder once, not on every later sample"
+        )
+
+        // A decoded picture — of any size — is the end of the matter.
+        var decoding = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(decoding.observe(
+                positionMs: step * 500,
+                presentationSize: CGSize(width: 3840, height: 2160),
+                hasVideoSource: true,
+                playing: true
+            ))
+        }
+        XCTAssertTrue(decoding.presentedVideo)
+
+        // An audiobook's presentation size is legitimately zero forever.
+        var audioOnly = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(audioOnly.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: false,
+                playing: true
+            ))
+        }
+
+        // Neither a paused transport nor a seek is six seconds of black.
+        var paused = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(paused.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: false
+            ))
+        }
+        var seeking = BlackFrameWatchdog()
+        XCTAssertFalse(seeking.observe(
+            positionMs: 0,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(seeking.observe(
+            positionMs: 600_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertEqual(seeking.blackMs, 0)
+    }
+
+    /// A device log has to say which rung a failure bought, and what bought
+    /// it — the two client-observed verdicts carry no AVFoundation error to
+    /// print at all.
+    @MainActor
+    func testApplePlaybackFailureDetailNamesTheLadderRungItBought() {
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: NSError(domain: "CoreMediaErrorDomain", code: -12927, userInfo: [:]),
+                eventDomain: "CoreMediaErrorDomain",
+                eventStatus: -12927,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .itemFailure,
+                    fallback: .transcode
+                )
+            ),
+            "error=CoreMediaErrorDomain:-12927 · event=CoreMediaErrorDomain:-12927 · cause=item-failed · ladder=transcode"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .readinessTimeout,
+                    fallback: .hdrBase
+                )
+            ),
+            "cause=readiness-timeout · ladder=hdr-base"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .blackFrames,
+                    fallback: .none
+                )
+            ),
+            "cause=black-frames · ladder=none",
+            "a verdict with no rung left still has to be visible in the log"
+        )
+    }
+
     @MainActor
     func testAutomaticSubtitlesApplyTheServersPickInsteadOfRederivingIt() {
         // The Scary Movie shape, as the decision hands it over: the server ran
