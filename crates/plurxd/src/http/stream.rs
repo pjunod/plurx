@@ -2269,7 +2269,10 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].kind, "credits");
         assert!(!m[0].chapter, "the duration heuristic is not a chapter");
-        assert_eq!(m[0].end_ms, hour, "the estimate runs to the end of the file");
+        assert_eq!(
+            m[0].end_ms, hour,
+            "the estimate runs to the end of the file"
+        );
         assert_eq!(
             hour - m[0].start_ms,
             82_500,
@@ -2392,8 +2395,7 @@ mod tests {
             Some(hour),
         );
         assert!(
-            !m.iter()
-                .any(|k| k.kind == "intro" && k.start_ms * 2 > hour),
+            !m.iter().any(|k| k.kind == "intro" && k.start_ms * 2 > hour),
             "no Skip Intro button past the halfway mark: {m:?}"
         );
         assert_eq!(m.len(), 2);
