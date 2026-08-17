@@ -62,8 +62,8 @@ pub struct SystemInfo {
     /// (a 4K film quietly playing at the Auto rung in Chrome and perfectly in
     /// Safari) is otherwise unattributable from outside the machine.
     pub dovi_rpu: bool,
-    /// Whether this exact ffmpeg can run the software-decode → Vulkan
-    /// libplacebo Dolby Vision reshape → software-encode graph.
+    /// Whether this exact ffmpeg can run the software-decode → tonemapx
+    /// Dolby Vision reshape → software-encode graph.
     pub dovi_reshape: bool,
 }
 
