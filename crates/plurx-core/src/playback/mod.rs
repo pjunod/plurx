@@ -236,7 +236,25 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
         reasons.push("bitrate above device maximum".to_owned());
     }
 
-    let hdr_ok = file.hdr.is_none() || profile.supports_hdr;
+    // A client that claims THIS file's Dolby Vision has already answered the
+    // dynamic-range question for it, and answered it more specifically than
+    // the generic HDR bit does: DV is only claimed off a display that shows
+    // DV (`CapsPolicy.dolbyVisionCaps` refuses to send `dv`/`dvprofile`
+    // otherwise), so a DV claim implies an HDR panel. The `hdr` bit can be 0
+    // on such a client anyway, because it is computed from a different and
+    // narrower source — Android reads it off the RAW MediaCodec registry
+    // (`video/hevc` present), while DV is probed through Media3's decoder
+    // selector, the registry gap PR #370 already worked around for the DV
+    // side. Letting `hdr=0` veto here forced an SDR transcode of a file the
+    // box had just said it decodes natively, with `DvHandling::None` agreeing
+    // nothing needed re-encoding.
+    //
+    // Deliberately narrow: only a DV *source* whose exact profile this client
+    // negotiated is excused. Plain HDR10/HLG still needs `supports_hdr`, and
+    // a client that never claimed DV (or claimed other profiles) still
+    // tone-maps, so an SDR-only client cannot be handed HDR by this.
+    let dolby_vision_claimed = is_dolby_vision(file) && profile.allows_dolby_vision(file);
+    let hdr_ok = file.hdr.is_none() || profile.supports_hdr || dolby_vision_claimed;
     if !hdr_ok {
         reasons.push(format!(
             "HDR ({}) needs tone-mapping for this display",
@@ -244,8 +262,7 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
         ));
     }
 
-    let dolby_vision_needs_remux =
-        profile.remux_dolby_vision && is_dolby_vision(file) && profile.allows_dolby_vision(file);
+    let dolby_vision_needs_remux = profile.remux_dolby_vision && dolby_vision_claimed;
     let container_ok = profile.allows_container(&file.container) && !dolby_vision_needs_remux;
     if dolby_vision_needs_remux {
         reasons.push("Dolby Vision normalized through copy-video HLS for this device".to_owned());
@@ -993,6 +1010,138 @@ mod tests {
         assert_eq!(sdr_fallback.method, PlaybackMethod::Transcode);
         assert!(!sdr_fallback.preserve_dolby_vision);
         assert_eq!(sdr_fallback.delivered_dynamic_range, "sdr");
+    }
+
+    /// A Dolby Vision claim is not allowed to be overruled by `hdr=0`.
+    ///
+    /// Android computes the two bits from different registries: `hdr=1` needs
+    /// `video/hevc` in the RAW `MediaCodecList`, while Dolby Vision is probed
+    /// through Media3's decoder selector (the gap PR #370 opened that path
+    /// for). A Google TV box can therefore send `dv=1&dvprofile=5&hdr=0` for a
+    /// panel and decoder that genuinely play the file — and got an SDR
+    /// transcode of it, because `hdr_ok` vetoed the plan even though
+    /// `DvHandling` had already answered `None`. Any client with that shape
+    /// (Apple, web) would hit the same thing, which is why the guard lives
+    /// here rather than in one client's caps builder.
+    #[test]
+    fn a_dolby_vision_claim_is_not_overruled_by_a_missing_hdr_bit() {
+        let mut p5 = file("mp4", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+
+        // dv=1&dvprofile=5, hdr=0 — the box that reported the bug.
+        let mut dv_no_hdr_bit = caps_profile(
+            vec!["mkv".into(), "mp4".into(), "mov".into(), "ts".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            false, // hdr=0
+            false,
+        );
+        dv_no_hdr_bit.dolby_vision_profiles = vec![5, 8];
+
+        let d = decide(&p5, &dv_no_hdr_bit, true);
+        assert_ne!(
+            d.method,
+            PlaybackMethod::Transcode,
+            "a client that just claimed DV Profile 5 must not be tone-mapped: {:?}",
+            d.reasons
+        );
+        assert_eq!(d.method, PlaybackMethod::DirectPlay);
+        assert!(d.preserve_dolby_vision);
+        assert_eq!(d.delivered_dynamic_range, "dolby_vision");
+        assert!(
+            d.reasons.iter().all(|r| !r.contains("tone-mapping")),
+            "{:?}",
+            d.reasons
+        );
+
+        // Same box, but the delivery envelope it wants is normalized HLS:
+        // a copy-video remux, still no re-encode and still Dolby Vision.
+        let mut dv_hls = dv_no_hdr_bit.clone();
+        dv_hls.remux_dolby_vision = true;
+        let remuxed = decide(&p5, &dv_hls, true);
+        assert_eq!(remuxed.method, PlaybackMethod::Remux);
+        assert!(remuxed.preserve_dolby_vision);
+        assert_eq!(remuxed.delivered_dynamic_range, "dolby_vision");
+    }
+
+    /// The other half of the guard: it excuses a client that claimed THIS
+    /// file's Dolby Vision, and nothing else. A genuinely SDR-only client
+    /// still gets tone-mapped, so the fix above is not a blanket `hdr_ok`
+    /// bypass for every DV source.
+    #[test]
+    fn a_client_that_never_claimed_dolby_vision_still_tone_maps_it() {
+        let mut p5 = file("mp4", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+
+        // No dv bit, no dvprofile, hdr=0 — an SDR panel.
+        let sdr_only = caps_profile(
+            vec!["mkv".into(), "mp4".into(), "mov".into(), "ts".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            false,
+            false,
+        );
+        let d = decide(&p5, &sdr_only, true);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(!d.preserve_dolby_vision);
+        assert_eq!(d.delivered_dynamic_range, "sdr");
+
+        // And a client that probed DV but not THIS profile is equally not
+        // excused: Profile 5 has no compatible base to strip to.
+        let mut dv_p8_only = sdr_only.clone();
+        dv_p8_only.dolby_vision_profiles = vec![8];
+        let d = decide(&p5, &dv_p8_only, true);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(!d.preserve_dolby_vision);
+        assert_eq!(d.delivered_dynamic_range, "sdr");
+    }
+
+    /// Regression pin for the dimension the guard must not touch: a plain
+    /// HDR10 source is still judged by `supports_hdr` alone, whatever the
+    /// client's Dolby Vision claim says.
+    #[test]
+    fn plain_hdr10_is_still_decided_by_the_hdr_bit_alone() {
+        let mut hdr10 = file("mp4", "hevc", "aac");
+        hdr10.hdr = Some("hdr10".to_owned());
+
+        // hdr=1, no DV claim → unchanged: direct play, HDR10 delivered.
+        let hdr_no_dv = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        let d = decide(&hdr10, &hdr_no_dv, true);
+        assert_eq!(d.method, PlaybackMethod::DirectPlay);
+        assert!(!d.preserve_dolby_vision);
+        assert_eq!(d.delivered_dynamic_range, "hdr10");
+
+        // hdr=0 plus a full DV claim does NOT buy an HDR10 file a pass: the
+        // excuse is about the file's own dynamic range, not the client's
+        // general HDR ambitions.
+        let mut dv_no_hdr_bit = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            false,
+            false,
+        );
+        dv_no_hdr_bit.dolby_vision_profiles = vec![5, 8];
+        let d = decide(&hdr10, &dv_no_hdr_bit, true);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert_eq!(d.delivered_dynamic_range, "sdr");
+        assert!(
+            d.reasons.iter().any(|r| r.contains("tone-mapping")),
+            "{:?}",
+            d.reasons
+        );
     }
 
     /// The badge's whole reason for existing: a DV disc remux says "DV P7"
