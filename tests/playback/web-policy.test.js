@@ -1595,6 +1595,35 @@ test("the detail screen names every subtitle track, its format and its markers",
   );
 });
 
+test("the detail screen keeps only the selected subtitle visible until expanded", () => {
+  const html = detailHarness().specBlock(MOVIE_FILE);
+  const disclosure = html.match(/<details class="trkfold">([\s\S]+?)<\/details>/)?.[1];
+  assert.ok(disclosure, "multiple subtitle tracks use a native disclosure");
+  assert.doesNotMatch(html, /<details class="trkfold" open>/);
+  assert.match(
+    disclosure,
+    /^<summary><span class="trk on">English · SRT · SDH · <span class="tdef">plays by default<\/span><\/span><span class="trkmore">2 more<\/span><\/summary>/,
+  );
+  assert.match(disclosure, /English · SRT · forced · Heptapod/);
+  assert.match(disclosure, /French · PGS/);
+});
+
+test("one subtitle track needs no expand control", () => {
+  const html = detailHarness().specBlock({
+    ...MOVIE_FILE,
+    subtitle_streams: [MOVIE_FILE.subtitle_streams[0]],
+    playback_defaults: {
+      ...MOVIE_FILE.playback_defaults,
+      subtitle: {
+        ...MOVIE_FILE.playback_defaults.subtitle,
+        selected_index: 0,
+      },
+    },
+  });
+  assert.equal(html.includes('class="trkfold"'), false);
+  assert.match(html, /English · SRT · forced · Heptapod/);
+});
+
 test("a file with no subtitle tracks says so instead of showing an empty row", () => {
   const bare = {
     ...MOVIE_FILE,
