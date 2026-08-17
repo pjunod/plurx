@@ -273,7 +273,7 @@ pub async fn create(
         None => {
             state
                 .transcode
-                .auto_height(source_height, network_prior.as_ref())
+                .auto_height_for_file(source.as_ref(), network_prior.as_ref())
                 .await
         }
         // The source's own height is the Original/forced-burn promise

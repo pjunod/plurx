@@ -491,3 +491,16 @@ commits = ["669d9727"]
 points = ["playback.pipeline", "server.api"]
 checks = ["rust-gate"]
 reason = "The retained plurxd regression `a_stall_below_the_ladder_floor_never_steps_up` drives a bound stall reopen from 144p and 240p Auto predecessors — the rungs `auto_height` reaches on a sub-360 source and `auto_height_from_prior` reaches on a starved link, which is the population that stalls — and requires the normalized answer and the persisted claim target to repeat that rung; reverting only the production correction restores the `LADDER_HEIGHTS[0]` fallback, so the way down hands a starving viewer 360p, a rung above where Auto put them and above what a sub-360 source can feed. The retained `stall_stickiness_follows_stated_quality_intent_not_a_posted_height` proves stall eligibility follows the stated `quality_auto` intent rather than the presence of `height`, so an Auto viewer whose burned subtitle posts the source height stays steppable while both wire-presence arms are unchanged for clients that omit the field; reverting only the production correction makes every Android Auto-plus-burn session permanently unsteppable. The retargeted `a_repeated_create_returns_the_same_session` asserts against the live `intent_fingerprint` key, so deleting `audio_offset_ms`, `user_name`, or `playback_id` from it now fails instead of leaving the suite green against the retired `fingerprint` helper."
+
+[[coverage]]
+commits = ["476d390", "4a414bf", "0313d1b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained graph regressions pin software decode, Vulkan initialization, explicit RPU application before any scale/color transform, BT.709 output arguments, even no-upscale dimensions, the independently named software-only renderer, and the absence of setparams/zscale or a CPU fallback while proving HDR10- and HLG-compatible Profile 8 inputs keep the correct base transfer. Manager regressions refuse unknown/unproven profiles, cap Profile 5 Auto at the software rung, and admit only the proved renderer/encoder pair; runtime admission additionally compares real-source frame hashes with RPU application enabled and disabled and refuses identical output. The recipe property test proves the effective session pipeline changes cache identity under cache format v2."
+
+[[coverage]]
+commits = ["c190468", "c02b248"]
+points = []
+checks = []
+reason = "These commits only record the Profile 5 correction's current validation evidence; they do not change runtime behavior."
+ignore = true
