@@ -3020,12 +3020,20 @@ final class PlayerController: ObservableObject {
         }
 
         // VideoToolbox decoder failures commonly surface as an underlying
-        // CoreMedia/OSStatus error instead of an AVError.Code.
+        // CoreMedia/OSStatus error instead of an AVError.Code. The two
+        // CoreMedia codes below are media verdicts too, not transport faults:
+        // a device with no Dolby Vision Profile 5 decoder rejects the asset
+        // outright (-12927), or fails to build a decoder session from the
+        // empty `hvcC` such a track carries (-15517). Leaving them out
+        // classified the most common Dolby Vision failure as terminal, so the
+        // ladder never ran and the viewer kept a black screen.
         let decoderStatusCodes: Set<Int> = [
             -12906, // kVTCouldNotFindVideoDecoderErr
             -12909, // kVTVideoDecoderBadDataErr
             -12910, // kVTVideoDecoderUnsupportedDataFormatErr
             -12911, // kVTVideoDecoderMalfunctionErr
+            -12927, // kFigPlayerError_IncompatibleAsset
+            -15517, // decoder initialization failed (empty hvcC)
             -17694, // kVTVideoDecoderReferenceMissingErr
         ]
         if chain.contains(where: { decoderStatusCodes.contains($0.code) })

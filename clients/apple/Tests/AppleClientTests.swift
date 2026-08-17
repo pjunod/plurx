@@ -554,6 +554,88 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    /// The Dolby Vision Profile 5 black screen. A device with no Profile 5
+    /// decoder answers with one of two CoreMedia verdicts, and neither used to
+    /// reach the ladder — so the client stopped dead instead of asking the
+    /// server for a picture it could actually decode.
+    @MainActor
+    func testApplePlayerTreatsDolbyVisionRejectionsAsCompatibilityFailures() {
+        for status in [-12927, -15517] {
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: "CoreMediaErrorDomain",
+                        code: status,
+                        userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "CoreMediaErrorDomain:\(status) is a media verdict, not a transport fault"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: AVFoundationErrorDomain,
+                        code: AVError.unknown.rawValue,
+                        userInfo: [NSUnderlyingErrorKey: NSError(
+                            domain: "CoreMediaErrorDomain",
+                            code: status,
+                            userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                        )]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "the verdict counts when it arrives underneath an opaque AVError"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: nil,
+                    eventDomain: "CoreMediaErrorDomain",
+                    eventStatus: status,
+                    eventComment: nil
+                ),
+                "the HLS error log carries the same verdict with no NSError at all"
+            )
+        }
+
+        // Widening pre-start classification must not have swallowed the
+        // transport and resource exclusions the ladder is protected by.
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.unknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(
+                    domain: NSURLErrorDomain,
+                    code: NSURLErrorTimedOut,
+                    userInfo: [NSLocalizedDescriptionKey: "The request timed out."]
+                )]
+            ),
+            eventDomain: NSURLErrorDomain,
+            eventStatus: NSURLErrorTimedOut,
+            eventComment: "segment request timed out"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.decoderTemporarilyUnavailable.rawValue,
+                userInfo: [:]
+            ),
+            eventDomain: nil,
+            eventStatus: nil,
+            eventComment: "decoder resources are temporarily unavailable"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(domain: "CoreMediaErrorDomain", code: -12660, userInfo: [:]),
+            eventDomain: "CoreMediaErrorDomain",
+            eventStatus: -12660,
+            eventComment: "HTTP 403"
+        ))
+    }
+
     @MainActor
     func testAutomaticSubtitlesApplyTheServersPickInsteadOfRederivingIt() {
         // The Scary Movie shape, as the decision hands it over: the server ran
