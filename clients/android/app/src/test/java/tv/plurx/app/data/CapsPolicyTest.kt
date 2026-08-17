@@ -6,6 +6,40 @@ import org.junit.Test
 class CapsPolicyTest {
 
     @Test
+    fun capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed() {
+        assertEquals(
+            "display-no-dv",
+            capabilityDiagnostics(
+                "0.2.7(28)",
+                setOf(HdrType.HDR10),
+                listOf("dv.decoder"),
+                listOf(DolbyVisionCodecProfile.DVHE_STN),
+                listOf(5),
+            )["dvstatus"],
+        )
+        assertEquals(
+            "decoder-missing",
+            capabilityDiagnostics(
+                "0.2.7(28)",
+                setOf(HdrType.DOLBY_VISION),
+                emptyList(),
+                emptyList(),
+                emptyList(),
+            )["dvstatus"],
+        )
+        val ready = capabilityDiagnostics(
+            "0.2.7(28)",
+            setOf(HdrType.DOLBY_VISION, HdrType.HDR10),
+            listOf("c2.vendor.dv.decoder"),
+            listOf(DolbyVisionCodecProfile.DVHE_STN),
+            listOf(5),
+        )
+        assertEquals("ready", ready["dvstatus"])
+        assertEquals("1,2", ready["hdrtypes"])
+        assertEquals("32", ready["dvraw"])
+    }
+
+    @Test
     fun directPlayContainersIncludeSupportedAudiobookSources() {
         val containers = DIRECT_PLAY_CONTAINERS.split(',').toSet()
         assertEquals(
