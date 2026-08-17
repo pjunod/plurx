@@ -48,10 +48,11 @@ pub enum Pipeline {
     /// download after the map — `tonemap_opencl` outputs OpenCL surfaces the
     /// H.264 encoders cannot take directly.
     TonemapOpencl,
-    /// Dolby Vision RPU reshaping through libplacebo. This is intentionally
-    /// separate from the ordinary HDR10 candidate list: it has a different
-    /// decode contract and must never fall back to the CPU zscale graph.
-    DoviLibplacebo,
+    /// Dolby Vision RPU reshaping through Jellyfin FFmpeg's SIMD software
+    /// filter. This is intentionally separate from the ordinary HDR10
+    /// candidate list: it has a different decode contract and must never fall
+    /// back to the non-Dolby-aware CPU zscale graph.
+    DoviTonemapx,
     /// hwdownload → CPU float tone-map → the encoder's own hwupload. Always
     /// available, always correct, and slow in exactly the case that matters.
     Cpu,
@@ -74,7 +75,7 @@ impl Pipeline {
             Pipeline::TonemapVaapi => "tonemap_vaapi",
             Pipeline::Libplacebo => "libplacebo",
             Pipeline::TonemapOpencl => "tonemap_opencl",
-            Pipeline::DoviLibplacebo => "dovi_libplacebo",
+            Pipeline::DoviTonemapx => "dovi_tonemapx",
             Pipeline::Cpu => "cpu",
         }
     }
@@ -83,7 +84,7 @@ impl Pipeline {
         CANDIDATES
             .iter()
             .copied()
-            .chain(std::iter::once(Pipeline::DoviLibplacebo))
+            .chain(std::iter::once(Pipeline::DoviTonemapx))
             .find(|p| p.name() == s)
     }
 
@@ -94,14 +95,14 @@ impl Pipeline {
             Pipeline::TonemapVaapi => "GPU tone-map (VA-API)",
             Pipeline::Libplacebo => "GPU tone-map (Vulkan)",
             Pipeline::TonemapOpencl => "GPU tone-map (OpenCL)",
-            Pipeline::DoviLibplacebo => "Dolby Vision reshape (Vulkan)",
+            Pipeline::DoviTonemapx => "Dolby Vision reshape (tonemapx)",
             Pipeline::Cpu => "CPU tone-map",
         }
     }
 
     /// True when frames stay on the GPU from decode to encode.
     pub fn on_gpu(self) -> bool {
-        self != Pipeline::Cpu
+        !matches!(self, Pipeline::Cpu | Pipeline::DoviTonemapx)
     }
 
     /// Can this pipeline pair with `encoder`?
@@ -117,10 +118,10 @@ impl Pipeline {
             Pipeline::VppQsv => encoder == Encoder::Qsv,
             Pipeline::TonemapVaapi => encoder == Encoder::Vaapi,
             Pipeline::Libplacebo | Pipeline::TonemapOpencl => encoder != Encoder::Software,
-            // The first safe implementation deliberately uses software decode
-            // and encode. That keeps DOVI frame side data attached and avoids
-            // mixing Vulkan's global filter device with QSV/VAAPI uploads.
-            Pipeline::DoviLibplacebo => encoder == Encoder::Software,
+            // The proved implementation deliberately uses software decode and
+            // encode. That keeps DOVI frame side data attached and gives the
+            // SIMD filter ordinary system-memory frames.
+            Pipeline::DoviTonemapx => encoder == Encoder::Software,
             Pipeline::Cpu => true,
         }
     }
@@ -138,8 +139,8 @@ impl Pipeline {
     pub fn handles(self, hdr_format: Option<&str>) -> bool {
         match (self, hdr_format) {
             (Pipeline::Cpu, _) => true,
-            (Pipeline::DoviLibplacebo, Some("dolby_vision")) => true,
-            (Pipeline::DoviLibplacebo, _) => false,
+            (Pipeline::DoviTonemapx, Some("dolby_vision")) => true,
+            (Pipeline::DoviTonemapx, _) => false,
             // Nothing to map. The graph is still allowed — its scaler is the
             // reason — and the tone-map step simply drops out.
             (_, None) => true,
@@ -171,7 +172,7 @@ impl Pipeline {
             // which knows things this type does not (source codec, bit depth).
             Pipeline::Libplacebo
             | Pipeline::TonemapOpencl
-            | Pipeline::DoviLibplacebo
+            | Pipeline::DoviTonemapx
             | Pipeline::Cpu => Vec::new(),
         }
     }
@@ -184,7 +185,7 @@ impl Pipeline {
             // libplacebo wants a Vulkan device; ffmpeg derives one from the
             // existing hardware context where it can, but naming it is what
             // makes the graph work on a box whose encoder is VA-API.
-            Pipeline::Libplacebo | Pipeline::DoviLibplacebo => vec![
+            Pipeline::Libplacebo => vec![
                 a("-init_hw_device"),
                 a("vulkan=vk"),
                 a("-filter_hw_device"),
@@ -278,14 +279,12 @@ impl Pipeline {
                     format!("{scale},format=nv12")
                 }
             }
-            Pipeline::DoviLibplacebo => {
+            Pipeline::DoviTonemapx => {
                 let h = height.max(2);
                 format!(
-                    "format=p010le,hwupload,\
-                     libplacebo=w={w}:h={h}:apply_dolbyvision=1:\
-                     tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
-                     color_trc=bt709:range=tv:format=nv12,\
-                     hwdownload,format=nv12"
+                    "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:\
+                     primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,\
+                     scale={w}:{h},format=yuv420p"
                 )
             }
         })
@@ -295,7 +294,7 @@ impl Pipeline {
     /// metadata is parsed onto AVFrames by the HEVC decoder; an inherited
     /// hardware decode/download path is not allowed to drop it silently.
     pub fn requires_software_decode(self) -> bool {
-        self == Pipeline::DoviLibplacebo
+        self == Pipeline::DoviTonemapx
     }
 
     /// The pipeline this session actually gets, given the one the node proved
@@ -395,7 +394,7 @@ impl Pipeline {
     /// works.
     pub fn fallback(self) -> Option<Pipeline> {
         match self {
-            Pipeline::Cpu | Pipeline::DoviLibplacebo => None,
+            Pipeline::Cpu | Pipeline::DoviTonemapx => None,
             _ => Some(Pipeline::Cpu),
         }
     }
@@ -416,18 +415,18 @@ mod tests {
         // A stored preference from a future version must not panic anything.
         assert_eq!(Pipeline::parse(""), None);
         assert_eq!(
-            Pipeline::parse("dovi_libplacebo"),
-            Some(Pipeline::DoviLibplacebo)
+            Pipeline::parse("dovi_tonemapx"),
+            Some(Pipeline::DoviTonemapx)
         );
         assert!(
-            !CANDIDATES.contains(&Pipeline::DoviLibplacebo),
+            !CANDIDATES.contains(&Pipeline::DoviTonemapx),
             "the Profile 5 renderer must be probed/admitted independently"
         );
     }
 
     #[test]
     fn profile5_renderer_has_one_safe_pairing_and_no_unsafe_fallback() {
-        let p = Pipeline::DoviLibplacebo;
+        let p = Pipeline::DoviTonemapx;
         assert!(p.pairs_with(Encoder::Software));
         for encoder in [
             Encoder::Nvenc,
@@ -445,10 +444,13 @@ mod tests {
         let graph = p
             .filters(Some(1920), 1080, Some("dolby_vision"))
             .expect("Profile 5 graph");
-        let reshape = graph.find("libplacebo=").expect("libplacebo transform");
-        assert_eq!(&graph[..reshape], "format=p010le,hwupload,");
-        assert!(graph.contains("apply_dolbyvision=1"), "{graph}");
-        assert!(graph.contains("hwdownload,format=nv12"), "{graph}");
+        let reshape = graph.find("tonemapx=").expect("tonemapx transform");
+        assert_eq!(reshape, 0, "Dolby reshape must precede scale: {graph}");
+        assert!(graph.contains("apply_dovi=1"), "{graph}");
+        assert!(graph.contains("scale=1920:1080"), "{graph}");
+        assert!(graph.ends_with("format=yuv420p"), "{graph}");
+        assert!(!graph.contains("hwupload"), "{graph}");
+        assert!(!graph.contains("libplacebo"), "{graph}");
         assert!(!graph.contains("setparams"), "{graph}");
         assert!(!graph.contains("zscale"), "{graph}");
         assert!(!graph[..reshape].contains("scale"), "{graph}");

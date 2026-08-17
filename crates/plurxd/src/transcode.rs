@@ -3442,7 +3442,7 @@ impl TranscodeManager {
         let required = Self::needs_dovi_reshape(file)?;
         if required && !self.dovi_reshape {
             return Err(unsupported_build_error(
-                "this ffmpeg did not prove the Vulkan libplacebo Dolby Vision renderer required for Profile 5",
+                "this ffmpeg did not prove the Dolby-aware tonemapx renderer required for Profile 5",
             ));
         }
         if required {
@@ -3507,7 +3507,7 @@ impl TranscodeManager {
             audio_index,
             start_seconds,
             tone_map: if dovi_reshape {
-                ToneMap::Libplacebo
+                ToneMap::Tonemapx
             } else {
                 tone_map
             },
@@ -3521,7 +3521,7 @@ impl TranscodeManager {
             // subtitle burn keeps the GPU graph (it downloads once for
             // libass/overlay after the expensive scale + tone-map is done).
             pipeline: if dovi_reshape {
-                Pipeline::DoviLibplacebo
+                Pipeline::DoviTonemapx
             } else {
                 Pipeline::for_session(
                     self.pipeline,
@@ -7802,8 +7802,8 @@ mod tests {
             None,
             ToneMap::Zscale,
         );
-        assert_eq!(opts.pipeline, Pipeline::DoviLibplacebo);
-        assert_eq!(opts.tone_map, ToneMap::Libplacebo);
+        assert_eq!(opts.pipeline, Pipeline::DoviTonemapx);
+        assert_eq!(opts.tone_map, ToneMap::Tonemapx);
         assert_eq!(manager.auto_height_for_file(Some(&file), None).await, 720);
     }
 

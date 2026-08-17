@@ -131,24 +131,24 @@ pub async fn has_dovi_rpu() -> bool {
         .await
 }
 
-/// Can the exact software-decode/Vulkan/libplacebo/software-encode route used
+/// Can the exact software-decode/tonemapx/software-encode route used
 /// for non-backward-compatible Dolby Vision start on this build?
 ///
-/// The option declaration is necessary but not sufficient: Vulkan device
-/// creation, upload/download formats, and libx264 must also work together.
+/// The option declaration is necessary but not sufficient: the SIMD filter
+/// and libx264 must also work together.
 /// Probe one synthetic frame through the production graph. The real Profile 5
 /// validation remains responsible for proving that RPU side data changes the
 /// pixels; this boot probe gates whether the renderer can be attempted at all.
 pub async fn has_dovi_reshape() -> bool {
     *DOVI_RESHAPE
         .get_or_init(|| async {
-            let help = probe_ffmpeg(&["-hide_banner", "-h", "filter=libplacebo"]).await;
+            let help = probe_ffmpeg(&["-hide_banner", "-h", "filter=tonemapx"]).await;
             let declared = help
                 .as_ref()
-                .is_ok_and(|text| declares_filter_option(text, "apply_dolbyvision"));
+                .is_ok_and(|text| declares_filter_option(text, "apply_dovi"));
             if !declared {
                 tracing::warn!(
-                    "ffmpeg libplacebo has no apply_dolbyvision option; non-compatible Dolby Vision transcodes will be refused"
+                    "ffmpeg tonemapx has no apply_dovi option; non-compatible Dolby Vision transcodes will be refused"
                 );
                 return false;
             }
@@ -156,10 +156,6 @@ pub async fn has_dovi_reshape() -> bool {
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                "-init_hw_device",
-                "vulkan=vk",
-                "-filter_hw_device",
-                "vk",
                 "-f",
                 "lavfi",
                 "-i",
@@ -167,7 +163,7 @@ pub async fn has_dovi_reshape() -> bool {
                 "-frames:v",
                 "1",
                 "-vf",
-                "format=p010le,hwupload,libplacebo=w=64:h=64:apply_dolbyvision=1:tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=nv12,hwdownload,format=nv12",
+                "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,scale=64:64,format=yuv420p",
                 "-c:v",
                 "libx264",
                 "-f",
@@ -180,10 +176,10 @@ pub async fn has_dovi_reshape() -> bool {
                 .await
                 .is_ok_and(|result| result.is_ok_and(|status| status.success()));
             if passed {
-                tracing::info!("ffmpeg proved the Dolby Vision libplacebo renderer");
+                tracing::info!("ffmpeg proved the Dolby Vision tonemapx renderer");
             } else {
                 tracing::warn!(
-                    "ffmpeg could not run the Dolby Vision libplacebo renderer; non-compatible Dolby Vision transcodes will be refused"
+                    "ffmpeg could not run the Dolby Vision tonemapx renderer; non-compatible Dolby Vision transcodes will be refused"
                 );
             }
             passed
@@ -199,18 +195,14 @@ async fn dovi_probe_output(file: &MediaFile, apply: bool) -> Result<Vec<String>,
         .max(0.0);
     let (width, height) = output_size(file, 720)
         .ok_or_else(|| "Dolby Vision pixel probe has no valid output size".to_owned())?;
-    let filter = Pipeline::DoviLibplacebo
+    let filter = Pipeline::DoviTonemapx
         .filters(Some(width), height, Some("dolby_vision"))
         .ok_or_else(|| "Dolby Vision renderer produced no filter graph".to_owned())?
-        .replace(
-            "apply_dolbyvision=1",
-            &format!("apply_dolbyvision={}", u8::from(apply)),
-        );
+        .replace("apply_dovi=1", &format!("apply_dovi={}", u8::from(apply)));
     let mut command = tokio::process::Command::new(ffmpeg_bin());
     command
         .kill_on_drop(true)
         .args(["-hide_banner", "-loglevel", "error"])
-        .args(["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"])
         .args(["-ss", &format!("{seek:.3}"), "-i"])
         .arg(&file.path)
         .args(["-map", "0:v:0", "-frames:v", "3", "-an", "-vf"])
@@ -407,16 +399,16 @@ mod tests {
     #[test]
     fn a_dolby_vision_renderer_option_is_matched_as_a_declaration() {
         assert!(declares_filter_option(
-            "   apply_dolbyvision <boolean> ..FV....... apply Dolby Vision metadata (default true)\n",
-            "apply_dolbyvision"
+            "   apply_dovi <boolean> ..FV....... Apply Dolby Vision metadata if possible (default true)\n",
+            "apply_dovi"
         ));
         assert!(!declares_filter_option(
-            "   tonemapping <int> ..FV....... used with apply_dolbyvision\n",
-            "apply_dolbyvision"
+            "   tonemap <int> ..FV....... used with apply_dovi\n",
+            "apply_dovi"
         ));
         assert!(!declares_filter_option(
-            "   apply_dolbyvision_legacy <boolean> ..FV.......\n",
-            "apply_dolbyvision"
+            "   apply_dovi_legacy <boolean> ..FV.......\n",
+            "apply_dovi"
         ));
     }
 
