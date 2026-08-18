@@ -12,7 +12,10 @@ Vision investigation are recorded in
 > Status (2026-08-18): source is v0.2.7, Apple build 64. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 63 hardens stall recovery against the tvOS freeze observed
+> landed. Build 64 corrects build 63's delivery watchdog, which fired on
+> healthy buffered playback and interrupted a 2160p session roughly every two
+> minutes; the film clock and buffered runway are now required to corroborate
+> the server's delivery meter. Build 63 hardens stall recovery against the tvOS freeze observed
 > on 2160p copy-HLS: a shared no-progress clock immune to
 > `timeControlStatus` flapping, a bounded unestablished leash instead of a
 > disarmed detector, a server-truth delivery watchdog on the status poll,

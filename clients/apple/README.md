@@ -15,7 +15,10 @@ only what this hardware genuinely can't play.
 > Status: **v0.2.7**, build `64` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 63 makes stall recovery un-foolable: one
+> same regression suite. Build 64 stops the delivery watchdog firing on a
+> healthy player: a full forward buffer looks exactly like a wedge from the
+> server's delivery meter, so the film clock and the buffered runway now have
+> to agree before it recovers. Build 63 makes stall recovery un-foolable: one
 > shared no-progress clock that regime flapping cannot reset, a longer
 > bounded leash (then a visible error) where recovery used to disarm
 > forever, a server-truth delivery watchdog fed by the 2-second status
