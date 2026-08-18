@@ -79,6 +79,16 @@ class OperationsContractCase(unittest.TestCase):
         self.assertLess(jellyfin_install, second_clean)
         self.assertEqual(dockerfile.count("&& apt-get clean"), 2)
 
+    def test_docker_build_requires_the_profile5_renderer_used_at_runtime(self):
+        dockerfile = read("Dockerfile")
+        self.assertIn("-h filter=tonemapx", dockerfile)
+        self.assertIn(
+            "grep -q '^[[:space:]]*apply_dovi[[:space:]]'",
+            dockerfile,
+        )
+        self.assertNotIn("-h filter=libplacebo", dockerfile)
+        self.assertNotIn("apply_dolbyvision", dockerfile)
+
     def test_ship_routes_real_mobile_targets_through_ansible(self):
         ship = read("scripts/ship")
         project = read("clients/apple/project.yml")
@@ -222,6 +232,18 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release -p plurxd --target ${{ matrix.target }}",
             workflow,
         )
+        self.assertEqual(
+            workflow.count(
+                "s|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g",
+            ),
+            4,
+        )
+        self.assertEqual(
+            workflow.count("sudo apt-get -o Acquire::Retries=3"),
+            8,
+        )
+        self.assertNotIn("sudo apt-get update", workflow)
+        self.assertNotIn("sudo apt-get install", workflow)
         self.assertNotIn(
             "cargo build --release --workspace --target ${{ matrix.target }}",
             workflow,

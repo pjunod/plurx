@@ -47,7 +47,9 @@ import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.OfflineQueueRequest
 import tv.plurx.app.data.offline.OfflineRecord
 import tv.plurx.app.data.offline.authoritativeOfflineNetwork
+import tv.plurx.app.player.PreplayTracks
 import tv.plurx.app.player.decisionForce
+import tv.plurx.app.player.preplayQueryParams
 
 /** Top-level app state: which screen the shell should show. */
 sealed interface Phase {
@@ -552,9 +554,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * an explicit "720p" silently did nothing. The height rides on the session
      * create instead (`sessionHeight`).
      */
-    suspend fun decision(fileId: Long): Decision = api().decision(
+    suspend fun decision(
+        fileId: Long,
+        tracks: PreplayTracks = PreplayTracks.NONE,
+    ): Decision = api().decision(
         fileId,
-        caps() + ("force" to decisionForce(_preferences.value.playbackQuality)),
+        caps() + ("force" to decisionForce(_preferences.value.playbackQuality)) +
+            // Request-local only. Omitting a parameter keeps the shared
+            // playback-default policy and the response older clients get; the
+            // server never writes a Playback setting from these.
+            preplayQueryParams(tracks),
     )
 
     suspend fun setWatched(itemId: Long, watched: Boolean): Int = if (watched) {

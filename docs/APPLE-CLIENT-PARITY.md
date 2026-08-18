@@ -9,13 +9,22 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-16): source is v0.2.7, Apple build 63. Native text
+> Status (2026-08-18): source is v0.2.7, Apple build 66. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 63 marks a duration-estimated Skip Credits button as an
+> landed. Build 66 marks a duration-estimated Skip Credits button as an
 > estimate, so it no longer reads exactly like a chapter-derived one.
-> Build 62 lists the audio and subtitle tracks a file actually has on
-> the detail screen and lets a viewer choose both before pressing Play (§6).
+> Build 64 corrects build 63's delivery watchdog, which fired on
+> healthy buffered playback and interrupted a 2160p session roughly every two
+> minutes; the film clock and buffered runway are now required to corroborate
+> the server's delivery meter. Build 63 hardens stall recovery against the tvOS freeze observed
+> on 2160p copy-HLS: a shared no-progress clock immune to
+> `timeControlStatus` flapping, a bounded unestablished leash instead of a
+> disarmed detector, a server-truth delivery watchdog on the status poll,
+> and a rolling automatic-reopen budget that ends storms at the visible
+> failure screen. Build 62 lists the audio and subtitle tracks a file
+> actually has on the detail screen and lets a viewer choose both before
+> pressing Play (§6).
 > Build 60 requires a concrete selected PGS track before treating the
 > overlay as active. Its physical non-PGS baseline reached active PiP and
 > returned or stopped cleanly on iPhone Air (iOS 26.6) and iPad Pro 13-inch
@@ -55,7 +64,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 62 has not reached
+> resolved status. Repository evidence still says build 65 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.

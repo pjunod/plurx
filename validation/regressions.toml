@@ -463,10 +463,14 @@ checks = ["rust-gate"]
 reason = "The shipped-binary regression `a_signal_during_startup_stops_the_daemon_before_it_boots` raises SIGTERM the moment store activation returns, which is before `boot` runs and long before any listener exists, then requires the daemon to exit 0 having recorded the startup-window signal and never logged `plurxd starting`. Watching the eagerly installed signal streams for the whole of startup stops the daemon at its next cancel-safe boundary; reverting only the production correction so the future is again handed straight to `boot` restores the buffer-until-serve behavior, and the daemon probes hardware, binds, serves and drains, so `plurxd starting` appears and the test fails. The covered guarantee starts after `select_daemon_store`, which renames directories and fsyncs activation markers in a fixed order and is deliberately never cancelled midway."
 
 [[coverage]]
-commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
+commits = [
+  "59ccda3a6e77e431e1e6c0caf934c7da4981ee85",
+  "5b1066860364f135877f9bb758995d1547ea0947",
+  "e4e3e50a2796216c75639f6ef61604ad68959c97",
+]
 points = ["persistence.upgrades", "cluster.auth"]
-checks = ["cluster-auth"]
-reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
+checks = ["cluster-auth", "rust-gate"]
+reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports two probe bands under the production 2 MiB WAL and verifies exact `probe_json` parity for both: the original 64 adjacent 48 KiB rows, plus 18 rows of 144 KiB whose 16 adjacent rows serialize past the 2,097,118-byte WAL payload capacity, which the test asserts as its own premise so a favourable row count cannot pass for byte safety. Import transactions are now bounded by measured serialized bytes, so the covered contract is byte safety rather than an average row size; reverting only the byte bound reproduces the writer panic node m6 hit in production. `a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node` covers the remaining case a byte bound cannot split: a single 2,100 KiB probe row is refused with the table, row id, measured size, and limit, and the voter still answers afterwards instead of restarting into unreplicated SQLite recovery. The importer's boundary arithmetic — the flush exactly on and one byte past the budget, mixed sizes forcing several flushes, a row above the budget carried alone, and the estimate proven an upper bound on the `bincode::config::legacy()` encoding `hiqlite-wal` 0.14 actually appends log entries with, asserted against `standard()` as well in case that changes — is pinned by the `store::hiqlite_import` unit tests. `the_row_estimate_stays_above_what_the_wal_encoder_produces` measures integer-heavy, text-heavy, and mixed rows rather than a few large payloads, because a per-param under-count is what an estimate checked only against wide payloads hides; it fails on the superseded 11-byte per-param allowance that was verified against `standard()` alone."
 
 [[coverage]]
 commits = ["a828a217", "ab10b2c7"]
@@ -491,3 +495,78 @@ commits = ["669d9727"]
 points = ["playback.pipeline", "server.api"]
 checks = ["rust-gate"]
 reason = "The retained plurxd regression `a_stall_below_the_ladder_floor_never_steps_up` drives a bound stall reopen from 144p and 240p Auto predecessors — the rungs `auto_height` reaches on a sub-360 source and `auto_height_from_prior` reaches on a starved link, which is the population that stalls — and requires the normalized answer and the persisted claim target to repeat that rung; reverting only the production correction restores the `LADDER_HEIGHTS[0]` fallback, so the way down hands a starving viewer 360p, a rung above where Auto put them and above what a sub-360 source can feed. The retained `stall_stickiness_follows_stated_quality_intent_not_a_posted_height` proves stall eligibility follows the stated `quality_auto` intent rather than the presence of `height`, so an Auto viewer whose burned subtitle posts the source height stays steppable while both wire-presence arms are unchanged for clients that omit the field; reverting only the production correction makes every Android Auto-plus-burn session permanently unsteppable. The retargeted `a_repeated_create_returns_the_same_session` asserts against the live `intent_fingerprint` key, so deleting `audio_offset_ms`, `user_name`, or `playback_id` from it now fails instead of leaving the suite green against the retired `fingerprint` helper."
+
+[[coverage]]
+commits = ["476d390", "4a414bf", "0313d1b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained graph regressions pin software decode, Vulkan initialization, explicit RPU application before any scale/color transform, BT.709 output arguments, even no-upscale dimensions, the independently named software-only renderer, and the absence of setparams/zscale or a CPU fallback while proving HDR10- and HLG-compatible Profile 8 inputs keep the correct base transfer. Manager regressions refuse unknown/unproven profiles, cap Profile 5 Auto at the software rung, and admit only the proved renderer/encoder pair; runtime admission additionally compares real-source frame hashes with RPU application enabled and disabled and refuses identical output. The recipe property test proves the effective session pipeline changes cache identity under cache format v2."
+
+[[coverage]]
+commits = ["8a4fff7"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained Profile 5 graph regression requires the Dolby-aware tonemapx filter with apply_dovi enabled before the even, no-upscale resize, BT.709 limited-range output, software decode and encode, a distinct dovi_tonemapx cache identity, and no Vulkan upload, libplacebo transform, zscale relabel, or unsafe fallback. The daemon capability regression matches the exact apply_dovi declaration, the manager regression admits only the proved software renderer pair, and the real-source mutation gate still refuses a source whose decoded pixels do not change when RPU application is disabled. Restoring the former dovi_libplacebo graph fails these assertions."
+
+[[coverage]]
+commits = ["885073b"]
+points = []
+checks = []
+reason = "This commit only records the Profile 5 renderer correction's current validation evidence; it does not change runtime behavior."
+ignore = true
+
+[[coverage]]
+commits = ["706539d"]
+points = ["operations.packaging", "playback.pipeline"]
+checks = ["operations-contract", "rust-gate"]
+reason = "The retained operations contract requires the runtime image to query the tonemapx filter and match the exact apply_dovi declaration used by the Profile 5 production graph, while explicitly rejecting the retired libplacebo/apply_dolbyvision assertion. The focused Rust graph, renderer-declaration, and admission regressions retain the matching runtime side of that packaging contract."
+
+[[coverage]]
+commits = ["c190468", "c02b248"]
+points = []
+checks = []
+reason = "These commits only record the Profile 5 correction's current validation evidence; they do not change runtime behavior."
+ignore = true
+
+[[coverage]]
+commits = ["9b34877b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained core regression `in_band_hevc_parameter_sets_fill_an_empty_dolby_vision_hvcc` reproduces the Dexter Profile 5 source's 23-byte hvcC with no VPS/SPS/PPS arrays, promotes the in-band parameter sets into a valid initialization record, reparses the result, and proves promotion is idempotent. The copy-argument regression requires non-backward-compatible Profile 5 to retain those units for the segmenter while ordinary HEVC and compatible-base Dolby Vision keep their existing normalization path; reverting only the production correction either leaves Apple TV without decoder configuration or regresses the established compatible-copy contract."
+
+[[coverage]]
+commits = ["b1132e8"]
+points = []
+checks = []
+reason = "This commit adds a startup operator warning naming unstamped builds and how to stamp them (make docker-up / PLURX_BUILD_REF); its only surface is that log line. The packaging contract that produces stamped images is already covered by the operations contract, and the deploy-path fix lives in the fleet playbook, not in runtime assertions."
+ignore = true
+
+[[coverage]]
+commits = ["e8f8acac", "6e98c2fb"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained HLS tests read the Dolby Vision configuration record from the published init and require a preserved Profile 5 master to advertise its dvh1 identifier; the core routing tests separately require a claimed Dolby Vision profile to survive a missing generic HDR bit while an unclaimed profile still tone-maps."
+
+[[coverage]]
+commits = ["7d2a68c3"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web policy tests execute the HEVC capability probe across decoder height, bit depth, level, and HDR support, refusing Main10, max-height, and PQ claims that the browser did not prove."
+
+[[coverage]]
+commits = ["0f418c9"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` requires the capability ceiling to hold for a Dolby Vision Profile 5 source on BOTH encoders and for every file on a software-only node, requires Auto's own answer to be present on the advertised ladder, and requires the ceiling to ignore network priors while Auto still honours them. Reverting `advertised_ladder` to the uncapped `ladder(source_height)` reinstates the 1080p rung a Profile 5 session cannot serve and fails the test on the exact rung the web ABR controller used to upgrade into."
+
+[[coverage]]
+commits = ["0adf25d"]
+points = ["web.experience"]
+checks = ["web-static"]
+reason = "The retained `a session that lands on a different range repaints the badge` runs the shipped `attachSession` against a player whose decision-time range disagrees with the session's, and requires the repaint; removing the `renderPlayerInfo()` call fails it on the stale chip rather than on a missing name. It also pins that a superseded generation never paints over the live player."
+
+[[coverage]]
+commits = ["406306b"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "Three corrections with three retained regressions. `profile5_renderer_keeps_software_decode_and_may_encode_anywhere_probed` requires the reshape to keep `requires_software_decode` and to stay off the GPU end to end while allowing every hardware encoder to pair — reverting the pairing to software-only fails it, and deleting the software-decode requirement fails it in the other direction, which is the split that made a 4K Dolby Vision source 720p for non-DV clients. `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` still pins Auto onto the advertised ladder and now pins that an unproved hardware pairing falls back to the software rung rather than advertising a rung that would fail. `an upgrade needs encode headroom, not just a bandwidth estimate` drives `decideRung` with the production shape — a ~200 Mb/s JIT estimate at 720p — and requires the upgrade to be refused when the server's measured pace predicts under realtime one rung up, requires it to proceed on real headroom, requires an unmeasured session to stay able to rise, requires a rung that already failed to open never to be re-entered, and requires emergencies to keep falling past a blocked rung; reverting any one of those arms restores the 720<->1080 limit cycle."

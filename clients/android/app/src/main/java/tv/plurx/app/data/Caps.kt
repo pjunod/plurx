@@ -11,8 +11,10 @@ import android.view.Display
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import tv.plurx.app.BuildConfig
 
 /**
  * Runtime playback capabilities for this device, sent to `/decision` so the
@@ -59,15 +61,23 @@ object Caps {
 
         val hdrTypes = displayHdrTypes(context)
         val hdr = displayIsHdr(hdrTypes) && (video.contains("hevc") || video.contains("av1"))
-        val rawDolbyVisionProfiles = if (DOLBY_VISION_MIME in decoderMimes) {
-            decoderDolbyVisionProfiles(codecs)
-        } else {
-            emptyList()
-        }
+        // Ask the same Media3 decoder selector that ExoPlayer uses. The raw
+        // platform registry can omit aliases and device workarounds that
+        // Media3 applies at playback time, which made capable Google TV boxes
+        // under-report Dolby Vision and receive an SDR transcode instead.
+        val dolbyVisionDecoderProbe = decoderDolbyVisionProbe()
+        val rawDolbyVisionProfiles = dolbyVisionDecoderProbe.profiles
         val dolbyVisionProfiles = dolbyVisionProfiles(rawDolbyVisionProfiles)
         val dolbyVision = dolbyVisionCaps(
             profiles = dolbyVisionProfiles,
             displaySupportsDolbyVision = HdrType.DOLBY_VISION in hdrTypes,
+        )
+        val diagnostics = capabilityDiagnostics(
+            version = "${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})",
+            hdrTypes = hdrTypes,
+            decoderNames = dolbyVisionDecoderProbe.names,
+            rawProfiles = rawDolbyVisionProfiles,
+            claimedProfiles = dolbyVisionProfiles,
         )
 
         val result = mapOf(
@@ -80,29 +90,37 @@ object Caps {
             // video HLS machinery even when this device can play them raw.
             "container" to DIRECT_PLAY_CONTAINERS,
             "hdr" to if (hdr) "1" else "0",
-        ) + dolbyVision
+        ) + dolbyVision + diagnostics
         Log.i(
             LOG_TAG,
             "model=${Build.MODEL} hdrTypes=${hdrTypes.sorted()} " +
+                "dvDecoders=${dolbyVisionDecoderProbe.names} " +
                 "rawDvProfiles=${rawDolbyVisionProfiles.sorted()} " +
                 "claimedDvProfiles=$dolbyVisionProfiles caps=$result",
         )
         return result
     }
 
-    /** Raw `video/dolby-vision` profile constants this device's decoders list. */
-    private fun decoderDolbyVisionProfiles(
-        codecs: Array<android.media.MediaCodecInfo>,
-    ): List<Int> = codecs.flatMap { info ->
-        if (info.isEncoder) return@flatMap emptyList()
-        if (info.supportedTypes.none { it.equals(DOLBY_VISION_MIME, ignoreCase = true) }) {
-            return@flatMap emptyList()
-        }
-        try {
-            info.getCapabilitiesForType(DOLBY_VISION_MIME).profileLevels.map { it.profile }
-        } catch (_: Exception) {
-            emptyList()
-        }
+    private data class DolbyVisionDecoderProbe(
+        val names: List<String>,
+        val profiles: List<Int>,
+    )
+
+    /** Non-secure, non-tunneled Dolby Vision decoders Media3 can actually select. */
+    private fun decoderDolbyVisionProbe(): DolbyVisionDecoderProbe = try {
+        val decoders = MediaCodecUtil.getDecoderInfos(
+            DOLBY_VISION_MIME,
+            /* secure = */ false,
+            /* tunneling = */ false,
+        )
+        DolbyVisionDecoderProbe(
+            names = decoders.map { it.name }.distinct(),
+            profiles = decoders.flatMap { decoder ->
+                decoder.profileLevels.map { it.profile }
+            }.distinct(),
+        )
+    } catch (_: Exception) {
+        DolbyVisionDecoderProbe(emptyList(), emptyList())
     }
 
     /**

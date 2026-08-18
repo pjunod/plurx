@@ -24,13 +24,13 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::MediaFile;
 
-use super::{Encoder, Pipeline, SubtitleBurn, ToneMap, TranscodeOptions, SEGMENT_SECONDS};
+use super::{Encoder, OutputGrade, SubtitleBurn, ToneMap, TranscodeOptions, SEGMENT_SECONDS};
 
 /// Bumped when the meaning of a recipe changes in a way the field list cannot
 /// express — a different hash construction, a corrected serialisation, a fixed
 /// bug in what the fields *mean*. Every old entry misses; nothing is served
 /// wrongly while a deploy rolls out.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Everything about *how this server encodes* that changes the output bytes.
 ///
@@ -52,8 +52,6 @@ pub struct PipelineDigest {
     /// distribution's patched 6.1 and a jellyfin 6.1 are different encoders.
     pub ffmpeg_build: String,
     pub encoder: Encoder,
-    /// The tone-map graph this node runs (see [`Pipeline`]).
-    pub pipeline: Pipeline,
 }
 
 impl PipelineDigest {
@@ -61,7 +59,6 @@ impl PipelineDigest {
         field(h, "ffmpeg", self.ffmpeg_build.as_bytes());
         field(h, "encoder", self.encoder.label().as_bytes());
         field(h, "codec", self.encoder.video_codec().as_bytes());
-        field(h, "pipeline", self.pipeline.name().as_bytes());
         // The output contract this build produces, spelled out rather than
         // implied by the encoder name: a future change to any of these is a
         // different picture from the same recipe, and has to miss.
@@ -140,6 +137,47 @@ impl Recipe<'_> {
             if self.audio_copied { b"copy" } else { b"aac" },
         );
         field(&mut h, "tonemap", tone_map_name(o.tone_map).as_bytes());
+        // The effective per-session renderer, not the node's ordinary HDR10
+        // winner. Dolby Vision Profile 5 deliberately runs a different graph;
+        // hashing the boot winner would let differently rendered pixels share
+        // one cache entry.
+        field(&mut h, "pipeline", o.pipeline.name().as_bytes());
+        // The output contract, when it is not the one `PipelineDigest::feed`
+        // spells out above (`yuv420p`, `bt709/bt709/bt709/tv`, and the
+        // encoder's H.264 `video_codec`). Emitted only for a non-SDR grade so
+        // that every recipe written before M5 hashes to exactly the bytes it
+        // did — an SDR cache entry must not be invalidated by a rung it never
+        // used.
+        //
+        // Belt and braces: `pipeline` above is already unique per grade, so
+        // HDR10 output could not have collided with SDR output regardless.
+        // This makes the key *say* what the bytes are rather than leaving it
+        // implied by a graph name.
+        let grade = o.pipeline.output_grade();
+        if grade != OutputGrade::Sdr {
+            field(&mut h, "grade", grade.name().as_bytes());
+            field(&mut h, "grade_pixfmt", grade.pixel_format().as_bytes());
+            field(
+                &mut h,
+                "grade_colour",
+                format!(
+                    "{}/{}/{}/tv",
+                    grade.primaries(),
+                    grade.transfer(),
+                    grade.matrix()
+                )
+                .as_bytes(),
+            );
+            field(
+                &mut h,
+                "grade_codec",
+                self.digest
+                    .encoder
+                    .video_codec_for(grade)
+                    .unwrap_or("libx265")
+                    .as_bytes(),
+            );
+        }
         field(
             &mut h,
             "burn",
@@ -171,6 +209,7 @@ fn tone_map_name(t: ToneMap) -> &'static str {
     match t {
         ToneMap::Zscale => "zscale",
         ToneMap::Libplacebo => "libplacebo",
+        ToneMap::Tonemapx => "tonemapx",
         ToneMap::None => "none",
     }
 }
@@ -204,7 +243,6 @@ mod tests {
         PipelineDigest {
             ffmpeg_build: "ffmpeg version 6.1.1-3ubuntu5".to_owned(),
             encoder: Encoder::Software,
-            pipeline: Pipeline::Cpu,
         }
     }
 
@@ -269,7 +307,9 @@ mod tests {
                 d.ffmpeg_build = "ffmpeg version 7.1".into()
             }),
             ("encoder family", |d, _, _, _| d.encoder = Encoder::Qsv),
-            ("pipeline", |d, _, _, _| d.pipeline = Pipeline::VppQsv),
+            ("pipeline", |_, _, o, _| {
+                o.pipeline = crate::transcode::Pipeline::VppQsv
+            }),
             // The source. Size and mtime are the invalidation mechanism.
             ("file id", |_, f, _, _| f.id = 43),
             ("size", |_, f, _, _| f.size += 1),
@@ -388,15 +428,66 @@ mod tests {
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    /// N1 will move rate control into the effective per-recipe identity. This
-    /// literal pins the pre-N1 VBR bytes first, so that refactor cannot turn a
-    /// cache-preserving contract into a fleet-wide miss by accident.
+    /// Version 2 intentionally invalidates version 1: the effective session
+    /// renderer now replaces the node's generic boot pipeline in the key, so
+    /// Profile 5 output made by the old relabel route can never be reused.
+    /// Pin the new bytes so any later fleet-wide invalidation stays explicit.
     #[test]
     fn legacy_vbr_recipe_hash_is_a_golden_fixture() {
         let (d, f, o) = (digest(), media(), TranscodeOptions::default());
         assert_eq!(
             hash_of(&d, &f, &o, false),
-            "2551a15c49c71a80c92c629c8ab42e004d86d9bfffc1de5e76f72e2225961855"
+            "b9dae1c44d396f94c760a627b7a3b709ec591db227c162eb5588d91420f767c6"
+        );
+    }
+
+    /// The HDR10 rung is a different picture from the same request, so it
+    /// must be a different entry — and adding it must not have moved a single
+    /// SDR key, or the whole fleet's cache misses on deploy for nothing.
+    ///
+    /// The second half is really enforced by
+    /// [`legacy_vbr_recipe_hash_is_a_golden_fixture`] above, which is a
+    /// literal. This states the rule the literal exists for.
+    #[test]
+    fn the_hdr10_grade_is_a_distinct_entry_and_no_sdr_key_moved() {
+        let (d, f) = (digest(), media());
+        let sdr = TranscodeOptions::default();
+        let hdr10 = TranscodeOptions {
+            pipeline: crate::transcode::Pipeline::DoviPassthrough,
+            ..Default::default()
+        };
+        let reshape = TranscodeOptions {
+            pipeline: crate::transcode::Pipeline::DoviTonemapx,
+            ..Default::default()
+        };
+        let sdr_hash = hash_of(&d, &f, &sdr, false);
+        let hdr10_hash = hash_of(&d, &f, &hdr10, false);
+        assert_ne!(hdr10_hash, sdr_hash);
+        assert_ne!(
+            hdr10_hash,
+            hash_of(&d, &f, &reshape, false),
+            "the two Dolby renderers produce different pictures"
+        );
+        // Every SDR pipeline still hashes exactly as it did — the grade
+        // fields are emitted only for a grade that is not SDR.
+        for pipeline in crate::transcode::PIPELINE_CANDIDATES
+            .iter()
+            .copied()
+            .chain(std::iter::once(crate::transcode::Pipeline::DoviTonemapx))
+        {
+            let o = TranscodeOptions {
+                pipeline,
+                ..Default::default()
+            };
+            assert_eq!(
+                o.pipeline.output_grade(),
+                crate::transcode::OutputGrade::Sdr,
+                "{pipeline:?}"
+            );
+        }
+        assert_eq!(
+            sdr_hash,
+            hash_of(&d, &f, &TranscodeOptions::default(), false)
         );
     }
 
