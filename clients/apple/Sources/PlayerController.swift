@@ -590,29 +590,66 @@ struct SameDeliveryStallRecoveryState: Equatable {
 /// waiting. The server already measures that wedge precisely
 /// (`delivered_idle_ms` since the last completed media delivery, and how much
 /// published media the client has not fetched), and this client already polls
-/// those numbers every two seconds. Two consecutive qualifying polls fire one
-/// recovery through the same bounded same-delivery ladder as every other
-/// stall; ineligible states (paused, stream change in flight, seek pending,
-/// nothing actually pending server-side) reset the confirmation count.
+/// those numbers every two seconds.
+///
+/// **Server evidence alone is not enough, and assuming it was shipped a
+/// regression.** A healthy player with a full forward buffer looks identical
+/// from the server's side: `preferredForwardBufferDuration` is 60 s, so once
+/// AVPlayer is topped up it stops fetching for a long stretch, while the
+/// producer runs ~2× realtime and parks at the 180 s ahead-window cap. Build
+/// 63 fired on exactly that state and killed a healthy 2160p session every
+/// ~2.4 minutes (`stall:stall-delivery ms≈19000` with `ahead_seconds` 150-180
+/// and `recent_speed` ≈ 2.0, each reopen reaching first frame in under a
+/// second). The discriminator is the film clock: **a player whose position is
+/// advancing is not starving, whatever the delivery meter says.** Buffered
+/// runway is the corroborating guard — media already in hand means the next
+/// fetch is a top-up, not a rescue.
+///
+/// Two consecutive qualifying polls fire one recovery through the same
+/// bounded same-delivery ladder as every other stall; any ineligible or
+/// healthy sample resets the confirmation count.
 struct DeliveryStarvationDetector: Equatable {
-    /// A healthy steady-state player completes a segment fetch every segment
+    /// A starved steady-state player completes a segment fetch every segment
     /// duration (~6-10 s here). Sixteen seconds of completed-delivery silence
-    /// while media is pending is beyond any healthy cadence.
+    /// is beyond any healthy cadence *for a client that has nothing buffered*.
     static let deliveredIdleThresholdMs = 16_000
     /// Require a real backlog, so playing out the tail of a finished stream
-    /// (published == fetched) can never qualify.
+    /// (published == fetched) can never qualify. Note this is nearly always
+    /// true mid-film — the ahead window is deliberately deep — so it excludes
+    /// the end of a stream and nothing else.
     static let pendingMediaThresholdMs = 10_000
+    /// The film clock must be stuck too. Samples are 2 s apart and ordinary
+    /// playback advances ~2000 ms between them, so this only tolerates
+    /// rounding.
+    static let positionToleranceMs = 250
+    /// A client holding more than this much buffered media ahead of the
+    /// playhead is topping up, not starving. Well under the 60 s forward
+    /// buffer preference so an ordinary top-up cycle can never qualify.
+    static let runwayCeilingSeconds = 10.0
     static let confirmationsRequired = 2
 
     private(set) var confirmations = 0
+    private var lastPositionMs: Int?
 
     mutating func observe(
         deliveredIdleMs: Int?,
         publishedEndMs: Int?,
         fetchedEndMs: Int?,
+        positionMs: Int,
+        runwaySeconds: Double?,
         eligible: Bool
     ) -> Bool {
+        let previousPositionMs = lastPositionMs
+        lastPositionMs = positionMs
+        // An unknown runway (no item, no loaded ranges) is not evidence of
+        // health — fall through to the position check, which is.
+        let starvedOfBuffer = (runwaySeconds ?? 0) <= Self.runwayCeilingSeconds
+        let clockStuck = previousPositionMs.map {
+            abs(positionMs - $0) <= Self.positionToleranceMs
+        } ?? false
         guard eligible,
+              clockStuck,
+              starvedOfBuffer,
               let deliveredIdleMs, deliveredIdleMs >= Self.deliveredIdleThresholdMs,
               let publishedEndMs,
               let fetchedEndMs,
@@ -627,7 +664,10 @@ struct DeliveryStarvationDetector: Equatable {
         return true
     }
 
-    mutating func reset() { confirmations = 0 }
+    mutating func reset() {
+        confirmations = 0
+        lastPositionMs = nil
+    }
 }
 
 /// Global brake on automatic session replacements. Each recovery path is
@@ -1351,6 +1391,23 @@ final class PlayerController: ObservableObject {
 
     var stalls: Int? {
         player.currentItem?.accessLog()?.events.last?.numberOfStalls
+    }
+
+    /// Runway of the item currently attached, or `nil` when there is no item
+    /// or no usable clock. `nil` means "unknown", which the delivery watchdog
+    /// must not read as "healthy".
+    func bufferedRunwaySeconds() -> Double? {
+        guard let item = player.currentItem else { return nil }
+        let playhead = item.currentTime().seconds
+        guard playhead.isFinite else { return nil }
+        let ranges = item.loadedTimeRanges.compactMap { value -> ClosedRange<Double>? in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = CMTimeRangeGetEnd(range).seconds
+            guard start.isFinite, end.isFinite, end >= start else { return nil }
+            return start...end
+        }
+        return Self.bufferedRunwaySeconds(playheadSeconds: playhead, ranges: ranges)
     }
 
     /// Playable seconds contiguous with the current clock. A later buffered
@@ -2735,13 +2792,15 @@ final class PlayerController: ObservableObject {
             && !isChangingStream
             && seekState.pendingMs == nil
             && player.currentItem != nil
+        let position = realPositionMs()
         guard deliveryStarvation.observe(
             deliveredIdleMs: status.deliveredIdleMs,
             publishedEndMs: status.publishedEndMs,
             fetchedEndMs: status.fetchedEndMs,
+            positionMs: position,
+            runwaySeconds: bufferedRunwaySeconds(),
             eligible: eligible
         ) else { return false }
-        let position = realPositionMs()
         currentMs = position
         let event = PlaybackStallEvent(
             kind: .delivery,
