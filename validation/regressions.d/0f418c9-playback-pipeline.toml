@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0f418c9"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` requires the capability ceiling to hold for a Dolby Vision Profile 5 source on BOTH encoders and for every file on a software-only node, requires Auto's own answer to be present on the advertised ladder, and requires the ceiling to ignore network priors while Auto still honours them. Reverting `advertised_ladder` to the uncapped `ladder(source_height)` reinstates the 1080p rung a Profile 5 session cannot serve and fails the test on the exact rung the web ABR controller used to upgrade into."
