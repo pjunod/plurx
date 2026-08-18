@@ -3572,10 +3572,21 @@ impl TranscodeManager {
         file: &plurx_core::domain::MediaFile,
     ) -> Result<Encoder, String> {
         if self.require_dovi_renderer(file).await? {
-            // This is the only pairing boot probes. Software decode preserves
-            // the RPU AVFrame side data and feeds the proved system-memory
-            // tonemapx graph.
-            Ok(Encoder::Software)
+            // Software decode is forced by the pipeline itself
+            // (`requires_software_decode`) — that is what preserves the RPU
+            // AVFrame side data the tonemapx graph consumes. The ENCODER is
+            // free to be the node's real one, provided that exact pairing has
+            // been proved at boot; an unproved pairing falls back to software
+            // rather than failing in front of a viewer. Pinning it to x264
+            // used to cap 4K Dolby Vision at 720p for every non-DV client.
+            let preferred = self.encoder().await;
+            if preferred != Encoder::Software
+                && crate::ffmpeg::has_dovi_reshape_with(preferred).await
+            {
+                Ok(preferred)
+            } else {
+                Ok(Encoder::Software)
+            }
         } else {
             Ok(self.encoder().await)
         }
@@ -5292,13 +5303,56 @@ impl TranscodeManager {
     ) -> i64 {
         let source_height = file.and_then(|file| file.height);
         if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
+            // Follow the encoder the reshape can actually reach. This used to
+            // be a flat software cap, which meant a 4K Dolby Vision film was
+            // 720p for every client that cannot take DV directly, even on a
+            // node whose hardware encoder was idle.
+            let max = self.capability_height_ceiling(file).await;
             let current = source_height
                 .filter(|height| *height > 0)
-                .unwrap_or(AUTO_SOFTWARE_HEIGHT)
-                .clamp(MIN_HEIGHT, AUTO_SOFTWARE_HEIGHT);
+                .unwrap_or(max)
+                .clamp(MIN_HEIGHT, max);
             auto_height_from_prior(current, source_height, prior, unix_ms())
         } else {
             self.auto_height(source_height, prior).await
+        }
+    }
+
+    /// The highest rung this node can actually sustain for this file, before
+    /// any network prior is applied.
+    ///
+    /// This exists because the advertised ladder was built from the source
+    /// height alone while Auto was capped by the pipeline — so on a
+    /// software-only node, or for a Dolby Vision source that must go through
+    /// the software reshape, the response promised a 1080p rung the server
+    /// would never serve. The web ABR controller believed it: it started at
+    /// the 720p Auto answer, measured a JIT delivery estimate far above the
+    /// 1080p bar, upgraded on schedule, got `session_failed`, took the
+    /// emergency downgrade back to 720p, and repeated on a ~2 minute period.
+    /// A ladder that lists a rung is a promise that the rung can be served.
+    ///
+    /// Deliberately excludes `auto_height_from_prior`: a network prior is a
+    /// judgement about one link at one moment, and hiding rungs on that basis
+    /// would keep a recovered link from ever being offered them again. This
+    /// is the capability ceiling only.
+    pub async fn capability_height_ceiling(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+    ) -> i64 {
+        // A Dolby Vision reshape is capped by whichever encoder it can
+        // actually reach — hardware when the pairing is proved, software
+        // otherwise — not unconditionally by the software rung.
+        let encoder = match file {
+            Some(file) if Self::needs_dovi_reshape(file) == Ok(true) => self
+                .encoder_for_file(file)
+                .await
+                .unwrap_or(Encoder::Software),
+            _ => self.encoder().await,
+        };
+        if encoder == Encoder::Software {
+            AUTO_SOFTWARE_HEIGHT
+        } else {
+            AUTO_HARDWARE_MAX_HEIGHT
         }
     }
 
@@ -7670,6 +7724,22 @@ pub fn ladder(source_height: Option<i64>) -> Vec<Rung> {
         .collect()
 }
 
+/// The ladder a session response may advertise: the source's own rungs,
+/// further capped by what this node can actually serve for this file
+/// ([`TranscodeManager::capability_height_ceiling`]).
+///
+/// Separate from [`ladder`] because the two answer different questions.
+/// `ladder` is "what rungs exist at or below this source"; this is "which of
+/// them will the server be held to". The web ABR controller upgrades into any
+/// rung the response lists, so the difference is load-bearing.
+pub fn advertised_ladder(source_height: Option<i64>, ceiling: i64) -> Vec<Rung> {
+    ladder(Some(
+        source_height
+            .filter(|height| *height > 0)
+            .map_or(ceiling, |height| height.min(ceiling)),
+    ))
+}
+
 /// Apply the node-local prior to the already encoder-capped Auto choice.
 /// Absence is an exact identity operation, which is the default-off contract.
 ///
@@ -8939,6 +9009,112 @@ mod tests {
             "an unprobed source has nothing to filter by"
         );
         assert_eq!(ladder(Some(0)).len(), 4, "0 is not a height");
+    }
+
+    /// An advertised rung is a promise. The web ABR controller upgrades into
+    /// any rung the ladder lists, so a ladder built from the source height
+    /// while Auto was capped by the pipeline produced a self-sustaining
+    /// oscillation: start at the 720p Auto answer, measure a JIT delivery
+    /// estimate far above the 1080p bar, upgrade on schedule, fail with
+    /// `session_failed`, take the emergency downgrade, repeat every ~2
+    /// minutes. Observed on a Dolby Vision Profile 5 episode.
+    #[tokio::test]
+    async fn the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let hardware = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        );
+        let software = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        let ordinary = {
+            let mut file = profile5_file();
+            file.hdr = None;
+            file.hdr_format = None;
+            file
+        };
+        let profile5 = profile5_file();
+
+        // A Profile 5 reshape follows whichever encoder it can actually
+        // reach. With no ffmpeg here the hardware pairing cannot be proved,
+        // so it falls back to software — which is the contract: an unproved
+        // pairing is never attempted, and the ceiling tells the truth about
+        // the fallback rather than advertising a rung that would fail.
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&profile5)).await,
+            AUTO_SOFTWARE_HEIGHT,
+            "an unproved hardware pairing falls back to the software rung"
+        );
+        assert_eq!(
+            software.capability_height_ceiling(Some(&profile5)).await,
+            AUTO_SOFTWARE_HEIGHT
+        );
+        // A software-only node caps every file the same way.
+        assert_eq!(
+            software.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_SOFTWARE_HEIGHT
+        );
+        // Hardware on an ordinary 4K source keeps the full ladder.
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_HARDWARE_MAX_HEIGHT
+        );
+        assert_eq!(hardware.capability_height_ceiling(None).await, 1080);
+
+        // The ceiling and Auto must agree, or the ladder is lying again.
+        for (manager, file) in [
+            (&hardware, &profile5),
+            (&software, &profile5),
+            (&software, &ordinary),
+            (&hardware, &ordinary),
+        ] {
+            let ceiling = manager.capability_height_ceiling(Some(file)).await;
+            let auto = manager.auto_height_for_file(Some(file), None).await;
+            assert!(
+                auto <= ceiling,
+                "Auto {auto} exceeds the advertised ceiling {ceiling}"
+            );
+            let rungs = advertised_ladder(file.height, ceiling);
+            assert!(
+                rungs.iter().all(|rung| rung.height <= ceiling),
+                "ladder {rungs:?} offers a rung above {ceiling}"
+            );
+            assert!(
+                rungs.iter().any(|rung| rung.height == auto),
+                "the rung Auto actually picked ({auto}) must be on the ladder: {rungs:?}"
+            );
+        }
+
+        // The prior must not narrow the menu: a link that has recovered has to
+        // be able to reach the cap again.
+        let starved = plurx_core::domain::NetworkPrior {
+            worst_rung_height: Some(720),
+            starved_at_ms: Some(unix_ms()),
+            ..Default::default()
+        };
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_HARDWARE_MAX_HEIGHT,
+            "the capability ceiling ignores network priors by construction"
+        );
+        assert!(
+            hardware
+                .auto_height_for_file(Some(&ordinary), Some(&starved))
+                .await
+                < AUTO_HARDWARE_MAX_HEIGHT,
+            "…while Auto still honours them"
+        );
     }
 
     /// Auto is a policy about the encoder, not about the file.

@@ -2231,6 +2231,114 @@ asyncTest("the Dolby Vision probe is unchanged by the tiering", async () => {
   assert.match(safari.capsQuery(caps), /&dv=1&dvprofile=5,8&/);
 });
 
+test("a session that lands on a different range repaints the badge", () => {
+  // The field bug: on a tone-mapped Dexter episode the chip read "DV P7 →
+  // HDR10" while the stats panel one line below read "Dynamic range: SDR".
+  // Both surfaces call dynamicRangeBadge() with the same arguments — the
+  // panel just repaints every second, and the chip was painted once at
+  // session open, before the route was chosen. attachSession is the one site
+  // every session passes through, so it owns the repaint.
+  let repaints = 0;
+  const build = new Function(
+    "PLAYER",
+    "renderPlayerInfo",
+    "attachHls",
+    [shippedSource("attachSession"), "return {attachSession};"].join("\n"),
+  );
+  const player = { deliveredRange: "hdr10" };
+  const { attachSession } = build(player, () => { repaints += 1; }, () => {});
+
+  attachSession({}, player, {
+    start_seconds: 0,
+    playlist_url: "/x.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(player.deliveredRange, "sdr", "the session is the source of truth");
+  assert.equal(repaints, 1, "the chip must be repainted, not left at the decision's guess");
+
+  // A response with no range keeps the decision's answer — and still must not
+  // leave a stale chip behind, because other fields it paints moved too.
+  const before = repaints;
+  attachSession({}, player, { start_seconds: 0, playlist_url: "/x.m3u8" }, 0);
+  assert.equal(player.deliveredRange, "sdr");
+  assert.ok(repaints > before, "every attach repaints");
+
+  // A superseded playback must not repaint over the live one.
+  const stale = { deliveredRange: "hdr10" };
+  const settled = repaints;
+  attachSession({}, stale, {
+    start_seconds: 0,
+    playlist_url: "/y.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(repaints, settled, "a stale generation never paints the live player");
+});
+
+test("an upgrade needs encode headroom, not just a bandwidth estimate", () => {
+  const ladder = [
+    { height: 1080, total_kbps: 8160, peak_kbps: 12160 },
+    { height: 720, total_kbps: 4160, peak_kbps: 6160 },
+    { height: 480, total_kbps: 2160, peak_kbps: 3160 },
+  ];
+  // The production shape: on a JIT server the estimate measures
+  // min(link, encode) of the CURRENT rung, so a fast 720p encode reads as
+  // ~200 Mb/s and clears any bar the 1080p rung can set. The server's own
+  // pace is what says whether one rung up is sustainable.
+  const base = {
+    ladder,
+    currentHeight: 720,
+    estimateKbps: 200_000,
+    runwaySeconds: 40,
+    previousRunwaySeconds: 40,
+    nowMs: 500_000,
+    lastSwitchAtMs: 0,
+    lastStallAtMs: null,
+    upgradeSinceMs: 1,
+  };
+
+  // 720 -> 1080 is 2.25x the pixels. A server holding 2.0x realtime at 720p
+  // predicts 0.89x at 1080p — under realtime, so no upgrade.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: 2.0 }).height,
+    720,
+    "an encoder that cannot hold realtime one rung up must not be sent there",
+  );
+  // 3.0x predicts 1.33x — enough margin, so the upgrade proceeds.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: 3.0 }).height,
+    1080,
+    "real headroom still upgrades",
+  );
+  // No measurement is not evidence against: absence must not freeze the rung.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: null }).height,
+    1080,
+    "an unmeasured session can still rise",
+  );
+  // A rung this playback already failed to open is never re-entered, however
+  // good the numbers look — the loop that oscillated 720<->1080 every ~2
+  // minutes had healthy-looking numbers on every cycle.
+  assert.equal(
+    policy.decideRung({
+      ...base,
+      recentSpeed: 3.0,
+      blockedHeights: new Set([1080]),
+    }).height,
+    720,
+    "a failed rung is not a candidate",
+  );
+  // Blocking the rung above must not block the way DOWN.
+  const pressured = policy.decideRung({
+    ...base,
+    recentSpeed: 3.0,
+    blockedHeights: new Set([1080]),
+    estimateKbps: 1_000,
+    runwaySeconds: 0.5,
+  });
+  assert.equal(pressured.height, 480, "emergencies still fall");
+  assert.equal(pressured.emergency, true);
+});
+
 // Drained last, in registration order, after every synchronous case has run.
 (async () => {
   for (const [name, run] of ASYNC_TESTS) {

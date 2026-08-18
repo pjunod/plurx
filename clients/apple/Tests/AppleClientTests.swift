@@ -1607,58 +1607,102 @@ final class AppleClientTests: XCTestCase {
 
     func testDeliveryStarvationRequiresServerTruthAndConfirmation() {
         var detector = DeliveryStarvationDetector()
+        // Wedge shape: film clock frozen at 40_000, nothing buffered.
+        func wedge(
+            _ idle: Int?, published: Int? = 200_000, fetched: Int? = 150_000,
+            eligible: Bool = true
+        ) -> Bool {
+            detector.observe(
+                deliveredIdleMs: idle, publishedEndMs: published, fetchedEndMs: fetched,
+                positionMs: 40_000, runwaySeconds: 0.5, eligible: eligible
+            )
+        }
 
-        // Healthy cadence: deliveries complete every few seconds.
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 6_000, publishedEndMs: 200_000, fetchedEndMs: 150_000,
-            eligible: true
-        ))
+        // Baseline sample establishes the position; healthy delivery cadence.
+        XCTAssertFalse(wedge(6_000))
+        XCTAssertFalse(wedge(6_000))
         // First qualifying poll only confirms; the second fires.
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 16_000, publishedEndMs: 200_000, fetchedEndMs: 150_000,
-            eligible: true
-        ))
-        XCTAssertTrue(detector.observe(
-            deliveredIdleMs: 18_000, publishedEndMs: 200_000, fetchedEndMs: 150_000,
-            eligible: true
-        ))
+        XCTAssertFalse(wedge(16_000))
+        XCTAssertTrue(wedge(18_000))
 
         // Playing out the tail of a finished stream can never qualify:
         // nothing is pending server-side.
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 60_000, publishedEndMs: 200_000, fetchedEndMs: 195_000,
-            eligible: true
-        ))
+        XCTAssertFalse(wedge(60_000, published: 200_000, fetched: 195_000))
 
         // Ineligible states (paused, change in flight, seek pending) reset
         // the confirmation count rather than accumulating across them.
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 20_000, publishedEndMs: 200_000, fetchedEndMs: 100_000,
-            eligible: true
-        ))
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 22_000, publishedEndMs: 200_000, fetchedEndMs: 100_000,
-            eligible: false
-        ))
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 24_000, publishedEndMs: 200_000, fetchedEndMs: 100_000,
-            eligible: true
-        ))
+        XCTAssertFalse(wedge(20_000, fetched: 100_000))
+        XCTAssertFalse(wedge(22_000, fetched: 100_000, eligible: false))
+        XCTAssertFalse(wedge(24_000, fetched: 100_000))
 
         // Absent server fields — an old server, or a session with no
         // delivery yet — never qualify.
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: nil, publishedEndMs: 200_000, fetchedEndMs: 100_000,
-            eligible: true
-        ))
-        XCTAssertFalse(detector.observe(
-            deliveredIdleMs: 30_000, publishedEndMs: nil, fetchedEndMs: nil,
-            eligible: true
-        ))
+        XCTAssertFalse(wedge(nil))
+        XCTAssertFalse(wedge(30_000, published: nil, fetched: nil))
 
         // The delivery kind reaches the server beacon as its own reason.
         XCTAssertEqual(PlaybackStallKind.delivery.rawValue, "delivery")
         XCTAssertFalse(PlaybackStallKind.delivery.terminalState.isPlaying)
+    }
+
+    /// The build 63 field regression, pinned. Server-side evidence alone —
+    /// "no completed delivery for 16+ s while published media is pending" —
+    /// is ALSO what a healthy player with a full forward buffer looks like:
+    /// `preferredForwardBufferDuration` is 60 s, so AVPlayer tops up and then
+    /// stops fetching for a long stretch while the producer parks at the
+    /// 180 s ahead-window cap. Build 63 fired on that and killed a healthy
+    /// 2160p session every ~2.4 minutes. The film clock is the discriminator.
+    func testDeliveryStarvationNeverFiresOnAHealthyBufferedPlayer() {
+        var detector = DeliveryStarvationDetector()
+
+        // A topped-up player: 55 s of runway, clock advancing 2 s per poll,
+        // server delivery meter idle for far longer than the threshold and a
+        // deep pending backlog (the ahead window is deliberately deep).
+        var positionMs = 40_000
+        var idleMs = 4_000
+        for _ in 0..<40 {
+            XCTAssertFalse(
+                detector.observe(
+                    deliveredIdleMs: idleMs,
+                    publishedEndMs: 600_000,
+                    fetchedEndMs: 420_000,
+                    positionMs: positionMs,
+                    runwaySeconds: 55,
+                    eligible: true
+                ),
+                "a player whose clock is advancing is not starving"
+            )
+            positionMs += 2_000
+            idleMs += 2_000
+        }
+
+        // Same server numbers, clock now frozen, buffer drained — that IS the
+        // wedge, and it must still be caught promptly.
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertTrue(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+    }
+
+    /// A frozen clock with media still in hand is a decode/render stall, not
+    /// delivery starvation — the position ladder owns that case, and the
+    /// delivery watchdog must not claim it.
+    func testDeliveryStarvationIgnoresAFrozenClockThatStillHasBuffer() {
+        var detector = DeliveryStarvationDetector()
+        for _ in 0..<10 {
+            XCTAssertFalse(detector.observe(
+                deliveredIdleMs: 45_000, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+                positionMs: 90_000, runwaySeconds: 42, eligible: true
+            ))
+        }
     }
 
     func testRecoveryReopenBudgetBrakesAStorm() {

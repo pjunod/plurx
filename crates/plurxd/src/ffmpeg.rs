@@ -42,6 +42,12 @@ pub struct PacingCaps {
 static PACING: tokio::sync::OnceCell<PacingCaps> = tokio::sync::OnceCell::const_new();
 static DOVI_RPU: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 static DOVI_RESHAPE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+/// One probe result per hardware encoder pairing for the Dolby Vision reshape.
+/// Keyed by `Encoder::name()`; a pairing is attempted only after it is proved
+/// here, which is the same discipline every other renderer gets.
+static DOVI_RESHAPE_HW: std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<&'static str, bool>>,
+> = std::sync::OnceLock::new();
 static DOVI_PASSTHROUGH: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Does this build carry a given bitstream filter? Matched on a whole line of
@@ -132,14 +138,20 @@ pub async fn has_dovi_rpu() -> bool {
         .await
 }
 
-/// Can the exact software-decode/tonemapx/software-encode route used
-/// for non-backward-compatible Dolby Vision start on this build?
+/// Can the software-decode/tonemapx route used for non-backward-compatible
+/// Dolby Vision start on this build, with the software encoder?
 ///
 /// The option declaration is necessary but not sufficient: the SIMD filter
 /// and libx264 must also work together.
 /// Probe one synthetic frame through the production graph. The real Profile 5
 /// validation remains responsible for proving that RPU side data changes the
 /// pixels; this boot probe gates whether the renderer can be attempted at all.
+///
+/// See [`has_dovi_reshape_with`] for the hardware-encode pairings. Software
+/// decode is not negotiable on any of them — the HEVC decoder is what attaches
+/// the RPU side data `apply_dovi=1` consumes, and an inherited hardware decode
+/// drops it silently — but the *encoder* only has to accept filtered frames,
+/// which is what the upload suffix is for.
 pub async fn has_dovi_reshape() -> bool {
     *DOVI_RESHAPE
         .get_or_init(|| async {
@@ -153,29 +165,7 @@ pub async fn has_dovi_reshape() -> bool {
                 );
                 return false;
             }
-            let args = [
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=size=64x64:rate=1:color=black",
-                "-frames:v",
-                "1",
-                "-vf",
-                "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,scale=64:64,format=yuv420p",
-                "-c:v",
-                "libx264",
-                "-f",
-                "null",
-                "-",
-            ];
-            let mut command = tokio::process::Command::new(ffmpeg_bin());
-            command.args(args).kill_on_drop(true);
-            let passed = tokio::time::timeout(Duration::from_secs(15), command.status())
-                .await
-                .is_ok_and(|result| result.is_ok_and(|status| status.success()));
+            let passed = probe_dovi_reshape_graph(None, "libx264").await;
             if passed {
                 tracing::info!("ffmpeg proved the Dolby Vision tonemapx renderer");
             } else {
@@ -186,6 +176,93 @@ pub async fn has_dovi_reshape() -> bool {
             passed
         })
         .await
+}
+
+/// Run one synthetic frame through the production Dolby Vision reshape graph,
+/// optionally uploading the filtered frames to a hardware encoder first.
+///
+/// `upload` is the encoder's own `filter_suffix()` — `hwupload` for VA-API,
+/// `hwupload=extra_hw_frames=64,format=qsv` for QSV — appended after the
+/// software filter chain. The decode side is untouched: `lavfi` produces
+/// system-memory frames exactly as a software HEVC decode does.
+async fn probe_dovi_reshape_graph(upload: Option<&str>, codec: &str) -> bool {
+    let filter = format!(
+        "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,scale=64:64,format=yuv420p{}",
+        upload.map(|s| format!(",{s}")).unwrap_or_default()
+    );
+    let mut command = tokio::process::Command::new(ffmpeg_bin());
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=64x64:rate=1:color=black",
+            "-frames:v",
+            "1",
+            "-vf",
+            &filter,
+            "-c:v",
+            codec,
+            "-f",
+            "null",
+            "-",
+        ])
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(20), command.status())
+        .await
+        .is_ok_and(|result| result.is_ok_and(|status| status.success()))
+}
+
+/// Can the Dolby Vision reshape run with this encoder on this build?
+///
+/// Why this exists: the reshape was pinned to software *encode* as well as
+/// software decode, and only the decode half was ever load-bearing. The RPU
+/// side data `apply_dovi=1` consumes is attached by the software HEVC decoder
+/// and does not survive an inherited hardware decode — that constraint is
+/// real and unchanged. The encoder merely has to accept the filter's output,
+/// which is what `hwupload` is for. Pinning it to libx264 capped every
+/// non-DV-capable client at the software Auto rung (720p) for a 4K Dolby
+/// Vision source, even on a node with a perfectly good hardware encoder that
+/// was doing nothing.
+///
+/// Nothing is assumed: each pairing is probed once, exactly like the software
+/// route, and an unproved pairing falls back to software rather than failing a
+/// session in front of a viewer.
+pub async fn has_dovi_reshape_with(encoder: plurx_core::transcode::Encoder) -> bool {
+    use plurx_core::transcode::Encoder;
+    if encoder == Encoder::Software {
+        return has_dovi_reshape().await;
+    }
+    // The filter chain is the same one the software route already proved; if
+    // that failed, no upload target can rescue it.
+    if !has_dovi_reshape().await {
+        return false;
+    }
+    let key = encoder.label();
+    let cell =
+        DOVI_RESHAPE_HW.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut memo = cell.lock().await;
+    if let Some(known) = memo.get(key) {
+        return *known;
+    }
+    let passed = probe_dovi_reshape_graph(encoder.filter_suffix(), encoder.video_codec()).await;
+    if passed {
+        tracing::info!(
+            encoder = key,
+            "ffmpeg proved the Dolby Vision reshape with a hardware encoder"
+        );
+    } else {
+        tracing::info!(
+            encoder = key,
+            "the Dolby Vision reshape cannot use this hardware encoder on this build; \
+             falling back to the software route"
+        );
+    }
+    memo.insert(key, passed);
+    passed
 }
 
 /// The message `tonemapx` prints when its HDR passthrough mode is asked for
