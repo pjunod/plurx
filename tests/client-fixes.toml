@@ -244,3 +244,19 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "Task { await self.retrySameDeliveryAfterStall(event) }"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testDeliveryStarvationRequiresServerTruthAndConfirmation"
+
+[[fixes]]
+id = "apple.dolby-vision-profile5-compatibility-errors"
+commits = ["631e9697"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func isCompatibilityPlaybackFailure("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testApplePlayerTreatsDolbyVisionRejectionsAsCompatibilityFailures"
+
+[[fixes]]
+id = "apple.dolby-vision-profile5-black-frame-watchdog"
+commits = ["47c06809"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct BlackFrameWatchdog: Equatable"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded"
