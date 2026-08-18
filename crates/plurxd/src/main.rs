@@ -445,6 +445,20 @@ fn log_startup(config: &Config, identity: &plurx_core::cluster::ClusterIdentity)
         data_dir = %config.storage.data_dir.display(),
         "plurxd starting"
     );
+    if crate::version::BUILD == "unknown" {
+        // Two fleet nodes shipped "unknown" on 2026-08-17 because a bare
+        // `docker compose up -d --build` skips the stamp; "did my deploy
+        // land?" then has no answer from inside the product. The image cannot
+        // derive the commit itself (`.git` is outside the build context by
+        // design), so the deploy path must pass it: `make docker-up`, or
+        // PLURX_BUILD_REF="$(git describe --tags --always --dirty)" in the
+        // compose environment.
+        tracing::warn!(
+            "running an UNSTAMPED build — deploys from this image are \
+             unattributable; build with `make docker-up` (or set \
+             PLURX_BUILD_REF) so the System page can say which commit this is"
+        );
+    }
 }
 
 /// Bind the HTTP listener, naming the address when it cannot be had — the

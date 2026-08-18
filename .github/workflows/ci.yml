@@ -127,7 +127,12 @@ jobs:
       # so without this those tests fail on `No such file or directory`, which
       # is an absent dependency rather than anything wrong with the tree.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          sudo sed -i \
+            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
       # Keep the portable baseline and focused Linux contracts in this job.
       # Browser and Android JVM checks are selected by the same impact graph,
       # but delegated to parallel jobs below instead of serializing the gate.
@@ -216,8 +221,11 @@ jobs:
           key: playwright-${{ runner.os }}-1.62.0
       - name: Install media and browser prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo sed -i \
+            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
           python3 -m pip install playwright==1.62.0
           python3 -m playwright install --with-deps chromium
       - name: Check every affected web layout
@@ -423,7 +431,12 @@ jobs:
       # Instrumented or not, this runs the same suite as the check job, so it
       # needs the same ffmpeg.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          sudo sed -i \
+            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
       - name: Measure line coverage
         run: cargo llvm-cov --workspace --summary-only --json --output-path cov.json
       - name: Build the shields.io badge JSON
@@ -481,7 +494,15 @@ jobs:
       - name: Install aarch64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         # Also provides the C cross-compiler for rusqlite's bundled SQLite.
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: |
+          # ubuntu-latest can inherit an Azure mirror that accepts the runner
+          # but never serves the archive. Pin the canonical mirror so apt does
+          # not spend the entire job retrying a dead regional endpoint.
+          sudo sed -i \
+            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y gcc-aarch64-linux-gnu
       - run: cargo build --release -p plurxd --target ${{ matrix.target }}
         env:
           # Linker for the arm64 target (harmlessly unused on x86_64).
