@@ -2229,6 +2229,47 @@ asyncTest("the Dolby Vision probe is unchanged by the tiering", async () => {
   assert.equal(caps.dv, 1);
   assert.equal(caps.dvprofile, "5,8");
   assert.match(safari.capsQuery(caps), /&dv=1&dvprofile=5,8&/);
+test("a session that lands on a different range repaints the badge", () => {
+  // The field bug: on a tone-mapped Dexter episode the chip read "DV P7 →
+  // HDR10" while the stats panel one line below read "Dynamic range: SDR".
+  // Both surfaces call dynamicRangeBadge() with the same arguments — the
+  // panel just repaints every second, and the chip was painted once at
+  // session open, before the route was chosen. attachSession is the one site
+  // every session passes through, so it owns the repaint.
+  let repaints = 0;
+  const build = new Function(
+    "PLAYER",
+    "renderPlayerInfo",
+    "attachHls",
+    [shippedSource("attachSession"), "return {attachSession};"].join("\n"),
+  );
+  const player = { deliveredRange: "hdr10" };
+  const { attachSession } = build(player, () => { repaints += 1; }, () => {});
+
+  attachSession({}, player, {
+    start_seconds: 0,
+    playlist_url: "/x.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(player.deliveredRange, "sdr", "the session is the source of truth");
+  assert.equal(repaints, 1, "the chip must be repainted, not left at the decision's guess");
+
+  // A response with no range keeps the decision's answer — and still must not
+  // leave a stale chip behind, because other fields it paints moved too.
+  const before = repaints;
+  attachSession({}, player, { start_seconds: 0, playlist_url: "/x.m3u8" }, 0);
+  assert.equal(player.deliveredRange, "sdr");
+  assert.ok(repaints > before, "every attach repaints");
+
+  // A superseded playback must not repaint over the live one.
+  const stale = { deliveredRange: "hdr10" };
+  const settled = repaints;
+  attachSession({}, stale, {
+    start_seconds: 0,
+    playlist_url: "/y.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(repaints, settled, "a stale generation never paints the live player");
 });
 
 // Drained last, in registration order, after every synchronous case has run.

@@ -5257,6 +5257,14 @@ function attachSession(v, t, info, wantSec){
   // create whose source lookup came back None) keeps whatever we had: the
   // decision's value is still the best answer. MEDIA-BADGES-PLAN.md §3.2.
   if(info.delivered_dynamic_range) t.deliveredRange=info.delivered_dynamic_range;
+  // …and repaint, or the chip keeps its pre-session HTML forever while the
+  // one-second stats panel follows the new truth. That is how "DV P7 → HDR10"
+  // sat beside "Dynamic range: SDR" on a tone-mapped Dexter episode: both
+  // surfaces call dynamicRangeBadge() with the same arguments, but only the
+  // panel repaints. renderPlayerInfo() is otherwise painted once, at session
+  // open — before the route is chosen and before the forced-burn override.
+  // MEDIA-BADGES-PLAN.md requires the chip and the panel row to agree.
+  if(t===PLAYER) renderPlayerInfo();
   t.probeUrl=info.playlist_url;
   const into = t.vod ? Math.max(0, wantSec||0) : 0;
   attachHls(v, info.playlist_url, into);
