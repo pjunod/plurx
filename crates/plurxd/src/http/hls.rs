@@ -156,6 +156,19 @@ pub struct CreateSession {
     /// With `copy`: retain Dolby Vision signaling and dynamic metadata because
     /// the decision established that this client supports the source profile.
     pub preserve_dolby_vision: Option<bool>,
+    /// For a transcode: this client decodes and presents HEVC Main10 PQ, so a
+    /// Dolby Vision source it cannot decode may be re-encoded to HDR10 rather
+    /// than tone-mapped to SDR. The create-body counterpart of `/decision`'s
+    /// `hdr10t=1`, exactly as `preserve_dolby_vision` is the counterpart of
+    /// `dv`.
+    ///
+    /// A request, never a verdict. The server refuses it for any source that
+    /// does not prove a Dolby Vision RPU through the production renderer, for
+    /// any rung other than 1080p, and for any build whose boot probe did not
+    /// clear the passthrough graph — every refusal lands on today's SDR
+    /// ladder. Absent means no, which is what every client that predates it
+    /// sends.
+    pub hdr10: Option<bool>,
     /// Manual A/V correction for this playback attempt only. Positive delays
     /// audio. It is carried into every seek/reopen by the client and is never
     /// written back to the media file.
@@ -193,6 +206,7 @@ impl CreateSession {
             audio_index: self.audio.filter(|a| *a >= 0),
             subtitle_burn: self.subtitle_burn.filter(|s| *s >= 0),
             audio_offset_ms: self.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000),
+            hdr10: self.hdr10 == Some(true),
         }
     }
 }
@@ -222,6 +236,7 @@ fn hdr_subtitle_burn_is_refused(source: Option<&MediaFile>, subtitle_burn: Optio
 fn session_delivered_dynamic_range(
     source: Option<&MediaFile>,
     kind: &crate::transcode::SessionKind,
+    grade: plurx_core::transcode::OutputGrade,
 ) -> Option<&'static str> {
     use crate::transcode::SessionKind;
     let file = source?;
@@ -235,7 +250,7 @@ fn session_delivered_dynamic_range(
         SessionKind::Transcode { .. } => (PlaybackMethod::Transcode, false),
     };
     Some(plurx_core::playback::delivered_dynamic_range(
-        file, method, preserve,
+        file, method, preserve, grade,
     ))
 }
 
@@ -263,6 +278,10 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
+    let ladder_ceiling = state
+        .transcode
+        .capability_height_ceiling(source.as_ref())
+        .await;
     let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
@@ -307,7 +326,10 @@ pub async fn create(
         // A reused request id asking for a different stream is the client's
         // mistake, not the server's; say which it is.
         .map_err(|error| session_start_error(id, error))?;
-    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind);
+    // The grade the session actually built, not the one the body asked for:
+    // the server refuses the HDR10 rung for a source or a rung that cannot
+    // prove it, and the badge has to follow the encoder.
+    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind, info.grade);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`. Read the normalized
     // route from the result: a bound Auto stall may have changed a copy request
@@ -347,7 +369,11 @@ pub async fn create(
         height: info.target_height,
         encoder: info.encoder.to_owned(),
         vod: info.vod,
-        ladder: crate::transcode::ladder(source_height),
+        // Capped at what this node can actually serve for this file, not just
+        // at the source height: an advertised rung is a promise, and the web
+        // ABR controller upgrades into any rung the ladder lists. See
+        // `capability_height_ceiling`.
+        ladder: crate::transcode::advertised_ladder(source_height, ladder_ceiling),
         prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         delivered_dynamic_range: delivered,
     }))
@@ -425,6 +451,9 @@ pub async fn start(
         copy: Some(q.copy == Some(1)),
         aac: Some(q.aac == Some(1)),
         preserve_dolby_vision: Some(false),
+        // The deprecated GET bridge has no capability parameters at all, so
+        // it keeps the SDR ladder it has always had.
+        hdr10: None,
         audio_offset_ms: None,
     };
     create(
@@ -779,6 +808,16 @@ fn language_tag(raw: Option<&str>) -> &str {
 /// `hvcC` record (`H150`), and AVPlayer treats the only HDR variant as
 /// unsupported. The init segment is the canonical description of the bytes
 /// this session actually publishes, including any Dolby Vision stripping.
+///
+/// A `dvh1`/`dvhe` sample entry is NOT described by the HEVC form. Dolby
+/// Vision's HLS identifier is `dvh1.PP.LL` — two-digit profile, two-digit
+/// level — and the `hvcC` beside it describes only the base layer, so reading
+/// the tier out of it and emitting `dvh1.2.4.L150.90` produces a string no
+/// player can resolve. AVPlayer rejected exactly that on a Profile 5 title
+/// while the same session's media playlist, which carries no CODECS at all,
+/// played. Dolby Vision therefore reads its own `dvcC`/`dvvC` configuration
+/// record, which is also the canonical answer when the library row's probe
+/// carried no DOVI side data and the advertised codec came through bare.
 async fn exact_hls_context(
     state: &AppState,
     session: &str,
@@ -816,7 +855,12 @@ async fn exact_hls_context(
             return context;
         }
     }
-    let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
+    let derived = if matches!(sample_entry, "dvh1" | "dvhe") {
+        dolby_vision_codec_from_init(&init, sample_entry)
+    } else {
+        hevc_codec_from_init(&init, sample_entry)
+    };
+    let Some(video) = derived else {
         return context;
     };
     context.codecs = match context.codecs.split_once(',') {
@@ -824,6 +868,44 @@ async fn exact_hls_context(
         _ => video,
     };
     context
+}
+
+/// Apple's Dolby Vision HLS identifier from the `DOVIDecoderConfigurationRecord`.
+///
+/// The record is carried by `dvcC` (profiles up to 7) or `dvvC` (profiles 8
+/// and 9) inside the sample entry. Its payload begins with two version bytes
+/// and then packs the two fields the playlist needs across two more:
+///
+/// ```text
+/// byte 2: dv_profile (7 bits) | dv_level high bit
+/// byte 3: dv_level low 5 bits | rpu_present | el_present | bl_present
+/// ```
+///
+/// Apple's form is `dvh1.PP.LL` with both fields zero-padded to two digits —
+/// no tier letter, no constraint bytes, and nothing from `hvcC`.
+fn dolby_vision_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
+    let type_at = [b"dvcC", b"dvvC"]
+        .into_iter()
+        .find_map(|name| init.windows(4).position(|window| window == name))?;
+    let box_start = type_at.checked_sub(4)?;
+    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
+    let box_end = box_start.checked_add(box_size)?;
+    // 8-byte header plus the 24-byte record.
+    if box_size < 32 || box_end > init.len() {
+        return None;
+    }
+    let payload = init.get(type_at + 4..box_end)?;
+    if payload.len() < 4 {
+        return None;
+    }
+    let profile = payload[2] >> 1;
+    let level = ((payload[2] & 0x01) << 5) | (payload[3] >> 3);
+    // Profile 0 is not assigned and level 0 is not a real declaration; either
+    // means the record was not what this parser assumed.
+    if profile == 0 || level == 0 {
+        return None;
+    }
+    Some(format!("{sample_entry}.{profile:02}.{level:02}"))
 }
 
 /// RFC 6381 identifier from the HEVCDecoderConfigurationRecord in `hvcC`.
@@ -2244,6 +2326,7 @@ mod tests {
             copy: Some(false),
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: Some(20_000),
         }
         .into_request(7, 1080);
@@ -2269,6 +2352,7 @@ mod tests {
             copy: None,
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: None,
         }
         .into_request(5615, 2160);
@@ -2306,28 +2390,45 @@ mod tests {
             aac: false,
             preserve_dolby_vision: preserve,
         };
+        use plurx_core::transcode::OutputGrade;
         assert_eq!(
-            session_delivered_dynamic_range(Some(&file), &copy(true)),
+            session_delivered_dynamic_range(Some(&file), &copy(true), OutputGrade::Sdr),
             Some("dolby_vision")
         );
         // Stripped: what reaches the client is the compatible base layer.
         let mut base = file.clone();
         base.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".into());
         assert_eq!(
-            session_delivered_dynamic_range(Some(&base), &copy(false)),
+            session_delivered_dynamic_range(Some(&base), &copy(false), OutputGrade::Sdr),
             Some("hdr10")
         );
         assert_eq!(
             session_delivered_dynamic_range(
                 Some(&file),
-                &crate::transcode::SessionKind::Transcode { height: 1080 }
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Sdr,
             ),
             Some("sdr"),
-            "every transcode is H.264 8-bit, whatever the source carried"
+            "an SDR-grade transcode is H.264 8-bit, whatever the source carried"
+        );
+        // …and the HDR10 rung of the same source says so, on the same helper.
+        // The session's grade is what decides it, so a rung the server refused
+        // cannot report HDR10 by having been asked for.
+        assert_eq!(
+            session_delivered_dynamic_range(
+                Some(&file),
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Hdr10,
+            ),
+            Some("hdr10"),
+            "the Dolby Vision → HDR10 rung is not SDR"
         );
         // A file that vanished from the store mid-request says nothing at
         // all rather than guessing; the client keeps what it had.
-        assert_eq!(session_delivered_dynamic_range(None, &copy(true)), None);
+        assert_eq!(
+            session_delivered_dynamic_range(None, &copy(true), OutputGrade::Sdr),
+            None
+        );
     }
 
     #[test]
@@ -2408,6 +2509,40 @@ mod tests {
         assert!(hdr.contains("VIDEO-RANGE=PQ"));
         assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    /// The HDR10 rung's master, built from the codec string the session
+    /// actually advertises.
+    ///
+    /// The point is that **no new attribute logic was written for it**. The
+    /// existing rule — an `hvc1`/`hev1`/`dvh1`/`dvhe` prefix plus an HDR
+    /// source column — already emits `VIDEO-RANGE=PQ` and `CODECS`, and a
+    /// re-encoded HDR10 rung satisfies both. A second implementation of that
+    /// rule is a second thing to keep in step.
+    #[test]
+    fn the_hdr10_rungs_master_gets_pq_and_hevc_codecs_from_the_existing_rule() {
+        let file = hls_file(vec![]);
+        // Exactly what `transcode::transcoded_hls_codecs(OutputGrade::Hdr10)`
+        // puts on the session.
+        let context = hls_context("hvc1.2.4.H120.90,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &context);
+        assert!(master.contains("VIDEO-RANGE=PQ"), "{master}");
+        assert!(
+            master.contains("CODECS=\"hvc1.2.4.H120.90,mp4a.40.2\""),
+            "{master}"
+        );
+        // No SUPPLEMENTAL-CODECS: the RPU is consumed by the reshape, so
+        // there is no Dolby Vision enhancement left to declare, and the
+        // master stays at compatibility version 7.
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"), "{master}");
+        assert!(master.contains("#EXT-X-VERSION:7"), "{master}");
+
+        // The SDR rung of the same source is H.264, and its master must stay
+        // SDR — the source's `hdr` column alone is not permission to claim PQ
+        // for a tone-mapped picture.
+        let sdr = master_playlist(&file, None, &hls_context("avc1.640034,mp4a.40.2", None));
+        assert!(!sdr.contains("VIDEO-RANGE="), "{sdr}");
+        assert!(!sdr.contains("CODECS="), "{sdr}");
     }
 
     #[test]
@@ -2495,6 +2630,148 @@ mod tests {
             Some("hvc1.2.4.H150.B0")
         );
         assert!(hevc_codec_from_init(&init[..12], "hvc1").is_none());
+    }
+
+    /// A `dvcC` record laid out the way the Dexter Profile 5 title's init
+    /// segment carries it: version 1.0, profile 5, level 6, RPU and BL
+    /// present, no enhancement layer, compatibility id 0.
+    fn dolby_vision_init(profile: u8, level: u8) -> Vec<u8> {
+        let mut init = vec![0, 0, 0, 32];
+        init.extend_from_slice(b"dvcC");
+        init.extend_from_slice(&[
+            1,
+            0,
+            (profile << 1) | (level >> 5),
+            ((level & 0x1f) << 3) | 0b101,
+            0,
+        ]);
+        init.extend_from_slice(&[0; 19]);
+        init
+    }
+
+    #[test]
+    fn dolby_vision_codec_is_read_from_its_own_configuration_record() {
+        let init = dolby_vision_init(5, 6);
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvh1").as_deref(),
+            Some("dvh1.05.06")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvhe").as_deref(),
+            Some("dvhe.05.06")
+        );
+        // Profile 8 level 10 exercises the level's high bit, which lives in
+        // the profile's byte.
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(8, 10), "dvh1").as_deref(),
+            Some("dvh1.08.10")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(7, 33), "dvh1").as_deref(),
+            Some("dvh1.07.33")
+        );
+        // Truncated, absent and empty records decline rather than guess.
+        assert!(dolby_vision_codec_from_init(&init[..16], "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(b"nothing here at all", "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(0, 6), "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(5, 0), "dvh1").is_none());
+    }
+
+    /// The regression this milestone exists for. A preserved Profile 5 init
+    /// carries `dvh1` + `hvcC` + `dvcC`; reading the tier out of `hvcC` and
+    /// publishing `dvh1.2.4.L150.90` is what AVPlayer refused with CoreMedia
+    /// -15517 while the same session's CODECS-free media playlist played.
+    #[tokio::test]
+    async fn a_preserved_dolby_vision_master_keeps_its_dolby_vision_identifier() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv").await;
+        // The sample entry's `hvcC` describes the base layer only: Main 10,
+        // High tier, level 150 — the record the HEVC reader would have used.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        init.extend_from_slice(&dolby_vision_init(5, 6));
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv", context).await;
+        assert_eq!(
+            resolved.codecs, "dvh1.05.06,ec-3",
+            "a Dolby Vision master must not be rewritten into HEVC shape"
+        );
+    }
+
+    /// The same probe also heals the other half of the failure: when the
+    /// library row carried no DOVI side data, `copied_hls_codecs` advertises a
+    /// bare `dvh1`, which the code's own comment calls fatal during asset
+    /// preparation. The init knows the answer.
+    #[tokio::test]
+    async fn a_bare_dolby_vision_declaration_is_completed_from_the_init() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-bare").await;
+        tokio::fs::write(dir.path().join("init.mp4"), dolby_vision_init(5, 6))
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-bare", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    /// And a Dolby Vision init with no configuration record at all leaves the
+    /// advertised string alone rather than falling back to the HEVC reader.
+    #[tokio::test]
+    async fn a_dolby_vision_init_without_a_configuration_record_changes_nothing() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-nodvcc").await;
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("init without dvcC");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-nodvcc", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    #[test]
+    fn a_profile_5_master_declares_dolby_vision_without_a_supplemental_codec() {
+        let file = hls_file(vec![]);
+        let profile5 = hls_context("dvh1.05.06,ec-3", None);
+        let master = master_playlist(&file, None, &profile5);
+
+        // Profile 5 has no compatible base layer to declare, so the master
+        // stays at version 7 — SUPPLEMENTAL-CODECS would drag it to 10, which
+        // this code already documents as rejection-prone.
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master.contains("CODECS=\"dvh1.05.06,ec-3\""));
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"));
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
