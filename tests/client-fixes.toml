@@ -260,3 +260,11 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "struct BlackFrameWatchdog: Equatable"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded"
+
+[[fixes]]
+id = "apple.build-64-release-claims"
+commits = ["e2e59a0c"]
+source = "clients/apple/project.yml"
+source_anchor = "CURRENT_PROJECT_VERSION: \"64\""
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"
