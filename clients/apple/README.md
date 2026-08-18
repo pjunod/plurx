@@ -12,10 +12,11 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `64` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `65` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 64 stops the delivery watchdog firing on a
+> same regression suite. Build 65 keeps the delivery watchdog honest about a
+> player that is still making progress. Build 64 stops the delivery watchdog firing on a
 > healthy player: a full forward buffer looks exactly like a wedge from the
 > server's delivery meter, so the film clock and the buffered runway now have
 > to agree before it recovers. Build 63 makes stall recovery un-foolable: one
