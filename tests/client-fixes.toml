@@ -236,19 +236,3 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func waitingMajority(waitingSamples: Int, stagnantChecks: Int)"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testRegimeFlappingCannotResetTheStallClock"
-
-[[fixes]]
-id = "apple.delivery-starvation-watchdog"
-commits = ["7ed1e5e"]
-source = "clients/apple/Sources/PlayerController.swift"
-source_anchor = "private func observeDeliveryStarvation(_ status: PlaybackSessionStatus)"
-test = "clients/apple/Tests/AppleClientTests.swift"
-test_anchor = "testDeliveryStarvationRequiresServerTruthAndConfirmation"
-
-[[fixes]]
-id = "apple.recovery-reopen-budget"
-commits = ["7ed1e5e"]
-source = "clients/apple/Sources/PlayerController.swift"
-source_anchor = "struct RecoveryReopenBudget"
-test = "clients/apple/Tests/AppleClientTests.swift"
-test_anchor = "testRecoveryReopenBudgetBrakesAStorm"
