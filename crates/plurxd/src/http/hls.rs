@@ -278,6 +278,10 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
+    let ladder_ceiling = state
+        .transcode
+        .capability_height_ceiling(source.as_ref())
+        .await;
     let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
@@ -365,7 +369,11 @@ pub async fn create(
         height: info.target_height,
         encoder: info.encoder.to_owned(),
         vod: info.vod,
-        ladder: crate::transcode::ladder(source_height),
+        // Capped at what this node can actually serve for this file, not just
+        // at the source height: an advertised rung is a promise, and the web
+        // ABR controller upgrades into any rung the ladder lists. See
+        // `capability_height_ceiling`.
+        ladder: crate::transcode::advertised_ladder(source_height, ladder_ceiling),
         prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         delivered_dynamic_range: delivered,
     }))
