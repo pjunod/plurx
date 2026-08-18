@@ -2807,7 +2807,7 @@ function showStallRecoveryFailure(note){
 function reportRateChase(v){
   const p=PLAYER; if(!p||!p.hitches) return;
   const h=p.hitches, want=(v.playbackRate||1);
-  if(h.rate==null || want<=0 || h.rate>=want*CHASE_RATE_MAX) return;
+  if(h.rate==null || !(h.rate>0) || want<=0 || h.rate>=want*CHASE_RATE_MAX) return;
   const runway=bufferRunway(v);
   if(runway<CHASE_RUNWAY_SECS) return;       // starved — endWait's case, not this one
   const now=performance.now();
@@ -5749,7 +5749,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     abr:{lastSwitchAtMs:clickedAt,lastStallAtMs:null,mildSamples:0,
       upgradeSinceMs:null,previousRunway:null,stallEvents:{supply:[],decode:[]},
       recentEstimateKbps:null,recentEstimateAtMs:null,
-      switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false},
+      switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false,
+      // Rungs this playback has already failed to open. Per playback, not
+      // persisted: a transient server failure must not cap quality forever.
+      failedHeights:new Set()},
     waitAt:null, waitRunway:null, waitTimer:null, waitReported:false,
     stallsByKind:null, stallRecoveries:0, recoveringStall:null, stallPrompt:false,
     burnedSub:preBurn, vod:false, };
@@ -6145,14 +6148,36 @@ function armHitchDetector(v){
   // spanning a seek measures the seek.
   const rateWin=[];
   const noteRate=(now, mediaTime, pf, h)=>{
+    // A ring that spans a timeline discontinuity measures the discontinuity.
+    // Pause and seek are cleared by the caller, but a SESSION REPLACEMENT is
+    // not: teardownHls()+attachHls() for a quality switch or a stall reopen
+    // rebases mediaTime and resets presentedFrames without ever setting
+    // v.paused or v.seeking. Sampling across that produced the nonsense in
+    // production — `rate=-53.307 of 1 fps=-91.5`, logged five seconds after a
+    // rung change — and those values feed the chase beacon and the stats
+    // panel. Any backwards step in either counter starts a new window.
+    const last=rateWin[rateWin.length-1];
+    if(last && (mediaTime<last.m || pf<last.p)){
+      rateWin.length=0;
+      h.rate=null; h.renderedFps=null;
+    }
     rateWin.push({w:now, m:mediaTime, p:pf});
     while(rateWin.length>240) rateWin.shift();
     const a=rateWin[0], b=rateWin[rateWin.length-1];
-    if(b.w-a.w>4000){
-      h.rate=+(((b.m-a.m)*1000)/(b.w-a.w)).toFixed(3);
+    const span=b.w-a.w;
+    if(span>4000){
+      const played=b.m-a.m, shown=b.p-a.p;
+      // Belt and braces: only publish figures that are physically possible.
+      // A rate or an fps that is negative, or not finite, is a measurement
+      // artefact and must not reach a beacon that reads it as evidence.
+      h.rate = played>=0 && Number.isFinite(played)
+        ? +((played*1000)/span).toFixed(3)
+        : null;
       // Frames that actually reached the screen, per second — the honest
       // "rendered" figure. Same window as the rate so they agree about time.
-      h.renderedFps=+(((b.p-a.p)*1000)/(b.w-a.w)).toFixed(1);
+      h.renderedFps = shown>=0 && Number.isFinite(shown)
+        ? +((shown*1000)/span).toFixed(1)
+        : null;
     }
   };
   const step=(now, meta)=>{
@@ -6948,6 +6973,13 @@ async function switchAutoRung(currentHeight,decision){
     try{
       info=await openSession(me.fileId,transcodeOpts(pos,aidx,decision.height));
     }catch(e){
+      // This rung is not available on this server for this file — a Dolby
+      // Vision reshape that cannot reach it, an encoder that will not start,
+      // a refusal. Remember it: the dwell and hold timers cannot end a loop
+      // whose every cycle looks new, and this one oscillated 720<->1080 on a
+      // ~2 minute period in production.
+      me.abr.failedHeights=me.abr.failedHeights||new Set();
+      me.abr.failedHeights.add(decision.height);
       if(live()){
         me.abr.switching=false;
         setLoading(true,"Quality adjustment failed.",e.message,
@@ -7037,7 +7069,8 @@ async function autoControllerTick(){
     activeSupplyStall,supplyStalls:p.abr.stallEvents.supply.length,
     lastStallAtMs:p.abr.lastStallAtMs,nowMs:now,
     lastSwitchAtMs:p.abr.lastSwitchAtMs,mildSamples:p.abr.mildSamples,
-    upgradeSinceMs:p.abr.upgradeSinceMs,playerHeight:playerPixelHeight(v)
+    upgradeSinceMs:p.abr.upgradeSinceMs,playerHeight:playerPixelHeight(v),
+    blockedHeights:p.abr.failedHeights
   });
   p.abr.previousRunway=runway;
   p.abr.mildSamples=result.mildSamples;

@@ -3572,10 +3572,21 @@ impl TranscodeManager {
         file: &plurx_core::domain::MediaFile,
     ) -> Result<Encoder, String> {
         if self.require_dovi_renderer(file).await? {
-            // This is the only pairing boot probes. Software decode preserves
-            // the RPU AVFrame side data and feeds the proved system-memory
-            // tonemapx graph.
-            Ok(Encoder::Software)
+            // Software decode is forced by the pipeline itself
+            // (`requires_software_decode`) — that is what preserves the RPU
+            // AVFrame side data the tonemapx graph consumes. The ENCODER is
+            // free to be the node's real one, provided that exact pairing has
+            // been proved at boot; an unproved pairing falls back to software
+            // rather than failing in front of a viewer. Pinning it to x264
+            // used to cap 4K Dolby Vision at 720p for every non-DV client.
+            let preferred = self.encoder().await;
+            if preferred != Encoder::Software
+                && crate::ffmpeg::has_dovi_reshape_with(preferred).await
+            {
+                Ok(preferred)
+            } else {
+                Ok(Encoder::Software)
+            }
         } else {
             Ok(self.encoder().await)
         }
@@ -5292,10 +5303,15 @@ impl TranscodeManager {
     ) -> i64 {
         let source_height = file.and_then(|file| file.height);
         if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
+            // Follow the encoder the reshape can actually reach. This used to
+            // be a flat software cap, which meant a 4K Dolby Vision film was
+            // 720p for every client that cannot take DV directly, even on a
+            // node whose hardware encoder was idle.
+            let max = self.capability_height_ceiling(file).await;
             let current = source_height
                 .filter(|height| *height > 0)
-                .unwrap_or(AUTO_SOFTWARE_HEIGHT)
-                .clamp(MIN_HEIGHT, AUTO_SOFTWARE_HEIGHT);
+                .unwrap_or(max)
+                .clamp(MIN_HEIGHT, max);
             auto_height_from_prior(current, source_height, prior, unix_ms())
         } else {
             self.auto_height(source_height, prior).await
@@ -5323,10 +5339,17 @@ impl TranscodeManager {
         &self,
         file: Option<&plurx_core::domain::MediaFile>,
     ) -> i64 {
-        if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
-            return AUTO_SOFTWARE_HEIGHT;
-        }
-        if self.encoder().await == Encoder::Software {
+        // A Dolby Vision reshape is capped by whichever encoder it can
+        // actually reach — hardware when the pairing is proved, software
+        // otherwise — not unconditionally by the software rung.
+        let encoder = match file {
+            Some(file) if Self::needs_dovi_reshape(file) == Ok(true) => self
+                .encoder_for_file(file)
+                .await
+                .unwrap_or(Encoder::Software),
+            _ => self.encoder().await,
+        };
+        if encoder == Encoder::Software {
             AUTO_SOFTWARE_HEIGHT
         } else {
             AUTO_HARDWARE_MAX_HEIGHT
@@ -9023,13 +9046,15 @@ mod tests {
         };
         let profile5 = profile5_file();
 
-        // The reported case: a Profile 5 source must go through the software
-        // reshape, which Auto caps at 720 — so 1080 must not be on the menu,
-        // on either encoder.
+        // A Profile 5 reshape follows whichever encoder it can actually
+        // reach. With no ffmpeg here the hardware pairing cannot be proved,
+        // so it falls back to software — which is the contract: an unproved
+        // pairing is never attempted, and the ceiling tells the truth about
+        // the fallback rather than advertising a rung that would fail.
         assert_eq!(
             hardware.capability_height_ceiling(Some(&profile5)).await,
             AUTO_SOFTWARE_HEIGHT,
-            "the reshape is software-only whatever the encoder is"
+            "an unproved hardware pairing falls back to the software rung"
         );
         assert_eq!(
             software.capability_height_ceiling(Some(&profile5)).await,

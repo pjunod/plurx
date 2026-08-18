@@ -147,10 +147,19 @@ impl Pipeline {
             Pipeline::VppQsv => encoder == Encoder::Qsv,
             Pipeline::TonemapVaapi => encoder == Encoder::Vaapi,
             Pipeline::Libplacebo | Pipeline::TonemapOpencl => encoder != Encoder::Software,
-            // The proved implementation deliberately uses software decode and
-            // encode. That keeps DOVI frame side data attached and gives the
-            // SIMD filter ordinary system-memory frames.
-            Pipeline::DoviTonemapx => encoder == Encoder::Software,
+            // Software DECODE is non-negotiable and stays so: the HEVC
+            // decoder is what attaches the DOVI frame side data that
+            // `apply_dovi=1` consumes, and an inherited hardware decode drops
+            // it silently (`requires_software_decode`). The ENCODER was pinned
+            // here too, but neither stated reason — side data attached,
+            // system-memory frames for the SIMD filter — is about the encode
+            // half. It cost every non-DV-capable client a 720p ceiling on 4K
+            // Dolby Vision while an idle hardware encoder sat next to it. The
+            // filtered frames reach a vendor encoder through the same
+            // `filter_suffix()` upload every other CPU-filtered path uses, and
+            // the pairing is probed at boot (`has_dovi_reshape_with`) before it
+            // is ever attempted — unproved pairings fall back to software.
+            Pipeline::DoviTonemapx => true,
             // Same reasoning, plus one more: the HDR10 grade's only measured
             // encoder is libx265 (see `Encoder::video_codec_for`), which is
             // the software family by definition.
@@ -602,17 +611,31 @@ mod tests {
     }
 
     #[test]
-    fn profile5_renderer_has_one_safe_pairing_and_no_unsafe_fallback() {
+    fn profile5_renderer_keeps_software_decode_and_may_encode_anywhere_probed() {
         let p = Pipeline::DoviTonemapx;
         assert!(p.pairs_with(Encoder::Software));
+        // The encode half is no longer pinned: a 4K Dolby Vision source used
+        // to cap every non-DV client at the software Auto rung (720p) while a
+        // hardware encoder sat idle beside it. Admission is gated by the boot
+        // probe (`ffmpeg::has_dovi_reshape_with`), not by this table.
         for encoder in [
             Encoder::Nvenc,
             Encoder::Qsv,
             Encoder::Vaapi,
             Encoder::VideoToolbox,
         ] {
-            assert!(!p.pairs_with(encoder), "unprobed pairing: {encoder:?}");
+            assert!(
+                p.pairs_with(encoder),
+                "encode may leave the CPU: {encoder:?}"
+            );
         }
+        // …but the DECODE half is the one that carries the RPU side data, and
+        // it must never leave the CPU whatever the encoder is.
+        assert!(p.requires_software_decode());
+        assert!(
+            !p.on_gpu(),
+            "frames start in system memory on every pairing"
+        );
         assert!(p.handles(Some("dolby_vision")));
         assert!(!p.handles(Some("hdr10")));
         assert!(p.requires_software_decode());
