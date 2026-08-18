@@ -18,7 +18,8 @@ mod recipe;
 
 pub use encoder::{
     detect_encoders, validate_quality_rate_control, validate_quality_rate_control_yielding,
-    EffectiveRateControl, Encoder, EncoderCaps, QualityRateControlValidation, QualityRc, RateMode,
+    EffectiveRateControl, Encoder, EncoderCaps, OutputGrade, QualityRateControlValidation,
+    QualityRc, RateMode,
 };
 pub use pipeline::{Pipeline, CANDIDATES as PIPELINE_CANDIDATES};
 pub use recipe::{PipelineDigest, Recipe};
@@ -302,14 +303,18 @@ pub fn hevc_copy_tag_for_format(
     hdr_format: Option<&str>,
     preserve_dolby_vision: bool,
 ) -> &'static str {
-    let compatible_base = hdr_format.is_some_and(|format| {
-        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
-    });
+    let compatible_base = dolby_vision_has_compatible_base(hdr_format);
     if hdr == Some("dolby_vision") && preserve_dolby_vision && !compatible_base {
         "dvh1"
     } else {
         "hvc1"
     }
+}
+
+fn dolby_vision_has_compatible_base(hdr_format: Option<&str>) -> bool {
+    hdr_format.is_some_and(|format| {
+        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
+    })
 }
 
 /// Whether this ffmpeg has the `dovi_rpu` bitstream filter (landed in 7.1).
@@ -659,6 +664,71 @@ fn with_subtitles(mut chain: Vec<String>, opts: &TranscodeOptions, source_path: 
     chain.join(",")
 }
 
+/// The 8-bit pixel formats this crate's filter chains ever name. Listed
+/// rather than inferred so a new spelling has to be added deliberately.
+const EIGHT_BIT_FORMATS: &[&str] = &["yuv420p", "yuvj420p", "nv12", "yuv422p", "yuv444p"];
+
+/// Refuse to hand ffmpeg a filter that asks for a PQ **output** transfer at an
+/// 8-bit output depth.
+///
+/// This is not a style check. `tonemapx` with `transfer=smpte2084` and an
+/// 8-bit output format does not return an error and does not print a
+/// diagnostic: it hits
+/// `Assertion 0 failed at libavfilter/vf_tonemapx.c:1475` and calls
+/// `abort()` — SIGABRT, exit 134, measured on jellyfin-ffmpeg7 7.1.4-3. A
+/// process kill is not something the session-level fallback machinery can
+/// tell apart from an OOM kill or an operator's `kill -9`, so the
+/// combination has to be impossible to *emit*, not merely recoverable from.
+///
+/// [`OutputGrade`] makes it impossible to construct in the first place —
+/// transfer and pixel format come out of one value. This is the second line:
+/// filter chains are also assembled as text (subtitle burns, the bitmap
+/// overlay's `-filter_complex`, `hwdownload` prefixes, and anything a future
+/// change concatenates), and text does not typecheck.
+///
+/// Judged **per filter**, and on the `transfer=` key specifically. The
+/// distinction is load-bearing in both directions:
+///
+/// - `zscale=tin=smpte2084:…:t=bt709,format=yuv420p` is the SDR tone-map, and
+///   it is correct. `tin=` declares the *input* transfer; a chain-wide search
+///   for the string `smpte2084` condemns it.
+/// - `tonemapx=transfer=smpte2084:format=yuv420p10le,scale=…,format=yuv420p`
+///   would be a legitimate 10-bit map followed by an 8-bit downconvert done
+///   by swscale, which does not abort. Only the filter that declares the PQ
+///   output has to be 10-bit.
+///
+/// Panics rather than returning an error because there is no recovery and no
+/// caller who could choose one: every reachable path builds the chain from an
+/// `OutputGrade`, so a violation is a bug in this file that a test must catch
+/// before a viewer's ffmpeg does.
+pub fn assert_no_pq_at_8_bit(chain: &str) {
+    // `,` separates filters, `;` separates the branches of a filter_complex.
+    for filter in chain.split([',', ';']) {
+        let options: Vec<&str> = filter.split(':').collect();
+        let declares_pq = options.iter().any(|option| {
+            option
+                .rsplit('=')
+                .next()
+                .is_some_and(|value| value == "smpte2084")
+                && option.contains("transfer=")
+        });
+        if !declares_pq {
+            continue;
+        }
+        let offender = options.iter().find_map(|option| {
+            let value = option.strip_prefix("format=")?;
+            EIGHT_BIT_FORMATS.contains(&value).then_some(value)
+        });
+        assert!(
+            offender.is_none(),
+            "filter `{filter}` pairs a PQ output transfer with the 8-bit format \
+             `{}`, which aborts ffmpeg (SIGABRT, vf_tonemapx.c:1475) rather than \
+             failing: {chain}",
+            offender.unwrap_or_default(),
+        );
+    }
+}
+
 /// Escape a path for use inside an ffmpeg filter argument (colons, quotes,
 /// backslashes, commas are special).
 fn escape_filter_path(path: &str) -> String {
@@ -923,22 +993,29 @@ pub fn hls_args(
             // broken order exactly, hidden by the tests only ever burning
             // with the suffix-less software encoder.
             let up = suffix.map(|s| format!(",{s}")).unwrap_or_default();
-            args.push("-filter_complex".into());
-            args.push(format!(
+            let complex = format!(
                 "[0:v]{vf}[vburn];{sub};\
                  [vburn][sburn]overlay=eof_action=pass{up}{BURNED_VIDEO_LABEL}"
-            ));
+            );
+            assert_no_pq_at_8_bit(&complex);
+            args.push("-filter_complex".into());
+            args.push(complex);
         }
         None => {
             if let Some(s) = suffix {
                 vf.push(',');
                 vf.push_str(s);
             }
+            assert_no_pq_at_8_bit(&vf);
             args.push("-vf".into());
             args.push(vf);
         }
     }
-    args.extend(encoder.encode_args(
+    // The grade is read off the pipeline rather than carried beside it, so a
+    // session cannot encode HEVC Main10 through a chain that ended in BT.709,
+    // or the reverse.
+    args.extend(encoder.encode_args_for(
+        opts.pipeline.output_grade(),
         opts.video_bitrate_kbps,
         opts.effective_rate_control,
         opts.force_idr,
@@ -1205,12 +1282,26 @@ fn copy_input_args(
             args.push("-strict".into());
             args.push("unofficial".into());
         }
-        args.push("-bsf:v".into());
-        args.push(hevc_copy_bsf_for_client(
-            source.hdr.as_deref(),
-            have_dovi_bsf,
-            preserve_dolby_vision,
-        ));
+        // A non-backward-compatible Dolby Vision stream is tagged `dvh1`, so
+        // its VPS/SPS/PPS must be present in hvcC before AVPlayer opens the
+        // first fragment. Some WEB-DL Matroska files carry a minimal, empty
+        // hvcC and repeat those parameter sets only in-band. Stripping them
+        // here made an initialization record with no decoder configuration;
+        // tvOS rejected it with CoreMedia -15517. Leave the parameter sets in
+        // the pipe so the GOP-aware segmenter can promote them into hvcC from
+        // the first sample. Compatible Profile 8 and ordinary HEVC keep the
+        // existing hvc1 normalization.
+        let promote_profile5_parameter_sets = source.hdr.as_deref() == Some("dolby_vision")
+            && preserve_dolby_vision
+            && !dolby_vision_has_compatible_base(source.hdr_format.as_deref());
+        if !promote_profile5_parameter_sets {
+            args.push("-bsf:v".into());
+            args.push(hevc_copy_bsf_for_client(
+                source.hdr.as_deref(),
+                have_dovi_bsf,
+                preserve_dolby_vision,
+            ));
+        }
     }
 
     if transcode_audio {
@@ -1771,6 +1862,317 @@ mod tests {
         assert!(!joined.contains("tin=smpte2084"), "{joined}");
     }
 
+    /// The SDR Profile 5 argument list, pinned **verbatim**.
+    ///
+    /// This is the hard requirement M5 was allowed to change nothing about:
+    /// an SDR client's Dolby Vision transcode has to be the same bytes it was
+    /// before an HDR rung existed beside it. A `contains` assertion cannot see
+    /// a reordered option, an added flag, or a changed preset — all three
+    /// change the picture or the cache identity — so this compares the whole
+    /// vector.
+    ///
+    /// If this fails, the answer is almost never to update the literal.
+    #[test]
+    fn the_sdr_argument_list_for_a_profile5_source_is_unchanged() {
+        let mut source = file(Some("dolby_vision"));
+        source.hdr_format = Some("Dolby Vision · Profile 5".into());
+        let opts = TranscodeOptions {
+            tone_map: ToneMap::Tonemapx,
+            pipeline: Pipeline::DoviTonemapx,
+            target_height: 1080,
+            video_bitrate_kbps: 8_000,
+            ..Default::default()
+        };
+        let args = hls_args(
+            &source,
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        assert_eq!(
+            args,
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "/media/movie.mkv",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-vf",
+                "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:\
+                 range=tv:format=yuv420p:apply_dovi=1,scale=1920:1080,format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-b:v",
+                "8000k",
+                "-maxrate",
+                "12000k",
+                "-bufsize",
+                "16000k",
+                "-profile:v",
+                "high",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*2)",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+                "-b:a",
+                "160k",
+                "-muxdelay",
+                "0",
+                "-muxpreload",
+                "0",
+                "-f",
+                "hls",
+                "-hls_time",
+                "2",
+                "-hls_playlist_type",
+                "event",
+                "-hls_flags",
+                "independent_segments+temp_file",
+                "-hls_segment_type",
+                "mpegts",
+                "-hls_segment_filename",
+                "/tmp/s/seg%05d.ts",
+                "-start_number",
+                "0",
+                "/tmp/s/index.m3u8",
+            ]
+            .map(str::to_owned)
+        );
+    }
+
+    /// The HDR10 rung's whole argument list: HEVC Main10 out of a PQ chain,
+    /// and nothing H.264 anywhere in it.
+    #[test]
+    fn the_hdr10_rung_produces_hevc_main10_pq() {
+        let mut source = file(Some("dolby_vision"));
+        source.hdr_format = Some("Dolby Vision · Profile 5".into());
+        let opts = TranscodeOptions {
+            tone_map: ToneMap::None,
+            pipeline: Pipeline::DoviPassthrough,
+            target_height: 1080,
+            video_bitrate_kbps: 8_000,
+            ..Default::default()
+        };
+        let args = hls_args(
+            &source,
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(
+                "-vf tonemapx=tonemap=none:transfer=smpte2084:matrix=bt2020:\
+                 primaries=bt2020:range=tv:format=yuv420p10le:apply_dovi=1,\
+                 scale=1920:1080,format=yuv420p10le"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("-c:v libx265"), "{joined}");
+        assert!(
+            joined.contains("-x265-params hdr10=1:repeat-headers=1"),
+            "{joined}"
+        );
+        assert!(!joined.contains("libx264"), "{joined}");
+        assert!(!joined.contains("-profile:v high"), "{joined}");
+        assert!(!joined.contains("zscale"), "{joined}");
+        assert!(joined.contains("apply_dovi=1"), "{joined}");
+        // The rate control is the same bounded VBR every rung uses.
+        assert!(joined.contains("-b:v 8000k -maxrate 12000k -bufsize 16000k"));
+        // …and the muxer/segment policy is untouched.
+        assert!(joined.contains("-force_key_frames expr:gte(t,n_forced*2)"));
+        assert!(joined.contains("-hls_segment_type mpegts"));
+    }
+
+    /// PQ at 8 bits does not fail — it calls `abort()`. The guard therefore
+    /// has to fire before ffmpeg is ever handed the chain, and it has to
+    /// leave the chains that legitimately mention PQ alone.
+    #[test]
+    fn a_pq_output_transfer_is_never_paired_with_an_eight_bit_format() {
+        // The SDR tone-map declares PQ as its INPUT and outputs 8-bit BT.709.
+        // That is correct, and a naive substring guard condemns it.
+        assert_no_pq_at_8_bit(
+            "zscale=tin=smpte2084:min=bt2020nc:pin=bt2020:t=linear:npl=100,\
+             format=gbrpf32le,tonemap=tonemap=hable:desat=0,\
+             zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p",
+        );
+        // A 10-bit PQ map followed by an unrelated 8-bit convert in a later
+        // filter is swscale's business, not tonemapx's.
+        assert_no_pq_at_8_bit(
+            "tonemapx=transfer=smpte2084:format=yuv420p10le,scale=64:64,format=yuv420p",
+        );
+        // Every chain this crate can actually build is clean, at every rung
+        // and for every source grade.
+        for pipeline in PIPELINE_CANDIDATES
+            .iter()
+            .copied()
+            .chain([Pipeline::DoviTonemapx, Pipeline::DoviPassthrough])
+        {
+            for hdr in [None, Some("hdr10"), Some("hlg"), Some("dolby_vision")] {
+                if let Some(graph) = pipeline.filters(Some(1920), 1080, hdr) {
+                    assert_no_pq_at_8_bit(&graph);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "aborts ffmpeg")]
+    fn a_pq_transfer_beside_an_eight_bit_format_is_refused_before_ffmpeg_sees_it() {
+        // The exact combination measured to SIGABRT: transfer=smpte2084 with
+        // an 8-bit output format on the same filter.
+        assert_no_pq_at_8_bit(
+            "tonemapx=tonemap=none:transfer=smpte2084:matrix=bt2020:primaries=bt2020:\
+             range=tv:format=yuv420p:apply_dovi=1",
+        );
+    }
+
+    /// Rule 4f: produce a stream and MEASURE it.
+    ///
+    /// Everything above this asserts about an argument list, and an argument
+    /// list is a hypothesis. This one takes the vector `hls_args` actually
+    /// builds, hands it to a real ffmpeg, and reads the colour properties of
+    /// the segment that comes out. It is the only test here that can tell the
+    /// difference between "the options are spelled correctly" and "the filter
+    /// does what the spelling implies" — which for `tonemapx`'s passthrough
+    /// mode is the entire question, because the mode is engaged by a value
+    /// (`transfer=smpte2084`) rather than by a switch.
+    ///
+    /// **It needs a real Dolby Vision Profile 5 source, and there is no way
+    /// to synthesise one from ffmpeg alone** — the RPU has to be injected by
+    /// `dovi_tool`, which is not a dependency of this repo. So it runs where
+    /// `PLURX_DV_P5_FIXTURE` names such a file and is skipped where it does
+    /// not, which is a compromise this file otherwise refuses (see
+    /// `testfixtures::require_ffmpeg`, which fails rather than skips). The
+    /// difference is that the missing thing here is *media*, not a tool an
+    /// operator can install.
+    ///
+    /// Measured on jellyfin-ffmpeg7 7.1.4-3-bookworm, 2 cores, against a
+    /// 1920x1080 Profile 5 sample — `profile=Main 10`,
+    /// `pix_fmt=yuv420p10le`, `color_range=tv`, `color_space=bt2020nc`,
+    /// `color_transfer=smpte2084`, `color_primaries=bt2020`, `level=120`, no
+    /// residual Dolby Vision RPU side data, 10.4 fps.
+    #[test]
+    fn the_hdr10_rung_really_produces_a_pq_stream() {
+        let Some(source_path) = std::env::var("PLURX_DV_P5_FIXTURE")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            eprintln!(
+                "skipping: set PLURX_DV_P5_FIXTURE to a real Dolby Vision Profile 5 \
+                 source to measure the HDR10 rung's output"
+            );
+            return;
+        };
+        let ffmpeg = std::env::var("PLURX_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+        let ffprobe = std::env::var("PLURX_FFPROBE").unwrap_or_else(|_| "ffprobe".to_owned());
+
+        let mut source = file(Some("dolby_vision"));
+        source.path = source_path.clone().into();
+        source.hdr_format = Some("Dolby Vision · Profile 5".into());
+        source.width = Some(1920);
+        source.height = Some(1080);
+        let out = std::env::temp_dir().join(format!(
+            "plurx-m5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&out).expect("output dir");
+
+        // The production builder. Not a hand-written command that resembles
+        // it — the same function a session calls.
+        let args = hls_args(
+            &source,
+            Encoder::Software,
+            &TranscodeOptions {
+                tone_map: ToneMap::None,
+                pipeline: Pipeline::DoviPassthrough,
+                target_height: 1080,
+                video_bitrate_kbps: 8_000,
+                ..Default::default()
+            },
+            Pacing::unpaced(),
+            &out.to_string_lossy(),
+        );
+        let produced = std::process::Command::new(&ffmpeg)
+            .args(&args)
+            .output()
+            .expect("running ffmpeg");
+        assert!(
+            produced.status.success(),
+            "the production HDR10 arguments failed: {}\n{}",
+            produced.status,
+            String::from_utf8_lossy(&produced.stderr)
+        );
+        // A signal death is finding (3) — PQ at 8 bits aborts — and must
+        // never be reported as an ordinary failure.
+        assert!(
+            produced.status.code().is_some(),
+            "ffmpeg died by signal, which is what the 8-bit PQ abort looks like"
+        );
+
+        let segment = out.join("seg00000.ts");
+        assert!(segment.is_file(), "no segment was produced");
+        let probe = std::process::Command::new(&ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+            .arg(
+                "stream=codec_name,profile,width,height,pix_fmt,color_range,\
+                 color_space,color_transfer,color_primaries",
+            )
+            .args(["-of", "default=nw=1"])
+            .arg(&segment)
+            .output()
+            .expect("running ffprobe");
+        let report = String::from_utf8_lossy(&probe.stdout);
+        // Printed, not just asserted on: this is the evidence, and a run that
+        // bothered to encode a real Profile 5 sample should say what came out.
+        eprintln!("HDR10 rung, measured from the production argument list:\n{report}");
+        for expected in [
+            "codec_name=hevc",
+            "profile=Main 10",
+            "pix_fmt=yuv420p10le",
+            "color_range=tv",
+            "color_space=bt2020nc",
+            "color_transfer=smpte2084",
+            "color_primaries=bt2020",
+        ] {
+            assert!(
+                report.contains(expected),
+                "the produced stream is not {expected}: {report}"
+            );
+        }
+
+        // The RPU was consumed, not passed on. A stream that still carried it
+        // would be Dolby Vision advertised as HDR10 — the reverse of the
+        // mislabel this rung exists to fix, and just as wrong.
+        let side = std::process::Command::new(&ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-read_intervals", "%+#1", "-show_frames"])
+            .args(["-show_entries", "frame=side_data_list", "-of", "default"])
+            .arg(&segment)
+            .output()
+            .expect("running ffprobe");
+        let side = String::from_utf8_lossy(&side.stdout);
+        assert!(
+            !side.contains("Dolby Vision"),
+            "the reshape left Dolby Vision metadata behind: {side}"
+        );
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
     #[test]
     fn tonemap_none_passes_hdr_through() {
         // PLURX_TONEMAP=off → no tone-map filter, HDR just normalized to yuv420p.
@@ -2050,6 +2452,11 @@ mod tests {
         )
         .join(" ");
         assert!(profile5.contains("-tag:v dvh1"));
+        assert!(profile5.contains("-strict unofficial"));
+        assert!(
+            !profile5.contains("-bsf:v"),
+            "Profile 5 parameter sets must reach the segmenter for hvcC promotion"
+        );
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.

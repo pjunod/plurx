@@ -220,3 +220,67 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "nonisolated static func sessionAttachSeekMs("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testLiveCopyRecoverySeeksPastThePrecedingKeyframe"
+
+[[fixes]]
+id = "android.google-tv-dolby-vision-detection"
+commits = ["eff7118d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/Caps.kt"
+source_anchor = "private fun decoderDolbyVisionProbe()"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed"
+
+[[fixes]]
+id = "apple.stall-clock-regime-flap"
+commits = ["7ed1e5e"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func waitingMajority(waitingSamples: Int, stagnantChecks: Int)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testRegimeFlappingCannotResetTheStallClock"
+
+[[fixes]]
+id = "apple.delivery-watchdog-unstructured-recovery"
+commits = ["5f996b2"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "Task { await self.retrySameDeliveryAfterStall(event) }"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testDeliveryStarvationRequiresServerTruthAndConfirmation"
+
+[[fixes]]
+id = "apple.dolby-vision-profile5-compatibility-errors"
+commits = ["631e9697"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func isCompatibilityPlaybackFailure("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testApplePlayerTreatsDolbyVisionRejectionsAsCompatibilityFailures"
+
+[[fixes]]
+id = "apple.dolby-vision-profile5-black-frame-watchdog"
+commits = ["47c06809"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct BlackFrameWatchdog: Equatable"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded"
+
+[[fixes]]
+id = "apple.build-64-release-claims"
+commits = ["e2e59a0c"]
+source = "clients/apple/project.yml"
+source_anchor = "CURRENT_PROJECT_VERSION: \"65\""
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"
+
+[[fixes]]
+id = "apple.delivery-watchdog-healthy-buffer"
+commits = ["276a1f4"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static let runwayCeilingSeconds = 10.0"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testDeliveryStarvationNeverFiresOnAHealthyBufferedPlayer"
+
+[[fixes]]
+id = "apple.build-65-release-claims"
+commits = ["9989092"]
+source = "docs/APPLE-CLIENT-PARITY.md"
+source_anchor = "Apple build 65"
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"

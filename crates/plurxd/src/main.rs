@@ -445,6 +445,20 @@ fn log_startup(config: &Config, identity: &plurx_core::cluster::ClusterIdentity)
         data_dir = %config.storage.data_dir.display(),
         "plurxd starting"
     );
+    if crate::version::BUILD == "unknown" {
+        // Two fleet nodes shipped "unknown" on 2026-08-17 because a bare
+        // `docker compose up -d --build` skips the stamp; "did my deploy
+        // land?" then has no answer from inside the product. The image cannot
+        // derive the commit itself (`.git` is outside the build context by
+        // design), so the deploy path must pass it: `make docker-up`, or
+        // PLURX_BUILD_REF="$(git describe --tags --always --dirty)" in the
+        // compose environment.
+        tracing::warn!(
+            "running an UNSTAMPED build — deploys from this image are \
+             unattributable; build with `make docker-up` (or set \
+             PLURX_BUILD_REF) so the System page can say which commit this is"
+        );
+    }
 }
 
 /// Bind the HTTP listener, naming the address when it cannot be had — the
@@ -590,6 +604,7 @@ async fn probe_system(
         pacing: crate::ffmpeg::pacing_caps().await,
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
         dovi_reshape: crate::ffmpeg::has_dovi_reshape().await,
+        dovi_passthrough: crate::ffmpeg::has_dovi_passthrough().await,
         encoder_selected,
         tone_map,
     };
@@ -603,6 +618,7 @@ struct Measured {
     pacing: crate::ffmpeg::PacingCaps,
     dovi_rpu: bool,
     dovi_reshape: bool,
+    dovi_passthrough: bool,
     encoder_selected: String,
     tone_map: pipeprobe::PipelineReport,
 }
@@ -632,6 +648,7 @@ fn system_info(
         pacing: measured.pacing,
         dovi_rpu: measured.dovi_rpu,
         dovi_reshape: measured.dovi_reshape,
+        dovi_passthrough: measured.dovi_passthrough,
     }
 }
 
@@ -2554,6 +2571,7 @@ mod startup_tests {
                 },
                 dovi_rpu: true,
                 dovi_reshape: true,
+                dovi_passthrough: true,
                 encoder_selected: selected.clone(),
                 tone_map: pipeprobe::PipelineReport::cpu_only("not probed"),
             },
