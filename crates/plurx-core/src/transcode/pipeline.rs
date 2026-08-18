@@ -24,7 +24,7 @@
 //! replaced. `plurxd`'s pipeline probe checks each of those against real HDR10
 //! and only then lets a node use a graph (PERF-PLAN §5).
 
-use super::Encoder;
+use super::{Encoder, OutputGrade};
 
 /// The video path for one session, from decoded frames to the encoder's input.
 ///
@@ -53,6 +53,30 @@ pub enum Pipeline {
     /// candidate list: it has a different decode contract and must never fall
     /// back to the non-Dolby-aware CPU zscale graph.
     DoviTonemapx,
+    /// Dolby Vision RPU application with **no tone-map at all**: the same
+    /// SIMD filter run in its HDR passthrough mode, emitting HEVC Main10 PQ
+    /// instead of BT.709 8-bit. The rung between "preserve Dolby Vision" and
+    /// "720p SDR H.264", for a client that cannot decode DV but can decode
+    /// Main10 PQ.
+    ///
+    /// `transfer=smpte2084` is what engages passthrough — the `tonemap=`
+    /// algorithm is ignored in this mode, which is why it is spelled `none`.
+    /// Measured on jellyfin-ffmpeg7 7.1.4-3 against a real Profile 5 sample:
+    /// the output ffprobes as `profile=Main 10`, `pix_fmt=yuv420p10le`,
+    /// `color_range=tv`, `color_space=bt2020nc`,
+    /// `color_transfer=smpte2084`, `color_primaries=bt2020`, with no residual
+    /// DV RPU side data.
+    ///
+    /// **It is Dolby-Vision-input-only, and it does not say so at runtime.**
+    /// Handed a plain HDR10 source it does not error: it emits a broken
+    /// picture — crushed shadows, everything above roughly 70% clipped to
+    /// white — with correct-looking tags and exit 0 (measured). The filter
+    /// logs `HDR passthrough only works for Dolby Vision inputs at the
+    /// moment` when its preconditions fail, and then carries on. So
+    /// [`Pipeline::handles`] admits `dolby_vision` and nothing else, and the
+    /// daemon gates on a *proved* RPU (`dovi_reshape_changes_pixels`) rather
+    /// than on the library row alone.
+    DoviPassthrough,
     /// hwdownload → CPU float tone-map → the encoder's own hwupload. Always
     /// available, always correct, and slow in exactly the case that matters.
     Cpu,
@@ -76,6 +100,7 @@ impl Pipeline {
             Pipeline::Libplacebo => "libplacebo",
             Pipeline::TonemapOpencl => "tonemap_opencl",
             Pipeline::DoviTonemapx => "dovi_tonemapx",
+            Pipeline::DoviPassthrough => "dovi_passthrough",
             Pipeline::Cpu => "cpu",
         }
     }
@@ -84,7 +109,7 @@ impl Pipeline {
         CANDIDATES
             .iter()
             .copied()
-            .chain(std::iter::once(Pipeline::DoviTonemapx))
+            .chain([Pipeline::DoviTonemapx, Pipeline::DoviPassthrough])
             .find(|p| p.name() == s)
     }
 
@@ -96,13 +121,17 @@ impl Pipeline {
             Pipeline::Libplacebo => "GPU tone-map (Vulkan)",
             Pipeline::TonemapOpencl => "GPU tone-map (OpenCL)",
             Pipeline::DoviTonemapx => "Dolby Vision reshape (tonemapx)",
+            Pipeline::DoviPassthrough => "Dolby Vision → HDR10 (tonemapx passthrough)",
             Pipeline::Cpu => "CPU tone-map",
         }
     }
 
     /// True when frames stay on the GPU from decode to encode.
     pub fn on_gpu(self) -> bool {
-        !matches!(self, Pipeline::Cpu | Pipeline::DoviTonemapx)
+        !matches!(
+            self,
+            Pipeline::Cpu | Pipeline::DoviTonemapx | Pipeline::DoviPassthrough
+        )
     }
 
     /// Can this pipeline pair with `encoder`?
@@ -122,6 +151,10 @@ impl Pipeline {
             // encode. That keeps DOVI frame side data attached and gives the
             // SIMD filter ordinary system-memory frames.
             Pipeline::DoviTonemapx => encoder == Encoder::Software,
+            // Same reasoning, plus one more: the HDR10 grade's only measured
+            // encoder is libx265 (see `Encoder::video_codec_for`), which is
+            // the software family by definition.
+            Pipeline::DoviPassthrough => encoder == Encoder::Software,
             Pipeline::Cpu => true,
         }
     }
@@ -141,6 +174,10 @@ impl Pipeline {
             (Pipeline::Cpu, _) => true,
             (Pipeline::DoviTonemapx, Some("dolby_vision")) => true,
             (Pipeline::DoviTonemapx, _) => false,
+            // Guard, not a preference. Passthrough on a non-DV HDR10 source
+            // is a broken picture at exit 0 — see the variant's doc comment.
+            (Pipeline::DoviPassthrough, Some("dolby_vision")) => true,
+            (Pipeline::DoviPassthrough, _) => false,
             // Nothing to map. The graph is still allowed — its scaler is the
             // reason — and the tone-map step simply drops out.
             (_, None) => true,
@@ -173,6 +210,7 @@ impl Pipeline {
             Pipeline::Libplacebo
             | Pipeline::TonemapOpencl
             | Pipeline::DoviTonemapx
+            | Pipeline::DoviPassthrough
             | Pipeline::Cpu => Vec::new(),
         }
     }
@@ -287,6 +325,26 @@ impl Pipeline {
                      scale={w}:{h},format=yuv420p"
                 )
             }
+            // The same filter, the same `apply_dovi=1`, the same
+            // reshape-before-scale order — and a different destination. Every
+            // colour term comes from one `OutputGrade`, which is what makes
+            // the PQ/8-bit pairing that `abort()`s the process unspellable
+            // here. `tonemap=none` is honest rather than meaningful: selecting
+            // `transfer=smpte2084` engages passthrough and the algorithm is
+            // ignored.
+            Pipeline::DoviPassthrough => {
+                let h = height.max(2);
+                let grade = OutputGrade::Hdr10;
+                let transfer = grade.transfer();
+                let matrix = grade.matrix();
+                let primaries = grade.primaries();
+                let format = grade.pixel_format();
+                format!(
+                    "tonemapx=tonemap=none:transfer={transfer}:matrix={matrix}:\
+                     primaries={primaries}:range=tv:format={format}:apply_dovi=1,\
+                     scale={w}:{h},format={format}"
+                )
+            }
         })
     }
 
@@ -294,7 +352,26 @@ impl Pipeline {
     /// metadata is parsed onto AVFrames by the HEVC decoder; an inherited
     /// hardware decode/download path is not allowed to drop it silently.
     pub fn requires_software_decode(self) -> bool {
-        self == Pipeline::DoviTonemapx
+        matches!(self, Pipeline::DoviTonemapx | Pipeline::DoviPassthrough)
+    }
+
+    /// The dynamic range of the bytes this pipeline's session puts on the
+    /// wire.
+    ///
+    /// The single source of truth for the grade, read by the filter builder,
+    /// the encoder choice, the cache recipe and the badge alike — so a
+    /// session cannot encode one grade and report another. Everything except
+    /// [`Pipeline::DoviPassthrough`] ends in BT.709 8-bit.
+    pub fn output_grade(self) -> OutputGrade {
+        match self {
+            Pipeline::DoviPassthrough => OutputGrade::Hdr10,
+            Pipeline::VppQsv
+            | Pipeline::TonemapVaapi
+            | Pipeline::Libplacebo
+            | Pipeline::TonemapOpencl
+            | Pipeline::DoviTonemapx
+            | Pipeline::Cpu => OutputGrade::Sdr,
+        }
     }
 
     /// The pipeline this session actually gets, given the one the node proved
@@ -394,7 +471,11 @@ impl Pipeline {
     /// works.
     pub fn fallback(self) -> Option<Pipeline> {
         match self {
-            Pipeline::Cpu | Pipeline::DoviTonemapx => None,
+            // A Dolby renderer has nothing below it. Falling back to the
+            // non-Dolby-aware CPU zscale graph would render Profile 5 as
+            // garbage rather than failing, and for the passthrough rung it
+            // would additionally swap the grade the client was promised.
+            Pipeline::Cpu | Pipeline::DoviTonemapx | Pipeline::DoviPassthrough => None,
             _ => Some(Pipeline::Cpu),
         }
     }
@@ -422,6 +503,102 @@ mod tests {
             !CANDIDATES.contains(&Pipeline::DoviTonemapx),
             "the Profile 5 renderer must be probed/admitted independently"
         );
+        assert_eq!(
+            Pipeline::parse("dovi_passthrough"),
+            Some(Pipeline::DoviPassthrough)
+        );
+        assert!(
+            !CANDIDATES.contains(&Pipeline::DoviPassthrough),
+            "the HDR10 rung has its own boot probe and its own admission"
+        );
+        assert_ne!(
+            Pipeline::DoviPassthrough.name(),
+            Pipeline::DoviTonemapx.name(),
+            "the two Dolby renderers must have distinct cache identities"
+        );
+    }
+
+    /// The HDR10 rung, end to end as a graph: what it will take, what it will
+    /// pair with, what it emits, and — the two that matter — that it never
+    /// sees a non-Dolby source and never emits 8 bits.
+    ///
+    /// Both are quiet failures. A non-DV source through the passthrough
+    /// filter is a broken picture at exit 0; PQ at 8 bits is `abort()`.
+    #[test]
+    fn the_hdr10_rung_is_dolby_vision_only_and_never_eight_bit() {
+        let p = Pipeline::DoviPassthrough;
+        assert_eq!(p.output_grade(), OutputGrade::Hdr10);
+        assert!(p.requires_software_decode());
+        assert!(!p.on_gpu());
+        assert_eq!(p.fallback(), None, "there is nothing below a DV renderer");
+        assert!(p.decode_args().is_empty(), "software decode keeps the RPU");
+        assert!(p.init_args().is_empty());
+
+        assert!(p.pairs_with(Encoder::Software));
+        for encoder in [
+            Encoder::Nvenc,
+            Encoder::Qsv,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            assert!(
+                !p.pairs_with(encoder),
+                "{encoder:?} has no measured HEVC Main10 encoder"
+            );
+        }
+
+        assert!(p.handles(Some("dolby_vision")));
+        for source in [None, Some("hdr10"), Some("hdr10plus"), Some("hlg")] {
+            assert!(
+                !p.handles(source),
+                "{source:?} through the passthrough filter is a broken picture at exit 0"
+            );
+        }
+
+        let graph = p
+            .filters(Some(1920), 1080, Some("dolby_vision"))
+            .expect("the HDR10 graph");
+        let reshape = graph.find("tonemapx=").expect("tonemapx transform");
+        assert_eq!(reshape, 0, "Dolby reshape must precede scale: {graph}");
+        assert!(graph.contains("apply_dovi=1"), "{graph}");
+        assert!(graph.contains("transfer=smpte2084"), "{graph}");
+        assert!(graph.contains("matrix=bt2020"), "{graph}");
+        assert!(graph.contains("primaries=bt2020"), "{graph}");
+        assert!(graph.contains("range=tv"), "{graph}");
+        assert!(graph.contains("scale=1920:1080"), "{graph}");
+        assert!(graph.ends_with("format=yuv420p10le"), "{graph}");
+        // The tone-map algorithm is ignored in passthrough mode; naming one
+        // would suggest a picture transform that does not happen.
+        assert!(graph.contains("tonemap=none"), "{graph}");
+        for eight_bit in ["format=yuv420p,", "format=yuv420p:", "format=nv12"] {
+            assert!(
+                !graph.contains(eight_bit),
+                "{eight_bit} beside a PQ transfer aborts ffmpeg: {graph}"
+            );
+        }
+        assert!(!graph.contains("hwupload"), "{graph}");
+        assert!(!graph.contains("libplacebo"), "{graph}");
+        assert!(!graph.contains("zscale"), "{graph}");
+        assert!(!graph[..reshape].contains("scale"), "{graph}");
+    }
+
+    /// Only the new rung carries a wider grade. This is the assertion that
+    /// stops a future change from quietly widening an existing graph — every
+    /// one of them ends in BT.709 8-bit, and `delivered_dynamic_range` says
+    /// "sdr" for all of them on that basis.
+    #[test]
+    fn only_the_passthrough_rung_reports_a_grade_above_sdr() {
+        for p in [
+            Pipeline::VppQsv,
+            Pipeline::TonemapVaapi,
+            Pipeline::Libplacebo,
+            Pipeline::TonemapOpencl,
+            Pipeline::DoviTonemapx,
+            Pipeline::Cpu,
+        ] {
+            assert_eq!(p.output_grade(), OutputGrade::Sdr, "{p:?}");
+        }
+        assert_eq!(Pipeline::DoviPassthrough.output_grade(), OutputGrade::Hdr10);
     }
 
     #[test]
@@ -454,6 +631,15 @@ mod tests {
         assert!(!graph.contains("setparams"), "{graph}");
         assert!(!graph.contains("zscale"), "{graph}");
         assert!(!graph[..reshape].contains("scale"), "{graph}");
+
+        // Pinned verbatim. An SDR client's Profile 5 picture is not allowed to
+        // change because an HDR rung was added beside it, and "contains" style
+        // assertions cannot see a reordering or an added option.
+        assert_eq!(
+            graph,
+            "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:\
+             range=tv:format=yuv420p:apply_dovi=1,scale=1920:1080,format=yuv420p"
+        );
     }
 
     /// The CPU chain is the floor: it pairs with everything, handles

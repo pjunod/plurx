@@ -156,6 +156,19 @@ pub struct CreateSession {
     /// With `copy`: retain Dolby Vision signaling and dynamic metadata because
     /// the decision established that this client supports the source profile.
     pub preserve_dolby_vision: Option<bool>,
+    /// For a transcode: this client decodes and presents HEVC Main10 PQ, so a
+    /// Dolby Vision source it cannot decode may be re-encoded to HDR10 rather
+    /// than tone-mapped to SDR. The create-body counterpart of `/decision`'s
+    /// `hdr10t=1`, exactly as `preserve_dolby_vision` is the counterpart of
+    /// `dv`.
+    ///
+    /// A request, never a verdict. The server refuses it for any source that
+    /// does not prove a Dolby Vision RPU through the production renderer, for
+    /// any rung other than 1080p, and for any build whose boot probe did not
+    /// clear the passthrough graph — every refusal lands on today's SDR
+    /// ladder. Absent means no, which is what every client that predates it
+    /// sends.
+    pub hdr10: Option<bool>,
     /// Manual A/V correction for this playback attempt only. Positive delays
     /// audio. It is carried into every seek/reopen by the client and is never
     /// written back to the media file.
@@ -193,6 +206,7 @@ impl CreateSession {
             audio_index: self.audio.filter(|a| *a >= 0),
             subtitle_burn: self.subtitle_burn.filter(|s| *s >= 0),
             audio_offset_ms: self.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000),
+            hdr10: self.hdr10 == Some(true),
         }
     }
 }
@@ -222,6 +236,7 @@ fn hdr_subtitle_burn_is_refused(source: Option<&MediaFile>, subtitle_burn: Optio
 fn session_delivered_dynamic_range(
     source: Option<&MediaFile>,
     kind: &crate::transcode::SessionKind,
+    grade: plurx_core::transcode::OutputGrade,
 ) -> Option<&'static str> {
     use crate::transcode::SessionKind;
     let file = source?;
@@ -235,7 +250,7 @@ fn session_delivered_dynamic_range(
         SessionKind::Transcode { .. } => (PlaybackMethod::Transcode, false),
     };
     Some(plurx_core::playback::delivered_dynamic_range(
-        file, method, preserve,
+        file, method, preserve, grade,
     ))
 }
 
@@ -307,7 +322,10 @@ pub async fn create(
         // A reused request id asking for a different stream is the client's
         // mistake, not the server's; say which it is.
         .map_err(|error| session_start_error(id, error))?;
-    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind);
+    // The grade the session actually built, not the one the body asked for:
+    // the server refuses the HDR10 rung for a source or a rung that cannot
+    // prove it, and the badge has to follow the encoder.
+    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind, info.grade);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`. Read the normalized
     // route from the result: a bound Auto stall may have changed a copy request
@@ -425,6 +443,9 @@ pub async fn start(
         copy: Some(q.copy == Some(1)),
         aac: Some(q.aac == Some(1)),
         preserve_dolby_vision: Some(false),
+        // The deprecated GET bridge has no capability parameters at all, so
+        // it keeps the SDR ladder it has always had.
+        hdr10: None,
         audio_offset_ms: None,
     };
     create(
@@ -2297,6 +2318,7 @@ mod tests {
             copy: Some(false),
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: Some(20_000),
         }
         .into_request(7, 1080);
@@ -2322,6 +2344,7 @@ mod tests {
             copy: None,
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: None,
         }
         .into_request(5615, 2160);
@@ -2359,28 +2382,45 @@ mod tests {
             aac: false,
             preserve_dolby_vision: preserve,
         };
+        use plurx_core::transcode::OutputGrade;
         assert_eq!(
-            session_delivered_dynamic_range(Some(&file), &copy(true)),
+            session_delivered_dynamic_range(Some(&file), &copy(true), OutputGrade::Sdr),
             Some("dolby_vision")
         );
         // Stripped: what reaches the client is the compatible base layer.
         let mut base = file.clone();
         base.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".into());
         assert_eq!(
-            session_delivered_dynamic_range(Some(&base), &copy(false)),
+            session_delivered_dynamic_range(Some(&base), &copy(false), OutputGrade::Sdr),
             Some("hdr10")
         );
         assert_eq!(
             session_delivered_dynamic_range(
                 Some(&file),
-                &crate::transcode::SessionKind::Transcode { height: 1080 }
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Sdr,
             ),
             Some("sdr"),
-            "every transcode is H.264 8-bit, whatever the source carried"
+            "an SDR-grade transcode is H.264 8-bit, whatever the source carried"
+        );
+        // …and the HDR10 rung of the same source says so, on the same helper.
+        // The session's grade is what decides it, so a rung the server refused
+        // cannot report HDR10 by having been asked for.
+        assert_eq!(
+            session_delivered_dynamic_range(
+                Some(&file),
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Hdr10,
+            ),
+            Some("hdr10"),
+            "the Dolby Vision → HDR10 rung is not SDR"
         );
         // A file that vanished from the store mid-request says nothing at
         // all rather than guessing; the client keeps what it had.
-        assert_eq!(session_delivered_dynamic_range(None, &copy(true)), None);
+        assert_eq!(
+            session_delivered_dynamic_range(None, &copy(true), OutputGrade::Sdr),
+            None
+        );
     }
 
     #[test]
@@ -2461,6 +2501,40 @@ mod tests {
         assert!(hdr.contains("VIDEO-RANGE=PQ"));
         assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    /// The HDR10 rung's master, built from the codec string the session
+    /// actually advertises.
+    ///
+    /// The point is that **no new attribute logic was written for it**. The
+    /// existing rule — an `hvc1`/`hev1`/`dvh1`/`dvhe` prefix plus an HDR
+    /// source column — already emits `VIDEO-RANGE=PQ` and `CODECS`, and a
+    /// re-encoded HDR10 rung satisfies both. A second implementation of that
+    /// rule is a second thing to keep in step.
+    #[test]
+    fn the_hdr10_rungs_master_gets_pq_and_hevc_codecs_from_the_existing_rule() {
+        let file = hls_file(vec![]);
+        // Exactly what `transcode::transcoded_hls_codecs(OutputGrade::Hdr10)`
+        // puts on the session.
+        let context = hls_context("hvc1.2.4.H120.90,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &context);
+        assert!(master.contains("VIDEO-RANGE=PQ"), "{master}");
+        assert!(
+            master.contains("CODECS=\"hvc1.2.4.H120.90,mp4a.40.2\""),
+            "{master}"
+        );
+        // No SUPPLEMENTAL-CODECS: the RPU is consumed by the reshape, so
+        // there is no Dolby Vision enhancement left to declare, and the
+        // master stays at compatibility version 7.
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"), "{master}");
+        assert!(master.contains("#EXT-X-VERSION:7"), "{master}");
+
+        // The SDR rung of the same source is H.264, and its master must stay
+        // SDR — the source's `hdr` column alone is not permission to claim PQ
+        // for a tone-mapped picture.
+        let sdr = master_playlist(&file, None, &hls_context("avc1.640034,mp4a.40.2", None));
+        assert!(!sdr.contains("VIDEO-RANGE="), "{sdr}");
+        assert!(!sdr.contains("CODECS="), "{sdr}");
     }
 
     #[test]

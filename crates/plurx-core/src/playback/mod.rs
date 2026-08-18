@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::MediaFile;
+use crate::transcode::OutputGrade;
 
 /// Built-in device profiles, parsed once from the embedded TOML.
 static PROFILES: LazyLock<HashMap<String, DeviceProfile>> = LazyLock::new(|| {
@@ -67,6 +68,11 @@ pub fn caps_profile(
         supports_dolby_vision,
         dolby_vision_profiles: Vec::new(),
         remux_dolby_vision: false,
+        // Set by the caller after construction, like `remux_dolby_vision` and
+        // `dolby_vision_profiles`: adding a seventh positional argument to a
+        // function with six booleans and vectors in a row is how a caller
+        // silently swaps two of them.
+        supports_hdr10_transcode: false,
     }
 }
 
@@ -123,6 +129,21 @@ pub struct DeviceProfile {
     /// AVPlayer supports specific delivery profiles, not every disc profile.
     #[serde(default)]
     pub dolby_vision_profiles: Vec<u8>,
+    /// This client has PROVED it can decode HEVC Main10 and present it as
+    /// PQ, at the height in `max_height`, on the display attached right now
+    /// (the wire's `hdr10t=1`).
+    ///
+    /// Strictly narrower than `supports_hdr`, which any HDR-capable codec
+    /// satisfies, and deliberately so: this is the bit that decides whether a
+    /// Dolby Vision source the client cannot decode is re-encoded to HDR10 or
+    /// tone-mapped to SDR, and getting it wrong the optimistic way delivers a
+    /// PQ stream to a display that renders it grey. `false` therefore means
+    /// NOT PROVEN, never "proven false" — a client with no
+    /// `MediaCapabilities`, an old client that never learned to send the
+    /// field, and a client that genuinely cannot all read the same here, and
+    /// all three get the tone-mapped path they get today.
+    #[serde(default)]
+    pub supports_hdr10_transcode: bool,
     /// This decoder accepts Dolby Vision through normalized HLS/fMP4 but not
     /// reliably as the source file over a progressive range URL. Apple
     /// AVPlayer can report a healthy P8 DV pipeline, advance the raw MP4's
@@ -186,6 +207,16 @@ pub struct Decision {
     /// instead of claiming the source's grade for a stripped remux. A session
     /// created later overrides it (MEDIA-BADGES-PLAN §3.2).
     pub delivered_dynamic_range: &'static str,
+    /// The grade a re-encode would target. Meaningless for direct play and
+    /// remux, where nothing is encoded — [`OutputGrade::Sdr`] there, which is
+    /// what every method answered before M5.
+    ///
+    /// Not serialised: `delivered_dynamic_range` is the wire answer, and two
+    /// wire fields saying the same thing are two fields that can disagree.
+    /// This one exists so the *server* can carry the choice from [`decide`]
+    /// into the session it builds.
+    #[serde(skip)]
+    pub transcode_grade: OutputGrade,
 }
 
 /// The per-dimension compatibility verdicts, shared by [`decide`] and
@@ -322,13 +353,18 @@ pub fn is_dolby_vision(file: &MediaFile) -> bool {
 ///
 /// The three deliveries are total:
 ///
-/// - **Transcode** is always `"sdr"`. Every encoder is H.264
-///   (`transcode/encoder.rs` — libx264 `-profile:v high`, h264_nvenc/qsv/
-///   vaapi/videotoolbox, no 10-bit path) and every filter chain ends in
-///   `yuv420p`/`nv12`; an HDR source goes through the tone-map graph. The
-///   `ToneMap::None` escape hatch still lands on 8-bit `format=yuv420p`
-///   (`transcode/mod.rs`), so "sdr" stays the honest answer — washed out at
-///   worst, never a wider grade than claimed.
+/// - **Transcode** answers whatever grade the session's encoder actually
+///   produces, which `grade` names. It was an unconditional `"sdr"` until
+///   M5, and for [`OutputGrade::Sdr`] it still is: those rungs are H.264
+///   8-bit (`transcode/encoder.rs` — libx264 `-profile:v high`,
+///   h264_nvenc/qsv/vaapi/videotoolbox) and every filter chain ends in
+///   `yuv420p`/`nv12`, so an HDR source has been tone-mapped by the time it
+///   reaches the encoder. The `ToneMap::None` escape hatch still lands on
+///   8-bit `format=yuv420p` (`transcode/mod.rs`), so "sdr" stays honest
+///   there — washed out at worst, never a wider grade than claimed.
+///   [`OutputGrade::Hdr10`] is the HEVC Main10 PQ rung
+///   (`Pipeline::DoviPassthrough`), and reporting `"sdr"` for it would put an
+///   SDR badge on a stream a viewer is watching in HDR.
 /// - **Direct play / remux of a non-DV source** delivers the source's grade:
 ///   the video is copied byte-for-byte.
 /// - **Direct play / remux of a DV source** either preserves the Dolby
@@ -352,9 +388,10 @@ pub fn delivered_dynamic_range(
     file: &MediaFile,
     method: PlaybackMethod,
     preserve_dolby_vision: bool,
+    grade: OutputGrade,
 ) -> &'static str {
     if method == PlaybackMethod::Transcode {
-        return "sdr";
+        return grade.delivered_dynamic_range();
     }
     match file.hdr.as_deref() {
         Some("dolby_vision") if preserve_dolby_vision => "dolby_vision",
@@ -394,6 +431,20 @@ fn has_compatible_dv_base(file: &MediaFile) -> bool {
         .is_some_and(|label| label.contains("HDR10-compatible") || label.contains("HLG-compatible"))
 }
 
+/// Does this source need the RPU-driven renderer rather than the ordinary
+/// HDR10 base-layer route — i.e. is it the Profile 5 case?
+///
+/// This is the same question `plurxd`'s `TranscodeManager::needs_dovi_reshape`
+/// answers, minus its refusal messages, and it exists here because the *grade*
+/// choice has to agree with the *renderer* choice or the badge lies. A source
+/// this returns false for is one the daemon renders with zscale or a vendor
+/// graph — neither of which reads an RPU, and neither of which the HDR10
+/// passthrough rung is implemented for. The two are held together by
+/// `plurxd`'s `the_grade_predicate_and_the_renderer_predicate_agree`.
+pub fn dolby_vision_needs_rpu_render(file: &MediaFile) -> bool {
+    is_dolby_vision(file) && !has_compatible_dv_base(file) && dolby_vision_profile(file) == Some(5)
+}
+
 /// What a Dolby Vision source needs doing about it for THIS client.
 ///
 /// The failure this exists to prevent: a DV remux was handed to Chrome
@@ -413,8 +464,40 @@ enum DvHandling {
     /// and a remux is the minimum.
     Strip,
     /// The client can't take DV and the server can't remove it. The only
-    /// stream this client will play is a re-encoded one.
-    Reencode,
+    /// stream this client will play is a re-encoded one — at the carried
+    /// [`OutputGrade`].
+    ///
+    /// The grade rides *inside* the variant rather than beside the enum
+    /// because it only means anything here. A `DvHandling` with a grade field
+    /// would let `None`/`Strip` carry one too, and then some future reader has
+    /// to know which combinations are real: `Strip` is a copy, so an HDR10
+    /// grade on it would describe an encode that never happens. The payload
+    /// spells the invariant instead of documenting it, and every existing
+    /// `== DvHandling::None` comparison keeps working unchanged.
+    Reencode(OutputGrade),
+}
+
+/// The grade a re-encode should target for a client that cannot take this
+/// source's Dolby Vision.
+///
+/// Two conditions, both required, and both narrow on purpose:
+///
+/// - **The client proved it** (`hdr10t=1` → `supports_hdr10_transcode`).
+///   Absent means not proven, and not proven means tone-map — the failure
+///   mode of guessing optimistically is a PQ stream on an SDR display, which
+///   renders grey and plays, so nobody reports it.
+/// - **The source actually carries an RPU to apply**
+///   ([`dolby_vision_needs_rpu_render`]). The passthrough chain is Dolby
+///   Vision-input-only: given a non-DV HDR10 source it emits a broken picture
+///   at exit 0 rather than failing (measured). Non-P5 Dolby Vision keeps
+///   today's route because that is the route the daemon actually builds for
+///   it, and a grade the renderer does not honour is a badge that lies.
+fn reencode_grade(file: &MediaFile, profile: &DeviceProfile) -> OutputGrade {
+    if profile.supports_hdr10_transcode && dolby_vision_needs_rpu_render(file) {
+        OutputGrade::Hdr10
+    } else {
+        OutputGrade::Sdr
+    }
 }
 
 fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> DvHandling {
@@ -423,7 +506,7 @@ fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -
     } else if dv_strippable && has_compatible_dv_base(file) {
         DvHandling::Strip
     } else {
-        DvHandling::Reencode
+        DvHandling::Reencode(reencode_grade(file, profile))
     }
 }
 
@@ -439,6 +522,7 @@ fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -
 pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> Decision {
     let (mut c, mut reasons) = evaluate(file, profile);
     let preserve_dolby_vision = is_dolby_vision(file) && profile.allows_dolby_vision(file);
+    let mut transcode_grade = OutputGrade::Sdr;
 
     match dv_handling(file, profile, dv_strippable) {
         DvHandling::None => {}
@@ -452,8 +536,9 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
                     .to_owned(),
             );
         }
-        DvHandling::Reencode => {
+        DvHandling::Reencode(grade) => {
             c.video_ok = false;
+            transcode_grade = grade;
             reasons.push(if has_compatible_dv_base(file) && !dv_strippable {
                 "this Dolby Vision profile is unsupported by this device and this ffmpeg \
                  cannot expose its compatible HDR base (requires dovi_rpu in ffmpeg 7.1+)"
@@ -463,6 +548,28 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
                  compatible HDR base; transcoding"
                     .to_owned()
             });
+            if grade == OutputGrade::Hdr10 {
+                // Said out loud because the alternative reads as a bug. This
+                // client is being handed a re-encode of a Dolby Vision title
+                // and a badge that says HDR10, and the only thing separating
+                // that from an over-claim is a capability bit it sent.
+                //
+                // The static-metadata caveat is in the reason string rather
+                // than only in a code comment because it is the one thing a
+                // viewer's display can notice: a true Profile 5 source carries
+                // no MDCV/CLL SEI at all (Dolby's L6 metadata lives in the
+                // RPU), so there is nothing to inherit and nothing honest to
+                // synthesise. The output is correctly tagged PQ/BT.2020, which
+                // is what selects a display's HDR mode; what it lacks is the
+                // mastering-display hint some panels use for headroom.
+                reasons.push(
+                    "re-encoding to HEVC Main10 PQ (HDR10) rather than tone-mapping, because \
+                     this client reported it decodes and presents Main10 PQ; HDR10 static \
+                     mastering metadata is not carried — a Profile 5 source has none to \
+                     inherit"
+                        .to_owned(),
+                );
+            }
         }
     }
 
@@ -484,13 +591,26 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
         PlaybackMethod::DirectPlay
     };
 
+    // A verdict that did not end up a transcode encodes nothing, so it has no
+    // grade to report. Leaving a stale Hdr10 here would put an HDR10 badge on
+    // a remux whose bytes are the source's own.
+    if method != PlaybackMethod::Transcode {
+        transcode_grade = OutputGrade::Sdr;
+    }
+
     Decision {
         method,
         reasons,
         transcode_audio: !c.audio_ok,
         preserve_dolby_vision,
         container: "mp4",
-        delivered_dynamic_range: delivered_dynamic_range(file, method, preserve_dolby_vision),
+        delivered_dynamic_range: delivered_dynamic_range(
+            file,
+            method,
+            preserve_dolby_vision,
+            transcode_grade,
+        ),
+        transcode_grade,
     }
 }
 
@@ -512,11 +632,17 @@ pub fn decide_forced(
                 transcode_audio: true,
                 preserve_dolby_vision: false,
                 container: "mp4",
+                // A manual "Transcode" from the quality menu is the SDR
+                // ladder, unchanged. Widening it to HDR10 would be a grade
+                // change nobody asked for on a control whose whole purpose is
+                // "make this smaller".
                 delivered_dynamic_range: delivered_dynamic_range(
                     file,
                     PlaybackMethod::Transcode,
                     false,
+                    OutputGrade::Sdr,
                 ),
+                transcode_grade: OutputGrade::Sdr,
             }
         }
         Force::Original => {
@@ -551,11 +677,15 @@ pub fn decide_forced(
                 transcode_audio: !c.audio_ok,
                 preserve_dolby_vision,
                 container: "mp4",
+                // Original never re-encodes video, so there is no grade: the
+                // method is DirectPlay or Remux and this argument is inert.
                 delivered_dynamic_range: delivered_dynamic_range(
                     file,
                     method,
                     preserve_dolby_vision,
+                    OutputGrade::Sdr,
                 ),
+                transcode_grade: OutputGrade::Sdr,
             }
         }
     }
@@ -927,6 +1057,204 @@ mod tests {
         assert_eq!(
             decide_forced(&dv, &safari, Force::Original, true).method,
             PlaybackMethod::DirectPlay
+        );
+    }
+
+    /// The whole point of M5, at the decision layer.
+    ///
+    /// A Chrome-shaped client — HEVC Main10 decoder, HDR display, no Dolby
+    /// Vision at any profile — handed a Profile 5 file used to be laddered
+    /// down to an SDR H.264 transcode, because the only re-encode grade that
+    /// existed was SDR. With `hdr10t=1` it gets the HEVC Main10 PQ rung
+    /// instead, and the badge says so.
+    #[test]
+    fn a_main10_pq_client_gets_the_hdr10_rung_for_a_profile5_source() {
+        let mut p5 = file("mkv", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+
+        let mut chrome = caps_profile(
+            vec!["mp4".into(), "webm".into()],
+            vec!["h264".into(), "hevc".into()],
+            vec!["aac".into()],
+            Some(2160),
+            true,
+            false,
+        );
+        chrome.supports_hdr10_transcode = true;
+
+        let hdr10 = decide(&p5, &chrome, true);
+        assert_eq!(hdr10.method, PlaybackMethod::Transcode);
+        assert!(!hdr10.preserve_dolby_vision);
+        assert_eq!(hdr10.transcode_grade, OutputGrade::Hdr10);
+        assert_eq!(hdr10.delivered_dynamic_range, "hdr10");
+        assert!(
+            hdr10
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("Main10 PQ")),
+            "the grade change has to be explainable: {:?}",
+            hdr10.reasons
+        );
+        // The static-metadata gap is disclosed, not hidden: a real Profile 5
+        // source carries no MDCV/CLL to inherit.
+        assert!(
+            hdr10.reasons.iter().any(|reason| reason.contains("static")),
+            "{:?}",
+            hdr10.reasons
+        );
+
+        // The same client, same file, without the proof: today's path,
+        // unchanged in every field.
+        let mut unproven = chrome.clone();
+        unproven.supports_hdr10_transcode = false;
+        let sdr = decide(&p5, &unproven, true);
+        assert_eq!(sdr.method, PlaybackMethod::Transcode);
+        assert_eq!(sdr.transcode_grade, OutputGrade::Sdr);
+        assert_eq!(sdr.delivered_dynamic_range, "sdr");
+        assert!(
+            !sdr.reasons
+                .iter()
+                .any(|reason| reason.contains("Main10 PQ")),
+            "{:?}",
+            sdr.reasons
+        );
+        // …and nothing else about the verdict moved.
+        assert!(!sdr.preserve_dolby_vision);
+        assert!(!sdr.transcode_audio);
+        assert_eq!(sdr.container, "mp4");
+
+        // A client that decodes the source's Dolby Vision still gets Dolby
+        // Vision. The HDR10 rung is a consolation prize, never a downgrade of
+        // a client that never needed one — and `hdr10t=1` must not become a
+        // reason to stop preserving.
+        let mut safari = chrome.clone();
+        safari.dolby_vision_profiles = vec![5, 8];
+        let preserved = decide(&p5, &safari, true);
+        assert!(preserved.preserve_dolby_vision);
+        assert_eq!(preserved.delivered_dynamic_range, "dolby_vision");
+        assert_eq!(preserved.transcode_grade, OutputGrade::Sdr);
+        assert_ne!(preserved.method, PlaybackMethod::Transcode);
+    }
+
+    /// Every source the HDR10 rung must refuse, and why each one is a
+    /// separate refusal rather than one rule.
+    #[test]
+    fn the_hdr10_rung_is_refused_for_every_source_it_was_not_measured_on() {
+        let mut chrome = caps_profile(
+            vec!["mp4".into()],
+            vec!["h264".into(), "hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        chrome.supports_hdr10_transcode = true;
+
+        // A plain HDR10 source. The passthrough filter would not error on it
+        // — it emits a broken picture at exit 0 — so this refusal is the only
+        // thing standing between a viewer and crushed shadows.
+        let mut hdr10_source = file("mkv", "hevc", "aac");
+        hdr10_source.hdr = Some("hdr10".to_owned());
+        let d = decide(&hdr10_source, &chrome, true);
+        assert_eq!(d.transcode_grade, OutputGrade::Sdr);
+        assert!(!dolby_vision_needs_rpu_render(&hdr10_source));
+
+        // HLG, and an SDR file: neither carries an RPU either.
+        let mut hlg = hdr10_source.clone();
+        hlg.hdr = Some("hlg".to_owned());
+        assert!(!dolby_vision_needs_rpu_render(&hlg));
+        assert!(!dolby_vision_needs_rpu_render(&file("mkv", "hevc", "aac")));
+
+        // Dolby Vision WITH a compatible base: the daemon renders it through
+        // zscale or a vendor graph, neither of which reads an RPU. Claiming
+        // HDR10 here would be a badge the renderer does not honour.
+        let mut p8 = file("mkv", "hevc", "aac");
+        p8.hdr = Some("dolby_vision".to_owned());
+        p8.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".to_owned());
+        assert!(!dolby_vision_needs_rpu_render(&p8));
+        // With no dovi_rpu this becomes a re-encode — and still an SDR one.
+        let d = decide(&p8, &chrome, false);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert_eq!(d.transcode_grade, OutputGrade::Sdr);
+        assert_eq!(d.delivered_dynamic_range, "sdr");
+
+        // A Dolby Vision profile the RPU renderer was never built for.
+        let mut p7 = p8.clone();
+        p7.hdr_format = Some("Dolby Vision · Profile 7".to_owned());
+        assert!(!dolby_vision_needs_rpu_render(&p7));
+        // …and one whose profile the scan could not read at all.
+        let mut unknown = p8.clone();
+        unknown.hdr_format = None;
+        assert!(!dolby_vision_needs_rpu_render(&unknown));
+
+        // Only the one it was measured on.
+        let mut p5 = p8;
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+        assert!(dolby_vision_needs_rpu_render(&p5));
+        assert_eq!(
+            decide(&p5, &chrome, true).transcode_grade,
+            OutputGrade::Hdr10
+        );
+    }
+
+    /// A grade only exists where something is encoded. A remux and a direct
+    /// play carry the source's own bytes, so an HDR10 grade left on either
+    /// would be a badge describing an encode that never ran.
+    #[test]
+    fn a_delivery_that_encodes_nothing_reports_no_grade() {
+        let mut p5 = file("mkv", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+        let mut client = caps_profile(
+            vec!["mkv".into(), "mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        client.supports_hdr10_transcode = true;
+        client.dolby_vision_profiles = vec![5];
+
+        let direct = decide(&p5, &client, true);
+        assert_eq!(direct.method, PlaybackMethod::DirectPlay);
+        assert_eq!(direct.transcode_grade, OutputGrade::Sdr);
+        assert_eq!(direct.delivered_dynamic_range, "dolby_vision");
+
+        // Original never re-encodes video, whatever was asked for.
+        let forced = decide_forced(&p5, &client, Force::Original, true);
+        assert_eq!(forced.transcode_grade, OutputGrade::Sdr);
+        // The quality menu's Transcode is the SDR ladder, deliberately.
+        let manual = decide_forced(&p5, &client, Force::Transcode, true);
+        assert_eq!(manual.method, PlaybackMethod::Transcode);
+        assert_eq!(manual.transcode_grade, OutputGrade::Sdr);
+        assert_eq!(manual.delivered_dynamic_range, "sdr");
+    }
+
+    /// The reporter itself, at both grades, on the same file.
+    #[test]
+    fn the_delivered_range_of_a_transcode_is_its_grade() {
+        let mut p5 = file("mkv", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+        assert_eq!(
+            delivered_dynamic_range(&p5, PlaybackMethod::Transcode, false, OutputGrade::Sdr),
+            "sdr"
+        );
+        assert_eq!(
+            delivered_dynamic_range(&p5, PlaybackMethod::Transcode, false, OutputGrade::Hdr10),
+            "hdr10"
+        );
+        // The grade is inert for anything that copies bytes.
+        assert_eq!(
+            delivered_dynamic_range(&p5, PlaybackMethod::Remux, true, OutputGrade::Hdr10),
+            "dolby_vision"
+        );
+        assert_eq!(
+            delivered_dynamic_range(&p5, PlaybackMethod::DirectPlay, false, OutputGrade::Hdr10),
+            "hdr10",
+            "a stripped Profile 5 copy's over-claim is unchanged by M5"
         );
     }
 
