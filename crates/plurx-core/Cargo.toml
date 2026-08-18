@@ -54,6 +54,11 @@ zeroize = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 axum = { workspace = true }
+# The encoder `hiqlite-wal` writes Raft entries with. Tests only, and only so
+# the import transaction estimate can be checked against the real encoding
+# rather than trusted. Already in the tree via hiqlite, so this adds no new
+# compiled crate; pinned to the version hiqlite 0.14 resolves.
+bincode = { version = "2", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # `trace` (sqlite3_trace_v2) is how the page-wide lookups prove they are one
 # statement rather than one per item. Tests only — resolver 2 keeps a

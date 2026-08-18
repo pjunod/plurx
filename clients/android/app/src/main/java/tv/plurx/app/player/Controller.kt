@@ -302,6 +302,22 @@ class Controller(
      */
     private var textSelectionArmed = false
 
+    /**
+     * The audio equivalent of [textSelectionArmed], and it exists for the same
+     * reason the text one does: only direct play hands the player a container
+     * with every source track in it, and those tracks only exist once the
+     * source has been prepared.
+     *
+     * Every other transport delivers the single audio stream the *server*
+     * selected — the plan's `?audio=<index>` or the session body's `audio` —
+     * so there is nothing to override there. Direct play has no such selector,
+     * which is why the server refuses a `direct` verdict for any choice other
+     * than the container's own default; ExoPlayer's language preference is
+     * then the only thing left that could put a different track on the
+     * speakers than the one the detail screen marked.
+     */
+    private var audioSelectionArmed = false
+
     private val pgsOverlay = AndroidPGSOverlayController(
         api = { vm.api() },
         scope = scope,
@@ -392,7 +408,10 @@ class Controller(
             playbackTelemetry.firstFrame(monotonicNowMs())
         }
 
-        override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
+        override fun onTracksChanged(tracks: Tracks) {
+            applyTextSelection()
+            applyAudioSelection()
+        }
 
         override fun onPositionDiscontinuity(
             oldPosition: Player.PositionInfo,
@@ -465,7 +484,7 @@ class Controller(
                 player.prepare()
                 playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
-                armTextSelection()
+                armTrackSelections()
             }
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
@@ -529,7 +548,7 @@ class Controller(
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
             // between two text tracks cost nothing.
-            armTextSelection()
+            armTrackSelections()
             applyTextSelection()
         }
         return true
@@ -571,7 +590,7 @@ class Controller(
                 player.prepare()
                 playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
-                armTextSelection()
+                armTrackSelections()
             }
             planMode == "remux" -> {
                 leaveSessionPlayback()
@@ -582,7 +601,7 @@ class Controller(
                 player.prepare()
                 playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
-                armTextSelection()
+                armTrackSelections()
             }
             else -> openSession(positionMs, attempt)
         }
@@ -640,7 +659,7 @@ class Controller(
             player.prepare()
             playbackTelemetry.prepared(attempt)
             player.playWhenReady = true
-            armTextSelection()
+            armTrackSelections()
         }
     }
 
@@ -668,16 +687,17 @@ class Controller(
         index?.let { i -> plan.subtitles.firstOrNull { it.index == i } }
 
     /**
-     * Record that the current selection still has to reach the player.
+     * Record that the current selections still have to reach the player.
      *
-     * Deliberately does not try to apply it: right after `prepare()` the only
+     * Deliberately does not try to apply them: right after `prepare()` the only
      * tracks on hand may still be the departing item's, and an override
      * naming a track group that is about to disappear would be dropped
      * silently — with the intent already marked as delivered. [listener]
-     * lands it against the tracks that actually arrive.
+     * lands them against the tracks that actually arrive.
      */
-    private fun armTextSelection() {
+    private fun armTrackSelections() {
         textSelectionArmed = true
+        audioSelectionArmed = true
     }
 
     private fun applyTextSelection() {
@@ -714,16 +734,54 @@ class Controller(
             .build()
     }
 
-    /** The player's text tracks flattened in publication order. */
-    private fun embeddedTextLanguages(): List<String?> =
+    /**
+     * Pin the audio track the server said would play.
+     *
+     * Only direct play needs this, and only direct play may have it: the raw
+     * file carries every stream, so ExoPlayer picks one — and it picks with
+     * `setPreferredAudioLanguage`, a client-side language preference that can
+     * disagree with the server's `select_tracks` (the dual-audio anime rule
+     * selects Japanese original audio against an English preference). Leaving
+     * that unpinned would make the detail screen's default marker, and any
+     * pre-play choice the server answered with a `direct` verdict, describe a
+     * track other than the one on the speakers.
+     *
+     * Every other transport already delivers exactly one audio stream — the
+     * one the plan's `?audio=` or the session body's `audio` selected — so an
+     * override there would index into a list of one.
+     */
+    private fun applyAudioSelection() {
+        if (!audioSelectionArmed) return
+        val index = selectedAudio
+        if (index == null || !directTransport) {
+            audioSelectionArmed = false
+            return
+        }
+        val ordinal = embeddedAudioTrackIndex(index, plan.audio, embeddedLanguages(C.TRACK_TYPE_AUDIO))
+        // Nothing to select yet — the media is still being prepared, or the
+        // player never published this track. Stay armed and let the next
+        // onTracksChanged retry; ExoPlayer's own pick is the honest fallback
+        // for a track that is genuinely not there.
+        val target = ordinal?.let { trackAt(C.TRACK_TYPE_AUDIO, it) } ?: return
+        audioSelectionArmed = false
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setOverrideForType(TrackSelectionOverride(target.first, target.second))
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .build()
+    }
+
+    /** The player's tracks of one type, flattened in publication order. */
+    private fun embeddedLanguages(type: Int): List<String?> =
         player.currentTracks.groups
-            .filter { it.type == C.TRACK_TYPE_TEXT }
+            .filter { it.type == type }
             .flatMap { group -> (0 until group.length).map { group.getTrackFormat(it).language } }
 
-    private fun textTrackAt(ordinal: Int): Pair<TrackGroup, Int>? {
+    private fun embeddedTextLanguages(): List<String?> = embeddedLanguages(C.TRACK_TYPE_TEXT)
+
+    private fun trackAt(type: Int, ordinal: Int): Pair<TrackGroup, Int>? {
         var seen = 0
         for (group in player.currentTracks.groups) {
-            if (group.type != C.TRACK_TYPE_TEXT) continue
+            if (group.type != type) continue
             for (i in 0 until group.length) {
                 if (seen == ordinal) return group.mediaTrackGroup to i
                 seen++
@@ -731,6 +789,9 @@ class Controller(
         }
         return null
     }
+
+    private fun textTrackAt(ordinal: Int): Pair<TrackGroup, Int>? =
+        trackAt(C.TRACK_TYPE_TEXT, ordinal)
 
     private fun leaveSessionPlayback() {
         sessionRequestVersion++
@@ -743,20 +804,18 @@ class Controller(
         deliveredRange = plan.deliveredDynamicRange
     }
 
-    private fun remuxUri(ms: Long): String {
-        val base = if (plan.mode == "direct") {
+    private fun remuxUri(ms: Long): String = progressiveRemuxUri(
+        plannedUrl = if (plan.mode == "direct") {
             Session.url("/api/v1/files/${plan.fileId}/stream.mp4")
         } else {
             plan.playUrl
-        }
-        val sb = StringBuilder(base)
-        sb.append(if (base.contains('?')) '&' else '?')
-        sb.append("start=").append(ms / 1000.0)
-        selectedAudio?.let { sb.append("&audio=").append(it) }
-        if (audioOffsetMs != 0L) sb.append("&audio_offset_ms=").append(audioOffsetMs)
-        caps.forEach { (k, v) -> sb.append('&').append(k).append('=').append(Uri.encode(v)) }
-        return sb.toString()
-    }
+        },
+        startSeconds = ms / 1000.0,
+        audioIndex = selectedAudio,
+        audioOffsetMs = audioOffsetMs,
+        caps = caps,
+        encode = Uri::encode,
+    )
 }
 
 /**

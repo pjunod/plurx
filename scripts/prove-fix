@@ -71,6 +71,31 @@ def command_for(arguments: argparse.Namespace) -> list[str]:
     return ["sh", "-lc", template]
 
 
+def proof_target_dir(inherited: str | None, disposable: Path) -> Path:
+    """Pick a cargo target directory that the ordinary gate never reads.
+
+    Both proof phases compile deliberately different source trees, and the
+    second one compiles *reverted* source. Sharing the caller's
+    ``CARGO_TARGET_DIR`` leaves those artifacts newer than the corrected
+    checkout, so cargo's mtime freshness check hands them to the next ordinary
+    `make validate` run in the real repository.
+
+    A sibling of the inherited directory is preferred over a directory inside
+    the disposable clone: proofs still reuse each other's dependency builds, so
+    the isolation costs one cold workspace build the first time rather than one
+    on every invocation. When nothing is inherited, cargo would default to a
+    target directory inside the clone anyway, so the disposable one is both
+    correct and free.
+    """
+
+    if not inherited:
+        return disposable / "cargo-target"
+    base = Path(inherited)
+    if not base.is_absolute():
+        base = (Path.cwd() / base).resolve()
+    return base.with_name(f"{base.name}-prove-fix")
+
+
 def validate_paths(root: Path, base: str, paths: list[str]) -> None:
     for raw in paths:
         path = Path(raw)
@@ -108,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
 
         environment = os.environ.copy()
         environment.setdefault("CARGO_TERM_COLOR", "never")
+        # Deliberately an override, not a default: displacing the inherited
+        # value is the entire point. See proof_target_dir.
+        target_dir = proof_target_dir(environment.get("CARGO_TARGET_DIR"), Path(directory))
+        environment["CARGO_TARGET_DIR"] = str(target_dir)
+        print(f"prove-fix: building into isolated CARGO_TARGET_DIR {target_dir}", flush=True)
         print("prove-fix: confirming the retained test passes on HEAD", flush=True)
         current = subprocess.run(
             test_command,

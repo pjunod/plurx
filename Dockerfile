@@ -70,6 +70,10 @@ RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
            echo "dovi_rpu needs ffmpeg 7.1+; see the note above this RUN." >&2; \
            echo "Rebuild fetching current packages: docker build --no-cache --pull" >&2; \
            exit 1 ) ) \
+    && ( /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -h filter=tonemapx 2>&1 | grep -q '^[[:space:]]*apply_dovi[[:space:]]' \
+      || ( echo "FATAL: this jellyfin-ffmpeg7 has no tonemapx apply_dovi renderer." >&2; \
+           echo "Profile 5 fallback requires tonemapx with Dolby Vision RPU reshaping." >&2; \
+           exit 1 ) ) \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r plurx \

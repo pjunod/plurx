@@ -9,11 +9,20 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-15): source is v0.2.7, Apple build 62. Native text
+> Status (2026-08-18): source is v0.2.7, Apple build 65. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 62 lists the audio and subtitle tracks a file actually has on
-> the detail screen and lets a viewer choose both before pressing Play (§6).
+> landed. Build 64 corrects build 63's delivery watchdog, which fired on
+> healthy buffered playback and interrupted a 2160p session roughly every two
+> minutes; the film clock and buffered runway are now required to corroborate
+> the server's delivery meter. Build 63 hardens stall recovery against the tvOS freeze observed
+> on 2160p copy-HLS: a shared no-progress clock immune to
+> `timeControlStatus` flapping, a bounded unestablished leash instead of a
+> disarmed detector, a server-truth delivery watchdog on the status poll,
+> and a rolling automatic-reopen budget that ends storms at the visible
+> failure screen. Build 62 lists the audio and subtitle tracks a file
+> actually has on the detail screen and lets a viewer choose both before
+> pressing Play (§6).
 > Build 60 requires a concrete selected PGS track before treating the
 > overlay as active. Its physical non-PGS baseline reached active PiP and
 > returned or stopped cleanly on iPhone Air (iOS 26.6) and iPad Pro 13-inch
@@ -53,7 +62,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 62 has not reached
+> resolved status. Repository evidence still says build 65 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -87,7 +96,7 @@ Vision investigation are recorded in
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position in the player; the detail screen also lists every track with language, codec, and channel layout, marks the server's `playback_defaults` pick, and lets a viewer choose one before pressing Play (§6) | Validate TrueHD/DTS fallback |
 | Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, styled ASS/SSA, and unrecognized overlay versions retain burn-in/refusal; the menu labels Overlay and Burn-in separately; automatic selection never starts a burn except a forced track (see §2); the detail screen lists every subtitle track with language, format, and Forced/SDH markers before playback and lets a viewer pick one — or Off — up front (§6) | Run [the physical acceptance procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) on iPad Pro, then complete the separate iPhone and Apple TV rows |
-| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
+| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing. The server can now normalize a bound stall reopen and return its resolved height, but this client does not yet send that cause. | P1: carry `previous_session_id` + typed stall cause through the precedence-aware reopen queue, with a client-side retry budget at the ladder floor (the server repeats that rung and bounds nothing); continuous adaptation and an honest Original option when compatible |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery, and selected-subtitle route/state (`PGS overlay · preparing`, ready overlay, unavailable, native WebVTT, or burned in). Sustained and self-recovered stalls reach the bounded server log with HLS session and per-item attempt identity, contiguous loaded runway, AVPlayer wait/buffer flags, access-log request/transfer counters, and the aged last successful server supply snapshot; live ingest replaces it with fresher session state when possible. Recovery TTFF is a separate attempt. | Add frame presentation rate and build stamp; validate correlated stall ingest on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
