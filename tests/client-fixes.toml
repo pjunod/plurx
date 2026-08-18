@@ -228,3 +228,27 @@ source = "clients/android/app/src/main/java/tv/plurx/app/data/Caps.kt"
 source_anchor = "private fun decoderDolbyVisionProbe()"
 test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
 test_anchor = "capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed"
+
+[[fixes]]
+id = "apple.stall-clock-regime-flap"
+commits = ["7ed1e5e"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func waitingMajority(waitingSamples: Int, stagnantChecks: Int)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testRegimeFlappingCannotResetTheStallClock"
+
+[[fixes]]
+id = "apple.delivery-starvation-watchdog"
+commits = ["7ed1e5e"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "private func observeDeliveryStarvation(_ status: PlaybackSessionStatus)"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testDeliveryStarvationRequiresServerTruthAndConfirmation"
+
+[[fixes]]
+id = "apple.recovery-reopen-budget"
+commits = ["7ed1e5e"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct RecoveryReopenBudget"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testRecoveryReopenBudgetBrakesAStorm"
