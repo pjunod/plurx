@@ -2229,6 +2229,8 @@ asyncTest("the Dolby Vision probe is unchanged by the tiering", async () => {
   assert.equal(caps.dv, 1);
   assert.equal(caps.dvprofile, "5,8");
   assert.match(safari.capsQuery(caps), /&dv=1&dvprofile=5,8&/);
+});
+
 test("a session that lands on a different range repaints the badge", () => {
   // The field bug: on a tone-mapped Dexter episode the chip read "DV P7 →
   // HDR10" while the stats panel one line below read "Dynamic range: SDR".
