@@ -540,3 +540,15 @@ points = []
 checks = []
 reason = "This commit adds a startup operator warning naming unstamped builds and how to stamp them (make docker-up / PLURX_BUILD_REF); its only surface is that log line. The packaging contract that produces stamped images is already covered by the operations contract, and the deploy-path fix lives in the fleet playbook, not in runtime assertions."
 ignore = true
+
+[[coverage]]
+commits = ["e8f8acac", "6e98c2fb"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained HLS tests read the Dolby Vision configuration record from the published init and require a preserved Profile 5 master to advertise its dvh1 identifier; the core routing tests separately require a claimed Dolby Vision profile to survive a missing generic HDR bit while an unclaimed profile still tone-maps."
+
+[[coverage]]
+commits = ["7d2a68c3"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web policy tests execute the HEVC capability probe across decoder height, bit depth, level, and HDR support, refusing Main10, max-height, and PQ claims that the browser did not prove."

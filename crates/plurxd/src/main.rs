@@ -604,6 +604,7 @@ async fn probe_system(
         pacing: crate::ffmpeg::pacing_caps().await,
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
         dovi_reshape: crate::ffmpeg::has_dovi_reshape().await,
+        dovi_passthrough: crate::ffmpeg::has_dovi_passthrough().await,
         encoder_selected,
         tone_map,
     };
@@ -617,6 +618,7 @@ struct Measured {
     pacing: crate::ffmpeg::PacingCaps,
     dovi_rpu: bool,
     dovi_reshape: bool,
+    dovi_passthrough: bool,
     encoder_selected: String,
     tone_map: pipeprobe::PipelineReport,
 }
@@ -646,6 +648,7 @@ fn system_info(
         pacing: measured.pacing,
         dovi_rpu: measured.dovi_rpu,
         dovi_reshape: measured.dovi_reshape,
+        dovi_passthrough: measured.dovi_passthrough,
     }
 }
 
@@ -2568,6 +2571,7 @@ mod startup_tests {
                 },
                 dovi_rpu: true,
                 dovi_reshape: true,
+                dovi_passthrough: true,
                 encoder_selected: selected.clone(),
                 tone_map: pipeprobe::PipelineReport::cpu_only("not probed"),
             },

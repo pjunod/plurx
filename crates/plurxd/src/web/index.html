@@ -2898,6 +2898,12 @@ function artHtml(it, cls){
 function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working"); render(); }
 let SERVER=null;   // last /server response (name, version, android_app, …)
 async function boot(){
+  // Before anything can build a /decision URL: the MediaCapabilities refinement
+  // of PLAY_CAPS is async, and the server hears one capability answer per
+  // session with no way to correct it afterwards. Awaiting here — ahead of even
+  // the /server call — means the setup and login paths, which reach render()
+  // without coming back through boot(), are covered too.
+  try{ await PLAY_CAPS_READY; }catch(e){}
   let server;
   try{ server=await api("/server"); SERVER=server; }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
   if(server.setup_required){ return renderSetup(server); }
@@ -5275,12 +5281,121 @@ function releaseSession(sessionId){
 // transcodes what it genuinely can't — Safari keeps HEVC, everyone keeps their
 // own audio codecs, etc. HDR is claimed only on an HDR display (else the server
 // tone-maps, since HDR-on-SDR looks washed-out).
-const PLAY_CAPS=(function(){
+
+// ---- HEVC decode tiers -----------------------------------------------------
+// The one question this file used to ask about HEVC was `hvc1.1.6.L93.B0` —
+// Main, 8-bit, level 3.1 (720p-class) — and a yes was reported to the server as
+// blanket `hevc` support with no height at all. That is probe-low/claim-high,
+// the exact shape that already cost this project a black picture with working
+// sound once (see MSE_VIDEO's comment further down for the transport half of
+// the same story): a 4K 10-bit Main10 stream handed to a decoder that only does
+// 8-bit at 720p is accepted by every layer above the decoder and rendered as
+// nothing. No error fires, so nothing falls back.
+//
+// So ask the two questions the server actually needs answered — how many
+// pixels, and how many bits — instead of one question that answers neither.
+// The profile field in the codec string is the ONLY place a decoder's answer
+// distinguishes bit depth (`hvc1.1.6.*` is Main/8-bit, `hvc1.2.4.*` is Main10),
+// and the level field is the height axis: L93 = 3.1 (720p), L120 = 4.0 (1080p),
+// L153 = 5.1 (4K). The 8-bit rungs above L93 are here so an ordinary 8-bit-only
+// decoder still reports the 1080p/4K ceiling it really has rather than being
+// pinned at 720p by the lowest rung we happen to ask about first.
+//
+// width/height/bitrate/framerate are only read by the MediaCapabilities path
+// (they are required members of its VideoConfiguration); the isTypeSupported
+// fallback has nowhere to put them.
+const HEVC_TIERS=[
+  {codec:"hvc1.1.6.L93.B0",  depth:8,  width:1280, height:720,  bitrate:4000000},
+  {codec:"hvc1.1.6.L120.B0", depth:8,  width:1920, height:1080, bitrate:8000000},
+  {codec:"hvc1.1.6.L153.B0", depth:8,  width:3840, height:2160, bitrate:25000000},
+  {codec:"hvc1.2.4.L120.B0", depth:10, width:1920, height:1080, bitrate:10000000},
+  {codec:"hvc1.2.4.L153.B0", depth:10, width:3840, height:2160, bitrate:30000000},
+];
+// Fold a per-tier pass/fail table into the three facts that go on the wire.
+//
+// `maxheight` is deliberately the height at which EVERY claimed HEVC profile
+// decodes, not the height of the tallest rung that passed. The server's
+// `max_height` is one codec-agnostic number (plurx-core/src/playback: a file
+// taller than it is transcoded, whatever its codec), so a client that decodes
+// 8-bit at 4K but Main10 only at 1080p cannot say "2160" and "hevc10" in the
+// same breath — that pair is precisely the black-screen claim. Taking the min
+// costs such a device a needless transcode of 4K 8-bit HEVC; over-claiming
+// costs it the picture. `pqPassed` is null when the probe had no way to ask
+// about the transfer function (isTypeSupported has no such axis).
+function hevcTierSummary(passed, pqPassed){
+  let depth8=0, depth10=0, pq=0;
+  HEVC_TIERS.forEach((t,i)=>{
+    if(!passed||!passed[i]) return;
+    if(t.depth>=10){
+      if(t.height>depth10) depth10=t.height;
+      if(pqPassed&&pqPassed[i]&&t.height>pq) pq=t.height;
+    }else if(t.height>depth8) depth8=t.height;
+  });
+  const maxheight=(depth8&&depth10)?Math.min(depth8,depth10):(depth8||depth10);
+  return {depth8, depth10, maxheight, pq10:!!(maxheight&&pq>=maxheight)};
+}
+// The fallback probe: `canPlayType`/`isTypeSupported`, one call per rung. Both
+// are synchronous and neither knows anything about transfer functions, so this
+// path can establish depth and height and never HDR presentation.
+function hevcTiersSync(can, mse){
+  return HEVC_TIERS.map(t=>{
+    const type=`video/mp4; codecs="${t.codec}"`;
+    return can(type)||mse(type);
+  });
+}
+// The real probe. `navigator.mediaCapabilities.decodingInfo` is the only API
+// that takes a resolution, a bitrate and a transfer function and answers about
+// the combination — which is what a decoder ceiling actually is. Each Main10
+// rung is asked twice: once plain (does the decoder do 10-bit at this size?)
+// and once with `transferFunction:'pq'` (can this machine PRESENT HDR10 at that
+// size?). Those differ: a 10-bit SDR anime rip decodes on hardware that cannot
+// put PQ on the wire, and folding the two together would either lose that file
+// to a transcode or claim HDR the display never gets.
+//
+// Returns null when the API is missing or every single query threw, which is
+// the caller's signal to use the synchronous ladder instead. It is async, and
+// that is why CAPS_Q is rebuilt rather than computed once: see PLAY_CAPS_READY.
+async function hevcTiersMediaCapabilities(){
+  let mc=null;
+  try{ mc=navigator&&navigator.mediaCapabilities; }catch(e){}
+  if(!mc||typeof mc.decodingInfo!=="function") return null;
+  let answered=false;
+  // `media-source` first because segmented remuxes are the demanding path, then
+  // `file` for progressive direct play — the same OR the sync probe does across
+  // isTypeSupported/canPlayType, so the two paths cannot disagree by shape.
+  const ask=async(t,pq)=>{
+    const video={contentType:`video/mp4; codecs="${t.codec}"`, width:t.width,
+      height:t.height, bitrate:t.bitrate, framerate:24};
+    if(pq) video.transferFunction="pq";
+    for(const type of ["media-source","file"]){
+      try{
+        const r=await mc.decodingInfo({type, video});
+        answered=true;
+        if(r&&r.supported) return true;
+      }catch(e){}
+    }
+    return false;
+  };
+  const passed=[], pqPassed=[];
+  for(const t of HEVC_TIERS){
+    const ok=await ask(t,false);
+    passed.push(ok);
+    pqPassed.push(!!(ok&&t.depth>=10&&await ask(t,true)));
+  }
+  return answered?{passed, pqPassed}:null;
+}
+function buildPlayCaps(hevc){
   let v=null; try{ v=document.createElement("video"); }catch(e){}
   const can=t=>{ try{ return !!v && v.canPlayType(t)!==""; }catch(e){ return false; } };
   const mse=t=>{ try{ return !!(window.MediaSource && MediaSource.isTypeSupported(t)); }catch(e){ return false; } };
   const vc=["h264"];
-  if(can('video/mp4; codecs="hvc1.1.6.L93.B0"')||mse('video/mp4; codecs="hvc1.1.6.L93.B0"')) vc.push("hevc");
+  // `hevc` still means "there is an HEVC decoder" and is what the server matches
+  // against ffprobe's codec_name; `hevc10` is the bit-depth half of the same
+  // answer, named to match the MSE_VIDEO ladder key so the two vocabularies stay
+  // one vocabulary. Sending 8-bit-only as bare `hevc` is what stops a Main10
+  // source from being direct-played to a decoder that would render it black.
+  if(hevc.depth8||hevc.depth10) vc.push("hevc");
+  if(hevc.depth10) vc.push("hevc10");
   if(can('video/mp4; codecs="av01.0.05M.08"')||mse('video/mp4; codecs="av01.0.05M.08"')) vc.push("av1");
   if(can('video/webm; codecs="vp9"')||mse('video/webm; codecs="vp9"')) vc.push("vp9");
   if(can('video/webm; codecs="vp8"')) vc.push("vp8");
@@ -5316,9 +5431,68 @@ const PLAY_CAPS=(function(){
   if(can('audio/ogg')) containers.push("ogg","opus");
   if(can('audio/wav')) containers.push("wav");
   return {vcodec:vc.join(","), acodec:ac.join(","), container:containers.join(","), hdr:hdr?1:0,
-    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay};
+    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay,
+    // Only ever the HEVC ceiling, and null when there is no HEVC decoder at
+    // all: the server's max_height is codec-agnostic, so a number here caps
+    // H.264 and AV1 too. Absent is today's behaviour and stays the answer for
+    // every browser that was never going to be sent HEVC anyway.
+    maxheight:hevc.maxheight||null,
+    hdr10t:(hevc.pq10&&hdrDisplay)?1:0};
+}
+// The boot-time answer, from the synchronous ladder so that CAPS_Q exists
+// before anything can ask for it. MediaCapabilities refines it below.
+let PLAY_CAPS=buildPlayCaps(hevcTierSummary(hevcTiersSync(
+  t=>{ try{ const v=document.createElement("video"); return v.canPlayType(t)!==""; }catch(e){ return false; } },
+  t=>{ try{ return !!(window.MediaSource && MediaSource.isTypeSupported(t)); }catch(e){ return false; } }
+), null));
+// The capability query string every /decision and /stream.mp4 carries.
+//
+//   vcodec     CSV of decodable video codecs. `hevc` = an HEVC decoder exists;
+//              `hevc10` = it does Main10 (10-bit). 8-bit-only clients send
+//              `hevc` without `hevc10`.
+//   acodec     CSV of decodable audio codecs.
+//   container  CSV of containers playable from a plain <video src>.
+//   hdr        1 when HDR may be sent as-is: an HDR-capable codec AND an HDR
+//              display. 0 asks the server to tone-map.
+//   dv         1 when this client decodes Dolby Vision at any profile.
+//   dvprofile  CSV of the DV profiles actually probed, e.g. `5,8`.
+//   maxheight  The tallest height every HEVC profile named in `vcodec` decodes.
+//              Omitted entirely when no HEVC is claimed, because the server
+//              applies max_height to every codec and an HEVC-derived cap must
+//              not quietly become an H.264 cap on a client sent no HEVC.
+//   hdr10t     1 means, exactly: this client can DECODE HEVC Main10 and PRESENT
+//              it as PQ, at the height reported in `maxheight`, on the display
+//              it is attached to right now. It is the conjunction of a
+//              MediaCapabilities query carrying `transferFunction:'pq'` and
+//              `(dynamic-range: high)`; either half failing sends 0, and so
+//              does a browser with no MediaCapabilities at all, because the
+//              fallback probe cannot ask about transfer functions and a guess
+//              here is the over-claim this whole probe exists to stop. 0 is
+//              therefore "not proven", never "proven false" — a server reading
+//              it must treat 0 as the safe/tone-mapped path. It is strictly
+//              narrower than `hdr`, which any HDR-capable codec satisfies.
+function capsQuery(c){
+  return `vcodec=${c.vcodec}&acodec=${c.acodec}&container=${c.container}&hdr=${c.hdr}`+
+    `&dv=${c.dv}&dvprofile=${c.dvprofile}`+
+    (c.maxheight?`&maxheight=${c.maxheight}`:"")+
+    `&hdr10t=${c.hdr10t}`;
+}
+let CAPS_Q=capsQuery(PLAY_CAPS);
+// Re-probe through MediaCapabilities and rebuild the wire string. Async because
+// decodingInfo is, and the server only ever hears one answer per session — so
+// boot() awaits this before it can route anything, and every consumer reads
+// CAPS_Q at call time rather than capturing it. A rejection anywhere leaves the
+// synchronous answer standing, which is the conservative one.
+const PLAY_CAPS_READY=(async()=>{
+  try{
+    const mc=await hevcTiersMediaCapabilities();
+    if(mc){
+      PLAY_CAPS=buildPlayCaps(hevcTierSummary(mc.passed, mc.pqPassed));
+      CAPS_Q=capsQuery(PLAY_CAPS);
+    }
+  }catch(e){}
+  return PLAY_CAPS;
 })();
-const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}&dvprofile=${PLAY_CAPS.dvprofile}`;
 
 // Manual quality override (player menu), persisted per browser. Auto runs the
 // automatic ladder; Original never transcodes video (direct/remux only); a

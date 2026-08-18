@@ -65,6 +65,12 @@ pub struct SystemInfo {
     /// Whether this exact ffmpeg can run the software-decode → tonemapx
     /// Dolby Vision reshape → software-encode graph.
     pub dovi_reshape: bool,
+    /// Whether this exact ffmpeg can run the HDR10 rung: the same software
+    /// decode into `tonemapx`'s HDR *passthrough* mode at 10 bit, into
+    /// libx265 Main10. Separate from `dovi_reshape` because it is a separate
+    /// probe of a separate graph — the SDR one proves nothing about a PQ
+    /// output, where an 8-bit format aborts the process outright.
+    pub dovi_passthrough: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -219,6 +225,7 @@ impl AppState {
             )
             .with_dv_strippable(system.dovi_rpu)
             .with_dovi_reshape(system.dovi_reshape)
+            .with_dovi_passthrough(system.dovi_passthrough)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
