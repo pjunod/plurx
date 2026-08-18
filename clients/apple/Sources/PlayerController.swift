@@ -614,6 +614,13 @@ enum PlaybackStallAction: Equatable {
 enum PlaybackStallKind: String, Equatable {
     case silent
     case buffering
+    /// The server's own delivery clock said this player stopped fetching
+    /// published media (`delivered_idle_ms` grew while `published - fetched`
+    /// stayed deep). Detected from the 2-second status poll, so it fires even
+    /// when AVPlayer's `timeControlStatus` flaps or lies — the wedge observed
+    /// on tvOS 2160p copy-HLS sessions that froze without ever tripping the
+    /// position-clock ladder.
+    case delivery
 
     var terminalState: PlaybackStallTerminalState {
         switch self {
@@ -625,6 +632,10 @@ enum PlaybackStallKind: String, Equatable {
             return PlaybackStallTerminalState(
                 message: "Playback could not resume after repeated buffering. Check the connection and try again."
             )
+        case .delivery:
+            return PlaybackStallTerminalState(
+                message: "Playback stopped fetching media after retrying the current stream. Check the connection and try again."
+            )
         }
     }
 }
@@ -634,11 +645,6 @@ struct PlaybackStallEvent: Equatable {
     let action: PlaybackStallAction
     let positionMs: Int
     let durationMs: Int
-}
-
-struct PlaybackStallSelection: Equatable {
-    let kind: PlaybackStallKind
-    let action: PlaybackStallAction
 }
 
 struct PlaybackStallTerminalState: Equatable {
@@ -680,6 +686,120 @@ struct SameDeliveryStallRecoveryState: Equatable {
     mutating func reset() { attempted = false }
 }
 
+/// Server-truth wedge detector, fed by the 2-second session-status poll.
+///
+/// The position-clock ladder can only see what AVPlayer admits. The failure
+/// this catches is the one where AVPlayer admits nothing: it keeps reloading
+/// the playlist, requests no media, and reports whatever `timeControlStatus`
+/// it likes — observed live on tvOS with 250 s of published, fetchable media
+/// waiting. The server already measures that wedge precisely
+/// (`delivered_idle_ms` since the last completed media delivery, and how much
+/// published media the client has not fetched), and this client already polls
+/// those numbers every two seconds.
+///
+/// **Server evidence alone is not enough, and assuming it was shipped a
+/// regression.** A healthy player with a full forward buffer looks identical
+/// from the server's side: `preferredForwardBufferDuration` is 60 s, so once
+/// AVPlayer is topped up it stops fetching for a long stretch, while the
+/// producer runs ~2× realtime and parks at the 180 s ahead-window cap. Build
+/// 63 fired on exactly that state and killed a healthy 2160p session every
+/// ~2.4 minutes (`stall:stall-delivery ms≈19000` with `ahead_seconds` 150-180
+/// and `recent_speed` ≈ 2.0, each reopen reaching first frame in under a
+/// second). The discriminator is the film clock: **a player whose position is
+/// advancing is not starving, whatever the delivery meter says.** Buffered
+/// runway is the corroborating guard — media already in hand means the next
+/// fetch is a top-up, not a rescue.
+///
+/// Two consecutive qualifying polls fire one recovery through the same
+/// bounded same-delivery ladder as every other stall; any ineligible or
+/// healthy sample resets the confirmation count.
+struct DeliveryStarvationDetector: Equatable {
+    /// A starved steady-state player completes a segment fetch every segment
+    /// duration (~6-10 s here). Sixteen seconds of completed-delivery silence
+    /// is beyond any healthy cadence *for a client that has nothing buffered*.
+    static let deliveredIdleThresholdMs = 16_000
+    /// Require a real backlog, so playing out the tail of a finished stream
+    /// (published == fetched) can never qualify. Note this is nearly always
+    /// true mid-film — the ahead window is deliberately deep — so it excludes
+    /// the end of a stream and nothing else.
+    static let pendingMediaThresholdMs = 10_000
+    /// The film clock must be stuck too. Samples are 2 s apart and ordinary
+    /// playback advances ~2000 ms between them, so this only tolerates
+    /// rounding.
+    static let positionToleranceMs = 250
+    /// A client holding more than this much buffered media ahead of the
+    /// playhead is topping up, not starving. Well under the 60 s forward
+    /// buffer preference so an ordinary top-up cycle can never qualify.
+    static let runwayCeilingSeconds = 10.0
+    static let confirmationsRequired = 2
+
+    private(set) var confirmations = 0
+    private var lastPositionMs: Int?
+
+    mutating func observe(
+        deliveredIdleMs: Int?,
+        publishedEndMs: Int?,
+        fetchedEndMs: Int?,
+        positionMs: Int,
+        runwaySeconds: Double?,
+        eligible: Bool
+    ) -> Bool {
+        let previousPositionMs = lastPositionMs
+        lastPositionMs = positionMs
+        // An unknown runway (no item, no loaded ranges) is not evidence of
+        // health — fall through to the position check, which is.
+        let starvedOfBuffer = (runwaySeconds ?? 0) <= Self.runwayCeilingSeconds
+        let clockStuck = previousPositionMs.map {
+            abs(positionMs - $0) <= Self.positionToleranceMs
+        } ?? false
+        guard eligible,
+              clockStuck,
+              starvedOfBuffer,
+              let deliveredIdleMs, deliveredIdleMs >= Self.deliveredIdleThresholdMs,
+              let publishedEndMs,
+              let fetchedEndMs,
+              publishedEndMs - fetchedEndMs >= Self.pendingMediaThresholdMs
+        else {
+            confirmations = 0
+            return false
+        }
+        confirmations += 1
+        guard confirmations >= Self.confirmationsRequired else { return false }
+        confirmations = 0
+        return true
+    }
+
+    mutating func reset() {
+        confirmations = 0
+        lastPositionMs = nil
+    }
+}
+
+/// Global brake on automatic session replacements. Each recovery path is
+/// individually bounded, but their budgets reset on different evidence, and
+/// the early-end guard keys on a repeated *position* — a reopen that lands a
+/// few seconds off each time evades it forever. The observed failure: nine
+/// sessions opened in sixteen seconds, none reaching first frame. Whatever
+/// the loop, the fourth automatic reopen inside a rolling minute stops
+/// playback with the visible failure screen instead.
+struct RecoveryReopenBudget: Equatable {
+    static let windowSeconds: TimeInterval = 60
+    static let maxAutomaticReopens = 3
+
+    private(set) var reopenTimes: [TimeInterval] = []
+
+    mutating func admit(
+        at now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        reopenTimes.removeAll { now - $0 > Self.windowSeconds }
+        guard reopenTimes.count < Self.maxAutomaticReopens else { return false }
+        reopenTimes.append(now)
+        return true
+    }
+
+    mutating func reset() { reopenTimes.removeAll() }
+}
+
 /// Per-AVPlayerItem establishment gate. Every replacement begins unarmed and
 /// has to advance five seconds on its own clock before buffering recovery may
 /// treat a wait as a mid-playback interruption.
@@ -697,6 +817,74 @@ struct PlayerAttachmentRecoveryState: Equatable {
               positionMs >= attachedAtPositionMs + 5_000
         else { return }
         establishedPlayback = true
+    }
+}
+
+/// A decoder that accepts the stream and renders nothing is invisible to every
+/// other detector here: audio advances the film clock, so both stall detectors
+/// reset on each sample, AVPlayer's stall counter never moves, and no NSError
+/// is ever produced. The one piece of evidence is `AVPlayerItem.presentationSize`,
+/// which stays `.zero` until a frame has actually been decoded. Dolby Vision
+/// Profile 5 on a device with no Profile 5 decoder fails exactly this way.
+///
+/// This deliberately does not reuse `PlayerAttachmentRecoveryState`: that gate
+/// arms after five seconds of clock progress whether or not a picture ever
+/// appeared, which is *below* this threshold, so it would disarm the watchdog
+/// before it could ever fire. A rendered frame is what establishes video here,
+/// and the first non-zero presentation size retires the watchdog for good.
+struct BlackFrameWatchdog: Equatable {
+    private(set) var lastPositionMs: Int?
+    private(set) var blackMs = 0
+    private(set) var presentedVideo = false
+    private(set) var fired = false
+
+    mutating func opened() {
+        lastPositionMs = nil
+        blackMs = 0
+        presentedVideo = false
+        fired = false
+    }
+
+    /// True exactly once, on the sample that proves the film clock ran for
+    /// `PlayerController.blackFrameDecodeFailureMs` with nothing on screen.
+    ///
+    /// `hasVideoSource` keeps audiobooks and other audio-only playbacks out:
+    /// their presentation size is legitimately `.zero` forever.
+    @MainActor
+    mutating func observe(
+        positionMs: Int,
+        presentationSize: CGSize,
+        hasVideoSource: Bool,
+        playing: Bool
+    ) -> Bool {
+        guard !fired, !presentedVideo else { return false }
+        if presentationSize.width > 0 && presentationSize.height > 0 {
+            presentedVideo = true
+            lastPositionMs = nil
+            blackMs = 0
+            return false
+        }
+        guard hasVideoSource, playing else {
+            lastPositionMs = nil
+            return false
+        }
+        guard let lastPositionMs else {
+            self.lastPositionMs = positionMs
+            return false
+        }
+        let delta = positionMs - lastPositionMs
+        self.lastPositionMs = positionMs
+        // Only elapsed film time counts. A seek, an item replacement, or any
+        // other discontinuity larger than one sampling interval can explain is
+        // a new baseline rather than more of the same black screen.
+        guard delta >= 0, delta <= PlayerController.blackFrameSampleCeilingMs else {
+            blackMs = 0
+            return false
+        }
+        blackMs += delta
+        guard blackMs >= PlayerController.blackFrameDecodeFailureMs else { return false }
+        fired = true
+        return true
     }
 }
 
@@ -741,21 +929,89 @@ enum PlaybackCompatibilityFallback: Equatable {
     case none
     case hdrBase
     case transcode
+
+    /// Names the rung in the client failure log, so a device log says which
+    /// recovery a failure actually bought rather than only that it happened.
+    var telemetryName: String {
+        switch self {
+        case .none: return "none"
+        case .hdrBase: return "hdr-base"
+        case .transcode: return "transcode"
+        }
+    }
+}
+
+/// What put a playback into the compatibility ladder. Only `itemFailure`
+/// carries an AVFoundation error; the other two are client-observed verdicts
+/// with no NSError to print, which is exactly why they need naming.
+enum PlaybackCompatibilityLadderCause: String, Equatable {
+    case itemFailure = "item-failed"
+    case readinessTimeout = "readiness-timeout"
+    case blackFrames = "black-frames"
+}
+
+/// One ladder decision, recorded in `ApplePlaybackFailureLog.detail`.
+struct PlaybackCompatibilityLadderStep: Equatable {
+    let cause: PlaybackCompatibilityLadderCause
+    let fallback: PlaybackCompatibilityFallback
 }
 
 /// Monotonic elapsed-time sampling policy for AVPlayer's silent-wait failure mode. A
 /// temporary buffer wait gets room to recover on its own; only sustained lack
 /// of film-time progress rebuilds the item, which is the in-player equivalent
 /// of the back-out-and-play-again workaround.
+///
+/// One shared clock counts stagnation regardless of `timeControlStatus`. The
+/// previous design ran a separate detector per regime and zeroed each one
+/// whenever AVPlayer crossed between `.playing` and
+/// `.waitingToPlayAtSpecifiedRate`; a starving 4K session flaps between those
+/// faster than either detector's threshold, so a real freeze never latched
+/// (observed on tvOS: sessions died server-side as `idle` with no stall beacon
+/// ever sent). The regime now only *labels* the eventual event — via a tally
+/// majority — instead of gating the count.
 struct PlaybackStallDetector: Equatable {
+    /// Consecutive stagnant 2-second samples before a nudge / a reopen, once
+    /// this item has established playback (5 s of real progress).
+    static let establishedNudgeChecks = 3
+    static let establishedReopenChecks = 6
+    /// An unestablished item — the first attach, or the item a recovery
+    /// reopen just created — may legitimately buffer for a while before its
+    /// first frame, so it gets a longer leash and no nudge. Before this
+    /// threshold existed the unestablished state had NO detector at all: a
+    /// reopen that landed into continued starvation froze forever with no
+    /// error. Fifteen checks ≈ 30 s, then the ladder decides (one bounded
+    /// reopen, then the visible terminal screen).
+    static let unestablishedReopenChecks = 15
+
     private(set) var lastPositionMs: Int?
     private(set) var stagnantChecks = 0
     private(set) var stagnantSince: TimeInterval?
     private(set) var recoveredDurationMs: Int?
+    /// How many of the current stagnation's samples were taken while AVPlayer
+    /// reported `.waitingToPlayAtSpecifiedRate`. Majority picks the event
+    /// kind: mostly-waiting → `.buffering` (transport recovery only), so a
+    /// flapping network stall can never be misread as decoder evidence and
+    /// spend the codec/HDR compatibility ladder.
+    private(set) var waitingSamples = 0
+
+    /// The regime majority of the stagnation run that produced the most
+    /// recent `.reopen`, snapshotted at fire time because firing restarts
+    /// the counters.
+    private(set) var firedWaitingMajority = false
+
+    /// Ties go to `.buffering`: an ambiguous stagnation gets transport
+    /// recovery, never the codec/HDR ladder. Only a run that was mostly
+    /// "playing" — the clock stopped while the player claimed motion — may
+    /// count as decoder evidence.
+    static func waitingMajority(waitingSamples: Int, stagnantChecks: Int) -> Bool {
+        waitingSamples * 2 >= stagnantChecks
+    }
 
     mutating func sample(
         positionMs: Int,
         shouldMonitor: Bool,
+        established: Bool,
+        waitingRegime: Bool,
         observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> PlaybackStallAction {
         guard shouldMonitor else {
@@ -777,16 +1033,31 @@ struct PlaybackStallDetector: Equatable {
             self.lastPositionMs = positionMs
             stagnantChecks = 0
             stagnantSince = observedAt
+            waitingSamples = 0
             return .none
         }
 
         stagnantChecks += 1
-        if stagnantChecks >= 6 {
+        if waitingRegime { waitingSamples += 1 }
+        let reopenChecks = established
+            ? Self.establishedReopenChecks
+            : Self.unestablishedReopenChecks
+        if stagnantChecks >= reopenChecks {
+            firedWaitingMajority = Self.waitingMajority(
+                waitingSamples: waitingSamples, stagnantChecks: stagnantChecks
+            )
             self.lastPositionMs = positionMs
             stagnantChecks = 0
+            waitingSamples = 0
             return .reopen
         }
-        return stagnantChecks == 3 ? .nudge : .none
+        if established && stagnantChecks == Self.establishedNudgeChecks {
+            firedWaitingMajority = Self.waitingMajority(
+                waitingSamples: waitingSamples, stagnantChecks: stagnantChecks
+            )
+            return .nudge
+        }
+        return .none
     }
 
     func stagnantDurationMs(at observedAt: TimeInterval) -> Int {
@@ -811,20 +1082,29 @@ struct PlaybackStallDetector: Equatable {
         lastPositionMs = nil
         stagnantChecks = 0
         stagnantSince = nil
+        waitingSamples = 0
     }
 
     mutating func reset() {
         clearSample()
         recoveredDurationMs = nil
+        firedWaitingMajority = false
     }
 }
 
-/// Owns both stall detectors so predicate gating, merge precedence, cause, and
+/// Owns the shared stall clock so predicate gating, kind labeling, and
 /// measured duration are one testable policy rather than parallel expressions
 /// inside an asynchronous AVPlayer loop.
+///
+/// One detector, not one per regime: `timeControlStatus` crossing between
+/// `.playing` and `.waitingToPlayAtSpecifiedRate` must never restart the
+/// count (the flap itself is a symptom of the stall being measured). The
+/// regime tally only decides the event's kind — mostly-waiting stagnation is
+/// `.buffering` and stays inside transport recovery; only a stagnation that
+/// was mostly "playing" (the clock stopped while the player claimed motion)
+/// counts as `.silent`, the decoder-evidence path.
 struct PlaybackRecoveryMonitor: Equatable {
-    private(set) var silentDetector = PlaybackStallDetector()
-    private(set) var bufferingDetector = PlaybackStallDetector()
+    private(set) var progressDetector = PlaybackStallDetector()
     private var recoveredStagnantDurationMs: Int?
 
     @MainActor
@@ -835,41 +1115,26 @@ struct PlaybackRecoveryMonitor: Equatable {
         establishedPlayback: Bool,
         observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> PlaybackStallEvent? {
-        let silentAction = silentDetector.sample(
+        let action = progressDetector.sample(
             positionMs: positionMs,
-            shouldMonitor: shouldMonitor
-                && PlayerController.shouldMonitorSilentPlaybackStall(
-                    timeControlStatus: timeControlStatus
-                ),
+            shouldMonitor: shouldMonitor,
+            established: establishedPlayback,
+            waitingRegime: PlayerController.shouldMonitorBufferingStall(
+                timeControlStatus: timeControlStatus
+            ),
             observedAt: observedAt
         )
-        let bufferingAction = bufferingDetector.sample(
-            positionMs: positionMs,
-            shouldMonitor: shouldMonitor
-                && establishedPlayback
-                && PlayerController.shouldMonitorBufferingStall(
-                    timeControlStatus: timeControlStatus
-                ),
-            observedAt: observedAt
-        )
-        for recovered in [
-            silentDetector.takeRecoveredDurationMs(),
-            bufferingDetector.takeRecoveredDurationMs(),
-        ].compactMap({ $0 }) {
+        if let recovered = progressDetector.takeRecoveredDurationMs() {
             recoveredStagnantDurationMs = max(recoveredStagnantDurationMs ?? 0, recovered)
         }
-        guard let selection = Self.select(
-            silentAction: silentAction,
-            bufferingAction: bufferingAction
-        ) else { return nil }
-        let durationMs = selection.kind == .buffering
-            ? bufferingDetector.stagnantDurationMs(at: observedAt)
-            : silentDetector.stagnantDurationMs(at: observedAt)
+        guard action != .none else { return nil }
+        // `stagnantSince` survives a fire (only real progress or a gate change
+        // clears it), so this duration describes the whole run that fired.
         return PlaybackStallEvent(
-            kind: selection.kind,
-            action: selection.action,
+            kind: progressDetector.firedWaitingMajority ? .buffering : .silent,
+            action: action,
             positionMs: positionMs,
-            durationMs: durationMs
+            durationMs: progressDetector.stagnantDurationMs(at: observedAt)
         )
     }
 
@@ -878,25 +1143,8 @@ struct PlaybackRecoveryMonitor: Equatable {
         return recoveredStagnantDurationMs
     }
 
-    /// Buffering wins if a future predicate change accidentally enables both
-    /// legs. The current predicates are exclusive; pinning precedence keeps a
-    /// later relaxation from routing a network wait into silent/HDR recovery.
-    static func select(
-        silentAction: PlaybackStallAction,
-        bufferingAction: PlaybackStallAction
-    ) -> PlaybackStallSelection? {
-        if bufferingAction != .none {
-            return PlaybackStallSelection(kind: .buffering, action: bufferingAction)
-        }
-        if silentAction != .none {
-            return PlaybackStallSelection(kind: .silent, action: silentAction)
-        }
-        return nil
-    }
-
     mutating func reset() {
-        silentDetector.reset()
-        bufferingDetector.reset()
+        progressDetector.reset()
         recoveredStagnantDurationMs = nil
     }
 }
@@ -947,12 +1195,47 @@ final class PlayerController: ObservableObject {
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
     static let repeatedEndToleranceMs = 250
     static let naturalEndToleranceMs = 15_000
+    /// How long an attached item may sit at `.unknown` before the wait is
+    /// spent. A resume has always been bounded by this because it had to seek;
+    /// a fresh start was not bounded at all, which is what let a title AVPlayer
+    /// neither readies nor fails hold the open forever behind a black screen.
+    static let itemReadinessDeadlineSeconds = 15
+    /// Film time that may pass on a black screen before the picture is judged
+    /// undecodable. Above `PlayerAttachmentRecoveryState`'s five-second
+    /// establishment window on purpose: audio-only progress must not be able
+    /// to certify a playback that has never drawn a frame.
+    static let blackFrameDecodeFailureMs = 6_000
+    /// The most film time one periodic sample may contribute to that total.
+    /// The observer runs twice a second, so anything past this is a seek or an
+    /// item replacement, not playback — and must not be counted as black.
+    static let blackFrameSampleCeilingMs = 2_000
     static let gracefulRepeatedEndFraction = 0.95
     static let playbackStartFailureTitle = "Couldn't start playback."
     static let playbackStoppedFailureTitle = "Playback stopped."
     static let earlyEndFailureTitle = "Playback stopped early."
     static let repeatedEarlyEndMessage =
         "Playback ended early at the same position after retrying the stream."
+    static let readinessTimeoutMessage =
+        "The stream never became ready to play."
+    static let blackFrameFailureMessage =
+        "The film clock advanced with no decoded picture."
+
+    /// A fresh start hands `seekWhenReady` nothing to wait on, so before this
+    /// only a resume was bounded. Bound the completed-VOD/direct cold start the
+    /// same way.
+    ///
+    /// Two exclusions, both because the wait is then somebody else's: a growing
+    /// session may still be filling the server's publish gate, and a reopen
+    /// that lands paused is not a viewer sitting in front of a black screen —
+    /// it is an item deliberately prepared at rate 0.
+    nonisolated static func shouldBoundFreshStartReadiness(
+        isVOD: Bool,
+        startMs: Int,
+        seeksAfterAttach: Bool,
+        resumesPlayback: Bool
+    ) -> Bool {
+        isVOD && startMs <= 0 && !seeksAfterAttach && resumesPlayback
+    }
 
     static func configureBuffering(_ item: AVPlayerItem, growingHLS: Bool) {
         item.preferredForwardBufferDuration = growingHLS
@@ -1070,6 +1353,9 @@ final class PlayerController: ObservableObject {
     /// that the device rejected HDR. Rebuild the same delivery once instead of
     /// silently replacing a picture the viewer has already watched with SDR.
     private var attachmentRecovery = PlayerAttachmentRecoveryState()
+    /// The only evidence a decoder is producing nothing while the film clock
+    /// runs. Scoped to one attached item, exactly like `attachmentRecovery`.
+    private var blackFrameWatchdog = BlackFrameWatchdog()
     private var establishedHDRRetryAttempted = false
     private var ttffMeasurement = ApplePlaybackTTFFState()
     private var ttffReason = "cold-start"
@@ -1120,6 +1406,8 @@ final class PlayerController: ObservableObject {
     /// the field. Read only to decide whether a stall reopen actually bought a
     /// lower rung.
     private var sessionHeight: Int?
+    private var deliveryStarvation = DeliveryStarvationDetector()
+    private var recoveryReopenBudget = RecoveryReopenBudget()
     /// Evidence that this server understands `native_subtitles`: its create
     /// response handed back a native master query. A server predating the
     /// feature returns the plain playlist URL and advertises no subtitle
@@ -1219,6 +1507,23 @@ final class PlayerController: ObservableObject {
 
     var stalls: Int? {
         player.currentItem?.accessLog()?.events.last?.numberOfStalls
+    }
+
+    /// Runway of the item currently attached, or `nil` when there is no item
+    /// or no usable clock. `nil` means "unknown", which the delivery watchdog
+    /// must not read as "healthy".
+    func bufferedRunwaySeconds() -> Double? {
+        guard let item = player.currentItem else { return nil }
+        let playhead = item.currentTime().seconds
+        guard playhead.isFinite else { return nil }
+        let ranges = item.loadedTimeRanges.compactMap { value -> ClosedRange<Double>? in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = CMTimeRangeGetEnd(range).seconds
+            guard start.isFinite, end.isFinite, end >= start else { return nil }
+            return start...end
+        }
+        return Self.bufferedRunwaySeconds(playheadSeconds: playhead, ranges: ranges)
     }
 
     /// Playable seconds contiguous with the current clock. A later buffered
@@ -1350,10 +1655,13 @@ final class PlayerController: ObservableObject {
         ttffReason = currentMs > 0 ? "resume" : "cold-start"
         ttffMeasurement.opened(at: currentMs)
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         establishedHDRRetryAttempted = false
         stallObservation.reset()
         lastUncorroboratedEndMs = nil
         sameDeliveryStallRecovery.reset()
+        deliveryStarvation.reset()
+        recoveryReopenBudget.reset()
         clearPlaybackNotice()
 
         #if os(iOS)
@@ -1416,7 +1724,10 @@ final class PlayerController: ObservableObject {
         decision = Self.offlineDecision(offline)
         wantsPlayback = true
         attachmentRecovery.opened(at: currentMs)
+        blackFrameWatchdog.opened()
         stallObservation.reset()
+        deliveryStarvation.reset()
+        recoveryReopenBudget.reset()
         lastUncorroboratedEndMs = nil
         player.appliesMediaSelectionCriteriaAutomatically = false
         player.automaticallyWaitsToMinimizeStalling = true
@@ -1508,6 +1819,7 @@ final class PlayerController: ObservableObject {
         isPlaying = true
         failed = false
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         updateNowPlaying()
     }
 
@@ -1515,6 +1827,7 @@ final class PlayerController: ObservableObject {
         guard let offlineAssetURL, started else { return }
         isChangingStream = true
         playbackRecoveryMonitor.reset()
+        deliveryStarvation.reset()
         await loadOffline(url: offlineAssetURL, startMs: positionMs)
         isChangingStream = false
         // The status observer holds its fire while `isChangingStream` is up;
@@ -1557,6 +1870,9 @@ final class PlayerController: ObservableObject {
         playbackError = nil
         playbackFailureTitle = Self.playbackStartFailureTitle
         lastUncorroboratedEndMs = nil
+        // The viewer explicitly asked for another attempt; the automatic
+        // brake must not carry a spent window into it.
+        recoveryReopenBudget.reset()
         wantsPlayback = true
         #if os(iOS)
         if offlineAssetURL != nil {
@@ -1598,6 +1914,7 @@ final class PlayerController: ObservableObject {
         ttffMeasurement.rebasePosition(at: target)
         refreshPGSOverlayWindow(at: target, force: true)
         playbackRecoveryMonitor.reset()
+        deliveryStarvation.reset()
         let route = Self.seekRoute(
             targetMs: target,
             baseMs: baseMs,
@@ -1786,6 +2103,7 @@ final class PlayerController: ObservableObject {
         playbackRecoveryMonitor.reset()
         stallReopenBudget.reset()
         sessionHeight = nil
+        deliveryStarvation.reset()
         ttffMeasurement.reset()
         seekState.clear()
         let position = realPositionMs()
@@ -1967,6 +2285,7 @@ final class PlayerController: ObservableObject {
         let attemptId = UUID().uuidString
         finished = false
         attachmentRecovery.opened(at: startMs)
+        blackFrameWatchdog.opened()
         isChangingStream = true
         failed = false
         playbackError = nil
@@ -2261,6 +2580,33 @@ final class PlayerController: ObservableObject {
                 }
                 throw error
             }
+        } else if Self.shouldBoundFreshStartReadiness(
+            isVOD: isVOD,
+            startMs: startMs,
+            seeksAfterAttach: seekAfterAttach != nil,
+            resumesPlayback: resumesPlayback
+        ) {
+            // A fresh start has no seek to wait behind, so nothing used to
+            // bound its wait for a first frame at all. An item AVFoundation
+            // neither readies nor fails — Dolby Vision Profile 5 on a device
+            // that cannot decode it — held this open forever, which is the
+            // black screen viewers reported.
+            do {
+                try await awaitItemReady(item)
+            } catch {
+                if isSuperseded(generation) { return }
+                if item.status == .failed {
+                    isChangingStream = false
+                    await handleItemFailure(item)
+                    return
+                }
+                // Only the deadline expiring is a verdict about the media. A
+                // cancelled task says nothing about the picture.
+                if let preparation = error as? PlaybackPreparationError,
+                   case .timedOut = preparation,
+                   await retryAfterReadinessTimeout(at: startMs) { return }
+                throw error
+            }
         }
         await applyPreferredAudioSelection(to: item)
         await applyNativeSubtitleSelection(nativeSubtitle, to: item)
@@ -2275,6 +2621,7 @@ final class PlayerController: ObservableObject {
         isPlaying = resumesPlayback
         currentMs = startMs
         playbackRecoveryMonitor.reset()
+        deliveryStarvation.reset()
         failed = false
         isChangingStream = false
         updateNowPlaying()
@@ -2593,19 +2940,72 @@ final class PlayerController: ObservableObject {
                 if let status {
                     self.diagnosticSessionStatus = status
                     self.diagnosticSessionStatusObservedAt = Date()
+                    // A fired wedge recovery replaces the session — and
+                    // `open()` cancels THIS poll task, so the recovery must
+                    // not run inside it. `observeDeliveryStarvation` spawns
+                    // an unstructured task (immune to this task's
+                    // cancellation) and this loop ends; the successor
+                    // session starts its own poll.
+                    if self.observeDeliveryStarvation(status) { return }
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
     }
 
+    /// Server-truth wedge check, run on every 2-second status poll. AVPlayer
+    /// can stop fetching published media while reporting any
+    /// `timeControlStatus` it likes and while its film clock still ticks —
+    /// states the position-clock monitor reads as healthy or keeps resetting
+    /// on. The server's delivery clock cannot be fooled that way: when it says
+    /// nothing was delivered for 16+ seconds while 10+ seconds of published
+    /// media sit unfetched, and this controller still wants playback with no
+    /// change or seek in flight, that is a stall whatever AVPlayer claims.
+    /// Recovery goes through the same bounded same-delivery ladder as every
+    /// other stall — one reopen, then the visible failure screen. Returns
+    /// whether a recovery was fired, so the polling task that observed it
+    /// can end itself: the recovery runs in an unstructured task because
+    /// `reopen` → `open()` cancels the status-poll task, and a recovery
+    /// awaited inline there would cancel itself mid-open.
+    private func observeDeliveryStarvation(_ status: PlaybackSessionStatus) -> Bool {
+        let eligible = started
+            && wantsPlayback
+            && !finished
+            && !failed
+            && !isChangingStream
+            && seekState.pendingMs == nil
+            && player.currentItem != nil
+        let position = realPositionMs()
+        guard deliveryStarvation.observe(
+            deliveredIdleMs: status.deliveredIdleMs,
+            publishedEndMs: status.publishedEndMs,
+            fetchedEndMs: status.fetchedEndMs,
+            positionMs: position,
+            runwaySeconds: bufferedRunwaySeconds(),
+            eligible: eligible
+        ) else { return false }
+        currentMs = position
+        let event = PlaybackStallEvent(
+            kind: .delivery,
+            action: .reopen,
+            positionMs: position,
+            durationMs: status.deliveredIdleMs ?? 0
+        )
+        Task { await self.retrySameDeliveryAfterStall(event) }
+        return true
+    }
+
     /// Sample the film clock independently of AVPlayer's periodic observer,
-    /// which stops firing when that clock stops. Silent freezes and explicit
-    /// buffering waits keep independent evidence: either may reconnect the
-    /// exact delivery after a sustained lack of progress, but buffering can
-    /// never enter the codec/HDR compatibility ladder. This restores the
-    /// in-player equivalent of closing and reopening a title without reviving
-    /// the false SDR fallbacks that originally caused buffering to be excluded.
+    /// which stops firing when that clock stops. One shared clock counts the
+    /// stagnation whatever `timeControlStatus` reports — a starving session
+    /// flaps between `.playing` and `.waitingToPlayAtSpecifiedRate` faster
+    /// than any per-regime counter's threshold, which is how real freezes
+    /// used to go undetected. The regime tally labels the fired event
+    /// instead: mostly-waiting stagnation is `.buffering` and reconnects the
+    /// exact delivery; only a mostly-"playing" stagnation may consult the
+    /// codec/HDR compatibility ladder, so the false SDR fallbacks that
+    /// originally caused buffering to be excluded stay dead. This restores
+    /// the in-player equivalent of closing and reopening a title.
     private func startPlaybackRecoveryMonitor() {
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
@@ -2626,10 +3026,11 @@ final class PlayerController: ObservableObject {
                     timeControlStatus: timeControlStatus,
                     shouldMonitor: shouldMonitor,
                     // A first-frame wait may be the server deliberately
-                    // filling its publish gate. Recovery begins only after
-                    // this item has advanced for five seconds, which confines
-                    // buffering recovery to the mid-playback failure reported
-                    // on iPad and prevents duplicate cold-start sessions.
+                    // filling its publish gate, so an unestablished item gets
+                    // a longer leash (~30 s) and no nudge before its bounded
+                    // reopen — long enough not to duplicate a cold start,
+                    // finite so a reopen that lands into continued starvation
+                    // can no longer freeze forever with no error.
                     establishedPlayback: self.attachmentRecovery.establishedPlayback
                 ) else { continue }
                 switch stallEvent.action {
@@ -2641,7 +3042,9 @@ final class PlayerController: ObservableObject {
                     self.isPlaying = true
                 case .reopen:
                     self.currentMs = position
-                    if stallEvent.kind == .buffering {
+                    // Only a mostly-"playing" stagnation may consult the HDR
+                    // ladder; every other kind is transport recovery.
+                    if stallEvent.kind != .silent {
                         await self.retrySameDeliveryAfterStall(stallEvent)
                         continue
                     }
@@ -2666,11 +3069,12 @@ final class PlayerController: ObservableObject {
         #endif
         let transport = Self.recoveryTransport(hasOfflineAsset: hasOfflineAsset)
         stallReopenBudget.observedStall(at: event.positionMs)
-        decision = Self.stallRecoveryDecision(
+        decision = Self.boundedStallRecoveryDecision(
             decision,
             transport: transport,
             budgetAllowsAnotherAttempt: stallReopenBudget.allowsAnotherAttempt,
-            kind: event.kind
+            kind: event.kind,
+            reopenStorm: &recoveryReopenBudget
         )
         reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
@@ -2721,6 +3125,40 @@ final class PlayerController: ObservableObject {
               !budgetAllowsAnotherAttempt
         else { return proposed }
         return .stop(kind.terminalState)
+    }
+
+    /// Compose the two independent stall bounds, in the one order that is safe.
+    ///
+    /// They answer different questions and neither subsumes the other. The
+    /// ladder floor asks whether reopens are still buying a strictly lower
+    /// rung; it is the only bound that can answer "never again", because a
+    /// link starved at the floor reproduces its own precondition forever. The
+    /// rolling budget asks how many automatic reopens landed in the last
+    /// minute; it is a storm cap and releases on its own once the window
+    /// slides.
+    ///
+    /// The floor is evaluated first because `admit()` *mutates* — it records a
+    /// timestamp. Consulting it ahead of the floor would charge a rolling slot
+    /// to a reopen the floor then converts to `.stop`, so a genuinely
+    /// unrelated stall minutes later would inherit that debt and hit the storm
+    /// cap early. A reopen that never happens must not be counted as one.
+    nonisolated static func boundedStallRecoveryDecision(
+        _ proposed: SameDeliveryStallRecoveryDecision,
+        transport: SameDeliveryRecoveryTransport,
+        budgetAllowsAnotherAttempt: Bool,
+        kind: PlaybackStallKind,
+        reopenStorm: inout RecoveryReopenBudget,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> SameDeliveryStallRecoveryDecision {
+        let decision = Self.stallRecoveryDecision(
+            proposed,
+            transport: transport,
+            budgetAllowsAnotherAttempt: budgetAllowsAnotherAttempt,
+            kind: kind
+        )
+        guard decision == .reopen else { return decision }
+        guard reopenStorm.admit(at: now) else { return .stop(kind.terminalState) }
+        return decision
     }
 
     /// The cause this recovery's create should carry. Only a live growing
@@ -2856,6 +3294,19 @@ final class PlayerController: ObservableObject {
                     at: observedPosition,
                     playing: isActuallyPlaying
                 )
+                // Sampled outside the playing branch so a picture that arrives
+                // while paused still retires the watchdog.
+                if self.blackFrameWatchdog.observe(
+                    positionMs: observedPosition,
+                    presentationSize: self.presentationSize,
+                    hasVideoSource: self.decision?.source?.videoCodec != nil,
+                    playing: isActuallyPlaying
+                ) {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.handleBlackFrameDecodeFailure(at: observedPosition)
+                    }
+                }
                 if isActuallyPlaying {
                     self.preferredRate = self.player.rate
                     self.attachmentRecovery.observe(
@@ -2980,7 +3431,21 @@ final class PlayerController: ObservableObject {
                 case .reopen:
                     // The viewer did not pause — the playlist merely announced
                     // its current end — and `wantsPlayback` still says so, so
-                    // this continuation keeps playing.
+                    // this continuation keeps playing. The repeated-position
+                    // guard alone cannot stop a loop whose reopens land a few
+                    // seconds apart each time (observed: nine sessions in
+                    // sixteen seconds); the shared rolling budget can.
+                    guard self.recoveryReopenBudget.admit() else {
+                        let expectedDurationMs = self.knownDurationMs > 0
+                            ? self.knownDurationMs
+                            : itemDurationMs
+                        self.stopAfterRepeatedEarlyEnd(
+                            at: endedAt,
+                            expectedDurationMs: expectedDurationMs,
+                            isGrowingPlaylist: isGrowingPlaylist
+                        )
+                        return
+                    }
                     await self.reopen(at: endedAt)
                     return
                 case .stop:
@@ -3020,7 +3485,29 @@ final class PlayerController: ObservableObject {
     /// genuinely failed replacement is still handled.
     private func handleItemFailure(_ item: AVPlayerItem) async {
         guard player.currentItem === item, !isChangingStream else { return }
-        reportPlaybackFailure(item)
+        let event = item.errorLog()?.events.last
+        let isCompatibilityFailure = Self.isCompatibilityPlaybackFailure(
+            error: item.error as NSError?,
+            eventDomain: event?.errorDomain,
+            eventStatus: event?.errorStatusCode,
+            eventComment: event?.errorComment
+        )
+        // Evaluated before anything recovers, because the log has to go out
+        // before the ladder's own reopen replaces this item. An established
+        // HDR delivery reconnects itself instead of descending, so it buys no
+        // rung — say so rather than naming one that never ran.
+        let reconnectsEstablishedHDR = Self.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: deliveredRange,
+            establishedPlayback: attachmentRecovery.establishedPlayback
+        )
+        let fallback: PlaybackCompatibilityFallback =
+            started && isCompatibilityFailure && !reconnectsEstablishedHDR
+                ? plannedCompatibilityFallback
+                : PlaybackCompatibilityFallback.none
+        reportPlaybackFailure(
+            item,
+            step: PlaybackCompatibilityLadderStep(cause: .itemFailure, fallback: fallback)
+        )
         if started {
             // P2-6: this item is already dead, so its `currentTime()`
             // is 0 or invalid and a VOD/direct retry would silently
@@ -3030,13 +3517,8 @@ final class PlayerController: ObservableObject {
             // paused when the item failed stays paused.
             let position = Self.compatibilityRetryPositionMs(lastObservedMs: currentMs)
             if await retryEstablishedHDRDelivery(at: position) { return }
-            let event = item.errorLog()?.events.last
-            if Self.isCompatibilityPlaybackFailure(
-                error: item.error as NSError?,
-                eventDomain: event?.errorDomain,
-                eventStatus: event?.errorStatusCode,
-                eventComment: event?.errorComment
-            ), await retryWithNextCompatibilityFallback(at: position) { return }
+            if isCompatibilityFailure,
+               await retryWithNextCompatibilityFallback(at: position) { return }
         }
         player.pause()
         isPlaying = false
@@ -3050,7 +3532,10 @@ final class PlayerController: ObservableObject {
             ?? PlaybackPreparationError.failed.localizedDescription
     }
 
-    private func reportPlaybackFailure(_ item: AVPlayerItem) {
+    private func reportPlaybackFailure(
+        _ item: AVPlayerItem,
+        step: PlaybackCompatibilityLadderStep
+    ) {
         #if os(iOS)
         if offlineId != nil { return }
         #endif
@@ -3068,10 +3553,37 @@ final class PlayerController: ObservableObject {
                 error: failure,
                 eventDomain: event?.errorDomain,
                 eventStatus: event?.errorStatusCode,
-                eventComment: event?.errorComment
+                eventComment: event?.errorComment,
+                ladderStep: step
             )
         )
         postClientLog(payload)
+    }
+
+    /// A ladder entry the client decided on its own: no AVFoundation error
+    /// exists to describe it, so the log carries only the cause and the rung.
+    private func reportCompatibilityLadderFailure(
+        message: String,
+        step: PlaybackCompatibilityLadderStep
+    ) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        postClientLog(ApplePlaybackFailureLog(
+            message: message,
+            method: clientLogMethod,
+            code: nil,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            detail: Self.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: step
+            )
+        ))
     }
 
     private func reportEarlyEndFailure(
@@ -3178,11 +3690,16 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    /// `ladderStep` names the recovery this failure bought, so a device log
+    /// shows which rung was chosen and what chose it — including for the two
+    /// client-observed verdicts (a readiness timeout, a black picture) that
+    /// carry no AVFoundation error at all.
     static func playbackFailureDetail(
         error: NSError?,
         eventDomain: String?,
         eventStatus: Int?,
-        eventComment: String?
+        eventComment: String?,
+        ladderStep: PlaybackCompatibilityLadderStep? = nil
     ) -> String {
         var fields: [String] = []
         if let error {
@@ -3202,6 +3719,10 @@ final class PlayerController: ObservableObject {
         }
         if let eventComment, !eventComment.isEmpty {
             fields.append("comment=\(eventComment)")
+        }
+        if let ladderStep {
+            fields.append("cause=\(ladderStep.cause.rawValue)")
+            fields.append("ladder=\(ladderStep.fallback.telemetryName)")
         }
         return fields.joined(separator: " · ")
     }
@@ -3270,20 +3791,11 @@ final class PlayerController: ObservableObject {
         return .reopen
     }
 
-    /// AVPlayer owns ordinary buffering and resumes it when enough media has
-    /// arrived. A stopped film clock while the player explicitly reports
-    /// `.waitingToPlayAtSpecifiedRate` therefore cannot be used as decoder
-    /// evidence. This applies equally to iPhone, iPad, and Apple TV.
-    static func shouldMonitorSilentPlaybackStall(
-        timeControlStatus: AVPlayer.TimeControlStatus
-    ) -> Bool {
-        timeControlStatus != .waitingToPlayAtSpecifiedRate
-    }
-
-    /// A network wait gets its own bounded recovery timer. It is intentionally
-    /// separate from `shouldMonitorSilentPlaybackStall`: the caller routes its
-    /// recovery straight back to the same delivery and never treats it as
-    /// evidence for a codec/HDR fallback.
+    /// Whether this sample was taken during an explicit network wait. The
+    /// shared stall clock counts regardless — crossing regimes must never
+    /// restart it — but the tally of waiting samples decides the fired
+    /// event's kind, and `.buffering` never enters the codec/HDR ladder.
+    /// This applies equally to iPhone, iPad, and Apple TV.
     static func shouldMonitorBufferingStall(
         timeControlStatus: AVPlayer.TimeControlStatus
     ) -> Bool {
@@ -3327,12 +3839,20 @@ final class PlayerController: ObservableObject {
         }
 
         // VideoToolbox decoder failures commonly surface as an underlying
-        // CoreMedia/OSStatus error instead of an AVError.Code.
+        // CoreMedia/OSStatus error instead of an AVError.Code. The two
+        // CoreMedia codes below are media verdicts too, not transport faults:
+        // a device with no Dolby Vision Profile 5 decoder rejects the asset
+        // outright (-12927), or fails to build a decoder session from the
+        // empty `hvcC` such a track carries (-15517). Leaving them out
+        // classified the most common Dolby Vision failure as terminal, so the
+        // ladder never ran and the viewer kept a black screen.
         let decoderStatusCodes: Set<Int> = [
             -12906, // kVTCouldNotFindVideoDecoderErr
             -12909, // kVTVideoDecoderBadDataErr
             -12910, // kVTVideoDecoderUnsupportedDataFormatErr
             -12911, // kVTVideoDecoderMalfunctionErr
+            -12927, // kFigPlayerError_IncompatibleAsset
+            -15517, // decoder initialization failed (empty hvcC)
             -17694, // kVTVideoDecoderReferenceMissingErr
         ]
         if chain.contains(where: { decoderStatusCodes.contains($0.code) })
@@ -3496,6 +4016,57 @@ final class PlayerController: ObservableObject {
         return true
     }
 
+    /// The rung the ladder would choose right now. Read before the ladder runs
+    /// so the failure log can name the step the viewer actually got, and so a
+    /// client-observed verdict with no rung left changes nothing at all.
+    private var plannedCompatibilityFallback: PlaybackCompatibilityFallback {
+        Self.nextCompatibilityFallback(
+            canRetryWithHDRBase: canRetryCurrentItemWithHDRBase,
+            hdrBaseAlreadyAttempted: dolbyVisionFallbackAttempted,
+            canRetryWithTranscode: canRetryCurrentItemWithTranscode,
+            transcodeAlreadyAttempted: compatibilityFallbackAttempted
+        )
+    }
+
+    /// A fresh start that never reached `.readyToPlay` is a media verdict, not
+    /// a transport fault: AVFoundation neither failed the item nor readied it,
+    /// which is what a Dolby Vision Profile 5 track with an empty `hvcC` does
+    /// on a device that cannot decode it. Spend one rung instead of stopping.
+    /// Returning false leaves the caller's original timeout to surface.
+    private func retryAfterReadinessTimeout(at position: Int) async -> Bool {
+        let fallback = plannedCompatibilityFallback
+        guard fallback != .none else { return false }
+        reportCompatibilityLadderFailure(
+            message: Self.readinessTimeoutMessage,
+            step: PlaybackCompatibilityLadderStep(
+                cause: .readinessTimeout,
+                fallback: fallback
+            )
+        )
+        return await retryWithNextCompatibilityFallback(at: position)
+    }
+
+    /// Six seconds of film clock with nothing decoded. Nothing was ever
+    /// established here — no frame has been presented for this item — so the
+    /// established-HDR policy does not apply and the pre-start ladder does.
+    /// With no rung left this deliberately does nothing: audio is still
+    /// playing, and there is no better delivery left to try.
+    private func handleBlackFrameDecodeFailure(at position: Int) async {
+        guard started, !isChangingStream, player.currentItem != nil else { return }
+        let fallback = plannedCompatibilityFallback
+        guard fallback != .none else { return }
+        reportCompatibilityLadderFailure(
+            message: Self.blackFrameFailureMessage,
+            step: PlaybackCompatibilityLadderStep(
+                cause: .blackFrames,
+                fallback: fallback
+            )
+        )
+        _ = await retryWithNextCompatibilityFallback(
+            at: Self.compatibilityRetryPositionMs(lastObservedMs: position)
+        )
+    }
+
     private func report(_ position: Int) {
         guard position > 0 else { return }
         let globalPosition = AudiobookTimeline.globalPosition(
@@ -3520,15 +4091,17 @@ final class PlayerController: ObservableObject {
         Task { await model?.reportProgress(itemId: itemId, positionMs: globalPosition, durationMs: duration) }
     }
 
-    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {
-        // AVPlayerItem's KVO publisher is not guaranteed to deliver another
-        // value when a tvOS network request stalls. The old unbounded
-        // `for await` consequently held the initial `play()` forever and left
-        // the transport looking paused. Poll the authoritative status with a
-        // finite deadline so playback either resumes or surfaces a useful
-        // connection error.
+    /// Wait for the attached item to reach `.readyToPlay`, or give up.
+    ///
+    /// AVPlayerItem's KVO publisher is not guaranteed to deliver another
+    /// value when a tvOS network request stalls. The old unbounded
+    /// `for await` consequently held the initial `play()` forever and left
+    /// the transport looking paused. Poll the authoritative status with a
+    /// finite deadline so playback either resumes or surfaces a useful
+    /// connection error.
+    private func awaitItemReady(_ item: AVPlayerItem) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(15))
+        let deadline = clock.now.advanced(by: .seconds(Self.itemReadinessDeadlineSeconds))
         while item.status == .unknown {
             try Task.checkCancellation()
             guard clock.now < deadline else { throw PlaybackPreparationError.timedOut }
@@ -3539,6 +4112,10 @@ final class PlayerController: ObservableObject {
             throw item.error ?? PlaybackPreparationError.failed
         }
         guard item.status == .readyToPlay else { throw PlaybackPreparationError.failed }
+    }
+
+    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {
+        try await awaitItemReady(item)
 
         _ = await player.seek(
             to: CMTime(seconds: Double(ms) / 1000.0, preferredTimescale: 600),

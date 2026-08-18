@@ -232,6 +232,18 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release -p plurxd --target ${{ matrix.target }}",
             workflow,
         )
+        self.assertEqual(
+            workflow.count(
+                "s|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g",
+            ),
+            4,
+        )
+        self.assertEqual(
+            workflow.count("sudo apt-get -o Acquire::Retries=3"),
+            8,
+        )
+        self.assertNotIn("sudo apt-get update", workflow)
+        self.assertNotIn("sudo apt-get install", workflow)
         self.assertNotIn(
             "cargo build --release --workspace --target ${{ matrix.target }}",
             workflow,

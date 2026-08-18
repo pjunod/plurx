@@ -16,6 +16,87 @@ pub enum Encoder {
     VideoToolbox,
 }
 
+/// The dynamic-range contract of the bytes a re-encode puts on the wire.
+///
+/// Not a preference and not a property of the source: this describes the
+/// OUTPUT, and it exists because `crate::playback::delivered_dynamic_range`
+/// used to answer `"sdr"` for every transcode on the strength of every rung
+/// being H.264 8-bit. Adding a rung that is not makes that hard-coded answer
+/// a lie on three clients at once, so the grade is carried rather than
+/// assumed.
+///
+/// **Transfer and pixel format come out of the same value on purpose.** PQ
+/// paired with an 8-bit output format is not an error return in
+/// jellyfin-ffmpeg's `tonemapx`; it is
+/// `Assertion 0 failed at libavfilter/vf_tonemapx.c:1475` — `abort()`, exit
+/// 134, measured. There is no way to spell that combination here because
+/// there is no place to spell the two halves separately: a caller picks a
+/// grade and gets both. [`crate::transcode::assert_no_pq_at_8_bit`] is the
+/// belt to this braces, for chains assembled as text elsewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputGrade {
+    /// BT.709 8-bit, the only grade that existed before M5.
+    #[default]
+    Sdr,
+    /// HEVC Main10, PQ transfer, BT.2020 primaries, limited range. The rung
+    /// for a client that cannot decode Dolby Vision but *can* decode HEVC
+    /// Main10 PQ, which was otherwise laddered all the way down to 720p SDR
+    /// H.264.
+    Hdr10,
+}
+
+impl OutputGrade {
+    /// The transfer characteristic this grade's filter chain targets.
+    pub fn transfer(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "bt709",
+            OutputGrade::Hdr10 => "smpte2084",
+        }
+    }
+
+    /// The colour matrix this grade's filter chain targets.
+    pub fn matrix(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "bt709",
+            OutputGrade::Hdr10 => "bt2020",
+        }
+    }
+
+    /// The primaries this grade's filter chain targets.
+    pub fn primaries(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "bt709",
+            OutputGrade::Hdr10 => "bt2020",
+        }
+    }
+
+    /// The output pixel format. Tied to [`Self::transfer`] by construction —
+    /// see the type's doc comment for what the untied version does.
+    pub fn pixel_format(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "yuv420p",
+            OutputGrade::Hdr10 => "yuv420p10le",
+        }
+    }
+
+    /// What `delivered_dynamic_range` reports for a transcode of this grade.
+    pub fn delivered_dynamic_range(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "sdr",
+            OutputGrade::Hdr10 => "hdr10",
+        }
+    }
+
+    /// Stable identity for the cache recipe and logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputGrade::Sdr => "sdr",
+            OutputGrade::Hdr10 => "hdr10",
+        }
+    }
+}
+
 /// The operator's requested rate-control family.
 ///
 /// This value is never allowed into a cache recipe. A request becomes an
@@ -106,17 +187,19 @@ impl Encoder {
         }
     }
 
-    /// The ffmpeg H.264 encoder name.
+    /// The ffmpeg H.264 encoder name — this family's SDR rung, and the only
+    /// codec any rung used before M5.
     ///
-    /// **Every arm is H.264 8-bit, and something outside this file depends on
-    /// that.** [`crate::playback::delivered_dynamic_range`] returns `"sdr"`
-    /// for every transcode without looking at anything — no encoder, no
-    /// filter chain, no source grade — because there is no rung here that
-    /// can carry a wider one, and the badge on every client is built from
-    /// that answer. Add an HEVC or AV1 arm and the badge starts calling an
-    /// HDR transcode SDR, silently, on all three clients at once. The
-    /// coupling has no compiler to enforce it, so it has a test instead:
-    /// `every_encoder_is_h264_because_the_badge_hard_codes_sdr`.
+    /// **Every arm here is H.264 8-bit, and something outside this file
+    /// depends on that.** [`crate::playback::delivered_dynamic_range`] used
+    /// to return `"sdr"` for every transcode without looking at anything, and
+    /// the badge on every client is built from that answer. It now reads the
+    /// session's [`OutputGrade`] instead, so a wider rung has somewhere
+    /// honest to be described — but it still reports `"sdr"` for
+    /// [`OutputGrade::Sdr`], which is what every arm of this function
+    /// produces. The coupling has no compiler to enforce it, so it has a
+    /// test instead:
+    /// `every_encoder_is_h264_because_the_sdr_grade_says_so`.
     pub fn video_codec(self) -> &'static str {
         match self {
             Encoder::Software => "libx264",
@@ -124,6 +207,45 @@ impl Encoder {
             Encoder::Qsv => "h264_qsv",
             Encoder::Vaapi => "h264_vaapi",
             Encoder::VideoToolbox => "h264_videotoolbox",
+        }
+    }
+
+    /// The ffmpeg encoder this family uses for `grade`, or `None` when this
+    /// family has no *measured* encoder for it.
+    ///
+    /// `None` is a real answer and callers must handle it: it is what keeps
+    /// an unmeasured hardware claim out of production. Selecting an encoder
+    /// here that nobody has run means a viewer's first press of play is the
+    /// experiment.
+    ///
+    /// **`hevc_qsv` is deliberately absent.** It is compiled into the
+    /// production build (`jellyfin-ffmpeg7 7.1.4-3`) and it is *unmeasured*:
+    /// the spike box has no `/dev/dri` and no GPU, so nothing about its rate,
+    /// its Main10 output tagging, or — more importantly — whether the Dolby
+    /// Vision RPU survives a full-hardware QSV decode into the filter graph
+    /// could be observed. Wiring it on structural reasoning would be exactly
+    /// the unmeasured claim this codebase refuses.
+    ///
+    /// TODO(measure-on-node): before adding a `hevc_qsv` arm, measure on a
+    /// node with real Intel graphics: (1) `hevc_qsv` Main10 encode rate at
+    /// 1080p and 2160p against the software 11.0 fps / 2-core baseline;
+    /// (2) that the output ffprobes as `profile=Main 10`,
+    /// `color_transfer=smpte2084`, `color_primaries=bt2020`; (3) that a
+    /// Profile 5 source decoded by `hevc_qsv` still delivers DOVI frame side
+    /// data to `tonemapx` — software `hevc` decode does (measured), and the
+    /// QSV decoder does its own bitstream handling, so this is the one that
+    /// is most likely to come back negative and is the reason the whole rung
+    /// currently pins [`Encoder::Software`].
+    pub fn video_codec_for(self, grade: OutputGrade) -> Option<&'static str> {
+        match grade {
+            OutputGrade::Sdr => Some(self.video_codec()),
+            // Measured: jellyfin-ffmpeg7 7.1.4-3, 2 cores, 1080p —
+            // Profile 5 decode -> tonemapx passthrough -> libx265 Main10
+            // veryfast at 11.0 fps, against 20.3 fps for today's SDR chain.
+            OutputGrade::Hdr10 => match self {
+                Encoder::Software => Some("libx265"),
+                Encoder::Nvenc | Encoder::Qsv | Encoder::Vaapi | Encoder::VideoToolbox => None,
+            },
         }
     }
 
@@ -221,6 +343,43 @@ impl Encoder {
         force_idr: bool,
         software_threads: Option<u32>,
     ) -> Vec<String> {
+        self.encode_args_for(
+            OutputGrade::Sdr,
+            bitrate_kbps,
+            rate_control,
+            force_idr,
+            software_threads,
+        )
+    }
+
+    /// [`Encoder::encode_args`] for a chosen [`OutputGrade`].
+    ///
+    /// [`OutputGrade::Sdr`] delegates to the pre-M5 body byte-for-byte; the
+    /// SDR argument list is pinned by
+    /// `the_sdr_argument_list_for_a_profile5_source_is_unchanged` and must
+    /// not move, because every existing cache entry and every SDR client
+    /// depends on it.
+    ///
+    /// [`OutputGrade::Hdr10`] is software-only (see
+    /// [`Encoder::video_codec_for`]) and always bitrate-bounded VBR. Quality
+    /// mode is deliberately not passed through: `-crf 23` means one thing to
+    /// x264 and a different one to x265, the node sweep that produced the
+    /// per-family defaults was run against H.264 only, and a quality number
+    /// nobody measured is a bitrate nobody predicted on a rung that is
+    /// already 1.8x the cost of the SDR one. Requesting quality mode on this
+    /// grade therefore yields VBR — over-invalidating the cache at worst,
+    /// never mislabelling bytes.
+    pub fn encode_args_for(
+        self,
+        grade: OutputGrade,
+        bitrate_kbps: u32,
+        rate_control: EffectiveRateControl,
+        force_idr: bool,
+        software_threads: Option<u32>,
+    ) -> Vec<String> {
+        if grade == OutputGrade::Hdr10 {
+            return self.hdr10_encode_args(bitrate_kbps, force_idr, software_threads);
+        }
         let br = format!("{bitrate_kbps}k");
         let maxrate = format!("{}k", bitrate_kbps * 3 / 2);
         let bufsize = format!("{}k", bitrate_kbps * 2);
@@ -305,6 +464,65 @@ impl Encoder {
                 bounded(base, true)
             }
         }
+    }
+
+    /// The HEVC Main10 encode for [`OutputGrade::Hdr10`].
+    ///
+    /// `hdr10=1` makes x265 emit the mastering-display and content-light SEI
+    /// it was given, and `repeat-headers=1` puts VPS/SPS/PPS in front of
+    /// every IDR — required, because an HLS segment that does not carry its
+    /// own parameter sets is not independently decodable, and this muxer
+    /// promises `independent_segments`.
+    ///
+    /// **HDR10 static metadata (MDCV/CLL) is NOT synthesised here, and that
+    /// is a known gap rather than an oversight.** A real Profile 5 source
+    /// carries no MDCV/CLL SEI at all — Dolby's L6 metadata lives inside the
+    /// RPU — so there is nothing for the reshape to inherit and nothing
+    /// honest for this function to declare. `hdr10=1` therefore passes
+    /// through whatever the decoded frames actually carry, which for a true
+    /// P5 source is nothing. The output is still correctly *tagged* PQ /
+    /// BT.2020 (measured), which is what a display needs to select its HDR
+    /// mode; what it lacks is the mastering-display hint some panels use for
+    /// tone-mapping headroom. Deriving one would mean inventing numbers.
+    ///
+    /// A family with no measured HEVC Main10 encoder (see
+    /// [`Encoder::video_codec_for`]) still gets `libx265` from here. That is
+    /// the fail-safe direction: the alternative is emitting an H.264
+    /// argument list while every badge and every HLS attribute says HDR10.
+    /// Selection never reaches it — `Pipeline::DoviPassthrough` pairs only
+    /// with [`Encoder::Software`].
+    fn hdr10_encode_args(
+        self,
+        bitrate_kbps: u32,
+        force_idr: bool,
+        software_threads: Option<u32>,
+    ) -> Vec<String> {
+        let codec = self
+            .video_codec_for(OutputGrade::Hdr10)
+            .unwrap_or("libx265");
+        let mut args: Vec<String> = ["-c:v", codec, "-preset", "veryfast"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        args.extend([
+            "-x265-params".to_owned(),
+            "hdr10=1:repeat-headers=1".to_owned(),
+        ]);
+        args.extend([
+            "-b:v".to_owned(),
+            format!("{bitrate_kbps}k"),
+            "-maxrate".to_owned(),
+            format!("{}k", bitrate_kbps * 3 / 2),
+            "-bufsize".to_owned(),
+            format!("{}k", bitrate_kbps * 2),
+        ]);
+        if let Some(flag) = force_idr.then(|| self.forced_idr_flag()).flatten() {
+            args.extend([flag.to_owned(), "1".to_owned()]);
+        }
+        if let Some(threads) = software_threads {
+            args.extend(["-threads".to_owned(), threads.to_string()]);
+        }
+        args
     }
 }
 
@@ -988,12 +1206,20 @@ mod tests {
     /// every HDR transcode lying, on web, Android and Apple at once, with no
     /// failure anywhere to say so.
     ///
+    /// M5 did exactly that: it added `Pipeline::DoviPassthrough`, an HEVC
+    /// Main10 PQ rung. The hard-coded `"sdr"` went first —
+    /// `delivered_dynamic_range` now takes an [`OutputGrade`] and reads it —
+    /// so this test narrowed rather than widened: it is now about the SDR
+    /// grade specifically, and the SDR grade is still H.264 8-bit on every
+    /// family. Adding a second HEVC/AV1/10-bit rung means teaching
+    /// `OutputGrade` about it, not relaxing this.
+    ///
     /// So it fails here, at CI time, with the instructions in the message.
     /// The `match` is what makes a new variant unmissable — it is exhaustive,
     /// so adding one stops this file compiling until it is named here, and
     /// naming it here is what puts it in front of the assertion.
     #[test]
-    fn every_encoder_is_h264_because_the_badge_hard_codes_sdr() {
+    fn every_encoder_is_h264_because_the_sdr_grade_says_so() {
         for encoder in ALL {
             let codec = match encoder {
                 Encoder::Software
@@ -1002,6 +1228,11 @@ mod tests {
                 | Encoder::Vaapi
                 | Encoder::VideoToolbox => encoder.video_codec(),
             };
+            assert_eq!(
+                encoder.video_codec_for(OutputGrade::Sdr),
+                Some(codec),
+                "the SDR grade is `video_codec` and nothing else"
+            );
             assert!(
                 codec == "libx264" || codec.starts_with("h264_"),
                 "{encoder:?} encodes `{codec}`, which is not H.264.\n\
@@ -1013,15 +1244,138 @@ mod tests {
                  correct while every rung is H.264 8-bit and every filter chain\n\
                  ends in yuv420p/nv12.\n\
                  \n\
-                 If you are adding an HEVC, AV1 or 10-bit rung, that hard-coded\n\
-                 \"sdr\" has to go first: teach `delivered_dynamic_range` what\n\
-                 this encoder actually emits (it already takes the file, so it\n\
-                 can carry the source grade through a passthrough rung), extend\n\
-                 the truth model in docs/MEDIA-BADGES-PLAN.md §2.1, and then\n\
-                 widen this assertion to whatever the new set is. Do not delete\n\
-                 it — a badge that lies is a bug nobody reports, because the\n\
-                 picture still plays."
+                 If you are adding an HEVC, AV1 or 10-bit rung, it does not go\n\
+                 here. `video_codec` is the SDR grade, and\n\
+                 `delivered_dynamic_range` reports \"sdr\" for it on that basis.\n\
+                 Give the new rung an `OutputGrade` variant, teach\n\
+                 `video_codec_for` about it, extend the truth model in\n\
+                 docs/MEDIA-BADGES-PLAN.md §2.1, and leave this alone. Do not\n\
+                 delete it — a badge that lies is a bug nobody reports, because\n\
+                 the picture still plays."
             );
+        }
+    }
+
+    /// The HDR10 grade is software-only, and the absence of a hardware arm is
+    /// the point rather than an omission.
+    ///
+    /// `hevc_qsv` is compiled into the production ffmpeg. It is not here
+    /// because nothing about it has been measured: the spike box has no
+    /// `/dev/dri`, so its rate, its Main10 output tagging, and above all
+    /// whether a Dolby Vision RPU survives a full-hardware QSV decode into
+    /// the filter graph are all unknown. `Encoder::video_codec_for` carries
+    /// the list of measurements a node has to produce before an arm is added.
+    #[test]
+    fn only_the_software_family_has_a_measured_hevc_main10_encoder() {
+        assert_eq!(
+            Encoder::Software.video_codec_for(OutputGrade::Hdr10),
+            Some("libx265")
+        );
+        for encoder in [
+            Encoder::Nvenc,
+            Encoder::Qsv,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            assert_eq!(
+                encoder.video_codec_for(OutputGrade::Hdr10),
+                None,
+                "{encoder:?} has an unmeasured HEVC Main10 encoder at best"
+            );
+        }
+    }
+
+    /// Every colour term of a grade comes from the grade, so the PQ/8-bit
+    /// pairing that calls `abort()` has no spelling.
+    #[test]
+    fn a_grade_ties_its_transfer_to_its_bit_depth() {
+        assert_eq!(OutputGrade::Sdr.transfer(), "bt709");
+        assert_eq!(OutputGrade::Sdr.pixel_format(), "yuv420p");
+        assert_eq!(OutputGrade::Sdr.delivered_dynamic_range(), "sdr");
+        assert_eq!(OutputGrade::Hdr10.transfer(), "smpte2084");
+        assert_eq!(OutputGrade::Hdr10.matrix(), "bt2020");
+        assert_eq!(OutputGrade::Hdr10.primaries(), "bt2020");
+        assert_eq!(OutputGrade::Hdr10.pixel_format(), "yuv420p10le");
+        assert_eq!(OutputGrade::Hdr10.delivered_dynamic_range(), "hdr10");
+        // The invariant itself, stated as a rule rather than a pair of
+        // literals: a PQ grade is never 8-bit.
+        for grade in [OutputGrade::Sdr, OutputGrade::Hdr10] {
+            if grade.transfer() == "smpte2084" {
+                assert!(
+                    grade.pixel_format().ends_with("10le")
+                        || grade.pixel_format().ends_with("12le"),
+                    "{grade:?} pairs PQ with {}",
+                    grade.pixel_format()
+                );
+            }
+        }
+        assert_eq!(OutputGrade::default(), OutputGrade::Sdr);
+    }
+
+    /// The HDR10 rung's encode arguments, and the SDR ones it must not have
+    /// disturbed.
+    #[test]
+    fn the_hdr10_rung_encodes_main10_and_leaves_the_sdr_arguments_alone() {
+        let hdr = Encoder::Software.encode_args_for(
+            OutputGrade::Hdr10,
+            8_000,
+            EffectiveRateControl::Vbr,
+            false,
+            Some(4),
+        );
+        assert_eq!(
+            hdr,
+            [
+                "-c:v",
+                "libx265",
+                "-preset",
+                "veryfast",
+                "-x265-params",
+                "hdr10=1:repeat-headers=1",
+                "-b:v",
+                "8000k",
+                "-maxrate",
+                "12000k",
+                "-bufsize",
+                "16000k",
+                "-threads",
+                "4",
+            ]
+        );
+        // Quality mode is an H.264 measurement; asking for it on this grade
+        // yields the bounded VBR rather than an x265 CRF nobody swept.
+        assert_eq!(
+            Encoder::Software.encode_args_for(
+                OutputGrade::Hdr10,
+                8_000,
+                EffectiveRateControl::Qvbr { quality: 23 },
+                false,
+                None,
+            ),
+            Encoder::Software.encode_args_for(
+                OutputGrade::Hdr10,
+                8_000,
+                EffectiveRateControl::Vbr,
+                false,
+                None,
+            ),
+        );
+
+        // …and the SDR list is exactly the one `encode_args` has always
+        // produced, for every family and both rate controls.
+        for encoder in ALL {
+            for rc in [
+                EffectiveRateControl::Vbr,
+                EffectiveRateControl::Qvbr { quality: 22 },
+            ] {
+                for force_idr in [false, true] {
+                    assert_eq!(
+                        encoder.encode_args_for(OutputGrade::Sdr, 4_000, rc, force_idr, Some(2)),
+                        encoder.encode_args(4_000, rc, force_idr, Some(2)),
+                        "{encoder:?} {rc:?} idr={force_idr}"
+                    );
+                }
+            }
         }
     }
 
