@@ -2538,10 +2538,13 @@ final class PlayerController: ObservableObject {
                 if let status {
                     self.diagnosticSessionStatus = status
                     self.diagnosticSessionStatusObservedAt = Date()
-                    // A wedge recovery below replaces the session; the
-                    // generation guard above ends this poll loop on its next
-                    // pass and the successor starts its own.
-                    await self.observeDeliveryStarvation(status)
+                    // A fired wedge recovery replaces the session — and
+                    // `open()` cancels THIS poll task, so the recovery must
+                    // not run inside it. `observeDeliveryStarvation` spawns
+                    // an unstructured task (immune to this task's
+                    // cancellation) and this loop ends; the successor
+                    // session starts its own poll.
+                    if self.observeDeliveryStarvation(status) { return }
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -2557,8 +2560,12 @@ final class PlayerController: ObservableObject {
     /// media sit unfetched, and this controller still wants playback with no
     /// change or seek in flight, that is a stall whatever AVPlayer claims.
     /// Recovery goes through the same bounded same-delivery ladder as every
-    /// other stall — one reopen, then the visible failure screen.
-    private func observeDeliveryStarvation(_ status: PlaybackSessionStatus) async {
+    /// other stall — one reopen, then the visible failure screen. Returns
+    /// whether a recovery was fired, so the polling task that observed it
+    /// can end itself: the recovery runs in an unstructured task because
+    /// `reopen` → `open()` cancels the status-poll task, and a recovery
+    /// awaited inline there would cancel itself mid-open.
+    private func observeDeliveryStarvation(_ status: PlaybackSessionStatus) -> Bool {
         let eligible = started
             && wantsPlayback
             && !finished
@@ -2571,15 +2578,17 @@ final class PlayerController: ObservableObject {
             publishedEndMs: status.publishedEndMs,
             fetchedEndMs: status.fetchedEndMs,
             eligible: eligible
-        ) else { return }
+        ) else { return false }
         let position = realPositionMs()
         currentMs = position
-        await retrySameDeliveryAfterStall(PlaybackStallEvent(
+        let event = PlaybackStallEvent(
             kind: .delivery,
             action: .reopen,
             positionMs: position,
             durationMs: status.deliveredIdleMs ?? 0
-        ))
+        )
+        Task { await self.retrySameDeliveryAfterStall(event) }
+        return true
     }
 
     /// Sample the film clock independently of AVPlayer's periodic observer,
