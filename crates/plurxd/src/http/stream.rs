@@ -185,6 +185,18 @@ pub struct Caps {
     /// `1` when supported DV profiles need a normalized copy-video HLS
     /// envelope instead of raw progressive direct play.
     pub dvhls: Option<u8>,
+    /// `1` means, exactly: this client can DECODE HEVC Main10 and PRESENT it
+    /// as PQ, at the height reported in `maxheight`, on the display attached
+    /// right now.
+    ///
+    /// Strictly narrower than `hdr`, which any HDR-capable codec satisfies —
+    /// the web client computes it as the conjunction of a `MediaCapabilities`
+    /// query carrying `transferFunction:'pq'` and `(dynamic-range: high)`.
+    /// `0` is therefore "not proven", never "proven false": a browser with no
+    /// `MediaCapabilities` cannot ask about transfer functions and sends 0
+    /// rather than guess, and absent (an older client) reads the same. A `0`
+    /// or absent value must take the tone-mapped path.
+    pub hdr10t: Option<u8>,
     /// Android capability probe evidence. Diagnostic only: these fields are
     /// logged so a remote SDR decision can be distinguished from an old app,
     /// missing decoder, or non-DV display route.
@@ -261,6 +273,9 @@ impl Caps {
                 .filter_map(|value| value.parse::<u8>().ok())
                 .collect();
             profile.remux_dolby_vision = self.dvhls == Some(1);
+            // Only a client that PROVED it. Absent is not proven, and not
+            // proven tone-maps — see the field's doc comment.
+            profile.supports_hdr10_transcode = self.hdr10t == Some(1);
             profile
         } else {
             self.profile
@@ -1002,6 +1017,7 @@ pub async fn decision(
         dv = q.dv.unwrap_or_default(),
         dvprofile = q.dvprofile.as_deref().unwrap_or(""),
         dvhls = q.dvhls.unwrap_or_default(),
+        hdr10t = q.hdr10t.unwrap_or_default(),
         capver = q.capver.as_deref().unwrap_or(""),
         hdrtypes = q.hdrtypes.as_deref().unwrap_or(""),
         dvdecoders = q.dvdecoders.as_deref().unwrap_or(""),
@@ -1269,6 +1285,12 @@ pub struct StreamQuery {
     pub dv: Option<u8>,
     pub dvprofile: Option<String>,
     pub dvhls: Option<u8>,
+    /// `1` when this client decodes HEVC Main10 and presents it as PQ at
+    /// `maxheight` on the display attached right now. Absent or `0` means NOT
+    /// PROVEN, so the server tone-maps. Carried here as well as on
+    /// `/decision` so a progressive remux's verdict is built from the same
+    /// capabilities the decision was.
+    pub hdr10t: Option<u8>,
     pub force: Option<String>,
     /// The player's own stream id, so it can ask `/stream/:id/status` how this
     /// remux is doing. Optional: an old client, curl, or an AirPlay target
@@ -1330,6 +1352,7 @@ impl StreamQuery {
             dv: self.dv,
             dvprofile: self.dvprofile.clone(),
             dvhls: self.dvhls,
+            hdr10t: self.hdr10t,
             capver: None,
             hdrtypes: None,
             dvdecoders: None,
@@ -1843,6 +1866,7 @@ mod tests {
             preserve_dolby_vision: true,
             container: "mp4",
             delivered_dynamic_range: "dolby_vision",
+            transcode_grade: plurx_core::transcode::OutputGrade::Sdr,
         }
     }
 

@@ -463,10 +463,14 @@ checks = ["rust-gate"]
 reason = "The shipped-binary regression `a_signal_during_startup_stops_the_daemon_before_it_boots` raises SIGTERM the moment store activation returns, which is before `boot` runs and long before any listener exists, then requires the daemon to exit 0 having recorded the startup-window signal and never logged `plurxd starting`. Watching the eagerly installed signal streams for the whole of startup stops the daemon at its next cancel-safe boundary; reverting only the production correction so the future is again handed straight to `boot` restores the buffer-until-serve behavior, and the daemon probes hardware, binds, serves and drains, so `plurxd starting` appears and the test fails. The covered guarantee starts after `select_daemon_store`, which renames directories and fsyncs activation markers in a fixed order and is deliberately never cancelled midway."
 
 [[coverage]]
-commits = ["59ccda3a6e77e431e1e6c0caf934c7da4981ee85"]
+commits = [
+  "59ccda3a6e77e431e1e6c0caf934c7da4981ee85",
+  "5b1066860364f135877f9bb758995d1547ea0947",
+  "e4e3e50a2796216c75639f6ef61604ad68959c97",
+]
 points = ["persistence.upgrades", "cluster.auth"]
-checks = ["cluster-auth"]
-reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports 64 adjacent files with full-size probe documents under the production 2 MiB WAL, verifies exact file parity, and reproduces the oversized transaction when the 16-row import bound is reverted; the covered bound is a row count rather than a byte measurement, so this evidence holds only while 16 adjacent files rows stay under the 2,097,118-byte WAL payload capacity, an average of ~131,069 bytes per row."
+checks = ["cluster-auth", "rust-gate"]
+reason = "The retained three-voter `large_probe_json_import_respects_the_production_wal_limit` regression imports two probe bands under the production 2 MiB WAL and verifies exact `probe_json` parity for both: the original 64 adjacent 48 KiB rows, plus 18 rows of 144 KiB whose 16 adjacent rows serialize past the 2,097,118-byte WAL payload capacity, which the test asserts as its own premise so a favourable row count cannot pass for byte safety. Import transactions are now bounded by measured serialized bytes, so the covered contract is byte safety rather than an average row size; reverting only the byte bound reproduces the writer panic node m6 hit in production. `a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node` covers the remaining case a byte bound cannot split: a single 2,100 KiB probe row is refused with the table, row id, measured size, and limit, and the voter still answers afterwards instead of restarting into unreplicated SQLite recovery. The importer's boundary arithmetic — the flush exactly on and one byte past the budget, mixed sizes forcing several flushes, a row above the budget carried alone, and the estimate proven an upper bound on the `bincode::config::legacy()` encoding `hiqlite-wal` 0.14 actually appends log entries with, asserted against `standard()` as well in case that changes — is pinned by the `store::hiqlite_import` unit tests. `the_row_estimate_stays_above_what_the_wal_encoder_produces` measures integer-heavy, text-heavy, and mixed rows rather than a few large payloads, because a per-param under-count is what an estimate checked only against wide payloads hides; it fails on the superseded 11-byte per-param allowance that was verified against `standard()` alone."
 
 [[coverage]]
 commits = ["a828a217", "ab10b2c7"]
@@ -534,4 +538,41 @@ reason = "The retained core regression `in_band_hevc_parameter_sets_fill_an_empt
 commits = ["647a6c9e"]
 points = ["cluster.auth"]
 checks = ["rust-gate", "cluster-auth"]
-reason = "The retained `a_replicated_deadline_is_never_reported_as_a_wal_size_violation` regression runs in the ordinary Rust gate without the three-voter cluster, because the rule protecting a load-sensitive gate must not itself be load-sensitive. It proves the production `STORE_TIMEOUT` text classifies as a deadline rather than a store fault, that the deadline diagnosis never contains `large probe_json rows must fit the production 2 MiB WAL` and does name both itself and docs/VALIDATION.md, and that a genuine oversized write (`ClientWriteError: panicked`, which is how hiqlite-wal's byte refusal reaches the client) still earns that size verdict — as does a deadline whose voter then fails a consistent readiness read. It pins the sentinel against the real `src/store/hiqlite.rs` source with `include_str!` so a rewording cannot silently send every timeout back to the WAL verdict. Removing only the deadline class, which is the pre-fix behavior where one `.expect` collapsed every failure into the size verdict, fails the regression with `the production deadline text must classify as a deadline, not as a store fault`. `cluster-auth` remains the check that exercises the same classifier against the live three-voter import."
+reason = "The retained `a_replicated_deadline_is_never_reported_as_a_wal_size_violation` regression runs in the ordinary Rust gate without the three-voter cluster, because the rule protecting a load-sensitive gate must not itself be load-sensitive. It proves the production `STORE_TIMEOUT` text classifies as a deadline rather than a store fault, that the deadline diagnosis never contains the size verdict `byte-bounded transactions must carry probe rows a row count cannot` and does name both itself and docs/VALIDATION.md, and that a genuine oversized write (`ClientWriteError: panicked`, which is how hiqlite-wal's byte refusal reaches the client) still earns that size verdict — as does a deadline whose voter then fails a consistent readiness read. It pins the sentinel against the real `src/store/hiqlite.rs` source with `include_str!` so a rewording cannot silently send every timeout back to the WAL verdict. Removing only the deadline class, which is the pre-fix behavior where one `.expect` collapsed every failure into the size verdict, fails the regression with `the production deadline text must classify as a deadline, not as a store fault`. `cluster-auth` remains the check that exercises the same classifier against the live three-voter import."
+
+[[coverage]]
+commits = ["b1132e8"]
+points = []
+checks = []
+reason = "This commit adds a startup operator warning naming unstamped builds and how to stamp them (make docker-up / PLURX_BUILD_REF); its only surface is that log line. The packaging contract that produces stamped images is already covered by the operations contract, and the deploy-path fix lives in the fleet playbook, not in runtime assertions."
+ignore = true
+
+[[coverage]]
+commits = ["e8f8acac", "6e98c2fb"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained HLS tests read the Dolby Vision configuration record from the published init and require a preserved Profile 5 master to advertise its dvh1 identifier; the core routing tests separately require a claimed Dolby Vision profile to survive a missing generic HDR bit while an unclaimed profile still tone-maps."
+
+[[coverage]]
+commits = ["7d2a68c3"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web policy tests execute the HEVC capability probe across decoder height, bit depth, level, and HDR support, refusing Main10, max-height, and PQ claims that the browser did not prove."
+
+[[coverage]]
+commits = ["0f418c9"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` requires the capability ceiling to hold for a Dolby Vision Profile 5 source on BOTH encoders and for every file on a software-only node, requires Auto's own answer to be present on the advertised ladder, and requires the ceiling to ignore network priors while Auto still honours them. Reverting `advertised_ladder` to the uncapped `ladder(source_height)` reinstates the 1080p rung a Profile 5 session cannot serve and fails the test on the exact rung the web ABR controller used to upgrade into."
+
+[[coverage]]
+commits = ["0adf25d"]
+points = ["web.experience"]
+checks = ["web-static"]
+reason = "The retained `a session that lands on a different range repaints the badge` runs the shipped `attachSession` against a player whose decision-time range disagrees with the session's, and requires the repaint; removing the `renderPlayerInfo()` call fails it on the stale chip rather than on a missing name. It also pins that a superseded generation never paints over the live player."
+
+[[coverage]]
+commits = ["406306b"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "Three corrections with three retained regressions. `profile5_renderer_keeps_software_decode_and_may_encode_anywhere_probed` requires the reshape to keep `requires_software_decode` and to stay off the GPU end to end while allowing every hardware encoder to pair — reverting the pairing to software-only fails it, and deleting the software-decode requirement fails it in the other direction, which is the split that made a 4K Dolby Vision source 720p for non-DV clients. `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` still pins Auto onto the advertised ladder and now pins that an unproved hardware pairing falls back to the software rung rather than advertising a rung that would fail. `an upgrade needs encode headroom, not just a bandwidth estimate` drives `decideRung` with the production shape — a ~200 Mb/s JIT estimate at 720p — and requires the upgrade to be refused when the server's measured pace predicts under realtime one rung up, requires it to proceed on real headroom, requires an unmeasured session to stay able to rise, requires a rung that already failed to open never to be re-entered, and requires emergencies to keep falling past a blocked rung; reverting any one of those arms restores the 720<->1080 limit cycle."

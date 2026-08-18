@@ -571,18 +571,83 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     path
 }
 
+/// Largest Raft entry the production WAL accepts, derived the same way
+/// `crates/plurx-core/src/store/hiqlite_import.rs` derives its import bounds:
+/// the `wal_size` above, less the 34 bytes `hiqlite-wal` reserves per segment.
+/// Retiring this third copy of the tuning into one exported constant is #304.
+#[cfg(feature = "hiqlite-store")]
+const CONTRACT_WAL_USABLE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024 - 34;
+
+/// The row-count chunk bound #279 shipped and #282 replaced. Present only so
+/// the fixtures below can assert they sit *past* it: a fixture the old bound
+/// would also have carried proves nothing about a byte bound.
+#[cfg(feature = "hiqlite-store")]
+const SUPERSEDED_ROW_CHUNK_BOUND: usize = 16;
+
+/// The retained #279 band: adjacent rows with full-size probe documents.
 #[cfg(feature = "hiqlite-store")]
 const LARGE_PROBE_FILE_COUNT: i64 = 64;
 #[cfg(feature = "hiqlite-store")]
 const LARGE_PROBE_PADDING_BYTES: usize = 48 * 1024;
 
+/// The band a row count cannot bound, and the reason this contract is about
+/// bytes: [`SUPERSEDED_ROW_CHUNK_BOUND`] adjacent rows of this size serialize
+/// past [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`], which is #290's production
+/// panic. Importing them proves the transaction builder split on bytes.
 #[cfg(feature = "hiqlite-store")]
-fn large_probe_json(ordinal: i64) -> String {
+const OVERSIZED_PROBE_FILE_COUNT: i64 = 18;
+#[cfg(feature = "hiqlite-store")]
+const OVERSIZED_PROBE_PADDING_BYTES: usize = 144 * 1024;
+
+/// The importer's single-row ceiling, mirroring its derivation from
+/// [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`] less its encoding reserve and
+/// transaction envelope. A row above this cannot be submitted in any
+/// transaction, so import refuses the backup.
+#[cfg(feature = "hiqlite-store")]
+const CONTRACT_IMPORT_MAX_ROW_BYTES: usize = CONTRACT_WAL_USABLE_PAYLOAD_BYTES - 64 * 1024 - 256;
+
+/// A single probe document larger than the whole WAL payload capacity, so it is
+/// unimportable under any bound rather than merely past the reserve. Import must
+/// refuse it instead of handing it to the WAL writer.
+#[cfg(feature = "hiqlite-store")]
+const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = 2_100 * 1024;
+
+/// The premises the probe fixtures rest on, checked where they are declared so
+/// a later size tweak cannot quietly turn either regression into a test of
+/// something easier than the bound it was written for.
+#[cfg(feature = "hiqlite-store")]
+const _: () = {
+    assert!(
+        OVERSIZED_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND
+            > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        "the oversized band must exceed what the superseded row bound would have submitted, \
+         or the regression re-proves the row count instead of the byte bound"
+    );
+    assert!(
+        LARGE_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        "the retained #279 band must stay inside the superseded bound, so the two bands \
+         test different things"
+    );
+    assert!(
+        UNIMPORTABLE_PROBE_PADDING_BYTES > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        "the refused row must exceed the WAL itself, so the refusal is unarguable rather \
+         than an artefact of the reserve held back from it"
+    );
+    assert!(
+        CONTRACT_IMPORT_MAX_ROW_BYTES < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        "the single-row ceiling must sit under the capacity it is derived from"
+    );
+};
+#[cfg(feature = "hiqlite-store")]
+const UNIMPORTABLE_PROBE_FILE_ID: i64 = 3_001;
+
+#[cfg(feature = "hiqlite-store")]
+fn large_probe_json(ordinal: i64, padding_bytes: usize) -> String {
     serde_json::json!({
         "format": {
             "filename": format!("/fixture/shows/large-probe-{ordinal:03}.mkv"),
             "tags": {
-                "comment": "x".repeat(LARGE_PROBE_PADDING_BYTES),
+                "comment": "x".repeat(padding_bytes),
             },
         },
         "ordinal": ordinal,
@@ -590,8 +655,10 @@ fn large_probe_json(ordinal: i64) -> String {
     .to_string()
 }
 
+/// Seeds `count` `files` rows whose `probe_json` is padded to `padding_bytes`,
+/// numbered from `first_id` so several bands can share one fixture.
 #[cfg(feature = "hiqlite-store")]
-fn seed_large_probe_files(path: &std::path::Path) {
+fn seed_probe_band(path: &std::path::Path, first_id: i64, count: i64, padding_bytes: usize) {
     let mut connection = rusqlite::Connection::open(path).expect("open large-probe fixture");
     let transaction = connection
         .transaction()
@@ -604,15 +671,16 @@ fn seed_large_probe_files(path: &std::path::Path) {
                  VALUES (?1, 10, ?2, ?3, ?4, ?5, ?6)",
             )
             .expect("prepare large-probe file insert");
-        for ordinal in 0..LARGE_PROBE_FILE_COUNT {
+        for ordinal in 0..count {
+            let id = first_id + ordinal;
             insert
                 .execute(rusqlite::params![
-                    1_000 + ordinal,
-                    format!("/fixture/shows/large-probe-{ordinal:03}.mkv"),
-                    10_000 + ordinal,
-                    500 + ordinal,
-                    large_probe_json(ordinal),
-                    600 + ordinal,
+                    id,
+                    format!("/fixture/shows/large-probe-{id:04}.mkv"),
+                    10_000 + id,
+                    500 + id,
+                    large_probe_json(id, padding_bytes),
+                    600 + id,
                 ])
                 .expect("insert large-probe file");
         }
@@ -921,9 +989,16 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
 /// reworded deadline cannot silently stop being recognized as one.
 const REPLICATED_DEADLINE_MESSAGE: &str = "replicated store operation timed out";
 
-/// The one claim the WAL-size contract is entitled to make. Nothing that did
+/// The one claim the byte-bound contract is entitled to make. Nothing that did
 /// not actually observe an oversized Raft transaction may print it.
-const WAL_SIZE_VERDICT: &str = "large probe_json rows must fit the production 2 MiB WAL";
+///
+/// This is the live wording of
+/// [`large_probe_json_import_respects_the_production_wal_limit`]'s verdict.
+/// #282 replaced #279's row cap with a byte budget and reworded it from
+/// `large probe_json rows must fit the production 2 MiB WAL`; the claim being
+/// guarded is unchanged, so a later rewording should move this constant rather
+/// than reintroduce a second sentence for the same verdict.
+const WAL_SIZE_VERDICT: &str = "byte-bounded transactions must carry probe rows a row count cannot";
 
 /// How many times a replicated contract step re-attempts after the store
 /// reports its per-operation deadline.
@@ -1031,10 +1106,9 @@ where
 /// A busy host must never be able to print the WAL-size verdict.
 ///
 /// Regression for #368: `make validate` reported
-/// `Database("replicated store operation timed out")` as
-/// `large probe_json rows must fit the production 2 MiB WAL` on a branch whose
-/// entire diff was two JSON/text files, so a saturated worker was
-/// indistinguishable from a real durable-state regression. Runs without the
+/// `Database("replicated store operation timed out")` as [`WAL_SIZE_VERDICT`]
+/// on a branch whose entire diff was two JSON/text files, so a saturated worker
+/// was indistinguishable from a real durable-state regression. Runs without the
 /// cluster on purpose — the rule it protects must not itself be load-sensitive.
 #[test]
 fn a_replicated_deadline_is_never_reported_as_a_wal_size_violation() {
@@ -1088,6 +1162,17 @@ fn a_replicated_deadline_is_never_reported_as_a_wal_size_violation() {
     );
 }
 
+/// Import transactions must be bounded by serialized bytes, not by a row count.
+///
+/// The fixture is built to defeat a row count on purpose: the oversized band's
+/// rows are large enough that [`SUPERSEDED_ROW_CHUNK_BOUND`] adjacent ones
+/// exceed the production WAL payload capacity, which is exactly the entry that
+/// panicked node `m6` into an HTTP-healthy unreplicated boot (#290). That
+/// premise is asserted where the fixture sizes are declared, so passing means
+/// the builder split on bytes rather than that the row count was favourable.
+///
+/// The #279 band is retained alongside it: the byte bound must not regress the
+/// ordinary large-library case that motivated the row cap.
 #[cfg(feature = "hiqlite-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_probe_json_import_respects_the_production_wal_limit() {
@@ -1096,7 +1181,18 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
 
     let source = tempfile::tempdir().expect("large-probe SQLite fixture directory");
     let fixture_path = populated_current_import_fixture(source.path());
-    seed_large_probe_files(&fixture_path);
+    seed_probe_band(
+        &fixture_path,
+        1_000,
+        LARGE_PROBE_FILE_COUNT,
+        LARGE_PROBE_PADDING_BYTES,
+    );
+    seed_probe_band(
+        &fixture_path,
+        2_000,
+        OVERSIZED_PROBE_FILE_COUNT,
+        OVERSIZED_PROBE_PADDING_BYTES,
+    );
     let prepared = prepare_sqlite_import(source.path()).expect("prepare large-probe import backup");
 
     // Each attempt re-proves the whole contract from an empty target, so a
@@ -1145,22 +1241,94 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
             .find(|digest| digest.table == "files")
             .expect("files digest")
             .row_count,
-        LARGE_PROBE_FILE_COUNT as u64 + 1,
-        "exact file parity must include the existing fixture row and all large probes"
+        (LARGE_PROBE_FILE_COUNT + OVERSIZED_PROBE_FILE_COUNT) as u64 + 1,
+        "exact file parity must include the existing fixture row and both probe bands"
     );
 
-    for ordinal in 0..LARGE_PROBE_FILE_COUNT {
-        let expected = large_probe_json(ordinal);
-        let stored = replicated_read("read imported large probe", || {
-            store.get_file_probe_json(1_000 + ordinal)
-        })
-        .await;
-        assert_eq!(
-            stored.as_deref(),
-            Some(expected.as_str()),
-            "large probe_json row {ordinal} must retain exact bytes"
-        );
+    // `probe_json` is durable media metadata: splitting a transaction may not
+    // drop, truncate, or rewrite a byte of it.
+    for (first_id, count, padding) in [
+        (1_000, LARGE_PROBE_FILE_COUNT, LARGE_PROBE_PADDING_BYTES),
+        (
+            2_000,
+            OVERSIZED_PROBE_FILE_COUNT,
+            OVERSIZED_PROBE_PADDING_BYTES,
+        ),
+    ] {
+        for ordinal in 0..count {
+            let id = first_id + ordinal;
+            let stored = replicated_read("read imported large probe", || {
+                store.get_file_probe_json(id)
+            })
+            .await;
+            assert_eq!(
+                stored.as_deref(),
+                Some(large_probe_json(id, padding).as_str()),
+                "large probe_json row {id} must retain exact bytes"
+            );
+        }
     }
+}
+
+/// A row no transaction could carry is refused before submission.
+///
+/// The alternative is #290's production failure: the WAL writer panics on the
+/// oversized entry, `plurxd` exits mid-import, and the restart serves
+/// unreplicated SQLite while reporting healthy. A refusal keeps the node alive
+/// and tells the operator which row to look at, so this asserts both — that the
+/// error is actionable, and that the voter still answers afterwards.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated unimportable-probe target");
+
+    let source = tempfile::tempdir().expect("unimportable-probe SQLite fixture directory");
+    let fixture_path = populated_current_import_fixture(source.path());
+    seed_probe_band(
+        &fixture_path,
+        UNIMPORTABLE_PROBE_FILE_ID,
+        1,
+        UNIMPORTABLE_PROBE_PADDING_BYTES,
+    );
+    let prepared =
+        prepare_sqlite_import(source.path()).expect("prepare unimportable-probe import backup");
+
+    let refusal = store
+        .import_sqlite_backup(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect_err("a row larger than the WAL payload capacity must not be submitted")
+        .to_string();
+    assert!(
+        refusal.contains("files")
+            && refusal.contains(&format!("row id={UNIMPORTABLE_PROBE_FILE_ID}")),
+        "the refusal must name the table and the row an operator has to fix: {refusal}"
+    );
+    assert!(
+        refusal.contains(&CONTRACT_IMPORT_MAX_ROW_BYTES.to_string()),
+        "the refusal must state the limit the row exceeded: {refusal}"
+    );
+    assert!(
+        !refusal.contains("xxxx"),
+        "a refusal must not quote the imported payload: {refusal}"
+    );
+
+    assert_eq!(
+        store
+            .get_file_probe_json(UNIMPORTABLE_PROBE_FILE_ID)
+            .await
+            .expect("query the voter after a refused import"),
+        None,
+        "the refused row must not be in replicated state, and the voter must still answer"
+    );
 }
 
 /// A legacy backup whose Trakt row is still cleartext must be refused, and

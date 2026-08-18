@@ -159,6 +159,17 @@ proved and nothing was found broken. The production deadline stays at three
 seconds because it is a server safety bound, so the suite absorbs load by
 re-attempting a deadlined step from a reset target instead of by relaxing it.
 
+**Why this check reaches that deadline before the others do.** The import
+contract and the production bound push against each other by design. The
+byte-budget transaction builder (#282) sizes every transaction as close to the
+WAL payload capacity as it can, because a transaction that stays comfortably
+small would not prove the bound it exists to prove. Maximising the payload also
+maximises how long one replicated operation takes, so this check spends most of
+its time on operations deliberately sized to sit near the three-second ceiling.
+That is not only a test-harness concern: a real library import on a busy server
+runs the same builder against the same fixed bound, so an operator seeing this
+timeout in production is seeing the same interaction, not a different bug.
+
 **How to tell it from a real regression.** The failures look different at the
 client, and the check now says which of these three it saw:
 
@@ -299,6 +310,18 @@ scripts/prove-fix origin/main repaired_case crates/plurxd/src/example.rs
 scripts/prove-fix --command 'make apple-test' origin/main - \
   clients/apple/Sources/PlayerView.swift
 ```
+
+Both proof runs compile into an isolated cargo target directory, never the one
+an ordinary `cargo` or `make validate` invocation uses. This is mandatory, not a
+convenience: the second run compiles reverted source, and cargo's freshness
+check is mtime-based, so a shared target directory leaves the pre-fix artifact
+newer than the corrected checkout and the next gate silently reuses it. The
+isolated directory is a sibling of the inherited `CARGO_TARGET_DIR`
+(`<dir>-prove-fix`), so proofs still reuse each other's dependency builds and
+pay one cold workspace build rather than one per invocation; with no inherited
+value it is a directory inside the disposable clone, matching what cargo would
+have done anyway. `tests/validation/test_prove_fix.py` asserts the isolation so
+a refactor cannot quietly reintroduce the sharing.
 
 The first run must be green. The second run must be red after the named
 production paths are taken from the base revision. A test that stays green is

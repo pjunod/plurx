@@ -449,14 +449,8 @@ final class AppleClientTests: XCTestCase {
 
     @MainActor
     func testApplePlayerNeverTreatsBufferingOrTransportFailureAsCodecFailure() {
-        XCTAssertFalse(PlayerController.shouldMonitorSilentPlaybackStall(
-            timeControlStatus: .waitingToPlayAtSpecifiedRate
-        ))
         XCTAssertTrue(PlayerController.shouldMonitorBufferingStall(
             timeControlStatus: .waitingToPlayAtSpecifiedRate
-        ))
-        XCTAssertTrue(PlayerController.shouldMonitorSilentPlaybackStall(
-            timeControlStatus: .playing
         ))
         XCTAssertFalse(PlayerController.shouldMonitorBufferingStall(
             timeControlStatus: .playing
@@ -551,6 +545,266 @@ final class AppleClientTests: XCTestCase {
             ),
             .none,
             "the recovery ladder cannot loop either compatibility attempt"
+        )
+    }
+
+    /// The Dolby Vision Profile 5 black screen. A device with no Profile 5
+    /// decoder answers with one of two CoreMedia verdicts, and neither used to
+    /// reach the ladder — so the client stopped dead instead of asking the
+    /// server for a picture it could actually decode.
+    @MainActor
+    func testApplePlayerTreatsDolbyVisionRejectionsAsCompatibilityFailures() {
+        for status in [-12927, -15517] {
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: "CoreMediaErrorDomain",
+                        code: status,
+                        userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "CoreMediaErrorDomain:\(status) is a media verdict, not a transport fault"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: AVFoundationErrorDomain,
+                        code: AVError.unknown.rawValue,
+                        userInfo: [NSUnderlyingErrorKey: NSError(
+                            domain: "CoreMediaErrorDomain",
+                            code: status,
+                            userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                        )]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "the verdict counts when it arrives underneath an opaque AVError"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: nil,
+                    eventDomain: "CoreMediaErrorDomain",
+                    eventStatus: status,
+                    eventComment: nil
+                ),
+                "the HLS error log carries the same verdict with no NSError at all"
+            )
+        }
+
+        // Widening pre-start classification must not have swallowed the
+        // transport and resource exclusions the ladder is protected by.
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.unknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(
+                    domain: NSURLErrorDomain,
+                    code: NSURLErrorTimedOut,
+                    userInfo: [NSLocalizedDescriptionKey: "The request timed out."]
+                )]
+            ),
+            eventDomain: NSURLErrorDomain,
+            eventStatus: NSURLErrorTimedOut,
+            eventComment: "segment request timed out"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.decoderTemporarilyUnavailable.rawValue,
+                userInfo: [:]
+            ),
+            eventDomain: nil,
+            eventStatus: nil,
+            eventComment: "decoder resources are temporarily unavailable"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(domain: "CoreMediaErrorDomain", code: -12660, userInfo: [:]),
+            eventDomain: "CoreMediaErrorDomain",
+            eventStatus: -12660,
+            eventComment: "HTTP 403"
+        ))
+    }
+
+    /// A resume was bounded only because it had a seek to run afterwards. A
+    /// fresh start had nothing to wait on and so waited forever — the exact
+    /// shape of the reported black screen.
+    @MainActor
+    func testApplePlayerBoundsAFreshStartsWaitForReadiness() {
+        XCTAssertEqual(PlayerController.itemReadinessDeadlineSeconds, 15)
+
+        XCTAssertTrue(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a VOD cold start has to give up eventually too"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 30_000,
+                seeksAfterAttach: true,
+                resumesPlayback: true
+            ),
+            "a resume is already bounded by the seek's own deadline"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: false,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a growing session may still be filling its publish gate"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: false
+            ),
+            "an item deliberately prepared at rate 0 is nobody's black screen"
+        )
+    }
+
+    /// Audio advancing over a black screen is invisible to every other
+    /// detector: the film clock moves, so both stall detectors reset on each
+    /// sample and AVPlayer never reports a stall. The presentation size is the
+    /// only evidence that nothing was decoded.
+    @MainActor
+    func testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded() {
+        XCTAssertEqual(PlayerController.blackFrameDecodeFailureMs, 6_000)
+
+        var black = BlackFrameWatchdog()
+        black.opened()
+        for step in 0...11 {
+            XCTAssertFalse(
+                black.observe(
+                    positionMs: step * 500,
+                    presentationSize: .zero,
+                    hasVideoSource: true,
+                    playing: true
+                ),
+                "five and a half seconds of black is still inside the threshold"
+            )
+        }
+        XCTAssertTrue(black.observe(
+            positionMs: 6_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(
+            black.observe(
+                positionMs: 6_500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: true
+            ),
+            "one item enters the ladder once, not on every later sample"
+        )
+
+        // A decoded picture — of any size — is the end of the matter.
+        var decoding = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(decoding.observe(
+                positionMs: step * 500,
+                presentationSize: CGSize(width: 3840, height: 2160),
+                hasVideoSource: true,
+                playing: true
+            ))
+        }
+        XCTAssertTrue(decoding.presentedVideo)
+
+        // An audiobook's presentation size is legitimately zero forever.
+        var audioOnly = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(audioOnly.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: false,
+                playing: true
+            ))
+        }
+
+        // Neither a paused transport nor a seek is six seconds of black.
+        var paused = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(paused.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: false
+            ))
+        }
+        var seeking = BlackFrameWatchdog()
+        XCTAssertFalse(seeking.observe(
+            positionMs: 0,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(seeking.observe(
+            positionMs: 600_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertEqual(seeking.blackMs, 0)
+    }
+
+    /// A device log has to say which rung a failure bought, and what bought
+    /// it — the two client-observed verdicts carry no AVFoundation error to
+    /// print at all.
+    @MainActor
+    func testApplePlaybackFailureDetailNamesTheLadderRungItBought() {
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: NSError(domain: "CoreMediaErrorDomain", code: -12927, userInfo: [:]),
+                eventDomain: "CoreMediaErrorDomain",
+                eventStatus: -12927,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .itemFailure,
+                    fallback: .transcode
+                )
+            ),
+            "error=CoreMediaErrorDomain:-12927 · event=CoreMediaErrorDomain:-12927 · cause=item-failed · ladder=transcode"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .readinessTimeout,
+                    fallback: .hdrBase
+                )
+            ),
+            "cause=readiness-timeout · ladder=hdr-base"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .blackFrames,
+                    fallback: .none
+                )
+            ),
+            "cause=black-frames · ladder=none",
+            "a verdict with no rung left still has to be visible in the log"
         )
     }
 
@@ -1130,25 +1384,25 @@ final class AppleClientTests: XCTestCase {
     func testStallDetectorIgnoresPausesAndRecoversOnlyAfterSustainedNoProgress() {
         var detector = PlaybackStallDetector()
 
-        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: false), .none)
-        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: false, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
 
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .nudge)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .reopen)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .nudge)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .reopen)
 
         // A deliberate pause resets the wall-clock evidence rather than
         // letting it carry into the next press of Play.
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
     }
 
     @MainActor
-    func testBufferingWaitHasAnIndependentBoundedRecoveryTimer() {
+    func testBufferingWaitHasABoundedRecoveryTimer() {
         var monitor = PlaybackRecoveryMonitor()
         let beganAt: TimeInterval = 1_000
 
@@ -1185,33 +1439,51 @@ final class AppleClientTests: XCTestCase {
             }
         }
 
-        XCTAssertNil(monitor.silentDetector.lastPositionMs)
-        XCTAssertEqual(monitor.bufferingDetector.lastPositionMs, 30_000)
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 30_000)
     }
 
     @MainActor
-    func testBufferingRecoveryCannotStartBeforeTheFirstFiveSecondsPlay() {
+    func testUnestablishedBufferingGetsALongerLeashThenABoundedReopen() {
         var monitor = PlaybackRecoveryMonitor()
         let beganAt: TimeInterval = 2_000
 
-        for check in 0...10 {
+        // An unestablished item may be waiting on the server's publish gate,
+        // so no nudge and no reopen through fourteen stagnant samples — the
+        // established thresholds must not apply…
+        for check in 0...14 {
             XCTAssertNil(monitor.sample(
                 positionMs: 0,
                 timeControlStatus: .waitingToPlayAtSpecifiedRate,
                 shouldMonitor: true,
                 establishedPlayback: false,
                 observedAt: beganAt + Double(check * 2)
-            ))
+            ), "unexpected event at check \(check)")
         }
-        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+        // …but the clock was counting the whole time, not disarmed…
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 0)
 
+        // …and the fifteenth stagnant sample reopens. Before this leash
+        // existed the unestablished state had no detector at all, so a
+        // recovery reopen that landed into continued starvation froze
+        // forever with no error — the field failure this pins.
+        let fired = monitor.sample(
+            positionMs: 0,
+            timeControlStatus: .waitingToPlayAtSpecifiedRate,
+            shouldMonitor: true,
+            establishedPlayback: false,
+            observedAt: beganAt + 30
+        )
+        XCTAssertEqual(fired?.action, .reopen)
+        XCTAssertEqual(fired?.kind, .buffering)
+
+        // Establishment restores the short mid-playback ladder.
         for check in 0...6 {
             let event = monitor.sample(
                 positionMs: 30_000,
                 timeControlStatus: .waitingToPlayAtSpecifiedRate,
                 shouldMonitor: true,
                 establishedPlayback: true,
-                observedAt: beganAt + Double(30 + check * 2)
+                observedAt: beganAt + Double(40 + check * 2)
             )
             if check == 6 {
                 XCTAssertEqual(event?.kind, .buffering)
@@ -1245,7 +1517,8 @@ final class AppleClientTests: XCTestCase {
                 observedAt: 3_000 + Double(check * 2)
             ))
         }
-        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+        // Counting, not disarmed: the unestablished leash is longer, not off.
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 90_000)
 
         attachment.observe(positionMs: 95_000, playing: true)
         XCTAssertTrue(attachment.establishedPlayback)
@@ -1287,25 +1560,169 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
-    func testPlaybackRecoveryPredicatesStayExclusiveAndBufferingWinsAMerge() {
-        for status in [
-            AVPlayer.TimeControlStatus.paused,
-            .waitingToPlayAtSpecifiedRate,
-            .playing,
-        ] {
-            XCTAssertNotEqual(
-                PlayerController.shouldMonitorSilentPlaybackStall(timeControlStatus: status),
-                PlayerController.shouldMonitorBufferingStall(timeControlStatus: status)
+    func testRegimeFlappingCannotResetTheStallClock() {
+        // The exact field failure this pins: AVPlayer alternates between
+        // `.playing` and `.waitingToPlayAtSpecifiedRate` faster than a
+        // per-regime detector's threshold. The old split design zeroed each
+        // leg on every crossing, so a real freeze never latched — sessions
+        // died server-side as `idle` with no stall beacon ever sent.
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 5_000
+        var fired: PlaybackStallEvent?
+
+        for check in 0...6 {
+            let event = monitor.sample(
+                positionMs: 42_000,
+                timeControlStatus: check % 2 == 0
+                    ? .waitingToPlayAtSpecifiedRate
+                    : .playing,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(check * 2)
+            )
+            if let event, event.action == .reopen { fired = event }
+        }
+
+        XCTAssertEqual(fired?.action, .reopen)
+        XCTAssertEqual(fired?.positionMs, 42_000)
+        // Half the stagnant samples were explicit waits; ambiguity routes to
+        // transport recovery, never the codec/HDR ladder.
+        XCTAssertEqual(fired?.kind, .buffering)
+    }
+
+    func testStallKindMajorityTiesGoToTransportRecovery() {
+        XCTAssertTrue(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 3, stagnantChecks: 6
+        ))
+        XCTAssertTrue(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 6, stagnantChecks: 6
+        ))
+        XCTAssertFalse(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 2, stagnantChecks: 6
+        ))
+        XCTAssertFalse(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 0, stagnantChecks: 6
+        ))
+    }
+
+    func testDeliveryStarvationRequiresServerTruthAndConfirmation() {
+        var detector = DeliveryStarvationDetector()
+        // Wedge shape: film clock frozen at 40_000, nothing buffered.
+        func wedge(
+            _ idle: Int?, published: Int? = 200_000, fetched: Int? = 150_000,
+            eligible: Bool = true
+        ) -> Bool {
+            detector.observe(
+                deliveredIdleMs: idle, publishedEndMs: published, fetchedEndMs: fetched,
+                positionMs: 40_000, runwaySeconds: 0.5, eligible: eligible
             )
         }
 
-        XCTAssertEqual(
-            PlaybackRecoveryMonitor.select(
-                silentAction: .reopen,
-                bufferingAction: .nudge
-            ),
-            PlaybackStallSelection(kind: .buffering, action: .nudge)
-        )
+        // Baseline sample establishes the position; healthy delivery cadence.
+        XCTAssertFalse(wedge(6_000))
+        XCTAssertFalse(wedge(6_000))
+        // First qualifying poll only confirms; the second fires.
+        XCTAssertFalse(wedge(16_000))
+        XCTAssertTrue(wedge(18_000))
+
+        // Playing out the tail of a finished stream can never qualify:
+        // nothing is pending server-side.
+        XCTAssertFalse(wedge(60_000, published: 200_000, fetched: 195_000))
+
+        // Ineligible states (paused, change in flight, seek pending) reset
+        // the confirmation count rather than accumulating across them.
+        XCTAssertFalse(wedge(20_000, fetched: 100_000))
+        XCTAssertFalse(wedge(22_000, fetched: 100_000, eligible: false))
+        XCTAssertFalse(wedge(24_000, fetched: 100_000))
+
+        // Absent server fields — an old server, or a session with no
+        // delivery yet — never qualify.
+        XCTAssertFalse(wedge(nil))
+        XCTAssertFalse(wedge(30_000, published: nil, fetched: nil))
+
+        // The delivery kind reaches the server beacon as its own reason.
+        XCTAssertEqual(PlaybackStallKind.delivery.rawValue, "delivery")
+        XCTAssertFalse(PlaybackStallKind.delivery.terminalState.isPlaying)
+    }
+
+    /// The build 63 field regression, pinned. Server-side evidence alone —
+    /// "no completed delivery for 16+ s while published media is pending" —
+    /// is ALSO what a healthy player with a full forward buffer looks like:
+    /// `preferredForwardBufferDuration` is 60 s, so AVPlayer tops up and then
+    /// stops fetching for a long stretch while the producer parks at the
+    /// 180 s ahead-window cap. Build 63 fired on that and killed a healthy
+    /// 2160p session every ~2.4 minutes. The film clock is the discriminator.
+    func testDeliveryStarvationNeverFiresOnAHealthyBufferedPlayer() {
+        var detector = DeliveryStarvationDetector()
+
+        // A topped-up player: 55 s of runway, clock advancing 2 s per poll,
+        // server delivery meter idle for far longer than the threshold and a
+        // deep pending backlog (the ahead window is deliberately deep).
+        var positionMs = 40_000
+        var idleMs = 4_000
+        for _ in 0..<40 {
+            XCTAssertFalse(
+                detector.observe(
+                    deliveredIdleMs: idleMs,
+                    publishedEndMs: 600_000,
+                    fetchedEndMs: 420_000,
+                    positionMs: positionMs,
+                    runwaySeconds: 55,
+                    eligible: true
+                ),
+                "a player whose clock is advancing is not starving"
+            )
+            positionMs += 2_000
+            idleMs += 2_000
+        }
+
+        // Same server numbers, clock now frozen, buffer drained — that IS the
+        // wedge, and it must still be caught promptly.
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertTrue(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+    }
+
+    /// A frozen clock with media still in hand is a decode/render stall, not
+    /// delivery starvation — the position ladder owns that case, and the
+    /// delivery watchdog must not claim it.
+    func testDeliveryStarvationIgnoresAFrozenClockThatStillHasBuffer() {
+        var detector = DeliveryStarvationDetector()
+        for _ in 0..<10 {
+            XCTAssertFalse(detector.observe(
+                deliveredIdleMs: 45_000, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+                positionMs: 90_000, runwaySeconds: 42, eligible: true
+            ))
+        }
+    }
+
+    func testRecoveryReopenBudgetBrakesAStorm() {
+        var budget = RecoveryReopenBudget()
+
+        // The observed storm: automatic reopens ~1.5 s apart. Three are
+        // admitted, the fourth inside the rolling minute is refused.
+        XCTAssertTrue(budget.admit(at: 100))
+        XCTAssertTrue(budget.admit(at: 101.5))
+        XCTAssertTrue(budget.admit(at: 103))
+        XCTAssertFalse(budget.admit(at: 104.5))
+        XCTAssertFalse(budget.admit(at: 150))
+
+        // Outside the window the brake releases…
+        XCTAssertTrue(budget.admit(at: 165))
+
+        // …and an explicit viewer retry clears it entirely.
+        budget.reset()
+        XCTAssertTrue(budget.admit(at: 166))
+        XCTAssertTrue(budget.admit(at: 166.5))
     }
 
     func testRepeatedBufferingRecoveryStopsWithNetworkSpecificState() {
