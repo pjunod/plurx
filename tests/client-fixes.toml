@@ -236,3 +236,11 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func waitingMajority(waitingSamples: Int, stagnantChecks: Int)"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testRegimeFlappingCannotResetTheStallClock"
+
+[[fixes]]
+id = "apple.delivery-watchdog-unstructured-recovery"
+commits = ["5f996b2"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "Task { await self.retrySameDeliveryAfterStall(event) }"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testDeliveryStarvationRequiresServerTruthAndConfirmation"
