@@ -521,6 +521,41 @@ Every run writes under `target/validation/`:
 CI uploads that directory even when a check fails. Read `report.json` first to
 find the affected promise, then the named log to diagnose the failing layer.
 
+## Load-sensitive checks — what a timeout means
+
+The replicated-store contract (`cluster-auth` check / `make cluster-check`)
+starts three separate voter processes, loads an import fixture, and drives
+every store method through a hiqlite remote client with a 3-second per-call
+deadline. On a loaded host — one running concurrent CI jobs, parallel build
+workers, or a mix of test processes — a voter can be busy enough to trigger
+that deadline.
+
+When this happens, the `StoreError::Timeout` variant is returned, which is
+distinct from `StoreError::Database` (a genuine storage error) and
+`StoreError::Migration` (a WAL-size contract violation). The test output will
+say:
+
+```
+replicated store operation timed out: replicated store operation after 3s
+```
+
+A timeout on a diff that cannot reach Rust code is evidence of host load, not
+a regression. To reproduce the failing test in isolation:
+
+```bash
+cargo test --locked -p plurx-core --features hiqlite-store \
+  --test store_contract -- <test_name> --test-threads=1 --nocapture
+```
+
+A passing isolated run confirms the host was loaded. The `make cluster-check`
+target runs these tests with `--test-threads=1` to minimise contention, but
+a loaded CI worker may still hit the deadline.
+
+The `cluster-growth` and `cluster-check` commands also start three-voter
+clusters and are subject to the same load sensitivity. The compacted growth
+gate (`resource-bounds` check) measures per-incoming-heartbeat write
+amplification; a loaded host may produce inflated byte counts there too.
+
 ## Non-goals — what the framework does not pretend to prove
 
 - **It does not infer behavior from code.** Humans define the contract and its

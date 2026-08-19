@@ -408,7 +408,9 @@ impl HiqliteAuthStore {
             super::hiqlite_catalog::local_catalog_truth_digest(self.client()),
         )
         .await
-        .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
+        .map_err(|_| StoreError::Timeout(format!(
+                    "replicated store operation after {STORE_TIMEOUT:?}"
+                )))?
     }
 
     async fn local_auth_dump(&self) -> Result<AuthStoreDump, StoreError> {
@@ -1024,7 +1026,7 @@ where
 {
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
-        .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
+        .map_err(|_| StoreError::Timeout("replicated store operation timed out".to_owned()))?
         .map_err(database_error)
 }
 

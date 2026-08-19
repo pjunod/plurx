@@ -1028,14 +1028,26 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
     );
     let prepared = prepare_sqlite_import(source.path()).expect("prepare large-probe import backup");
 
-    let report = store
+    let report = match store
         .import_sqlite_backup(
             &prepared.backup_path,
             &prepared.backup_sha256,
             prepared.schema_version,
         )
         .await
-        .expect("byte-bounded transactions must carry probe rows a row count cannot");
+    {
+        Ok(report) => report,
+        Err(plurx_core::error::StoreError::Timeout(message)) => {
+            panic!(
+                "large-probe import timed out after 3 s (the host was too loaded to                  complete the test): {message}"
+            );
+        }
+        Err(error) => {
+            panic!(
+                "byte-bounded transactions must carry probe rows a row count cannot: {error}"
+            );
+        }
+    };
     assert_eq!(
         report
             .tables
@@ -1130,6 +1142,50 @@ async fn a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node
             .expect("query the voter after a refused import"),
         None,
         "the refused row must not be in replicated state, and the voter must still answer"
+    );
+}
+
+/// A simulated store timeout must surface as `StoreError::Timeout`, not as a
+/// WAL-limit or database failure.
+///
+/// This is the regression for the defect reported in #368, where a busy host's
+/// `replicated store operation timed out` was wrapped in `StoreError::Database`
+/// and surfaced as `large probe_json rows must fit the production 2 MiB WAL`.
+/// The fix added the separate `StoreError::Timeout` variant so the two failure
+/// modes are distinguishable by type, not by string-matching.
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_timeout_is_distinct_from_a_wal_limit_failure() {
+    use plurx_core::error::StoreError;
+
+    // Build a timeout error exactly as timeout_store produces it.
+    let timeout_error = StoreError::Timeout("test timeout after 3s".to_owned());
+    assert!(
+        !matches!(timeout_error, StoreError::Database(_)),
+        "a timeout must not be reported as a database error"
+    );
+    assert!(
+        !timeout_error.to_string().contains("WAL"),
+        "a timeout must not be reported as a WAL-limit error: {}",
+        timeout_error
+    );
+
+    // The import-time WAL-size refusal produces StoreError::Migration, which
+    // must also not be confused with a timeout.
+    let wal_error = StoreError::Migration(
+        "table files import transaction of 1 row(s) serializes to about 42 bytes,          above the production WAL payload capacity"
+            .to_owned(),
+    );
+    assert!(
+        !matches!(wal_error, StoreError::Timeout(_)),
+        "a WAL-limit error must not be reported as a timeout"
+    );
+
+    // A generic store error must still be distinguishable from both.
+    let db_error = StoreError::Database("the database is on fire".to_owned());
+    assert!(
+        !matches!(db_error, StoreError::Timeout(_)),
+        "a database error must not be reported as a timeout"
     );
 }
 

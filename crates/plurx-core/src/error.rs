@@ -11,6 +11,17 @@ pub enum StoreError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// A replicated-store operation failed before it finished because the
+    /// three-second wall-clock deadline was reached.  Separate from
+    /// `Database` so callers can distinguish a loaded machine (retryable)
+    /// from a genuine data or storage error (investigatable).
+    ///
+    /// The runner context should state what the timeout means — "the voter
+    /// was busy serving other requests or the host was under CPU/memory
+    /// pressure" — rather than presenting it as a storage-integrity failure.
+    #[error("replicated store operation timed out: {0}")]
+    Timeout(String),
+
     #[error("schema migration failed: {0}")]
     Migration(String),
 
