@@ -3289,7 +3289,7 @@ mod tests {
             .expect("complete cache");
         assert!(state
             .store
-            .mark_offline_package_ready(&package_id, "test-recipe", 15, 90_000)
+            .mark_offline_package_ready(&package_id, &state.node_id, "test-recipe", 15, 90_000)
             .await
             .expect("mark ready"));
         let (status_code, lease) = call(
