@@ -142,11 +142,66 @@ scripts/playback-lab run --suite stall-recovery \
   --network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json
 ```
 
-**How the shaping works.** A loopback reverse proxy sits between the browser
-and the isolated server, metering every byte the browser pulls through one
-shared token bucket. This process keeps talking to the server directly, so the
-harness's own polling never competes with the shaped budget. Three properties
-follow, and each is the reason it is not an OS-level shaper:
+### Physical Apple acceptance is one unattended run
+
+Do not use Network Link Conditioner presets and a person with the Siri Remote
+to time this test. The presets do not expose the actual buffered runway, their
+effective transition time depends on how fast the operator returns to the app,
+and a playback that advanced in between two changes begins a new recovery
+episode. That makes the result both frustrating and ambiguous.
+
+Install and sign in to a debug build once, then run the device through the
+LAN-reachable shaper from the Mac that can see it through `devicectl`:
+
+```bash
+scripts/playback-lab device-run \
+  --device APPLE_DEVICE_UDID \
+  --target http://PLURX_SERVER:32400 \
+  --public-host MAC_LAN_ADDRESS \
+  --file-id 42 --item-id 17 --height 480 \
+  --network-profile 8mbps-to-1.1mbps-to-350kbps \
+  --observe 180 --json out/apple-device-acceptance.json
+```
+
+The command performs the entire sequence:
+
+1. It binds a reverse proxy on the Mac and launches the installed app directly
+   into the selected file and quality through debug-only command-line defaults.
+2. The app reports a probe every two seconds with film position, contiguous
+   AVPlayer runway, buffer flags, access-log throughput, session/rung, and
+   attempt identity.
+3. Twelve seconds after the first real frame, the proxy changes the exact link
+   from 8 Mb/s to 1.1 Mb/s. After the recovered attempt presents its first
+   frame, it changes to 350 kb/s eight seconds later. No operator timing enters
+   the result.
+4. The command retains every probe, TTFF, stall, transition, and shaped-byte
+   ledger in one JSON artifact. It then relaunches the app without acceptance
+   arguments, returning the device to normal use.
+
+The launch hook and periodic probes compile only in `DEBUG`. A normal release
+build has neither the direct-playback entry point nor a way to enable the extra
+telemetry. The control API uses a random token, and neither that token nor the
+app's bearer credential is written to the evidence artifact.
+
+For exploratory control without launching a device, `device-proxy` exposes
+authenticated status, next-stage, and evidence endpoints. Its randomly
+generated token is stored only in the requested mode-0600 control file and the
+file is removed when the proxy exits:
+
+```bash
+scripts/playback-lab device-proxy \
+  --target http://PLURX_SERVER:32400 --listen 0.0.0.0 \
+  --public-host MAC_LAN_ADDRESS \
+  --network-profile 8mbps-to-1.1mbps-to-350kbps \
+  --auto-advance --control-file /tmp/plurx-device-proxy.json
+```
+
+**How the shaping works.** A reverse proxy sits between the player and server,
+on loopback for browser runs or a named LAN interface for physical devices. It
+meters every byte the player pulls through one shared token bucket. This
+process keeps talking to the server directly, so the harness's own polling
+never competes with the shaped budget. Three properties follow, and each is the
+reason it is not an OS-level shaper:
 
 - it needs no root, no `pfctl`/`tc`, and no kernel state that could outlive a
   failed run or affect anything else on the machine;

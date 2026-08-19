@@ -10,6 +10,7 @@
 
 const fs = require("node:fs");
 const fsp = fs.promises;
+const crypto = require("node:crypto");
 const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
@@ -48,7 +49,8 @@ function parseRate(text) {
 }
 
 /**
- * `<high>-to-<low>[@<seconds>]`, e.g. `8mbps-to-1.5mbps` or `8mbps-to-1.5mbps@20`.
+ * `<high>-to-<lower>[-to-<lowest>...][@<seconds>]`, e.g.
+ * `8mbps-to-1.5mbps` or `8mbps-to-1.1mbps-to-350kbps`.
  *
  * The descent is mandatory. A profile that rises, or holds flat, cannot make a
  * cliff, and silently accepting one would let a green stall-recovery run mean
@@ -66,14 +68,18 @@ function parseNetworkProfile(spec) {
   }
   const [shape, cliffText] = profileParts;
   const parts = shape.split("-to-");
-  if (parts.length !== 2) {
+  if (parts.length < 2) {
     const known = Object.keys(NETWORK_PROFILES).join(", ");
     throw new Error(`unknown network profile "${spec}"; known profiles: ${known}`);
   }
-  const from = parseRate(parts[0]);
-  const to = parseRate(parts[1]);
-  if (to >= from) {
-    throw new Error(`network profile "${spec}" must descend: ${to} kb/s is not below ${from} kb/s`);
+  const rates = parts.map(parseRate);
+  for (let index = 1; index < rates.length; index += 1) {
+    if (rates[index] >= rates[index - 1]) {
+      throw new Error(
+        `network profile "${spec}" must descend at every stage: `
+        + `${rates[index]} kb/s is not below ${rates[index - 1]} kb/s`,
+      );
+    }
   }
   let cliffAfterSeconds = DEFAULT_CLIFF_AFTER_SECONDS;
   if (cliffText !== undefined) {
@@ -82,16 +88,17 @@ function parseNetworkProfile(spec) {
       throw new Error(`network profile "${spec}" needs a positive cliff delay in seconds`);
     }
   }
-  const id = `${parts[0]}-to-${parts[1]}`;
+  const id = parts.join("-to-");
   return {
     id,
     spec: raw,
-    description: NETWORK_PROFILES[id]?.description || `${from} kb/s, then a cliff to ${to} kb/s`,
+    description: NETWORK_PROFILES[id]?.description || `${rates.join(" → ")} kb/s`,
     cliff_after_seconds: cliffAfterSeconds,
-    stages: [
-      { index: 0, label: "before-cliff", kbps: from },
-      { index: 1, label: "after-cliff", kbps: to },
-    ],
+    stages: rates.map((kbps, index) => ({
+      index,
+      label: index === 0 ? "before-cliff" : index === 1 ? "after-cliff" : `after-cliff-${index}`,
+      kbps,
+    })),
   };
 }
 
@@ -111,6 +118,13 @@ Usage:
                              [--firefox PATH] [--geckodriver PATH]
                              [--headed] [--keep-runtime]
   scripts/playback-lab normalize --json PATH [--out PATH]
+  scripts/playback-lab device-proxy --target URL --listen HOST --public-host HOST
+                              --network-profile PROFILE --control-file PATH
+                              [--port PORT] [--auto-advance]
+                              [--recovery-cliff-after SECONDS]
+  scripts/playback-lab device-run --device UDID --target URL --public-host HOST
+                              --file-id ID --network-profile PROFILE [--item-id ID]
+                              [--height PIXELS] [--observe SECONDS] [--json PATH]
 
 Commands:
   doctor     Verify the external programs and browser automation surface.
@@ -118,6 +132,8 @@ Commands:
   plan       Print the cases without starting a server or browser.
   run        Boot an isolated server, scan the corpus, and play every case.
   normalize  Scrub a report's run-local values so two runs can be compared.
+  device-proxy  Shape a real server for remotely launched physical devices.
+  device-run    Launch, shape, observe, and restore one physical Apple device.
 
 The smoke suite covers each verdict plus the high-risk 4K transport forks and
 seek/audio/subtitle restarts. The full suite adds every fixture x quality mode.
@@ -681,9 +697,25 @@ function rollingPeakKbps(samples, mediaOnly) {
  * cliff is a function call the report can timestamp.
  */
 class ShapingProxy {
-  constructor(profile, targetOrigin) {
+  constructor(profile, targetOrigin, options = {}) {
     this.profile = profile;
     this.target = new URL(targetOrigin);
+    this.listenHost = options.listenHost || "127.0.0.1";
+    this.listenPort = options.listenPort === undefined ? 0 : Number(options.listenPort);
+    this.publicHost = options.publicHost || this.listenHost;
+    this.controlToken = options.controlToken || null;
+    this.autoAdvance = Boolean(options.autoAdvance);
+    this.recoveryCliffAfterSeconds = Number(options.recoveryCliffAfterSeconds || 8);
+    if (!Number.isInteger(this.listenPort) || this.listenPort < 0 || this.listenPort > 65535) {
+      throw new Error(`shaper listen port must be an integer from 0 to 65535, got ${options.listenPort}`);
+    }
+    if ((this.listenHost === "0.0.0.0" || this.listenHost === "::")
+        && (!options.publicHost || options.publicHost === true)) {
+      throw new Error("a wildcard shaper bind requires --public-host for physical-device URLs");
+    }
+    if (!Number.isFinite(this.recoveryCliffAfterSeconds) || this.recoveryCliffAfterSeconds <= 0) {
+      throw new Error("--recovery-cliff-after must be a positive number of seconds");
+    }
     this.stageIndex = 0;
     this.bucket = new TokenBucket(profile.stages[0].kbps, performance.now());
     this.agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
@@ -692,6 +724,10 @@ class ShapingProxy {
     this.limiterTail = Promise.resolve();
     this.limiterWaiters = new Set();
     this.frozenTelemetry = null;
+    this.clientEvents = [];
+    this.transitions = [];
+    this.advanceTimer = null;
+    this.scheduledAdvance = null;
     this.deliverySamples = profile.stages.map(() => []);
     this.admissionSamples = profile.stages.map(() => []);
     // Claims priced by the bucket but not yet delivered or refunded. Held by
@@ -725,7 +761,7 @@ class ShapingProxy {
   async start(binder) {
     const bind = binder || ((server) => new Promise((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => resolve(server.address().port));
+      server.listen(this.listenPort, this.listenHost, () => resolve(server.address().port));
     }));
     this.server = http.createServer((request, response) => this.handle(request, response));
     this.server.keepAliveTimeout = 30_000;
@@ -737,7 +773,10 @@ class ShapingProxy {
     if (!this.port) throw new Error("network shaping is unavailable: the shaper bound no port");
     this.startedAt = this.now();
     this.stages[0].entered_at_ms = 0;
-    this.baseUrl = `http://127.0.0.1:${this.port}`;
+    const publicHost = this.publicHost.includes(":") && !this.publicHost.startsWith("[")
+      ? `[${this.publicHost}]`
+      : this.publicHost;
+    this.baseUrl = `http://${publicHost}:${this.port}`;
     return this.baseUrl;
   }
 
@@ -770,7 +809,7 @@ class ShapingProxy {
   }
 
   /** Drop the link to the next stage. Called once, at a point the report keeps. */
-  applyCliff() {
+  applyCliff(reason = "manual") {
     if (this.stageIndex + 1 >= this.stages.length) return null;
     const at = this.now() - this.startedAt;
     this.stages[this.stageIndex].left_at_ms = at;
@@ -779,7 +818,120 @@ class ShapingProxy {
     stage.entered_at_ms = at;
     this.bucket.setRate(stage.kbps, this.now());
     this.wakeLimiter();
+    this.transitions.push({
+      at_ms: Number(at.toFixed(3)),
+      reason,
+      stage_index: stage.index,
+      kbps: stage.kbps,
+    });
+    this.scheduledAdvance = null;
+    if (this.advanceTimer) clearTimeout(this.advanceTimer);
+    this.advanceTimer = null;
     return at;
+  }
+
+  scheduleAdvance(delaySeconds, reason) {
+    if (this.stageIndex + 1 >= this.stages.length || this.advanceTimer) return false;
+    const delayMs = Math.round(delaySeconds * 1000);
+    this.scheduledAdvance = {
+      reason,
+      stage_index: this.stageIndex + 1,
+      kbps: this.stages[this.stageIndex + 1].kbps,
+      due_at: new Date(Date.now() + delayMs).toISOString(),
+    };
+    this.advanceTimer = setTimeout(() => {
+      this.advanceTimer = null;
+      this.applyCliff(reason);
+    }, delayMs);
+    return true;
+  }
+
+  captureClientLog(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+    const allowed = [
+      "level", "event", "message", "method", "title", "file_id", "vcodec", "detail", "ms",
+      "height", "encoder", "session_id", "attempt", "reason", "snapshot", "ua",
+    ];
+    const captured = { captured_at: new Date().toISOString() };
+    for (const key of allowed) {
+      if (payload[key] !== undefined) captured[key] = payload[key];
+    }
+    this.clientEvents.push(captured);
+    if (this.clientEvents.length > 500) this.clientEvents.splice(0, this.clientEvents.length - 500);
+    if (!this.autoAdvance || payload.event !== "ttff") return;
+    if (this.stageIndex === 0) {
+      this.scheduleAdvance(this.profile.cliff_after_seconds, "initial-ttff");
+    } else if (String(payload.reason || "").startsWith("stall-")) {
+      this.scheduleAdvance(this.recoveryCliffAfterSeconds, "recovery-ttff");
+    }
+  }
+
+  controlSnapshot() {
+    return {
+      schema_version: 1,
+      generated_at: new Date().toISOString(),
+      target: this.target.origin,
+      proxy: this.baseUrl,
+      current_stage: this.stageIndex,
+      current_kbps: this.stages[this.stageIndex].kbps,
+      scheduled_advance: this.scheduledAdvance,
+      transitions: this.transitions,
+      shaping: this.telemetry(),
+      client_events: this.clientEvents,
+    };
+  }
+
+  writeJson(response, status, value) {
+    const body = `${JSON.stringify(value, null, 2)}\n`;
+    response.writeHead(status, {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+      "cache-control": "no-store",
+    });
+    response.end(body);
+  }
+
+  handleControl(request, response, route) {
+    if (!this.controlToken || request.headers["x-playback-lab-control"] !== this.controlToken) {
+      this.writeJson(response, 403, { error: "valid playback-lab control token required" });
+      return;
+    }
+    if (request.method === "GET" && route === "/__playback_lab/status") {
+      this.writeJson(response, 200, this.controlSnapshot());
+      return;
+    }
+    if (request.method === "POST" && route === "/__playback_lab/cliff") {
+      const appliedAt = this.applyCliff("control-api");
+      this.writeJson(response, appliedAt === null ? 409 : 200, {
+        applied_at_ms: appliedAt,
+        current_stage: this.stageIndex,
+        current_kbps: this.stages[this.stageIndex].kbps,
+      });
+      return;
+    }
+    if (request.method === "POST" && route === "/__playback_lab/evidence") {
+      this.writeJson(response, 200, this.controlSnapshot());
+      return;
+    }
+    this.writeJson(response, 404, { error: "unknown playback-lab control route" });
+  }
+
+  observeClientLog(request) {
+    let bytes = 0;
+    const chunks = [];
+    request.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes <= 256 * 1024) chunks.push(chunk);
+    });
+    request.on("end", () => {
+      if (bytes > 256 * 1024) return;
+      try {
+        this.captureClientLog(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch (_) {
+        // The upstream remains authoritative for malformed client logs. The
+        // evidence tap is deliberately observational and never changes them.
+      }
+    });
   }
 
   /**
@@ -877,8 +1029,15 @@ class ShapingProxy {
   }
 
   handle(request, response) {
-    const media = isMediaPath(request.url);
     const route = diagnosticPath(request.url);
+    if (route.startsWith("/__playback_lab/")) {
+      this.handleControl(request, response, route);
+      return;
+    }
+    if (request.method === "POST" && route === "/api/v1/client-log" && this.controlToken) {
+      this.observeClientLog(request);
+    }
+    const media = isMediaPath(request.url);
     const transfer = { cancelled: false, upstreamResponse: null };
     const cancel = () => {
       // `close` also fires after a successful response. Only an unfinished
@@ -1162,6 +1321,9 @@ class ShapingProxy {
   async close() {
     this.freezeTelemetry();
     this.closed = true;
+    if (this.advanceTimer) clearTimeout(this.advanceTimer);
+    this.advanceTimer = null;
+    this.scheduledAdvance = null;
     this.wakeLimiter();
     this.agent.destroy();
     if (!this.server) return;
@@ -2701,6 +2863,228 @@ async function normalizeCommand(options) {
   }
 }
 
+function requireTextOption(options, key, flag) {
+  const value = options[key];
+  if (!value || value === true) throw new Error(`${flag} needs a value`);
+  return String(value);
+}
+
+function enabledOption(value) {
+  if (value === undefined || value === false) return false;
+  if (value === true) return true;
+  if (/^(1|true|yes|on)$/i.test(String(value))) return true;
+  if (/^(0|false|no|off)$/i.test(String(value))) return false;
+  throw new Error(`boolean option value must be true or false, got ${value}`);
+}
+
+async function writeDeviceProxyControlFile(file, document) {
+  const resolved = path.resolve(file);
+  await fsp.mkdir(path.dirname(resolved), { recursive: true });
+  await fsp.writeFile(resolved, `${JSON.stringify(document, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+  return resolved;
+}
+
+async function deviceProxyCommand(options, dependencies = {}) {
+  const targetText = requireTextOption(options, "target", "--target");
+  const target = new URL(targetText);
+  if (target.protocol !== "http:") {
+    throw new Error("device-proxy currently requires an http:// target");
+  }
+  if (target.username || target.password) {
+    throw new Error("put credentials in the device's stored session, not in --target");
+  }
+  const profile = parseNetworkProfile(requireTextOption(
+    options, "network_profile", "--network-profile",
+  ));
+  const listenHost = requireTextOption(options, "listen", "--listen");
+  const publicHost = requireTextOption(options, "public_host", "--public-host");
+  const controlFile = requireTextOption(options, "control_file", "--control-file");
+  const controlToken = crypto.randomBytes(32).toString("hex");
+  const shaper = dependencies.createShaper
+    ? dependencies.createShaper(profile, target.origin, {
+      listenHost,
+      listenPort: options.port,
+      publicHost,
+      controlToken,
+      autoAdvance: enabledOption(options.auto_advance),
+      recoveryCliffAfterSeconds: options.recovery_cliff_after,
+    })
+    : new ShapingProxy(profile, target.origin, {
+      listenHost,
+      listenPort: options.port,
+      publicHost,
+      controlToken,
+      autoAdvance: enabledOption(options.auto_advance),
+      recoveryCliffAfterSeconds: options.recovery_cliff_after,
+    });
+  let resolvedControlFile = null;
+  let baseUrl = null;
+  try {
+    baseUrl = await shaper.start(options.shaper_binder);
+    resolvedControlFile = await writeDeviceProxyControlFile(controlFile, {
+      schema_version: 1,
+      pid: process.pid,
+      proxy: baseUrl,
+      target: target.origin,
+      profile: profile.spec,
+      status_path: "/__playback_lab/status",
+      cliff_path: "/__playback_lab/cliff",
+      evidence_path: "/__playback_lab/evidence",
+      control_header: "x-playback-lab-control",
+      control_token: controlToken,
+    });
+    process.stdout.write(`DEVICE  ${baseUrl} -> ${target.origin}\n`);
+    process.stdout.write(`PROFILE ${profile.stages.map((stage) => `${stage.kbps} kb/s`).join(" -> ")}\n`);
+    process.stdout.write(`CONTROL ${resolvedControlFile} (mode 0600; token is stored only there)\n`);
+    const waitForShutdown = dependencies.waitForShutdown || (() => new Promise((resolve) => {
+      const stop = () => resolve();
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    }));
+    await waitForShutdown();
+    const evidenceFile = path.resolve(options.evidence || `${resolvedControlFile}.evidence.json`);
+    await fsp.writeFile(evidenceFile, `${JSON.stringify(shaper.controlSnapshot(), null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    process.stdout.write(`EVIDENCE ${evidenceFile}\n`);
+  } finally {
+    await shaper.close().catch(() => {});
+    if (resolvedControlFile) await fsp.unlink(resolvedControlFile).catch(() => {});
+  }
+  return { baseUrl, shaper };
+}
+
+function positiveNumberOption(options, key, flag, fallback) {
+  if (options[key] === undefined) return fallback;
+  const value = Number(options[key]);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${flag} must be positive`);
+  return value;
+}
+
+function launchPhysicalAppleDevice(args) {
+  const result = spawnSync("xcrun", ["devicectl", "device", "process", "launch", ...args], {
+    encoding: "utf8",
+  });
+  if (result.error) throw new Error(`xcrun devicectl could not launch the device app: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`xcrun devicectl launch failed: ${sanitizedText(result.stderr || result.stdout)}`);
+  }
+}
+
+function acceptanceTerminalEvent(events) {
+  return [...events].reverse().find((event) =>
+    (event.event === "stall" && /outcome=(stop|terminal)/.test(String(event.detail || "")))
+      || event.event === "avplayer_item_failed"
+      || event.event === "avplayer_early_end");
+}
+
+async function waitForDeviceAcceptance(shaper, timeoutMs, interval = sleep) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const terminal = acceptanceTerminalEvent(shaper.clientEvents);
+    if (terminal) return { reason: "terminal-client-event", event: terminal };
+    await interval(Math.min(1_000, Math.max(1, deadline - Date.now())));
+  }
+  return {
+    reason: "observation-window-ended",
+    event: acceptanceTerminalEvent(shaper.clientEvents) || null,
+  };
+}
+
+async function deviceRunCommand(options, dependencies = {}) {
+  const targetText = requireTextOption(options, "target", "--target");
+  const target = new URL(targetText);
+  if (target.protocol !== "http:" || target.username || target.password) {
+    throw new Error("--target must be a credential-free http:// server origin");
+  }
+  const device = requireTextOption(options, "device", "--device");
+  const publicHost = requireTextOption(options, "public_host", "--public-host");
+  const fileId = Number(requireTextOption(options, "file_id", "--file-id"));
+  if (!Number.isInteger(fileId) || fileId <= 0) throw new Error("--file-id must be a positive integer");
+  const itemId = options.item_id === undefined ? 0 : Math.max(0, Number(options.item_id));
+  if (!Number.isInteger(itemId)) throw new Error("--item-id must be a non-negative integer");
+  const height = options.height === undefined ? 480 : positiveNumberOption(options, "height", "--height");
+  if (!Number.isInteger(height)) throw new Error("--height must be a positive integer");
+  const observeSeconds = positiveNumberOption(options, "observe", "--observe", 180);
+  const profile = parseNetworkProfile(requireTextOption(
+    options, "network_profile", "--network-profile",
+  ));
+  const bundleId = options.bundle_id && options.bundle_id !== true
+    ? String(options.bundle_id)
+    : "tv.plurx.app";
+  const token = crypto.randomBytes(32).toString("hex");
+  const shaper = dependencies.createShaper
+    ? dependencies.createShaper(profile, target.origin, {
+      listenHost: "0.0.0.0",
+      listenPort: options.port,
+      publicHost,
+      controlToken: token,
+      autoAdvance: options.auto_advance === undefined ? true : enabledOption(options.auto_advance),
+      recoveryCliffAfterSeconds: options.recovery_cliff_after,
+    })
+    : new ShapingProxy(profile, target.origin, {
+      listenHost: "0.0.0.0",
+      listenPort: options.port,
+      publicHost,
+      controlToken: token,
+      autoAdvance: options.auto_advance === undefined ? true : enabledOption(options.auto_advance),
+      recoveryCliffAfterSeconds: options.recovery_cliff_after,
+    });
+  const launch = dependencies.launchDevice || launchPhysicalAppleDevice;
+  const restore = dependencies.restoreDevice || launchPhysicalAppleDevice;
+  let baseUrl;
+  let evidence;
+  let launched = false;
+  try {
+    baseUrl = await shaper.start(options.shaper_binder);
+    process.stdout.write(`DEVICE  ${device}\n`);
+    process.stdout.write(`SHAPE   ${profile.stages.map((stage) => `${stage.kbps} kb/s`).join(" -> ")}\n`);
+    launch([
+      "--device", device,
+      "--terminate-existing",
+      "--activate",
+      bundleId,
+      "-plurx.origin", baseUrl,
+      "-plurx.acceptance.fileId", String(fileId),
+      "-plurx.acceptance.itemId", String(itemId),
+      "-plurx.acceptance.title", String(options.title || "Playback acceptance"),
+      "-plurx.acceptance.height", String(height),
+      "-plurx.acceptance.probe", "YES",
+    ]);
+    launched = true;
+    const completion = await (dependencies.waitForAcceptance || waitForDeviceAcceptance)(
+      shaper, observeSeconds * 1_000,
+    );
+    evidence = { ...shaper.controlSnapshot(), device, bundle_id: bundleId, completion };
+    const stamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
+    const jsonPath = path.resolve(options.json || path.join(
+      DEFAULT_REPORT_DIR, `${stamp}-apple-device-acceptance.json`,
+    ));
+    await fsp.mkdir(path.dirname(jsonPath), { recursive: true });
+    await fsp.writeFile(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    process.stdout.write(`RESULT  ${completion.reason}\n`);
+    process.stdout.write(`JSON    ${jsonPath}\n`);
+  } finally {
+    await shaper.close().catch(() => {});
+    if (launched && !enabledOption(options.leave_running)) {
+      try {
+        restore(["--device", device, "--terminate-existing", "--activate", bundleId]);
+      } catch (error) {
+        process.stderr.write(`playback-lab: device restore failed: ${sanitizedError(error)}\n`);
+      }
+    }
+  }
+  return evidence;
+}
+
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
   if (command === "help" || command === "--help" || command === "-h") {
@@ -2708,6 +3092,8 @@ async function main() {
     return;
   }
   if (command === "normalize") return normalizeCommand(options);
+  if (command === "device-proxy") return deviceProxyCommand(options);
+  if (command === "device-run") return deviceRunCommand(options);
   if (command === "run") {
     const outcome = await executeRun(loadManifest(), options);
     if (outcome.error) throw outcome.error;
@@ -2729,6 +3115,8 @@ module.exports = {
   ShapingProxy,
   TokenBucket,
   diagnosticPath,
+  deviceRunCommand,
+  deviceProxyCommand,
   executeRun,
   expandCases,
   fixturesForBuild,
@@ -2743,7 +3131,9 @@ module.exports = {
   shaperBurstBoundKbps,
   shaperClaimBoundBytes,
   timeToSustained,
+  waitForDeviceAcceptance,
   writeFatalRunReport,
+  writeDeviceProxyControlFile,
 };
 
 if (require.main === module) {
