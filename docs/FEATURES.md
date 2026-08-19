@@ -405,17 +405,27 @@ decoding shows what the file is versus what your browser is actually rendering.
 - **Skip Intro / Skip Credits** buttons appear when playback enters a marked
   region. Markers come from real **chapters** (MakeMKV, anime OP/ED, hand-
   authored titles), read from the scan-time probe rather than by re-probing the
-  file every time you press Play; a conservative duration-based end-credits
-  estimate is the fallback when a file has no chapters. Skipping credits that
-  run to the end finishes the item.
+  file every time you press Play — and a chapter has to sit where its title
+  claims, so a scene called "Closing Time" halfway through an episode does not
+  become a Skip Credits button. When no chapter title names the credits, the
+  window is inferred: from the file's final chapter boundary when that lands in
+  a plausible tail, and from the runtime alone when it does not — about 2.5% of
+  it, so a 22-minute episode gets roughly the last 30 seconds and a two-hour
+  film three minutes, which is where it caps. The inference errs late on
+  purpose: a button that opens a little way into the credits costs you a few
+  seconds, one that opens early interrupts the show. Skipping credits that run
+  to the end finishes the item.
 - **Auto-skip** intro & credits — an opt-in, per-user, persisted toggle in the
   preferences menu (default off).
 - **Method-aware seek:** direct play seeks natively; remux and transcode restart
   the server stream at the new offset.
 
 **How to read it:** a "Skip Credits" button that reads as an estimate exists
-because that file had no end-credits chapter — it's a guess and the timeline
-knows it. Chapter-derived buttons are exact.
+because no chapter in that file was *titled* as the end credits — where it
+starts is inferred, and the timeline knows it. That holds even when the start
+came from a real final chapter boundary and is exact to the frame: the boundary
+is real, what it contains was never confirmed. Buttons drawn from a chapter that
+names itself are exact in both senses.
 
 **How to read the Server block:** encode speed below 1× means the server
 cannot produce the stream as fast as you are watching it, and a stall is only
@@ -670,8 +680,8 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   owns those fields and would overwrite them on the next refresh. Manual
   fix-match is a separate, planned feature.
 - **Does not fingerprint or ML-guess intros.** Skip markers come from chapters
-  (plus one honest duration-based credits estimate). A wrong "Skip Intro" that
-  jumps into a scene is worse than none.
+  (plus one honest credits inference, from the final chapter boundary or the
+  runtime). A wrong "Skip Intro" that jumps into a scene is worse than none.
 - **Does not transcode by default or pre-bake renditions.** Transcode is on
   demand, only when a device forces it. There is no "optimize library."
 - **Does not run a cluster yet.** HA is decided and spiked (§8) but Phase 4;

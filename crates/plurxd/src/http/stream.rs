@@ -377,9 +377,10 @@ pub struct SourceSummary {
 }
 
 /// A skippable region of the timeline (opening titles, end credits). Derived
-/// from real chapter markers when the file has them, otherwise a conservative
-/// heuristic for end credits only (`chapter: false`).
-#[derive(Serialize)]
+/// from a chapter title that names it when the file has one, otherwise inferred
+/// for end credits only (`chapter: false`) — from the file's final chapter
+/// boundary if it lands in a plausible tail, and from the runtime if not.
+#[derive(Serialize, Debug)]
 pub struct Marker {
     /// "intro" | "credits".
     pub kind: String,
@@ -387,8 +388,9 @@ pub struct Marker {
     pub label: String,
     pub start_ms: i64,
     pub end_ms: i64,
-    /// True when this came from an actual chapter title; false for the
-    /// duration-based credits guess (so the UI can hedge the wording).
+    /// True when a chapter title named this region; false for either inferred
+    /// credits window, boundary-derived or duration-derived (so the UI can
+    /// hedge the wording). The wire shape is fixed — three clients decode it.
     pub chapter: bool,
 }
 
@@ -803,50 +805,137 @@ fn classify_chapter(title: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// How long the end credits plausibly run on a file of this length.
+///
+/// 2.5% of runtime: ~33s on a 22-minute episode, ~68s on a 45-minute one, ~82s
+/// on a 55-minute hour, and the three-minute ceiling only from feature length
+/// (two hours) up. The floor catches shorts.
+///
+/// The predecessor was `(dur / 12).clamp(45s, 150s)`, whose ceiling bound for
+/// every runtime at or above 30 minutes — a 50-minute episode and a 3-hour film
+/// were handed the identical 2m30s window. TV end credits run 20–60s, so that
+/// put "Skip Credits" on screen a minute and a half into the last act.
+///
+/// Erring late is the deliberate choice in both the proportion and the ceiling.
+/// A window that opens late merely shortens a button the viewer was going to
+/// press anyway; one that opens early interrupts the show, and there is no
+/// content analysis here (`docs/ARCHITECTURE.md` §6) to tell us which it did.
+fn plausible_credits_tail_ms(duration_ms: i64) -> i64 {
+    (duration_ms / 40).clamp(20_000, 180_000)
+}
+
+/// Where a title-classified marker is allowed to sit, as a percentage of the
+/// timeline. `intro_kw`/`credit_kw` are deliberately broad substrings, so a
+/// mid-file chapter called "Closing Time" or "The Ending" classifies as
+/// credits. Markers are sorted by start and every client takes the *first*
+/// marker containing the playhead, so an unbounded spurious match does not
+/// merely coexist with the real one — it replaces it. These bounds sit far
+/// outside where real intros and credits fall (an anime ED lands past 80%, a
+/// film's credits past 90%), so they only ever catch the pathological case.
+const INTRO_MAX_START_PCT: i64 = 50;
+const CREDITS_MIN_START_PCT: i64 = 70;
+
+/// One chapter of the probed file, kept whether or not its title classified.
+/// An unclassified span still carries the boundary that places the credits.
+#[derive(Clone, Copy)]
+struct ChapterSpan {
+    start_ms: i64,
+    end_ms: i64,
+    /// The `(kind, label)` its title named, if any.
+    class: Option<(&'static str, &'static str)>,
+}
+
 /// Turn an ffprobe `chapters` array into skippable intro/credits markers.
 /// Pure, so the classification and the bounds checks are testable without a
 /// file or a subprocess.
 fn markers_from_chapters(chapters: &[serde_json::Value], duration_ms: Option<i64>) -> Vec<Marker> {
-    let mut out = Vec::new();
+    let at = |ch: &serde_json::Value, key: &str| -> Option<i64> {
+        ch.get(key)
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|s| (s * 1000.0) as i64)
+    };
+
+    // Every chapter with a sane span, classified or not. The unclassified ones
+    // are not noise: the last boundary among them is the only positional
+    // evidence a chaptered file offers when no title says "credits".
+    let mut spans: Vec<ChapterSpan> = Vec::new();
     for ch in chapters {
         let title = ch
             .get("tags")
             .and_then(|t| t.get("title"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        let Some((kind, label)) = classify_chapter(title) else {
-            continue;
-        };
-        let at = |key: &str| -> Option<i64> {
-            ch.get(key)
-                .and_then(|s| s.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|s| (s * 1000.0) as i64)
-        };
-        if let (Some(start_ms), Some(end_ms)) = (at("start_time"), at("end_time")) {
+        if let (Some(start_ms), Some(end_ms)) = (at(ch, "start_time"), at(ch, "end_time")) {
             if end_ms > start_ms {
-                out.push(Marker {
-                    kind: kind.to_owned(),
-                    label: label.to_owned(),
+                spans.push(ChapterSpan {
                     start_ms,
                     end_ms,
-                    chapter: true,
+                    class: classify_chapter(title),
                 });
             }
         }
     }
+    spans.sort_by_key(|s| s.start_ms);
 
-    // Heuristic end-credits fallback: only when chapters gave us nothing and we
-    // know the runtime. Conservative window (last 60s, or 8% for long films),
-    // marked chapter:false so the UI can label it as an estimate.
+    // The runtime is the yardstick for every bound below. A file probed without
+    // one still has the chapters' own extent, which is close enough to place a
+    // marker as a fraction. With neither there is nothing to place and nothing
+    // to guess from.
+    let Some(timeline_ms) = duration_ms.or_else(|| spans.iter().map(|s| s.end_ms).max()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for &ChapterSpan {
+        start_ms,
+        end_ms,
+        class,
+    } in &spans
+    {
+        let Some((kind, label)) = class else { continue };
+        let in_bounds = if kind == "intro" {
+            start_ms * 100 <= timeline_ms * INTRO_MAX_START_PCT
+        } else {
+            start_ms * 100 >= timeline_ms * CREDITS_MIN_START_PCT
+        };
+        if !in_bounds {
+            continue;
+        }
+        out.push(Marker {
+            kind: kind.to_owned(),
+            label: label.to_owned(),
+            start_ms,
+            end_ms,
+            chapter: true,
+        });
+    }
+
+    // No chapter title said "credits" — either because the file has no chapters
+    // at all, or because it has them and none is the credits. Both used to take
+    // the same blind duration guess, throwing away real boundaries in the
+    // chaptered case. Both are inferences, so both stay `chapter:false` and the
+    // UI keeps hedging; only the chaptered one gets an exact start.
     let has_credits = out.iter().any(|m| m.kind == "credits");
     if !has_credits {
         if let Some(dur) = duration_ms.filter(|d| *d > 5 * 60_000) {
-            let tail = (dur / 12).clamp(45_000, 150_000);
+            let tail = plausible_credits_tail_ms(dur);
+            // A final chapter boundary that lands inside a plausible tail is
+            // almost certainly where the credits begin, and it is exact where
+            // the proportion is not. "Plausible" is that same tail doubled, so
+            // an unusually generous credits chapter still qualifies while a
+            // last *story* chapter — minutes of runtime, not seconds — does
+            // not, and falls back to the estimate rather than opening the
+            // button early. The 15s floor keeps a post-credits stinger from
+            // becoming the button.
+            let boundary = spans
+                .last()
+                .map(|s| s.start_ms)
+                .filter(|start| (15_000..=tail * 2).contains(&(dur - start)));
             out.push(Marker {
                 kind: "credits".to_owned(),
                 label: "Skip Credits".to_owned(),
-                start_ms: dur - tail,
+                start_ms: boundary.unwrap_or(dur - tail),
                 end_ms: dur,
                 chapter: false,
             });
@@ -2231,11 +2320,36 @@ mod tests {
         assert_eq!(m[1].kind, "credits");
         assert_eq!(m[1].start_ms, 3_000_000);
 
-        // A chapterless file still offers Skip Credits, flagged as a guess.
-        let m = markers_from_chapters(&[], Some(45 * 60_000));
+        // A chapterless file still offers Skip Credits, flagged as a guess —
+        // and the guess is proportionate to the runtime instead of the flat
+        // 2m30s tail that every file at or above 30 minutes used to get. A
+        // 55-minute episode whose credits run 20–60s cannot afford to have the
+        // button open a minute and a half into the last act.
+        let hour = 55 * 60_000;
+        let m = markers_from_chapters(&[], Some(hour));
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].kind, "credits");
         assert!(!m[0].chapter, "the duration heuristic is not a chapter");
+        assert_eq!(
+            m[0].end_ms, hour,
+            "the estimate runs to the end of the file"
+        );
+        assert_eq!(
+            hour - m[0].start_ms,
+            82_500,
+            "2.5% of a 55-minute runtime, not a flat 150s"
+        );
+
+        // Proportionate means it actually moves with the runtime: a 22-minute
+        // episode and a 3-hour film do not get the same window.
+        let short = markers_from_chapters(&[], Some(22 * 60_000));
+        let long = markers_from_chapters(&[], Some(180 * 60_000));
+        assert_eq!(22 * 60_000 - short[0].start_ms, 33_000);
+        assert_eq!(
+            180 * 60_000 - long[0].start_ms,
+            180_000,
+            "the ceiling only binds at feature length and above"
+        );
 
         // Nothing to guess from, and nothing invented.
         assert!(markers_from_chapters(&[], None).is_empty());
@@ -2249,6 +2363,105 @@ mod tests {
             serde_json::json!({ "tags": { "title": "Intro" } }),
         ];
         assert!(markers_from_chapters(&junk, None).is_empty());
+    }
+
+    /// A chaptered file whose chapter titles never say "credits" still carries
+    /// positional evidence, and the final boundary is better evidence than a
+    /// proportion of the runtime. It is still an inference — no title confirmed
+    /// it — so it stays `chapter:false` and the UI keeps hedging; what changes
+    /// is that the start is exact.
+    #[test]
+    fn a_chaptered_file_without_a_credits_title_uses_its_last_boundary() {
+        let hour = 3_300_000; // 55 minutes
+        let m = markers_from_chapters(
+            &[
+                chapter("Opening", "0.000", "90.000"),
+                chapter("Act One", "90.000", "1600.000"),
+                chapter("Act Two", "1600.000", "3200.000"),
+                chapter("Chapter 5", "3200.000", "3300.000"),
+            ],
+            Some(hour),
+        );
+        assert_eq!(m.len(), 2, "the intro chapter and one credits inference");
+        assert_eq!(m[0].kind, "intro");
+        assert!(m[0].chapter);
+        assert_eq!(m[1].kind, "credits");
+        assert_eq!(
+            m[1].start_ms, 3_200_000,
+            "the real final boundary, not dur minus a guessed tail"
+        );
+        assert_eq!(m[1].end_ms, hour);
+        assert!(
+            !m[1].chapter,
+            "no title said credits, so the UI still hedges"
+        );
+
+        // A final boundary that is nowhere near the tail is a story chapter,
+        // not the credits. Fall back to the proportional estimate rather than
+        // opening the button 28 minutes early.
+        let m = markers_from_chapters(
+            &[
+                chapter("Opening", "0.000", "90.000"),
+                chapter("Act One", "90.000", "1600.000"),
+                chapter("Finale", "1600.000", "3300.000"),
+            ],
+            Some(hour),
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[1].kind, "credits");
+        assert_eq!(m[1].start_ms, hour - 82_500, "the deliberate fallback");
+        assert!(!m[1].chapter);
+    }
+
+    /// `credit_kw` and `intro_kw` match broad substrings anywhere in a title, so
+    /// classification alone will happily call a mid-episode chapter the credits.
+    /// Clients take the *first* marker containing the playhead, so an unbounded
+    /// match does not sit harmlessly beside the real one — it becomes the
+    /// button. Position vetoes the title.
+    #[test]
+    fn a_marker_in_the_wrong_half_of_the_runtime_is_rejected() {
+        let hour = 3_300_000; // 55 minutes
+
+        // "Closing Time" and "The Ending" are ordinary scene titles that trip
+        // the credits substrings halfway through the episode.
+        let m = markers_from_chapters(
+            &[
+                chapter("Opening", "0.000", "90.000"),
+                chapter("Closing Time", "1650.000", "1800.000"),
+                chapter("The Ending", "1800.000", "3300.000"),
+            ],
+            Some(hour),
+        );
+        assert!(
+            !m.iter()
+                .any(|k| k.kind == "credits" && k.start_ms * 100 < hour * 70),
+            "no Skip Credits button before the last 30% of the runtime: {m:?}"
+        );
+        assert_eq!(m.len(), 2, "the intro, and one credits inference: {m:?}");
+        assert_eq!(m[0].kind, "intro");
+        assert_eq!(m[1].kind, "credits");
+        assert_eq!(
+            m[1].start_ms,
+            hour - 82_500,
+            "the rejected titles do not suppress the fallback either"
+        );
+
+        // The mirror case: a "Recap" chapter at the very end is not an intro.
+        let m = markers_from_chapters(
+            &[
+                chapter("Opening", "0.000", "90.000"),
+                chapter("Act One", "90.000", "3200.000"),
+                chapter("Recap", "3200.000", "3300.000"),
+            ],
+            Some(hour),
+        );
+        assert!(
+            !m.iter().any(|k| k.kind == "intro" && k.start_ms * 2 > hour),
+            "no Skip Intro button past the halfway mark: {m:?}"
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!((m[0].kind.as_str(), m[0].start_ms), ("intro", 0));
+        assert_eq!((m[1].kind.as_str(), m[1].start_ms), ("credits", 3_200_000));
     }
 
     /// The backfill writes chapters into the stored probe without disturbing
