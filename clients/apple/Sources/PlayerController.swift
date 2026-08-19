@@ -436,13 +436,26 @@ struct ApplePlaybackObservedStallLog: Encodable {
 /// A plain value with no player and no network in it, so the policy is
 /// unit-testable without either.
 struct PlayerReopenQueue: Equatable {
-    private(set) var pendingMs: Int?
+    private(set) var pending: PlayerReopenRequest?
 
-    /// The position to open right now, or `nil` when a replacement is already
-    /// running and this request was queued behind it instead.
-    mutating func request(_ positionMs: Int, changeInFlight: Bool) -> Int? {
-        guard changeInFlight else { return positionMs }
-        pendingMs = positionMs
+    var pendingMs: Int? { pending?.positionMs }
+
+    /// The request to open right now, or `nil` when a replacement is already
+    /// running and this one was queued behind it instead.
+    mutating func request(
+        _ positionMs: Int,
+        intent: PlayerOpenIntent = .normal,
+        changeInFlight: Bool
+    ) -> PlayerReopenRequest? {
+        let next = PlayerReopenRequest(positionMs: positionMs, intent: intent)
+        guard changeInFlight else { return next }
+        // Last writer wins, and the *cause* travels with the position rather
+        // than surviving it. A viewer seek landing behind a stall recovery
+        // deliberately drops that recovery's binding: the seek builds its own
+        // session, so by the time the queued request could be issued the
+        // predecessor its ticket names has already been superseded and the
+        // server would refuse the create outright.
+        pending = next
         return nil
     }
 
@@ -450,14 +463,106 @@ struct PlayerReopenQueue: Equatable {
     /// finished, consumed. Deliberately *not* deduplicated against the position
     /// just opened: a queued audio, quality, or subtitle change can name the
     /// very same position and still needs the session rebuilt around it.
-    mutating func takePending() -> Int? {
-        defer { pendingMs = nil }
-        return pendingMs
+    mutating func takePending() -> PlayerReopenRequest? {
+        defer { pending = nil }
+        return pending
     }
 
     /// The stream is gone — the change failed, or the player stopped. Nothing
     /// queued behind it is worth reopening.
-    mutating func clear() { pendingMs = nil }
+    mutating func clear() { pending = nil }
+}
+
+/// One queued or immediate stream replacement: where to resume, and why it is
+/// happening. The cause is carried rather than recomputed at open time because
+/// only the request that observed the stall knows which session stalled.
+struct PlayerReopenRequest: Equatable {
+    var positionMs: Int
+    var intent: PlayerOpenIntent = .normal
+}
+
+/// Why a create body is being posted. Everything a viewer does — a seek, a
+/// quality/audio/subtitle change, a fresh title — is `.normal` and carries no
+/// binding; exactly one stall recovery per stall is `.stallReopen`.
+enum PlayerOpenIntent: Equatable {
+    case normal
+    case stallReopen(StallReopenTicket)
+}
+
+/// The bound half of a same-session stall reopen: the exact predecessor the
+/// server reads the resolved rung from, plus the request identity that makes a
+/// transport replay of this one recovery idempotent. Minted once per stall, so
+/// a replayed create returns the predecessor's already-persisted answer
+/// instead of stepping the ladder down a second time.
+struct StallReopenTicket: Equatable {
+    let previousSessionId: String
+    let requestId: String
+}
+
+/// The client-side bound the server deliberately does not implement. A session
+/// at or below the ladder floor is answered with the rung it is already on,
+/// every time, and the server counts nothing and raises no terminal error —
+/// bounding it there would need the per-playback retry state the contract
+/// forbids (docs/ADAPTIVE-QUALITY.md, "Native stall-reopen server boundary").
+/// Without a budget here a starved link reopens the floor rung forever.
+///
+/// The floor is the predecessor's own rung, never 360: a sub-360 source and a
+/// starved network prior both resolve below the ladder, so this state machine
+/// compares heights and never names one.
+struct StallReopenBudget: Equatable {
+    /// Two reopens that fail to buy a lower rung. The first is a genuine retry
+    /// — a transient link may have recovered — and the second is the last one
+    /// worth a viewer's patience before the ordinary stall failure is shown.
+    static let floorAttemptLimit = 2
+
+    /// Film progress that separates one starvation episode from the next. The
+    /// loop this bounds is tight by construction: five seconds of playback
+    /// rearms `SameDeliveryStallRecoveryState`, so a floor-locked link stalls
+    /// again almost immediately. A minute of real film means the link recovered
+    /// and a later stall deserves its own retries — otherwise a brief blip ten
+    /// minutes in would disable automatic recovery for the rest of the title.
+    static let episodeProgressMs = 60_000
+
+    private(set) var floorAttempts = 0
+    /// Film position of the last reopen that spent budget, so the distance to
+    /// the next stall can be measured without a wall clock.
+    private(set) var lastAttemptPositionMs: Int?
+
+    var allowsAnotherAttempt: Bool { floorAttempts < Self.floorAttemptLimit }
+
+    /// Called with each stall before the budget is read. A stall a full minute
+    /// of film past the last unproductive reopen is a new episode, not the loop.
+    mutating func observedStall(at positionMs: Int) {
+        guard let lastAttemptPositionMs,
+              positionMs - lastAttemptPositionMs >= Self.episodeProgressMs
+        else { return }
+        floorAttempts = 0
+    }
+
+    /// Record what a bound stall reopen actually resolved to. Only a strictly
+    /// lower rung is evidence that stepping down is still available; a height
+    /// the server could not state — `0` for a remux of an unprobed source, or
+    /// absent from a server predating the field — is not that evidence and
+    /// spends budget, because an unbounded retry loop is the worse failure.
+    mutating func resolved(height: Int?, previousHeight: Int?, at positionMs: Int) {
+        lastAttemptPositionMs = positionMs
+        guard let height, height > 0,
+              let previousHeight, previousHeight > 0,
+              height < previousHeight
+        else {
+            floorAttempts += 1
+            return
+        }
+        floorAttempts = 0
+    }
+
+    /// A viewer command, a new title, or any other open that builds its own
+    /// session retires the budget: it bounds automatic recovery, not the
+    /// viewer.
+    mutating func reset() {
+        floorAttempts = 0
+        lastAttemptPositionMs = nil
+    }
 }
 
 /// The film-time target of an interactive seek. AVPlayer's clock is not a
@@ -1316,6 +1421,17 @@ final class PlayerController: ObservableObject {
     /// stop visibly instead of walking the HDR/SDR compatibility ladder on a
     /// guess.
     private var sameDeliveryStallRecovery = SameDeliveryStallRecoveryState()
+    /// The floor bound the server contract leaves to the client. Independent of
+    /// `sameDeliveryStallRecovery`, which five seconds of recovered playback
+    /// resets — a link starved at the floor stalls, reopens, plays just long
+    /// enough to rearm that state, and stalls again, which is exactly the
+    /// unbounded loop this counts.
+    private var stallReopenBudget = StallReopenBudget()
+    /// The normalized output height of the session currently playing, as the
+    /// server resolved it. Nil for direct play, and for a server that predates
+    /// the field. Read only to decide whether a stall reopen actually bought a
+    /// lower rung.
+    private var sessionHeight: Int?
     private var deliveryStarvation = DeliveryStarvationDetector()
     private var recoveryReopenBudget = RecoveryReopenBudget()
     /// Evidence that this server understands `native_subtitles`: its create
@@ -2015,6 +2131,8 @@ final class PlayerController: ObservableObject {
         clearPGSOverlaySelection()
         pgsOverlayItemGeneration &+= 1
         playbackRecoveryMonitor.reset()
+        stallReopenBudget.reset()
+        sessionHeight = nil
         deliveryStarvation.reset()
         ttffMeasurement.reset()
         seekState.clear()
@@ -2112,7 +2230,10 @@ final class PlayerController: ObservableObject {
             // queue forever. A command issued before the decision arrived is
             // already represented by `seekState.pendingMs`.
             let initialPosition = seekState.pendingMs ?? startMs
-            try await openAndDrain(decision: decision, at: initialPosition)
+            try await openAndDrain(
+                decision: decision,
+                request: PlayerReopenRequest(positionMs: initialPosition)
+            )
         } catch {
             guard started else { return }
             reopenQueue.clear()
@@ -2121,7 +2242,7 @@ final class PlayerController: ObservableObject {
         }
     }
 
-    private func reopen(at position: Int) async {
+    private func reopen(at position: Int, intent: PlayerOpenIntent = .normal) async {
         // A growing EVENT playlist can momentarily announce its current end,
         // and several UI actions can also request a restart. Never overlap two
         // server-session replacements (see `PlayerReopenQueue`) — they share a
@@ -2130,11 +2251,15 @@ final class PlayerController: ObservableObject {
         // just deleted — but never discard one either: a request that lands
         // mid-change is remembered and replayed as the single trailing reopen.
         guard let decision, started else { return }
-        guard let next = reopenQueue.request(position, changeInFlight: isChangingStream) else {
+        guard let next = reopenQueue.request(
+            position,
+            intent: intent,
+            changeInFlight: isChangingStream
+        ) else {
             return
         }
         do {
-            try await openAndDrain(decision: decision, at: next)
+            try await openAndDrain(decision: decision, request: next)
         } catch {
             reopenQueue.clear()
             seekState.clear()
@@ -2148,10 +2273,16 @@ final class PlayerController: ObservableObject {
     /// true however long a burst of step-seeks runs. Nothing awaits between a
     /// finished `open` and the next one, so no other request can observe the
     /// gap and start a competing replacement.
-    private func openAndDrain(decision: Decision, at startMs: Int) async throws {
-        var next = startMs
+    ///
+    /// Each drained request carries its own cause, so a stall reopen is issued
+    /// exactly once: whatever this loop replays next is either a viewer command
+    /// (unbound) or a genuinely new stall that minted its own ticket. One stall
+    /// can therefore never step the ladder down twice.
+    private func openAndDrain(decision: Decision, request: PlayerReopenRequest) async throws {
+        var request = request
         while true {
-            try await open(decision: decision, at: next)
+            let next = request.positionMs
+            try await open(decision: decision, at: next, intent: request.intent)
             guard started else {
                 reopenQueue.clear()
                 // Parity with `stop()`: nothing will complete a pending
@@ -2169,11 +2300,15 @@ final class PlayerController: ObservableObject {
                 seekState.completeReopen(at: next)
                 return
             }
-            next = trailing
+            request = trailing
         }
     }
 
-    private func open(decision: Decision, at startMs: Int) async throws {
+    private func open(
+        decision: Decision,
+        at startMs: Int,
+        intent: PlayerOpenIntent = .normal
+    ) async throws {
         guard let model, started else { return }
         openGeneration &+= 1
         let generation = openGeneration
@@ -2247,9 +2382,17 @@ final class PlayerController: ObservableObject {
         var seekAfterAttach: Int?
         var nextBaseMs = 0
 
+        // Only automatic stall recovery is bounded. Every other open — a seek,
+        // a quality/audio/subtitle change, a compatibility retry — is fresh
+        // intent that builds its own session, so it retires the floor budget
+        // rather than inheriting a starved predecessor's exhausted one.
+        if case .normal = intent { stallReopenBudget.reset() }
+
         if direct {
             activeBurnedSubtitle = nil
             isDirectPlayback = true
+            // Direct play has no session and therefore no rung.
+            sessionHeight = nil
             nextBaseMs = 0
             usesDirectTimeline = true
             isVOD = true
@@ -2277,26 +2420,53 @@ final class PlayerController: ObservableObject {
             )
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
-            let body = CreateSessionRequest(
-                playbackId: playbackId,
-                height: Self.burnSessionHeight(
-                    burnSubtitle: burnSubtitle,
-                    mode: normalMode,
-                    selectedHeight: selectedHeight,
-                    sourceHeight: decision.source?.height
+            let body = Self.applyOpenIntent(
+                to: CreateSessionRequest(
+                    playbackId: playbackId,
+                    height: Self.burnSessionHeight(
+                        burnSubtitle: burnSubtitle,
+                        mode: normalMode,
+                        selectedHeight: selectedHeight,
+                        sourceHeight: decision.source?.height
+                    ),
+                    start: Double(startMs) / 1000.0,
+                    audio: chosenAudio,
+                    subtitleBurn: burnSubtitle,
+                    nativeSubtitles: true,
+                    subtitle: nativeSubtitle,
+                    copy: copy ? true : nil,
+                    aac: copy ? aac : nil,
+                    preserveDolbyVision: copy ? preserveDolbyVision : nil
                 ),
-                start: Double(startMs) / 1000.0,
-                audio: chosenAudio,
-                subtitleBurn: burnSubtitle,
-                nativeSubtitles: true,
-                subtitle: nativeSubtitle,
-                copy: copy ? true : nil,
-                aac: copy ? aac : nil,
-                preserveDolbyVision: copy ? preserveDolbyVision : nil
+                intent: intent,
+                currentSessionId: superseded,
+                selectedHeight: selectedHeight
             )
+            // The rung this open is stepping down *from*, read before the
+            // successor overwrites it. Only a strictly lower answer proves the
+            // ladder still has somewhere to go.
+            let previousHeight = sessionHeight
             let hls: HlsStart
             do {
-                hls = try await model.createHlsSession(fileId: fileId, body: body)
+                do {
+                    hls = try await model.createHlsSession(fileId: fileId, body: body)
+                } catch let createError {
+                    // The bound half of a stall reopen is the only part of this
+                    // body the server can refuse on its own: the predecessor
+                    // may have been superseded or retired between the stall and
+                    // this create, including by a retryable failure that
+                    // replays after the claim was already normalized. Recovery
+                    // is still wanted, so re-post the identical recipe unbound
+                    // — under a fresh request id, because the old one is spent
+                    // on the refused claim. Exactly one retry, only for a bound
+                    // attempt, and only for the status that means "that
+                    // predecessor is not a thing I can step down from".
+                    guard let unbound = Self.unboundStallRetry(
+                        for: body,
+                        after: createError
+                    ) else { throw createError }
+                    hls = try await model.createHlsSession(fileId: fileId, body: unbound)
+                }
             } catch {
                 // A superseded attempt must not report its own failure over
                 // the newer open's state (P2-6), and must not put back a stream
@@ -2318,7 +2488,20 @@ final class PlayerController: ObservableObject {
                 isChangingStream = false
                 return
             }
+            // Spend the floor budget on what the server actually answered, in
+            // lockstep with the `sessionHeight` it is measured against. An
+            // unbound fallback counts too: it did not buy a lower rung either.
+            if case .stallReopen = intent {
+                stallReopenBudget.resolved(
+                    height: hls.height,
+                    previousHeight: previousHeight,
+                    at: startMs
+                )
+            }
             sessionId = hls.sessionId
+            // The authoritative normalized answer for this session, and the
+            // rung the next stall reopen is measured against.
+            sessionHeight = hls.height
             isDirectPlayback = false
             serverServesNativeSubtitles = Self.playlistAdvertisesNativeSubtitles(hls.playlistUrl)
             activeBurnedSubtitle = burnSubtitle
@@ -2906,29 +3089,38 @@ final class PlayerController: ObservableObject {
     }
 
     /// One bounded transport recovery shared by buffering and non-HDR silent
-    /// freezes. It deliberately calls `reopen` directly: no capability flag or
-    /// selected format changes, so the replacement uses the identical recipe.
+    /// freezes. It changes no capability flag and no selected format, so the
+    /// replacement uses the identical recipe — but it names the session that
+    /// stalled, so the server resolves it one rung down instead of rebuilding
+    /// the rung that just starved.
     private func retrySameDeliveryAfterStall(_ event: PlaybackStallEvent) async {
         var decision = sameDeliveryStallRecovery.next(for: event.kind)
-        // The per-epoch budget above resets on five seconds of real progress,
-        // so a session that keeps almost-recovering can spend it repeatedly.
-        // The rolling reopen budget is the backstop that turns that loop into
-        // the visible failure screen.
-        if case .reopen = decision, !recoveryReopenBudget.admit() {
-            decision = .stop(event.kind.terminalState)
-        }
+        #if os(iOS)
+        let hasOfflineAsset = offlineAssetURL != nil
+        #else
+        let hasOfflineAsset = false
+        #endif
+        let transport = Self.recoveryTransport(hasOfflineAsset: hasOfflineAsset)
+        stallReopenBudget.observedStall(at: event.positionMs)
+        decision = Self.boundedStallRecoveryDecision(
+            decision,
+            transport: transport,
+            budgetAllowsAnotherAttempt: stallReopenBudget.allowsAnotherAttempt,
+            kind: event.kind,
+            reopenStorm: &recoveryReopenBudget
+        )
         reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
         case .reopen:
             ttffReason = "stall-\(event.kind.rawValue)"
             ttffMeasurement.opened(at: event.positionMs)
             #if os(iOS)
-            if Self.recoveryTransport(hasOfflineAsset: offlineAssetURL != nil) == .offlineAsset {
+            if transport == .offlineAsset {
                 await reloadOffline(at: event.positionMs)
                 return
             }
             #endif
-            await reopen(at: event.positionMs)
+            await reopen(at: event.positionMs, intent: stallReopenIntent())
         case .stop(let terminal):
             player.pause()
             isPlaying = terminal.isPlaying
@@ -2944,6 +3136,149 @@ final class PlayerController: ObservableObject {
         hasOfflineAsset: Bool
     ) -> SameDeliveryRecoveryTransport {
         hasOfflineAsset ? .offlineAsset : .serverSession
+    }
+
+    /// The exhausted-floor arm of the recovery state machine. A server session
+    /// that keeps being answered with the rung it is already on has nowhere
+    /// left to go, so the ordinary stall failure is shown rather than another
+    /// reopen. Only server sessions are bounded: an offline package has no rung
+    /// to step down to and no server to ask.
+    ///
+    /// Separate from `SameDeliveryStallRecoveryState`, which five seconds of
+    /// recovered playback rearms — that interval is exactly the tight
+    /// stall/reopen/stall loop this arm has to end.
+    nonisolated static func stallRecoveryDecision(
+        _ proposed: SameDeliveryStallRecoveryDecision,
+        transport: SameDeliveryRecoveryTransport,
+        budgetAllowsAnotherAttempt: Bool,
+        kind: PlaybackStallKind
+    ) -> SameDeliveryStallRecoveryDecision {
+        guard proposed == .reopen,
+              transport == .serverSession,
+              !budgetAllowsAnotherAttempt
+        else { return proposed }
+        return .stop(kind.terminalState)
+    }
+
+    /// Compose the two independent stall bounds, in the one order that is safe.
+    ///
+    /// They answer different questions and neither subsumes the other. The
+    /// ladder floor asks whether reopens are still buying a strictly lower
+    /// rung; it is the only bound that can answer "never again", because a
+    /// link starved at the floor reproduces its own precondition forever. The
+    /// rolling budget asks how many automatic reopens landed in the last
+    /// minute; it is a storm cap and releases on its own once the window
+    /// slides.
+    ///
+    /// The floor is evaluated first because `admit()` *mutates* — it records a
+    /// timestamp. Consulting it ahead of the floor would charge a rolling slot
+    /// to a reopen the floor then converts to `.stop`, so a genuinely
+    /// unrelated stall minutes later would inherit that debt and hit the storm
+    /// cap early. A reopen that never happens must not be counted as one.
+    nonisolated static func boundedStallRecoveryDecision(
+        _ proposed: SameDeliveryStallRecoveryDecision,
+        transport: SameDeliveryRecoveryTransport,
+        budgetAllowsAnotherAttempt: Bool,
+        kind: PlaybackStallKind,
+        reopenStorm: inout RecoveryReopenBudget,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> SameDeliveryStallRecoveryDecision {
+        let decision = Self.stallRecoveryDecision(
+            proposed,
+            transport: transport,
+            budgetAllowsAnotherAttempt: budgetAllowsAnotherAttempt,
+            kind: kind
+        )
+        guard decision == .reopen else { return decision }
+        guard reopenStorm.admit(at: now) else { return .stop(kind.terminalState) }
+        return decision
+    }
+
+    /// The cause this recovery's create should carry. Only a live growing
+    /// session has a predecessor rung to step down from: direct play holds no
+    /// session at all, and a VOD session is a completed cache entry whose
+    /// bytes are already on disk, so neither is something the ladder can
+    /// answer. Those reopen unbound, exactly as before.
+    nonisolated static func stallReopenIntent(
+        sessionId: String?,
+        isVOD: Bool,
+        // One identity for this one stall. A transport replay of the same
+        // create returns the answer already persisted under it rather than
+        // stepping the ladder a second time.
+        requestId: String
+    ) -> PlayerOpenIntent {
+        guard let sessionId, !isVOD else { return .normal }
+        return .stallReopen(
+            StallReopenTicket(previousSessionId: sessionId, requestId: requestId)
+        )
+    }
+
+    private func stallReopenIntent() -> PlayerOpenIntent {
+        Self.stallReopenIntent(
+            sessionId: sessionId,
+            isVOD: isVOD,
+            requestId: UUID().uuidString
+        )
+    }
+
+    /// Stamp an open's cause onto its create body.
+    ///
+    /// `quality_auto` goes on every body, not only a bound one: it is the
+    /// viewer's answer to the quality menu, and the server's fallback
+    /// inference ("no height means Auto") misreads the promise height a
+    /// subtitle burn posts as a sticky manual pick, which would leave that
+    /// session permanently unsteppable.
+    ///
+    /// A stall ticket is honored only while it still names the session that is
+    /// actually playing. A seek, a quality change, or another recovery that
+    /// completed first has already replaced that predecessor, and a create
+    /// naming a session the server no longer runs is refused outright — so the
+    /// binding is dropped and the recovery proceeds as an ordinary reopen.
+    nonisolated static func applyOpenIntent(
+        to body: CreateSessionRequest,
+        intent: PlayerOpenIntent,
+        currentSessionId: String?,
+        selectedHeight: Int?
+    ) -> CreateSessionRequest {
+        var body = body
+        body.qualityAuto = selectedHeight == nil
+        guard case .stallReopen(let ticket) = intent,
+              let currentSessionId,
+              ticket.previousSessionId == currentSessionId
+        else { return body }
+        body.previousSessionId = ticket.previousSessionId
+        body.reopenReason = Self.stallReopenReason
+        body.requestId = ticket.requestId
+        return body
+    }
+
+    /// The wire value for a typed stall recovery. The server accepts no other.
+    static let stallReopenReason = "stall"
+
+    /// The unbound body to re-post when the server refuses a bound stall
+    /// reopen, or `nil` when this failure is not that case.
+    ///
+    /// Narrowed to `400` on a body that actually carried the binding. Every
+    /// other field of a create this client sends has already produced a
+    /// session on the open that is currently playing, so a `400` here is the
+    /// predecessor going away underneath the recovery — the one failure a
+    /// second, unbound attempt can fix. Anything else (401, 404, 5xx,
+    /// transport) is left to the caller's existing restore-and-surface path.
+    nonisolated static func unboundStallRetry(
+        for body: CreateSessionRequest,
+        after error: Error
+    ) -> CreateSessionRequest? {
+        guard body.previousSessionId != nil,
+              let apiError = error as? APIError,
+              case .http(400) = apiError
+        else { return nil }
+        var retry = body
+        retry.previousSessionId = nil
+        retry.reopenReason = nil
+        // The refused claim consumed the old identity: replaying it returns
+        // the same refusal rather than a session.
+        retry.requestId = UUID().uuidString
+        return retry
     }
 
     private func fail(_ error: Error) {
