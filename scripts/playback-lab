@@ -3052,6 +3052,7 @@ async function deviceRunCommand(options, dependencies = {}) {
       "--device", device,
       "--terminate-existing",
       "--activate",
+      "--",
       bundleId,
       "-plurx.origin", baseUrl,
       "-plurx.acceptance.fileId", String(fileId),
@@ -3085,7 +3086,7 @@ async function deviceRunCommand(options, dependencies = {}) {
     await shaper.close().catch(() => {});
     if (launched && !enabledOption(options.leave_running)) {
       try {
-        restore(["--device", device, "--terminate-existing", "--activate", bundleId]);
+        restore(["--device", device, "--terminate-existing", "--activate", "--", bundleId]);
       } catch (error) {
         process.stderr.write(`playback-lab: device restore failed: ${sanitizedError(error)}\n`);
       }

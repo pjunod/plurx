@@ -339,11 +339,14 @@ test("device-run defaults to Auto quality, writes evidence, and restores the app
       assert.ok(launches[0].includes("-plurx.origin"));
       assert.ok(launches[0].includes("-plurx.acceptance.fileId"));
       assert.ok(launches[0].includes("-plurx.acceptance.probe"));
+      assert.ok(launches[0].indexOf("--") < launches[0].indexOf("tv.plurx.app"),
+        "devicectl options must end before dash-prefixed app arguments");
       assert.equal(launches[0].includes("-plurx.acceptance.height"), false,
         "omitting --height must preserve the player's Auto quality selection");
       assert.deepEqual(launches[1].slice(0, 5), [
         "restore", "--device", "physical-device-17", "--terminate-existing", "--activate",
       ]);
+      assert.deepEqual(launches[1].slice(5), ["--", "tv.plurx.app"]);
       assert.equal(evidence.completion.reason, "test-complete");
       const artifact = JSON.parse(await fsp.readFile(json, "utf8"));
       assert.equal(artifact.client_events[0].snapshot.runway, 4.75);
