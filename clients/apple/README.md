@@ -20,9 +20,10 @@ only what this hardware genuinely can't play.
 > `reopen_reason: "stall"`, so the server answers one rung *down* rather than
 > rebuilding the rung that just starved, states `quality_auto` so a subtitle
 > burn's promise height is not read as a sticky manual pick, and stops at the
-> ladder floor — the bound the server deliberately leaves to the client.
-> Build 65 keeps the delivery watchdog honest about a
-> player that is still making progress. Build 64 stops the delivery watchdog firing on a
+> ladder floor — the bound the server deliberately leaves to the client. It
+> also adds unattended physical-device bandwidth acceptance with exact runway
+> evidence. Build 65 keeps the delivery watchdog honest about a player that is
+> still making progress. Build 64 stops the delivery watchdog firing on a
 > healthy player: a full forward buffer looks exactly like a wedge from the
 > server's delivery meter, so the film clock and the buffered runway now have
 > to agree before it recovers. Build 63 makes stall recovery un-foolable: one

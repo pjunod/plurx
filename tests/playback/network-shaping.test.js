@@ -82,6 +82,19 @@ test("the acceptance profile parses into a recorded, descending cliff", () => {
   assert.equal(lab.parseNetworkProfile("1500kbps-to-500kbps").stages[0].kbps, 1500);
 });
 
+test("a physical-device profile can descend through three exact link stages", () => {
+  const profile = lab.parseNetworkProfile("8mbps-to-1.1mbps-to-350kbps@15");
+  assert.deepEqual(profile.stages.map((stage) => stage.kbps), [8000, 1100, 350]);
+  assert.deepEqual(profile.stages.map((stage) => stage.label), [
+    "before-cliff", "after-cliff", "after-cliff-2",
+  ]);
+  assert.equal(profile.cliff_after_seconds, 15);
+  assert.throws(
+    () => lab.parseNetworkProfile("8mbps-to-1mbps-to-2mbps"),
+    /must descend at every stage/,
+  );
+});
+
 test("no profile means no shaping, so existing suites keep today's behavior", () => {
   for (const spec of [undefined, null, "", false, "none"]) {
     assert.equal(lab.parseNetworkProfile(spec), null, JSON.stringify(spec));
@@ -213,6 +226,129 @@ test("the shaper holds the link, applies the cliff, and records both stages", as
       "closing the shaper releases its listening socket",
     );
   }, { firstResponseDelayMs: 750 });
+});
+
+test("the physical-device control API is authenticated and advances exact stages", async () => {
+  await withOrigin(1024, async (origin) => {
+    const shaper = new lab.ShapingProxy(
+      lab.parseNetworkProfile("8mbps-to-1mbps-to-350kbps"),
+      origin,
+      { controlToken: "test-control-token" },
+    );
+    const base = await shaper.start();
+    const authorized = { "x-playback-lab-control": "test-control-token" };
+    try {
+      const refused = await fetch(`${base}/__playback_lab/status`);
+      assert.equal(refused.status, 403);
+
+      const status = await fetch(`${base}/__playback_lab/status`, { headers: authorized });
+      assert.equal(status.status, 200);
+      assert.equal((await status.json()).current_kbps, 8000);
+
+      const first = await fetch(`${base}/__playback_lab/cliff`, {
+        method: "POST", headers: authorized,
+      });
+      assert.equal(first.status, 200);
+      assert.equal((await first.json()).current_kbps, 1000);
+      const second = await fetch(`${base}/__playback_lab/cliff`, {
+        method: "POST", headers: authorized,
+      });
+      assert.equal(second.status, 200);
+      assert.equal((await second.json()).current_kbps, 350);
+      const exhausted = await fetch(`${base}/__playback_lab/cliff`, {
+        method: "POST", headers: authorized,
+      });
+      assert.equal(exhausted.status, 409);
+    } finally {
+      await shaper.close();
+    }
+  });
+});
+
+test("client probes are captured without credentials and TTFF drives scheduled cliffs", async () => {
+  await withOrigin(1, async (origin) => {
+    const shaper = new lab.ShapingProxy(
+      lab.parseNetworkProfile("8mbps-to-1mbps-to-350kbps@0.01"),
+      origin,
+      {
+        controlToken: "test-control-token",
+        autoAdvance: true,
+        recoveryCliffAfterSeconds: 0.01,
+      },
+    );
+    await shaper.start();
+    try {
+      shaper.captureClientLog({
+        event: "playback_probe",
+        file_id: 42,
+        snapshot: { runway: 3.5 },
+        token: "must-not-survive",
+        url: "http://example.invalid/?token=must-not-survive",
+      });
+      shaper.captureClientLog({ event: "ttff", reason: "cold-start", attempt: "one" });
+      assert.equal(shaper.controlSnapshot().scheduled_advance.stage_index, 1);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(shaper.stageIndex, 1);
+
+      shaper.captureClientLog({ event: "ttff", reason: "stall-buffering", attempt: "two" });
+      assert.equal(shaper.controlSnapshot().scheduled_advance.stage_index, 2);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(shaper.stageIndex, 2);
+
+      const evidence = JSON.stringify(shaper.controlSnapshot());
+      assert.match(evidence, /playback_probe/);
+      assert.match(evidence, /"runway":3.5/);
+      assert.doesNotMatch(evidence, /must-not-survive/);
+      assert.deepEqual(shaper.transitions.map((entry) => entry.reason), [
+        "initial-ttff", "recovery-ttff",
+      ]);
+    } finally {
+      await shaper.close();
+    }
+  });
+});
+
+test("device-run launches with deterministic defaults, writes evidence, and restores the app", async () => {
+  await withTempDir(async (directory) => {
+    await withOrigin(1, async (origin) => {
+      const launches = [];
+      const json = path.join(directory, "device-evidence.json");
+      const evidence = await lab.deviceRunCommand({
+        device: "physical-device-17",
+        target: origin,
+        public_host: "127.0.0.1",
+        file_id: "42",
+        item_id: "17",
+        height: "480",
+        network_profile: "8mbps-to-1mbps-to-350kbps",
+        json,
+      }, {
+        createShaper: (profile, target, options) => new lab.ShapingProxy(profile, target, {
+          ...options, listenHost: "127.0.0.1",
+        }),
+        launchDevice: (args) => launches.push(["launch", ...args]),
+        restoreDevice: (args) => launches.push(["restore", ...args]),
+        waitForAcceptance: async (shaper) => {
+          shaper.captureClientLog({
+            event: "playback_probe", file_id: 42, snapshot: { runway: 4.75 },
+          });
+          return { reason: "test-complete", event: null };
+        },
+      });
+
+      assert.equal(launches.length, 2);
+      assert.ok(launches[0].includes("-plurx.origin"));
+      assert.ok(launches[0].includes("-plurx.acceptance.fileId"));
+      assert.ok(launches[0].includes("-plurx.acceptance.probe"));
+      assert.deepEqual(launches[1].slice(0, 5), [
+        "restore", "--device", "physical-device-17", "--terminate-existing", "--activate",
+      ]);
+      assert.equal(evidence.completion.reason, "test-complete");
+      const artifact = JSON.parse(await fsp.readFile(json, "utf8"));
+      assert.equal(artifact.client_events[0].snapshot.runway, 4.75);
+      assert.doesNotMatch(JSON.stringify(artifact), /control_token|authorization|bearer/i);
+    });
+  });
 });
 
 test("concurrent reservations are rescheduled at the cliff instead of bursting", async () => {
