@@ -48,8 +48,9 @@ order:
   (`stream.rs:669`, `hls.rs:194`, `transcode.rs:3505`, `hls.rs:389`).
 - **B11 — the copy-path publish gate is a *deliberate* 12 s of media.**
   `COPY_PUBLISH_GATE_SECS = 12` (`plurx-core/src/transcode/mod.rs:221`),
-  filled at I/O speed only when ffmpeg has `-readrate_initial_burst`
-  (6.1+, warned at `ffmpeg.rs:140-152`). The playlist request long-polls
+  filled at I/O speed only when ffmpeg honours `-readrate_initial_burst`
+  (some builds declare the option but ignore it; probed behaviourally in
+  `ffmpeg.rs`). The playlist request long-polls
   up to 30 s for it (`transcode.rs:4426`). With burst the gate fills at
   I/O speed ("costs a few seconds" — STUTTER-4K); without it, at the
   flat 2× pace, the fill alone is cushion ÷ 2 ≈ 6 s — `ffmpeg.rs:144-145`

@@ -472,7 +472,22 @@ fn pacing_from_probe(probe: Result<String, String>) -> PacingCaps {
 pub async fn pacing_caps() -> PacingCaps {
     *PACING
         .get_or_init(|| async {
-            pacing_from_probe(probe_ffmpeg(&["-hide_banner", "-h", "full"]).await)
+            let help = probe_ffmpeg(&["-hide_banner", "-h", "full"]).await;
+            let mut caps = pacing_from_probe(help);
+            // Some builds (notably ffmpeg 8.0.1) declare the option but
+            // silently ignore it. Check behaviourally when the declaration
+            // looks promising.
+            if caps.initial_burst && !probe_burst_honoured().await {
+                let ffmpeg_path = ffmpeg_bin();
+                tracing::warn!(
+                    "this ffmpeg ({ffmpeg_path}) declares -readrate_initial_burst but does not honour it: \
+                     sessions are paced flat from the first byte, so the copy path's publish gate \
+                     fills at the paced rate instead of at I/O speed and every play starts seconds \
+                     slower than it needs to"
+                );
+                caps.initial_burst = false;
+            }
+            caps
         })
         .await
 }
@@ -501,6 +516,54 @@ impl PacingCaps {
             readrate: Some(rate),
             initial_burst: self.initial_burst.then_some(burst).filter(|b| *b > 0.0),
             legacy_re: false,
+        }
+    }
+}
+
+/// Check whether this ffmpeg build actually honours `-readrate_initial_burst`.
+///
+/// Some builds (notably ffmpeg 8.0.1-3ubuntu2) declare the option in their
+/// help text but silently ignore it at runtime, so a purely textual probe of
+/// the declaration is insufficient. This runs a short behavioural test.
+///
+/// The test creates a 2-second `testsrc` fixture and runs ffmpeg with a 300 s
+/// burst at 2x readrate. An honoured burst consumes the fixture at I/O speed
+/// (sub-200 ms). An inert burst paces at the readrate and takes ~1 second of
+/// wall time. A 600 ms threshold cleanly separates the two cases.
+async fn probe_burst_honoured() -> bool {
+    let args = &[
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=2:size=2x2:rate=1",
+        "-readrate_initial_burst",
+        "300",
+        "-readrate",
+        "2",
+        "-f",
+        "null",
+        "-",
+    ];
+    let start = std::time::Instant::now();
+    match tokio::process::Command::new(ffmpeg_bin())
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            // The paced duration is 2 s / 2x = 1 s. A 600 ms threshold
+            // avoids false negatives from moderate startup overhead or
+            // slow I/O on underpowered machines.
+            start.elapsed() < std::time::Duration::from_millis(600)
+        }
+        _ => {
+            // Probe itself failed (no lavfi device, missing binary, etc.).
+            // Conservatively report not honoured so nobody relies on a
+            // capability we cannot confirm at runtime.
+            false
         }
     }
 }
@@ -636,6 +699,35 @@ mod tests {
         );
         assert!(!caps.readrate);
         assert!(!caps.initial_burst);
+    }
+
+    /// Regression: when `-readrate_initial_burst` is declared but not honoured at
+    /// runtime, `PacingCaps::resolve` must emit the same flags as a build that
+    /// never had the burst clause — the readrate alone, without the burst flag.
+    /// This is the path `pacing_caps()` takes after `probe_burst_honoured()` returns
+    /// false: it corrects `initial_burst` to false, and `resolve` must not emit
+    /// the inert flag.
+    #[test]
+    fn inert_burst_produces_the_same_resolve_as_no_burst_declaration() {
+        // Simulate caps as they would be after the behavioural probe corrects
+        // initial_burst to false on an ffmpeg build that declares but ignores
+        // the option.
+        let corrected = PacingCaps {
+            readrate: true,
+            initial_burst: false,
+        };
+        // Must produce -readrate without -readrate_initial_burst, matching the
+        // 5.1–6.0 behaviour where the burst clause legitimately does not exist.
+        assert_eq!(
+            corrected.resolve(2.0, 90.0, true).args(),
+            vec!["-readrate", "2.00"],
+            "an inert burst must resolve to readrate-only flags, just like a              build that never declared the burst clause"
+        );
+        // Zero rate still means unpaced.
+        assert!(
+            corrected.resolve(0.0, 90.0, true).args().is_empty(),
+            "zero readrate must still produce unpaced flags even with corrected caps"
+        );
     }
 
     #[test]
