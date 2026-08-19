@@ -65,14 +65,16 @@ needed. Following the plan there would start a stream that cannot show the
 chosen track and replace it a moment later, which is exactly the re-buffer a
 pre-play choice exists to avoid.
 
-The server contract is shipped, and the **web** and **Apple** clients render
-it: the item detail screen lists both track sets with the selected one marked,
-and offers pre-play Audio and Subtitles pickers whose choice reaches
-`/decision` and the first session open. Apple states a bitmap track's burn-in
-cost on the detail screen, and words PGS as a possibility rather than a
-certainty because the `pgs-v1` overlay flag rides on `/decision`'s tracks,
-which a detail screen has not fetched. Android rendering lands in its platform
-follow-up rather than inventing placeholder policy in the meantime.
+The server contract is shipped, and the **web**, **Apple**, and **Android**
+clients render it: the item detail screen lists both track sets with the
+selected one marked, and offers pre-play Audio and Subtitles pickers whose
+choice reaches `/decision` and the first session open. Apple states a bitmap
+track's burn-in cost on the detail screen, and words PGS as a possibility
+rather than a certainty because the `pgs-v1` overlay flag rides on
+`/decision`'s tracks, which a detail screen has not fetched. Android prices the
+same track from a selection-aware `/decision` preflight, so it reads that flag
+and states the cost outright; a preflight that fails claims nothing and leaves
+the disclosure to the in-player path.
 
 ## 2. Per-platform notes
 

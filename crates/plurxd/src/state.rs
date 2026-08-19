@@ -62,6 +62,15 @@ pub struct SystemInfo {
     /// (a 4K film quietly playing at the Auto rung in Chrome and perfectly in
     /// Safari) is otherwise unattributable from outside the machine.
     pub dovi_rpu: bool,
+    /// Whether this exact ffmpeg can run the software-decode → tonemapx
+    /// Dolby Vision reshape → software-encode graph.
+    pub dovi_reshape: bool,
+    /// Whether this exact ffmpeg can run the HDR10 rung: the same software
+    /// decode into `tonemapx`'s HDR *passthrough* mode at 10 bit, into
+    /// libx265 Main10. Separate from `dovi_reshape` because it is a separate
+    /// probe of a separate graph — the SDR one proves nothing about a PQ
+    /// output, where an 8-bit format aborts the process outright.
+    pub dovi_passthrough: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -215,6 +224,8 @@ impl AppState {
                 system.tone_map.selected(),
             )
             .with_dv_strippable(system.dovi_rpu)
+            .with_dovi_reshape(system.dovi_reshape)
+            .with_dovi_passthrough(system.dovi_passthrough)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
@@ -1690,7 +1701,7 @@ impl JobManager {
             // The rung a viewer would actually be given, so the entry matches
             // what a real playback looks up. Asking the manager rather than
             // assuming is what keeps the two in step when Auto's policy moves.
-            let height = transcode.auto_height(file.height, None).await;
+            let height = transcode.auto_height_for_file(Some(&file), None).await;
             match transcode.produce(&file, height, deadline).await {
                 Ok(Some(made)) => {
                     produced += 1;

@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use plurx_core::domain::PlaybackEvent;
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::{
-    self, EffectiveRateControl, Encoder, EncoderCaps, Pacing, Pipeline, PipelineDigest,
-    QualityRateControlValidation, QualityRc, RateMode, Recipe, ToneMap, TranscodeOptions,
+    self, EffectiveRateControl, Encoder, EncoderCaps, OutputGrade, Pacing, Pipeline,
+    PipelineDigest, QualityRateControlValidation, QualityRc, RateMode, Recipe, ToneMap,
+    TranscodeOptions,
 };
 use tokio::process::Child;
 use tokio::sync::Mutex;
@@ -1415,6 +1416,11 @@ struct Session {
     /// RFC 6381 sample types present in the primary HLS rendition. A native
     /// subtitle master must advertise these; omitting or abbreviating the
     /// referenced formats makes AVPlayer reject an otherwise playable copy.
+    /// The dynamic range this session's bytes actually carry. Recorded on the
+    /// session, not recomputed from the request, because an idempotent
+    /// recovery must report what the running encoder is producing rather than
+    /// what a later reader would decide.
+    grade: OutputGrade,
     hls_codecs: String,
     /// Backward-compatible enhancement carried by the video samples, such as
     /// Dolby Vision Profile 8.1 over an HDR10 HEVC base layer. Apple requires
@@ -2447,6 +2453,11 @@ pub struct StartInfo {
     /// must report this answer rather than the pre-normalization request.
     pub kind: SessionKind,
     pub encoder: &'static str,
+    /// The dynamic range this session's bytes carry. `StartResponse` turns it
+    /// into `delivered_dynamic_range`, overriding whatever `/decision` said —
+    /// a burn, a forced rung, or a refused HDR10 grade all produce a session
+    /// the decision never promised.
+    pub grade: OutputGrade,
     /// Served from the cache: every segment already exists, so this is a VOD
     /// asset rather than a stream being written.
     ///
@@ -2569,6 +2580,17 @@ pub struct SessionRequest {
     pub subtitle_burn: Option<i64>,
     /// Manual A/V correction for this playback only (positive delays audio).
     pub audio_offset_ms: i64,
+    /// The client asked for the HDR10 re-encode grade rather than the SDR
+    /// ladder: it decodes and presents HEVC Main10 PQ (`hdr10t=1` at
+    /// `/decision`, `CreateSession::hdr10` here).
+    ///
+    /// A request, not a verdict. The server still refuses it for any source
+    /// that does not *prove* a Dolby Vision RPU through the production
+    /// renderer — see `TranscodeManager::hdr10_grade_for`. A client that
+    /// asks for it on an HDR10 source gets today's tone-mapped SDR rung,
+    /// because the passthrough filter on a non-DV input emits a broken
+    /// picture at exit 0 rather than failing (measured).
+    pub hdr10: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2633,6 +2655,15 @@ impl SessionRequest {
                 aac,
                 preserve_dolby_vision,
             } => format!("c{}d{}", u8::from(aac), u8::from(preserve_dolby_vision)),
+        };
+        // A different grade is different bytes, so it cannot share an
+        // idempotency identity. Appended rather than folded into every arm so
+        // that an SDR request fingerprints to exactly the string it always
+        // did — a replay in flight across a deploy still recovers its session.
+        let kind = if self.hdr10 {
+            format!("{kind}+hdr10")
+        } else {
+            kind
         };
         // These strings are client-controlled. A typed JSON tuple keeps a
         // colon inside a username, playback id, or session id from producing
@@ -3141,6 +3172,14 @@ pub struct TranscodeManager {
     /// whatever ffmpeg it was running, leave the DV configuration in every
     /// remux, and have browsers that cannot decode DV refuse the stream.
     dv_strippable: bool,
+    /// Whether boot proved the exact software/tonemapx/software renderer used
+    /// for non-backward-compatible Dolby Vision.
+    dovi_reshape: bool,
+    /// Whether this daemon's ffmpeg proved the HDR10 passthrough renderer at
+    /// boot ([`crate::ffmpeg::has_dovi_passthrough`]). Its own field, and its
+    /// own probe: the SDR reshape graph proves nothing about a PQ output.
+    dovi_passthrough: bool,
+    dovi_proofs: std::sync::Mutex<HashMap<String, bool>>,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -3199,6 +3238,9 @@ impl TranscodeManager {
             background_producer: Mutex::new(()),
             offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
+            dovi_reshape: false,
+            dovi_passthrough: false,
+            dovi_proofs: std::sync::Mutex::new(HashMap::new()),
             cached_limits: std::sync::RwLock::new(None),
             #[cfg(test)]
             playlist_wait_override_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3217,6 +3259,16 @@ impl TranscodeManager {
     /// not the cache's.
     pub fn with_dv_strippable(mut self, dv_strippable: bool) -> Self {
         self.dv_strippable = dv_strippable;
+        self
+    }
+
+    pub fn with_dovi_passthrough(mut self, dovi_passthrough: bool) -> Self {
+        self.dovi_passthrough = dovi_passthrough;
+        self
+    }
+
+    pub fn with_dovi_reshape(mut self, dovi_reshape: bool) -> Self {
+        self.dovi_reshape = dovi_reshape;
         self
     }
 
@@ -3291,7 +3343,6 @@ impl TranscodeManager {
         Some(PipelineDigest {
             ffmpeg_build: cache.ffmpeg_build.clone(),
             encoder: Encoder::Software, // replaced per lookup
-            pipeline: self.pipeline,
         })
     }
 
@@ -3398,6 +3449,149 @@ impl TranscodeManager {
         self.select_tracks(file, None, None).await.audio_index
     }
 
+    /// Whether this file needs RPU-driven reshaping rather than the ordinary
+    /// HDR10 base-layer route. Unknown and unsupported non-compatible
+    /// profiles are refused instead of being guessed through zscale.
+    fn needs_dovi_reshape(file: &plurx_core::domain::MediaFile) -> Result<bool, String> {
+        if file.hdr.as_deref() != Some("dolby_vision") {
+            return Ok(false);
+        }
+        if file.hdr_format.as_deref().is_some_and(|label| {
+            label.contains("HDR10-compatible") || label.contains("HLG-compatible")
+        }) {
+            return Ok(false);
+        }
+        match plurx_core::playback::dolby_vision_profile(file) {
+            Some(5) => Ok(true),
+            Some(profile) => Err(unsupported_build_error(format!(
+                "Dolby Vision Profile {profile} has no compatible base and no proven renderer; rescan after upgrading ffprobe or use a compatible source"
+            ))),
+            None => Err(unsupported_build_error(
+                "Dolby Vision profile/base compatibility is unknown; rescan after upgrading ffprobe rather than producing untrusted colors",
+            )),
+        }
+    }
+
+    fn dovi_proof_key(file: &plurx_core::domain::MediaFile) -> String {
+        format!("{}:{}:{}", file.path.display(), file.size, file.mtime)
+    }
+
+    async fn require_dovi_renderer(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<bool, String> {
+        let required = Self::needs_dovi_reshape(file)?;
+        if required && !self.dovi_reshape {
+            return Err(unsupported_build_error(
+                "this ffmpeg did not prove the Dolby-aware tonemapx renderer required for Profile 5",
+            ));
+        }
+        if required {
+            let key = Self::dovi_proof_key(file);
+            let cached = self
+                .dovi_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied();
+            let proved = match cached {
+                Some(proved) => proved,
+                None => {
+                    let proved = crate::ffmpeg::dovi_reshape_changes_pixels(file).await;
+                    self.dovi_proofs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, proved);
+                    proved
+                }
+            };
+            if !proved {
+                return Err(unsupported_build_error("this source did not prove that Dolby Vision RPU application changes pixels through the production renderer"));
+            }
+        }
+        Ok(required)
+    }
+
+    /// The grade this session will actually encode at.
+    ///
+    /// `requested` is the client's `hdr10t=1` carried through the create body.
+    /// Everything else here is a refusal, and each one is load-bearing:
+    ///
+    /// - **Not asked for.** Absent means not proven (the wire contract), and
+    ///   not proven means today's tone-mapped SDR rung.
+    /// - **Not a source with an RPU to apply.** The passthrough filter is
+    ///   Dolby-Vision-input-only: given a plain HDR10 source it emits a broken
+    ///   picture — crushed shadows, clipping above roughly 70% — at exit 0,
+    ///   with correct-looking tags (measured). The gate is real Dolby Vision
+    ///   detection, never a config flag, and it is narrowed further to the
+    ///   profiles the RPU renderer is actually built for
+    ///   ([`plurx_core::playback::dolby_vision_needs_rpu_render`], which is
+    ///   `needs_dovi_reshape` without the refusal messages).
+    /// - **Not the 1080p rung.** See [`HDR10_HEIGHT`].
+    /// - **Not proved by this build**, or **not proved by this source**: the
+    ///   boot probe says the graph runs, and `require_dovi_renderer` says
+    ///   this file's RPU actually changes pixels through it. The second is the
+    ///   one that cannot be inferred, and it is the same proof the SDR reshape
+    ///   rung already demands.
+    ///
+    /// Every refusal degrades to [`OutputGrade::Sdr`], which is exactly
+    /// today's behaviour — an HDR10 rung that cannot be proved is not an
+    /// error, it is the ladder that already exists.
+    async fn hdr10_grade_for(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        requested: bool,
+        target_height: i64,
+    ) -> Result<OutputGrade, String> {
+        if !requested
+            || !plurx_core::playback::dolby_vision_needs_rpu_render(file)
+            || !hdr10_rung_fits(file, target_height)
+        {
+            return Ok(OutputGrade::Sdr);
+        }
+        if !self.dovi_passthrough {
+            tracing::info!(
+                file = file.id,
+                "this ffmpeg did not prove the Dolby Vision HDR10 passthrough renderer; \
+                 using the tone-mapped SDR rung"
+            );
+            return Ok(OutputGrade::Sdr);
+        }
+        // The same per-source proof the SDR reshape rung demands: that the
+        // decoder really exports RPU side data for THIS file and that
+        // applying it really changes pixels. A `hdr=dolby_vision` column is a
+        // scan's opinion; this is a measurement.
+        if !self.require_dovi_renderer(file).await? {
+            return Ok(OutputGrade::Sdr);
+        }
+        Ok(OutputGrade::Hdr10)
+    }
+
+    async fn encoder_for_file(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<Encoder, String> {
+        if self.require_dovi_renderer(file).await? {
+            // Software decode is forced by the pipeline itself
+            // (`requires_software_decode`) — that is what preserves the RPU
+            // AVFrame side data the tonemapx graph consumes. The ENCODER is
+            // free to be the node's real one, provided that exact pairing has
+            // been proved at boot; an unproved pairing falls back to software
+            // rather than failing in front of a viewer. Pinning it to x264
+            // used to cap 4K Dolby Vision at 720p for every non-DV client.
+            let preferred = self.encoder().await;
+            if preferred != Encoder::Software
+                && crate::ffmpeg::has_dovi_reshape_with(preferred).await
+            {
+                Ok(preferred)
+            } else {
+                Ok(Encoder::Software)
+            }
+        } else {
+            Ok(self.encoder().await)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn options_for_tone_map(
         &self,
@@ -3409,16 +3603,37 @@ impl TranscodeManager {
         subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
         software_threads: Option<u32>,
         tone_map: ToneMap,
+        grade: OutputGrade,
     ) -> TranscodeOptions {
         let subtitle_file = self.subtitle_file(file, subtitle_burn.as_ref());
+        let dovi_reshape = Self::needs_dovi_reshape(file).unwrap_or(false);
+        let hdr10 = grade == OutputGrade::Hdr10;
         TranscodeOptions {
             target_height,
             software_threads,
             video_bitrate_kbps: bitrate_for_height(target_height),
-            effective_rate_control: self.effective_rate_control(encoder),
+            // Quality mode is an H.264 measurement. The node sweep that
+            // produced the per-family CRF/QVBR defaults never ran against
+            // x265, where the same number means a different bitrate, so the
+            // HDR10 rung takes the bounded VBR every rung had before N1.
+            effective_rate_control: if hdr10 {
+                EffectiveRateControl::Vbr
+            } else {
+                self.effective_rate_control(encoder)
+            },
             audio_index,
             start_seconds,
-            tone_map,
+            // The HDR10 rung does not tone-map at all — that is what it is
+            // for — so `ToneMap::None` is the honest recipe value. It is also
+            // inert: `Pipeline::DoviPassthrough` owns the whole graph, and
+            // `video_filters` returns before the tone-map branch is reached.
+            tone_map: if hdr10 {
+                ToneMap::None
+            } else if dovi_reshape {
+                ToneMap::Tonemapx
+            } else {
+                tone_map
+            },
             // The node proved a graph; this session may still not be entitled
             // to it (HLG, non-compatible Dolby Vision, a light source, an
             // encoder it cannot feed). Deciding once, here,
@@ -3428,13 +3643,22 @@ impl TranscodeManager {
             // HDR10-compatible is an hdr10 stream to a tone-map, and a bitmap
             // subtitle burn keeps the GPU graph (it downloads once for
             // libass/overlay after the expensive scale + tone-map is done).
-            pipeline: Pipeline::for_session(
-                self.pipeline,
-                encoder,
-                transcode::routing_hdr(file),
-                transcode::heavy_source(file),
-                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
-            ),
+            pipeline: if hdr10 {
+                // Admitted by `hdr10_grade_for`, which has already proved the
+                // source carries an RPU. Nothing below this line may select
+                // it from a column alone.
+                Pipeline::DoviPassthrough
+            } else if dovi_reshape {
+                Pipeline::DoviTonemapx
+            } else {
+                Pipeline::for_session(
+                    self.pipeline,
+                    encoder,
+                    transcode::routing_hdr(file),
+                    transcode::heavy_source(file),
+                    subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
+                )
+            },
             subtitle_burn,
             subtitle_file,
             // Only where the startup probe proved this build takes it. A
@@ -3463,6 +3687,7 @@ impl TranscodeManager {
         software_threads: Option<u32>,
         tone_map: ToneMap,
         effective_rate_control: EffectiveRateControl,
+        grade: OutputGrade,
     ) -> TranscodeOptions {
         let mut opts = self.options_for_tone_map(
             encoder,
@@ -3473,8 +3698,14 @@ impl TranscodeManager {
             subtitle_burn,
             software_threads,
             tone_map,
+            grade,
         );
-        opts.effective_rate_control = effective_rate_control;
+        // Not for the HDR10 rung: `options_for_tone_map` pinned it to VBR
+        // because x265 has no measured quality-mode setting, and a captured
+        // snapshot must not put one back.
+        if opts.pipeline.output_grade() == OutputGrade::Sdr {
+            opts.effective_rate_control = effective_rate_control;
+        }
         opts
     }
 
@@ -3489,6 +3720,7 @@ impl TranscodeManager {
         audio_index: Option<i64>,
         subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
         software_threads: Option<u32>,
+        grade: OutputGrade,
     ) -> TranscodeOptions {
         self.options_for_effective_rate_control(
             encoder,
@@ -3500,6 +3732,7 @@ impl TranscodeManager {
             software_threads,
             tone_map_pref(),
             rate_control.effective_for(encoder),
+            grade,
         )
     }
 
@@ -3522,6 +3755,10 @@ impl TranscodeManager {
             None,
             tone_map_pref(),
             rate_control.effective_for(encoder),
+            // Speculative pre-transcodes have no client to have proved a
+            // Main10 PQ decoder, so they produce the SDR ladder — the rung
+            // every client can take.
+            OutputGrade::Sdr,
         )
     }
 
@@ -3542,6 +3779,9 @@ impl TranscodeManager {
             None,
             ToneMap::Zscale,
             spec.effective_rate_control,
+            // An offline package is downloaded for playback anywhere later;
+            // the SDR rung is the one that plays everywhere.
+            OutputGrade::Sdr,
         )
     }
 
@@ -3678,7 +3918,8 @@ impl TranscodeManager {
             start_seconds: 0.0,
             // A cache hit is the whole stream from the beginning.
             media_origin_seconds: 0.0,
-            hls_codecs: "avc1.640034,mp4a.40.2".into(),
+            grade: opts.pipeline.output_grade(),
+            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade()),
             hls_supplemental_codecs: None,
             target_height: opts.target_height,
             encoder_label: Mutex::new("cached"),
@@ -3739,6 +3980,7 @@ impl TranscodeManager {
                 height: opts.target_height,
             },
             encoder: "cached",
+            grade: opts.pipeline.output_grade(),
             vod: true,
         })
     }
@@ -3789,7 +4031,7 @@ impl TranscodeManager {
         let mut playback_file = file.clone();
         playback_file.audio_offset_ms = 0;
         let file = &playback_file;
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         // Through the same track selection a real playback uses. Not an
         // optimisation — the tracks are part of the recipe, so producing with
         // "no audio track chosen" makes an entry named for a session that will
@@ -3863,7 +4105,7 @@ impl TranscodeManager {
         if cancelled.is_cancelled() {
             return Ok(OfflineProduceOutcome::Yielded);
         }
-        let encoder = self.encoder().await;
+        let encoder = self.encoder_for_file(file).await?;
         let subtitle_burn = match spec.subtitle {
             OfflineSubtitle::Burn(index) => {
                 let stream = file
@@ -4373,6 +4615,7 @@ impl TranscodeManager {
                     user_name,
                     &req.playback_id,
                     req.automatic,
+                    req.hdr10,
                 )
                 .await?
             }
@@ -4595,6 +4838,7 @@ impl TranscodeManager {
             target_height: session.target_height,
             kind: session.kind,
             encoder,
+            grade: session.grade,
             vod: session.cached,
         })
     }
@@ -4690,8 +4934,11 @@ impl TranscodeManager {
 
     /// Capture the exact effective mode selected for a new resumable package.
     /// Callers persist this value before queueing any encoder work.
-    pub async fn effective_rate_control_for_new_offline_package(&self) -> EffectiveRateControl {
-        self.effective_rate_control(self.encoder().await)
+    pub async fn effective_rate_control_for_new_offline_package(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+    ) -> Result<EffectiveRateControl, String> {
+        Ok(self.effective_rate_control(self.encoder_for_file(file).await?))
     }
 
     #[cfg(test)]
@@ -5049,6 +5296,66 @@ impl TranscodeManager {
         auto_height_from_prior(current, source_height, prior, unix_ms())
     }
 
+    pub async fn auto_height_for_file(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+        prior: Option<&plurx_core::domain::NetworkPrior>,
+    ) -> i64 {
+        let source_height = file.and_then(|file| file.height);
+        if file.is_some_and(|file| Self::needs_dovi_reshape(file) == Ok(true)) {
+            // Follow the encoder the reshape can actually reach. This used to
+            // be a flat software cap, which meant a 4K Dolby Vision film was
+            // 720p for every client that cannot take DV directly, even on a
+            // node whose hardware encoder was idle.
+            let max = self.capability_height_ceiling(file).await;
+            let current = source_height
+                .filter(|height| *height > 0)
+                .unwrap_or(max)
+                .clamp(MIN_HEIGHT, max);
+            auto_height_from_prior(current, source_height, prior, unix_ms())
+        } else {
+            self.auto_height(source_height, prior).await
+        }
+    }
+
+    /// The highest rung this node can actually sustain for this file, before
+    /// any network prior is applied.
+    ///
+    /// This exists because the advertised ladder was built from the source
+    /// height alone while Auto was capped by the pipeline — so on a
+    /// software-only node, or for a Dolby Vision source that must go through
+    /// the software reshape, the response promised a 1080p rung the server
+    /// would never serve. The web ABR controller believed it: it started at
+    /// the 720p Auto answer, measured a JIT delivery estimate far above the
+    /// 1080p bar, upgraded on schedule, got `session_failed`, took the
+    /// emergency downgrade back to 720p, and repeated on a ~2 minute period.
+    /// A ladder that lists a rung is a promise that the rung can be served.
+    ///
+    /// Deliberately excludes `auto_height_from_prior`: a network prior is a
+    /// judgement about one link at one moment, and hiding rungs on that basis
+    /// would keep a recovered link from ever being offered them again. This
+    /// is the capability ceiling only.
+    pub async fn capability_height_ceiling(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+    ) -> i64 {
+        // A Dolby Vision reshape is capped by whichever encoder it can
+        // actually reach — hardware when the pairing is proved, software
+        // otherwise — not unconditionally by the software rung.
+        let encoder = match file {
+            Some(file) if Self::needs_dovi_reshape(file) == Ok(true) => self
+                .encoder_for_file(file)
+                .await
+                .unwrap_or(Encoder::Software),
+            _ => self.encoder().await,
+        };
+        if encoder == Encoder::Software {
+            AUTO_SOFTWARE_HEIGHT
+        } else {
+            AUTO_HARDWARE_MAX_HEIGHT
+        }
+    }
+
     /// The admin's playback language preferences (Settings → Playback
     /// defaults), falling back to English/English/Auto.
     pub async fn lang_prefs(&self) -> plurx_core::tracks::LangPrefs {
@@ -5143,6 +5450,7 @@ impl TranscodeManager {
             0,
             user_name,
             playback_id,
+            false,
             false,
         )
         .await
@@ -5270,6 +5578,7 @@ impl TranscodeManager {
         user_name: &str,
         playback_id: &str,
         automatic: bool,
+        hdr10: bool,
     ) -> Result<StartInfo, String> {
         let rate_control = self.rate_control_snapshot();
         // Before spawning, not after: the point is to never have two encoders
@@ -5312,7 +5621,10 @@ impl TranscodeManager {
         // hardware slot and no place in the queue — the work is already done,
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
-        let mut encoder = self.encoder().await;
+        let mut encoder = self.encoder_for_file(&file).await?;
+        // Resolved once, before the cache lookup: the grade changes the bytes,
+        // so it has to be part of the recipe a hit is looked up by.
+        let grade = self.hdr10_grade_for(&file, hdr10, target_height).await?;
         let opts = self.live_lookup_options(
             rate_control,
             encoder,
@@ -5322,6 +5634,7 @@ impl TranscodeManager {
             audio_index,
             subtitle_burn.clone(),
             None,
+            grade,
         );
         if let Some(info) = self
             .serve_cached(
@@ -5395,6 +5708,7 @@ impl TranscodeManager {
             audio_index,
             subtitle_burn,
             sw_permit.as_ref().map(|p| p.threads() as u32),
+            grade,
         );
         let pacing = self.pacing(false).await;
         let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
@@ -5469,7 +5783,8 @@ impl TranscodeManager {
             // A transcode seeks accurately, so its media begins exactly where
             // it was asked to: no probe, no discrepancy to resolve.
             media_origin_seconds: start_seconds,
-            hls_codecs: "avc1.640034,mp4a.40.2".into(),
+            grade: opts.pipeline.output_grade(),
+            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade()),
             hls_supplemental_codecs: None,
             target_height,
             encoder_label: Mutex::new(encoder.label()),
@@ -5642,6 +5957,7 @@ impl TranscodeManager {
                 height: target_height,
             },
             encoder: encoder.label(),
+            grade: opts.pipeline.output_grade(),
             vod: false,
         })
     }
@@ -5683,7 +5999,19 @@ impl TranscodeManager {
         };
         let mut retry_opts = opts.clone();
         if downgrade_pipeline {
-            retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+            let Some(fallback) = opts.pipeline.fallback() else {
+                tracing::error!(
+                    session = %sid,
+                    pipeline = opts.pipeline.name(),
+                    "renderer stalled and has no color-safe fallback; refusing to retry through a different color transform"
+                );
+                session.kill_child().await;
+                session.fail(PlaylistError::SessionFailed(
+                    "the Dolby Vision renderer stopped; no color-safe fallback is available".into(),
+                ));
+                return opts.effective_rate_control;
+            };
+            retry_opts.pipeline = fallback;
         } else {
             // A family-tuned default is part of the effective identity. A
             // VideoToolbox value, for example, is not a valid x264 CRF merely
@@ -5946,6 +6274,9 @@ impl TranscodeManager {
         let (hls_codecs, hls_supplemental_codecs) =
             copied_hls_codecs(&file, audio_index, options, probe_json.as_deref());
         let session = Arc::new(Session {
+            // A copy session encodes nothing; `session_delivered_dynamic_range`
+            // reads its range off the source and `preserve_dolby_vision`.
+            grade: OutputGrade::Sdr,
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
             child_transition: Mutex::new(()),
@@ -6156,6 +6487,9 @@ impl TranscodeManager {
                 preserve_dolby_vision: options.preserve_dolby_vision,
             },
             encoder: "copy",
+            // A copy session encodes nothing; its dynamic range is the
+            // source's, read off `kind`/`preserve_dolby_vision`.
+            grade: OutputGrade::Sdr,
             vod: false,
         })
     }
@@ -7231,6 +7565,93 @@ fn bitrate_for_height(height: i64) -> u32 {
     }
 }
 
+/// The one rung the Dolby-Vision → HDR10 re-encode runs at.
+///
+/// **1080p, exactly — not "at least" and not "at most".** Three reasons, and
+/// they point the same way:
+///
+/// - *Above it is unmeasured and probably a loss.* The full chain (Profile 5
+///   decode → `tonemapx` passthrough → libx265 Main10 veryfast) measured 10.4
+///   fps at 1080p on two cores, about 1.8x the cost of the SDR chain's 20.3.
+///   A real node has more cores, but no 4K10 rate has been measured on one,
+///   and a 4K encode running below realtime is worse for a viewer than a
+///   1080p one running above it. **Open item:** measure `libx265` and
+///   `hevc_qsv` Main10 at 2160p on a node before considering a 4K HDR rung.
+/// - *Below it, the point is gone.* The rung exists so a client that can
+///   decode Main10 PQ is not laddered down to 720p SDR. A client that cannot
+///   sustain 1080p is better served by the SDR ladder, which already handles
+///   step-down, than by a smaller HDR picture nobody measured.
+/// - *One rung is one measurement.* The HLS codec declaration
+///   ([`HDR10_HLS_CODEC`]) is a level and a tier x265 chooses from the frame
+///   size and the rate. Pinning the rung pins both to the point that was
+///   actually observed instead of a table of guesses.
+///
+/// **Open item — Auto does not reach this rung.** The HDR10 grade runs on
+/// software (see `Encoder::video_codec_for`), and `auto_height_for_file` caps
+/// a software Auto session at [`AUTO_SOFTWARE_HEIGHT`] (720). So a viewer on
+/// Auto still gets the tone-mapped SDR ladder; only a client that names the
+/// 1080p rung — which the quality menu does — gets HDR10. Raising the
+/// software Auto ceiling for this grade would be a *performance* claim, and
+/// the only rate that exists is 10.4 fps at 1080p on two cores, which is
+/// sub-realtime. A node measurement has to come first.
+pub const HDR10_HEIGHT: i64 = 1080;
+
+/// HEVC level 4.0's maximum luma picture size, in samples.
+///
+/// The output frame has to fit the level [`HDR10_HLS_CODEC`] declares. A
+/// 2.39:1 film at 1080 high is 2578x1080 — 2.78 M samples, past this bound —
+/// and x265 would encode it at level 5, making the advertised `L120` a lie
+/// about the stream. Those sessions take the SDR ladder, which is what they
+/// get today.
+const HDR10_MAX_LUMA_SAMPLES: i64 = 2_228_224;
+
+/// The RFC 6381 identifier for the HDR10 rung's video, **measured** rather
+/// than derived.
+///
+/// Produced by running the production argument list against a real Profile 5
+/// sample on jellyfin-ffmpeg7 7.1.4-3 at 1920x1080 / 8000 kb/s, remuxing the
+/// result to fMP4, and reading the `hvcC` with the same field extraction
+/// `http::hls::hevc_codec_from_init` uses: profile_space 0, tier high,
+/// profile_idc 2 (Main 10), compatibility flags 0x4 reversed, level 120
+/// (4.0), one non-zero constraint byte 0x90.
+///
+/// Its shape is what makes the master emit `VIDEO-RANGE=PQ` — that logic
+/// keys on an `hvc1`/`hev1`/`dvh1`/`dvhe` prefix and is deliberately not
+/// duplicated here.
+///
+/// Note the **H**igh tier: `should_serve_high_tier_media_playlist` already
+/// collapses a High-tier HDR master to its media rendition for AVPlayer, and
+/// this rung inherits that unchanged.
+const HDR10_HLS_CODEC: &str = "hvc1.2.4.H120.90";
+
+/// The RFC 6381 `CODECS` value for a *re-encoded* HLS session.
+///
+/// A transcode's output is described by the argument list that produced it,
+/// not by a probe: unlike the copy path there is no source sample entry to
+/// read, and unlike an fMP4 session there is no `init.mp4` for
+/// `http::hls::exact_hls_context` to open (this muxer writes MPEG-TS). So the
+/// string is the grade's, and the grade is the pipeline's.
+fn transcoded_hls_codecs(grade: OutputGrade) -> String {
+    match grade {
+        OutputGrade::Sdr => "avc1.640034,mp4a.40.2".to_owned(),
+        OutputGrade::Hdr10 => format!("{HDR10_HLS_CODEC},mp4a.40.2"),
+    }
+}
+
+/// Does this source at this rung fit the HDR10 grade's one measured point?
+fn hdr10_rung_fits(file: &plurx_core::domain::MediaFile, target_height: i64) -> bool {
+    if target_height != HDR10_HEIGHT {
+        return false;
+    }
+    match plurx_core::transcode::output_size(file, target_height) {
+        // Never upscale into HDR: `output_size` clamps to the source, so a
+        // 720p source at the 1080 rung produces a 720p frame, which is not
+        // the geometry the codec declaration was measured at.
+        Some((w, h)) => h == HDR10_HEIGHT && w * h <= HDR10_MAX_LUMA_SAMPLES,
+        None => false,
+    }
+}
+
 /// The quality ladder's rungs, bottom to top (ADAPTIVE-QUALITY.md).
 ///
 /// 4K output rungs are deliberately absent: a client that can take 20 Mb/s
@@ -7301,6 +7722,22 @@ pub fn ladder(source_height: Option<i64>) -> Vec<Rung> {
             }
         })
         .collect()
+}
+
+/// The ladder a session response may advertise: the source's own rungs,
+/// further capped by what this node can actually serve for this file
+/// ([`TranscodeManager::capability_height_ceiling`]).
+///
+/// Separate from [`ladder`] because the two answer different questions.
+/// `ladder` is "what rungs exist at or below this source"; this is "which of
+/// them will the server be held to". The web ABR controller upgrades into any
+/// rung the response lists, so the difference is load-bearing.
+pub fn advertised_ladder(source_height: Option<i64>, ceiling: i64) -> Vec<Rung> {
+    ladder(Some(
+        source_height
+            .filter(|height| *height > 0)
+            .map_or(ceiling, |height| height.min(ceiling)),
+    ))
 }
 
 /// Apply the node-local prior to the already encoder-capped Auto choice.
@@ -7553,6 +7990,7 @@ fn test_session(dir: PathBuf) -> Session {
         method: crate::delivery::Method::Transcode,
         start_seconds: 0.0,
         media_origin_seconds: 0.0,
+        grade: OutputGrade::Sdr,
         hls_codecs: "avc1.640034,mp4a.40.2".into(),
         hls_supplemental_codecs: None,
         target_height: 720,
@@ -7583,6 +8021,347 @@ fn test_session(dir: PathBuf) -> Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile5_file() -> plurx_core::domain::MediaFile {
+        plurx_core::domain::MediaFile {
+            id: 5,
+            item_id: 1,
+            path: PathBuf::from("/media/profile5.mkv"),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(1_000),
+            container: Some("matroska".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main 10".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            hdr: Some("dolby_vision".into()),
+            hdr_format: Some("Dolby Vision · Profile 5".into()),
+            bitrate: Some(20_000_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        }
+    }
+
+    #[test]
+    fn noncompatible_dolby_vision_is_never_guessed_through_zscale() {
+        let profile5 = profile5_file();
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&profile5), Ok(true));
+
+        let mut compatible = profile5.clone();
+        compatible.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
+        assert_eq!(TranscodeManager::needs_dovi_reshape(&compatible), Ok(false));
+
+        let mut unknown = profile5.clone();
+        unknown.hdr_format = Some("Dolby Vision".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unknown)
+            .expect_err("unknown profile must be refused")
+            .contains("unknown"));
+
+        let mut unsupported = profile5;
+        unsupported.hdr_format = Some("Dolby Vision · Profile 4".into());
+        assert!(TranscodeManager::needs_dovi_reshape(&unsupported)
+            .expect_err("unproven non-compatible profile must be refused")
+            .contains("Profile 4"));
+    }
+
+    #[tokio::test]
+    async fn profile5_requires_the_probed_software_renderer_pair() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let dir = tempfile::tempdir().expect("work");
+        let caps = EncoderCaps {
+            qsv: true,
+            ..EncoderCaps::default()
+        };
+        let manager = TranscodeManager::new(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            caps.clone(),
+            Pipeline::VppQsv,
+        );
+        let file = profile5_file();
+        assert!(manager
+            .encoder_for_file(&file)
+            .await
+            .expect_err("an unproved renderer must refuse before spawn")
+            .contains("did not prove"));
+
+        let manager =
+            TranscodeManager::new(store, dir.path().join("proved"), caps, Pipeline::VppQsv)
+                .with_dovi_reshape(true);
+        manager
+            .dovi_proofs
+            .lock()
+            .expect("proof cache")
+            .insert(TranscodeManager::dovi_proof_key(&file), true);
+        let encoder = manager.encoder_for_file(&file).await.expect("proved route");
+        assert_eq!(encoder, Encoder::Software);
+        let opts = manager.options_for_tone_map(
+            encoder,
+            &file,
+            1080,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+            OutputGrade::Sdr,
+        );
+        assert_eq!(opts.pipeline, Pipeline::DoviTonemapx);
+        assert_eq!(opts.tone_map, ToneMap::Tonemapx);
+        assert_eq!(manager.auto_height_for_file(Some(&file), None).await, 720);
+    }
+
+    /// The grade predicate and the renderer predicate answer the same
+    /// question and must never drift.
+    ///
+    /// `playback::dolby_vision_needs_rpu_render` decides whether `/decision`
+    /// may promise HDR10; `TranscodeManager::needs_dovi_reshape` decides
+    /// which renderer this daemon actually builds. If they disagree, a client
+    /// is promised a grade the encoder does not produce — an HDR10 badge over
+    /// a tone-mapped SDR picture, which plays, so nobody reports it.
+    #[test]
+    fn the_grade_predicate_and_the_renderer_predicate_agree() {
+        let base = profile5_file();
+        let variant = |label: Option<&str>, hdr: Option<&str>| {
+            let mut file = base.clone();
+            file.hdr = hdr.map(str::to_owned);
+            file.hdr_format = label.map(str::to_owned);
+            file
+        };
+        let cases = [
+            (Some("Dolby Vision · Profile 5"), Some("dolby_vision")),
+            (Some("Dolby Vision · Profile 4"), Some("dolby_vision")),
+            (Some("Dolby Vision · Profile 7"), Some("dolby_vision")),
+            (
+                Some("Dolby Vision · Profile 8 (HDR10-compatible)"),
+                Some("dolby_vision"),
+            ),
+            (
+                Some("Dolby Vision · Profile 7 (HLG-compatible)"),
+                Some("dolby_vision"),
+            ),
+            (Some("Dolby Vision"), Some("dolby_vision")),
+            (None, Some("dolby_vision")),
+            (None, Some("hdr10")),
+            (None, Some("hlg")),
+            (None, None),
+        ];
+        for (label, hdr) in cases {
+            let file = variant(label, hdr);
+            assert_eq!(
+                plurx_core::playback::dolby_vision_needs_rpu_render(&file),
+                TranscodeManager::needs_dovi_reshape(&file) == Ok(true),
+                "the two predicates disagree about {label:?} / {hdr:?}"
+            );
+        }
+    }
+
+    /// The HDR10 rung runs at exactly one measured point, and everything
+    /// else falls back to the SDR ladder rather than to a guess.
+    #[test]
+    fn the_hdr10_rung_only_admits_the_geometry_it_was_measured_at() {
+        let mut file = profile5_file();
+        file.width = Some(3840);
+        file.height = Some(2160);
+        assert!(hdr10_rung_fits(&file, HDR10_HEIGHT));
+        // No 2160p HDR rung: a 4K10 encode rate has not been measured on a
+        // node, and a 4K encode below realtime is worse than 1080p above it.
+        assert!(!hdr10_rung_fits(&file, 2160));
+        for lower in [360, 480, 720, 900] {
+            assert!(!hdr10_rung_fits(&file, lower), "{lower}");
+        }
+
+        // Never upscaled into: a 720p source at the 1080 rung produces a 720p
+        // frame, which is not the geometry the codec string describes.
+        let mut small = file.clone();
+        small.width = Some(1280);
+        small.height = Some(720);
+        assert!(!hdr10_rung_fits(&small, HDR10_HEIGHT));
+
+        // A 2.39:1 frame at 1080 high is past HEVC level 4.0's luma bound, so
+        // x265 would encode it at level 5 and `HDR10_HLS_CODEC` would be
+        // describing a stream that does not exist.
+        let mut scope = file.clone();
+        scope.width = Some(5760);
+        scope.height = Some(2400);
+        let (w, h) = plurx_core::transcode::output_size(&scope, HDR10_HEIGHT).expect("size");
+        assert!(w * h > HDR10_MAX_LUMA_SAMPLES, "{w}x{h}");
+        assert!(!hdr10_rung_fits(&scope, HDR10_HEIGHT));
+
+        // An unprobed source has no geometry to check.
+        let mut unprobed = file;
+        unprobed.width = None;
+        assert!(!hdr10_rung_fits(&unprobed, HDR10_HEIGHT));
+    }
+
+    /// The session's `CODECS` follows the grade, and its shape is what makes
+    /// the master emit `VIDEO-RANGE=PQ` (see `http::hls`, which is not
+    /// duplicated here).
+    #[test]
+    fn a_transcode_advertises_the_codec_its_grade_produces() {
+        assert_eq!(
+            transcoded_hls_codecs(OutputGrade::Sdr),
+            "avc1.640034,mp4a.40.2"
+        );
+        let hdr10 = transcoded_hls_codecs(OutputGrade::Hdr10);
+        assert_eq!(hdr10, "hvc1.2.4.H120.90,mp4a.40.2");
+        assert!(
+            hdr10.starts_with("hvc1"),
+            "the HDR attribute logic keys on this prefix: {hdr10}"
+        );
+    }
+
+    /// The whole gate, exercised through the manager rather than asserted
+    /// about in pieces: what it takes to actually get the HDR10 rung, and the
+    /// four ways to lose it.
+    #[tokio::test]
+    async fn the_hdr10_grade_is_refused_until_every_precondition_is_proved() {
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let dir = tempfile::tempdir().expect("work");
+        let file = profile5_file();
+        let manager = TranscodeManager::new(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        )
+        .with_dovi_reshape(true)
+        .with_dovi_passthrough(true);
+        manager
+            .dovi_proofs
+            .lock()
+            .expect("proof cache")
+            .insert(TranscodeManager::dovi_proof_key(&file), true);
+
+        // Everything proved, and asked for.
+        assert_eq!(
+            manager
+                .hdr10_grade_for(&file, true, HDR10_HEIGHT)
+                .await
+                .expect("proved"),
+            OutputGrade::Hdr10
+        );
+        // Not asked for: absent means not proven, and not proven tone-maps.
+        assert_eq!(
+            manager
+                .hdr10_grade_for(&file, false, HDR10_HEIGHT)
+                .await
+                .expect("no request"),
+            OutputGrade::Sdr
+        );
+        // Not the measured rung.
+        assert_eq!(
+            manager
+                .hdr10_grade_for(&file, true, 2160)
+                .await
+                .expect("wrong rung"),
+            OutputGrade::Sdr
+        );
+        // Not a source with an RPU. This is the guard that stands between a
+        // plain HDR10 file and a broken picture at exit 0.
+        let mut hdr10_source = file.clone();
+        hdr10_source.hdr = Some("hdr10".into());
+        hdr10_source.hdr_format = None;
+        assert_eq!(
+            manager
+                .hdr10_grade_for(&hdr10_source, true, HDR10_HEIGHT)
+                .await
+                .expect("non-dv source"),
+            OutputGrade::Sdr
+        );
+
+        // Not proved by this build.
+        let unproved = TranscodeManager::new(
+            store,
+            dir.path().join("unproved"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        )
+        .with_dovi_reshape(true);
+        assert_eq!(
+            unproved
+                .hdr10_grade_for(&file, true, HDR10_HEIGHT)
+                .await
+                .expect("unproved build"),
+            OutputGrade::Sdr
+        );
+
+        // And the options the proved case actually builds.
+        let opts = manager.options_for_tone_map(
+            Encoder::Software,
+            &file,
+            HDR10_HEIGHT,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+            OutputGrade::Hdr10,
+        );
+        assert_eq!(opts.pipeline, Pipeline::DoviPassthrough);
+        assert_eq!(opts.pipeline.output_grade(), OutputGrade::Hdr10);
+        assert_eq!(opts.tone_map, ToneMap::None);
+        assert_eq!(
+            opts.effective_rate_control,
+            EffectiveRateControl::Vbr,
+            "x265 has no measured quality-mode setting"
+        );
+        // …and the SDR grade for the same file is the pre-M5 reshape rung,
+        // untouched.
+        let sdr = manager.options_for_tone_map(
+            Encoder::Software,
+            &file,
+            HDR10_HEIGHT,
+            0.0,
+            None,
+            None,
+            None,
+            ToneMap::Zscale,
+            OutputGrade::Sdr,
+        );
+        assert_eq!(sdr.pipeline, Pipeline::DoviTonemapx);
+        assert_eq!(sdr.tone_map, ToneMap::Tonemapx);
+    }
+
+    /// An HDR10 request is a different stream, so it cannot recover another
+    /// request's session through the idempotency key — and an SDR request
+    /// still fingerprints to exactly the string it always did.
+    #[test]
+    fn the_grade_is_part_of_a_request_identity() {
+        let request = SessionRequest {
+            file_id: 5,
+            playback_id: "player".into(),
+            request_id: Some("attempt".into()),
+            automatic: false,
+            previous_session_id: None,
+            reopen_reason: None,
+            kind: SessionKind::Transcode { height: 1080 },
+            start_seconds: 0.0,
+            audio_index: None,
+            subtitle_burn: None,
+            audio_offset_ms: 0,
+            hdr10: false,
+        };
+        let hdr10 = SessionRequest {
+            hdr10: true,
+            ..request.clone()
+        };
+        assert_ne!(
+            request.intent_fingerprint("paul"),
+            hdr10.intent_fingerprint("paul")
+        );
+        assert!(hdr10.intent_fingerprint("paul").contains("t1080+hdr10"));
+        assert!(request.intent_fingerprint("paul").contains("\"t1080\""));
+    }
 
     #[test]
     fn ffmpeg_gets_the_app_owned_runtime_cache() {
@@ -7783,6 +8562,7 @@ mod tests {
             audio_index,
             subtitle_burn.clone(),
             None,
+            OutputGrade::Sdr,
         );
         let speculative = mgr.speculative_producer_options(
             captured,
@@ -7831,6 +8611,7 @@ mod tests {
             audio_index,
             None,
             None,
+            OutputGrade::Sdr,
         );
         assert_ne!(live_vbr, live);
         assert_ne!(hash(&live_vbr), expected);
@@ -8140,6 +8921,7 @@ mod tests {
             None,
             None,
             ToneMap::Zscale,
+            OutputGrade::Sdr,
         );
         opts.pipeline = Pipeline::Cpu;
         opts.effective_rate_control = captured.effective_for(Encoder::VideoToolbox);
@@ -8227,6 +9009,112 @@ mod tests {
             "an unprobed source has nothing to filter by"
         );
         assert_eq!(ladder(Some(0)).len(), 4, "0 is not a height");
+    }
+
+    /// An advertised rung is a promise. The web ABR controller upgrades into
+    /// any rung the ladder lists, so a ladder built from the source height
+    /// while Auto was capped by the pipeline produced a self-sustaining
+    /// oscillation: start at the 720p Auto answer, measure a JIT delivery
+    /// estimate far above the 1080p bar, upgrade on schedule, fail with
+    /// `session_failed`, take the emergency downgrade, repeat every ~2
+    /// minutes. Observed on a Dolby Vision Profile 5 episode.
+    #[tokio::test]
+    async fn the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let hardware = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        );
+        let software = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        let ordinary = {
+            let mut file = profile5_file();
+            file.hdr = None;
+            file.hdr_format = None;
+            file
+        };
+        let profile5 = profile5_file();
+
+        // A Profile 5 reshape follows whichever encoder it can actually
+        // reach. With no ffmpeg here the hardware pairing cannot be proved,
+        // so it falls back to software — which is the contract: an unproved
+        // pairing is never attempted, and the ceiling tells the truth about
+        // the fallback rather than advertising a rung that would fail.
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&profile5)).await,
+            AUTO_SOFTWARE_HEIGHT,
+            "an unproved hardware pairing falls back to the software rung"
+        );
+        assert_eq!(
+            software.capability_height_ceiling(Some(&profile5)).await,
+            AUTO_SOFTWARE_HEIGHT
+        );
+        // A software-only node caps every file the same way.
+        assert_eq!(
+            software.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_SOFTWARE_HEIGHT
+        );
+        // Hardware on an ordinary 4K source keeps the full ladder.
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_HARDWARE_MAX_HEIGHT
+        );
+        assert_eq!(hardware.capability_height_ceiling(None).await, 1080);
+
+        // The ceiling and Auto must agree, or the ladder is lying again.
+        for (manager, file) in [
+            (&hardware, &profile5),
+            (&software, &profile5),
+            (&software, &ordinary),
+            (&hardware, &ordinary),
+        ] {
+            let ceiling = manager.capability_height_ceiling(Some(file)).await;
+            let auto = manager.auto_height_for_file(Some(file), None).await;
+            assert!(
+                auto <= ceiling,
+                "Auto {auto} exceeds the advertised ceiling {ceiling}"
+            );
+            let rungs = advertised_ladder(file.height, ceiling);
+            assert!(
+                rungs.iter().all(|rung| rung.height <= ceiling),
+                "ladder {rungs:?} offers a rung above {ceiling}"
+            );
+            assert!(
+                rungs.iter().any(|rung| rung.height == auto),
+                "the rung Auto actually picked ({auto}) must be on the ladder: {rungs:?}"
+            );
+        }
+
+        // The prior must not narrow the menu: a link that has recovered has to
+        // be able to reach the cap again.
+        let starved = plurx_core::domain::NetworkPrior {
+            worst_rung_height: Some(720),
+            starved_at_ms: Some(unix_ms()),
+            ..Default::default()
+        };
+        assert_eq!(
+            hardware.capability_height_ceiling(Some(&ordinary)).await,
+            AUTO_HARDWARE_MAX_HEIGHT,
+            "the capability ceiling ignores network priors by construction"
+        );
+        assert!(
+            hardware
+                .auto_height_for_file(Some(&ordinary), Some(&starved))
+                .await
+                < AUTO_HARDWARE_MAX_HEIGHT,
+            "…while Auto still honours them"
+        );
     }
 
     /// Auto is a policy about the encoder, not about the file.
@@ -9308,6 +10196,7 @@ mod tests {
             audio_index: None,
             subtitle_burn: None,
             audio_offset_ms: 0,
+            hdr10: false,
         }
     }
 
@@ -9754,6 +10643,7 @@ mod tests {
             None,
             None,
             ToneMap::Zscale,
+            OutputGrade::Sdr,
         );
         opts.pipeline = Pipeline::Cpu;
         let sw_pool = mgr.admissions.software_pool();
@@ -10869,6 +11759,7 @@ mod tests {
             method: crate::delivery::Method::Transcode,
             start_seconds: 0.0,
             media_origin_seconds: 0.0,
+            grade: OutputGrade::Sdr,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: 1080,
@@ -11471,6 +12362,7 @@ mod tests {
             None,
             None,
             tone_map_pref(),
+            OutputGrade::Sdr,
         );
         let mut digest = mgr.digest().expect("cache configured");
         mgr.effective_recipe(&mut digest, file, &opts, encoder, false)
@@ -11502,8 +12394,17 @@ mod tests {
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let hash = recipe_hash_for(&mgr, &file, 1080).await;
         let encoder = mgr.encoder().await;
-        let opts =
-            mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
+        let opts = mgr.options_for_tone_map(
+            encoder,
+            &file,
+            1080,
+            0.0,
+            None,
+            None,
+            None,
+            tone_map_pref(),
+            OutputGrade::Sdr,
+        );
         let look = || {
             mgr.serve_cached(
                 &file,
@@ -12505,8 +13406,17 @@ mod tests {
         assert!(mgr.digest().is_none());
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let encoder = mgr.encoder().await;
-        let opts =
-            mgr.options_for_tone_map(encoder, &file, 1080, 0.0, None, None, None, tone_map_pref());
+        let opts = mgr.options_for_tone_map(
+            encoder,
+            &file,
+            1080,
+            0.0,
+            None,
+            None,
+            None,
+            tone_map_pref(),
+            OutputGrade::Sdr,
+        );
         assert!(mgr
             .serve_cached(
                 &file,
@@ -12756,6 +13666,7 @@ mod tests {
             audio_index: None,
             subtitle_burn: None,
             audio_offset_ms: 0,
+            hdr10: false,
         };
 
         // The idempotency identity is `intent_fingerprint`, so that is what
@@ -12859,6 +13770,7 @@ mod tests {
             audio_index: None,
             subtitle_burn: None,
             audio_offset_ms: 0,
+            hdr10: false,
         };
 
         let (a, b) = tokio::join!(
@@ -12905,6 +13817,7 @@ mod tests {
             audio_index: None,
             subtitle_burn: None,
             audio_offset_ms: 0,
+            hdr10: false,
         };
         assert!(mgr.create_session(&request, "paul").await.is_err());
 
@@ -12952,6 +13865,7 @@ mod tests {
             audio_index: None,
             subtitle_burn: None,
             audio_offset_ms: 0,
+            hdr10: false,
         };
         let previous = mgr
             .create_session(&original, "paul")

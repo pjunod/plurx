@@ -1971,6 +1971,374 @@ test("a quality change still reproduces the tracks that are playing", () => {
   assert.deepEqual(h.playbackSelection(player, 43), { audio: null, subtitle: -1 });
 });
 
+// ---- HEVC capability probe -------------------------------------------------
+// The probe is this client's only statement about what its decoder can do, and
+// the failure it guards against is silent: a 4K Main10 stream direct-played to
+// an 8-bit decoder is accepted by every layer above the decoder and rendered as
+// a black picture with working sound. No `error` event fires, so no fallback
+// runs. The shipped ladder, fold and query builder are exercised here, not a
+// copy of them, because a copy is exactly what stops telling the truth.
+function hevcHarness({
+  supported = [],
+  pqSupported = [],
+  mediaCapabilities = "auto",
+  hdrDisplay = false,
+} = {}) {
+  const hit = (list) => (type) => list.some((c) => String(type).includes(c));
+  const decodes = hit(supported);
+  const MediaSource = { isTypeSupported: decodes };
+  const win = { MediaSource };
+  const doc = {
+    createElement: () => ({ canPlayType: (t) => (decodes(t) ? "probably" : "") }),
+  };
+  const calls = [];
+  const nav = {};
+  if (mediaCapabilities === "auto") {
+    nav.mediaCapabilities = {
+      decodingInfo(config) {
+        calls.push({
+          type: config.type,
+          contentType: config.video.contentType,
+          width: config.video.width,
+          height: config.video.height,
+          transferFunction: config.video.transferFunction || null,
+        });
+        const answers =
+          config.video.transferFunction === "pq" ? pqSupported : supported;
+        const ok = hit(answers)(config.video.contentType);
+        return Promise.resolve({ supported: ok, smooth: ok, powerEfficient: ok });
+      },
+    };
+  } else if (mediaCapabilities !== null) {
+    nav.mediaCapabilities = mediaCapabilities;
+  }
+  const build = new Function(
+    "window",
+    "document",
+    "MediaSource",
+    "navigator",
+    "displayIsHdr",
+    [
+      shippedBinding("const", "HEVC_TIERS"),
+      shippedSource("hevcTierSummary"),
+      shippedSource("hevcTiersSync"),
+      shippedSource("hevcTiersMediaCapabilities"),
+      shippedSource("buildPlayCaps"),
+      shippedSource("capsQuery"),
+      "return {HEVC_TIERS, hevcTierSummary, hevcTiersSync," +
+        " hevcTiersMediaCapabilities, buildPlayCaps, capsQuery};",
+    ].join("\n"),
+  );
+  const shipped = build(win, doc, MediaSource, nav, () => hdrDisplay);
+  return {
+    ...shipped,
+    calls,
+    codecs: shipped.HEVC_TIERS.map((t) => t.codec),
+    // Everything the client would put on the wire, from the synchronous ladder.
+    syncCaps() {
+      const summary = shipped.hevcTierSummary(
+        shipped.hevcTiersSync(
+          (t) => doc.createElement().canPlayType(t) !== "",
+          (t) => MediaSource.isTypeSupported(t),
+        ),
+        null,
+      );
+      return shipped.buildPlayCaps(summary);
+    },
+    // …and from the MediaCapabilities refinement, exactly as PLAY_CAPS_READY
+    // does it: the synchronous answer stands when the API says nothing.
+    async refinedCaps() {
+      const mc = await shipped.hevcTiersMediaCapabilities();
+      if (!mc) return this.syncCaps();
+      return shipped.buildPlayCaps(
+        shipped.hevcTierSummary(mc.passed, mc.pqPassed),
+      );
+    },
+  };
+}
+const MAIN8 = ["hvc1.1.6.L93.B0", "hvc1.1.6.L120.B0", "hvc1.1.6.L153.B0"];
+const MAIN10 = ["hvc1.2.4.L120.B0", "hvc1.2.4.L153.B0"];
+
+test("the reported height is one every claimed HEVC profile actually decodes", () => {
+  const h = hevcHarness();
+  const rows = [
+    [[], [], { depth8: 0, depth10: 0, maxheight: 0, pq10: false }],
+    [
+      ["hvc1.1.6.L93.B0"],
+      [],
+      { depth8: 720, depth10: 0, maxheight: 720, pq10: false },
+    ],
+    [MAIN8, [], { depth8: 2160, depth10: 0, maxheight: 2160, pq10: false }],
+    [
+      MAIN8.concat(MAIN10),
+      MAIN10,
+      { depth8: 2160, depth10: 2160, maxheight: 2160, pq10: true },
+    ],
+    // The whole point. Main10 decodes only to 1080p while 8-bit reaches 4K: the
+    // client may not say "2160" and "hevc10" in one breath, because the server's
+    // max_height is codec-agnostic and would then direct-play a 4K Main10.
+    [
+      MAIN8.concat(["hvc1.2.4.L120.B0"]),
+      ["hvc1.2.4.L120.B0"],
+      { depth8: 2160, depth10: 1080, maxheight: 1080, pq10: true },
+    ],
+    // PQ proven at 1080 only while the reported height is 2160 — hdr10t is a
+    // claim about the reported height, so it must not be made here.
+    [
+      MAIN8.concat(MAIN10),
+      ["hvc1.2.4.L120.B0"],
+      { depth8: 2160, depth10: 2160, maxheight: 2160, pq10: false },
+    ],
+  ];
+  for (const [passing, pq, expected] of rows) {
+    assert.deepEqual(
+      h.hevcTierSummary(
+        h.codecs.map((c) => passing.includes(c)),
+        h.codecs.map((c) => pq.includes(c)),
+      ),
+      expected,
+      JSON.stringify(passing),
+    );
+  }
+});
+
+test("an 8-bit-only decoder is never reported to the server as Main10", () => {
+  const caps = hevcHarness({
+    supported: ["hvc1.1.6.L93.B0", "hvc1.1.6.L120.B0"],
+  }).syncCaps();
+  assert.equal(caps.vcodec.split(",").includes("hevc"), true);
+  assert.equal(caps.vcodec.split(",").includes("hevc10"), false);
+  assert.equal(caps.maxheight, 1080);
+  assert.equal(caps.hdr10t, 0);
+});
+
+test("no HEVC decoder means no maxheight, so an HEVC cap never caps H.264", () => {
+  const h = hevcHarness({ supported: ["avc1.640033"] });
+  const caps = h.syncCaps();
+  assert.equal(caps.vcodec.includes("hevc"), false);
+  assert.equal(caps.maxheight, null);
+  assert.equal(h.capsQuery(caps).includes("maxheight"), false);
+});
+
+test("the synchronous fallback cannot prove PQ, so it never claims hdr10t", () => {
+  // isTypeSupported/canPlayType have no transfer-function axis. A Main10 yes
+  // plus an HDR panel is the guess this probe exists to refuse to make.
+  const caps = hevcHarness({
+    supported: MAIN8.concat(MAIN10),
+    hdrDisplay: true,
+  }).syncCaps();
+  assert.equal(caps.vcodec.split(",").includes("hevc10"), true);
+  assert.equal(caps.maxheight, 2160);
+  assert.equal(caps.hdr, 1); // the loose, long-standing claim is unchanged
+  assert.equal(caps.hdr10t, 0); // the strict new one is not made
+});
+
+asyncTest(
+  "hdr10t needs a PQ answer AND an HDR display, and says so on the wire",
+  async () => {
+    const hdr = await hevcHarness({
+      supported: MAIN8.concat(MAIN10),
+      pqSupported: MAIN10,
+      hdrDisplay: true,
+    }).refinedCaps();
+    assert.equal(hdr.maxheight, 2160);
+    assert.equal(hdr.hdr10t, 1);
+
+    const sdrPanel = await hevcHarness({
+      supported: MAIN8.concat(MAIN10),
+      pqSupported: MAIN10,
+      hdrDisplay: false,
+    }).refinedCaps();
+    assert.equal(sdrPanel.vcodec.split(",").includes("hevc10"), true);
+    assert.equal(sdrPanel.maxheight, 2160, "the Main10 claim stays honest on SDR");
+    assert.equal(sdrPanel.hdr10t, 0);
+
+    // Decodes 10-bit but cannot put PQ on the wire — a 10-bit SDR rip must
+    // still direct-play, so `hevc10` stays and only `hdr10t` goes.
+    const noPq = await hevcHarness({
+      supported: MAIN8.concat(MAIN10),
+      pqSupported: [],
+      hdrDisplay: true,
+    }).refinedCaps();
+    assert.equal(noPq.vcodec.split(",").includes("hevc10"), true);
+    assert.equal(noPq.hdr10t, 0);
+
+    const h = hevcHarness({
+      supported: MAIN8.concat(MAIN10),
+      pqSupported: MAIN10,
+      hdrDisplay: true,
+    });
+    const query = h.capsQuery(await h.refinedCaps());
+    assert.match(query, /&maxheight=2160&/);
+    assert.match(query, /&hdr10t=1$/);
+    assert.equal(
+      h.calls.some((c) => c.transferFunction === "pq"),
+      true,
+      "the HDR rungs are asked with transferFunction:'pq'",
+    );
+  },
+);
+
+asyncTest(
+  "a browser with no MediaCapabilities degrades without crashing or over-claiming",
+  async () => {
+    const absent = hevcHarness({
+      supported: MAIN8.concat(MAIN10),
+      mediaCapabilities: null,
+      hdrDisplay: true,
+    });
+    assert.equal(await absent.hevcTiersMediaCapabilities(), null);
+    const caps = await absent.refinedCaps();
+    assert.equal(caps.vcodec.split(",").includes("hevc10"), true);
+    assert.equal(caps.maxheight, 2160);
+    assert.equal(caps.hdr10t, 0);
+
+    // Present but rejecting every configuration: the same fallback, not an
+    // exception escaping into boot() and a page that never renders.
+    const throws = hevcHarness({
+      supported: MAIN8,
+      mediaCapabilities: {
+        decodingInfo() {
+          throw new TypeError("unsupported configuration");
+        },
+      },
+      hdrDisplay: true,
+    });
+    assert.equal(await throws.hevcTiersMediaCapabilities(), null);
+    assert.equal((await throws.refinedCaps()).maxheight, 2160);
+  },
+);
+
+asyncTest("the Dolby Vision probe is unchanged by the tiering", async () => {
+  // Chrome answers no to dvh1.05.06 and must keep doing so; Safari answers yes
+  // to both profiles. Neither answer may move because HEVC learned about depth.
+  const chrome = await hevcHarness({
+    supported: MAIN8.concat(MAIN10),
+    pqSupported: MAIN10,
+    hdrDisplay: true,
+  }).refinedCaps();
+  assert.equal(chrome.dv, 0);
+  assert.equal(chrome.dvprofile, "");
+
+  const safari = hevcHarness({
+    supported: MAIN8.concat(MAIN10, ["dvh1.05.06", "dvhe.08.07"]),
+    mediaCapabilities: null,
+    hdrDisplay: true,
+  });
+  const caps = await safari.refinedCaps();
+  assert.equal(caps.dv, 1);
+  assert.equal(caps.dvprofile, "5,8");
+  assert.match(safari.capsQuery(caps), /&dv=1&dvprofile=5,8&/);
+});
+
+test("a session that lands on a different range repaints the badge", () => {
+  // The field bug: on a tone-mapped Dexter episode the chip read "DV P7 →
+  // HDR10" while the stats panel one line below read "Dynamic range: SDR".
+  // Both surfaces call dynamicRangeBadge() with the same arguments — the
+  // panel just repaints every second, and the chip was painted once at
+  // session open, before the route was chosen. attachSession is the one site
+  // every session passes through, so it owns the repaint.
+  let repaints = 0;
+  const build = new Function(
+    "PLAYER",
+    "renderPlayerInfo",
+    "attachHls",
+    [shippedSource("attachSession"), "return {attachSession};"].join("\n"),
+  );
+  const player = { deliveredRange: "hdr10" };
+  const { attachSession } = build(player, () => { repaints += 1; }, () => {});
+
+  attachSession({}, player, {
+    start_seconds: 0,
+    playlist_url: "/x.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(player.deliveredRange, "sdr", "the session is the source of truth");
+  assert.equal(repaints, 1, "the chip must be repainted, not left at the decision's guess");
+
+  // A response with no range keeps the decision's answer — and still must not
+  // leave a stale chip behind, because other fields it paints moved too.
+  const before = repaints;
+  attachSession({}, player, { start_seconds: 0, playlist_url: "/x.m3u8" }, 0);
+  assert.equal(player.deliveredRange, "sdr");
+  assert.ok(repaints > before, "every attach repaints");
+
+  // A superseded playback must not repaint over the live one.
+  const stale = { deliveredRange: "hdr10" };
+  const settled = repaints;
+  attachSession({}, stale, {
+    start_seconds: 0,
+    playlist_url: "/y.m3u8",
+    delivered_dynamic_range: "sdr",
+  }, 0);
+  assert.equal(repaints, settled, "a stale generation never paints the live player");
+});
+
+test("an upgrade needs encode headroom, not just a bandwidth estimate", () => {
+  const ladder = [
+    { height: 1080, total_kbps: 8160, peak_kbps: 12160 },
+    { height: 720, total_kbps: 4160, peak_kbps: 6160 },
+    { height: 480, total_kbps: 2160, peak_kbps: 3160 },
+  ];
+  // The production shape: on a JIT server the estimate measures
+  // min(link, encode) of the CURRENT rung, so a fast 720p encode reads as
+  // ~200 Mb/s and clears any bar the 1080p rung can set. The server's own
+  // pace is what says whether one rung up is sustainable.
+  const base = {
+    ladder,
+    currentHeight: 720,
+    estimateKbps: 200_000,
+    runwaySeconds: 40,
+    previousRunwaySeconds: 40,
+    nowMs: 500_000,
+    lastSwitchAtMs: 0,
+    lastStallAtMs: null,
+    upgradeSinceMs: 1,
+  };
+
+  // 720 -> 1080 is 2.25x the pixels. A server holding 2.0x realtime at 720p
+  // predicts 0.89x at 1080p — under realtime, so no upgrade.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: 2.0 }).height,
+    720,
+    "an encoder that cannot hold realtime one rung up must not be sent there",
+  );
+  // 3.0x predicts 1.33x — enough margin, so the upgrade proceeds.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: 3.0 }).height,
+    1080,
+    "real headroom still upgrades",
+  );
+  // No measurement is not evidence against: absence must not freeze the rung.
+  assert.equal(
+    policy.decideRung({ ...base, recentSpeed: null }).height,
+    1080,
+    "an unmeasured session can still rise",
+  );
+  // A rung this playback already failed to open is never re-entered, however
+  // good the numbers look — the loop that oscillated 720<->1080 every ~2
+  // minutes had healthy-looking numbers on every cycle.
+  assert.equal(
+    policy.decideRung({
+      ...base,
+      recentSpeed: 3.0,
+      blockedHeights: new Set([1080]),
+    }).height,
+    720,
+    "a failed rung is not a candidate",
+  );
+  // Blocking the rung above must not block the way DOWN.
+  const pressured = policy.decideRung({
+    ...base,
+    recentSpeed: 3.0,
+    blockedHeights: new Set([1080]),
+    estimateKbps: 1_000,
+    runwaySeconds: 0.5,
+  });
+  assert.equal(pressured.height, 480, "emergencies still fall");
+  assert.equal(pressured.emergency, true);
+});
+
 // Drained last, in registration order, after every synchronous case has run.
 (async () => {
   for (const [name, run] of ASYNC_TESTS) {
