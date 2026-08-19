@@ -4077,6 +4077,16 @@ impl TranscodeManager {
         )
     }
 
+    /// The node id a package produced here is owned by, for the fenced
+    /// package writes. Offline production requires a cache, so a manager
+    /// without one owns no package and its fenced writes correctly match
+    /// nothing.
+    fn offline_owner(&self) -> &str {
+        self.cache
+            .as_ref()
+            .map_or("", |cache| cache.node_id.as_str())
+    }
+
     /// Prepare the exact mobile package requested by an authenticated user.
     /// Unlike speculative production, this preserves the file's A/V offset,
     /// accepts explicit tracks, and forces SDR even on a passthrough node.
@@ -4158,7 +4168,12 @@ impl TranscodeManager {
             if let OfflineSubtitle::Native(index) = spec.subtitle {
                 let _ = self
                     .store
-                    .update_offline_progress(package_id, "extracting_subtitles", 999)
+                    .update_offline_progress(
+                        package_id,
+                        self.offline_owner(),
+                        "extracting_subtitles",
+                        999,
+                    )
                     .await;
                 crate::subtitles::ensure_vtt(&self.subtitle_cache, file, index).await?;
             }
@@ -4201,7 +4216,7 @@ impl TranscodeManager {
             if let Some(package_id) = offline_package_id {
                 let _ = self
                     .store
-                    .update_offline_progress(package_id, "transcoding", 999)
+                    .update_offline_progress(package_id, &cache.node_id, "transcoding", 999)
                     .await;
             }
             return Ok(OfflineProduceOutcome::Cached(Produced {
@@ -4454,7 +4469,12 @@ impl TranscodeManager {
                         .clamp(1, 999);
                     let _ = self
                         .store
-                        .update_offline_progress(package_id, "transcoding", progress)
+                        .update_offline_progress(
+                            package_id,
+                            self.offline_owner(),
+                            "transcoding",
+                            progress,
+                        )
                         .await;
                 }
             }
@@ -8725,7 +8745,7 @@ mod tests {
             .expect("pinned recipe");
 
         assert!(store
-            .requeue_offline_package(package_id)
+            .requeue_offline_package(package_id, NODE)
             .await
             .expect("requeue"));
         store
