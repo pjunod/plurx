@@ -281,6 +281,6 @@ test_anchor = "testDeliveryStarvationNeverFiresOnAHealthyBufferedPlayer"
 id = "apple.build-65-release-claims"
 commits = ["9989092"]
 source = "docs/APPLE-CLIENT-PARITY.md"
-source_anchor = "Apple build 65"
+source_anchor = "Apple build 66"
 test = "tests/operations/test_mobile_build_claims.py"
 test_anchor = "test_repository_build_claims_match_release_inputs"
