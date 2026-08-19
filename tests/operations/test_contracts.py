@@ -407,8 +407,15 @@ class OperationsContractCase(unittest.TestCase):
 
         # Both sides of the #380 split stay covered: the gate lanes on the major
         # their timing assumptions were written against, and a nightly lane on
-        # the one every worker host already runs.
-        self.assertEqual({"6", "8"}, majors)
+        # the one every worker host already runs. Changing this set is allowed
+        # and is the point — it is how a decision to move the fleet's ffmpeg
+        # arrives as a reviewed diff rather than as a Tuesday.
+        self.assertEqual(
+            {"6", "8"},
+            majors,
+            "the ffmpeg majors CI covers changed; update docs/VALIDATION.md's "
+            "'Which ffmpeg the profiles assume' in the same commit",
+        )
 
     def test_ci_flake_ledger_records_real_job_outcomes_and_durations(self):
         script = ROOT / "scripts/ci-flake-report"

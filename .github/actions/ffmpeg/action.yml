@@ -55,7 +55,12 @@ runs:
         WANT_MAJOR: ${{ inputs.major }}
       run: |
         set -euo pipefail
-        banner="$(ffmpeg -version | head -1)"
+        # Not `ffmpeg -version | head -1`: `head` closes the pipe on the first
+        # line and `ffmpeg` still has a dozen to write, so under `pipefail` that
+        # is a SIGPIPE away from failing a required gate for no reason. Take the
+        # whole banner and cut it in the shell.
+        version_output="$(ffmpeg -version)"
+        banner="${version_output%%$'\n'*}"
         package="$(dpkg-query -W -f='${Version}' ffmpeg 2>/dev/null || echo 'not from apt')"
         # `ffmpeg version 6.1.1-3ubuntu5 Copyright ...`, and some builds prefix
         # the number with `n`. Anything else leaves `got` empty and fails below
