@@ -12,12 +12,15 @@
 //! which needs no quorum and therefore no contended host.
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::io::Write as _;
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -62,6 +65,21 @@ const API_SECRET: &str = "plurx-m1b-api-secret";
 pub const INSTANCE_ID: &str = "m1b-cluster-check";
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+/// The interface every harness listener binds. hiqlite composes each listener
+/// from this and the port half of the node's own `addr_raft`/`addr_api`
+/// (`hiqlite-0.14.0/src/start.rs:318`), which is why the two must agree.
+const LISTEN_ADDR: &str = "127.0.0.1";
+/// The phrase every port-collision verdict in this crate carries, and the one
+/// [`is_port_collision`] recognises.
+const PORT_COLLISION: &str = "port collision";
+/// Exit status a voter uses when a listener lost its port. 98 is `EADDRINUSE`,
+/// which is what the failed `bind` itself reported.
+pub const BIND_FAILURE_EXIT: i32 = 98;
+/// How many times a cluster start reallocates its ports before giving up.
+const PORT_RETRY_ATTEMPTS: u32 = 5;
+/// How long a voter waits for its own listeners to accept before it reports
+/// them as never bound.
+const LISTENER_PROOF_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the convergence helpers retry before reporting failure.
 pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Incoming active-player heartbeats in the compacted-growth record.
@@ -178,28 +196,40 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
 async fn run_growth_subprocess() -> Result<()> {
     let root = tempfile::tempdir().context("compacted-growth subprocess data root")?;
-    let mut command = Command::new(harness_executable()?);
-    command
-        .arg("growth")
-        .arg(root.path())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("spawn compacted-growth subprocess")?;
-    let status = match tokio::time::timeout(Duration::from_secs(300), child.wait()).await {
-        Ok(status) => status.context("wait for compacted-growth subprocess")?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!("compacted-growth subprocess timed out after 300 seconds");
+    let executable = harness_executable()?;
+    with_port_retry(|attempt| {
+        let executable = executable.clone();
+        let attempt_root = root.path().join(format!("attempt-{attempt}"));
+        async move {
+            std::fs::create_dir_all(&attempt_root)?;
+            let mut command = Command::new(&executable);
+            command
+                .arg("growth")
+                .arg(&attempt_root)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            let mut child = command
+                .spawn()
+                .context("spawn compacted-growth subprocess")?;
+            let status = match tokio::time::timeout(Duration::from_secs(300), child.wait()).await {
+                Ok(status) => status.context("wait for compacted-growth subprocess")?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("compacted-growth subprocess timed out after 300 seconds");
+                }
+            };
+            if status.code() == Some(BIND_FAILURE_EXIT) {
+                bail!("{PORT_COLLISION}: the compacted-growth voter lost one of its ports");
+            }
+            if !status.success() {
+                bail!("compacted-growth subprocess exited {:?}", status.code());
+            }
+            Ok(())
         }
-    };
-    if !status.success() {
-        bail!("compacted-growth subprocess exited {:?}", status.code());
-    }
-    Ok(())
+    })
+    .await
 }
 
 async fn controller() -> Result<()> {
@@ -216,9 +246,17 @@ async fn controller() -> Result<()> {
 async fn run_membership_lifecycle_case() -> Result<()> {
     let executable = harness_executable()?;
     let root = tempfile::tempdir().context("membership lifecycle data root")?;
-    let specs = allocate_nodes(3)?;
-    let first = specs[0].clone();
-    let mut cluster = ClusterProcesses::start(&executable, root.path(), vec![first]).await?;
+    let (mut cluster, specs, cluster_root) = with_port_retry(|attempt| {
+        let executable = executable.clone();
+        let attempt_root = root.path().join(format!("attempt-{attempt}"));
+        async move {
+            let specs = allocate_nodes(3)?;
+            let cluster =
+                ClusterProcesses::start(&executable, &attempt_root, vec![specs[0].clone()]).await?;
+            Ok((cluster, specs, attempt_root))
+        }
+    })
+    .await?;
     cluster.request(1, Request::Bootstrap).await?.require_ok()?;
 
     let initial_dump = match cluster.request(1, Request::Dump).await? {
@@ -267,7 +305,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 &executable,
                 NodeLaunch {
                     node_id,
-                    root: root.path().to_path_buf(),
+                    root: cluster_root.clone(),
                     nodes: specs[..node_id as usize].to_vec(),
                 },
             )
@@ -473,6 +511,9 @@ async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
         root,
         nodes: allocate_nodes(1)?,
     };
+    // This voter runs hiqlite in-process rather than behind the stdin/stdout
+    // protocol, so a lost port would otherwise surface as a growth verdict.
+    install_bind_failure_guard(BindFailureChannel::Stderr, voter_listen_addrs(&launch)?);
     let mut config = node_config(&launch)?;
     config.filename_db = Cow::Borrowed("growth.db");
     config.raft_config = NodeConfig::default_raft_config(GROWTH_COMPACTION_LOGS);
@@ -1622,6 +1663,32 @@ pub fn harness_executable() -> Result<PathBuf> {
     std::env::current_exe().context("cluster-check executable")
 }
 
+/// Retry a cluster start whose only failure was a port taken between
+/// allocation and bind.
+///
+/// `attempt` is handed the attempt number so it can allocate fresh ports and a
+/// fresh data root each time. Only [`is_port_collision`] errors are retried;
+/// every other failure is a verdict and is returned immediately, which is the
+/// whole point of classifying the collision rather than matching a message
+/// here.
+pub async fn with_port_retry<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut last_error = None;
+    for number in 1..=PORT_RETRY_ATTEMPTS {
+        match attempt(number).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_port_collision(&error) => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.with_context(|| {
+        format!("cluster ports stayed occupied across {PORT_RETRY_ATTEMPTS} allocations")
+    })?)
+}
+
 /// Allocate ports and start `voters` voter processes, retrying the whole
 /// allocation when a port was taken between binding it and using it.
 pub async fn start_cluster_with_port_retry(
@@ -1629,19 +1696,13 @@ pub async fn start_cluster_with_port_retry(
     root: &Path,
     voters: u64,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
-    let mut last_error = None;
-    for attempt in 1..=5 {
+    with_port_retry(|attempt| async move {
         let specs = allocate_nodes(voters)?;
         let attempt_root = root.join(format!("attempt-{attempt}"));
-        match ClusterProcesses::start(executable, &attempt_root, specs.clone()).await {
-            Ok(cluster) => return Ok((cluster, specs)),
-            Err(error) if format!("{error:#}").contains("Address already in use") => {
-                last_error = Some(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.context("cluster ports stayed occupied across five allocations")?)
+        let cluster = ClusterProcesses::start(executable, &attempt_root, specs.clone()).await?;
+        Ok((cluster, specs))
+    })
+    .await
 }
 
 /// Assert a voter's local dump carries every row the harness wrote: the
@@ -1732,7 +1793,12 @@ pub fn validate_known_dump(dump: &serde_json::Value) -> Result<()> {
 /// line-delimited request protocol until stdin closes.
 pub async fn node(launch: NodeLaunch) -> Result<()> {
     install_crypto_provider();
-    let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
+    // Arm this before hiqlite can spawn a listener, so a bind that lost its
+    // port is reported as a port collision rather than surviving as a voter
+    // that answers every later request with a durable-state symptom.
+    let listeners = voter_listen_addrs(&launch)?;
+    install_bind_failure_guard(BindFailureChannel::Protocol, listeners.clone());
+    let _ = ServerTlsConfig::server_config_self_signed(LISTEN_ADDR).await;
     let client = match hiqlite::start_node(node_config(&launch)?).await {
         Ok(client) => client,
         Err(error) => {
@@ -1746,6 +1812,13 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .context("voter health timed out")?;
+    if let Err(error) = prove_listeners_bound(&listeners).await {
+        write_response(&Response::Error {
+            message: format!("{error:#}"),
+        })
+        .await?;
+        return Err(error);
+    }
     let replication = ReplicationMonitor::replicated(client.clone());
 
     write_response(&Response::Ready {
@@ -3076,8 +3149,8 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
                 addr_api: node.api.clone(),
             })
             .collect(),
-        listen_addr_api: Cow::Borrowed("127.0.0.1"),
-        listen_addr_raft: Cow::Borrowed("127.0.0.1"),
+        listen_addr_api: Cow::Borrowed(LISTEN_ADDR),
+        listen_addr_raft: Cow::Borrowed(LISTEN_ADDR),
         data_dir: Cow::Owned(data_dir.to_string_lossy().into_owned()),
         filename_db: Cow::Borrowed("auth.db"),
         secret_raft: RAFT_SECRET.to_owned(),
@@ -3092,20 +3165,175 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
 }
 
 /// Reserve a raft and an API port for each of `count` voters.
+///
+/// Every listener for the allocation is held until the last port is chosen, so
+/// one allocation can never hand the same port to two of its own listeners.
+/// It cannot do more than that: the ports are released here and bound later by
+/// a different process, so an unrelated process may still claim one in
+/// between. That residual race is what [`install_bind_failure_guard`] reports
+/// and what [`with_port_retry`] answers.
 pub fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
+    let mut held = Vec::with_capacity(count as usize * 2);
+    for _ in 0..count * 2 {
+        held.push(TcpListener::bind((LISTEN_ADDR, 0)).context("reserve a harness port")?);
+    }
+    let mut ports = held
+        .iter()
+        .map(|listener| Ok(listener.local_addr()?.port()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter();
     (1..=count)
         .map(|id| {
             Ok(NodeSpec {
                 id,
-                raft: format!("127.0.0.1:{}", free_port()?),
-                api: format!("127.0.0.1:{}", free_port()?),
+                raft: format!("{LISTEN_ADDR}:{}", ports.next().context("raft port")?),
+                api: format!("{LISTEN_ADDR}:{}", ports.next().context("api port")?),
             })
         })
         .collect()
 }
 
+/// Observe one free port.
+///
+/// The listener is released as the expression ends, so this reports a port
+/// that *was* free rather than one this process holds. Nothing that starts a
+/// voter may treat the result as a reservation; see [`allocate_nodes`].
 pub fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    Ok(TcpListener::bind((LISTEN_ADDR, 0))?.local_addr()?.port())
+}
+
+/// The last port collision this process observed, recorded by
+/// [`install_bind_failure_guard`].
+static BIND_FAILURE: OnceLock<String> = OnceLock::new();
+
+/// Where a voter reports a listener that never bound.
+#[derive(Clone, Copy, Debug)]
+pub enum BindFailureChannel {
+    /// Write a [`Response::Error`] on the stdin/stdout voter protocol, so the
+    /// controller reads the collision as this voter's own startup verdict.
+    Protocol,
+    /// Print to stderr, for a harness voter that has no protocol peer.
+    Stderr,
+}
+
+/// Is this error a port taken between allocation and bind, rather than
+/// anything the cluster contract asserts?
+///
+/// A port is only ever observed free and then released, so a voter is always
+/// started on a port another process may have claimed in the meantime. That is
+/// an environment fact, not a durable-state fault. Classifying it here — once,
+/// by name — is what keeps "the port moved" from being read as "the store is
+/// un-migrated".
+pub fn is_port_collision(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains(PORT_COLLISION) || text.contains("Address already in use")
+}
+
+/// Make a listener that never bound the voter's own verdict.
+///
+/// hiqlite serves its raft and its API listener from detached `tokio::spawn`
+/// tasks that `.unwrap()` the serve future (`hiqlite-0.14.0/src/start.rs:148`
+/// and `:231`). A bind that loses its port panics one of those tasks and
+/// nothing else: `start_node` has already returned `Ok`,
+/// `wait_until_healthy_db` probes only the *local* database, and the process
+/// stays alive serving one dead listener. The collision then reached the
+/// controller as whatever the crippled voter failed at next — a replicated
+/// deadline for the API port, or `no such table: cluster_meta` for a
+/// linearizable read that never reached a state machine, which reads as an
+/// un-migrated store rather than a busy port.
+///
+/// This hook turns that panic into a classified verdict and stops the voter,
+/// so a port collision cannot go on to be reported as durable-state damage.
+/// Panics that are not bind failures keep their previous behaviour.
+pub fn install_bind_failure_guard(channel: BindFailureChannel, addresses: Vec<String>) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let Some(payload) = bind_failure_payload(info) else {
+            previous(info);
+            return;
+        };
+        let message = format!(
+            "{PORT_COLLISION}: a voter listener could not bind one of [{}]: {payload}",
+            addresses.join(", ")
+        );
+        let _ = BIND_FAILURE.set(message.clone());
+        match channel {
+            BindFailureChannel::Protocol => {
+                // A panic hook cannot drive the async writer, so emit the same
+                // newline framing the controller reads synchronously.
+                if let Ok(mut line) = serde_json::to_vec(&Response::Error { message }) {
+                    line.push(b'\n');
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(&line);
+                    let _ = stdout.flush();
+                }
+            }
+            BindFailureChannel::Stderr => eprintln!("{message}"),
+        }
+        // Leaving the voter alive is the defect being fixed: it would keep
+        // answering with downstream symptoms of the dead listener. `exit`
+        // rather than `abort` so an instrumented build still writes its
+        // coverage profile.
+        std::process::exit(BIND_FAILURE_EXIT);
+    }));
+}
+
+/// The panic message, when the panic is a listener that could not bind.
+fn bind_failure_payload(info: &PanicHookInfo<'_>) -> Option<String> {
+    let payload = info.payload_as_str()?;
+    (payload.contains("AddrInUse") || payload.contains("Address already in use"))
+        .then(|| payload.to_owned())
+}
+
+/// The addresses this voter's hiqlite node will bind.
+///
+/// hiqlite builds each listener from `listen_addr_*` and the port half of this
+/// node's own entry (`hiqlite-0.14.0/src/start.rs:318`), so these are the two
+/// addresses a collision can be a collision *with*.
+pub fn voter_listen_addrs(launch: &NodeLaunch) -> Result<Vec<String>> {
+    let node = launch
+        .nodes
+        .iter()
+        .find(|node| node.id == launch.node_id)
+        .with_context(|| format!("voter {} has no spec of its own", launch.node_id))?;
+    [&node.raft, &node.api]
+        .into_iter()
+        .map(|address| {
+            let (_, port) = address
+                .rsplit_once(':')
+                .with_context(|| format!("voter address {address} has no port"))?;
+            Ok(format!("{LISTEN_ADDR}:{port}"))
+        })
+        .collect()
+}
+
+/// Prove both of a voter's listeners accept before it announces readiness.
+///
+/// Readiness used to depend on nothing but the local database, so a voter
+/// whose listener lost its port still wrote `Response::Ready`. Connecting to
+/// each address is the positive half of the proof — it catches a listener that
+/// is simply absent. The negative half is [`install_bind_failure_guard`],
+/// which is what separates "my listener is up" from "somebody else's listener
+/// is up on my port", because a squatter accepts connections too.
+async fn prove_listeners_bound(addresses: &[String]) -> Result<()> {
+    for address in addresses {
+        let deadline = TokioInstant::now() + LISTENER_PROOF_TIMEOUT;
+        loop {
+            if let Some(failure) = BIND_FAILURE.get() {
+                bail!("{failure}");
+            }
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(_) => break,
+                Err(error) if TokioInstant::now() >= deadline => {
+                    return Err(anyhow!(error)).with_context(|| {
+                        format!("voter listener {address} never accepted a connection")
+                    });
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn unix_now() -> Result<i64> {

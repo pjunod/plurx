@@ -163,6 +163,53 @@ exactly what `git merge-tree` computes from the two parents. Anything Git cannot
 prove empty is reviewable content and takes a delta pass. The rule and its
 refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
 
+## Load-sensitive cluster checks — a timeout is not a verdict
+
+One check drives real replicated infrastructure rather than a library, so the
+host it runs on is part of the experiment. `cluster-auth` (`make
+cluster-check`, points `cluster.auth` and `persistence.upgrades`) starts voters
+as separate processes; the Rust gate's `plurx-cluster-check` harness tests do
+the same. Under a full `make validate` those voters compete with every other
+check for the same cores **and for the same ephemeral ports**.
+
+### A busy port is not an un-migrated store
+
+A voter's raft and API ports are chosen by binding port zero, reading the
+port, and releasing the listener. Nothing holds them: the process that binds
+them for real is a child started afterwards, and hiqlite binds its own sockets
+from an address string, so there is no listener to hand over. Under
+gate-parallel load another process can claim one of those ports in between,
+and that is an environment fact rather than durable-state evidence.
+
+It used not to read as one. hiqlite serves both listeners from detached
+`tokio::spawn` tasks that `.unwrap()` the serve future
+(`hiqlite-0.14.0/src/start.rs:148` and `:231`), so a losing bind panicked a
+background task and nothing else: `start_node` had already returned `Ok`,
+`wait_until_healthy_db` probes only the *local* database, and the voter
+announced readiness with a dead listener. The collision then surfaced as
+whatever the crippled voter failed at next:
+
+| Port lost | What the gate used to print |
+|---|---|
+| raft | `no such table: cluster_meta` — a linearizable read reaching a state machine that never applied the schema batch, which is exactly what a genuinely un-migrated store looks like |
+| API | `replicated store operation timed out`, then `auth store has not been opened` |
+
+Both of those are contract verdicts, and the first is a serious one. Neither
+was true. A voter now proves both of its listeners accept before it announces
+readiness, and a bind failure is reported as `port collision: …` and stops the
+voter, so a busy port cannot go on to be reported as durable-state damage.
+Cluster starts reallocate their ports up to five times on that classification
+and on nothing else — see `is_port_collision` and `with_port_retry` in
+`crates/plurx-cluster-check/src/lib.rs`.
+
+**How to tell them apart.** Read the verdict, never the elapsed time. A `port
+collision:` failure names the loopback address that collided and means nothing
+was proved; rerun the check alone. Anything else is the contract's own answer
+and is reproducible on an idle host. Note that the API-port case above shares
+its `replicated store operation timed out` text with an ordinary replicated
+deadline — the difference is that a collision now says so first, so a timeout
+arriving on its own is still the deadline it has always been.
+
 ## The UI golden — a saved answer key, not a magic test
 
 “Golden” is testing jargon for a reviewed, known-good output saved in the

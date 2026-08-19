@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use plurx_cluster_check::{
-    allocate_nodes, free_port, harness_executable, install_crypto_provider, node_config,
-    prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
+    allocate_nodes, free_port, harness_executable, install_crypto_provider, is_port_collision,
+    node_config, prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
     require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry, unix_now,
     validate_compacted_growth, validate_known_dump, ClusterProcesses, CompactedGrowthReport,
     NodeLaunch, NodeProcess, NodeSpec, Preflight, Request, Response, GROWTH_BYTES_PER_BEAT_BUDGET,
@@ -755,6 +755,119 @@ async fn every_argument_rejection_names_what_was_wrong() {
         .is_err(),
         "an undecodable launch payload must be rejected"
     );
+}
+
+/// Every verdict a crippled voter produces downstream of a lost port, so the
+/// regression can assert the collision is reported *instead of* one of these.
+///
+/// `no such table: cluster_meta` is the one that started this: a linearizable
+/// read on a voter whose raft listener died reads a state machine that never
+/// applied the schema batch, which is indistinguishable from an un-migrated
+/// store. The other two are what an API-port collision produces.
+const STORE_VERDICTS: [&str; 4] = [
+    "no such table",
+    "cluster_meta",
+    "replicated store operation timed out",
+    "auth store has not been opened",
+];
+
+/// Start one voter with `held` already bound by somebody else and return how
+/// its startup failed.
+///
+/// Expect a hiqlite bind panic on stderr while this runs. That panic is the
+/// defect's mechanism, not a test failure: the voter's listener task is what
+/// dies, and the whole point of the assertion below is that the parent now
+/// hears about it.
+async fn startup_error_with_an_occupied_port(occupied: Occupied) -> String {
+    let root = tempfile::tempdir().expect("port collision test root");
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let held = squatter.local_addr().expect("held address").port();
+    let free = free_port().expect("the voter's other port");
+    let (raft, api) = match occupied {
+        Occupied::Raft => (held, free),
+        Occupied::Api => (free, held),
+    };
+
+    let launch = NodeLaunch {
+        node_id: 1,
+        root: root.path().to_path_buf(),
+        nodes: vec![NodeSpec {
+            id: 1,
+            raft: format!("127.0.0.1:{raft}"),
+            api: format!("127.0.0.1:{api}"),
+        }],
+    };
+    let mut voter = NodeProcess::spawn(&harness_binary(), &launch).expect("spawn the voter");
+    let error = voter
+        .wait_ready()
+        .await
+        .expect_err("a voter that could not bind must not announce readiness");
+    assert!(
+        is_port_collision(&error),
+        "a cluster start must be able to reallocate this, got: {error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(&format!("127.0.0.1:{held}")),
+        "the verdict should name the address that collided, got: {text}"
+    );
+    for verdict in STORE_VERDICTS {
+        assert!(
+            !text.contains(verdict),
+            "a busy port was reported as {verdict:?}: {text}"
+        );
+    }
+    text
+}
+
+#[derive(Clone, Copy)]
+enum Occupied {
+    Raft,
+    Api,
+}
+
+/// A port taken between allocation and bind is reported as a port collision,
+/// never as a durable-state fault.
+///
+/// `free_port` can only observe a port free and then release it, so the voter
+/// binds a port another process may already have claimed. hiqlite serves both
+/// listeners from detached tasks that `.unwrap()` the serve future, so that
+/// bind failure used to panic a background task and nothing else: `start_node`
+/// returned `Ok`, the local-database health probe passed, and the voter
+/// announced `Ready` with a dead listener. The collision then reached the gate
+/// as whatever the crippled voter failed at next — for a raft-port collision,
+/// `no such table: cluster_meta`, which reads as an un-migrated store.
+///
+/// Both listeners are asserted because they fail differently: a raft collision
+/// used to bootstrap "successfully" and misreport much later, while an API
+/// collision used to surface as a replicated deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voter_handed_an_occupied_port_reports_a_collision_not_a_store_verdict() {
+    for occupied in [Occupied::Raft, Occupied::Api] {
+        startup_error_with_an_occupied_port(occupied).await;
+    }
+}
+
+/// The classifier that decides whether a cluster start may reallocate must not
+/// answer yes for anything the cluster contract asserts.
+///
+/// This is the other half of the regression above: reporting a collision is
+/// only useful if a real store fault is still a verdict rather than something
+/// the harness silently retries five times and then reports as a busy port.
+#[test]
+fn a_store_verdict_is_never_classified_as_a_port_collision() {
+    assert!(is_port_collision(&anyhow::anyhow!(
+        "port collision: a voter listener could not bind one of [127.0.0.1:9]"
+    )));
+    assert!(is_port_collision(&anyhow::anyhow!(
+        "Os {{ code: 98, kind: AddrInUse, message: \"Address already in use\" }}"
+    )));
+    for verdict in STORE_VERDICTS {
+        assert!(
+            !is_port_collision(&anyhow::anyhow!("database error: {verdict}")),
+            "{verdict:?} is a durable-state verdict, not an environment fact"
+        );
+    }
 }
 
 #[test]
