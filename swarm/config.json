@@ -176,37 +176,25 @@
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
-      "clone": "plurx-builder-sol-1",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-sol-1"
     },
     "builder-2": {
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
-      "clone": "plurx-builder-sol-2",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-sol-2"
     },
     "builder-3": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
-      "clone": "plurx-builder-opus-1",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-opus-1"
     },
     "builder-4": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
-      "clone": "plurx-builder-opus-2",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-opus-2"
     },
     "reviewer-1": {
       "role": "reviewer",

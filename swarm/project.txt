@@ -86,13 +86,14 @@ worker names in `swarm/config.json` deliberately carry no model, because the
 supervisor picks a session-scoped model per dispatch and any name encoding one
 would drift out of date without anything noticing. The
 supervisor assigns an independent Reviewer whose model differs from the author;
-an idle Builder may review only after Builder work is exhausted and only under
-the same model-separation rule. Review is read-only against the author's branch
-and ends with a recorded approval or numbered change requests. The author
-answers findings and requests re-review. On approval the Reviewer transitions
-the item to `needs-lead`; Lead then verifies the exact head, marks drafts ready,
-merges automatically, and reconciles issues. Only branch protection, failed
-checks, or changes-requested review may stop that merge.
+only dedicated Reviewer capacity handles review work. If review demand exceeds
+that capacity, add or resize Reviewer slots; never borrow a Builder. Review is
+read-only against the author's branch and ends with a recorded approval or
+numbered change requests. The author answers findings and requests re-review.
+On approval the Reviewer transitions the item to `needs-lead`; Lead then
+verifies the exact head, marks drafts ready, merges automatically, and
+reconciles issues. Only branch protection, failed checks, or changes-requested
+review may stop that merge.
 
 When blocked, comment with the symptom, evidence, attempts, and exact unblocker;
 replace `swarm:active` with `swarm:blocked`; report `swarmctl block`; then release
