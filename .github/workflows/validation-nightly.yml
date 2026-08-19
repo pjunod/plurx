@@ -17,7 +17,10 @@ env:
 jobs:
   deep-validation:
     name: playback, recovery, bounds, clients, UI, and packaging
-    runs-on: ubuntu-latest
+    # The deep tier is the gate's own evidence run one level further, so it uses
+    # the gate's pinned ffmpeg. `ffmpeg8-pacing` below is where the other major
+    # gets covered. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -27,10 +30,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install media and browser prerequisites
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
           python3 -m pip install playwright
           python3 -m playwright install --with-deps chromium
       - name: Run every scheduled validation
@@ -88,9 +92,59 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
+  # Every other lane in this repository runs ffmpeg 6, which is how #380 —
+  # ffmpeg 8 declaring `-readrate_initial_burst` and ignoring it — reached three
+  # worker hosts without CI noticing. A pin alone would have kept that blind
+  # spot permanent, so the other major gets a lane of its own.
+  #
+  # Nightly rather than the required gate, deliberately: the capability probe
+  # this asserts is #386's territory, and a required matrix over both majors
+  # would have the fleet staring at a red required check until that lands. This
+  # runs the same `playback-recovery` capability assertion the deep tier already
+  # owns (validation/points.toml), so when #386 changes what the probe reports,
+  # this lane is where the change meets a real ffmpeg 8 rather than a mock.
+  ffmpeg8-pacing:
+    name: pacing capability contract on ffmpeg 8
+    # The container tag is the pin here — `ubuntu:26.04` is where ffmpeg 8 comes
+    # from, and it moves only when this line does. The host image is pinned too
+    # so the two cannot drift independently.
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    timeout-minutes: 45
+    steps:
+      # A bare distro image, unlike a hosted runner image, ships none of this;
+      # `git` in particular has to exist before checkout, or the action falls
+      # back to a tarball and `./.github/actions/ffmpeg` below has no repository
+      # to resolve against. `cmake` is aws-lc-sys'.
+      - name: Install the container's build prerequisites
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -o Acquire::Retries=3 update
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl git pkg-config
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-ffmpeg8
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "8"
+      # `--ignored` because the assertion is a runner capability contract rather
+      # than a unit test: it is meaningless on a machine whose ffmpeg nobody
+      # chose, which until this job was every machine CI had.
+      - name: Assert the pacing capability contract on ffmpeg 8
+        run: |
+          cargo test --locked -p plurxd \
+            ffmpeg::tests::nightly_runner_has_ffmpeg_readrate \
+            -- --exact --ignored --nocapture
+
   mutation:
     name: report-only weekly mutation spot-check
-    runs-on: ubuntu-latest
+    # Mutants are judged by whether the suite kills them, and the suite spawns
+    # ffmpeg, so this needs the same pinned build. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -100,8 +154,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: nightly-mutation
-      - name: Install media prerequisite
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
       - name: Install the mutation spot-checker
         run: cargo install cargo-mutants --locked
         timeout-minutes: 20

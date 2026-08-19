@@ -6,6 +6,7 @@ artifact_dir = "target/validation"
 always_checks = ["catalog-contract", "history-regressions", "rust-gate", "rust-gate-ci"]
 audit_paths = [
   ".dockerignore",
+  ".github/actions/**",
   ".github/workflows/**",
   "Cargo.lock",
   "Cargo.toml",
@@ -564,6 +565,7 @@ title = "Build, deploy, and release artifacts"
 contract = "Every supported installation path builds the same stamped server and keeps its runtime configuration explicit."
 paths = [
   ".dockerignore",
+  ".github/actions/**",
   ".github/workflows/**",
   "Dockerfile",
   "deploy/**",
@@ -581,6 +583,7 @@ id = "validation.framework"
 title = "Functionality-point catalog and automation"
 contract = "Every governed source file maps to a named point, every point maps to a runnable check, and every run leaves machine-readable evidence."
 paths = [
+  ".github/actions/**",
   ".github/workflows/**",
   "Makefile",
   "docs/VALIDATION.md",

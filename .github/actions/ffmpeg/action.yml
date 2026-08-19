@@ -1,0 +1,81 @@
+name: Provision ffmpeg
+description: >-
+  Install ffmpeg for a validation lane, print the build that actually resolved,
+  and fail when it is not the major that lane's assertions were written against.
+
+# Every job that needed ffmpeg used to run `apt-get install -y ffmpeg` on
+# `ubuntu-latest`, so the required gate's ffmpeg was whichever build GitHub's
+# image happened to ship that week — nowhere stated, nowhere asserted, and
+# nothing failed if it changed. That is not hypothetical: ffmpeg 8 declares
+# `-readrate_initial_burst` and ignores it, which silently costs the copy path
+# its startup burst (#380, fixed by #386). CI never caught it because CI has
+# never run ffmpeg 8, and the same accident runs the other way — when
+# `ubuntu-latest` promotes past 24.04, every ffmpeg job inherits ffmpeg 8 in one
+# step with no diff to blame it on.
+#
+# So a caller does two things and this action checks the second against the
+# first: it pins the environment that supplies ffmpeg — a concrete runner image
+# or a container tag, never `ubuntu-latest` alone — and it names the major it
+# expects. `tests/operations/test_contracts.py` enforces the pair, which is what
+# keeps a change of ffmpeg build visible as a diff to a checked-in file.
+
+inputs:
+  major:
+    description: >-
+      The ffmpeg major series this lane's assertions were written against.
+      Ubuntu keeps an LTS on one ffmpeg major for its life, so pinning the image
+      pins this number; it is written out anyway so the log names the intent and
+      an unexpected build fails here rather than inside a playback assertion.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install ffmpeg
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Hosted images run as a non-root user and have sudo; a container job
+        # is already root and has neither sudo nor the mirror list below.
+        sudo=""
+        if [ "$(id -u)" -ne 0 ]; then sudo="sudo"; fi
+        sources=/etc/apt/sources.list.d/ubuntu.sources
+        if [ -f "$sources" ]; then
+          $sudo sed -i \
+            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+            "$sources"
+        fi
+        $sudo apt-get -o Acquire::Retries=3 update
+        DEBIAN_FRONTEND=noninteractive \
+          $sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
+
+    - name: Record and enforce the resolved ffmpeg build
+      shell: bash
+      env:
+        WANT_MAJOR: ${{ inputs.major }}
+      run: |
+        set -euo pipefail
+        banner="$(ffmpeg -version | head -1)"
+        package="$(dpkg-query -W -f='${Version}' ffmpeg 2>/dev/null || echo 'not from apt')"
+        # `ffmpeg version 6.1.1-3ubuntu5 Copyright ...`, and some builds prefix
+        # the number with `n`. Anything else leaves `got` empty and fails below
+        # rather than silently comparing against nothing.
+        got="$(printf '%s\n' "$banner" | sed -n '1s/^ffmpeg version n\?\([0-9][0-9]*\).*/\1/p')"
+
+        {
+          echo "### ffmpeg for this job"
+          echo
+          echo "- expected major: \`$WANT_MAJOR\`"
+          echo "- resolved: \`$banner\`"
+          echo "- apt package: \`$package\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "expected major=$WANT_MAJOR resolved=$banner apt=$package"
+
+        if [ "$got" != "$WANT_MAJOR" ]; then
+          echo "::error::This lane asserts against ffmpeg $WANT_MAJOR but got '$banner'"     >&2
+          echo "The environment moved under a pinned expectation. Either the runner"         >&2
+          echo "image or container tag changed, or the archive did. Decide which major"      >&2
+          echo "this lane should assert against, change it here in the workflow, and say"    >&2
+          echo "why in docs/VALIDATION.md — do not widen this check to accept both."         >&2
+          exit 1
+        fi
