@@ -86,13 +86,14 @@ worker names in `swarm/config.json` deliberately carry no model, because the
 supervisor picks a session-scoped model per dispatch and any name encoding one
 would drift out of date without anything noticing. The
 supervisor assigns an independent Reviewer whose model differs from the author;
-an idle Builder may review only after Builder work is exhausted and only under
-the same model-separation rule. Review is read-only against the author's branch
-and ends with a recorded approval or numbered change requests. The author
-answers findings and requests re-review. On approval the Reviewer transitions
-the item to `needs-lead`; Lead then verifies the exact head, marks drafts ready,
-merges automatically, and reconciles issues. Only branch protection, failed
-checks, or changes-requested review may stop that merge.
+only dedicated Reviewer capacity handles review work. If review demand exceeds
+that capacity, add or resize Reviewer slots; never borrow a Builder. Review is
+read-only against the author's branch and ends with a recorded approval or
+numbered change requests. The author answers findings and requests re-review.
+On approval the Reviewer transitions the item to `needs-lead`; Lead then
+verifies the exact head, marks drafts ready, merges automatically, and
+reconciles issues. Only branch protection, failed checks, or changes-requested
+review may stop that merge.
 
 When blocked, comment with the symptom, evidence, attempts, and exact unblocker;
 replace `swarm:active` with `swarm:blocked`; report `swarmctl block`; then release
@@ -146,8 +147,23 @@ QUALITY AND COMPLETION
 - A corrective change includes a regression that passes with the fix and fails
   when only the production correction is reverted. New behavior updates its
   checked-in contract documentation in the same change.
-- Rebase on current `origin/main`, re-read affected contracts, and rerun the
-  required checks immediately before requesting final review.
+- Merge current `origin/main` into the branch, re-read affected contracts, and
+  rerun the required checks immediately before requesting final review. Never
+  rebase a branch that has a recorded approval: a merge keeps the approved
+  commit an ancestor so at most one commit needs a delta pass, while a rebase
+  rewrites every sha and throws the whole reviewed range back to the start.
+- `main` requires a pull request to be up to date before it merges, so an
+  approved branch takes a new head commit whenever `main` moves. That does not
+  cost a review by itself: `merge-change` carries the pinned approval across a
+  base sync Git proves empty — exactly two parents, the second already an
+  ancestor of `main`, and an automatic merge whose tree is exactly what
+  `git merge-tree` computes from the two parents — and drops those commits from
+  the author set so the session that pushed the sync can still merge it. Run
+  `merge-change` and let the gate decide; do not push an empty base sync and
+  hand the branch back for a re-review. Anything Git cannot prove empty is
+  reviewable content and takes a delta pass, and every required check must be
+  green at the new head, because the required profile is versioned in `main` and
+  can change under a byte-identical patch.
 - A pull request is ready only when its issue acceptance criteria are accounted
   for, the diff contains no unrelated change, required checks are green, docs are
   honest, and remaining risk is explicit.
