@@ -308,7 +308,7 @@ test("client probes are captured without credentials and TTFF drives scheduled c
   });
 });
 
-test("device-run launches with deterministic defaults, writes evidence, and restores the app", async () => {
+test("device-run defaults to Auto quality, writes evidence, and restores the app", async () => {
   await withTempDir(async (directory) => {
     await withOrigin(1, async (origin) => {
       const launches = [];
@@ -319,7 +319,6 @@ test("device-run launches with deterministic defaults, writes evidence, and rest
         public_host: "127.0.0.1",
         file_id: "42",
         item_id: "17",
-        height: "480",
         network_profile: "8mbps-to-1mbps-to-350kbps",
         json,
       }, {
@@ -340,6 +339,8 @@ test("device-run launches with deterministic defaults, writes evidence, and rest
       assert.ok(launches[0].includes("-plurx.origin"));
       assert.ok(launches[0].includes("-plurx.acceptance.fileId"));
       assert.ok(launches[0].includes("-plurx.acceptance.probe"));
+      assert.equal(launches[0].includes("-plurx.acceptance.height"), false,
+        "omitting --height must preserve the player's Auto quality selection");
       assert.deepEqual(launches[1].slice(0, 5), [
         "restore", "--device", "physical-device-17", "--terminate-existing", "--activate",
       ]);
@@ -347,6 +348,34 @@ test("device-run launches with deterministic defaults, writes evidence, and rest
       const artifact = JSON.parse(await fsp.readFile(json, "utf8"));
       assert.equal(artifact.client_events[0].snapshot.runway, 4.75);
       assert.doesNotMatch(JSON.stringify(artifact), /control_token|authorization|bearer/i);
+    });
+  });
+});
+
+test("device-run passes an explicitly requested manual quality height", async () => {
+  await withTempDir(async (directory) => {
+    await withOrigin(1, async (origin) => {
+      const launches = [];
+      await lab.deviceRunCommand({
+        device: "physical-device-17",
+        target: origin,
+        public_host: "127.0.0.1",
+        file_id: "42",
+        height: "480",
+        network_profile: "8mbps-to-1mbps-to-350kbps",
+        json: path.join(directory, "manual-quality-evidence.json"),
+      }, {
+        createShaper: (profile, target, options) => new lab.ShapingProxy(profile, target, {
+          ...options, listenHost: "127.0.0.1",
+        }),
+        launchDevice: (args) => launches.push(["launch", ...args]),
+        restoreDevice: (args) => launches.push(["restore", ...args]),
+        waitForAcceptance: async () => ({ reason: "test-complete", event: null }),
+      });
+
+      const heightFlag = launches[0].indexOf("-plurx.acceptance.height");
+      assert.ok(heightFlag > 0);
+      assert.equal(launches[0][heightFlag + 1], "480");
     });
   });
 });
