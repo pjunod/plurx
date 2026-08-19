@@ -284,3 +284,11 @@ source = "docs/APPLE-CLIENT-PARITY.md"
 source_anchor = "Apple build 67"
 test = "tests/operations/test_mobile_build_claims.py"
 test_anchor = "test_repository_build_claims_match_release_inputs"
+
+[[fixes]]
+id = "apple.build-67-release-claims"
+commits = ["f8abc338"]
+source = "clients/apple/project.yml"
+source_anchor = "CURRENT_PROJECT_VERSION: \"67\""
+test = "tests/operations/test_mobile_build_claims.py"
+test_anchor = "test_repository_build_claims_match_release_inputs"
