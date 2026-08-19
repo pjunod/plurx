@@ -1043,9 +1043,7 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
             );
         }
         Err(error) => {
-            panic!(
-                "byte-bounded transactions must carry probe rows a row count cannot: {error}"
-            );
+            panic!("byte-bounded transactions must carry probe rows a row count cannot: {error}");
         }
     };
     assert_eq!(

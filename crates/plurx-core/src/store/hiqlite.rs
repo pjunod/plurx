@@ -408,9 +408,11 @@ impl HiqliteAuthStore {
             super::hiqlite_catalog::local_catalog_truth_digest(self.client()),
         )
         .await
-        .map_err(|_| StoreError::Timeout(format!(
-                    "replicated store operation after {STORE_TIMEOUT:?}"
-                )))?
+        .map_err(|_| {
+            StoreError::Timeout(format!(
+                "replicated store operation after {STORE_TIMEOUT:?}"
+            ))
+        })?
     }
 
     async fn local_auth_dump(&self) -> Result<AuthStoreDump, StoreError> {

@@ -213,7 +213,7 @@ commits = [
   "ea7862f6",
   "9e649050",
   "3a7b47b2",
-  "c96fc45e",
+  "d3ad6247",
 ]
 points = []
 checks = []
@@ -584,3 +584,10 @@ commits = ["9bae48af"]
 points = ["cluster.membership", "offline.viewing"]
 checks = ["cluster-auth"]
 reason = "The `membership` scenario now requests one more download on the departing node 250 ms into its removal — after the resolution plan was drawn, inside the bounded probe wait — and requires it to end up moved to a survivor or failed `node_removed` with its reservation released, never left queued on the removed node. `scripts/prove-fix e52e7de9 - crates/plurx-core/src/cluster/membership.rs` restores only the pre-fix removal path and the scenario fails with exactly the stranded row it exists to reject: `state: \"queued\", node_id: \"node-2\", reserved_bytes: 900`. The producer fence is pinned separately in the replicated offline contract the default `cluster-check` gate runs: a wrong-node yield or progress write against a preparing package must change nothing, and removing either `node_id` predicate from the hiqlite statements fails that assertion."
+
+
+[[coverage]]
+commits = ["12c2905"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `a_store_timeout_is_distinct_from_a_wal_limit_failure` requires StoreError::Timeout to be reported as a deadline, not as a database or WAL-limit error — the regression for #368, where a loaded host's replicated-store timeout was printed as the WAL-size verdict. reverting the StoreError::Timeout arm in hiqlite.rs to StoreError::Database fails it."
