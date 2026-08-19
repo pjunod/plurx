@@ -218,7 +218,7 @@ id = "apple.buffering-recovery"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "struct PlaybackRecoveryMonitor: Equatable"
 test = "clients/apple/Tests/AppleClientTests.swift"
-test_anchor = "testBufferingWaitHasAnIndependentBoundedRecoveryTimer"
+test_anchor = "testBufferingWaitHasABoundedRecoveryTimer"
 
 [[decisions]]
 id = "apple.item-end"

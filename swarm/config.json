@@ -172,7 +172,7 @@
       "model": "opus",
       "clone": "plurx-lead"
     },
-    "builder-sol-1": {
+    "builder-1": {
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
@@ -181,7 +181,7 @@
         "reviewer"
       ]
     },
-    "builder-sol-2": {
+    "builder-2": {
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
@@ -190,7 +190,7 @@
         "reviewer"
       ]
     },
-    "builder-opus-1": {
+    "builder-3": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
@@ -199,7 +199,7 @@
         "reviewer"
       ]
     },
-    "builder-opus-2": {
+    "builder-4": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
@@ -208,13 +208,13 @@
         "reviewer"
       ]
     },
-    "reviewer-sol": {
+    "reviewer-1": {
       "role": "reviewer",
       "provider": "codex",
       "model": "gpt-5.6-sol",
       "clone": "plurx-reviewer-sol"
     },
-    "reviewer-opus": {
+    "reviewer-2": {
       "role": "reviewer",
       "provider": "claude",
       "model": "opus",

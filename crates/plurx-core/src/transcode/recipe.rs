@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::MediaFile;
 
-use super::{Encoder, SubtitleBurn, ToneMap, TranscodeOptions, SEGMENT_SECONDS};
+use super::{Encoder, OutputGrade, SubtitleBurn, ToneMap, TranscodeOptions, SEGMENT_SECONDS};
 
 /// Bumped when the meaning of a recipe changes in a way the field list cannot
 /// express — a different hash construction, a corrected serialisation, a fixed
@@ -142,6 +142,42 @@ impl Recipe<'_> {
         // hashing the boot winner would let differently rendered pixels share
         // one cache entry.
         field(&mut h, "pipeline", o.pipeline.name().as_bytes());
+        // The output contract, when it is not the one `PipelineDigest::feed`
+        // spells out above (`yuv420p`, `bt709/bt709/bt709/tv`, and the
+        // encoder's H.264 `video_codec`). Emitted only for a non-SDR grade so
+        // that every recipe written before M5 hashes to exactly the bytes it
+        // did — an SDR cache entry must not be invalidated by a rung it never
+        // used.
+        //
+        // Belt and braces: `pipeline` above is already unique per grade, so
+        // HDR10 output could not have collided with SDR output regardless.
+        // This makes the key *say* what the bytes are rather than leaving it
+        // implied by a graph name.
+        let grade = o.pipeline.output_grade();
+        if grade != OutputGrade::Sdr {
+            field(&mut h, "grade", grade.name().as_bytes());
+            field(&mut h, "grade_pixfmt", grade.pixel_format().as_bytes());
+            field(
+                &mut h,
+                "grade_colour",
+                format!(
+                    "{}/{}/{}/tv",
+                    grade.primaries(),
+                    grade.transfer(),
+                    grade.matrix()
+                )
+                .as_bytes(),
+            );
+            field(
+                &mut h,
+                "grade_codec",
+                self.digest
+                    .encoder
+                    .video_codec_for(grade)
+                    .unwrap_or("libx265")
+                    .as_bytes(),
+            );
+        }
         field(
             &mut h,
             "burn",
@@ -402,6 +438,56 @@ mod tests {
         assert_eq!(
             hash_of(&d, &f, &o, false),
             "b9dae1c44d396f94c760a627b7a3b709ec591db227c162eb5588d91420f767c6"
+        );
+    }
+
+    /// The HDR10 rung is a different picture from the same request, so it
+    /// must be a different entry — and adding it must not have moved a single
+    /// SDR key, or the whole fleet's cache misses on deploy for nothing.
+    ///
+    /// The second half is really enforced by
+    /// [`legacy_vbr_recipe_hash_is_a_golden_fixture`] above, which is a
+    /// literal. This states the rule the literal exists for.
+    #[test]
+    fn the_hdr10_grade_is_a_distinct_entry_and_no_sdr_key_moved() {
+        let (d, f) = (digest(), media());
+        let sdr = TranscodeOptions::default();
+        let hdr10 = TranscodeOptions {
+            pipeline: crate::transcode::Pipeline::DoviPassthrough,
+            ..Default::default()
+        };
+        let reshape = TranscodeOptions {
+            pipeline: crate::transcode::Pipeline::DoviTonemapx,
+            ..Default::default()
+        };
+        let sdr_hash = hash_of(&d, &f, &sdr, false);
+        let hdr10_hash = hash_of(&d, &f, &hdr10, false);
+        assert_ne!(hdr10_hash, sdr_hash);
+        assert_ne!(
+            hdr10_hash,
+            hash_of(&d, &f, &reshape, false),
+            "the two Dolby renderers produce different pictures"
+        );
+        // Every SDR pipeline still hashes exactly as it did — the grade
+        // fields are emitted only for a grade that is not SDR.
+        for pipeline in crate::transcode::PIPELINE_CANDIDATES
+            .iter()
+            .copied()
+            .chain(std::iter::once(crate::transcode::Pipeline::DoviTonemapx))
+        {
+            let o = TranscodeOptions {
+                pipeline,
+                ..Default::default()
+            };
+            assert_eq!(
+                o.pipeline.output_grade(),
+                crate::transcode::OutputGrade::Sdr,
+                "{pipeline:?}"
+            );
+        }
+        assert_eq!(
+            sdr_hash,
+            hash_of(&d, &f, &TranscodeOptions::default(), false)
         );
     }
 

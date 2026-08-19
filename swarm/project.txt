@@ -80,7 +80,11 @@ copying large raw logs.
 When the implementation and required gate are ready, create exactly one review
 issue carrying `swarm:review` and no ready or role label. Link the pull request,
 implementation issue, acceptance evidence, commands run, and known risk. Include
-the exact line `Swarm-Author-LLM: <provider>/<model>` from launcher context. The
+the exact line `Swarm-Author-LLM: <provider>/<model>` from launcher context. Take
+that identity from `SWARM_PROVIDER`/`SWARM_MODEL`, never from your worker name:
+worker names in `swarm/config.json` deliberately carry no model, because the
+supervisor picks a session-scoped model per dispatch and any name encoding one
+would drift out of date without anything noticing. The
 supervisor assigns an independent Reviewer whose model differs from the author;
 an idle Builder may review only after Builder work is exhausted and only under
 the same model-separation rule. Review is read-only against the author's branch
