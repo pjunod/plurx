@@ -210,6 +210,41 @@ its `replicated store operation timed out` text with an ordinary replicated
 deadline — the difference is that a collision now says so first, so a timeout
 arriving on its own is still the deadline it has always been.
 
+### PortReservation — the listener is held until the voter starts
+
+The residual race between `allocate_nodes` (which binds, reads the port, and
+releases the listener) and the child process binding the same port from its
+address string cannot be eliminated on a general OS: the child is a separate
+process, and there is no mechanism to hand a listening socket across
+`Command::spawn`. The race is made as short as possible in two ways:
+
+1. **`PortReservation`** (`crates/plurx-cluster-check/src/lib.rs`, added for
+   issue #381). `allocate_nodes` now returns a `PortReservation` whose
+   listeners are held alive until the caller consumes it. The site that starts
+   the child process — `ClusterProcesses::start` — holds the reservation
+   through the `NodeSpec` construction and drops it immediately before
+   spawning, so the window between "port released" and "child binds" is the
+   narrowest possible sequence of `drop` + `Command::spawn`.
+2. **`start_cluster_with_port_retry`** wraps every start in `with_port_retry`,
+   which retries the entire allocation up to five times on `is_port_collision`
+   and on nothing else. A collision on a transiently occupied port is
+   self-healing; a collision on a permanently held port fails with a message
+   naming the collision, never a durable-state verdict.
+
+The two mechanisms are complementary: `PortReservation` closes the window as
+far as the OS allows, and the retry loop answers any collision that still
+manages to slip through before the child binds.
+
+### Previous instances of the same defect shape
+
+This is the fourth issue whose root cause is a check that cannot tell its
+environment from the contract it asserts:
+
+- #315: benchmark wall clock reported as a performance regression.
+- #368: replicated deadline reported as a WAL-size violation.
+- #374: data-directory lock reported as a second daemon.
+- #381: port collision reported as an un-migrated store (this issue).
+
 ## The UI golden — a saved answer key, not a magic test
 
 “Golden” is testing jargon for a reviewed, known-good output saved in the

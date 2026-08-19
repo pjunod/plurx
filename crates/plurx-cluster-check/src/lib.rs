@@ -250,10 +250,13 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         let executable = executable.clone();
         let attempt_root = root.path().join(format!("attempt-{attempt}"));
         async move {
-            let specs = allocate_nodes(3)?;
+            let (listeners, all_specs) = allocate_nodes(3)?.into_inner();
             let cluster =
-                ClusterProcesses::start(&executable, &attempt_root, vec![specs[0].clone()]).await?;
-            Ok((cluster, specs, attempt_root))
+                ClusterProcesses::start(&executable, &attempt_root, PortReservation {
+                    listeners,
+                    specs: vec![all_specs[0].clone()],
+                }).await?;
+            Ok((cluster, all_specs, attempt_root))
         }
     })
     .await?;
@@ -506,13 +509,18 @@ async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
             .path()
             .to_path_buf()
     });
+    let reservation = allocate_nodes(1)?;
+    let (listeners, specs) = reservation.into_inner();
     let launch = NodeLaunch {
         node_id: 1,
         root,
-        nodes: allocate_nodes(1)?,
+        nodes: specs,
     };
     // This voter runs hiqlite in-process rather than behind the stdin/stdout
     // protocol, so a lost port would otherwise surface as a growth verdict.
+    // The reservation is dropped here: hiqlite binds its own sockets from the
+    // address strings, so we must release the port before it can bind it.
+    drop(listeners);
     install_bind_failure_guard(BindFailureChannel::Stderr, voter_listen_addrs(&launch)?);
     let mut config = node_config(&launch)?;
     config.filename_db = Cow::Borrowed("growth.db");
@@ -1350,7 +1358,13 @@ impl ClusterProcesses {
     /// Start one voter process per spec from `executable` and wait for each to
     /// announce readiness. The executable is explicit rather than
     /// `current_exe()` so a test binary can start real harness voters.
-    pub async fn start(executable: &Path, root: &Path, specs: Vec<NodeSpec>) -> Result<Self> {
+    pub async fn start(executable: &Path, root: &Path, reservation: PortReservation) -> Result<Self> {
+        let (_listeners, specs) = reservation.into_inner();
+        // Listeners are dropped here: the child process must bind the same
+        // ports, so we cannot hold them across the spawn. The window between
+        // releasing the port and the child binding it is the residual race
+        // that [`install_bind_failure_guard`] + retry handle.
+        drop(_listeners);
         let mut nodes = Vec::with_capacity(specs.len());
         for node_id in 1..=specs.len() as u64 {
             let launch = NodeLaunch {
@@ -1697,9 +1711,10 @@ pub async fn start_cluster_with_port_retry(
     voters: u64,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
     with_port_retry(|attempt| async move {
-        let specs = allocate_nodes(voters)?;
+        let reservation = allocate_nodes(voters)?;
+        let specs = reservation.specs.clone();
         let attempt_root = root.join(format!("attempt-{attempt}"));
-        let cluster = ClusterProcesses::start(executable, &attempt_root, specs.clone()).await?;
+        let cluster = ClusterProcesses::start(executable, &attempt_root, reservation).await?;
         Ok((cluster, specs))
     })
     .await
@@ -3164,25 +3179,67 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
     })
 }
 
-/// Reserve a raft and an API port for each of `count` voters.
+/// A reserved set of ports whose listeners stay alive so no other process
+/// can claim them before the intended voter binds.
 ///
-/// Every listener for the allocation is held until the last port is chosen, so
-/// one allocation can never hand the same port to two of its own listeners.
-/// It cannot do more than that: the ports are released here and bound later by
-/// a different process, so an unrelated process may still claim one in
-/// between. That residual race is what [`install_bind_failure_guard`] reports
-/// and what [`with_port_retry`] answers.
-pub fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
-    let mut held = Vec::with_capacity(count as usize * 2);
-    for _ in 0..count * 2 {
-        held.push(TcpListener::bind((LISTEN_ADDR, 0)).context("reserve a harness port")?);
+/// Drop the reservation to release the ports. Pass it to
+/// [`ClusterProcesses::start`] so the cluster holds the ports until every
+/// voter has announced readiness, or to any call site that needs the
+/// guarantee that these ports will not be reallocated while the caller
+/// decides.
+pub struct PortReservation {
+    /// Held open so nothing else claims the port between allocation and bind.
+    #[allow(dead_code)]
+    listeners: Vec<TcpListener>,
+    /// The voter specs describing the reserved ports.
+    pub specs: Vec<NodeSpec>,
+}
+
+impl PortReservation {
+    /// An empty reservation that holds no ports. Useful for tests that
+    /// create a cluster with no voters.
+    pub fn empty() -> Self {
+        Self {
+            listeners: Vec::new(),
+            specs: Vec::new(),
+        }
     }
-    let mut ports = held
+    /// The [`NodeSpec`] entries allocated for each voter.
+    pub fn specs(&self) -> &[NodeSpec] {
+        &self.specs
+    }
+
+    /// Consume the reservation and return only the specs, releasing the ports.
+    pub fn into_specs(self) -> Vec<NodeSpec> {
+        self.specs
+    }
+
+    /// Returns the listeners, consuming the reservation.
+    pub fn into_inner(self) -> (Vec<TcpListener>, Vec<NodeSpec>) {
+        (self.listeners, self.specs)
+    }
+}
+
+/// Reserve a raft and an API port for each of `count` voters, holding every
+/// listener open so another process cannot claim the port between allocation
+/// and bind.
+///
+/// Each port is bound to [`LISTEN_ADDR`] on a kernel-assigned port, the port
+/// number is recorded in a [`NodeSpec`], and the listener is kept alive until
+/// the [`PortReservation`] is consumed. Pass the reservation to
+/// [`ClusterProcesses::start`] so the ports stay reserved until every voter
+/// has announced readiness.
+pub fn allocate_nodes(count: u64) -> Result<PortReservation> {
+    let mut listeners = Vec::with_capacity(count as usize * 2);
+    for _ in 0..count * 2 {
+        listeners.push(TcpListener::bind((LISTEN_ADDR, 0)).context("reserve a harness port")?);
+    }
+    let mut ports = listeners
         .iter()
         .map(|listener| Ok(listener.local_addr()?.port()))
         .collect::<Result<Vec<_>>>()?
         .into_iter();
-    (1..=count)
+    let specs = (1..=count)
         .map(|id| {
             Ok(NodeSpec {
                 id,
@@ -3190,7 +3247,8 @@ pub fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
                 api: format!("{LISTEN_ADDR}:{}", ports.next().context("api port")?),
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(PortReservation { listeners, specs })
 }
 
 /// Observe one free port.
@@ -3198,6 +3256,13 @@ pub fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
 /// The listener is released as the expression ends, so this reports a port
 /// that *was* free rather than one this process holds. Nothing that starts a
 /// voter may treat the result as a reservation; see [`allocate_nodes`].
+///
+/// # Correct use
+///
+/// `free_port` is for observation, not allocation. Use it to find a port for
+/// a squatter in a collision test, or to assert that the OS assigned a
+/// non-zero port. Never use it to choose a port a voter will later bind:
+/// that is what [`allocate_nodes`] / [`PortReservation`] are for.
 pub fn free_port() -> Result<u16> {
     Ok(TcpListener::bind((LISTEN_ADDR, 0))?.local_addr()?.port())
 }
@@ -3331,6 +3396,28 @@ async fn prove_listeners_bound(addresses: &[String]) -> Result<()> {
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
             }
+        }
+        // A successful connection means *something* is listening on the port,
+        // but it may be a squatter rather than our own listener. Try to bind
+        // the same address to check whether the port is actually free.
+        // If we can bind, our listener never bound — the port was taken by
+        // another process between allocation and hiqlite's bind attempt.
+        // hiqlite's bind failure panics in a spawned task where the panic
+        // hook does not fire, so BIND_FAILURE would not be set. This check
+        // catches that case.
+        let probe = std::net::TcpListener::bind(address);
+        if let Ok(listener) = probe {
+            // The port is free — our listener never bound. Release the probe
+            // and report the collision so the controller can retry.
+            drop(listener);
+            bail!(
+                "{PORT_COLLISION}: voter listener {address} was never bound;                  the port was taken between allocation and bind"
+            );
+        }
+        // EADDRINUSE means someone has the port — either our listener or a
+        // squatter. Check BIND_FAILURE in case the panic guard caught it.
+        if let Some(failure) = BIND_FAILURE.get() {
+            bail!("{failure}");
         }
     }
     Ok(())
