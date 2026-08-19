@@ -287,6 +287,31 @@ struct ApplePlaybackDiagnosticSnapshot: Encodable, Equatable {
     }
 }
 
+/// Periodic debug-acceptance sample. Unlike a stall report this is emitted
+/// while playback is healthy too, giving the rig the actual buffer runway that
+/// existed before each bandwidth transition instead of an operator's guess.
+struct ApplePlaybackProbeLog: Encodable {
+    let level = "info"
+    let event = "playback_probe"
+    let message = "periodic physical-device playback sample"
+    let method: String
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let height: Int?
+    let encoder: String?
+    let sessionId: String?
+    let attempt: String
+    let snapshot: ApplePlaybackDiagnosticSnapshot
+    let ua = "Apple AVPlayer"
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, title, vcodec, height, encoder, attempt, snapshot, ua
+        case fileId = "file_id"
+        case sessionId = "session_id"
+    }
+}
+
 /// One sustained AVPlayer clock stall forwarded before the controller either
 /// reconnects the same delivery or stops after an immediate repeat. The
 /// server's existing `stall` vocabulary renders `ms` as `stall_ms`; position
@@ -1254,6 +1279,7 @@ final class PlayerController: ObservableObject {
     private var establishedHDRRetryAttempted = false
     private var ttffMeasurement = ApplePlaybackTTFFState()
     private var ttffReason = "cold-start"
+    private var diagnosticProbesEnabled = false
     private var stallObservation = PlaybackStallObservationState()
     /// An item that ends before its expected boundary gets one reopen. A
     /// second end at the same position finishes an otherwise uncorroborated
@@ -1508,7 +1534,9 @@ final class PlayerController: ObservableObject {
         progressOffsetMs: Int = 0,
         itemDurationMs: Int? = nil,
         title: String,
-        selection: PrePlaySelection = .none
+        selection: PrePlaySelection = .none,
+        initialHeight: Int? = nil,
+        diagnosticProbesEnabled: Bool = false
     ) {
         guard !started else { return }
         started = true
@@ -1525,6 +1553,8 @@ final class PlayerController: ObservableObject {
         self.currentMs = max(0, startMs)
         self.title = title
         self.prePlaySelection = selection
+        selectedHeight = initialHeight.flatMap { $0 > 0 ? $0 : nil }
+        self.diagnosticProbesEnabled = diagnosticProbesEnabled
         audioOverride = nil
         finished = false
         playbackFailureTitle = Self.playbackStartFailureTitle
@@ -2838,6 +2868,9 @@ final class PlayerController: ObservableObject {
                     && self.player.currentItem != nil
                 let timeControlStatus = self.player.timeControlStatus
                 let position = self.realPositionMs()
+                if self.diagnosticProbesEnabled, self.player.currentItem != nil {
+                    self.reportPlaybackProbe(at: position)
+                }
                 guard let stallEvent = self.playbackRecoveryMonitor.sample(
                     positionMs: position,
                     timeControlStatus: timeControlStatus,
@@ -3294,6 +3327,27 @@ final class PlayerController: ObservableObject {
             sessionId: sessionId,
             attempt: playbackAttemptId,
             reason: ttffReason
+        ))
+    }
+
+    private func reportPlaybackProbe(at positionMs: Int) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        let method = clientLogMethod
+        let height = sessionStatus?.targetHeight
+            ?? selectedHeight
+            ?? (method == "transcode" ? nil : decision?.source?.height)
+        postClientLog(ApplePlaybackProbeLog(
+            method: method,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            height: height,
+            encoder: encoder,
+            sessionId: sessionId,
+            attempt: playbackAttemptId,
+            snapshot: playbackDiagnosticSnapshot(at: positionMs)
         ))
     }
 

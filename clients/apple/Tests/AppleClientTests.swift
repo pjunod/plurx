@@ -1830,6 +1830,67 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(object["token"])
     }
 
+    func testPhysicalDeviceAcceptanceLaunchReadsOnlyExplicitDebugDefaults() throws {
+        let suite = "tv.plurx.acceptance-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(PlaybackAcceptanceLaunch.current(defaults: defaults))
+
+        defaults.set(42, forKey: "plurx.acceptance.fileId")
+        defaults.set(17, forKey: "plurx.acceptance.itemId")
+        defaults.set(91_000, forKey: "plurx.acceptance.startMs")
+        defaults.set(7_200_000, forKey: "plurx.acceptance.durationMs")
+        defaults.set("Acceptance movie", forKey: "plurx.acceptance.title")
+        defaults.set(480, forKey: "plurx.acceptance.height")
+        defaults.set(true, forKey: "plurx.acceptance.probe")
+
+        XCTAssertEqual(
+            PlaybackAcceptanceLaunch.current(defaults: defaults),
+            PlaybackAcceptanceLaunch(
+                itemId: 17,
+                fileId: 42,
+                startMs: 91_000,
+                durationMs: 7_200_000,
+                title: "Acceptance movie",
+                height: 480,
+                probesEnabled: true
+            )
+        )
+    }
+
+    func testApplePlaybackProbeCarriesRunwayAndNoCredentialSurface() throws {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = 90_000
+        snapshot.runway = 6.25
+        snapshot.timeControlStatus = "playing"
+        let payload = ApplePlaybackProbeLog(
+            method: "transcode",
+            title: "Acceptance movie",
+            fileId: 42,
+            vcodec: "hevc",
+            height: 480,
+            encoder: "videotoolbox",
+            sessionId: "session-17",
+            attempt: "attempt-2",
+            snapshot: snapshot
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "playback_probe")
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(object["height"] as? Int, 480)
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "attempt-2")
+        let encodedSnapshot = try XCTUnwrap(object["snapshot"] as? [String: Any])
+        XCTAssertEqual(encodedSnapshot["runway"] as? Double, 6.25)
+        XCTAssertEqual(encodedSnapshot["time_control_status"] as? String, "playing")
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
+    }
+
     func testAppleBufferingStallLogCarriesPositionMethodAndDuration() throws {
         var snapshot = ApplePlaybackDiagnosticSnapshot()
         snapshot.positionMs = 90_000
