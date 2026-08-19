@@ -143,6 +143,7 @@ jobs. Impact optimization therefore fails open: a bad diff base costs time;
 it never suppresses tests. The scheduled workflow still runs the `nightly`
 profile.
 
+
 ## Load-sensitive cluster checks — a timeout is not a verdict
 
 One check drives real replicated infrastructure rather than a library, so the
@@ -152,12 +153,12 @@ host it runs on is part of the experiment:
 |---|---|---|
 | `cluster-auth` (`make cluster-check`) | `cluster.auth` · `persistence.upgrades` | Three voters run as separate processes and every call carries a three-second per-operation deadline (`STORE_TIMEOUT` in `crates/plurx-core/src/store/hiqlite.rs`). Under a full `make validate` those voters compete with every other check for the same cores, and that deadline is reachable by scheduling pressure alone |
 
-**What a timeout there means.** `Database("replicated store operation timed
-out")` is the host reporting that it could not finish an operation in three
-seconds. It is not durable-state evidence in either direction: nothing was
-proved and nothing was found broken. The production deadline stays at three
-seconds because it is a server safety bound, so the suite absorbs load by
-re-attempting a deadlined step from a reset target instead of by relaxing it.
+**What a timeout there means.** `Database("replicated store operation timed out")`
+is the host reporting that it could not finish an operation in three seconds.
+It is not durable-state evidence in either direction: nothing was proved and
+nothing was found broken. The production deadline stays at three seconds
+because it is a server safety bound, so the suite absorbs load by re-attempting
+a deadlined step from a reset target instead of by relaxing it.
 
 **Why this check reaches that deadline before the others do.** The import
 contract and the production bound push against each other by design. The
@@ -188,6 +189,27 @@ client, and the check now says which of these three it saw:
 Never re-diagnose a red `cluster-auth` from elapsed time. Read which of those
 three the failure text claims, and reproduce it in isolation before treating it
 as a durable-state regression.
+
+### Base syncs — the gate revalidates, the reviewer does not
+
+`main` is protected with `required_status_checks.strict: true`, so a pull
+request has to be up to date before it merges. Clear that by merging `main`
+**into** the branch. Never rebase a branch that has a recorded approval: a merge
+keeps the approved commit an ancestor, while a rebase rewrites every sha and
+sends the whole reviewed range back through review.
+
+That base sync is revalidated but not re-reviewed. `PR validation gate` reruns
+at the new head — which is the point of `strict`, and is load-bearing here
+rather than ceremonial, because the required profile is itself versioned in
+`main`: this catalog and `validation/points.toml` can add a check to the `ci`
+profile after a branch was cut, so a byte-identical patch can legitimately face
+a check set that did not exist when it was approved. The independent approval,
+by contrast, is carried forward across a base sync Git proves empty — two
+parents, the second already on `main`, and an automatic merge whose tree is
+exactly what `git merge-tree` computes from the two parents. Anything Git cannot
+prove empty is reviewable content and takes a delta pass. The rule and its
+refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
+
 
 ## The UI golden — a saved answer key, not a magic test
 
