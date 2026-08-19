@@ -1211,7 +1211,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(id, id, 100, 90_000)
+            .mark_offline_package_ready(id, "test-node", id, 100, 90_000)
             .await
             .expect("mark ready"));
         fixture
@@ -1249,7 +1249,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "unused", 10, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "unused", 10, 90_000)
             .await
             .expect("mark ready"));
         let token = "1".repeat(64);
@@ -1590,7 +1590,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "ready-recipe", 456, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "ready-recipe", 456, 90_000)
             .await
             .expect("ready"));
 

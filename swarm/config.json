@@ -149,8 +149,9 @@
     ],
     "reasoning_routes": {
       "deep": {
-        "provider": "claude",
-        "model": "fable"
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro-0813",
+        "reasoning_effort": "xhigh"
       }
     }
   },

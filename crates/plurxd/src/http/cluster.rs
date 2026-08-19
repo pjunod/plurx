@@ -95,7 +95,7 @@ fn api_error(error: MembershipError) -> ApiError {
         | MembershipError::ReservedToken
         | MembershipError::LeaderRemoval
         | MembershipError::QuorumLoss
-        | MembershipError::OfflineWork => StatusCode::CONFLICT,
+        | MembershipError::OfflineWork(_) => StatusCode::CONFLICT,
         MembershipError::NodeNotFound => StatusCode::NOT_FOUND,
         MembershipError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
