@@ -280,6 +280,7 @@ class ModelContractTest {
         assertEquals("transcode", decision.delivery!!.mode)
         assertEquals(50L, decision.audio_offset_ms)
         assertEquals("Skip intro", decision.markers.single().label)
+        assertTrue(decision.markers.single().chapter)
     }
 
     @Test

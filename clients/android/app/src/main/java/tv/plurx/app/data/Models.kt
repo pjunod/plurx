@@ -331,8 +331,11 @@ data class Marker(
     val label: String,
     val start_ms: Long,
     val end_ms: Long,
-    val chapter: Boolean = false,
-)
+    val chapter: Boolean = true,
+) {
+    val displayLabel: String
+        get() = if (chapter) label else "$label (estimated)"
+}
 
 /**
  * The server-owned execution plan for a verdict (`DecisionResponse.delivery`
