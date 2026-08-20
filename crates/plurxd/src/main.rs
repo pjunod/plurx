@@ -727,6 +727,10 @@ fn build_state(
 /// these owns its own timing rather than riding on traffic.
 fn spawn_background_loops(state: &AppState) {
     tokio::spawn(state.membership.clone().heartbeat_loop());
+    // Answers "can you read this package's source?" while a peer is being
+    // removed. Every node has to be listening for its own removal to be
+    // possible, so this runs whether or not a removal is in progress.
+    tokio::spawn(state.membership.clone().offline_source_probe_loop());
     tokio::spawn(std::sync::Arc::clone(&state.transcode).rate_control_refresh_loop());
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());

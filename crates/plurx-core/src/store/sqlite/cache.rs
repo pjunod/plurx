@@ -651,7 +651,7 @@ mod tests {
             .await
             .expect("package");
         store
-            .mark_offline_package_ready("package", "flight", 900, 1_000)
+            .mark_offline_package_ready("package", NODE, "flight", 900, 1_000)
             .await
             .expect("ready");
         assert_eq!(store.cache_bytes(NODE).await.expect("bytes"), 0);

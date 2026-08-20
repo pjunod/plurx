@@ -212,6 +212,8 @@ commits = [
   "7868f4da",
   "ea7862f6",
   "9e649050",
+  "3a7b47b2",
+  "d3ad6247",
 ]
 points = []
 checks = []
@@ -589,3 +591,15 @@ commits = ["0d56a300"]
 points = ["cluster.auth"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The retained `start_cluster_with_port_retry_reallocates_after_a_collision` releases the first PortReservation, takes its raft port before the real voter binds, and requires the production retry wrapper to allocate different raft and API ports and successfully start on its second attempt. The direct-voter regression separately requires the bind-failure guard and listener proof to report the occupied address as a port collision rather than a durable-state verdict. Reverting the reservation or retry integration makes one of those mechanism checks fail."
+
+[[coverage]]
+commits = ["e52e7de9"]
+points = ["cluster.membership", "offline.viewing"]
+checks = ["cluster-auth"]
+reason = "The three-voter `membership` scenario seeds four packages on a real follower against real files on disk and removes it: a source every survivor can read is requeued onto one of them and then claimed and published there, a source that exists nowhere fails `node_removed` with `reserved_bytes` back at zero, a `ready` package fails the same way despite a perfectly readable source because its bytes lived only on the removed node, and the removed node can no longer publish the work its successor took over. Restoring the pre-fix production files removes the probe protocol the scenario depends on, so it cannot pass without them. Three separate policy mutations were also each rejected by a distinct assertion: requeueing without a verified probe answer trips the `node_removed` case, and admitting `ready` into the movable set trips first the atomic-plan guard and then, once the requeue statement is widened to accept `ready` too, the ready-state assertion itself."
+
+[[coverage]]
+commits = ["9bae48af"]
+points = ["cluster.membership", "offline.viewing"]
+checks = ["cluster-auth"]
+reason = "The `membership` scenario now requests one more download on the departing node 250 ms into its removal — after the resolution plan was drawn, inside the bounded probe wait — and requires it to end up moved to a survivor or failed `node_removed` with its reservation released, never left queued on the removed node. `scripts/prove-fix e52e7de9 - crates/plurx-core/src/cluster/membership.rs` restores only the pre-fix removal path and the scenario fails with exactly the stranded row it exists to reject: `state: \"queued\", node_id: \"node-2\", reserved_bytes: 900`. The producer fence is pinned separately in the replicated offline contract the default `cluster-check` gate runs: a wrong-node yield or progress write against a preparing package must change nothing, and removing either `node_id` predicate from the hiqlite statements fails that assertion."
