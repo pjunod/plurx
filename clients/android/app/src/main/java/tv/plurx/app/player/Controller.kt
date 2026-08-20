@@ -188,6 +188,7 @@ class Controller(
     private var sameHdrRetryUsed = false
 
     private val stallReopenBudget = StallReopenBudget()
+    private val stallGuard = ControllerStallGuard(stallReopenBudget)
 
     /**
      * Every create for this playback passes through one coordinator. This
@@ -294,9 +295,6 @@ class Controller(
 
     /** Stable for this player instance — the server's supersession key. */
     private val playbackId = UUID.randomUUID().toString()
-
-    /** Only the newest asynchronous session request may replace the player. */
-    private var sessionRequestVersion = 0L
 
     /**
      * The open session is the whole stream on disk (a pre-transcode cache
@@ -507,9 +505,8 @@ class Controller(
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
             sessionIsVod -> {
-                sessionRequestVersion = stallReopenBudget.resetForUserAction()
                 beginPlaybackAttempt("seek")
-                player.seekTo(t)
+                stallGuard.vodSeek { player.seekTo(t) }
             }
             else -> openSession(t, beginPlaybackAttempt("seek"))
         }
@@ -522,7 +519,7 @@ class Controller(
     fun release() {
         stallWatchdogJob.cancel()
         pgsOverlay.release()
-        sessionRequestVersion = stallReopenBudget.resetForUserAction()
+        stallGuard.invalidateForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
 
@@ -568,9 +565,10 @@ class Controller(
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
             // between two text tracks cost nothing.
-            sessionRequestVersion = stallReopenBudget.resetForUserAction()
-            armTrackSelections()
-            applyTextSelection()
+            stallGuard.inPlaceSubtitleChange {
+                armTrackSelections()
+                applyTextSelection()
+            }
         }
         return true
     }
@@ -604,7 +602,7 @@ class Controller(
     ) {
         // A user-initiated restart (seek, quality switch, track change) resets
         // the stall reopen budget and invalidates any in-flight stall.
-        sessionRequestVersion = stallReopenBudget.resetForUserAction()
+        stallGuard.invalidateForUserAction()
 
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
@@ -641,7 +639,7 @@ class Controller(
      * client sends is unit-tested rather than assembled inline.
      */
     private fun openSession(ms: Long, attempt: PlaybackAttempt) {
-        val requestVersion = ++sessionRequestVersion
+        val requestVersion = stallGuard.beginRequest()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
         encoder = null
@@ -650,7 +648,7 @@ class Controller(
             val hls = try {
                 sessionCreateCoordinator.create(
                     body = sessionBody(ms),
-                    isCurrent = { requestVersion == sessionRequestVersion },
+                    isCurrent = { stallGuard.isCurrent(requestVersion) },
                 ) ?: return@launch
             } catch (cancelled: CancellationException) {
                 // The screen left composition (or a newer request superseded
@@ -659,7 +657,7 @@ class Controller(
                 // nobody is waiting for any more.
                 throw cancelled
             } catch (_: Exception) {
-                if (requestVersion == sessionRequestVersion) {
+                if (stallGuard.isCurrent(requestVersion)) {
                     playbackTelemetry.cancel(attempt)
                     onError("The server couldn't start this stream.")
                 }
@@ -668,7 +666,7 @@ class Controller(
             // A later seek or track switch won while this request was in
             // flight. Release this now-stale server session instead of letting
             // its older timeline replace the current one.
-            if (requestVersion != sessionRequestVersion) {
+            if (!stallGuard.isCurrent(requestVersion)) {
                 vm.endHlsSession(hls.session_id)
                 return@launch
             }
@@ -716,7 +714,7 @@ class Controller(
         // Use the stall-specific session body that carries the predecessor
         // info. `sessionBody` is also called for seeks and track switches;
         // those paths must NOT carry stall fields.
-        val requestVersion = ++sessionRequestVersion
+        val requestVersion = stallGuard.beginRequest()
         val prevId = sessionId
         // Capture the predecessor height for the same-rung budget
         // before nulling the session ID.  The first stall reopen
@@ -749,18 +747,18 @@ class Controller(
             val hls = try {
                 sessionCreateCoordinator.reopenAfterStall(
                     body = body,
-                    isCurrent = { requestVersion == sessionRequestVersion },
+                    isCurrent = { stallGuard.isCurrent(requestVersion) },
                 ) ?: return@launch
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                if (requestVersion == sessionRequestVersion) {
+                if (stallGuard.isCurrent(requestVersion)) {
                     playbackTelemetry.cancel(attempt)
                     onError("The stream stalled and recovery failed.")
                 }
                 return@launch
             }
-            if (requestVersion != sessionRequestVersion) {
+            if (!stallGuard.isCurrent(requestVersion)) {
                 vm.endHlsSession(hls.session_id)
                 return@launch
             }
@@ -920,7 +918,7 @@ class Controller(
         trackAt(C.TRACK_TYPE_TEXT, ordinal)
 
     private fun leaveSessionPlayback() {
-        sessionRequestVersion = stallReopenBudget.resetForUserAction()
+        stallGuard.invalidateForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
         encoder = null

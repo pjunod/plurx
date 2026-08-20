@@ -67,6 +67,39 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
 }
 
 /**
+ * Owns the controller's monotonically increasing session-request token.
+ *
+ * The budget sequence is deliberately not the request token: session opens and
+ * stall reopens also consume tokens, so copying the smaller budget sequence can
+ * make an old token current again.  The path-specific helpers keep the VOD-seek
+ * and in-place subtitle actions directly regression-testable.
+ */
+internal class ControllerStallGuard(
+    private val budget: StallReopenBudget,
+) {
+    private var requestVersion = 0L
+
+    fun beginRequest(): Long = ++requestVersion
+
+    fun isCurrent(version: Long): Boolean = version == requestVersion
+
+    fun invalidateForUserAction() {
+        budget.resetForUserAction()
+        requestVersion++
+    }
+
+    fun vodSeek(action: () -> Unit) {
+        invalidateForUserAction()
+        action()
+    }
+
+    fun inPlaceSubtitleChange(action: () -> Unit) {
+        invalidateForUserAction()
+        action()
+    }
+}
+
+/**
  * Serializes every server-mutating create for one playback id. In particular,
  * a user restart that invalidates a stall while its 400 fallback is in flight
  * is sent after that fallback, so the newer user action remains the server's

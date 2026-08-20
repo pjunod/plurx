@@ -93,6 +93,40 @@ class StallBudgetTest {
     }
 
     @Test
+    fun vodSeekResetsBudgetAndCannotReuseAStallRequestToken() {
+        val budget = StallReopenBudget()
+        val guard = ControllerStallGuard(budget)
+        guard.beginRequest() // initial session
+        val staleStall = guard.beginRequest()
+        var sought = false
+
+        guard.vodSeek { sought = true }
+        val newerRequest = guard.beginRequest()
+
+        assertTrue(sought)
+        assertEquals(1, budget.resetCount)
+        assertFalse(guard.isCurrent(staleStall))
+        assertTrue(guard.isCurrent(newerRequest))
+    }
+
+    @Test
+    fun inPlaceSubtitleChangeResetsBudgetAndCannotReuseAStallRequestToken() {
+        val budget = StallReopenBudget()
+        val guard = ControllerStallGuard(budget)
+        guard.beginRequest() // initial session
+        val staleStall = guard.beginRequest()
+        var selectionApplied = false
+
+        guard.inPlaceSubtitleChange { selectionApplied = true }
+        val newerRequest = guard.beginRequest()
+
+        assertTrue(selectionApplied)
+        assertEquals(1, budget.resetCount)
+        assertFalse(guard.isCurrent(staleStall))
+        assertTrue(guard.isCurrent(newerRequest))
+    }
+
+    @Test
     fun badRequestRetriesExactlyOnceUnboundWithFreshRequestId() = runBlocking {
         val calls = mutableListOf<CreateSessionReq>()
         val badRequest = TestBadRequest()
