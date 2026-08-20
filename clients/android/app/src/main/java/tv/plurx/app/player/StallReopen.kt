@@ -1,5 +1,6 @@
 package tv.plurx.app.player
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import tv.plurx.app.data.CreateSessionReq
@@ -44,6 +45,9 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
  * a user restart that invalidates a stall while its 400 fallback is in flight
  * is sent after that fallback, so the newer user action remains the server's
  * final replacement as well as the controller's final adopted response.
+ *
+ * Note: [Mutex] is not reentrant. Internal helpers that already hold the lock
+ * must call [callCreate] directly rather than going through [create].
  */
 internal class SessionCreateCoordinator(
     private val create: suspend (CreateSessionReq) -> HlsStart,
@@ -56,7 +60,19 @@ internal class SessionCreateCoordinator(
         body: CreateSessionReq,
         isCurrent: () -> Boolean = { true },
     ): HlsStart? = createMutex.withLock {
-        if (isCurrent()) create(body) else null
+        if (isCurrent()) callCreate(body) else null
+    }
+
+    /**
+     * Invoke the raw [create] lambda without re-entering [createMutex].
+     * Must only be called from inside [createMutex.withLock].
+     */
+    private suspend fun callCreate(body: CreateSessionReq): HlsStart {
+        try {
+            return create(body)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        }
     }
 
     suspend fun reopenAfterStall(
@@ -66,11 +82,11 @@ internal class SessionCreateCoordinator(
         createMutex.withLock {
             if (!isCurrent()) return@withLock null
             try {
-                create(body)
+                callCreate(body)
             } catch (failure: Throwable) {
                 if (!isBadRequest(failure)) throw failure
                 if (!isCurrent()) return@withLock null
-                create(
+                callCreate(
                     body.copy(
                         request_id = freshRequestId(),
                         previous_session_id = null,
