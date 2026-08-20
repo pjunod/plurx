@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["65ecdbbc"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The paused-clock peer refresh test awaits one real replicated read/publish cycle, pins the literal two-second interval and stale-to-VBR convergence, and rejects removal of the production refresh call."

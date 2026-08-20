@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["7d2a68c3"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web policy tests execute the HEVC capability probe across decoder height, bit depth, level, and HDR support, refusing Main10, max-height, and PQ claims that the browser did not prove."

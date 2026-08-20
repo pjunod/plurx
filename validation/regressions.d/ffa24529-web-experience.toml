@@ -1,0 +1,18 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "ffa24529",
+  "9aafbb8f",
+  "7942b093",
+  "89ee64cc",
+  "d3150674",
+  "2de71755",
+  "9a9179b8",
+  "946486bb",
+  "3de76374",
+  "665208eb",
+]
+points = ["web.experience", "playback.pipeline"]
+checks = ["playback-smoke", "playback-exhaustive"]
+reason = "The shipped browser player is exercised against deterministic media across delivery, quality, fallback, seek, subtitle, and restart cases."

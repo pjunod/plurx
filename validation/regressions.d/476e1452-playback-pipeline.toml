@@ -1,0 +1,19 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "476e1452",
+  "cf873d79",
+  "26f6b4f5",
+  "068cfc8c",
+  "73d5f6b6",
+  "8c071c67",
+  "a6aa3bab",
+  "0fd107b9",
+  "a9dfbc70",
+  "cd730e86",
+  "fcb22c87",
+]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "Current HLS, segmenter, logging, and encoder unit/integration suites pin these corrected wire and lifecycle rules."
