@@ -410,6 +410,13 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("1 transcode · 1 copy-video", report)
         self.assertIn("most recent copy-video command", report)
 
+    def test_android_player_renders_the_marker_display_label(self):
+        player = read(
+            "clients/android/app/src/main/java/tv/plurx/app/player/PlayerScreen.kt"
+        )
+
+        self.assertIn("Text(activeMarker.displayLabel", player)
+
 
 if __name__ == "__main__":
     unittest.main()
