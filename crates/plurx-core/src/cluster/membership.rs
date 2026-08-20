@@ -65,7 +65,14 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
          api_address TEXT NOT NULL, \
          last_seen_at INTEGER NOT NULL, \
          removed_at INTEGER) STRICT",
+    "CREATE TABLE IF NOT EXISTS cluster_http_endpoints (\
+         node_id TEXT PRIMARY KEY, \
+         http_base TEXT NOT NULL, \
+         updated_at INTEGER NOT NULL) STRICT",
 ];
+
+const ACTIVITY_AUTH_WINDOW_SECONDS: i64 = 30;
+const ACTIVITY_AUTH_CONTEXT: &[u8] = b"plurx-internal-activity-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MembershipError {
@@ -174,6 +181,10 @@ pub struct RedeemJoinRequest {
     pub node_id: String,
     pub raft_address: String,
     pub api_address: String,
+    /// Explicitly advertised plurxd endpoint. This remains cluster-internal;
+    /// public membership projections intentionally omit it.
+    #[serde(default)]
+    pub http_base: String,
     pub schema_version: i64,
     pub protocol_version: i64,
 }
@@ -243,6 +254,15 @@ pub struct ClusterNodeRecord {
     pub role: NodeRole,
     pub reachable: bool,
     pub last_seen_at: i64,
+}
+
+/// Internal addressing paired with the privacy-safe health projection.
+/// This type is never serialized by the public membership API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityPeer {
+    pub node_id: String,
+    pub http_base: Option<String>,
+    pub reachable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +551,17 @@ impl MembershipManager {
                 ),
             )
             .await?;
+        if !request.http_base.is_empty() {
+            inner
+                .client
+                .execute(
+                    "INSERT INTO cluster_http_endpoints (node_id, http_base, updated_at) \
+                     VALUES ($1, $2, $3) ON CONFLICT(node_id) DO UPDATE SET \
+                     http_base = excluded.http_base, updated_at = excluded.updated_at",
+                    params!(request.node_id.as_str(), request.http_base.as_str(), now),
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -606,7 +637,83 @@ impl MembershipManager {
                 ),
             )
             .await?;
+        inner
+            .client
+            .execute(
+                "INSERT INTO cluster_http_endpoints (node_id, http_base, updated_at) \
+                 VALUES ($1, $2, $3) ON CONFLICT(node_id) DO UPDATE SET \
+                 http_base = excluded.http_base, updated_at = excluded.updated_at",
+                params!(
+                    inner.identity.node_id.as_str(),
+                    inner.bootstrap_http.as_str(),
+                    now
+                ),
+            )
+            .await?;
         Ok(())
+    }
+
+    /// Resolve peer daemon endpoints without widening the public node status.
+    pub async fn activity_peers(&self) -> Result<Vec<ActivityPeer>, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let status = self.status().await?;
+        let rows = inner
+            .client
+            .query_map::<ActivityEndpointRow, _>(
+                "SELECT node_id, http_base FROM cluster_http_endpoints ORDER BY node_id",
+                params!(),
+            )
+            .await?;
+        let endpoints = rows
+            .into_iter()
+            .map(|row| (row.node_id, row.http_base))
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(status
+            .nodes
+            .into_iter()
+            .filter(|node| node.node_id != inner.identity.node_id)
+            .map(|node| {
+                let http_base = endpoints.get(&node.node_id).cloned();
+                ActivityPeer {
+                    node_id: node.node_id,
+                    http_base,
+                    reachable: node.reachable,
+                }
+            })
+            .collect())
+    }
+
+    /// Sign one short-lived internal activity request without putting the
+    /// shared cluster API secret on the HTTP wire.
+    pub fn sign_activity_request(&self, unix_seconds: i64) -> Result<String, MembershipError> {
+        let inner = self.replicated_inner()?;
+        Ok(hex::encode(hmac_sha256(
+            inner.secrets.api.as_bytes(),
+            &activity_auth_message(unix_seconds),
+        )))
+    }
+
+    #[must_use]
+    pub fn authorize_activity_request(&self, unix_seconds: i64, signature: &str) -> bool {
+        let Ok(inner) = self.replicated_inner() else {
+            return false;
+        };
+        let Ok(now) = unix_seconds_now() else {
+            return false;
+        };
+        if now.abs_diff(unix_seconds) > ACTIVITY_AUTH_WINDOW_SECONDS as u64 {
+            return false;
+        }
+        let Ok(candidate) = hex::decode(signature) else {
+            return false;
+        };
+        constant_time_eq(
+            &candidate,
+            &hmac_sha256(
+                inner.secrets.api.as_bytes(),
+                &activity_auth_message(unix_seconds),
+            ),
+        )
     }
 
     pub async fn heartbeat_loop(self) {
@@ -1215,6 +1322,71 @@ struct NodeRow {
     last_seen_at: i64,
 }
 
+struct ActivityEndpointRow {
+    node_id: String,
+    http_base: String,
+}
+
+impl From<&mut Row<'_>> for ActivityEndpointRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            node_id: row.get("node_id"),
+            http_base: row.get("http_base"),
+        }
+    }
+}
+
+fn activity_auth_message(unix_seconds: i64) -> Vec<u8> {
+    let mut message = ACTIVITY_AUTH_CONTEXT.to_vec();
+    message.extend_from_slice(&unix_seconds.to_be_bytes());
+    message
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut normalized = [0_u8; BLOCK];
+    if key.len() > BLOCK {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK];
+    let mut outer_pad = [0x5c_u8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn unix_seconds_now() -> Result<i64, MembershipError> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| MembershipError::Internal(error.to_string()))?
+            .as_secs(),
+    )
+    .map_err(|_| MembershipError::Internal("clock overflow".to_owned()))
+}
+
 impl From<&mut Row<'_>> for NodeRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -1319,6 +1491,7 @@ mod tests {
             node_id: "node-b".to_owned(),
             raft_address: "node-b:32401".to_owned(),
             api_address: "node-b:32402".to_owned(),
+            http_base: "http://node-b:32400".to_owned(),
             schema_version: payload.schema_version,
             protocol_version: payload.protocol_version,
         };

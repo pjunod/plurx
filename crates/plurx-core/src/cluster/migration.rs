@@ -441,6 +441,7 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
             node_id: identity.node_id.clone(),
             raft_address: local.raft_address.clone(),
             api_address: local.api_address.clone(),
+            http_base: configured_join_url(config)?,
             schema_version: AUTH_SCHEMA_VERSION,
             protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
         },

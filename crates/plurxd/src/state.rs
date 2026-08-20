@@ -100,6 +100,9 @@ pub struct AppState {
     pub replication: plurx_core::cluster::migration::status::ReplicationMonitor,
     /// Join/add/remove lifecycle and privacy-safe per-node health.
     pub membership: plurx_core::cluster::membership::MembershipManager,
+    /// Bounded authenticated client for node-local activity snapshots.
+    #[allow(dead_code)] // aggregation child #326 is the first consumer
+    pub peer_activity: crate::http::internal_activity::PeerActivityClient,
     pub server_name: String,
     /// Stable identity of the node that owns local transcode/offline bytes.
     pub node_id: String,
@@ -247,6 +250,9 @@ impl AppState {
         AppState {
             store,
             replication,
+            peer_activity: crate::http::internal_activity::PeerActivityClient::new(
+                membership.clone(),
+            ),
             membership,
             server_name,
             node_id,

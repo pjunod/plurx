@@ -295,6 +295,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             node_id: format!("node-{node_id}"),
             raft_address: spec.raft,
             api_address: spec.api,
+            http_base: format!("http://127.0.0.1:{}", 32_400 + node_id),
             schema_version: AUTH_SCHEMA_VERSION,
             protocol_version: AUTH_PROTOCOL_VERSION,
         };
@@ -366,6 +367,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                         node_id: "expired-candidate".to_owned(),
                         raft_address: "127.0.0.1:1".to_owned(),
                         api_address: "127.0.0.1:2".to_owned(),
+                        http_base: "http://127.0.0.1:3".to_owned(),
                         schema_version: AUTH_SCHEMA_VERSION,
                         protocol_version: AUTH_PROTOCOL_VERSION,
                     },
@@ -384,6 +386,66 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         || status.replication.health != ReplicationHealth::InSync
     {
         bail!("three-voter membership status was not healthy: {status:?}");
+    }
+    let activity_peers = match cluster.request(1, Request::ActivityPeers).await? {
+        Response::ActivityPeers { peers } => peers,
+        response => bail!("unexpected activity-peer response: {response:?}"),
+    };
+    if activity_peers.len() != 2
+        || activity_peers
+            .iter()
+            .any(|(_, endpoint, reachable)| endpoint.is_none() || !reachable)
+    {
+        bail!("cluster-internal activity endpoints were incomplete: {activity_peers:?}");
+    }
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let signature = match cluster
+        .request(1, Request::SignActivityRequest { unix_seconds: now })
+        .await?
+    {
+        Response::ActivitySignature { signature } => signature,
+        response => bail!("unexpected activity signature response: {response:?}"),
+    };
+    match cluster
+        .request(
+            2,
+            Request::AuthorizeActivityRequest {
+                unix_seconds: now,
+                signature: signature.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("peer rejected shared cluster activity authority: {response:?}"),
+    }
+    let stale_time = now - 31;
+    let stale_signature = match cluster
+        .request(
+            1,
+            Request::SignActivityRequest {
+                unix_seconds: stale_time,
+            },
+        )
+        .await?
+    {
+        Response::ActivitySignature { signature } => signature,
+        response => bail!("unexpected stale activity signature response: {response:?}"),
+    };
+    for request in [
+        Request::AuthorizeActivityRequest {
+            unix_seconds: now,
+            signature: "00".repeat(32),
+        },
+        Request::AuthorizeActivityRequest {
+            unix_seconds: stale_time,
+            signature: stale_signature,
+        },
+    ] {
+        match cluster.request(2, request).await? {
+            Response::Flag { value: false } => {}
+            response => bail!("invalid activity authority was accepted: {response:?}"),
+        }
     }
     let public_status = serde_json::to_string(&status)?;
     if public_status.contains(&redeemed_token) || public_status.contains("127.0.0.1") {
@@ -1331,6 +1393,14 @@ pub enum Request {
         request: FinalizeJoinRequest,
     },
     MembershipStatus,
+    SignActivityRequest {
+        unix_seconds: i64,
+    },
+    AuthorizeActivityRequest {
+        unix_seconds: i64,
+        signature: String,
+    },
+    ActivityPeers,
     HeartbeatPreservesTombstone {
         node_id: String,
     },
@@ -1400,6 +1470,12 @@ pub enum Response {
     Ok,
     Flag {
         value: bool,
+    },
+    ActivitySignature {
+        signature: String,
+    },
+    ActivityPeers {
+        peers: Vec<(String, Option<String>, bool)>,
     },
     SeededOfflineRemovalWork {
         user_id: i64,
@@ -2277,6 +2353,23 @@ async fn handle_request(
             .await
             .map(|status| Response::MembershipStatus { status })
             .or_else(|error| Ok(membership_error_response(error))),
+        Request::SignActivityRequest { unix_seconds } => Ok(Response::ActivitySignature {
+            signature: membership_ref(membership)?.sign_activity_request(unix_seconds)?,
+        }),
+        Request::AuthorizeActivityRequest {
+            unix_seconds,
+            signature,
+        } => Ok(Response::Flag {
+            value: membership_ref(membership)?.authorize_activity_request(unix_seconds, &signature),
+        }),
+        Request::ActivityPeers => Ok(Response::ActivityPeers {
+            peers: membership_ref(membership)?
+                .activity_peers()
+                .await?
+                .into_iter()
+                .map(|peer| (peer.node_id, peer.http_base, peer.reachable))
+                .collect(),
+        }),
         Request::HeartbeatPreservesTombstone { node_id } => {
             membership_ref(membership)?.heartbeat().await?;
             let rows = client
