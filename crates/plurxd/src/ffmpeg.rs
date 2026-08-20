@@ -30,6 +30,21 @@ pub fn ffprobe_bin() -> String {
     resolve_bin(std::env::var("PLURX_FFPROBE").ok(), "ffprobe")
 }
 
+/// The executable and first line it reports from `-version`.
+pub async fn ffmpeg_build() -> String {
+    let bin = ffmpeg_bin();
+    let version = probe_ffmpeg(&["-version"])
+        .await
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "version unavailable".to_owned());
+    format!("{bin} ({version})")
+}
+
 /// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
 /// `-readrate_initial_burst` in 6.1; passing either to an older build is a hard
 /// exit, not a warning, so probe rather than assume. Probed once per process.
@@ -477,15 +492,18 @@ pub async fn pacing_caps() -> PacingCaps {
             // Some builds (notably ffmpeg 8.0.1) declare the option but
             // silently ignore it. Check behaviourally when the declaration
             // looks promising.
-            if caps.initial_burst && !probe_burst_honoured().await {
-                let ffmpeg_path = ffmpeg_bin();
-                tracing::warn!(
-                    "this ffmpeg ({ffmpeg_path}) declares -readrate_initial_burst but does not honour it: \
-                     sessions are paced flat from the first byte, so the copy path's publish gate \
-                     fills at the paced rate instead of at I/O speed and every play starts seconds \
-                     slower than it needs to"
-                );
-                caps.initial_burst = false;
+            if caps.initial_burst {
+                let measured = classify_burst(caps, probe_burst().await);
+                if caps.initial_burst && !measured.initial_burst {
+                    let ffmpeg_build = ffmpeg_build().await;
+                    tracing::warn!(
+                        "this ffmpeg build ({ffmpeg_build}) declares -readrate_initial_burst but does not honour it: \
+                         sessions are paced flat from the first byte, so the copy path's publish gate \
+                         fills at the paced rate instead of at I/O speed and every play starts seconds \
+                         slower than it needs to"
+                    );
+                }
+                caps = measured;
             }
             caps
         })
@@ -530,7 +548,12 @@ impl PacingCaps {
 /// burst at 2x readrate. An honoured burst consumes the fixture at I/O speed
 /// (sub-200 ms). An inert burst paces at the readrate and takes ~1 second of
 /// wall time. A 600 ms threshold cleanly separates the two cases.
-async fn probe_burst_honoured() -> bool {
+fn classify_burst(mut caps: PacingCaps, probe: Result<Duration, String>) -> PacingCaps {
+    caps.initial_burst &= probe.is_ok_and(|elapsed| elapsed < Duration::from_millis(600));
+    caps
+}
+
+async fn probe_burst() -> Result<Duration, String> {
     let args = &[
         "-hide_banner",
         "-loglevel",
@@ -553,18 +576,9 @@ async fn probe_burst_honoured() -> bool {
         .output()
         .await
     {
-        Ok(out) if out.status.success() => {
-            // The paced duration is 2 s / 2x = 1 s. A 600 ms threshold
-            // avoids false negatives from moderate startup overhead or
-            // slow I/O on underpowered machines.
-            start.elapsed() < std::time::Duration::from_millis(600)
-        }
-        _ => {
-            // Probe itself failed (no lavfi device, missing binary, etc.).
-            // Conservatively report not honoured so nobody relies on a
-            // capability we cannot confirm at runtime.
-            false
-        }
+        Ok(out) if out.status.success() => Ok(start.elapsed()),
+        Ok(out) => Err(format!("exited with {}", out.status)),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -701,33 +715,25 @@ mod tests {
         assert!(!caps.initial_burst);
     }
 
-    /// Regression: when `-readrate_initial_burst` is declared but not honoured at
-    /// runtime, `PacingCaps::resolve` must emit the same flags as a build that
-    /// never had the burst clause — the readrate alone, without the burst flag.
-    /// This is the path `pacing_caps()` takes after `probe_burst_honoured()` returns
-    /// false: it corrects `initial_burst` to false, and `resolve` must not emit
-    /// the inert flag.
     #[test]
-    fn inert_burst_produces_the_same_resolve_as_no_burst_declaration() {
-        // Simulate caps as they would be after the behavioural probe corrects
-        // initial_burst to false on an ffmpeg build that declares but ignores
-        // the option.
-        let corrected = PacingCaps {
+    fn burst_probe_classifies_honoured_inert_and_failed_measurements() {
+        let declared = PacingCaps {
             readrate: true,
-            initial_burst: false,
+            initial_burst: true,
         };
-        // Must produce -readrate without -readrate_initial_burst, matching the
-        // 5.1–6.0 behaviour where the burst clause legitimately does not exist.
-        assert_eq!(
-            corrected.resolve(2.0, 90.0, true).args(),
-            vec!["-readrate", "2.00"],
-            "an inert burst must resolve to readrate-only flags, just like a              build that never declared the burst clause"
-        );
-        // Zero rate still means unpaced.
-        assert!(
-            corrected.resolve(0.0, 90.0, true).args().is_empty(),
-            "zero readrate must still produce unpaced flags even with corrected caps"
-        );
+        assert!(classify_burst(declared, Ok(Duration::from_millis(599))).initial_burst);
+        for probe in [
+            Ok(Duration::from_millis(600)),
+            Ok(Duration::from_secs(1)),
+            Err("probe failed".to_owned()),
+        ] {
+            let corrected = classify_burst(declared, probe);
+            assert!(!corrected.initial_burst);
+            assert_eq!(
+                corrected.resolve(2.0, 90.0, true).args(),
+                vec!["-readrate", "2.00"]
+            );
+        }
     }
 
     #[test]

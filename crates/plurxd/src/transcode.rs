@@ -11101,10 +11101,10 @@ mod tests {
         // Skip the suspend-resume cycle that requires a populated reserve;
         // the progress and speed checks above still validate the encoder.
         let burst_honoured = pacing_caps().await.initial_burst;
-        let ffmpeg_bin = crate::ffmpeg::ffmpeg_bin();
+        let ffmpeg_build = crate::ffmpeg::ffmpeg_build().await;
         if !burst_honoured {
             eprintln!(
-                "INFO: {ffmpeg_bin} does not honour -readrate_initial_burst: \
+                "INFO: {ffmpeg_build} does not honour -readrate_initial_burst: \
                  skipping ahead and suspend-resume assertions that require \
                  burst-published reserve segments"
             );
@@ -11115,7 +11115,7 @@ mod tests {
                     .ahead()
                     .await
                     .is_some_and(|a| a.seconds > 0 && a.bytes > 0),
-                "published media with an unmoved frontier is reserve"
+                "published media with an unmoved frontier is reserve; measured {ffmpeg_build}"
             );
 
             // A window it has already exceeded suspends it, and a suspended
