@@ -102,8 +102,9 @@ good the feature is.
 ## 2. Decisions in force
 
 Paul ratified PERF2-PLAN §14's recommended runtime defaults on 2026-08-09 and
-the N1 peak/storage contracts on 2026-08-12, and the N4.2 storage contract on
-2026-08-14. D1–D6 remain runtime settings; D7–D9 are binding implementation
+the N1 peak/storage contracts on 2026-08-12, the N4.2 storage contract on
+2026-08-14, and the append-only reconciliation after reading state shipped on
+2026-08-20. D1–D6 remain runtime settings; D7–D10 are binding implementation
 contracts. In force for implementation:
 
 | Decision | Implement as |
@@ -117,9 +118,10 @@ contracts. In force for implementation:
 | D7 N1 peak gate | each mode's exact 10 s complete-served-segment peak ≤ unchanged advertised peak; derived bufsize-window and theoretical VBV remain diagnostics |
 | D8 N1 offline identity | one non-null `vbr` / `qvbr:<q>` column; SQLite v18, replicated v5/protocol v4 fresh bootstrap/import, existing replicated v4 refused; its N3 SQLite v19 assignment was superseded by D9 |
 | D9 N4.2 prior storage | node-local SQLite v19; N3 SQLite v20; replicated schema v5/protocol v4 unchanged; another voter starts cold |
+| D10 append-only reconciliation | preserve shipped reading state at SQLite v20 and replicated v6; credential-generation correction at SQLite v21; N3 SQLite v22; protocol v4 unchanged |
 
 If the operator changes D1–D6 mid-build, that lands as a settings-default
-commit with a CHANGELOG line. Changing D7, D8, or D9 is a new contract decision
+commit with a CHANGELOG line. Changing D7, D8, D9, or D10 is a new contract decision
 and must follow the stop-and-flag rule.
 
 ---
@@ -404,8 +406,9 @@ at creation. Owner decisions recorded 2026-08-12: the full harness binds the
 bufsize-window observation and theoretical VBV allowance stay diagnostic.
 Offline packages use one non-null `effective_rate_control` column (`vbr` or
 `qvbr:<q>`), SQLite v18 with existing rows defaulted/backfilled to `vbr`, and
-replicated schema v5 with protocol v4; D9 later moves N3's SQLite migration to
-v20 because N4.2's node-local priors take v19.
+replicated schema v5 with protocol v4. D10 preserves the shipped reading-state
+migration at SQLite v20 and replicated v6, applies the N4.2
+credential-generation correction at SQLite v21, and moves N3 to SQLite v22.
 *Stop-and-flag if:* the legacy VBR digest bytes cannot be preserved
 exactly; or a driver family needs flags that `validation_args`'s
 15-frame probe cannot exercise; or offline snapshot storage needs anything

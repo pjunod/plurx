@@ -60,6 +60,22 @@ and is checked identically; it exists only because browsers won't attach
 headers to `<img>`/`<video>` requests. Treat a URL with `?token=` as a
 credential — it grants exactly what the bearer does.
 
+## Network priors — credential generations, never reusable user ids
+
+Node-local network priors are keyed by a lowercase SHA-256 credential-generation
+digest, not by the reusable numeric user id. The digest uses the
+`plurx/network-prior-user/v1` domain and length-delimited `user.id`,
+`user.created_at`, and complete Argon2 PHC `password_hash` inputs. Authentication
+captures it once and carries it internally through lookup and observation, so an
+in-flight event cannot switch identities after a reset or delete/recreate.
+
+Password reset, password rehash, and delete/recreate start cold; an admin-role
+change preserves the generation. The digest is excluded from APIs, logs,
+metrics, telemetry payloads, and client diagnostics. SQLite v21 and the next
+node-local Hiqlite sidecar migration drop old numeric-key rows because they
+cannot be translated safely. This correction adds no replicated migration:
+replicated schema remains v6 and protocol remains v4.
+
 ## Offline media leases — one package, one narrow capability
 
 The signed-in JSON API owns package creation, status, lease issue, and

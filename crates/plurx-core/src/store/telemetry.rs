@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params, Connection};
 
 use crate::domain::{
-    NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery,
+    CredentialGeneration, NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery,
     NETWORK_PRIOR_STARVED_TTL_MS,
 };
 use crate::error::StoreError;
@@ -47,7 +47,10 @@ CREATE TABLE playback_events (
 CREATE INDEX playback_events_by_event ON playback_events(event, at_unix_ms);
 CREATE INDEX playback_events_by_file ON playback_events(file_id, at_unix_ms);";
 
-pub(crate) const NETWORK_PRIORS_SCHEMA: &str = "
+/// Old integer-key network priors schema (sidecar v2).
+/// Replaced by [`NETWORK_PRIORS_SCHEMA`] in sidecar v3.
+#[cfg(any(test, feature = "hiqlite-store"))]
+pub(crate) const NETWORK_PRIORS_V2_SCHEMA: &str = "
 CREATE TABLE network_priors (
     user_id             INTEGER NOT NULL,
     client_class        TEXT NOT NULL,
@@ -62,8 +65,25 @@ CREATE TABLE network_priors (
 CREATE INDEX network_priors_by_updated
     ON network_priors(updated_at_ms, user_id, client_class);";
 
+/// New credential-generation-key network priors schema (sidecar v3+).
 #[cfg(any(test, feature = "hiqlite-store"))]
-const SIDECAR_SCHEMA_VERSION: i64 = 2;
+pub(crate) const NETWORK_PRIORS_SCHEMA: &str = "
+CREATE TABLE network_priors (
+    credential_generation TEXT NOT NULL,
+    client_class          TEXT NOT NULL,
+    network_fingerprint   TEXT NOT NULL,
+    sustained_kbps        INTEGER,
+    worst_rung_height     INTEGER,
+    starved_at_ms         INTEGER,
+    sample_count          INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (credential_generation, client_class, network_fingerprint)
+) STRICT;
+CREATE INDEX network_priors_by_updated
+    ON network_priors(updated_at_ms, credential_generation, client_class);";
+
+#[cfg(any(test, feature = "hiqlite-store"))]
+const SIDECAR_SCHEMA_VERSION: i64 = 3;
 const MAX_QUERY_ROWS: i64 = 2_000;
 const MAX_PRUNE_ROWS: i64 = 10_000;
 const MAX_PRIORS_PER_USER_CLIENT: i64 = 64;
@@ -178,7 +198,7 @@ fn prior_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkPrior> {
         .and_then(|value| u32::try_from(value).ok());
     let sample_count = u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX);
     Ok(NetworkPrior {
-        user_id: row.get(0)?,
+        credential_generation: CredentialGeneration::from(row.get::<_, String>(0)?),
         client_class: row.get(1)?,
         network_fingerprint: row.get(2)?,
         sustained_kbps,
@@ -193,7 +213,7 @@ pub(crate) fn observe_prior(
     conn: &Connection,
     observation: &NetworkPriorObservation,
 ) -> Result<NetworkPrior, StoreError> {
-    if observation.user_id <= 0
+    if observation.credential_generation.as_str().trim().is_empty()
         || observation.client_class.trim().is_empty()
         || observation.network_fingerprint.trim().is_empty()
         || (observation.throughput_kbps.is_none() && observation.starved_rung_height.is_none())
@@ -214,7 +234,7 @@ pub(crate) fn observe_prior(
     // stays deterministic under test.
     transaction.execute(
         "INSERT INTO network_priors (
-             user_id, client_class, network_fingerprint, sustained_kbps,
+             credential_generation, client_class, network_fingerprint, sustained_kbps,
              worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          ) VALUES (
              ?1, ?2, ?3, ?4, ?5,
@@ -222,7 +242,7 @@ pub(crate) fn observe_prior(
              CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END,
              ?6
          )
-         ON CONFLICT(user_id, client_class, network_fingerprint) DO UPDATE SET
+         ON CONFLICT(credential_generation, client_class, network_fingerprint) DO UPDATE SET
              sustained_kbps = CASE
                  WHEN excluded.sustained_kbps IS NULL THEN network_priors.sustained_kbps
                  WHEN network_priors.sustained_kbps IS NULL THEN excluded.sustained_kbps
@@ -250,7 +270,7 @@ pub(crate) fn observe_prior(
              updated_at_ms = excluded.updated_at_ms
          WHERE excluded.updated_at_ms >= network_priors.updated_at_ms",
         params![
-            observation.user_id,
+            observation.credential_generation.as_str(),
             observation.client_class,
             observation.network_fingerprint,
             observation.throughput_kbps.map(i64::from),
@@ -261,26 +281,26 @@ pub(crate) fn observe_prior(
     )?;
     transaction.execute(
         "DELETE FROM network_priors
-         WHERE user_id = ?1 AND client_class = ?2
+         WHERE credential_generation = ?1 AND client_class = ?2
            AND network_fingerprint IN (
              SELECT network_fingerprint FROM network_priors
-             WHERE user_id = ?1 AND client_class = ?2
+             WHERE credential_generation = ?1 AND client_class = ?2
              ORDER BY updated_at_ms DESC, network_fingerprint DESC
              LIMIT -1 OFFSET ?3
            )",
         params![
-            observation.user_id,
+            observation.credential_generation.as_str(),
             observation.client_class,
             MAX_PRIORS_PER_USER_CLIENT,
         ],
     )?;
     let prior = transaction.query_row(
-        "SELECT user_id, client_class, network_fingerprint, sustained_kbps,
+        "SELECT credential_generation, client_class, network_fingerprint, sustained_kbps,
                 worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          FROM network_priors
-         WHERE user_id = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
+         WHERE credential_generation = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
         params![
-            observation.user_id,
+            observation.credential_generation.as_str(),
             observation.client_class,
             observation.network_fingerprint,
         ],
@@ -292,18 +312,18 @@ pub(crate) fn observe_prior(
 
 pub(crate) fn get_prior(
     conn: &Connection,
-    user_id: i64,
+    credential_generation: &str,
     client_class: &str,
     network_fingerprint: &str,
 ) -> Result<Option<NetworkPrior>, StoreError> {
     use rusqlite::OptionalExtension;
 
     conn.query_row(
-        "SELECT user_id, client_class, network_fingerprint, sustained_kbps,
+        "SELECT credential_generation, client_class, network_fingerprint, sustained_kbps,
                 worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          FROM network_priors
-         WHERE user_id = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
-        params![user_id, client_class, network_fingerprint],
+         WHERE credential_generation = ?1 AND client_class = ?2 AND network_fingerprint = ?3",
+        params![credential_generation, client_class, network_fingerprint],
         prior_from_row,
     )
     .optional()
@@ -320,11 +340,11 @@ pub(crate) fn prune_priors(
     }
     let changed = conn.execute(
         "DELETE FROM network_priors
-         WHERE (user_id, client_class, network_fingerprint) IN (
-             SELECT user_id, client_class, network_fingerprint
+         WHERE (credential_generation, client_class, network_fingerprint) IN (
+             SELECT credential_generation, client_class, network_fingerprint
              FROM network_priors
              WHERE updated_at_ms < ?1
-             ORDER BY updated_at_ms, user_id, client_class, network_fingerprint
+             ORDER BY updated_at_ms, credential_generation, client_class, network_fingerprint
              LIMIT ?2
          )",
         params![before_ms, limit.min(MAX_PRUNE_ROWS)],
@@ -382,11 +402,24 @@ impl NodeLocalTelemetry {
         // of failing every restart forever.
         if current < SIDECAR_SCHEMA_VERSION {
             let mut migration = String::from("BEGIN;\n");
+            let mut needs_prior_upgrade = current >= 2 || table_exists(&conn, "network_priors")?;
             if !table_exists(&conn, "playback_events")? {
                 migration.push_str(PLAYBACK_EVENTS_SCHEMA);
                 migration.push('\n');
             }
-            if !table_exists(&conn, "network_priors")? {
+            if current < 2 && !table_exists(&conn, "network_priors")? {
+                // v0/v1: create the legacy integer-key prior table. The
+                // upgrade step below handles the v2→v3 transition.
+                migration.push_str(NETWORK_PRIORS_V2_SCHEMA);
+                migration.push('\n');
+                needs_prior_upgrade = true;
+            }
+            if needs_prior_upgrade {
+                // v2→v3: drop the old integer-key prior table and recreate
+                // with the credential-generation text key. Old numeric-key
+                // rows cannot be translated because the user_id alone is not
+                // enough material to recover the credential generation.
+                migration.push_str("DROP TABLE IF EXISTS network_priors;\n");
                 migration.push_str(NETWORK_PRIORS_SCHEMA);
                 migration.push('\n');
             }
@@ -447,12 +480,19 @@ impl NodeLocalTelemetry {
 
     pub(crate) async fn prior(
         &self,
-        user_id: i64,
+        credential_generation: String,
         client_class: String,
         network_fingerprint: String,
     ) -> Result<Option<NetworkPrior>, StoreError> {
-        self.with_conn(move |conn| get_prior(conn, user_id, &client_class, &network_fingerprint))
-            .await
+        self.with_conn(move |conn| {
+            get_prior(
+                conn,
+                &credential_generation,
+                &client_class,
+                &network_fingerprint,
+            )
+        })
+        .await
     }
 
     pub(crate) async fn prune_priors(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError> {
@@ -487,15 +527,15 @@ mod tests {
         network: &str,
         throughput_kbps: Option<u32>,
         starved_rung_height: Option<i64>,
-        observed_at_ms: i64,
+        at_ms: i64,
     ) -> NetworkPriorObservation {
         NetworkPriorObservation {
-            user_id: 7,
+            credential_generation: CredentialGeneration::from("test-gen".to_owned()),
             client_class: "safari".to_owned(),
             network_fingerprint: network.to_owned(),
             throughput_kbps,
             starved_rung_height,
-            observed_at_ms,
+            observed_at_ms: at_ms,
         }
     }
 
@@ -684,7 +724,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
             .expect("count priors");
         assert_eq!(count, MAX_PRIORS_PER_USER_CLIENT);
-        assert!(get_prior(&conn, 7, "safari", "192.0.0.0/24")
+        assert!(get_prior(&conn, "test-gen", "safari", "192.0.0.0/24")
             .expect("oldest lookup")
             .is_none());
 
@@ -738,7 +778,7 @@ mod tests {
         let error = NodeLocalTelemetry::open(&path)
             .err()
             .expect("future sidecar schema must be refused");
-        assert!(error.to_string().contains("only knows v2"), "{error}");
+        assert!(error.to_string().contains("only knows v3"), "{error}");
     }
 
     #[tokio::test]
@@ -776,7 +816,11 @@ mod tests {
         assert_eq!(prior.sustained_kbps, Some(5_000));
         assert_eq!(
             sidecar
-                .prior(7, "safari".to_owned(), "192.0.2.0/24".to_owned())
+                .prior(
+                    "test-gen".to_owned(),
+                    "safari".to_owned(),
+                    "192.0.2.0/24".to_owned()
+                )
                 .await
                 .expect("read migrated prior"),
             Some(prior)
@@ -807,13 +851,13 @@ mod tests {
             [],
         )
         .expect("seed event");
-        // The interrupted upgrade: the new table is committed, the version is
-        // not.
-        conn.execute_batch(NETWORK_PRIORS_SCHEMA)
+        // The interrupted upgrade: the old integer-key table is committed,
+        // the version is not.
+        conn.execute_batch(NETWORK_PRIORS_V2_SCHEMA)
             .expect("committed v2 table");
-        observe_prior(
-            &conn,
-            &observation("192.0.2.0/24", Some(4_000), Some(720), 15),
+        conn.execute(
+            "INSERT INTO network_priors              (user_id, client_class, network_fingerprint, sustained_kbps,               worst_rung_height, starved_at_ms, sample_count, updated_at_ms)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            rusqlite::params![15, "safari", "192.0.2.0/24", 4_000i64, 720i64, 15i64, 15i64],
         )
         .expect("seed prior");
         conn.pragma_update(None, "user_version", 1)
@@ -832,13 +876,20 @@ mod tests {
                 .len(),
             1
         );
-        let prior = sidecar
-            .prior(7, "safari".to_owned(), "192.0.2.0/24".to_owned())
-            .await
-            .expect("read preserved prior")
-            .expect("the committed prior survives the repair");
-        assert_eq!(prior.sustained_kbps, Some(4_000));
-        assert_eq!(prior.worst_rung_height, Some(720));
+        // The old integer-key prior is dropped because the user_id alone is
+        // not enough material to recover the credential generation.
+        assert!(
+            sidecar
+                .prior(
+                    "test-gen".to_owned(),
+                    "safari".to_owned(),
+                    "192.0.2.0/24".to_owned()
+                )
+                .await
+                .expect("read old prior")
+                .is_none(),
+            "old integer-key prior rows must be dropped, not translated"
+        );
 
         // The repair finished the upgrade rather than leaving it to be retried
         // on every restart.
