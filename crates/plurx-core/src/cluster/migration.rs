@@ -15,6 +15,8 @@ use std::borrow::Cow;
 #[cfg(feature = "hiqlite-store")]
 use std::collections::BTreeSet;
 #[cfg(feature = "hiqlite-store")]
+use std::io::Seek;
+#[cfg(feature = "hiqlite-store")]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "hiqlite-store")]
 use std::sync::Arc;
@@ -261,7 +263,7 @@ pub async fn select_daemon_store(config: &Config) -> Result<SelectedStore, Store
     install_default_crypto_provider();
     std::fs::create_dir_all(&config.storage.data_dir)
         .map_err(|error| migration_io("creating", &config.storage.data_dir, error))?;
-    let daemon_lock = acquire_daemon_lock(&config.storage.data_dir)?;
+    let daemon_lock = acquire_daemon_lock(&config.storage.data_dir).await?;
     recover_interrupted_readdress(&config.storage.data_dir)?;
 
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
@@ -1353,24 +1355,176 @@ async fn open_active_credential_key(
     Ok(Arc::new(key))
 }
 
+/// Who the lock file says is holding the data directory.
+///
+/// This never decides whether to refuse — the advisory lock is the only
+/// authority for that, and a recorded id can be stale, truncated, or written
+/// by a process that has since died. It exists so a refusal can say which of
+/// two very different conditions it actually saw, because they call for
+/// opposite responses from whoever reads the message.
 #[cfg(feature = "hiqlite-store")]
-fn acquire_daemon_lock(data_dir: &Path) -> Result<File, StoreError> {
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonLockHolder {
+    /// The recorded owner is this very process.
+    ///
+    /// Not a second daemon under any reading: an earlier activation inside
+    /// this process still has its lock handle open. In production that is a
+    /// leak to fix here; in an in-process test it is the previous activation
+    /// not having finished dropping.
+    ThisProcess(u32),
+    /// A different process. This is the genuine double-start.
+    OtherProcess(u32),
+    /// The lock file carried no usable owner record — it predates this
+    /// bookkeeping, or the holder was interrupted between taking the lock and
+    /// recording itself. Treated as another process, because the lock is held
+    /// and nothing says it is ours.
+    Unidentified,
+}
+
+/// How long startup re-attempts the data-directory lock before concluding that
+/// another daemon owns it.
+///
+/// The lock lives exactly as long as the owner's open handle, and closing that
+/// handle is the last thing a departing owner does. A container restarted by
+/// `Restart=always`, a `systemctl restart`, and an in-process test that
+/// re-activates the same directory all hand the incoming owner a predecessor
+/// that is still finishing. Refusing on the first `WouldBlock` reported every
+/// one of them as "another plurxd process already owns the data directory" —
+/// a message that in production means a genuine double-start and is a correct,
+/// serious refusal.
+///
+/// Waiting a bounded window costs nothing on a quiet host, where the first
+/// attempt succeeds, and it cannot let a second live daemon through: a running
+/// owner holds the lock for its entire lifetime, so it is still holding it when
+/// the window expires. The window only converts "not free at this instant" into
+/// "not free for five seconds", which is the claim the refusal actually makes.
+#[cfg(feature = "hiqlite-store")]
+const DAEMON_LOCK_ACQUIRE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Gap between attempts inside [`DAEMON_LOCK_ACQUIRE_WINDOW`].
+///
+/// Short enough that a predecessor closing its handle is picked up promptly,
+/// long enough that the wait is not a spin. There is no OS notification for an
+/// advisory lock being released without blocking on it, and blocking would give
+/// up the bound this whole path exists to keep.
+#[cfg(feature = "hiqlite-store")]
+const DAEMON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+#[cfg(feature = "hiqlite-store")]
+async fn acquire_daemon_lock(data_dir: &Path) -> Result<File, StoreError> {
+    acquire_daemon_lock_within(data_dir, DAEMON_LOCK_ACQUIRE_WINDOW).await
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn acquire_daemon_lock_within(data_dir: &Path, window: Duration) -> Result<File, StoreError> {
     let path = data_dir.join(DAEMON_LOCK_FILENAME);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = options
+    let mut file = options
         .open(&path)
         .map_err(|error| migration_io("opening", &path, error))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Migration(format!(
-            "another plurxd process already owns the data directory {}",
-            data_dir.display()
-        ))),
-        Err(std::fs::TryLockError::Error(error)) => Err(migration_io("locking", &path, error)),
+    let mut waited = Duration::ZERO;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                record_daemon_lock_holder(&mut file, &path);
+                return Ok(file);
+            }
+            Err(std::fs::TryLockError::WouldBlock) if waited < window => {
+                // Async, not `thread::sleep`: this runs on the daemon runtime,
+                // and the predecessor whose handle we are waiting on may need
+                // that same runtime to finish dropping it.
+                let step = DAEMON_LOCK_RETRY_INTERVAL.min(window - waited);
+                tokio::time::sleep(step).await;
+                waited += step;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(daemon_lock_conflict(
+                    data_dir,
+                    &read_daemon_lock_holder(&path),
+                    waited,
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(migration_io("locking", &path, error))
+            }
+        }
     }
+}
+
+/// Record this process as the owner, so a later contender's refusal can name
+/// it. Written under the lock we just took, so no two writers race here.
+///
+/// Best effort on purpose. The record only ever improves somebody else's error
+/// message, and the lock — which is the thing that actually protects the data
+/// directory — is already held by the time this runs. Refusing startup because
+/// a seven-byte cosmetic write failed would trade a working server for a nicer
+/// diagnostic; a contender falls back to
+/// [`DaemonLockHolder::Unidentified`] instead.
+#[cfg(feature = "hiqlite-store")]
+fn record_daemon_lock_holder(file: &mut File, path: &Path) {
+    if let Err(error) = file
+        .set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|_| writeln!(file, "{}", std::process::id()))
+        .and_then(|()| file.flush())
+    {
+        tracing::debug!(
+            path = %path.display(),
+            %error,
+            "could not record this process as the data-directory lock owner"
+        );
+    }
+}
+
+/// Read the recorded owner without taking the lock. Every failure is
+/// [`DaemonLockHolder::Unidentified`]: this only ever improves a message, so a
+/// missing or malformed record must not turn into a startup error of its own.
+#[cfg(feature = "hiqlite-store")]
+fn read_daemon_lock_holder(path: &Path) -> DaemonLockHolder {
+    match std::fs::read_to_string(path)
+        .ok()
+        .and_then(|recorded| recorded.trim().parse::<u32>().ok())
+    {
+        Some(pid) if pid == std::process::id() => DaemonLockHolder::ThisProcess(pid),
+        Some(pid) => DaemonLockHolder::OtherProcess(pid),
+        None => DaemonLockHolder::Unidentified,
+    }
+}
+
+/// Describe a lock that stayed held for the whole acquire window.
+///
+/// The two conditions are not variants of one complaint. Another live process
+/// means the operator started a second daemon on one data directory and must
+/// stop one of them; this process means our own handle leaked and no operator
+/// action would help. Printing the first text for the second condition sends
+/// whoever reads it looking for a process that does not exist.
+#[cfg(feature = "hiqlite-store")]
+fn daemon_lock_conflict(
+    data_dir: &Path,
+    holder: &DaemonLockHolder,
+    waited: Duration,
+) -> StoreError {
+    let data_dir = data_dir.display();
+    let waited = waited.as_secs_f32();
+    StoreError::Migration(match holder {
+        DaemonLockHolder::ThisProcess(pid) => format!(
+            "the data directory {data_dir} is still locked inside this plurxd process \
+             (pid {pid}) after waiting {waited:.1}s for the previous owner's handle to \
+             close. No second plurxd process is involved: an earlier activation in this \
+             process never dropped its data-directory lock"
+        ),
+        DaemonLockHolder::OtherProcess(pid) => format!(
+            "another plurxd process already owns the data directory {data_dir} \
+             (pid {pid}) and still held it after waiting {waited:.1}s"
+        ),
+        DaemonLockHolder::Unidentified => format!(
+            "another plurxd process already owns the data directory {data_dir} \
+             (owner pid not recorded) and still held it after waiting {waited:.1}s"
+        ),
+    })
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -2583,6 +2737,130 @@ mod tests {
     use axum::{Json, Router};
     #[cfg(feature = "hiqlite-store")]
     use serde_json::json;
+
+    /// The claim a data-directory refusal is entitled to make. Nothing that did
+    /// not observe a *different* live process may print it.
+    #[cfg(feature = "hiqlite-store")]
+    const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
+
+    /// A predecessor still closing its handle is not a second daemon.
+    ///
+    /// Regression for #374. `acquire_daemon_lock` took the advisory lock
+    /// non-blockingly, so
+    /// `daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization`
+    /// re-activating the same data directory printed [`SECOND_DAEMON_VERDICT`]
+    /// whenever the previous activation's handle had not finished dropping.
+    /// Unloaded the drop won that race; under gate-parallel CI load it did not,
+    /// and `rust-gate` failed on diffs that cannot reach this code — a load
+    /// artifact reported as a production-grade double-start.
+    ///
+    /// Exercises the real production entry point and its real window, because
+    /// the window is the correction. Reverting to a single non-blocking attempt
+    /// fails here immediately.
+    #[cfg(feature = "hiqlite-store")]
+    #[tokio::test]
+    async fn a_still_closing_predecessor_lock_is_not_reported_as_a_second_daemon() {
+        let data = tempfile::tempdir().expect("daemon lock dir");
+        let holder = acquire_daemon_lock(data.path())
+            .await
+            .expect("the first owner takes the lock");
+
+        // Well inside DAEMON_LOCK_ACQUIRE_WINDOW, and the whole point of it:
+        // the incoming owner cannot know this handle is about to close.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(holder);
+        });
+
+        let acquired = acquire_daemon_lock(data.path()).await;
+        release.await.expect("predecessor release task");
+        let error = match acquired {
+            Ok(_lock) => return,
+            Err(error) => error,
+        };
+        panic!(
+            "a predecessor that was still closing its handle was refused: {error}. The \
+             data-directory lock must wait out a departing owner rather than read a \
+             not-yet-closed handle as a second running daemon"
+        );
+    }
+
+    /// The refusal survives, and it does not conflate the two conditions.
+    ///
+    /// The owner here is this test process, so the lock is genuinely held for
+    /// the whole window and must still be refused — but calling that "another
+    /// plurxd process" would send a reader hunting a process that does not
+    /// exist. A short explicit window keeps this from costing five seconds;
+    /// the production window is exercised by the regression above.
+    #[cfg(feature = "hiqlite-store")]
+    #[tokio::test]
+    async fn a_lock_held_for_the_whole_window_is_refused_without_blaming_another_process() {
+        let data = tempfile::tempdir().expect("daemon lock dir");
+        let _holder = acquire_daemon_lock(data.path())
+            .await
+            .expect("the owner takes the lock");
+        assert_eq!(
+            read_daemon_lock_holder(&data.path().join(DAEMON_LOCK_FILENAME)),
+            DaemonLockHolder::ThisProcess(std::process::id()),
+            "an owner must record itself so a contender's refusal can name it"
+        );
+
+        let message = acquire_daemon_lock_within(data.path(), Duration::from_millis(200))
+            .await
+            .expect_err("a lock held for the whole window must still be refused")
+            .to_string();
+        assert!(
+            !message.contains(SECOND_DAEMON_VERDICT),
+            "our own still-open handle was reported as a second daemon: {message}"
+        );
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "a refusal must name the recorded holder: {message}"
+        );
+    }
+
+    /// A genuinely different owner keeps the operator-facing verdict.
+    ///
+    /// `crates/plurxd/tests/cluster_activation.rs` proves this end to end with
+    /// two real processes; this pins the text and the classification so the
+    /// #374 correction cannot quietly stop calling a real double-start what it
+    /// is. An unrecorded owner is treated the same way: the lock is held and
+    /// nothing says it is ours.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn a_different_owner_is_still_reported_as_a_second_daemon() {
+        let data = tempfile::tempdir().expect("daemon lock dir");
+        let path = data.path().join(DAEMON_LOCK_FILENAME);
+
+        let foreign = std::process::id().wrapping_add(1);
+        std::fs::write(&path, format!("{foreign}\n")).expect("record a foreign owner");
+        assert_eq!(
+            read_daemon_lock_holder(&path),
+            DaemonLockHolder::OtherProcess(foreign)
+        );
+        std::fs::write(&path, "not-a-pid").expect("record an unusable owner");
+        assert_eq!(
+            read_daemon_lock_holder(&path),
+            DaemonLockHolder::Unidentified
+        );
+        assert_eq!(
+            read_daemon_lock_holder(&data.path().join("absent.lock")),
+            DaemonLockHolder::Unidentified,
+            "a missing record must degrade to a message, never to a startup error"
+        );
+
+        for holder in [
+            DaemonLockHolder::OtherProcess(foreign),
+            DaemonLockHolder::Unidentified,
+        ] {
+            let message =
+                daemon_lock_conflict(data.path(), &holder, DAEMON_LOCK_ACQUIRE_WINDOW).to_string();
+            assert!(
+                message.contains(SECOND_DAEMON_VERDICT),
+                "{holder:?} must keep the double-start verdict: {message}"
+            );
+        }
+    }
 
     /// Staging import never needs a remotely reachable address. Active M3
     /// voters and maintenance clients use persisted membership addresses.
