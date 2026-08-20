@@ -348,3 +348,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "fun seekTo(targetMs: Long)"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 test_anchor = "vodSeekAfterExhaustionResetsBudget"
+
+[[fixes]]
+id = "android.stall-budget-subtitle-test-fix"
+commits = ["d0ebd112"]
+source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+source_anchor = "fun subtitleTrackChangeResetsBudget"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "subtitleTrackChangeResetsBudget"
