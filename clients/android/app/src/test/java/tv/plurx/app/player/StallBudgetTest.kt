@@ -59,7 +59,6 @@ class StallBudgetTest {
         // predecessor's own rung, not 360.
         assertTrue(Controller.isStrictDowngrade(predecessorHeight = 360, resolvedHeight = 240))
     }
-}
 
     @Test
     fun stallBudgetExercisesEveryAcceptanceCriterion() {
