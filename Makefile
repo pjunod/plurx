@@ -70,7 +70,7 @@ check: validation-lint history-check operations-check benchmark-check rust-check
 
 .PHONY: hiqlite-spike
 hiqlite-spike: ## Run the isolated M0 raft/SQLite semantic proof
-	$(CARGO) test --manifest-path spikes/hiqlite-m0/Cargo.toml \
+	$(CARGO) test --locked --manifest-path spikes/hiqlite-m0/Cargo.toml \
 	  --test hiqlite_m0 -- --nocapture
 
 .PHONY: hiqlite-baseline
