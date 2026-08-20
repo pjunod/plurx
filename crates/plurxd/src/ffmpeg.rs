@@ -721,7 +721,12 @@ mod tests {
             readrate: true,
             initial_burst: true,
         };
-        assert!(classify_burst(declared, Ok(Duration::from_millis(599))).initial_burst);
+        let honoured = classify_burst(declared, Ok(Duration::from_millis(599)));
+        assert!(honoured.initial_burst);
+        assert_eq!(
+            honoured.resolve(2.0, 90.0, true).args(),
+            vec!["-readrate_initial_burst", "90.0", "-readrate", "2.00"]
+        );
         for probe in [
             Ok(Duration::from_millis(600)),
             Ok(Duration::from_secs(1)),

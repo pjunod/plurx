@@ -575,10 +575,10 @@ reason = "Three corrections with three retained regressions. `profile5_renderer_
 
 
 [[coverage]]
-commits = ["49828817"]
+commits = ["49828817", "7202c297"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
-reason = "The retained `inert_burst_produces_the_same_resolve_as_no_burst_declaration` asserts that corrected `PacingCaps` (initial_burst=false after the behavioural probe corrects a build that declares but ignores -readrate_initial_burst) produces readrate-only flags identical to a 5.1-6.0 build that never had the burst clause. Reverting the behavioural probe in `pacing_caps()` restores `initial_burst=true` for ffmpeg 8 builds, and the test fails because `resolve` then emits `-readrate_initial_burst` alongside `-readrate` for a flag that does nothing. The integration test `a_client_fetch_releases_a_held_session_and_restarts_progress` separately pins that the behavioural probe tolerates an inert burst binary without failing."
+reason = "The retained `burst_probe_classifies_honoured_inert_and_failed_measurements` regression exercises the production classifier with honoured, inert, and failed behavioural measurements. It requires only a sub-threshold measurement to preserve `initial_burst=true`; inert and failed measurements must correct the declared capability to false and resolve to readrate-only pacing. Reverting the classifier correction restores `initial_burst=true` for ffmpeg builds that declare but ignore the option, and the regression fails because `resolve` emits a burst flag that does nothing. The integration test `a_client_fetch_releases_a_held_session_and_restarts_progress` separately pins that a real inert binary is diagnosed by build and skips only the assertions that require burst-published reserve."
 
 [[coverage]]
 commits = ["e52e7de9"]
