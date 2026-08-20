@@ -576,7 +576,7 @@ async fn probe_burst() -> Result<Duration, String> {
     let args = burst_probe_args();
     let start = std::time::Instant::now();
     match tokio::process::Command::new(ffmpeg_bin())
-        .args(&args)
+        .args(args)
         .output()
         .await
     {
