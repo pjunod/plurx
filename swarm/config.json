@@ -29,7 +29,8 @@
     "directory": ".swarm",
     "heartbeat_seconds": 30,
     "stuck_after_seconds": 900,
-    "clone_root": ".."
+    "clone_root": "..",
+    "worker_network_access": true
   },
   "providers": {
     "codex": {
@@ -124,6 +125,7 @@
       "reviewer": "swarm:reviewer"
     },
     "poll_seconds": 30,
+    "prefer_expiring_quota": true,
     "retry_seconds": 120,
     "limit": 100,
     "pull_request_limit": 1000,
