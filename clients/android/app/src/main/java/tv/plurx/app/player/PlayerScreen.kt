@@ -943,7 +943,7 @@ private fun PlayerContent(
             TvButton(
                 onClick = { controller.seekTo(activeMarker.end_ms); poke() },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = 112.dp),
-            ) { Text(activeMarker.label, fontWeight = FontWeight.SemiBold) }
+            ) { Text(activeMarker.displayLabel, fontWeight = FontWeight.SemiBold) }
         }
 
         if (!isInPip && controlsVisible) {
