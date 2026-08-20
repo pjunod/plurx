@@ -622,3 +622,11 @@ points = ["core.media", "persistence.upgrades", "cluster.auth", "server.api", "a
 checks = ["rust-gate"]
 reason = "Rust auto-formatting and clippy derive fixes for the credential-generation implementation. The rust-gate validates all affected surfaces. No behavioral change."
 
+
+[[coverage]]
+commits = ["78f36467"]
+points = []
+checks = []
+reason = "This commit only records the formatting fix's validation evidence in regressions.toml; it does not change runtime behavior."
+ignore = true
+
