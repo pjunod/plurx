@@ -426,9 +426,9 @@ decoding shows what the file is versus what your browser is actually rendering.
 - **Method-aware seek:** direct play seeks natively; remux and transcode restart
   the server stream at the new offset.
 
-**How to read it:** a "Skip Credits" button that reads as an estimate exists
-because that file had no end-credits chapter — it's a guess and the timeline
-knows it. Chapter-derived buttons are exact.
+**How to read it:** a "Skip Credits · Estimated" button exists because that
+file had no end-credits chapter — the button labels the duration-based guess.
+Chapter-derived buttons keep the exact chapter label.
 
 **How to read the Server block:** encode speed below 1× means the server
 cannot produce the stream as fast as you are watching it, and a stall is only
