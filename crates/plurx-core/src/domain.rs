@@ -679,6 +679,12 @@ pub enum OfflineCreateOutcome {
     RowLimit { limit: i64 },
     ByteLimit { used: i64, limit: i64 },
     GlobalByteLimit { used: i64, limit: i64 },
+    /// The requesting node has been removed from the cluster; its `removed_at`
+    /// tombstone is set in `cluster_nodes`. A removed-but-still-running node
+    /// cannot create new offline packages. Single-node SQLite never returns
+    /// this variant because it has no removal path and no `cluster_nodes`
+    /// table.
+    NodeIsTombstone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

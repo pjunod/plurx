@@ -966,6 +966,18 @@ struct OfflineAdmissionRow {
     node_used: i64,
 }
 
+
+struct MembershipTombstoneRow {
+    removed_at: Option<i64>,
+}
+
+impl From<&mut Row<'_>> for MembershipTombstoneRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            removed_at: row.get("removed_at"),
+        }
+    }
+}
 impl From<&mut Row<'_>> for OfflineAdmissionRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -1259,6 +1271,8 @@ impl OfflinePackageStore for HiqliteAuthStore {
                    AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE node_id = $5 \
                        AND state IN ('queued', 'preparing', 'ready')) <= $24 - $19 \
+                   AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
+                     WHERE node_id = $5 AND removed_at IS NOT NULL) \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
                     source_size, source_mtime, recipe_hash, effective_rate_control, \
                     target_height, audio_index, \
@@ -1325,6 +1339,24 @@ impl OfflinePackageStore for HiqliteAuthStore {
                 } else {
                     OfflineCreateOutcome::RequestConflict
                 });
+            }
+
+            // If the INSERT fell through AND no existing package was found, the
+            // node may have been removed. Fail early with a legible outcome
+            // rather than falling through to "admission changed concurrently".
+            if self
+                .client()
+                .query_consistent_map::<MembershipTombstoneRow, _>(
+                    "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                    hiqlite::macros::params!(package.node_id.as_str()),
+                )
+                .await
+                .map_err(database_error)?
+                .first()
+                .and_then(|row| row.removed_at)
+                .is_some()
+            {
+                return Ok(OfflineCreateOutcome::NodeIsTombstone);
             }
 
             let admission = self

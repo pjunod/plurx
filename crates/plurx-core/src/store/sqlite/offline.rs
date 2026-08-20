@@ -883,6 +883,23 @@ mod tests {
         );
     }
 
+
+    #[tokio::test]
+    async fn single_node_does_not_reject_packages_as_node_removed() {
+        // Single-node SQLite has no removal path and no `cluster_nodes`
+        // table. The `NodeIsTombstone` variant must never be returned.
+        let store = store().await;
+        let package = match store
+            .create_offline_package(&request("single-node"), 10, 1_000, 2_000)
+            .await
+            .expect("create")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("single-node create returned {other:?}"),
+        };
+        assert_eq!(package.request_id, "single-node");
+    }
+
     #[tokio::test]
     async fn zero_quotas_disable_offline_admission() {
         let store = store().await;

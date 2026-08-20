@@ -333,13 +333,15 @@ before committing rather than acting on the list it started with.
 
 **Stop the removed node once the removal returns**, or repoint its clients at a
 surviving server. Removal takes the machine out of the cluster roster; it does
-not switch the machine off, and a removed plurxd that is still running and still
-reachable can still accept a download request and record the package against
-itself. Nothing resolves those: the removal that would have failed or moved them
-has already finished. They hold their reservation against the requesting user's
-byte budget until the seven-day expiry, and a package that reaches `ready` on a
-node you later switch off will not download. This is the only offline case
-removal does not clean up for you.
+not switch the machine off. A removed-but-still-running node that keeps
+receiving download requests is refused at the write path with a legible
+`node_removed` response — the durable insert checks the `cluster_nodes.removed_at`
+tombstone and returns `NodeIsTombstone` before any admission or quota step.
+Nothing ever reaches the encoder or holds a reservation against a tombstone.
+
+This is a fence on the offline package write path only. A removed-but-running
+node keeps its other write paths open, and the operator advice below still
+applies — but the offline case removal could not clean up for you is now closed.
 
 Before it commits, the cluster asks every other node whether it can actually
 read each package's source file — not whether the path looks the same, but
