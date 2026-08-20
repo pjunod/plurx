@@ -332,3 +332,11 @@ source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.
 source_anchor = "class StallBudgetTest"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 test_anchor = "budgetStopsAfterThreeSameRungAnswers"
+
+[[fixes]]
+id = "android.stall-coordinator-create-callback"
+commits = ["f9b8117a"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "private val createSession: suspend (CreateSessionReq) -> HlsStart"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "createSession = { body ->"
