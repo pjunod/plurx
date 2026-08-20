@@ -311,7 +311,7 @@ test_anchor = "stallReopenCarriesPreviousSessionIdAndReopenReason"
 
 [[fixes]]
 id = "android.bound-stall-budget-logic"
-commits = ["8a6d759"]
+commits = ["8a6d759", "c7b81c5"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "internal class StallReopenBudget"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
