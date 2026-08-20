@@ -1,112 +1,197 @@
 package tv.plurx.app.player
 
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
-import org.junit.Test
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Test
+import tv.plurx.app.data.CreateSessionReq
+import tv.plurx.app.data.HlsStart
+import tv.plurx.app.data.ReopenReason
 
-/**
- * Regression guard for the stall-reopen budget logic in [Controller].
- *
- * Each test verifies one acceptance criterion and fails when the matching
- * production correction is reverted.  The budget is a pure-function decision
- * on [Controller.isStrictDowngrade], so these tests need no Android runtime.
- */
+/** Regression guards for the production stall-reopen transition. */
 class StallBudgetTest {
-
-    // ---- strict downgrade (resolved < predecessor) -----------------------
-
     @Test
-    fun nullPredecessorHeightIsNeverADowngrade() {
-        // First stall at cold start: no predecessor height means we cannot
-        // determine a step down, so it must count toward the bound.
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = null, resolvedHeight = 1080))
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = null, resolvedHeight = null))
+    fun budgetStopsAfterThreeSameRungAnswers() {
+        val budget = StallReopenBudget()
+        budget.seed(240)
+
+        repeat(3) {
+            assertTrue(budget.canReopen())
+            budget.record(240)
+        }
+
+        assertFalse(budget.canReopen())
+        assertEquals(3, budget.nonDowngradeCount)
     }
 
     @Test
-    fun absentResolvedHeightIsNeverADowngrade() {
-        // The server returned no height (or height 0) — the client cannot
-        // verify a step down, so this counts toward the bound.
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = 1080, resolvedHeight = null))
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = 1080, resolvedHeight = 0))
+    fun strictDowngradeResetsBudgetAtThePredecessorsOwnRung() {
+        val budget = StallReopenBudget()
+        budget.seed(360)
+        budget.record(360)
+        budget.record(240)
+
+        assertTrue(budget.canReopen())
+        assertEquals(0, budget.nonDowngradeCount)
+        assertEquals(240, budget.predecessorHeight)
     }
 
     @Test
-    fun sameRungIsNotADowngrade() {
-        // Same rung at the floor: the server cannot step further down.
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = 480, resolvedHeight = 480))
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = 2160, resolvedHeight = 2160))
+    fun absentSameOrHigherAnswerConsumesBudget() {
+        val budget = StallReopenBudget()
+        budget.seed(480)
+
+        budget.record(null)
+        budget.seed(480)
+        budget.record(480)
+        budget.record(720)
+
+        assertFalse(budget.canReopen())
     }
 
     @Test
-    fun higherRungIsNotADowngrade() {
-        // The server answered with a higher rung (shouldn't happen in
-        // practice, but still not a downgrade).
-        assertFalse(Controller.isStrictDowngrade(predecessorHeight = 480, resolvedHeight = 720))
+    fun resetInvalidatesTheOldFloorBudget() {
+        val budget = StallReopenBudget()
+        budget.seed(240)
+        repeat(3) { budget.record(240) }
+
+        budget.reset()
+
+        assertTrue(budget.canReopen())
+        assertEquals(0, budget.nonDowngradeCount)
+        assertNull(budget.predecessorHeight)
     }
 
     @Test
-    fun strictlyLowerRungIsADowngrade() {
-        // A genuine downgrade resets the budget counter.
-        assertTrue(Controller.isStrictDowngrade(predecessorHeight = 2160, resolvedHeight = 1080))
-        assertTrue(Controller.isStrictDowngrade(predecessorHeight = 1080, resolvedHeight = 720))
-        assertTrue(Controller.isStrictDowngrade(predecessorHeight = 720, resolvedHeight = 480))
-    }
-
-    @Test
-    fun minHeightDowngradeFloorStillQualifies() {
-        // A sub-360 source resolves below the ladder; the floor is the
-        // predecessor's own rung, not 360.
-        assertTrue(Controller.isStrictDowngrade(predecessorHeight = 360, resolvedHeight = 240))
-    }
-
-    @Test
-    fun stallBudgetExercisesEveryAcceptanceCriterion() {
-        // Smoke-test anchor: each individual criterion has its own
-        // named test above.  This combined case confirms the full
-        // sequence that a Controller.onStall() caller exercises.
-        assertFalse(Controller.isStrictDowngrade(null, 1080))
-        assertFalse(Controller.isStrictDowngrade(1080, null))
-        assertFalse(Controller.isStrictDowngrade(1080, 0))
-        assertFalse(Controller.isStrictDowngrade(480, 480))
-        assertTrue(Controller.isStrictDowngrade(2160, 1080))
-        assertTrue(Controller.isStrictDowngrade(360, 240))
-    }
-
-    // ---- 400 fallback copy -------------------------------------------------
-    //
-    // When the server returns HTTP 400 for a bound-stall create, Controller
-    // retries once with an unbound body: it clears previousSessionId and
-    // reopenReason and mints a fresh requestId.  This test verifies that
-    // the value transformation is correct.
-
-    @Test
-    fun boundStall400FallbackClearsStallFields() {
-        val stallBody = tv.plurx.app.data.CreateSessionReq(
-            playback_id = "pb",
-            request_id = "stall-request-1",
-            height = 1080,
-            start = 4.0,
-            previous_session_id = "prev-42",
-            reopen_reason = tv.plurx.app.data.ReopenReason.Stall,
+    fun badRequestRetriesExactlyOnceUnboundWithFreshRequestId() = runBlocking {
+        val calls = mutableListOf<CreateSessionReq>()
+        val badRequest = TestBadRequest()
+        val coordinator = SessionCreateCoordinator(
+            create = { body ->
+                calls += body
+                if (calls.size == 1) throw badRequest
+                response("replacement")
+            },
+            isBadRequest = { it === badRequest },
+            freshRequestId = { "fresh-request" },
         )
-        // The fallback copy: same fields, but clear bound fields and
-        // mint a fresh request_id.
-        val fallbackBody = stallBody.copy(
-            requestId = "fallback-request-1",
-            previousSessionId = null,
-            reopenReason = null,
-        )
-        // Bound fields must be cleared.
-        assertNull("fallback must clear previous_session_id", fallbackBody.previous_session_id)
-        assertNull("fallback must clear reopen_reason", fallbackBody.reopen_reason)
-        // requestId was replaced, not inherited.
-        assertEquals("fallback-request-1", fallbackBody.request_id)
-        // Non-bound fields are preserved.
-        assertEquals("pb", fallbackBody.playback_id)
-        assertEquals(1080, fallbackBody.height)
-        assertEquals(4.0, fallbackBody.start, 0.001)
+
+        val result = coordinator.reopenAfterStall(stallBody())
+
+        assertEquals("replacement", result?.session_id)
+        assertEquals(2, calls.size)
+        assertEquals("predecessor", calls[0].previous_session_id)
+        assertEquals(ReopenReason.Stall, calls[0].reopen_reason)
+        assertEquals("fresh-request", calls[1].request_id)
+        assertNull(calls[1].previous_session_id)
+        assertNull(calls[1].reopen_reason)
     }
+
+    @Test
+    fun nonBadRequestIsTerminalWithoutFallback() = runBlocking {
+        val terminal = IllegalStateException("server failed")
+        var calls = 0
+        val coordinator = SessionCreateCoordinator(
+            create = {
+                calls++
+                throw terminal
+            },
+            isBadRequest = { false },
+            freshRequestId = { "unused" },
+        )
+
+        try {
+            coordinator.reopenAfterStall(stallBody())
+            fail("expected terminal failure")
+        } catch (failure: Throwable) {
+            assertSame(terminal, failure)
+        }
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun invalidationBeforeFallbackPreventsTheRetry() = runBlocking {
+        var current = true
+        var calls = 0
+        val badRequest = TestBadRequest()
+        val coordinator = SessionCreateCoordinator(
+            create = {
+                calls++
+                current = false
+                throw badRequest
+            },
+            isBadRequest = { it === badRequest },
+            freshRequestId = { "unused" },
+        )
+
+        assertNull(coordinator.reopenAfterStall(stallBody()) { current })
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun newerUserCreateIsTheFinalServerMutationAfterInFlightFallback() = runBlocking {
+        val calls = mutableListOf<CreateSessionReq>()
+        val fallbackStarted = CompletableDeferred<Unit>()
+        val finishFallback = CompletableDeferred<Unit>()
+        val badRequest = TestBadRequest()
+        var stallCurrent = true
+        val coordinator = SessionCreateCoordinator(
+            create = { body ->
+                calls += body
+                when (body.request_id) {
+                    "stall-request" -> throw badRequest
+                    "fallback-request" -> {
+                        fallbackStarted.complete(Unit)
+                        finishFallback.await()
+                        response("stale-fallback")
+                    }
+                    else -> response("user-session")
+                }
+            },
+            isBadRequest = { it === badRequest },
+            freshRequestId = { "fallback-request" },
+        )
+
+        val stall = async {
+            coordinator.reopenAfterStall(stallBody()) { stallCurrent }
+        }
+        fallbackStarted.await()
+        stallCurrent = false
+        val user = async {
+            coordinator.create(
+                CreateSessionReq(playback_id = "playback", request_id = "user-request"),
+            )
+        }
+        finishFallback.complete(Unit)
+
+        assertEquals("stale-fallback", stall.await()?.session_id)
+        assertEquals("user-session", user.await()?.session_id)
+        assertEquals(
+            listOf("stall-request", "fallback-request", "user-request"),
+            calls.map { it.request_id },
+        )
+    }
+
+    private fun stallBody() = CreateSessionReq(
+        playback_id = "playback",
+        request_id = "stall-request",
+        height = 1080,
+        start = 4.0,
+        previous_session_id = "predecessor",
+        reopen_reason = ReopenReason.Stall,
+    )
+
+    private fun response(id: String) = HlsStart(
+        session_id = id,
+        playlist_url = "/sessions/$id/master.m3u8",
+        height = 1080,
+    )
+
+    private class TestBadRequest : RuntimeException()
 }

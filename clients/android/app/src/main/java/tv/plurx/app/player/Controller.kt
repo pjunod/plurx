@@ -187,14 +187,18 @@ class Controller(
     /** One reconnect of the exact HDR recipe; a repeated failure is visible. */
     private var sameHdrRetryUsed = false
 
-    /** Height resolved in the last stall reopen's `StartResponse`, or null at cold start. */
-    private var stallPredecessorHeight: Int? = null
+    private val stallReopenBudget = StallReopenBudget()
 
-    /** Consecutive stall-reopen responses at the same resolved rung. */
-    private var stallReopenNonDowngradeCount = 0
-
-    /** Max consecutive stall-reopen responses at the same rung before giving up. */
-    private val maxStallNonDowngrade = 3
+    /**
+     * Every create for this playback passes through one coordinator. This
+     * keeps a newer user restart behind an in-flight stall fallback, making
+     * the user request the server's final replacement as well as the UI's.
+     */
+    private val sessionCreateCoordinator = SessionCreateCoordinator(
+        create = { body -> vm.createHlsSession(plan.fileId, body) },
+        isBadRequest = { failure -> failure is HttpException && failure.code() == 400 },
+        freshRequestId = { UUID.randomUUID().toString() },
+    )
 
     /**
      * The delivery this plan would use with no subtitle in play. A manual A/V
@@ -520,8 +524,7 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        stallPredecessorHeight = null
-        stallReopenNonDowngradeCount = 0
+        stallReopenBudget.reset()
 
         player.removeListener(listener)
         mediaSession.release()
@@ -601,8 +604,7 @@ class Controller(
         // A user-initiated restart (seek, quality switch, track change) resets
         // the stall reopen budget — the viewer chose a new state, so any
         // previous floor is stale.
-        stallPredecessorHeight = null
-        stallReopenNonDowngradeCount = 0
+        stallReopenBudget.reset()
 
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
@@ -646,7 +648,10 @@ class Controller(
         sessionIsVod = false
         scope.launch {
             val hls = try {
-                vm.createHlsSession(plan.fileId, sessionBody(ms))
+                sessionCreateCoordinator.create(
+                    body = sessionBody(ms),
+                    isCurrent = { requestVersion == sessionRequestVersion },
+                ) ?: return@launch
             } catch (cancelled: CancellationException) {
                 // The screen left composition (or a newer request superseded
                 // this one) — the caller saying stop, not the server failing.
@@ -670,7 +675,7 @@ class Controller(
             sessionId = hls.session_id
             // Save this session's resolved height so the stall-reopen budget
             // can compare each stall response against the predecessor rung.
-            stallPredecessorHeight = hls.height
+            stallReopenBudget.seed(hls.height)
             encoder = hls.encoder
             sessionIsVod = hls.vod
             hls.delivered_dynamic_range?.let { deliveredRange = it }
@@ -704,7 +709,7 @@ class Controller(
         // If we have already exhausted the budget at the current floor rung,
         // stop reopening — the server cannot step further down and the client
         // must not churn forever.
-        if (stallReopenNonDowngradeCount >= maxStallNonDowngrade) return
+        if (!stallReopenBudget.canReopen()) return
         val reason = "stall"
         val observedAtMs = monotonicNowMs()
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
@@ -717,8 +722,6 @@ class Controller(
         // before nulling the session ID.  The first stall reopen
         // compares against this; subsequent stalls compare against
         // each previous stall response.
-        val predecessorHeight = stallPredecessorHeight
-        stallPredecessorHeight = null
         // Keep the predecessor alive through the create request — the
         // server validates previous_session_id against a live session
         // map.  Session creation supersedes and kills the predecessor
@@ -744,38 +747,12 @@ class Controller(
                 reopenReason = ReopenReason.Stall,
             )
             val hls = try {
-                if (requestVersion != sessionRequestVersion) return@launch
-                vm.createHlsSession(plan.fileId, body)
+                sessionCreateCoordinator.reopenAfterStall(
+                    body = body,
+                    isCurrent = { requestVersion == sessionRequestVersion },
+                ) ?: return@launch
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (e: HttpException) {
-                // 400 fallback: retry once as an unbound create with a fresh request_id
-                if (e.code() == 400 && requestVersion == sessionRequestVersion) {
-                    val fallbackBody = body.copy(
-                        request_id = UUID.randomUUID().toString(),
-                        previous_session_id = null,
-                        reopen_reason = null,
-                    )
-                    if (requestVersion != sessionRequestVersion) return@launch
-                    val fallbackHls = try {
-                        vm.createHlsSession(plan.fileId, fallbackBody)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        if (requestVersion == sessionRequestVersion) {
-                            playbackTelemetry.cancel(attempt)
-                            onError("The stream stalled and recovery failed.")
-                        }
-                        return@launch
-                    }
-                    fallbackHls
-                } else {
-                    if (requestVersion == sessionRequestVersion) {
-                        playbackTelemetry.cancel(attempt)
-                        onError("The stream stalled and recovery failed.")
-                    }
-                    return@launch
-                }
             } catch (_: Exception) {
                 if (requestVersion == sessionRequestVersion) {
                     playbackTelemetry.cancel(attempt)
@@ -794,14 +771,7 @@ class Controller(
             // Absent or zero height counts as no step down — it is the server
             // saying "this session is already at its answer" without a rung
             // the client can compare.
-            val resolvedHeight = hls.height
-            val steppedDown = isStrictDowngrade(predecessorHeight, resolvedHeight)
-            if (steppedDown) {
-                stallReopenNonDowngradeCount = 0
-            } else {
-                stallReopenNonDowngradeCount++
-            }
-            stallPredecessorHeight = resolvedHeight
+            stallReopenBudget.record(hls.height)
             sessionId = hls.session_id
             encoder = hls.encoder
             sessionIsVod = hls.vod
@@ -953,24 +923,12 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        stallPredecessorHeight = null
-        stallReopenNonDowngradeCount = 0
+        stallReopenBudget.reset()
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —
         // otherwise a chip would keep reporting the session that just ended.
         deliveredRange = plan.deliveredDynamicRange
-    }
-
-    /**
-     * Pure stall-budget decision: whether one reopen response resolved a
-     * strictly lower rung than its predecessor.  Absent or zero height counts
-     * as no step down.  Tested in [StallBudgetTest].
-     */
-    internal companion object {
-        internal fun isStrictDowngrade(predecessorHeight: Int?, resolvedHeight: Int?): Boolean =
-            resolvedHeight != null && resolvedHeight > 0 &&
-                predecessorHeight != null && resolvedHeight < predecessorHeight
     }
 
     private fun remuxUri(ms: Long): String = progressiveRemuxUri(

@@ -299,7 +299,7 @@ commits = ["c54f9411"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "private fun onStall(positionMs: Long)"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
 
 [[fixes]]
 id = "android.bound-stall-predecessor-alive"
@@ -312,18 +312,18 @@ test_anchor = "stallReopenCarriesPreviousSessionIdAndReopenReason"
 [[fixes]]
 id = "android.bound-stall-budget-logic"
 commits = ["8a6d759"]
-source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
-source_anchor = "internal fun isStrictDowngrade(predecessorHeight: Int?, resolvedHeight: Int?)"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "internal class StallReopenBudget"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
 
 [[fixes]]
 id = "android.bound-stall-400-fallback"
 commits = ["95825c9", "88ca951", "0a9201977b0717e7f6235290b1615003fdc3142b", "bd86a5a"]
-source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
-source_anchor = "// 400 fallback: retry once as an unbound create with a fresh request_id"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "suspend fun reopenAfterStall("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "boundStall400FallbackClearsStallFields"
+test_anchor = "badRequestRetriesExactlyOnceUnboundWithFreshRequestId"
 
 [[fixes]]
 id = "android.stall-budget-test-format"
@@ -331,4 +331,4 @@ commits = ["afcc9bb"]
 source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 source_anchor = "class StallBudgetTest"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
