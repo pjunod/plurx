@@ -73,7 +73,7 @@ class StallBudgetTest {
         val calls = mutableListOf<CreateSessionReq>()
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
-            create = { body ->
+            createSession = { body ->
                 calls += body
                 if (calls.size == 1) throw badRequest
                 response("replacement")
@@ -98,7 +98,7 @@ class StallBudgetTest {
         val terminal = IllegalStateException("server failed")
         var calls = 0
         val coordinator = SessionCreateCoordinator(
-            create = {
+            createSession = {
                 calls++
                 throw terminal
             },
@@ -121,7 +121,7 @@ class StallBudgetTest {
         var calls = 0
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
-            create = {
+            createSession = {
                 calls++
                 current = false
                 throw badRequest
@@ -142,7 +142,7 @@ class StallBudgetTest {
         val badRequest = TestBadRequest()
         var stallCurrent = true
         val coordinator = SessionCreateCoordinator(
-            create = { body ->
+            createSession = { body ->
                 calls += body
                 when (body.request_id) {
                     "stall-request" -> throw badRequest
