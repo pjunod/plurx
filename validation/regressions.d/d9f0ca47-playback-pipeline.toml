@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d9f0ca47"]
+points = ["playback.pipeline"]
+checks = ["rust-gate", "playback-exhaustive"]
+reason = "The manager regressions hold a live transcode's first one-segment EVENT playlist until real media cushion exists, and the exhaustive shipped-player matrix rejects startup stalls."

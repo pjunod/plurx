@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["eecb645d", "a70731b1"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["playback-smoke", "playback-exhaustive"]
+reason = "The browser matrix exercises remembered decode limits and player controls throughout live playback."

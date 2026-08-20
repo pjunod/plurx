@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["09d540c0"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained episode-counter unit pins one Auto supply event per browser pause even when hls.js reports at the start and the video element reports at the end; restoring only the prior wall-clock coalescing lets two long pauses reach the three-stall rescue threshold."

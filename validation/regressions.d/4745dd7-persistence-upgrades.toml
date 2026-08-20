@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4745dd7"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate"]
+reason = "The retained process regression `activated_one_voter_rebuilds_current_state_after_sigkill` proves that an acknowledged post-activation write survives SIGKILL and restart through Hiqlite auto-heal."
