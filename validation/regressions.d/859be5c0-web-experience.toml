@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["859be5c0"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy unit pins severe-pressure selection against fresh completed-fragment throughput and proves a duplicate supply signal cannot trigger a second restart at the ladder floor; restoring only the pre-correction controller ignores the fresh cliff sample and walks through an intermediate rung."

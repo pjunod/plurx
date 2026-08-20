@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["593c7aca"]
+points = ["offline.viewing", "persistence.upgrades", "operations.packaging"]
+checks = ["offline-contract", "cluster-auth", "operations-contract"]
+reason = "SQLite, HTTP, and shared-store contracts pin first-write-wins offline request idempotency across a server policy change; harness counterexamples reject producer, offline, direct-delivery, and competing-session contamination before and during capture."

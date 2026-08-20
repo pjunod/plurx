@@ -1,0 +1,17 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "8ec51001",
+  "f2ded341",
+  "841d6003",
+  "07a07864",
+  "2c4347fb",
+  "57634389",
+  "62d1d1ad",
+  "53ec0ee2",
+  "9edf23b7",
+]
+points = ["operations.packaging", "validation.framework"]
+checks = ["operations-contract"]
+reason = "Executable source contracts pin Compose identity, override discovery, configured ports, build stamps, report parsing, and real client shipping targets."

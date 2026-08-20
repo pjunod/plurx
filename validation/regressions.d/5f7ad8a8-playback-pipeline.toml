@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["5f7ad8a8"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained replacement-gap regression pins that watchdog and copy-segmenter restarts remove the killed predecessor before the next playlist poll; reverting only the production correction permanently fails the replacement session."
