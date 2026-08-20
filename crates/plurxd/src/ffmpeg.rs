@@ -553,26 +553,30 @@ fn classify_burst(mut caps: PacingCaps, probe: Result<Duration, String>) -> Paci
     caps
 }
 
-async fn probe_burst() -> Result<Duration, String> {
-    let args = &[
+fn burst_probe_args() -> [&'static str; 14] {
+    [
         "-hide_banner",
         "-loglevel",
         "error",
         "-f",
         "lavfi",
-        "-i",
-        "testsrc=duration=2:size=2x2:rate=1",
         "-readrate_initial_burst",
         "300",
         "-readrate",
         "2",
+        "-i",
+        "testsrc=duration=2:size=2x2:rate=1",
         "-f",
         "null",
         "-",
-    ];
+    ]
+}
+
+async fn probe_burst() -> Result<Duration, String> {
+    let args = burst_probe_args();
     let start = std::time::Instant::now();
     match tokio::process::Command::new(ffmpeg_bin())
-        .args(args)
+        .args(&args)
         .output()
         .await
     {
@@ -737,6 +741,25 @@ mod tests {
             assert_eq!(
                 corrected.resolve(2.0, 90.0, true).args(),
                 vec!["-readrate", "2.00"]
+            );
+        }
+    }
+
+    #[test]
+    fn burst_probe_applies_pacing_to_the_input() {
+        let args = burst_probe_args();
+        let input = args
+            .iter()
+            .position(|arg| *arg == "-i")
+            .expect("the probe must declare its synthetic input");
+        for option in ["-readrate_initial_burst", "-readrate"] {
+            let option_index = args
+                .iter()
+                .position(|arg| *arg == option)
+                .unwrap_or_else(|| panic!("the probe must pass {option}"));
+            assert!(
+                option_index < input,
+                "{option} is an input option and must precede -i: {args:?}"
             );
         }
     }
