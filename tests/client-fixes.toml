@@ -292,3 +292,11 @@ source = "clients/apple/project.yml"
 source_anchor = "CURRENT_PROJECT_VERSION: \"67\""
 test = "tests/operations/test_mobile_build_claims.py"
 test_anchor = "test_repository_build_claims_match_release_inputs"
+
+[[fixes]]
+id = "android.bound-stall-downgrade"
+commits = ["c54f9411", "39eb38c7", "43dbf510"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "private fun onStall(positionMs: Long)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "stallReopenCarriesPreviousSessionIdAndReopenReason"
