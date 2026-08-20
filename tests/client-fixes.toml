@@ -319,7 +319,7 @@ test_anchor = "budgetStopsAfterThreeSameRungAnswers"
 
 [[fixes]]
 id = "android.bound-stall-400-fallback"
-commits = ["95825c9", "88ca951", "0a9201977b0717e7f6235290b1615003fdc3142b", "bd86a5a"]
+commits = ["95825c9", "88ca951", "0a9201977b0717e7f6235290b1615003fdc3142b", "bd86a5a", "c5a8817"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "suspend fun reopenAfterStall("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
