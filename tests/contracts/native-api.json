@@ -90,7 +90,8 @@
       }
     ],
     "children": [],
-    "ancestors": []
+    "ancestors": [],
+    "reading": null
   },
   "audiobook_detail": {
     "item": {
@@ -181,7 +182,8 @@
       }
     ],
     "children": [],
-    "ancestors": []
+    "ancestors": [],
+    "reading": null
   },
   "page": {
     "items": [

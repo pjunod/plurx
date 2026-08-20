@@ -1,6 +1,6 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0 complete · M1–M6 ready to build · **Written:**
+**Status:** M0–M1 complete · M2–M6 ready to build · **Written:**
 2026-08-20 · **Verified against:** `plurx` `810c3b16` and `monarr` `00bf7d9`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
@@ -73,7 +73,7 @@ Six decisions define the work:
 | Curator | Ebook and audiobook editions, metadata, profiles, search, import | M0 replaced its stale book decline with exact-path `hint:"book"` targeted scans. |
 | Runner | Downloads and unpacks Curator's payload | Nothing. Runner must remain unaware of reading. |
 | Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
-| Cinema server | Authenticated, range-capable `GET /api/v1/files/{id}/content` for original book bytes | No reading-state store or reader surface. |
+| Cinema server | Authenticated, range-capable original bytes plus revision-bound, per-user reading-state storage and API | No reader surface. |
 | Cinema web | Books shelf, detail, **Open book**, **Download** | Opens another browser/platform handler; no in-app EPUB renderer. |
 | Cinema native | Book detail on Apple and Android; external URL intent | No phone/tablet reader or ebook offline record. |
 | User state | Timed `watch_state` for movies, episodes, videos, and audiobooks | Text books are correctly excluded; a locator-shaped sibling is needed. |
@@ -134,11 +134,12 @@ product contract is decided separately.
 
 ## 4. Server contract — reading state is a locator, not a clock
 
-Re-verify the identifiers below against `crates/plurx-core/src/store/mod.rs`,
-`crates/plurx-core/src/store/sqlite/mod.rs`,
-`crates/plurx-core/src/store/hiqlite_catalog.rs`, and
-`crates/plurxd/src/http/mod.rs` when M1 begins. SQLite is schema v19 at this
-plan's baseline, so the append-only migration below is v20.
+The implementation lives in `crates/plurx-core/src/store/mod.rs`,
+`crates/plurx-core/src/store/sqlite/reading.rs`,
+`crates/plurx-core/src/store/hiqlite_reading.rs`, and
+`crates/plurxd/src/http/reading.rs`. M1 advanced SQLite from schema v19 to
+v20 and the authoritative Hiqlite schema from v5 to v6 without changing the
+replicated protocol version.
 
 ### 4.1 Durable model
 
@@ -176,7 +177,7 @@ resume locator until the current revision records one.
   "type": "application/xhtml+xml",
   "locations": {
     "progression": 0.42,
-    "total_progression": 0.19,
+    "totalProgression": 0.19,
     "position": 56
   }
 }
@@ -184,7 +185,7 @@ resume locator until the current revision records one.
 
 `href` names a manifest resource after archive-path normalization.
 `locations.progression` is the fraction within that resource;
-`total_progression` is the fraction through the full publication; `position`
+`totalProgression` is the fraction through the full publication; `position`
 is optional renderer output, never the sole resume authority. New fields are
 additive. A future incompatible representation increments `version` and keeps
 the v1 decoder until all shipped clients have crossed the migration window.
@@ -335,6 +336,10 @@ make check                            # Cinema repository baseline
 
 ### 7.2 M1 — replicated reading state and API
 
+**Status:** complete 2026-08-20. SQLite and three-voter Hiqlite run the same
+reading-state contract; full repository, cluster, Apple, and Android model
+gates are green.
+
 Add §4's `ReadingState` domain type, `ReadingStore`, SQLite v20 migration,
 Hiqlite catalogue table/dumps/import parity, three user-token routes, DTO
 summary, OpenAPI/native models, and backend-neutral tests. The server accepts
@@ -455,7 +460,7 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | Milestone | State | Evidence |
 |---|---|---|
 | M0 · Curator handoff | Complete | Curator `make test`; Cinema `make check`; focused cross-seam tests |
-| M1 · Reading state/API | Planned | §4 contract |
+| M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
 | M2 · EPUB proof/web | Planned | §5 proof matrix |
 | M3 · Native online | Planned | Simulator/emulator + accessibility acceptance |
 | M4 · Offline EPUB | Planned | Physical airplane-mode drill |

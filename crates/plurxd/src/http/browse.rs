@@ -11,7 +11,9 @@ use plurx_core::domain::{Item, ItemKind, ItemSort, WatchState};
 use plurx_core::mediafacts::MediaFacts;
 use serde::{Deserialize, Serialize};
 
-use super::dto::{chapters_from_probe_json, in_progress_dto, recent_dto, FileDto, ItemDto};
+use super::dto::{
+    chapters_from_probe_json, in_progress_dto, recent_dto, FileDto, ItemDto, ReadingDto,
+};
 use super::error::ApiError;
 use super::extract::AuthUser;
 use crate::state::AppState;
@@ -244,6 +246,9 @@ pub struct ItemDetail {
     pub ancestors: Vec<ItemDto>,
     pub children: Vec<ItemDto>,
     pub files: Vec<FileDto>,
+    /// Current revision-bound locator for text books. `None` means unread or
+    /// that the saved locator belongs to a replaced file revision.
+    pub reading: Option<ReadingDto>,
 }
 
 /// GET /api/v1/items/:id — item plus its ancestors (for breadcrumbs),
@@ -369,6 +374,16 @@ pub async fn item_detail(
         _ => None,
     };
 
+    let reading = if item.kind == ItemKind::Book {
+        state
+            .store
+            .current_reading_state(user.id, id)
+            .await?
+            .map(ReadingDto::try_from)
+            .transpose()?
+    } else {
+        None
+    };
     let item_dto = ItemDto::from(item)
         .with_watch(watch.get(&id).copied())
         .with_rollup(rollup);
@@ -377,6 +392,7 @@ pub async fn item_detail(
         ancestors: ancestors.into_iter().map(Into::into).collect(),
         children: annotate_with_counts(children, &watch, &child_counts, &mut child_media),
         files: file_dtos,
+        reading,
     }))
 }
 

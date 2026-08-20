@@ -307,6 +307,7 @@ paths = [
   "crates/plurx-core/src/store/mod.rs",
   "crates/plurx-core/src/store/replicated.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
+  "crates/plurx-core/src/store/sqlite/reading.rs",
   "crates/plurx-core/src/store/sqlite/telemetry.rs",
   "crates/plurx-core/src/store/telemetry.rs",
   "crates/plurx-core/tests/store_contract.rs",
@@ -339,6 +340,7 @@ paths = [
   "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
   "vendor/rust_decimal/**",
@@ -365,7 +367,7 @@ contract = "The single server binary exposes stable native endpoints and coordin
 paths = [
   "crates/plurxd/Cargo.toml",
   "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
-  "crates/plurxd/src/http/{dto,error,extract,mod,network,system}.rs",
+  "crates/plurxd/src/http/{dto,error,extract,mod,network,reading,system}.rs",
   "plurx.example.toml",
 ]
 checks = ["rust-gate", "api-wire", "user-journey"]
