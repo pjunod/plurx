@@ -23,6 +23,7 @@ mod offline;
 mod pgs_overlay;
 mod photos;
 mod plex;
+mod reading;
 mod scan;
 pub(crate) mod stream;
 pub(crate) mod system;
@@ -50,6 +51,7 @@ mod users;
 mod watch;
 mod web;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
 use axum::response::IntoResponse;
@@ -153,6 +155,13 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/progress", post(watch::progress))
         .route("/items/{id}/scrobble", post(watch::scrobble))
         .route("/items/{id}/unscrobble", post(watch::unscrobble))
+        .route(
+            "/items/{id}/reading-state",
+            get(reading::get_state)
+                .put(reading::put_state)
+                .delete(reading::delete_state)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         // Playback
         .route("/files/{id}/decision", get(stream::decision))
         .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
@@ -943,6 +952,49 @@ mod tests {
         assert_eq!(rec["status"], "done");
         assert_eq!(rec["correlation_id"], "t-42-a3f9c1");
         assert_eq!(rec["source"], "monarr");
+    }
+
+    /// Curator announces book imports through the same targeted-scan seam as
+    /// video. The hint carries no provider id: the resolved Books library and
+    /// the file extension decide whether this is a text book or audiobook.
+    #[tokio::test]
+    async fn a_curator_book_import_reaches_the_books_library() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let book = dir.path().join("Ursula K. Le Guin/The Dispossessed");
+        std::fs::create_dir_all(&book).expect("mkdir");
+        std::fs::write(book.join("The Dispossessed.epub"), b"epub fixture").expect("write");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Books", "kind": "books", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let body = scan_and_settle(
+            &app,
+            &key,
+            json!({
+                "path": book,
+                "hint": "book",
+                "correlation_id": "t-84-books",
+                "source": "monarr"
+            }),
+        )
+        .await;
+        assert_eq!(body["correlation_id"], "t-84-books");
+        let item_id = body["items"][0]["item_id"].as_i64().expect("item id");
+        let (status, detail) =
+            call(&app, get(&format!("/api/v1/items/{item_id}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["item"]["kind"], "book");
+        assert_eq!(detail["item"]["title"], "The Dispossessed");
     }
 
     /// The rail is absent, not broken, when no monarr is paired — and a
@@ -2448,7 +2500,7 @@ mod tests {
                     "node_id": "joining-node",
                     "raft_address": "127.0.0.1:32411",
                     "api_address": "127.0.0.1:32412",
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "protocol_version": 4
                 }),
             ),
@@ -3003,6 +3055,305 @@ mod tests {
         );
         state.pgs_overlay_enabled = true;
         (router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn reading_state_api_is_authenticated_revision_bound_and_ordered() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Reading API Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![std::path::PathBuf::from("/reading-api")],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let book = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "Reading API Contract".into(),
+                year: Some(2026),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.epub",
+                4_096,
+                100,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+
+        let uri = format!("/api/v1/items/{book}/reading-state?file_id={file}");
+        assert_eq!(
+            call(&app, get(&uri, None)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, empty) = call(&app, get(&uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert!(empty["state"].is_null());
+        assert_eq!(empty["stale"], false);
+
+        let put_uri = format!("/api/v1/items/{book}/reading-state");
+        let (status, saved) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4096, "mtime": 100 },
+                    "locator": {
+                        "version": 1,
+                        "href": "Text/chapter-3.xhtml#paragraph-2",
+                        "locations": { "progression": 0.6, "totalProgression": 0.6 }
+                    },
+                    "progression": 0.6,
+                    "completed": false,
+                    "recorded_at": 200
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["file_id"], file);
+        assert_eq!(saved["revision"], json!({ "size": 4096, "mtime": 100 }));
+        assert_eq!(saved["progression"], 0.6);
+
+        // An older offline close event returns the durable winner; it cannot
+        // rewind the state saved by a newer device.
+        let (status, winner) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4096, "mtime": 100 },
+                    "locator": { "version": 1, "href": "Text/chapter-1.xhtml" },
+                    "progression": 0.1,
+                    "completed": false,
+                    "recorded_at": 100
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{winner}");
+        assert_eq!(winner["progression"], 0.6);
+        assert_eq!(
+            winner["locator"]["href"],
+            "Text/chapter-3.xhtml#paragraph-2"
+        );
+
+        let (status, detail) =
+            call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["reading"]["progression"], 0.6);
+
+        let (status, conflict) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4097, "mtime": 100 },
+                    "locator": { "version": 1, "href": "chapter.xhtml" },
+                    "progression": 0.7,
+                    "completed": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+
+        let same_file = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.epub",
+                4_100,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("replace revision");
+        assert_eq!(same_file, file);
+        let (status, stale) = call(&app, get(&uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{stale}");
+        assert_eq!(stale["stale"], true);
+        assert!(stale["state"].is_null(), "{stale}");
+        let (_, detail) = call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
+        assert!(detail["reading"].is_null(), "{detail}");
+
+        let (status, current) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4100, "mtime": 101 },
+                    "locator": { "version": 1, "href": "Text/chapter-4.xhtml" },
+                    "progression": 1.0,
+                    "completed": true,
+                    "recorded_at": 50
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert_eq!(current["completed"], true);
+        assert_eq!(current["updated_at"], 50);
+
+        assert_eq!(
+            call(&app, delete(&uri, Some(&admin))).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(&app, delete(&uri, Some(&admin))).await.0,
+            StatusCode::NO_CONTENT,
+            "deletion is idempotent"
+        );
+        assert!(call(&app, get(&uri, Some(&admin))).await.1["state"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reading_state_api_rejects_non_books_invalid_locators_and_large_bodies() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Reading Validation Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![std::path::PathBuf::from("/reading-validation")],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let mut items = Vec::new();
+        for (kind, name, extension) in [
+            (ItemKind::Book, "Text", "epub"),
+            (ItemKind::Audiobook, "Audio", "m4b"),
+        ] {
+            let item = state
+                .store
+                .insert_item(&NewItem {
+                    library_id: library.id,
+                    kind,
+                    parent_id: None,
+                    title: name.into(),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("item");
+            let file = state
+                .store
+                .upsert_file(
+                    item,
+                    &format!("/reading-validation/{name}.{extension}"),
+                    100,
+                    10,
+                    &ProbeResult::default(),
+                )
+                .await
+                .expect("file");
+            items.push((item, file));
+        }
+        let (book, book_file) = items[0];
+        let (audio, audio_file) = items[1];
+        let payload = |locator: Value, progression: f64| {
+            json!({
+                "file_id": book_file,
+                "revision": { "size": 100, "mtime": 10 },
+                "locator": locator,
+                "progression": progression,
+                "completed": false
+            })
+        };
+
+        for locator in [
+            json!({ "version": 2, "href": "chapter.xhtml" }),
+            json!({ "version": 1, "href": "../secret" }),
+            json!({ "version": 1, "href": "https://example.com/chapter" }),
+            json!({
+                "version": 1,
+                "href": "chapter.xhtml",
+                "locations": { "progression": 1.1 }
+            }),
+        ] {
+            let (status, body) = call(
+                &app,
+                put(
+                    &format!("/api/v1/items/{book}/reading-state"),
+                    Some(&admin),
+                    payload(locator, 0.5),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/items/{book}/reading-state"),
+                    Some(&admin),
+                    payload(json!({ "version": 1, "href": "chapter.xhtml" }), 1.1),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (status, body) = call(
+            &app,
+            put(
+                &format!("/api/v1/items/{audio}/reading-state"),
+                Some(&admin),
+                json!({
+                    "file_id": audio_file,
+                    "revision": { "size": 100, "mtime": 10 },
+                    "locator": { "version": 1, "href": "chapter.xhtml" },
+                    "progression": 0.5,
+                    "completed": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let oversized = "x".repeat(70 * 1024);
+        let (status, _) = call(
+            &app,
+            put(
+                &format!("/api/v1/items/{book}/reading-state"),
+                Some(&admin),
+                payload(json!({ "version": 1, "href": oversized }), 0.5),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -5785,6 +6136,7 @@ mod tests {
                 "/files/0/probed",
                 "/children",
                 "/ancestors",
+                "/reading",
             ],
         );
 
