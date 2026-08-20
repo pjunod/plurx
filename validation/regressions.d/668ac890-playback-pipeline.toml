@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["668ac890"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The HLS HTTP refusal contract and helper matrix pin the server-side DV/HDR10/HLG subtitle-burn guard before encoder creation."

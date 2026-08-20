@@ -10,6 +10,19 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Recording a regression mapping no longer conflicts every other open pull
+  request.** Every corrective change used to append a `[[coverage]]` block to
+  the tail of one `validation/regressions.toml`, so each merge to `main` put a
+  conflict in the same region of every other branch carrying a mapping —
+  and clearing it with a rebase rewrote the SHAs a reviewer had pinned an
+  approval to. The ledger is now a directory: one entry per file at
+  `validation/regressions.d/<first-commit-prefix>-<slug>.toml`, loaded and
+  concatenated by the history audit. Two changes cannot pick the same path, so
+  the collision is structurally impossible rather than merely rare, and the
+  loader refuses to run while a shared `validation/regressions.toml` exists.
+  All 66 existing entries moved across with their claims unchanged; the audit
+  reports the same 414 corrective commits and the same route for every one.
+
 - **Apple copy-HLS stall recovery no longer replays the preceding keyframe.**
   A replacement session still opens on the keyframe before the requested film
   position, but the client now seeks the attached item forward by that exact

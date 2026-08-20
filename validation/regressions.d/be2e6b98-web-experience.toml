@@ -1,0 +1,25 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "be2e6b98",
+  "51e9e223",
+  "7ec96fb1",
+  "0c107ed1",
+  "198d7abc",
+  "35760622",
+  "f07dd96a",
+  "27fd7bb7",
+  "aba1e5df",
+  "a153e0eb",
+  "485f1034",
+  "5595f224",
+  "e7a12cf4",
+  "0e7a3cea",
+  "9cbd1ca6",
+  "e5c3bdfa",
+  "e59bd691",
+]
+points = ["web.experience"]
+checks = ["web-static", "web-layout"]
+reason = "The deterministic browser sweep covers every layout, route, and viewport while enforcing structure, focus order, requests, accessibility, and error-free rendering."
