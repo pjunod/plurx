@@ -203,9 +203,9 @@ class StallBudgetTest {
     fun subtitleTrackChangeResetsBudget() {
         val budget = StallReopenBudget()
         budget.seed(1080)
-        budget.record(720)
+        budget.record(1080)
         assertEquals(1, budget.nonDowngradeCount)
-        assertEquals(720, budget.predecessorHeight)
+        assertEquals(1080, budget.predecessorHeight)
 
         // Subtitle track change resets the budget
         budget.reset()
