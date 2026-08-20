@@ -2180,18 +2180,10 @@ async fn handle_request(
             {
                 Ok(OfflineCreateOutcome::NodeIsTombstone) => Ok(Response::Ok),
                 Ok(other) => bail!(
-                    "removed node was not refused as tombstone: expected                      NodeIsTombstone, got {other:?}"
+                    "removed node was not refused as tombstone: expected \
+                     NodeIsTombstone, got {other:?}"
                 ),
-                Err(error) => {
-                    // A missing cluster_nodes table on non-replicated paths is
-                    // expected and not an error.
-                    let msg = error.to_string();
-                    if msg.contains("no such table: cluster_nodes") {
-                        Ok(Response::Ok)
-                    } else {
-                        bail!("tombstone offline fence failed: {error:#}")
-                    }
-                }
+                Err(error) => bail!("tombstone offline fence failed: {error:#}"),
             }
         }
         Request::HeartbeatPreservesTombstone { node_id } => {

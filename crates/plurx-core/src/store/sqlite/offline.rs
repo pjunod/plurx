@@ -883,7 +883,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn single_node_does_not_reject_packages_as_node_removed() {
         // Single-node SQLite has no removal path and no `cluster_nodes`

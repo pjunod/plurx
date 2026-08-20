@@ -966,7 +966,6 @@ struct OfflineAdmissionRow {
     node_used: i64,
 }
 
-
 struct MembershipTombstoneRow {
     removed_at: Option<i64>,
 }
@@ -1250,7 +1249,30 @@ impl OfflinePackageStore for HiqliteAuthStore {
             )));
         }
         let now = self.now()?;
-        let sql = "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
+        // The replicated Store can be exercised before MembershipManager owns
+        // and creates `cluster_nodes` (notably by the backend-neutral store
+        // contract). Once that schema exists, every insert must consult it in
+        // the same statement so removal cannot race package creation. If it is
+        // absent, there cannot yet be a membership tombstone to fence.
+        let membership_schema_exists = self
+            .client()
+            .query_consistent_map::<ScalarRow, _>(
+                "SELECT COUNT(*) AS value FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'cluster_nodes'",
+                params!(),
+            )
+            .await
+            .map_err(database_error)?
+            .first()
+            .is_some_and(|row| row.value > 0);
+        let tombstone_clause = if membership_schema_exists {
+            "AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
+                 WHERE node_id = $5 AND removed_at IS NOT NULL)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
                     source_path, source_size, source_mtime, effective_rate_control, \
                     target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
@@ -1271,21 +1293,21 @@ impl OfflinePackageStore for HiqliteAuthStore {
                    AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE node_id = $5 \
                        AND state IN ('queued', 'preparing', 'ready')) <= $24 - $19 \
-                   AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
-                     WHERE node_id = $5 AND removed_at IS NOT NULL) \
+                   {tombstone_clause} \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
                     source_size, source_mtime, recipe_hash, effective_rate_control, \
                     target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
-                    error_message, created_at, updated_at, last_access_at, expires_at";
-        validate_sql(sql)?;
+                    error_message, created_at, updated_at, last_access_at, expires_at"
+        );
+        validate_sql(&sql)?;
         for attempt in 0..2 {
             let inserted = self
                 .client()
                 .execute_returning_map::<_, OfflinePackageRow>(
-                    sql,
+                    sql.clone(),
                     params!(
                         package.id.as_str(),
                         package.request_id.as_str(),
@@ -1344,17 +1366,18 @@ impl OfflinePackageStore for HiqliteAuthStore {
             // If the INSERT fell through AND no existing package was found, the
             // node may have been removed. Fail early with a legible outcome
             // rather than falling through to "admission changed concurrently".
-            if self
-                .client()
-                .query_consistent_map::<MembershipTombstoneRow, _>(
-                    "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
-                    hiqlite::macros::params!(package.node_id.as_str()),
-                )
-                .await
-                .map_err(database_error)?
-                .first()
-                .and_then(|row| row.removed_at)
-                .is_some()
+            if membership_schema_exists
+                && self
+                    .client()
+                    .query_consistent_map::<MembershipTombstoneRow, _>(
+                        "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                        hiqlite::macros::params!(package.node_id.as_str()),
+                    )
+                    .await
+                    .map_err(database_error)?
+                    .first()
+                    .and_then(|row| row.removed_at)
+                    .is_some()
             {
                 return Ok(OfflineCreateOutcome::NodeIsTombstone);
             }

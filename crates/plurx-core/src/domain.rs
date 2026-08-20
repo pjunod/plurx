@@ -676,9 +676,17 @@ pub enum OfflineCreateOutcome {
     Created(OfflinePackage),
     Existing(OfflinePackage),
     RequestConflict,
-    RowLimit { limit: i64 },
-    ByteLimit { used: i64, limit: i64 },
-    GlobalByteLimit { used: i64, limit: i64 },
+    RowLimit {
+        limit: i64,
+    },
+    ByteLimit {
+        used: i64,
+        limit: i64,
+    },
+    GlobalByteLimit {
+        used: i64,
+        limit: i64,
+    },
     /// The requesting node has been removed from the cluster; its `removed_at`
     /// tombstone is set in `cluster_nodes`. A removed-but-still-running node
     /// cannot create new offline packages. Single-node SQLite never returns

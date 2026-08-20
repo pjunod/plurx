@@ -590,3 +590,9 @@ commits = ["de5699c"]
 points = ["cluster.membership", "offline.viewing"]
 checks = ["rust-gate"]
 reason = "The `membership` scenario now requests one offline package from the removed-but-running node after removal (TombstoneOfflineFence), and requires the response to be `NodeIsTombstone`. Reverting the `NOT EXISTS` clause in the hiqlite INSERT and the separate tombstone-probe fallback both fail the same scenario: the INSERT returns `Created` instead of refusing. Reverting the `single_node_does_not_reject_packages_as_node_removed` SQLite test also fails `scripts/prove-tombstone-offline-fence` step 1, which proves single-node is unaffected."
+
+[[coverage]]
+commits = ["eb5b74b"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "This metadata-only correction replaces a stale provisional commit ID with the published tombstone-fence implementation commit. `make history-check` validates that the corrective commit resolves to retained evidence and rejects stale or cross-contract mappings."
