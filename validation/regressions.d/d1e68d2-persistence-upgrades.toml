@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d1e68d2"]
+points = ["core.media", "persistence.upgrades", "playback.pipeline", "server.api"]
+checks = ["rust-gate"]
+reason = "Formatting and clippy derive fixes for the network prior credential-generation implementation; exercised by rust-gate format, lint, and workspace tests."

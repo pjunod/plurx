@@ -1,0 +1,6 @@
+version = 1
+
+[[coverage]]
+commits = ["78f3646"]
+ignore = true
+reason = "This commit only records the formatting fix's validation evidence in regressions.toml; it does not change runtime behavior."
