@@ -615,3 +615,10 @@ commits = ["9bae48af"]
 points = ["cluster.membership", "offline.viewing"]
 checks = ["cluster-auth"]
 reason = "The `membership` scenario now requests one more download on the departing node 250 ms into its removal — after the resolution plan was drawn, inside the bounded probe wait — and requires it to end up moved to a survivor or failed `node_removed` with its reservation released, never left queued on the removed node. `scripts/prove-fix e52e7de9 - crates/plurx-core/src/cluster/membership.rs` restores only the pre-fix removal path and the scenario fails with exactly the stranded row it exists to reject: `state: \"queued\", node_id: \"node-2\", reserved_bytes: 900`. The producer fence is pinned separately in the replicated offline contract the default `cluster-check` gate runs: a wrong-node yield or progress write against a preparing package must change nothing, and removing either `node_id` predicate from the hiqlite statements fails that assertion."
+
+[[coverage]]
+commits = ["d1e68d22"]
+points = ["core.media", "persistence.upgrades", "cluster.auth", "server.api", "api.contract", "playback.pipeline", "watch-state.sync"]
+checks = ["rust-gate"]
+reason = "Rust auto-formatting and clippy derive fixes for the credential-generation implementation. The rust-gate validates all affected surfaces. No behavioral change."
+
