@@ -359,7 +359,7 @@ test_anchor = "consecutiveUserActionsAdvanceSequenceMonotonically"
 
 [[fixes]]
 id = "android.stall-budget-reset-count-and-coordinator-invalidation"
-commits = ["241a08e"]
+commits = ["241a08e", "adcd84c"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "fun resetForUserAction()"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
