@@ -284,13 +284,11 @@ pub async fn create(
         .await;
     let mut identity = super::network::identity(&headers, remote);
     if let Some(ref mut id) = identity {
-        id.credential_generation = Some(
-            plurx_core::domain::CredentialGeneration::derive(
-                user.id,
-                user.created_at,
-                &user.password_hash,
-            ),
-        );
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
     }
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), identity.as_ref()).await?;

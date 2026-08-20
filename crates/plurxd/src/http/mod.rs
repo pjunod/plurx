@@ -2786,7 +2786,8 @@ mod tests {
             user.id,
             user.created_at,
             &user.password_hash,
-        ).into_inner();
+        )
+        .into_inner();
         let prior = || {
             state
                 .store

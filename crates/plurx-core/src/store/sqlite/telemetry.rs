@@ -49,7 +49,12 @@ impl NetworkPriorStore for SqliteStore {
         let client_class = client_class.to_owned();
         let network_fingerprint = network_fingerprint.to_owned();
         self.with_read(move |conn| {
-            crate::store::telemetry::get_prior(conn, &credential_generation, &client_class, &network_fingerprint)
+            crate::store::telemetry::get_prior(
+                conn,
+                &credential_generation,
+                &client_class,
+                &network_fingerprint,
+            )
         })
         .await
     }

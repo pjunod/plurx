@@ -419,9 +419,7 @@ impl NodeLocalTelemetry {
                 // with the credential-generation text key. Old numeric-key
                 // rows cannot be translated because the user_id alone is not
                 // enough material to recover the credential generation.
-                migration.push_str(
-                    "DROP TABLE IF EXISTS network_priors;\n"
-                );
+                migration.push_str("DROP TABLE IF EXISTS network_priors;\n");
                 migration.push_str(NETWORK_PRIORS_SCHEMA);
                 migration.push('\n');
             }
@@ -487,7 +485,12 @@ impl NodeLocalTelemetry {
         network_fingerprint: String,
     ) -> Result<Option<NetworkPrior>, StoreError> {
         self.with_conn(move |conn| {
-            get_prior(conn, &credential_generation, &client_class, &network_fingerprint)
+            get_prior(
+                conn,
+                &credential_generation,
+                &client_class,
+                &network_fingerprint,
+            )
         })
         .await
     }
@@ -813,7 +816,11 @@ mod tests {
         assert_eq!(prior.sustained_kbps, Some(5_000));
         assert_eq!(
             sidecar
-                .prior("test-gen".to_owned(), "safari".to_owned(), "192.0.2.0/24".to_owned())
+                .prior(
+                    "test-gen".to_owned(),
+                    "safari".to_owned(),
+                    "192.0.2.0/24".to_owned()
+                )
                 .await
                 .expect("read migrated prior"),
             Some(prior)
@@ -873,7 +880,11 @@ mod tests {
         // not enough material to recover the credential generation.
         assert!(
             sidecar
-                .prior("test-gen".to_owned(), "safari".to_owned(), "192.0.2.0/24".to_owned())
+                .prior(
+                    "test-gen".to_owned(),
+                    "safari".to_owned(),
+                    "192.0.2.0/24".to_owned()
+                )
                 .await
                 .expect("read old prior")
                 .is_none(),

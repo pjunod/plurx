@@ -627,13 +627,11 @@ pub async fn client_log(
     // read paths use, or the prior is written under a key nothing reads.
     let mut network = super::network::identity(&headers, remote);
     if let Some(ref mut id) = network {
-        id.credential_generation = Some(
-            plurx_core::domain::CredentialGeneration::derive(
-                user.id,
-                user.created_at,
-                &user.password_hash,
-            ),
-        );
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
     }
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);

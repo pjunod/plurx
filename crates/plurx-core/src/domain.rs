@@ -845,7 +845,7 @@ pub struct PlaybackEventQuery {
 /// credential generation is also opaque — it is the stable node-local prior
 /// identity derived from the user's credential material and must never be
 /// exposed through APIs, logs, or telemetry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPrior {
     pub credential_generation: CredentialGeneration,
     pub client_class: String,
@@ -862,34 +862,6 @@ pub struct NetworkPrior {
     pub starved_at_ms: Option<i64>,
     pub sample_count: u32,
     pub updated_at_ms: i64,
-}
-
-impl Default for NetworkPrior {
-    fn default() -> Self {
-        Self {
-            credential_generation: CredentialGeneration::default(),
-            client_class: String::new(),
-            network_fingerprint: String::new(),
-            sustained_kbps: None,
-            worst_rung_height: None,
-            starved_at_ms: None,
-            sample_count: 0,
-            updated_at_ms: 0,
-        }
-    }
-}
-
-impl Default for NetworkPriorObservation {
-    fn default() -> Self {
-        Self {
-            credential_generation: CredentialGeneration::default(),
-            client_class: String::new(),
-            network_fingerprint: String::new(),
-            throughput_kbps: None,
-            starved_rung_height: None,
-            observed_at_ms: 0,
-        }
-    }
 }
 
 /// How long a supply-starvation verdict is believed after the starvation that
@@ -930,14 +902,8 @@ impl NetworkPrior {
 /// generation, so a prior bound to the old generation is unreachable through
 /// the new one. An admin-role change preserves the generation because the
 /// inputs do not change.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct CredentialGeneration(String);
-
-impl Default for CredentialGeneration {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 impl CredentialGeneration {
     /// Domain-separated, length-delimited encoding domain.
@@ -1003,7 +969,7 @@ impl std::ops::Deref for CredentialGeneration {
 }
 
 /// One telemetry-derived update to a [`NetworkPrior`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPriorObservation {
     pub credential_generation: CredentialGeneration,
     pub client_class: String,

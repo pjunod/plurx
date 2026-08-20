@@ -34,9 +34,10 @@ use plurx_core::cluster::migration::{
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
-    CredentialGeneration, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, TraktAuth,
+    scopes, ArtworkAttempt, CredentialGeneration, ItemEdit, ItemKind, ItemSort, LibraryKind,
+    MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
+    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
+    TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]

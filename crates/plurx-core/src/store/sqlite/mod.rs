@@ -1559,10 +1559,12 @@ mod tests {
         {
             let conn = Connection::open(&db).expect("raw open");
             for (index, sql) in MIGRATIONS.iter().enumerate().take(19) {
-                conn.execute_batch(&format!("BEGIN;
+                conn.execute_batch(&format!(
+                    "BEGIN;
 {sql}
-COMMIT;"))
-                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+COMMIT;"
+                ))
+                .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
             }
             // Seed the old numeric-key prior table.
             conn.execute_batch(
@@ -1600,10 +1602,7 @@ COMMIT;"))
             .await
             .expect("write v20 prior");
         assert_eq!(prior.sustained_kbps, Some(8_000));
-        assert_eq!(
-            prior.credential_generation.as_str(),
-            "v20-test-gen"
-        );
+        assert_eq!(prior.credential_generation.as_str(), "v20-test-gen");
 
         let conn = Connection::open(&db).expect("raw reopen");
         assert_eq!(
