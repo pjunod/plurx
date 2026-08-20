@@ -493,6 +493,12 @@ checks = ["web-static"]
 reason = "The retained shipped-web regressions execute the real `closePlayer()` and `playbackSelection()` to prove that a track choice belongs to an open playback rather than to the file: closing the player drops it, so the next cold start of the same file takes the detail-screen pickers the viewer is actually looking at, while an in-playback quality change still reproduces the tracks on screen. Reverting only the production correction fails `closing the player ends its track choice instead of arming the next play`, because `closePlayer()` does not replace `PLAYER` and the stale selection keeps matching after the playback ended."
 
 [[coverage]]
+commits = ["0ec00529"]
+points = ["web.experience"]
+checks = ["web-membership"]
+reason = "The retained shipped-HTML regressions distinguish SQLite's explicit membership-unavailable state from real roster-read failures, require every late cluster completion to pass through the live Settings-route guard, and require a stale-node removal refusal to initiate the roster refresh its sentence promises; restoring the reviewed pre-correction index.html fails all three assertions."
+
+[[coverage]]
 commits = ["669d9727"]
 points = ["playback.pipeline", "server.api"]
 checks = ["rust-gate"]
