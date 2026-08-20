@@ -57,6 +57,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.CreateSessionReq
+import tv.plurx.app.data.ReopenReason
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.SubTrack
 import tv.plurx.app.data.Net
@@ -184,6 +185,15 @@ class Controller(
 
     /** One reconnect of the exact HDR recipe; a repeated failure is visible. */
     private var sameHdrRetryUsed = false
+
+    /** The predecessor session ID, set at each stall reopen for the next one. */
+    private var previousSessionId: String? = null
+
+    /** How many times this playback has reopened due to a stall. */
+    private var stallReopenCount = 0
+
+    /** Max consecutive stall reopens at the same rung before giving up. */
+    private val maxStallReopens = 3
 
     /**
      * The delivery this plan would use with no subtitle in play. A manual A/V
@@ -433,7 +443,10 @@ class Controller(
         pgsOverlay.select(selectedSubtitle.takeIf { subtitleDelivery == SubtitleDelivery.BitmapOverlay })
         stallWatchdogJob = scope.launch {
             while (isActive) {
-                playbackTelemetry.sampleStall(establishedPlayback, monotonicNowMs())
+                val measurement = playbackTelemetry.sampleStall(establishedPlayback, monotonicNowMs())
+                if (measurement != null) {
+                    onStall(measurement.positionMs)
+                }
                 delay(1_000)
             }
         }
@@ -506,6 +519,9 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        previousSessionId = null
+        stallReopenCount = 0
+
         player.removeListener(listener)
         mediaSession.release()
         player.release()
@@ -581,6 +597,11 @@ class Controller(
         reason: String,
         observedAtMs: Long = monotonicNowMs(),
     ) {
+        // A user-initiated restart (seek, quality switch, track change) resets
+        // the stall reopen budget — the viewer chose a new state, so any
+        // previous floor is stale.
+        stallReopenCount = 0
+
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
             !subtitleDelivery.usesPlanTransport -> openSession(positionMs, attempt)
@@ -651,6 +672,79 @@ class Controller(
             // A cached session is the whole stream on disk: its timeline
             // starts at zero and the player seeks, exactly like direct play.
             val timeline = sessionPlaybackTimeline(hls, requestedStartMs = ms)
+            baseMs = timeline.baseMs
+            player.setMediaItem(
+                MediaItem.fromUri(Session.url(hls.playlist_url)),
+                timeline.attachPositionMs,
+            )
+            player.prepare()
+            playbackTelemetry.prepared(attempt)
+            player.playWhenReady = true
+            armTrackSelections()
+        }
+    }
+
+    /**
+     * Called when a detected stall measurement is available. Reopens with the
+     * stall-specific fields (previous_session_id, reopen_reason) and enforces
+     * the client-side retry budget: if the server returns the same height as
+     * the last stall reopen (the floor), we stop reopening after a bounded
+     * number of attempts.
+     */
+    private fun onStall(positionMs: Long) {
+        if (stallReopenCount >= maxStallReopens) return
+        if (sessionId == null) return
+        stallReopenCount++
+        val reason = "stall"
+        val observedAtMs = monotonicNowMs()
+        val attempt = beginPlaybackAttempt(reason, observedAtMs)
+        // Use the stall-specific session body that carries the predecessor
+        // info. `sessionBody` is also called for seeks and track switches;
+        // those paths must NOT carry stall fields.
+        val requestVersion = ++sessionRequestVersion
+        val prevId = sessionId
+        prevId?.let { vm.endHlsSession(it) }
+        sessionId = null
+        encoder = null
+        sessionIsVod = false
+        scope.launch {
+            val body = subtitleSessionBody(
+                playbackId = playbackId,
+                requestId = UUID.randomUUID().toString(),
+                startSeconds = positionMs / 1000.0,
+                delivery = subtitleDelivery,
+                subtitleIndex = selectedSubtitle,
+                copyableVideo = planMode != "transcode",
+                aac = plan.aac,
+                preserveDolbyVision = plan.preserveDolbyVision,
+                audioIndex = selectedAudio,
+                audioOffsetMs = audioOffsetMs,
+                quality = vm.preferences.value.playbackQuality,
+                sourceHeight = plan.sourceHeight,
+                previousSessionId = prevId,
+                reopenReason = ReopenReason.Stall,
+            )
+            val hls = try {
+                vm.createHlsSession(plan.fileId, body)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (requestVersion == sessionRequestVersion) {
+                    playbackTelemetry.cancel(attempt)
+                    onError("The stream stalled and recovery failed.")
+                }
+                return@launch
+            }
+            if (requestVersion != sessionRequestVersion) {
+                vm.endHlsSession(hls.session_id)
+                return@launch
+            }
+            previousSessionId = hls.session_id
+            sessionId = hls.session_id
+            encoder = hls.encoder
+            sessionIsVod = hls.vod
+            hls.delivered_dynamic_range?.let { deliveredRange = it }
+            val timeline = sessionPlaybackTimeline(hls, requestedStartMs = positionMs)
             baseMs = timeline.baseMs
             player.setMediaItem(
                 MediaItem.fromUri(Session.url(hls.playlist_url)),
@@ -797,6 +891,7 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        previousSessionId = null
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —
