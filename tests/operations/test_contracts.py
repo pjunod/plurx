@@ -42,6 +42,12 @@ class OperationsContractCase(unittest.TestCase):
 
         self.assertRegex(profile, r"(?m)^debug = 0$")
 
+        spike = read("spikes/hiqlite-m0/Cargo.toml")
+        for name in ("dev", "test"):
+            with self.subTest(workspace="hiqlite-m0", profile=name):
+                profile = spike.split(f"[profile.{name}]", 1)[1].split("[", 1)[0]
+                self.assertRegex(profile, r"(?m)^debug = 0$")
+
     def test_swarm_runtime_keeps_network_quota_and_role_boundaries_explicit(self):
         config = json.loads(read("swarm/config.json"))
 
@@ -220,9 +226,9 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.android_device == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.web_layout == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.release_build == 'true'", workflow)
-        self.assertIn("if: needs.scope.outputs.hiqlite_spike == 'true'", workflow)
-        self.assertIn("if: needs.scope.outputs.cluster_auth == 'true'", workflow)
-        self.assertIn("name: three-voter replicated store contracts", workflow)
+        self.assertIn("needs.scope.outputs.hiqlite_spike == 'true'", workflow)
+        self.assertIn("needs.scope.outputs.cluster_auth == 'true'", workflow)
+        self.assertIn("name: replicated storage contracts", workflow)
         self.assertIn("if: needs.scope.outputs.rust == 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
@@ -230,12 +236,11 @@ class OperationsContractCase(unittest.TestCase):
             "MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}",
             workflow,
         )
-        self.assertIn("HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}", workflow)
         self.assertIn("CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}", workflow)
         pr_gate = workflow.split("  pr_gate:", 1)[1]
         self.assertIn("      - mobile_version", pr_gate)
-        self.assertIn("      - hiqlite_spike", pr_gate)
         self.assertIn("      - cluster_auth", pr_gate)
+        self.assertNotIn("      - hiqlite_spike", pr_gate)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
 
@@ -332,9 +337,15 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("key: avd-35-google_apis-pixel_7_pro", workflow)
         self.assertIn("-no-snapshot-save", workflow)
 
-        # The spike workspace's target dir must be inside its cache mapping,
-        # or its 400-crate build runs cold every time.
-        self.assertIn("spikes/hiqlite-m0 -> spikes/hiqlite-m0/target", workflow)
+        # The semantic proof reuses the cluster job's root target instead of
+        # compiling the same Hiqlite/OpenRaft dependency graph a second time.
+        cluster = workflow.split("  cluster_auth:", 1)[1].split(
+            "\n  web_layout:", 1
+        )[0]
+        self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/target", cluster)
+        self.assertIn("run: make cluster-check", cluster)
+        self.assertIn("run: make hiqlite-spike", cluster)
+        self.assertNotIn("spikes/hiqlite-m0/target", workflow)
 
         # The docker smoke build keeps the GHA layer cache wired so the
         # ffmpeg runtime layers stop re-downloading on every run.
