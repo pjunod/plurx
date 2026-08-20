@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["cc866f51"]
+points = ["server.api"]
+checks = ["rust-gate", "resource-bounds"]
+reason = "The daemon's EPUB unit and HTTP integration tests cover manifest parsing, path and encryption refusals, revision and owner scoping, CSP, streamed response bytes, bounded sessions and readers; the nightly 620 MiB proof drains a 120 MiB child without expanding it in memory."
