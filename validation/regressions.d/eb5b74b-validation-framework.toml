@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["eb5b74b"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "This metadata-only correction replaces a stale provisional commit ID with the published tombstone-fence implementation commit. `make history-check` validates that the corrective commit resolves to retained evidence and rejects stale or cross-contract mappings."
