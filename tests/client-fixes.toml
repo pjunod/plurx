@@ -340,3 +340,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "private val createSession: suspend (CreateSessionReq) -> HlsStart"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 test_anchor = "createSession = { body ->"
+
+[[fixes]]
+id = "android.stall-budget-seek-reset"
+commits = ["1995a17d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "fun seekTo(targetMs: Long)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "vodSeekAfterExhaustionResetsBudget"
