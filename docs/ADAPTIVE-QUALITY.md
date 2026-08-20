@@ -247,10 +247,13 @@ floor is answered with the rung it is on, every time. The server counts
 nothing and never refuses: bounding the retries server-side would mean
 inventing per-playback retry state, which is exactly the parallel store this
 contract forbids, and a new terminal path §7.3 rules out. The retry budget is
-therefore **the client's**, and no client in this repository implements one
-yet — until the Apple and Android halves carry it, a client that keeps
-reopening at the floor will keep being answered at the floor. Those halves own
-the bound; this document does not claim it exists.
+therefore **the client's**. The Apple client implements one
+(`StallReopenBudget`: two consecutive bound reopens that fail to resolve a
+strictly lower rung end in the ordinary stall failure; an unstated height —
+`0`, or absent — counts as no step down; and a minute of recovered film starts
+a fresh episode, so one blip cannot disable recovery for the rest of a title).
+Android has not adopted the wire yet, so a client without that bound will keep
+being answered at the floor.
 
 The floor is the predecessor's own rung, not 360. Auto is not
 ladder-constrained below 360 — a sub-360 source resolves there, and a starved
@@ -268,8 +271,12 @@ must send `quality_auto: true`, or that session can never be stepped down.
 
 Omitting either bound field, naming a stale or foreign session, or sending an
 unknown reason is a client error. Ordinary seeks and track changes omit both
-fields and keep their existing behavior. Apple and Android adoption remains a
-separate client change; until then, this endpoint addition is inert for them.
+fields and keep their existing behavior. A client must therefore treat that
+`400` as fall-back-to-unbound-create rather than a playback failure: a
+retryable error that fires *after* the claim was normalized replays as
+`invalid stall reopen` for the same `request_id`, so the retry has to drop the
+binding and mint a fresh id. Apple does this; Android adoption remains a
+separate client change, and until then this endpoint addition is inert there.
 
 ## Phase 3 — seamless switching (optional, the majors' UX)
 

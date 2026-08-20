@@ -349,37 +349,244 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     let target = (2..=3)
         .find(|node_id| *node_id != leader)
         .context("choose a removable follower")?;
+    // M3c (`CLUSTERING-PLAN.md` §6.7): removal resolves the offline work the
+    // departing node owns instead of refusing forever. Seeded on the target's
+    // own process so the fixture's source files exist where its packages say
+    // they do.
+    let target_node = format!("node-{target}");
+    let media_dir = root.path().join(format!("media-{target_node}"));
+    let offline_user = match cluster
+        .request(
+            target,
+            Request::SeedOfflineRemovalWork {
+                node_id: target_node.clone(),
+                media_dir: media_dir.to_string_lossy().to_string(),
+            },
+        )
+        .await?
+    {
+        Response::SeededOfflineRemovalWork { user_id } => user_id,
+        response => bail!("unexpected offline removal seed response: {response:?}"),
+    };
+
+    // The refusal survives, narrowed to what the policy genuinely cannot
+    // resolve: a download that is in flight right now. Lifting the blanket
+    // refusal must not turn removal into "always succeeds".
+    let transfer_package = format!("{TRANSFER_PACKAGE}-{target_node}");
+    match cluster
+        .request(
+            1,
+            Request::RemoveVoter {
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::MembershipError { code, message } if code == "node_owns_offline_work" => {
+            if !message.contains("transferring") {
+                bail!("in-flight transfer refusal gave the operator no reason: {message}");
+            }
+        }
+        response => bail!("removal did not refuse an in-flight transfer: {response:?}"),
+    }
+    // The operator takes the action the refusal named.
+    match cluster
+        .request(
+            1,
+            Request::DeleteOfflinePackage {
+                package_id: transfer_package,
+                user_id: offline_user,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("could not clear the in-flight transfer fixture: {response:?}"),
+    }
+
+    // One more download is requested on the departing node while the removal
+    // is resolving. The node serves its API until the membership change
+    // commits, so a package created after the plan was drawn is real; a
+    // removal that resolved only its opening snapshot would commit and leave
+    // this one owned by a node that no longer exists.
+    let late_package = format!("{LATE_PACKAGE}-{target_node}");
     cluster
         .request(
             target,
-            Request::SeedOfflineWork {
-                node_id: format!("node-{target}"),
+            Request::SeedOfflineWorkDuringRemoval {
+                node_id: target_node.clone(),
+                media_dir: media_dir.to_string_lossy().to_string(),
+                user_id: offline_user,
+                delay_ms: LATE_PACKAGE_DELAY_MS,
             },
         )
         .await?
         .require_ok()?;
-    require_membership_error(
-        cluster
-            .request(
-                1,
-                Request::RemoveVoter {
-                    node_id: format!("node-{target}"),
-                },
-            )
-            .await?,
-        "node_owns_offline_work",
-    )?;
-    cluster
-        .request(1, Request::ResetContractState)
-        .await?
-        .require_ok()?;
+
     cluster
         .request(
             1,
             Request::RemoveVoter {
-                node_id: format!("node-{target}"),
+                node_id: target_node.clone(),
             },
         )
+        .await?
+        .require_ok()?;
+
+    // Either §6.7 outcome closes it — moved to a survivor, or failed with its
+    // reservation released. The outcome this exists to catch is the third one:
+    // still queued on a node that is now a tombstone, holding the traveller's
+    // byte budget until the seven-day expiry.
+    match offline_summary(&mut cluster, &late_package, offline_user).await? {
+        Response::OfflinePackageSummary {
+            state,
+            node_id,
+            error_code,
+            ..
+        } if state == "queued" && node_id != target_node && error_code.is_none() => {}
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0 => {}
+        response => bail!(
+            "a download requested while the removal was resolving was left owned by the removed \
+             node: {response:?}"
+        ),
+    }
+
+    // A survivor proved it reads the source, so the work moved rather than
+    // dying with the node.
+    let movable_package = format!("{MOVABLE_PACKAGE}-{target_node}");
+    let movable = offline_summary(&mut cluster, &movable_package, offline_user).await?;
+    match &movable {
+        Response::OfflinePackageSummary {
+            state,
+            node_id,
+            error_code,
+            ..
+        } if state == "queued" && *node_id != target_node && error_code.is_none() => {}
+        response => bail!("a verified package was not requeued on a survivor: {response:?}"),
+    }
+    let Response::OfflinePackageSummary {
+        node_id: new_owner, ..
+    } = movable
+    else {
+        unreachable!("matched above")
+    };
+
+    // No survivor could read this one, so it failed loudly with the stable
+    // code and gave its reservation back instead of holding the traveller's
+    // byte budget until the seven-day expiry.
+    match offline_summary(
+        &mut cluster,
+        &format!("{STRANDED_PACKAGE}-{target_node}"),
+        offline_user,
+    )
+    .await?
+    {
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0 => {}
+        response => bail!("an unverifiable package was not failed as node_removed: {response:?}"),
+    }
+
+    // A ready package whose bytes lived only on the removed node stops
+    // advertising itself as ready, even though its source is perfectly
+    // readable elsewhere. Requeueing it would risk handing a resuming
+    // downloader a different encoder's generation behind the same lease URL.
+    match offline_summary(
+        &mut cluster,
+        &format!("{READY_PACKAGE}-{target_node}"),
+        offline_user,
+    )
+    .await?
+    {
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            actual_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0
+            && actual_bytes.is_none() => {}
+        response => bail!("a ready package survived its node's removal: {response:?}"),
+    }
+
+    // The re-homed package is ordinary claimable work on its new owner, and
+    // the node that just left can no longer publish it.
+    let new_owner_voter = (1..=3)
+        .find(|voter| format!("node-{voter}") == new_owner)
+        .context("requeued package landed on a node outside the cluster")?;
+    // The package requested mid-removal can share this queue, so claim until
+    // the one under test comes out instead of assuming it is first.
+    let mut claimed_movable = false;
+    for _ in 0..2 {
+        match cluster
+            .request(
+                new_owner_voter,
+                Request::ClaimNextOfflinePackage {
+                    node_id: new_owner.clone(),
+                },
+            )
+            .await?
+        {
+            Response::ClaimedOfflinePackage {
+                package_id: Some(package_id),
+            } if package_id == movable_package => {
+                claimed_movable = true;
+                break;
+            }
+            Response::ClaimedOfflinePackage {
+                package_id: Some(package_id),
+            } if package_id == late_package => {}
+            response => {
+                bail!("the requeued package was not claimable on its new owner: {response:?}")
+            }
+        }
+    }
+    if !claimed_movable {
+        bail!("the requeued package never became claimable on its new owner");
+    }
+    match cluster
+        .request(
+            1,
+            Request::PublishOfflinePackage {
+                package_id: movable_package.clone(),
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("the removed node still published re-homed work: {response:?}"),
+    }
+    match cluster
+        .request(
+            new_owner_voter,
+            Request::PublishOfflinePackage {
+                package_id: movable_package,
+                node_id: new_owner,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("the new owner could not complete the requeued package: {response:?}"),
+    }
+
+    cluster
+        .request(1, Request::ResetContractState)
         .await?
         .require_ok()?;
     cluster
@@ -443,6 +650,22 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     }
     cluster.shutdown_all().await?;
     Ok(())
+}
+
+async fn offline_summary(
+    cluster: &mut ClusterProcesses,
+    package_id: &str,
+    user_id: i64,
+) -> Result<Response> {
+    cluster
+        .request(
+            1,
+            Request::OfflinePackageSummary {
+                package_id: package_id.to_owned(),
+                user_id,
+            },
+        )
+        .await
 }
 
 fn require_membership_error(response: Response, expected: &str) -> Result<()> {
@@ -1045,18 +1268,66 @@ pub enum Request {
     Bootstrap,
     RejectIdentityDrift,
     Open,
-    IssueJoinToken { ttl_ms: u64 },
-    RedeemJoin { request: RedeemJoinRequest },
-    FinalizeJoin { request: FinalizeJoinRequest },
+    IssueJoinToken {
+        ttl_ms: u64,
+    },
+    RedeemJoin {
+        request: RedeemJoinRequest,
+    },
+    FinalizeJoin {
+        request: FinalizeJoinRequest,
+    },
     MembershipStatus,
-    HeartbeatPreservesTombstone { node_id: String },
-    RemoveVoter { node_id: String },
-    SeedOfflineWork { node_id: String },
+    HeartbeatPreservesTombstone {
+        node_id: String,
+    },
+    RemoveVoter {
+        node_id: String,
+    },
+    SeedOfflineRemovalWork {
+        node_id: String,
+        media_dir: String,
+    },
+    /// Request a download on this node `delay_ms` from now and answer
+    /// immediately, so the package lands while a removal started right after
+    /// this call is still resolving. Real operators do exactly this: the
+    /// departing node keeps serving its API until the membership change
+    /// commits.
+    SeedOfflineWorkDuringRemoval {
+        node_id: String,
+        media_dir: String,
+        user_id: i64,
+        delay_ms: u64,
+    },
+    DeleteOfflinePackage {
+        package_id: String,
+        user_id: i64,
+    },
+    OfflinePackageSummary {
+        package_id: String,
+        user_id: i64,
+    },
+    ClaimNextOfflinePackage {
+        node_id: String,
+    },
+    PublishOfflinePackage {
+        package_id: String,
+        node_id: String,
+    },
     ResetContractState,
-    RecordLocalTelemetry { marker: String },
-    CountLocalTelemetry { marker: String },
-    Exercise { ordinal: u64 },
-    PostLossWrite { target: String, position_ms: i64 },
+    RecordLocalTelemetry {
+        marker: String,
+    },
+    CountLocalTelemetry {
+        marker: String,
+    },
+    Exercise {
+        ordinal: u64,
+    },
+    PostLossWrite {
+        target: String,
+        position_ms: i64,
+    },
     VerifyProof,
     Dump,
     CatalogView,
@@ -1074,6 +1345,25 @@ pub enum Response {
         node_id: u64,
     },
     Ok,
+    Flag {
+        value: bool,
+    },
+    SeededOfflineRemovalWork {
+        user_id: i64,
+    },
+    /// Just enough of a package to assert a §6.7 outcome. Deliberately does
+    /// not carry `source_path`: a media path has no business crossing a
+    /// harness wire any more than it does a log line.
+    OfflinePackageSummary {
+        state: String,
+        node_id: String,
+        error_code: Option<String>,
+        reserved_bytes: i64,
+        actual_bytes: Option<i64>,
+    },
+    ClaimedOfflinePackage {
+        package_id: Option<String>,
+    },
     TelemetryCount {
         count: usize,
     },
@@ -1804,7 +2094,9 @@ async fn handle_request(
             let opened = Arc::new(
                 HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID, telemetry_path).await?,
             );
-            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            let opened_membership = membership_manager(client, opened.clone(), launch).await?;
+            tokio::spawn(opened_membership.clone().offline_source_probe_loop());
+            *membership = Some(opened_membership);
             *store = Some(opened);
             Ok(Response::Ok)
         }
@@ -1819,7 +2111,9 @@ async fn handle_request(
         }
         Request::Open => {
             let opened = Arc::new(HiqliteAuthStore::open(client.clone(), telemetry_path).await?);
-            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            let opened_membership = membership_manager(client, opened.clone(), launch).await?;
+            tokio::spawn(opened_membership.clone().offline_source_probe_loop());
+            *membership = Some(opened_membership);
             *store = Some(opened);
             Ok(Response::Ok)
         }
@@ -1861,10 +2155,75 @@ async fn handle_request(
             .await
             .map(|_| Response::Ok)
             .or_else(|error| Ok(membership_error_response(error))),
-        Request::SeedOfflineWork { node_id } => {
-            seed_offline_work(store_ref(store)?, &node_id).await?;
+        Request::SeedOfflineRemovalWork { node_id, media_dir } => {
+            let user_id =
+                seed_offline_removal_work(store_ref(store)?, &node_id, Path::new(&media_dir))
+                    .await?;
+            Ok(Response::SeededOfflineRemovalWork { user_id })
+        }
+        Request::SeedOfflineWorkDuringRemoval {
+            node_id,
+            media_dir,
+            user_id,
+            delay_ms,
+        } => {
+            // Answered before the package exists on purpose. The caller starts
+            // the removal next, so the request lands mid-resolution the way a
+            // real one would, rather than at a moment the harness chose.
+            let store = store.clone().context("node store is not open")?;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if let Err(error) = seed_offline_work_during_removal(
+                    &store,
+                    &node_id,
+                    Path::new(&media_dir),
+                    user_id,
+                )
+                .await
+                {
+                    eprintln!("cluster-check: mid-removal offline seed failed: {error:#}");
+                }
+            });
             Ok(Response::Ok)
         }
+        Request::DeleteOfflinePackage {
+            package_id,
+            user_id,
+        } => Ok(Response::Flag {
+            value: store_ref(store)?
+                .delete_offline_package(&package_id, user_id)
+                .await?,
+        }),
+        Request::OfflinePackageSummary {
+            package_id,
+            user_id,
+        } => {
+            let package = store_ref(store)?
+                .offline_package_for_user(&package_id, user_id)
+                .await?
+                .with_context(|| format!("offline package {package_id} disappeared"))?;
+            Ok(Response::OfflinePackageSummary {
+                state: package.state,
+                node_id: package.node_id,
+                error_code: package.error_code,
+                reserved_bytes: package.reserved_bytes,
+                actual_bytes: package.actual_bytes,
+            })
+        }
+        Request::ClaimNextOfflinePackage { node_id } => Ok(Response::ClaimedOfflinePackage {
+            package_id: store_ref(store)?
+                .claim_next_offline_package(&node_id)
+                .await?
+                .map(|package| package.id),
+        }),
+        Request::PublishOfflinePackage {
+            package_id,
+            node_id,
+        } => Ok(Response::Flag {
+            value: store_ref(store)?
+                .mark_offline_package_ready(&package_id, &node_id, "rehomed-recipe", 900, 90_000)
+                .await?,
+        }),
         Request::ResetContractState => {
             store_ref(store)?.validation_reset_contract_state().await?;
             Ok(Response::Ok)
@@ -2052,7 +2411,31 @@ async fn membership_manager(
     .map_err(Into::into)
 }
 
-async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()> {
+/// Package ids the removal scenario asserts on. Each names the §6.7 outcome
+/// it is there to pin down.
+const MOVABLE_PACKAGE: &str = "offline-movable";
+const STRANDED_PACKAGE: &str = "offline-stranded";
+const READY_PACKAGE: &str = "offline-ready";
+const TRANSFER_PACKAGE: &str = "offline-transfer";
+/// Requested after the removal has already drawn its plan.
+const LATE_PACKAGE: &str = "offline-late";
+/// Long enough to land after the removal snapshots the work it plans to
+/// resolve, and well inside the bounded probe wait that follows it.
+const LATE_PACKAGE_DELAY_MS: u64 = 250;
+
+/// Seed the four packages a node removal has to deal with, backed by real
+/// files on a real filesystem.
+///
+/// The sources are genuinely written to disk (and genuinely absent, for the
+/// stranded one) because the whole contract under test is that a survivor
+/// proves it can *read* the bytes. A fixture that only wrote rows would prove
+/// the requeue mechanics and skip the part §6.7 actually cares about.
+async fn seed_offline_removal_work(
+    store: &HiqliteAuthStore,
+    node_id: &str,
+    media_dir: &Path,
+) -> Result<i64> {
+    std::fs::create_dir_all(media_dir).context("offline removal fixture media directory")?;
     let user = store
         .create_user(&format!("membership-offline-{node_id}"), "hash", false)
         .await?;
@@ -2060,7 +2443,7 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
         .create_library(&NewLibrary {
             name: format!("Membership Offline {node_id}"),
             kind: LibraryKind::Movies,
-            paths: vec![PathBuf::from(format!("/cluster/membership/{node_id}"))],
+            paths: vec![media_dir.to_path_buf()],
             anime: false,
         })
         .await?;
@@ -2075,25 +2458,167 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
             episode_number: None,
         })
         .await?;
-    let source_path = format!("/cluster/membership/{node_id}/offline.mkv");
+
+    // Created and transitioned one at a time so exactly one package is
+    // claimable at each step: the fairness ordering in the queue is not what
+    // this scenario is proving.
+    for (package_id, present, target_state) in [
+        (MOVABLE_PACKAGE, true, "preparing"),
+        (READY_PACKAGE, true, "ready"),
+        (TRANSFER_PACKAGE, true, "ready"),
+        (STRANDED_PACKAGE, false, "queued"),
+    ] {
+        let source_path = media_dir.join(format!("{package_id}.mkv"));
+        let (source_size, source_mtime) = if present {
+            std::fs::write(&source_path, vec![0_u8; 4_096])
+                .with_context(|| format!("write offline fixture source for {package_id}"))?;
+            let metadata = std::fs::metadata(&source_path)?;
+            let mtime = i64::try_from(metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs())?;
+            (i64::try_from(metadata.len())?, mtime)
+        } else {
+            // Nothing is written here on purpose: no node can prove a source
+            // that does not exist, which is exactly the case that must resolve
+            // to `node_removed` instead of a hopeful reassignment.
+            (4_096, 1_700_000_000)
+        };
+        let source = source_path.to_string_lossy().to_string();
+        let file = store
+            .upsert_file(
+                item,
+                &source,
+                source_size,
+                source_mtime,
+                &ProbeResult::default(),
+            )
+            .await?;
+        let package = NewOfflinePackage {
+            id: format!("{package_id}-{node_id}"),
+            request_id: format!("{package_id}-request-{node_id}"),
+            user_id: user.id,
+            file_id: file,
+            node_id: node_id.to_owned(),
+            source_path: source,
+            source_size,
+            source_mtime,
+            effective_rate_control: "vbr".to_owned(),
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".to_owned(),
+            estimated_bytes: 700,
+            reserved_bytes: 900,
+            expires_at: unix_now()?.saturating_add(3_600),
+        };
+        if !matches!(
+            store
+                .create_offline_package(&package, 10, 100_000, 1_000_000)
+                .await?,
+            OfflineCreateOutcome::Created(_)
+        ) {
+            bail!("membership offline fixture {package_id} was not admitted");
+        }
+        if target_state == "queued" {
+            continue;
+        }
+        if store
+            .claim_next_offline_package(node_id)
+            .await?
+            .is_none_or(|claimed| claimed.id != package.id)
+        {
+            bail!("membership offline fixture {package_id} did not claim in order");
+        }
+        if target_state == "ready"
+            && !store
+                .mark_offline_package_ready(&package.id, node_id, package_id, 900, 90_000)
+                .await?
+        {
+            bail!("membership offline fixture {package_id} did not publish");
+        }
+    }
+
+    // One downloader is mid-transfer. A lease touched this recently is what
+    // the activity surface calls "sending", and removal refuses rather than
+    // cutting it off.
+    let expires_at = unix_now()?.saturating_add(3_600);
+    if !matches!(
+        store
+            .put_offline_lease(
+                &format!("{TRANSFER_PACKAGE}-{node_id}"),
+                user.id,
+                &format!("{:x}", Sha256::digest(b"membership-offline-transfer")),
+                expires_at,
+            )
+            .await?,
+        OfflineLeaseOutcome::Created(_) | OfflineLeaseOutcome::Renewed(_)
+    ) {
+        bail!("membership offline transfer lease was not admitted");
+    }
+    Ok(user.id)
+}
+
+/// Request one more download on the departing node, after that node's removal
+/// has already snapshotted the work it planned to resolve.
+///
+/// The source is a real, readable file so a survivor can genuinely prove it.
+/// What this fixture is about is whether the removal looks *again* before it
+/// commits — the probe protocol itself is already covered by the four packages
+/// seeded up front.
+async fn seed_offline_work_during_removal(
+    store: &HiqliteAuthStore,
+    node_id: &str,
+    media_dir: &Path,
+    user_id: i64,
+) -> Result<()> {
+    let dir = media_dir.join("late");
+    std::fs::create_dir_all(&dir).context("mid-removal offline fixture directory")?;
+    let library = store
+        .create_library(&NewLibrary {
+            name: format!("Membership Offline Late {node_id}"),
+            kind: LibraryKind::Movies,
+            paths: vec![dir.clone()],
+            anime: false,
+        })
+        .await?;
+    let item = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Membership Offline Late {node_id}"),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let source_path = dir.join(format!("{LATE_PACKAGE}.mkv"));
+    std::fs::write(&source_path, vec![0_u8; 4_096])
+        .context("mid-removal offline fixture source")?;
+    let metadata = std::fs::metadata(&source_path)?;
+    let source_size = i64::try_from(metadata.len())?;
+    let source_mtime = i64::try_from(metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs())?;
+    let source = source_path.to_string_lossy().to_string();
     let file = store
         .upsert_file(
             item,
-            &source_path,
-            1_000,
-            1_700_000_000,
+            &source,
+            source_size,
+            source_mtime,
             &ProbeResult::default(),
         )
         .await?;
     let package = NewOfflinePackage {
-        id: format!("membership-offline-{node_id}"),
-        request_id: format!("membership-offline-request-{node_id}"),
-        user_id: user.id,
+        id: format!("{LATE_PACKAGE}-{node_id}"),
+        request_id: format!("{LATE_PACKAGE}-request-{node_id}"),
+        user_id,
         file_id: file,
         node_id: node_id.to_owned(),
-        source_path,
-        source_size: 1_000,
-        source_mtime: 1_700_000_000,
+        source_path: source,
+        source_size,
+        source_mtime,
         effective_rate_control: "vbr".to_owned(),
         target_height: 720,
         output_width: Some(1280),
@@ -2113,7 +2638,7 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
             .await?,
         OfflineCreateOutcome::Created(_)
     ) {
-        bail!("membership offline fixture was not admitted");
+        bail!("the download requested during the removal was not admitted");
     }
     Ok(())
 }
@@ -2751,26 +3276,47 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .set_offline_package_recipe(&offline.id, &recipe_hash)
             .await?
         || !store
-            .update_offline_progress(&offline.id, "video", 500)
-            .await?
-        || !store
-            .mark_offline_package_ready(&offline.id, &recipe_hash, 800, 120_000)
+            .update_offline_progress(&offline.id, &node_id, "video", 500)
             .await?
     {
         bail!("replicated offline preparation state machine failed");
     }
+    // The producer fence, asserted while the package is genuinely
+    // mid-preparation: its writes belong to whichever node owns it *now*.
+    // Removal re-homes a package while the departing node's encoder may still
+    // be running, and an unfenced yield would knock the survivor's claimed
+    // work back to `queued` while its progress flapped.
     if store
-        .mark_offline_package_ready(&offline.id, &recipe_hash, 801, 120_001)
+        .requeue_offline_package(&offline.id, &wrong_node)
         .await?
-        || store.requeue_offline_package(&offline.id).await?
+        || store
+            .update_offline_progress(&offline.id, &wrong_node, "stolen", 999)
+            .await?
+        || store
+            .offline_package_for_user(&offline.id, user.id)
+            .await?
+            .is_none_or(|package| package.phase != "video" || package.progress_millis != 500)
+    {
+        bail!("replicated offline producer writes were not fenced to the owning node");
+    }
+    if !store
+        .mark_offline_package_ready(&offline.id, &node_id, &recipe_hash, 800, 120_000)
+        .await?
+    {
+        bail!("replicated offline preparation state machine failed");
+    }
+    if store
+        .mark_offline_package_ready(&offline.id, &node_id, &recipe_hash, 801, 120_001)
+        .await?
+        || store.requeue_offline_package(&offline.id, &node_id).await?
         || store
             .set_offline_package_recipe(&offline.id, "wrong-recipe")
             .await?
         || store
-            .update_offline_progress(&offline.id, "wrong-state", 999)
+            .update_offline_progress(&offline.id, &node_id, "wrong-state", 999)
             .await?
         || store
-            .fail_offline_package(&offline.id, "wrong-state", "wrong", "wrong")
+            .fail_offline_package(&offline.id, &node_id, "wrong-state", "wrong", "wrong")
             .await?
     {
         bail!("replicated offline terminal-state guards accepted a late mutation");
@@ -2861,13 +3407,13 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .claim_next_offline_package(&node_id)
             .await?
             .is_none_or(|package| package.id != work.id)
-        || !store.requeue_offline_package(&work.id).await?
+        || !store.requeue_offline_package(&work.id, &node_id).await?
         || store
             .claim_next_offline_package(&node_id)
             .await?
             .is_none_or(|package| package.id != work.id)
         || !store
-            .fail_offline_package(&work.id, "video", "proof", "expected")
+            .fail_offline_package(&work.id, &node_id, "video", "proof", "expected")
             .await?
         || !store.delete_offline_package(&work.id, user.id).await?
     {

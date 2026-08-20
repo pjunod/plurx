@@ -897,7 +897,7 @@ mod tests {
         let package_id = preparing_package(&store, file, "efready").await;
         let dir = entry(&store, root.path(), file, "efready", 100).await;
         assert!(store
-            .mark_offline_package_ready(&package_id, "efready", 100, 90_000)
+            .mark_offline_package_ready(&package_id, NODE, "efready", 100, 90_000)
             .await
             .expect("ready"));
         store
@@ -1378,7 +1378,7 @@ mod tests {
                 .await
                 .expect("bind recipe");
             assert!(store
-                .mark_offline_package_ready(ready_id, "aakeep", 20, 90_000)
+                .mark_offline_package_ready(ready_id, &cluster_id, "aakeep", 20, 90_000)
                 .await
                 .expect("publish ready package"));
 

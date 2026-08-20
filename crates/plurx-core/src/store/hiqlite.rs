@@ -349,6 +349,7 @@ impl HiqliteAuthStore {
     pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
         self.telemetry.clear().await?;
         let statements = [
+            "DELETE FROM offline_source_probes",
             "DELETE FROM offline_lease_guards",
             "DELETE FROM offline_package_leases",
             "DELETE FROM offline_packages",
@@ -389,7 +390,8 @@ impl HiqliteAuthStore {
             (statements[14].to_owned(), params!()),
             (statements[15].to_owned(), params!()),
             (statements[16].to_owned(), params!()),
-            (statements[17].to_owned(), params!(keys::INSTANCE_ID)),
+            (statements[17].to_owned(), params!()),
+            (statements[18].to_owned(), params!(keys::INSTANCE_ID)),
         ]))
         .await?
         .into_iter()

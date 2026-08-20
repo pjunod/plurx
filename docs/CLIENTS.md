@@ -116,8 +116,9 @@ remain attached to the server and keeps the existing streaming path.
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available
-to both native codebases. Their watchdog/cause-precedence integrations remain
-separate work, so neither client is yet claimed to step down on a stall.
+to both native codebases. **Apple has adopted it**; the Android integration
+remains separate work, so that client is not yet claimed to step down on a
+stall.
 
 Two obligations come with adopting it. A client that posts a *promise* height —
 the source height a subtitle burn or Quality = Original sends — while the
@@ -127,6 +128,23 @@ height as a sticky manual pick and never steps the session down; Android's
 its live case, not a hypothetical one. And the retry budget at the ladder floor
 belongs to the client: the server repeats the floor rung indefinitely and
 raises no terminal error of its own, by design.
+
+Apple's shape of both, in `PlayerController`, is the reference for the Android
+half. `quality_auto` goes on *every* create as the viewer's own answer
+(`selectedHeight == nil`), never inferred from whether a height happened to be
+posted. `StallReopenBudget` counts consecutive bound reopens that failed to
+resolve a strictly lower rung and stops after two — deliberately independent of
+the five-seconds-of-progress rearm, because a link starved at the floor stalls,
+reopens, briefly plays, and stalls again forever otherwise. It bounds one
+starvation episode rather than the whole title: a minute of recovered film
+clears it, so a blip ten minutes in does not leave the remaining hour with no
+automatic recovery. A height the server
+could not state — `0` for a remux of an unprobed source, or absent from an
+older server — is read as *no step down* and spends budget rather than
+resetting it. One stall mints one `request_id` and carries it through every
+replay of that recovery, and a bound create refused with `400` is re-posted
+once unbound under a fresh identity, because a claim that was normalized before
+a retryable failure replays as `invalid stall reopen` for the original id.
 
 **Roku** — Hardest constraints, embraced rather than fought: SceneGraph Video node only (no custom demux/decoders). Envelope: HLS/DASH preferred; HEVC 4K@40Mbps, **AVC capped 1080p/10Mbps**, AV1 only newer devices/DASH-only; DV/HDR10+ device-tier-dependent; AC3/EAC3/DTS passthrough-only with an AAC stereo fallback track required; subs TTML/WebVTT/SRT only → **PGS/VobSub must burn in server-side**. plurx's remux/transcode pipeline makes Roku a well-behaved HLS client. Distribution reality: private channels are dead (since 2022); dev mode sideloads exactly one app; beta channels last 120 days/20 users. Roku ships last, and public store certification is the eventual real path there.
 

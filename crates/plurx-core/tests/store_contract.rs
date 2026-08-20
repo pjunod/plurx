@@ -204,6 +204,18 @@ const OFFLINE_METHODS: &[&str] = &[
     "mark_offline_package_ready",
     "delete_offline_package",
     "expire_offline_packages",
+    // Node removal (`CLUSTERING-PLAN.md` §6.7). Cluster-only behavior: the
+    // SQLite backend implements these inertly because a single-node install
+    // has no node to remove, so the real contract lives in the replicated
+    // case and in `plurx-cluster-check`.
+    "unresolved_offline_packages",
+    "offline_transfers_in_flight",
+    "request_offline_source_probes",
+    "pending_offline_source_probes",
+    "answer_offline_source_probe",
+    "outstanding_offline_source_probes",
+    "verified_offline_source_nodes",
+    "resolve_offline_packages_for_removal",
 ];
 const TELEMETRY_METHODS: &[&str] = &[
     "record_playback_event",
@@ -1915,7 +1927,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 129, "review the Store method count");
+    assert_eq!(declared.len(), 137, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -3660,7 +3672,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .expect("claim after reset")
             .expect("package after reset");
         assert!(store
-            .requeue_offline_package(&first.id)
+            .requeue_offline_package(&first.id, "offline-node")
             .await
             .expect("requeue"));
         store
@@ -3683,7 +3695,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             Some("offline-recipe")
         );
         assert!(store
-            .update_offline_progress(&first.id, "video", 500)
+            .update_offline_progress(&first.id, "offline-node", "video", 500)
             .await
             .expect("progress"));
         let progressing = store
@@ -3694,7 +3706,13 @@ async fn offline_package_contract_runs_through_dyn_store() {
         assert_eq!(progressing.phase, "video");
         assert_eq!(progressing.progress_millis, 500);
         assert!(store
-            .mark_offline_package_ready(&first.id, "offline-recipe", 4_000, 7_200_000)
+            .mark_offline_package_ready(
+                &first.id,
+                "offline-node",
+                "offline-recipe",
+                4_000,
+                7_200_000
+            )
             .await
             .expect("ready"));
         assert!(matches!(
@@ -3723,7 +3741,13 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .await
             .expect("create failed fixture");
         assert!(store
-            .fail_offline_package(&failed.id, "video", "encoder", "contract failure")
+            .fail_offline_package(
+                &failed.id,
+                "offline-node",
+                "video",
+                "encoder",
+                "contract failure"
+            )
             .await
             .expect("fail package"));
         let failed_package = store
