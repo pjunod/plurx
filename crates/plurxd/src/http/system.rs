@@ -625,7 +625,16 @@ pub async fn client_log(
     let event = client_playback_event(&ev, user.id);
     // Deliberately not `ev.ua`: the class must come from the same input the
     // read paths use, or the prior is written under a key nothing reads.
-    let network = super::network::identity(&headers, remote);
+    let mut network = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = network {
+        id.credential_generation = Some(
+            plurx_core::domain::CredentialGeneration::derive(
+                user.id,
+                user.created_at,
+                &user.password_hash,
+            ),
+        );
+    }
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);
     tokio::spawn(async move {

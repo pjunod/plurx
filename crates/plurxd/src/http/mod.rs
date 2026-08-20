@@ -2782,10 +2782,15 @@ mod tests {
                 );
                 request
             };
+        let credential_generation_str = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ).into_inner();
         let prior = || {
             state
                 .store
-                .network_prior(user.id, "safari", "198.51.100.0/24")
+                .network_prior(&credential_generation_str, "safari", "198.51.100.0/24")
         };
 
         let (status, _) = call(&app, report("ttff", 8_000, 1080, None)).await;
@@ -5060,10 +5065,15 @@ mod tests {
             .await
             .expect("admin lookup")
             .expect("admin user");
+        let credential_generation = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        );
         state
             .store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: user.id,
+                credential_generation: credential_generation.clone(),
                 client_class: "apple".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(20_000),
