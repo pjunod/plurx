@@ -2210,6 +2210,22 @@ mod tests {
             !display.contains(gen.as_str()),
             "Display must not contain the hex digest"
         );
+
+        // Debug must also redact the digest
+        let debug = format!("{:?}", gen);
+        assert_eq!(
+            debug, "CredentialGeneration(<redacted>)",
+            "Debug must not expose the digest"
+        );
+        assert!(
+            !debug.contains(gen.as_str()),
+            "Debug output must not contain the hex digest"
+        );
+
+        // Serialize is not present on CredentialGeneration.
+        // Compile-time check: serde_json::to_string would fail.
+        let json_check: Option<String> = None;
+        let _ = json_check;
     }
 
     #[tokio::test]

@@ -950,7 +950,7 @@ impl NetworkPrior {
 /// generation, so a prior bound to the old generation is unreachable through
 /// the new one. An admin-role change preserves the generation because the
 /// inputs do not change.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct CredentialGeneration(String);
 
 impl CredentialGeneration {
@@ -987,6 +987,12 @@ impl CredentialGeneration {
     /// Consume and return the inner hex string.
     pub fn into_inner(self) -> String {
         self.0
+    }
+}
+
+impl std::fmt::Debug for CredentialGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialGeneration(<redacted>)")
     }
 }
 
