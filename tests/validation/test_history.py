@@ -6,7 +6,13 @@ import tempfile
 import textwrap
 import unittest
 
-from validation.history import ISSUE_RE, HistoryError, audit_history, load_coverage
+from validation.history import (
+    ISSUE_RE,
+    HistoryError,
+    audit_history,
+    load_coverage,
+    verify_migration_fidelity,
+)
 from validation.runner import load_catalog
 
 
@@ -450,6 +456,44 @@ class CoverageDirectoryCase(unittest.TestCase):
             load_coverage(root / "validation/regressions.d")
 
         self.assertIn("no longer the regression ledger", str(raised.exception))
+
+    def test_migration_fidelity_catches_a_dropped_multi_commit_member(self):
+        root = self.repository()
+        legacy = root / "legacy-regressions.toml"
+        legacy.write_text(
+            textwrap.dedent(
+                """
+                version = 1
+
+                [[coverage]]
+                commits = ["0000aa11", "1111bb22"]
+                points = ["app"]
+                checks = ["baseline"]
+                reason = "Seeded before either branch."
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HistoryError) as raised:
+            verify_migration_fidelity(legacy, root / "validation/regressions.d")
+        self.assertIn("1 missing and 1 extra", str(raised.exception))
+
+        (root / "validation/regressions.d/0000aa11-seed.toml").write_text(
+            textwrap.dedent(
+                """
+                version = 1
+
+                [[coverage]]
+                commits = ["0000aa11", "1111bb22"]
+                points = ["app"]
+                checks = ["baseline"]
+                reason = "Seeded before either branch."
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        verify_migration_fidelity(legacy, root / "validation/regressions.d")
 
 
 if __name__ == "__main__":

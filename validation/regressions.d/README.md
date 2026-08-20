@@ -8,6 +8,13 @@ document and therefore has no runtime behavior to validate.
 `scripts/history-audit` loads every `*.toml` file here, in file-name order, and
 treats them as one ledger. Entry order carries no meaning.
 
+During the shared-file migration or a merge that still receives legacy entries,
+save the incoming `regressions.toml` and run
+`scripts/history-audit --compare-legacy <saved-file>`. The command compares the
+full semantic entry multiset, including every member of a multi-commit entry.
+After resolving the merge and deleting the shared file, run the ordinary
+`scripts/history-audit` command separately.
+
 ## One entry per file
 
 Each file holds exactly one `[[coverage]]` entry and is named after the first

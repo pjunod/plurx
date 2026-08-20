@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import dataclasses
 import json
 from pathlib import Path
@@ -162,6 +163,64 @@ def _load_coverage_fragment(path: Path) -> CoverageEntry:
                 f"after its first mapped commit"
             )
     return entry
+
+
+def load_legacy_coverage(path: Path) -> tuple[CoverageEntry, ...]:
+    """Load a pre-migration shared ledger for a one-time fidelity check."""
+
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HistoryError(f"cannot read {path}: {exc}") from exc
+    if raw.get("version") != 1:
+        raise HistoryError(f"{path.name} regression coverage version must be 1")
+    stray = set(raw) - {"version", "coverage"}
+    if stray:
+        raise HistoryError(f"{path.name} has unknown keys {', '.join(sorted(stray))}")
+
+    entries: list[CoverageEntry] = []
+    for index, item in enumerate(raw.get("coverage", [])):
+        where = f"{path.name} coverage[{index}]"
+        if not isinstance(item, dict):
+            raise HistoryError(f"{where} must be a table")
+        unknown = set(item) - COVERAGE_FIELDS
+        if unknown:
+            raise HistoryError(f"{where} has unknown keys {', '.join(sorted(unknown))}")
+        entries.append(
+            CoverageEntry(
+                origin=where,
+                commits=_commit_prefixes(item.get("commits"), f"{where} commits"),
+                points=_strings(item.get("points"), f"{where} points"),
+                checks=_strings(item.get("checks"), f"{where} checks"),
+                reason=str(item.get("reason", "")).strip(),
+                ignore=bool(item.get("ignore", False)),
+            )
+        )
+    return tuple(entries)
+
+
+def verify_migration_fidelity(legacy_path: Path, fragments_path: Path) -> None:
+    """Refuse a migration that drops or changes any shared-ledger entry."""
+
+    def meaning(entry: CoverageEntry) -> tuple[object, ...]:
+        return (entry.commits, entry.points, entry.checks, entry.reason, entry.ignore)
+
+    legacy = Counter(meaning(entry) for entry in load_legacy_coverage(legacy_path))
+    if not fragments_path.is_dir():
+        raise HistoryError(f"cannot read {fragments_path}: not a directory")
+    fragment_entries = tuple(
+        _load_coverage_fragment(fragment)
+        for fragment in sorted(fragments_path.glob("*.toml"))
+    )
+    fragments = Counter(meaning(entry) for entry in fragment_entries)
+    if legacy != fragments:
+        missing = sum((legacy - fragments).values())
+        extra = sum((fragments - legacy).values())
+        raise HistoryError(
+            "regression-ledger migration changed entry meaning: "
+            f"{missing} missing and {extra} extra"
+        )
 
 
 def load_coverage(path: Path = DEFAULT_COVERAGE) -> tuple[CoverageEntry, ...]:
@@ -508,8 +567,17 @@ def main(argv: list[str] | None = None) -> int:
         description="Verify every historical corrective commit has validation evidence."
     )
     parser.add_argument("--report", type=Path, help="write the machine-readable audit JSON")
+    parser.add_argument(
+        "--compare-legacy",
+        type=Path,
+        help="prove the fragment ledger is semantically identical to a legacy ledger",
+    )
     args = parser.parse_args(argv)
     try:
+        if args.compare_legacy:
+            verify_migration_fidelity(args.compare_legacy, DEFAULT_COVERAGE)
+            print("regression-ledger migration preserves every legacy entry")
+            return 0
         report = audit_history()
     except HistoryError as exc:
         print(f"history audit error: {exc}", file=sys.stderr)
