@@ -20,7 +20,9 @@ has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
 > Status: **v0.2.7**, build `30` — native viewer parity across phone, foldable,
-> and TV. Build 28 makes the detail screen list every audio and subtitle track
+> and TV. Build 30 adds the revision-bound ebook reading-state wire models and
+> authenticated API routes without exposing a TV reader. Build 28 makes the
+> detail screen list every audio and subtitle track
 > with the server's own default markers and its five-state preferred-language
 > verdict, and lets the viewer pick both — including Off — before pressing play;
 > the choice reaches the first `/decision` and any burn-in cost is disclosed

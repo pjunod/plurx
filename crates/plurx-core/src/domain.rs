@@ -484,6 +484,40 @@ pub struct WatchState {
     pub updated_at: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Reading state
+// ---------------------------------------------------------------------------
+
+/// One durable, renderer-neutral place in a text publication.
+///
+/// Unlike watch progress this state is bound to an exact file revision. EPUB
+/// spine locations survive typography and viewport changes; milliseconds do
+/// not describe a place in reflowable text at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadingState {
+    pub file_id: i64,
+    pub file_size: i64,
+    pub file_mtime: i64,
+    pub locator_json: String,
+    pub progression_millis: i64,
+    pub completed: bool,
+    pub updated_at: i64,
+}
+
+/// A reading-state write before the store resolves its ordering clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadingStateWrite {
+    pub file_id: i64,
+    pub file_size: i64,
+    pub file_mtime: i64,
+    pub locator_json: String,
+    pub progression_millis: i64,
+    pub completed: bool,
+    /// Unix seconds observed by an offline client. `None` means an online
+    /// write whose server clock is authoritative now.
+    pub recorded_at: Option<i64>,
+}
+
 /// How much of a container has been seen: how many playable leaves sit under
 /// an item, and how many of those are watched.
 ///
