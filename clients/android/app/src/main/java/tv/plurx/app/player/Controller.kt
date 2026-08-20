@@ -709,7 +709,10 @@ class Controller(
         // those paths must NOT carry stall fields.
         val requestVersion = ++sessionRequestVersion
         val prevId = sessionId
-        prevId?.let { vm.endHlsSession(it) }
+        // Keep the predecessor alive through the create request — the
+        // server validates previous_session_id against a live session
+        // map.  Session creation supersedes and kills the predecessor
+        // atomically.
         sessionId = null
         encoder = null
         sessionIsVod = false
