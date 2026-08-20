@@ -81,6 +81,29 @@ const HIQLITE_READDRESS_BACKUP_DIRNAME: &str = "hiqlite.before-readdress";
 const HIQLITE_READDRESS_MARKER_FILENAME: &str = "hiqlite-readdress.json";
 #[cfg(feature = "hiqlite-store")]
 const HIQLITE_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Hiqlite Raft WAL segment size used by every plurx voter.
+///
+/// Hiqlite 0.14 accepts one serialized Raft entry up to `wal_size - 34` bytes:
+/// its WAL writer subtracts the fixed segment metadata before checking each
+/// entry independently. The 16 MiB segment therefore leaves 16,777,182 usable
+/// bytes. OpenRaft's configured `max_payload_entries = 128` limits the number
+/// of entries in one append request, not the size of an individual entry, and
+/// Hiqlite carries that request in a WebSocket binary frame whose length field
+/// supports this size without a smaller application cap.
+///
+/// Import transactions deliberately stay far below the usable entry capacity
+/// at the replication-time ceiling measured before this headroom increase.
+/// Keep all voters and import bounds tied to this constant so a retune cannot
+/// make the contract exercise a different limit than production.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+/// Bytes Hiqlite WAL 0.14 reserves before one serialized log entry.
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_WAL_SEGMENT_RESERVED_BYTES: usize = 34;
+/// Largest serialized Raft entry accepted by the configured production WAL.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_USABLE_PAYLOAD_BYTES: usize =
+    HIQLITE_WAL_SIZE_BYTES as usize - HIQLITE_WAL_SEGMENT_RESERVED_BYTES;
 #[cfg(feature = "hiqlite-store")]
 const ACTIVATION_MARKER_VERSION: u32 = 1;
 #[cfg(feature = "hiqlite-store")]
@@ -1632,7 +1655,7 @@ async fn start_voter(
         tls_raft: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     };
