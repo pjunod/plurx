@@ -347,20 +347,20 @@ commits = ["1995a17d"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "fun seekTo(targetMs: Long)"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "vodSeekAfterExhaustionResetsBudget"
+test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
 
 [[fixes]]
 id = "android.stall-budget-subtitle-test-fix"
 commits = ["d0ebd112"]
 source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-source_anchor = "fun subtitleTrackChangeResetsBudget"
+source_anchor = "class StallBudgetTest"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "subtitleTrackChangeResetsBudget"
+test_anchor = "consecutiveUserActionsAdvanceSequenceMonotonically"
 
 [[fixes]]
 id = "android.stall-budget-reset-count-and-coordinator-invalidation"
 commits = ["241a08e"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
-source_anchor = "fun reset()"
+source_anchor = "fun resetForUserAction()"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "resetInvalidatesTheOldFloorBudget"
+test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"

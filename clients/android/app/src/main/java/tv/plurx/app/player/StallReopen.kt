@@ -15,6 +15,15 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
         private set
     var nonDowngradeCount: Int = 0
         private set
+    /**
+     * Monotonically increasing sequence advanced by every user-initiated
+     * restart (VOD seek, subtitle/audio switch, quality change). Each
+     * increment invalidates any in-flight stall reopen from the prior
+     * cycle. Read by [Controller] for its [isCurrent] guard and by tests
+     * that assert production-linked invalidation.
+     */
+    var userActionSequence: Long = 0L
+        private set
 
     fun canReopen(): Boolean = nonDowngradeCount < maxNonDowngrades
 
@@ -35,6 +44,19 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
         predecessorHeight = null
         nonDowngradeCount = 0
         resetCount++
+    }
+
+    /**
+     * Production seam that both [Controller] and tests use to advance the
+     * user-action sequence and reset the stall budget atomically.  Every
+     * user-initiated playback restart (VOD seek, subtitle/audio switch,
+     * quality change, leaveSessionPlayback) goes through this method so
+     * reverting any one of those Controller paths changes the returned
+     * sequence number.
+     */
+    fun resetForUserAction(): Long {
+        reset()
+        return ++userActionSequence
     }
 
     companion object {

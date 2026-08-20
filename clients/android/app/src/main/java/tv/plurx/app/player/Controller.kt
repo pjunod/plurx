@@ -507,8 +507,7 @@ class Controller(
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
             sessionIsVod -> {
-                stallReopenBudget.reset()
-                sessionRequestVersion++
+                sessionRequestVersion = stallReopenBudget.resetForUserAction()
                 beginPlaybackAttempt("seek")
                 player.seekTo(t)
             }
@@ -523,10 +522,9 @@ class Controller(
     fun release() {
         stallWatchdogJob.cancel()
         pgsOverlay.release()
-        sessionRequestVersion++
+        sessionRequestVersion = stallReopenBudget.resetForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        stallReopenBudget.reset()
 
         player.removeListener(listener)
         mediaSession.release()
@@ -570,8 +568,7 @@ class Controller(
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
             // between two text tracks cost nothing.
-            stallReopenBudget.reset()
-            sessionRequestVersion++
+            sessionRequestVersion = stallReopenBudget.resetForUserAction()
             armTrackSelections()
             applyTextSelection()
         }
@@ -606,9 +603,8 @@ class Controller(
         observedAtMs: Long = monotonicNowMs(),
     ) {
         // A user-initiated restart (seek, quality switch, track change) resets
-        // the stall reopen budget — the viewer chose a new state, so any
-        // previous floor is stale.
-        stallReopenBudget.reset()
+        // the stall reopen budget and invalidates any in-flight stall.
+        sessionRequestVersion = stallReopenBudget.resetForUserAction()
 
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
@@ -924,10 +920,9 @@ class Controller(
         trackAt(C.TRACK_TYPE_TEXT, ordinal)
 
     private fun leaveSessionPlayback() {
-        sessionRequestVersion++
+        sessionRequestVersion = stallReopenBudget.resetForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        stallReopenBudget.reset()
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —

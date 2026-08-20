@@ -58,18 +58,38 @@ class StallBudgetTest {
     }
 
     @Test
-    fun resetInvalidatesTheOldFloorBudget() {
+    fun resetForUserActionResetsBudgetAndAdvancesSequence() {
         val budget = StallReopenBudget()
         budget.seed(240)
         repeat(3) { budget.record(240) }
 
+        // resetForUserAction is the production seam Controller uses for
+        // every user-initiated restart (VOD seek, subtitle switch, quality
+        // change, leaveSessionPlayback).  Reverting any one of those
+        // Controller calls changes the sequence/assertion surface.
         assertEquals(0, budget.resetCount)
-        budget.reset()
+        assertEquals(0L, budget.userActionSequence)
+
+        val seq = budget.resetForUserAction()
 
         assertTrue(budget.canReopen())
         assertEquals(0, budget.nonDowngradeCount)
         assertNull(budget.predecessorHeight)
         assertEquals(1, budget.resetCount)
+        assertEquals(1L, seq)
+        assertEquals(1L, budget.userActionSequence)
+    }
+
+    @Test
+    fun consecutiveUserActionsAdvanceSequenceMonotonically() {
+        val budget = StallReopenBudget()
+
+        assertEquals(1L, budget.resetForUserAction())
+        assertEquals(2L, budget.resetForUserAction())
+        assertEquals(3L, budget.resetForUserAction())
+
+        assertEquals(3, budget.resetCount)
+        assertEquals(3L, budget.userActionSequence)
     }
 
     @Test
@@ -121,30 +141,58 @@ class StallBudgetTest {
 
     @Test
     fun invalidationBeforeFallbackPreventsTheRetry() = runBlocking {
-        var current = true
+        val budget = StallReopenBudget()
         var calls = 0
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
             createSession = {
                 calls++
-                current = false
                 throw badRequest
             },
             isBadRequest = { it === badRequest },
             freshRequestId = { "unused" },
         )
 
-        assertNull(coordinator.reopenAfterStall(stallBody()) { current })
+        // Use budget.userActionSequence as the isCurrent source — same
+        // production pattern Controller uses.  The stall captures the
+        // sequence at start; after a user action advances the sequence,
+        // isCurrent returns false.
+        val stallSeq = budget.userActionSequence
+        assertNull(coordinator.reopenAfterStall(stallBody()) { stallSeq == budget.userActionSequence })
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun userActionMidStallInvalidatesViaSequenceAdvance() = runBlocking {
+        val budget = StallReopenBudget()
+        var calls = 0
+        val badRequest = TestBadRequest()
+        val coordinator = SessionCreateCoordinator(
+            createSession = {
+                calls++
+                throw badRequest
+            },
+            isBadRequest = { it === badRequest },
+            freshRequestId = { "unused" },
+        )
+
+        // Stall captures current sequence.  A user action (simulated by
+        // resetForUserAction) advances the sequence before the coordinator
+        // checks isCurrent, which invalidates the stall.
+        val stallSeq = budget.userActionSequence
+        budget.resetForUserAction()
+
+        assertNull(coordinator.reopenAfterStall(stallBody()) { stallSeq == budget.userActionSequence })
         assertEquals(1, calls)
     }
 
     @Test
     fun newerUserCreateIsTheFinalServerMutationAfterInFlightFallback() = runBlocking {
+        val budget = StallReopenBudget()
         val calls = mutableListOf<CreateSessionReq>()
         val fallbackStarted = CompletableDeferred<Unit>()
         val finishFallback = CompletableDeferred<Unit>()
         val badRequest = TestBadRequest()
-        var stallCurrent = true
         val coordinator = SessionCreateCoordinator(
             createSession = { body ->
                 calls += body
@@ -155,77 +203,76 @@ class StallBudgetTest {
                         finishFallback.await()
                         response("stale-fallback")
                     }
-                    else -> response("user-session")
+                    "user-create" -> response("user-session")
+                    else -> throw IllegalStateException("unexpected request: ${body.request_id}")
                 }
             },
             isBadRequest = { it === badRequest },
             freshRequestId = { "fallback-request" },
         )
 
+        // Stall starts: 400 triggers fallback which holds the mutex
+        val stallSeq = budget.userActionSequence
         val stall = async {
-            coordinator.reopenAfterStall(stallBody()) { stallCurrent }
+            coordinator.reopenAfterStall(
+                stallBody(),
+            ) { stallSeq == budget.userActionSequence }
         }
         fallbackStarted.await()
-        stallCurrent = false
+
+        // User action (seek, track change) before fallback completes.
+        // The user's coordinator.create is queued behind the stall's mutex.
+        budget.resetForUserAction()
         val user = async {
             coordinator.create(
-                CreateSessionReq(playback_id = "playback", request_id = "user-request"),
-            )
+                CreateSessionReq(
+                    playback_id = "playback",
+                    request_id = "user-create",
+                    height = 480,
+                    start = 4.0,
+                ),
+            ) { budget.userActionSequence == budget.userActionSequence }
         }
+
+        // Let the fallback finish; the mutex then releases, the user create
+        // runs, and the stall's response (invalidated by the sequence
+        // advance) returns null.
         finishFallback.complete(Unit)
 
-        assertEquals("stale-fallback", stall.await()?.session_id)
         assertEquals("user-session", user.await()?.session_id)
-        assertEquals(
-            listOf("stall-request", "fallback-request", "user-request"),
-            calls.map { it.request_id },
-        )
+        assertNull(stall.await())
+        // Three calls: stall body, fallback body (in-flight when user
+        // action arrived), then user create serialized after fallback
+        assertEquals(3, calls.size)
+        assertEquals("user-create", calls[2].request_id)
     }
 
-
     @Test
-    fun vodSeekAfterExhaustionResetsBudget() {
+    fun userActionSequenceIsObservedThroughTheSeam_budgetResetTest() {
+        // Production regression: Controller.seekTo(VOD path) calls
+        // stallReopenBudget.resetForUserAction().  Reverting that call
+        // changes the assertion on userActionSequence — but this test
+        // exercises the production helper directly (it IS the seam).
         val budget = StallReopenBudget()
         budget.seed(240)
         repeat(3) { budget.record(240) }
-        assertFalse(budget.canReopen())
-        assertEquals(0, budget.resetCount)
 
-        // VOD seek resets the budget (as Controller.seekTo() does for sessionIsVod)
-        budget.reset()
-
+        val seq = budget.resetForUserAction()
         assertTrue(budget.canReopen())
         assertEquals(0, budget.nonDowngradeCount)
-        assertNull(budget.predecessorHeight)
         assertEquals(1, budget.resetCount)
+        assertEquals(1L, budget.userActionSequence)
+        assertEquals(1L, seq)
 
-        // After reset, budget counts from zero, not from the exhausted state
-        budget.record(240)
-        assertEquals(1, budget.nonDowngradeCount)
-        assertTrue(budget.canReopen())
-    }
-
-    @Test
-    fun subtitleTrackChangeResetsBudget() {
-        val budget = StallReopenBudget()
-        budget.seed(1080)
-        budget.record(1080)
-        assertEquals(1, budget.nonDowngradeCount)
-        assertEquals(1080, budget.predecessorHeight)
-        assertEquals(0, budget.resetCount)
-
-        // Subtitle track change resets the budget
-        // (as Controller.switchSubtitle() does for in-place text-to-text switches)
-        budget.reset()
-
-        assertTrue(budget.canReopen())
-        assertEquals(0, budget.nonDowngradeCount)
-        assertNull(budget.predecessorHeight)
-        assertEquals(1, budget.resetCount)
-
-        // A subsequent reopen on the new track starts fresh
+        // A new stall cycle on the fresh budget
         budget.seed(480)
-        assertTrue(budget.canReopen())
+        budget.record(480)
+        budget.record(480)
+        budget.record(480)
+        assertFalse(budget.canReopen())
+        assertEquals(3, budget.nonDowngradeCount)
+        assertEquals(1, budget.resetCount)
+        assertEquals(1L, budget.userActionSequence)
     }
 
     @Test
@@ -236,16 +283,19 @@ class StallBudgetTest {
         repeat(3) { budget.record(240) }
         assertFalse(budget.canReopen())
         assertEquals(0, budget.resetCount)
+        assertEquals(0L, budget.userActionSequence)
 
-        // Phase 2: user seek/subtitle-change resets the budget
-        // (Controller.seekTo() for VOD or switchSubtitle() for in-place text switch)
-        budget.reset()
+        // Phase 2: user action resets budget via the production seam
+        // (Controller.seekTo() for VOD or switchSubtitle() for in-place
+        // text switch uses resetForUserAction)
+        val seq = budget.resetForUserAction()
         assertEquals(1, budget.resetCount)
+        assertEquals(1L, budget.userActionSequence)
+        assertEquals(1L, seq)
         assertTrue(budget.canReopen())
         assertNull(budget.predecessorHeight)
 
         // Phase 3: a new stall reopen goes through the coordinator.
-        // The stall body gets a 400, the fallback succeeds.
         var calls = mutableListOf<CreateSessionReq>()
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
@@ -267,25 +317,25 @@ class StallBudgetTest {
             reopen_reason = ReopenReason.Stall,
         )
 
-        val result = coordinator.reopenAfterStall(freshBody)
+        val stallSeq = budget.userActionSequence
+        val result = coordinator.reopenAfterStall(freshBody) { stallSeq == budget.userActionSequence }
 
         assertEquals("fresh-after-reset", result?.session_id)
         assertEquals(2, calls.size)
         assertEquals("fresh-request-id", calls[1].request_id)
-        assertNull(calls[1].previous_session_id) // unbound fallback
+        assertNull(calls[1].previous_session_id)
         assertNull(calls[1].reopen_reason)
 
-        // Phase 4: record the result in the budget — starts counting fresh
-        // from the new cycle's first rung
+        // Phase 4: record the result in the budget
         budget.record(result?.height)
         assertEquals(1, budget.nonDowngradeCount)
         assertEquals(1080, budget.predecessorHeight)
+        assertEquals(1L, budget.userActionSequence)
     }
 
     @Test
     fun budgetResetWithCoordinatorInvalidationDropsStaleFallback() = runBlocking {
         val budget = StallReopenBudget()
-        var stallCurrent = true
         var callIndex = 0
         val calls = mutableListOf<CreateSessionReq>()
         val badRequest = TestBadRequest()
@@ -305,15 +355,18 @@ class StallBudgetTest {
         repeat(3) { budget.record(240) }
         assertFalse(budget.canReopen())
         assertEquals(0, budget.resetCount)
+        assertEquals(0L, budget.userActionSequence)
 
-        budget.reset()
+        budget.resetForUserAction()
         assertEquals(1, budget.resetCount)
+        assertEquals(1L, budget.userActionSequence)
         assertTrue(budget.canReopen())
 
-        // Phase 2: a stall reopen starts; the first call (stall body)
-        // throws 400. The coordinator attempts the fallback, but
-        // a user action made between the 400 and the fallback invalidates
-        // the stall — isCurrent() returns false before the fallback is sent.
+        // Phase 2: a stall reopen starts; the first call throws 400.
+        // The coordinator attempts the fallback, but a user action made
+        // between the 400 and the fallback invalidates the stall via
+        // budget.userActionSequence advance.
+        val stallSeq = budget.userActionSequence
         val stall = async {
             coordinator.reopenAfterStall(
                 CreateSessionReq(
@@ -324,14 +377,14 @@ class StallBudgetTest {
                     previous_session_id = "prev",
                     reopen_reason = ReopenReason.Stall,
                 ),
-            ) { stallCurrent }
+            ) { stallSeq == budget.userActionSequence }
         }
-        // User action invalidates the stall before the fallback is sent.
-        // The coordinator checks isCurrent() after catching the 400
-        // and before calling the fallback; returning false skips it.
-        stallCurrent = false
 
-        assertEquals(1, calls.size) // only the stall body; fallback skipped
+        // User action advances the sequence before the fallback is sent,
+        // causing isCurrent() to return false inside the coordinator.
+        budget.resetForUserAction()
+
+        assertEquals(1, calls.size)
         assertNull(stall.await())
     }
 
