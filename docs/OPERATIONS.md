@@ -489,6 +489,14 @@ is appended in either case (`m6 · 192.168.1.20`), so a picker remains
 identifiable even when several machines have similar names. This avoids making
 every host override repeat its own machine identity.
 
+Once `cluster.advertise_host` opts a node into clustering, the replicated
+server name replaces that node-local label. The companion reads the logical
+name, logical `instance.id`, local `node.id`, and cluster-advertisement flag
+from `/api/v1/server`; it does not read Hiqlite directly. Bonjour and GDM then
+publish distinct node records under the same logical name and id. Rename the
+server through the admin settings API, not TOML: TOML is only the first-store
+seed and changing it later deliberately does nothing.
+
 Do not add `network_mode: host` to `plurxd`: Compose rejects a service that also
 has a `networks:` attachment. The companion is a different service, so an
 override can safely keep `plurxd` on an external `media` network. On a Docker

@@ -101,11 +101,7 @@ pub async fn root(State(state): State<AppState>) -> Result<Response, ApiError> {
         .get_setting(plurx_core::store::keys::SERVER_NAME)
         .await?
         .unwrap_or_else(|| state.server_name.clone());
-    Ok(xml(plex::root_container(
-        &id,
-        &name,
-        version(),
-    )))
+    Ok(xml(plex::root_container(&id, &name, version())))
 }
 
 /// GET /library — the library root container clients load before sections.

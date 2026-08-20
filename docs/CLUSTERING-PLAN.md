@@ -793,6 +793,18 @@ remove, no survivor to re-home onto, and no SQLite table backs the probe
 protocol. Its offline behavior is unchanged and remains a valid rollback
 target.
 
+**M3d delivered.** `server.name` is now a replicated setting. The node-local
+TOML value atomically seeds an empty store, preserving an existing install's
+name on upgrade; after that, the replicated winner is authoritative and a
+joining node's config cannot rename the server. An admin rename writes through
+the `Store` boundary and converges on every voter. Cluster-enabled processes
+publish one record per `node.id`: Bonjour uses a node-derived hostname and
+`node_id` TXT property, while GDM adds `Node-Identifier`. Both retain the same
+logical `instance.id` and name. A never-joined install omits the node field and
+keeps its historical discovery bytes. The host-network `plurxd advertise`
+companion reads this complete public identity from the daemon, so it applies
+the same clustered-versus-legacy rule without opening the replicated store.
+
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
 node records under one logical identity/name; remove one follower while

@@ -28,6 +28,9 @@ pub struct ServerInfo {
     /// Compile time, always present — the fallback when `build` is "unknown".
     pub built_at: &'static str,
     pub instance_id: String,
+    /// Stable local node identity used only to distinguish cluster records.
+    pub node_id: String,
+    pub cluster_advertisement: bool,
     pub uptime_seconds: u64,
     /// True when no users exist yet — the web app shows first-run setup.
     pub setup_required: bool,
@@ -52,6 +55,8 @@ pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInf
         build: crate::version::BUILD,
         built_at: crate::version::BUILT_AT,
         instance_id,
+        node_id: state.node_id.clone(),
+        cluster_advertisement: state.cluster_advertisement,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         setup_required,
         android_app,
@@ -1018,6 +1023,8 @@ fn client_log_line(ev: &ClientLog, suppressed: u64) -> String {
 
 #[derive(Serialize)]
 pub struct SettingsDto {
+    /// Replicated logical name shared by every voter.
+    pub server_name: String,
     pub tmdb_configured: bool,
     /// The stored TMDB key itself. This endpoint is admin-only and the key is
     /// low-sensitivity (read-only metadata), so the admin who set it can see
@@ -1121,6 +1128,11 @@ pub struct SettingsDto {
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
+    let server_name = state
+        .store
+        .get_setting(keys::SERVER_NAME)
+        .await?
+        .unwrap_or_else(|| state.server_name.clone());
     let tmdb_api_key = state
         .store
         .get_setting(keys::TMDB_API_KEY)
@@ -1286,6 +1298,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .await?
         .is_some_and(|v| v.trim() == "1");
     Ok(SettingsDto {
+        server_name,
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
         omdb_configured: !omdb_api_key.is_empty(),
