@@ -9,6 +9,9 @@ import tv.plurx.app.data.HlsStart
 /** Client-owned bound for repeated stall reopens at one resolved rung. */
 internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
     var predecessorHeight: Int? = null
+    /** Number of times [reset] has been called. Cumulative, never decremented,
+     *  used by [Controller] for user-action budget resets and guarded by tests. */
+    var resetCount: Int = 0
         private set
     var nonDowngradeCount: Int = 0
         private set
@@ -31,6 +34,7 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
     fun reset() {
         predecessorHeight = null
         nonDowngradeCount = 0
+        resetCount++
     }
 
     companion object {
