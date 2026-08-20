@@ -573,6 +573,13 @@ points = ["playback.pipeline", "web.experience"]
 checks = ["rust-gate", "web-static"]
 reason = "Three corrections with three retained regressions. `profile5_renderer_keeps_software_decode_and_may_encode_anywhere_probed` requires the reshape to keep `requires_software_decode` and to stay off the GPU end to end while allowing every hardware encoder to pair — reverting the pairing to software-only fails it, and deleting the software-decode requirement fails it in the other direction, which is the split that made a 4K Dolby Vision source 720p for non-DV clients. `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` still pins Auto onto the advertised ladder and now pins that an unproved hardware pairing falls back to the software rung rather than advertising a rung that would fail. `an upgrade needs encode headroom, not just a bandwidth estimate` drives `decideRung` with the production shape — a ~200 Mb/s JIT estimate at 720p — and requires the upgrade to be refused when the server's measured pace predicts under realtime one rung up, requires it to proceed on real headroom, requires an unmeasured session to stay able to rise, requires a rung that already failed to open never to be re-entered, and requires emergencies to keep falling past a blocked rung; reverting any one of those arms restores the 720<->1080 limit cycle."
 
+
+[[coverage]]
+commits = ["49828817"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained `inert_burst_produces_the_same_resolve_as_no_burst_declaration` asserts that corrected `PacingCaps` (initial_burst=false after the behavioural probe corrects a build that declares but ignores -readrate_initial_burst) produces readrate-only flags identical to a 5.1-6.0 build that never had the burst clause. Reverting the behavioural probe in `pacing_caps()` restores `initial_burst=true` for ffmpeg 8 builds, and the test fails because `resolve` then emits `-readrate_initial_burst` alongside `-readrate` for a flag that does nothing. The integration test `a_client_fetch_releases_a_held_session_and_restarts_progress` separately pins that the behavioural probe tolerates an inert burst binary without failing."
+
 [[coverage]]
 commits = ["e52e7de9"]
 points = ["cluster.membership", "offline.viewing"]
