@@ -607,6 +607,7 @@ paths = [
   "scripts/ci-flake-report",
   "scripts/history-audit",
   "scripts/prove-fix",
+  "scripts/prove-tombstone-offline-fence",
   "scripts/validate",
   "tests/client-fixes.toml",
   "tests/validation/**",
