@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["c2cdfca"]
+points = ["persistence.upgrades"]
+checks = ["rust-gate"]
+reason = "The retained password-reset and rehash test suite exercises the credential_generation derivation with real Argon2 PHC hashes. Using the correct rehash_hash variable instead of a hardcoded string means reverting this fix produces an unused-variable warning and fails the password rehash assertion on the wrong hash."
