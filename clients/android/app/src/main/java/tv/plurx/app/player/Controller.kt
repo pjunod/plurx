@@ -744,6 +744,7 @@ class Controller(
                 reopenReason = ReopenReason.Stall,
             )
             val hls = try {
+                if (requestVersion != sessionRequestVersion) return@launch
                 vm.createHlsSession(plan.fileId, body)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -755,6 +756,7 @@ class Controller(
                         previousSessionId = null,
                         reopenReason = null,
                     )
+                    if (requestVersion != sessionRequestVersion) return@launch
                     val fallbackHls = try {
                         vm.createHlsSession(plan.fileId, fallbackBody)
                     } catch (cancelled: CancellationException) {
