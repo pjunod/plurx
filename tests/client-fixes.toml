@@ -358,6 +358,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt
 test_anchor = "newerUserCreateIsTheFinalServerMutationAfterInFlightFallback"
 
 [[fixes]]
+id = "android.stall-controller-monotonic-invalidation"
+commits = ["7482d42"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "class ControllerStallGuard("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "vodSeekResetsBudgetAndCannotReuseAStallRequestToken"
+
+[[fixes]]
 id = "android.stall-budget-subtitle-test-fix"
 commits = ["d0ebd112"]
 source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
