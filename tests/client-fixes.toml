@@ -319,7 +319,7 @@ test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
 
 [[fixes]]
 id = "android.bound-stall-400-fallback"
-commits = ["95825c9", "88ca951"]
+commits = ["95825c9", "88ca951", "0a9201977b0717e7f6235290b1615003fdc3142b"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "// 400 fallback: retry once as an unbound create with a fresh request_id"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
