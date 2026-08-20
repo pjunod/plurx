@@ -350,6 +350,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt
 test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
 
 [[fixes]]
+id = "android.stall-response-invalidation-race"
+commits = ["038ee8f"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = ".takeIf { isCurrent() }"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "newerUserCreateIsTheFinalServerMutationAfterInFlightFallback"
+
+[[fixes]]
 id = "android.stall-budget-subtitle-test-fix"
 commits = ["d0ebd112"]
 source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
