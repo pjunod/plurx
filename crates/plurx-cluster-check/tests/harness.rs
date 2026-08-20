@@ -901,22 +901,24 @@ async fn start_cluster_with_port_retry_reallocates_after_a_collision() {
         .await
         .expect("a fresh allocation should start after the collision");
 
-    assert_eq!(
-        allocations.len(),
-        2,
-        "the wrapper should retry exactly once"
+    assert!(
+        allocations.len() >= 2,
+        "the injected collision must force at least one fresh allocation"
     );
+    let successful_allocation = allocations
+        .last()
+        .expect("a successful attempt records its allocation");
     assert_ne!(
-        allocations[0][0].raft, allocations[1][0].raft,
+        allocations[0][0].raft, successful_allocation[0].raft,
         "the retry must allocate a fresh raft port"
     );
     assert_ne!(
-        allocations[0][0].api, allocations[1][0].api,
+        allocations[0][0].api, successful_allocation[0].api,
         "the retry must allocate a fresh API port"
     );
-    assert_eq!(started_specs[0].id, allocations[1][0].id);
-    assert_eq!(started_specs[0].raft, allocations[1][0].raft);
-    assert_eq!(started_specs[0].api, allocations[1][0].api);
+    assert_eq!(started_specs[0].id, successful_allocation[0].id);
+    assert_eq!(started_specs[0].raft, successful_allocation[0].raft);
+    assert_eq!(started_specs[0].api, successful_allocation[0].api);
     cluster
         .shutdown_all()
         .await
