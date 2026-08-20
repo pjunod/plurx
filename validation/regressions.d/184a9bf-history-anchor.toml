@@ -1,6 +1,6 @@
 version = 1
 
 [[coverage]]
-commits = ["184a9bf"]
+commits = ["184a9bf", "88da6e5"]
 ignore = true
-reason = "This commit only fixes the regression file name; it does not change runtime behavior."
+reason = "These commits only fix regression file names and add history anchors; they do not change runtime behavior."
