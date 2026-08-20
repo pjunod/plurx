@@ -178,6 +178,47 @@ class StallBudgetTest {
         )
     }
 
+
+    @Test
+    fun vodSeekAfterExhaustionResetsBudget() {
+        val budget = StallReopenBudget()
+        budget.seed(240)
+        repeat(3) { budget.record(240) }
+        assertFalse(budget.canReopen())
+
+        // VOD seek resets the budget
+        budget.reset()
+
+        assertTrue(budget.canReopen())
+        assertEquals(0, budget.nonDowngradeCount)
+        assertNull(budget.predecessorHeight)
+
+        // After reset, budget counts from zero, not from the exhausted state
+        budget.record(240)
+        assertEquals(1, budget.nonDowngradeCount)
+        assertTrue(budget.canReopen())
+    }
+
+    @Test
+    fun subtitleTrackChangeResetsBudget() {
+        val budget = StallReopenBudget()
+        budget.seed(1080)
+        budget.record(720)
+        assertEquals(1, budget.nonDowngradeCount)
+        assertEquals(720, budget.predecessorHeight)
+
+        // Subtitle track change resets the budget
+        budget.reset()
+
+        assertTrue(budget.canReopen())
+        assertEquals(0, budget.nonDowngradeCount)
+        assertNull(budget.predecessorHeight)
+
+        // A subsequent reopen on the new track starts fresh
+        budget.seed(480)
+        assertTrue(budget.canReopen())
+    }
+
     private fun stallBody() = CreateSessionReq(
         playback_id = "playback",
         request_id = "stall-request",

@@ -507,6 +507,8 @@ class Controller(
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
             sessionIsVod -> {
+                stallReopenBudget.reset()
+                sessionRequestVersion++
                 beginPlaybackAttempt("seek")
                 player.seekTo(t)
             }
@@ -568,6 +570,8 @@ class Controller(
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
             // between two text tracks cost nothing.
+            stallReopenBudget.reset()
+            sessionRequestVersion++
             armTrackSelections()
             applyTextSelection()
         }
