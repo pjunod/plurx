@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["769a68c"]
+points = []
+checks = []
+reason = "This commit only records the rehash_hash fix's current validation evidence in the regression ledger; it does not change runtime behavior."
+ignore = true
