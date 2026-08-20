@@ -1,7 +1,8 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M1 complete · M2–M6 ready to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `810c3b16` and `monarr` `00bf7d9`
+**Status:** M0–M1 complete · M2a publication proof complete · M2b–M6 ready
+to build · **Written:**
+2026-08-20 · **Verified against:** `plurx` `43b7cb68` and `monarr` `a3f5fb8`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -265,6 +266,38 @@ wire locator envelope from §4.1. Do not paper over a failed proof with a
 platform-specific locator hidden inside `locator_json`; that only postpones
 the incompatibility until a user changes devices.
 
+#### M2a verdict — stream the publication; do not expand it
+
+M2a adopts Readium Web's server boundary without importing an unfinished web
+navigator: Cinema turns the packaged EPUB into a manifest/resource API, then
+M2b's browser navigator consumes that API. This keeps the original file as the
+source of truth, lets web and native WebViews share normalized hrefs, and keeps
+the account bearer out of publication markup. The response shape follows the
+[Readium Web Publication Manifest](https://github.com/readium/webpub-manifest)
+names — `metadata`, `readingOrder`, `resources`, and `toc` — while remaining a
+Cinema API rather than claiming full Readium conformance.
+
+The only new parser dependency is
+[`zip` 8.6.0](https://github.com/zip-rs/zip2/releases/tag/v8.6.0), built with
+default features off and Deflate only. Cinema parses the OCF container,
+package, EPUB 3 navigation document, and EPUB 2 NCX itself with the existing
+`quick-xml` dependency. No renderer bundle or build step has been selected
+yet; M2b has to earn that choice with the browser proofs below.
+
+| Proof | M2a evidence | Remaining gate |
+|---|---|---|
+| Navigation | Generated EPUB 2 NCX and EPUB 3 nav fixtures preserve spine order, authored labels, fragments, and nested TOC entries. | Browser TOC interaction in M2b. |
+| Locator stability | Manifest hrefs are decoded, normalized, and revision-bound. | M2b must restore the same paragraph after font, margin, viewport, and mode changes. |
+| Security | Absolute, drive-prefixed, control, backslash, duplicate, encoded traversal, and container-escaping paths fail closed. Encrypted publications get a distinct protected-book refusal. Resource responses block script, connect, form, object, frame, and remote image/font/media loads. | Browser test proves scripts stay inert and remote requests never leave the page. |
+| Scale | The ignored/nightly 620 MiB EPUB (one 500 MiB refused child plus one 120 MiB streamed child) peaks at 19,382,272 bytes RSS on the M2a macOS proof run; child resources stream in 64 KiB chunks, stay below 128 MiB each, and share eight node-wide reader slots. | M2b observes the same ceiling while navigating/searching. |
+| Accessibility | Publication order and headings remain in authored XHTML rather than being flattened server-side. | VoiceOver/TalkBack and keyboard browser acceptance in M2b/M3. |
+| Offline identity | Manifest hrefs and M1 locators use the same file revision and normalized archive path. | M4 reopens those bytes and locators with the server absent. |
+
+The measured parser/stream ceiling is 256 MiB peak RSS for the 620 MiB fixture.
+The proof used 18.5 MiB while draining the 120 MiB child; the wider ceiling
+leaves room for allocator and platform variance without permitting a second
+expanded copy of the book.
+
 ### 5.2 The security boundary is stricter than the ordinary web app
 
 Publication markup renders in a sandboxed document without scripts, top-level
@@ -278,6 +311,28 @@ reader allocates them.
 The M2 spike records the chosen concrete limits against its large-book fixture
 instead of inventing numbers in this plan. Those limits become code constants,
 tests, and a user-facing failure message in the same milestone.
+
+M2a established the limits:
+
+| Boundary | Limit |
+|---|---:|
+| Archive entries | 20,000 |
+| Declared total uncompressed bytes | 1 GiB |
+| One served resource | 128 MiB |
+| Decompressed resource chunk | 64 KiB |
+| Concurrent resource reads per node | 8 |
+| Container/package/navigation XML | 8 MiB each |
+| Compression ratio | 1,000:1 |
+| Live publication sessions per node | 64 |
+| Sliding session lifetime | 2 hours |
+
+`POST /api/v1/files/{file_id}/publication` requires the user token, validates
+the current book revision, parses only bounded metadata, and mints a random
+session capability. Nested resources use
+`GET /api/v1/publication/{session}/{resource}` without the account token.
+Those path credentials are redacted from HTTP traces, slide while in use, can
+be closed early by their owner, and refuse a resource if the source size or
+mtime changes after the manifest was parsed.
 
 ## 6. Offline contract — save the original, not a video package
 
@@ -356,6 +411,14 @@ make cluster-check
 ```
 
 ### 7.3 M2 — EPUB proof and web reader
+
+**Status:** M2a publication API complete 2026-08-20; M2b reader UI remains.
+
+M2a ships §5's bounded OCF/package/nav parser, Readium-shaped manifest,
+revision-bound resource capability, security headers, generated EPUB 2/3
+fixtures, and 620 MiB memory proof. It deliberately stops before calling the
+feature a reader: locator stability, accessibility, search, and actual browser
+network refusal require a rendered page.
 
 Run §5.1's dependency/architecture proof and record the verdict in this plan.
 Then ship the authenticated web reader, **Read/Resume** detail actions, table

