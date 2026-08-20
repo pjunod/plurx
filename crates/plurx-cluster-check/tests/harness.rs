@@ -18,12 +18,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use plurx_cluster_check::{
-    allocate_nodes, free_port, harness_executable, install_crypto_provider, node_config,
-    prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
-    require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry, unix_now,
-    validate_compacted_growth, validate_known_dump, ClusterProcesses, CompactedGrowthReport,
-    NodeLaunch, NodeProcess, NodeSpec, Preflight, Request, Response, GROWTH_BYTES_PER_BEAT_BUDGET,
-    INSTANCE_ID,
+    allocate_nodes, free_port, harness_executable, install_crypto_provider, is_port_collision,
+    node_config, prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
+    require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry,
+    start_cluster_with_port_retry_using, unix_now, validate_compacted_growth, validate_known_dump,
+    ClusterProcesses, CompactedGrowthReport, NodeLaunch, NodeProcess, NodeSpec, PortReservation,
+    Preflight, Request, Response, GROWTH_BYTES_PER_BEAT_BUDGET, INSTANCE_ID,
 };
 use plurx_core::store::{ClusterCompatibility, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 use serde_json::json;
@@ -401,9 +401,10 @@ async fn a_voter_that_dies_during_startup_is_reported_not_awaited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_voter_is_an_error_rather_than_a_panic() {
     let root = tempfile::tempdir().expect("unknown-voter test root");
-    let mut cluster = ClusterProcesses::start(&harness_binary(), root.path(), Vec::new())
-        .await
-        .expect("an empty cluster starts no processes");
+    let mut cluster =
+        ClusterProcesses::start(&harness_binary(), root.path(), PortReservation::empty())
+            .await
+            .expect("an empty cluster starts no processes");
     assert!(cluster.node_ids().is_empty());
 
     let error = format!(
@@ -757,9 +758,178 @@ async fn every_argument_rejection_names_what_was_wrong() {
     );
 }
 
+/// Every verdict a crippled voter produces downstream of a lost port, so the
+/// regression can assert the collision is reported *instead of* one of these.
+///
+/// `no such table: cluster_meta` is the one that started this: a linearizable
+/// read on a voter whose raft listener died reads a state machine that never
+/// applied the schema batch, which is indistinguishable from an un-migrated
+/// store. The other two are what an API-port collision produces.
+const STORE_VERDICTS: [&str; 4] = [
+    "no such table",
+    "cluster_meta",
+    "replicated store operation timed out",
+    "auth store has not been opened",
+];
+
+/// Start one voter with `held` already bound by somebody else and return how
+/// its startup failed.
+///
+/// Expect a hiqlite bind panic on stderr while this runs. That panic is the
+/// defect's mechanism, not a test failure: the voter's listener task is what
+/// dies, and the whole point of the assertion below is that the parent now
+/// hears about it.
+async fn startup_error_with_an_occupied_port(occupied: Occupied) -> String {
+    let root = tempfile::tempdir().expect("port collision test root");
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let held = squatter.local_addr().expect("held address").port();
+    let free = free_port().expect("the voter's other port");
+    let (raft, api) = match occupied {
+        Occupied::Raft => (held, free),
+        Occupied::Api => (free, held),
+    };
+
+    let launch = NodeLaunch {
+        node_id: 1,
+        root: root.path().to_path_buf(),
+        nodes: vec![NodeSpec {
+            id: 1,
+            raft: format!("127.0.0.1:{raft}"),
+            api: format!("127.0.0.1:{api}"),
+        }],
+    };
+    let mut voter = NodeProcess::spawn(&harness_binary(), &launch).expect("spawn the voter");
+    let error = voter
+        .wait_ready()
+        .await
+        .expect_err("a voter that could not bind must not announce readiness");
+    assert!(
+        is_port_collision(&error),
+        "a cluster start must be able to reallocate this, got: {error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(&format!("127.0.0.1:{held}")),
+        "the verdict should name the address that collided, got: {text}"
+    );
+    for verdict in STORE_VERDICTS {
+        assert!(
+            !text.contains(verdict),
+            "a busy port was reported as {verdict:?}: {text}"
+        );
+    }
+    text
+}
+
+#[derive(Clone, Copy)]
+enum Occupied {
+    Raft,
+    Api,
+}
+
+/// A port taken between allocation and bind is reported as a port collision,
+/// never as a durable-state fault.
+///
+/// `free_port` can only observe a port free and then release it, so the voter
+/// binds a port another process may already have claimed. hiqlite serves both
+/// listeners from detached tasks that `.unwrap()` the serve future, so that
+/// bind failure used to panic a background task and nothing else: `start_node`
+/// returned `Ok`, the local-database health probe passed, and the voter
+/// announced `Ready` with a dead listener. The collision then reached the gate
+/// as whatever the crippled voter failed at next — for a raft-port collision,
+/// `no such table: cluster_meta`, which reads as an un-migrated store.
+///
+/// Both listeners are asserted because they fail differently: a raft collision
+/// used to bootstrap "successfully" and misreport much later, while an API
+/// collision used to surface as a replicated deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voter_handed_an_occupied_port_reports_a_collision_not_a_store_verdict() {
+    for occupied in [Occupied::Raft, Occupied::Api] {
+        startup_error_with_an_occupied_port(occupied).await;
+    }
+}
+
+/// The classifier that decides whether a cluster start may reallocate must not
+/// answer yes for anything the cluster contract asserts.
+///
+/// This is the other half of the regression above: reporting a collision is
+/// only useful if a real store fault is still a verdict rather than something
+/// the harness silently retries five times and then reports as a busy port.
+#[test]
+fn a_store_verdict_is_never_classified_as_a_port_collision() {
+    assert!(is_port_collision(&anyhow::anyhow!(
+        "port collision: a voter listener could not bind one of [127.0.0.1:9]"
+    )));
+    assert!(is_port_collision(&anyhow::anyhow!(
+        "Os {{ code: 98, kind: AddrInUse, message: \"Address already in use\" }}"
+    )));
+    for verdict in STORE_VERDICTS {
+        assert!(
+            !is_port_collision(&anyhow::anyhow!("database error: {verdict}")),
+            "{verdict:?} is a durable-state verdict, not an environment fact"
+        );
+    }
+}
+
+/// The production start wrapper reallocates after a classified collision.
+///
+/// The pre-start seam returns a classified collision on the first attempt while
+/// its reservation is still held. The second call then returns a normal, fresh
+/// reservation and the real cluster start must become ready on different ports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_cluster_with_port_retry_reallocates_after_a_collision() {
+    let root = tempfile::tempdir().expect("port-collision retry test root");
+    let mut allocations = Vec::new();
+    let (mut cluster, started_specs) = start_cluster_with_port_retry_using(
+        &harness_binary(),
+        root.path(),
+        1,
+        |_| {
+            let reservation = allocate_nodes(1).expect("allocate retry ports");
+            allocations.push(reservation.specs().to_vec());
+            Ok(reservation)
+        },
+        |attempt, reservation| {
+            if attempt == 1 {
+                anyhow::bail!(
+                    "port collision: simulated bind refusal for {}",
+                    reservation.specs()[0].raft
+                );
+            }
+            Ok(())
+        },
+    )
+    .await
+    .expect("a fresh allocation should start after the collision");
+
+    assert!(
+        allocations.len() >= 2,
+        "the injected collision must force at least one fresh allocation"
+    );
+    let successful_allocation = allocations
+        .last()
+        .expect("a successful attempt records its allocation");
+    assert_ne!(
+        allocations[0][0].raft, successful_allocation[0].raft,
+        "the retry must allocate a fresh raft port"
+    );
+    assert_ne!(
+        allocations[0][0].api, successful_allocation[0].api,
+        "the retry must allocate a fresh API port"
+    );
+    assert_eq!(started_specs[0].id, successful_allocation[0].id);
+    assert_eq!(started_specs[0].raft, successful_allocation[0].raft);
+    assert_eq!(started_specs[0].api, successful_allocation[0].api);
+    cluster
+        .shutdown_all()
+        .await
+        .expect("shut down retried cluster");
+}
 #[test]
 fn allocated_voters_get_distinct_loopback_ports() {
-    let specs = allocate_nodes(3).expect("allocate three voters");
+    let specs = allocate_nodes(3)
+        .expect("allocate three voters")
+        .into_specs();
     assert_eq!(
         specs.iter().map(|node| node.id).collect::<Vec<_>>(),
         vec![1, 2, 3],
@@ -786,7 +956,10 @@ fn allocated_voters_get_distinct_loopback_ports() {
     );
 
     assert!(
-        allocate_nodes(0).expect("allocate nothing").is_empty(),
+        allocate_nodes(0)
+            .expect("allocate nothing")
+            .into_specs()
+            .is_empty(),
         "asking for no voters allocates no ports"
     );
     assert_ne!(free_port().expect("a free port"), 0);
@@ -798,7 +971,7 @@ fn a_voter_config_lands_in_its_own_data_directory() {
     let launch = NodeLaunch {
         node_id: 2,
         root: root.path().to_path_buf(),
-        nodes: allocate_nodes(3).expect("allocate voters"),
+        nodes: allocate_nodes(3).expect("allocate voters").into_specs(),
     };
 
     let config = node_config(&launch).expect("build the voter config");
@@ -865,7 +1038,7 @@ async fn a_malformed_request_is_answered_and_the_voter_keeps_serving() {
     let launch = NodeLaunch {
         node_id: 1,
         root: root.path().to_path_buf(),
-        nodes: allocate_nodes(1).expect("allocate one voter"),
+        nodes: allocate_nodes(1).expect("allocate one voter").into_specs(),
     };
     // Driven as a raw child rather than through `NodeProcess`, which can only
     // send a well-formed `Request`.
@@ -950,9 +1123,12 @@ async fn a_candidate_that_does_not_exit_42_is_a_harness_failure() {
 
     let error = format!(
         "{:#}",
-        run_incompatible_preflight(&candidate, &allocate_nodes(1).expect("allocate a voter"))
-            .await
-            .expect_err("a candidate that does not exit 42 must not count as a refusal")
+        run_incompatible_preflight(
+            &candidate,
+            &allocate_nodes(1).expect("allocate a voter").into_specs()
+        )
+        .await
+        .expect_err("a candidate that does not exit 42 must not count as a refusal")
     );
     assert!(
         error.contains("incompatible voter exited Some(7)"),

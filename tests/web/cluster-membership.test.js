@@ -328,11 +328,12 @@ test("a stale-node refusal refreshes the roster it says is stale", () => {
 test("node_owns_offline_work tells the operator what to do next", () => {
   const ui = sandbox();
   const text = ui.membershipRefusalText("node_owns_offline_work", "");
-  // Expected to be the common refusal until offline-package resolution lands,
-  // so "this node owns offline work" alone would be a dead end.
+  // Automatic resolution can still refuse for an active transfer or work
+  // created during removal, so "this node owns offline work" is a dead end.
   assert.match(text, /offline download/i);
-  assert.match(text, /delete them or let them expire/i);
-  assert.match(text, /then remove this node again/i);
+  assert.match(text, /active downloads.*finish or delete those packages/i);
+  assert.match(text, /stop clients from starting new downloads/i);
+  assert.match(text, /retry the removal/i);
 });
 
 test("an unknown refusal still says something true", () => {

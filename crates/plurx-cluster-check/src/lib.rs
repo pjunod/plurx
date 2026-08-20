@@ -12,12 +12,15 @@
 //! which needs no quorum and therefore no contended host.
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::io::Write as _;
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -62,6 +65,21 @@ const API_SECRET: &str = "plurx-m1b-api-secret";
 pub const INSTANCE_ID: &str = "m1b-cluster-check";
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+/// The interface every harness listener binds. hiqlite composes each listener
+/// from this and the port half of the node's own `addr_raft`/`addr_api`
+/// (`hiqlite-0.14.0/src/start.rs:318`), which is why the two must agree.
+const LISTEN_ADDR: &str = "127.0.0.1";
+/// The phrase every port-collision verdict in this crate carries, and the one
+/// [`is_port_collision`] recognises.
+const PORT_COLLISION: &str = "port collision";
+/// Exit status a voter uses when a listener lost its port. 98 is `EADDRINUSE`,
+/// which is what the failed `bind` itself reported.
+pub const BIND_FAILURE_EXIT: i32 = 98;
+/// How many times a cluster start reallocates its ports before giving up.
+const PORT_RETRY_ATTEMPTS: u32 = 5;
+/// How long a voter waits for its own listeners to accept before it reports
+/// them as never bound.
+const LISTENER_PROOF_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the convergence helpers retry before reporting failure.
 pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Incoming active-player heartbeats in the compacted-growth record.
@@ -178,28 +196,40 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
 async fn run_growth_subprocess() -> Result<()> {
     let root = tempfile::tempdir().context("compacted-growth subprocess data root")?;
-    let mut command = Command::new(harness_executable()?);
-    command
-        .arg("growth")
-        .arg(root.path())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("spawn compacted-growth subprocess")?;
-    let status = match tokio::time::timeout(Duration::from_secs(300), child.wait()).await {
-        Ok(status) => status.context("wait for compacted-growth subprocess")?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!("compacted-growth subprocess timed out after 300 seconds");
+    let executable = harness_executable()?;
+    with_port_retry(|attempt| {
+        let executable = executable.clone();
+        let attempt_root = root.path().join(format!("attempt-{attempt}"));
+        async move {
+            std::fs::create_dir_all(&attempt_root)?;
+            let mut command = Command::new(&executable);
+            command
+                .arg("growth")
+                .arg(&attempt_root)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            let mut child = command
+                .spawn()
+                .context("spawn compacted-growth subprocess")?;
+            let status = match tokio::time::timeout(Duration::from_secs(300), child.wait()).await {
+                Ok(status) => status.context("wait for compacted-growth subprocess")?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("compacted-growth subprocess timed out after 300 seconds");
+                }
+            };
+            if status.code() == Some(BIND_FAILURE_EXIT) {
+                bail!("{PORT_COLLISION}: the compacted-growth voter lost one of its ports");
+            }
+            if !status.success() {
+                bail!("compacted-growth subprocess exited {:?}", status.code());
+            }
+            Ok(())
         }
-    };
-    if !status.success() {
-        bail!("compacted-growth subprocess exited {:?}", status.code());
-    }
-    Ok(())
+    })
+    .await
 }
 
 async fn controller() -> Result<()> {
@@ -216,9 +246,24 @@ async fn controller() -> Result<()> {
 async fn run_membership_lifecycle_case() -> Result<()> {
     let executable = harness_executable()?;
     let root = tempfile::tempdir().context("membership lifecycle data root")?;
-    let specs = allocate_nodes(3)?;
-    let first = specs[0].clone();
-    let mut cluster = ClusterProcesses::start(&executable, root.path(), vec![first]).await?;
+    let (mut cluster, specs, cluster_root) = with_port_retry(|attempt| {
+        let executable = executable.clone();
+        let attempt_root = root.path().join(format!("attempt-{attempt}"));
+        async move {
+            let (listeners, all_specs) = allocate_nodes(3)?.into_inner();
+            let cluster = ClusterProcesses::start(
+                &executable,
+                &attempt_root,
+                PortReservation {
+                    listeners,
+                    specs: vec![all_specs[0].clone()],
+                },
+            )
+            .await?;
+            Ok((cluster, all_specs, attempt_root))
+        }
+    })
+    .await?;
     cluster.request(1, Request::Bootstrap).await?.require_ok()?;
 
     let initial_dump = match cluster.request(1, Request::Dump).await? {
@@ -267,7 +312,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 &executable,
                 NodeLaunch {
                     node_id,
-                    root: root.path().to_path_buf(),
+                    root: cluster_root.clone(),
                     nodes: specs[..node_id as usize].to_vec(),
                 },
             )
@@ -349,37 +394,244 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     let target = (2..=3)
         .find(|node_id| *node_id != leader)
         .context("choose a removable follower")?;
+    // M3c (`CLUSTERING-PLAN.md` §6.7): removal resolves the offline work the
+    // departing node owns instead of refusing forever. Seeded on the target's
+    // own process so the fixture's source files exist where its packages say
+    // they do.
+    let target_node = format!("node-{target}");
+    let media_dir = root.path().join(format!("media-{target_node}"));
+    let offline_user = match cluster
+        .request(
+            target,
+            Request::SeedOfflineRemovalWork {
+                node_id: target_node.clone(),
+                media_dir: media_dir.to_string_lossy().to_string(),
+            },
+        )
+        .await?
+    {
+        Response::SeededOfflineRemovalWork { user_id } => user_id,
+        response => bail!("unexpected offline removal seed response: {response:?}"),
+    };
+
+    // The refusal survives, narrowed to what the policy genuinely cannot
+    // resolve: a download that is in flight right now. Lifting the blanket
+    // refusal must not turn removal into "always succeeds".
+    let transfer_package = format!("{TRANSFER_PACKAGE}-{target_node}");
+    match cluster
+        .request(
+            1,
+            Request::RemoveVoter {
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::MembershipError { code, message } if code == "node_owns_offline_work" => {
+            if !message.contains("transferring") {
+                bail!("in-flight transfer refusal gave the operator no reason: {message}");
+            }
+        }
+        response => bail!("removal did not refuse an in-flight transfer: {response:?}"),
+    }
+    // The operator takes the action the refusal named.
+    match cluster
+        .request(
+            1,
+            Request::DeleteOfflinePackage {
+                package_id: transfer_package,
+                user_id: offline_user,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("could not clear the in-flight transfer fixture: {response:?}"),
+    }
+
+    // One more download is requested on the departing node while the removal
+    // is resolving. The node serves its API until the membership change
+    // commits, so a package created after the plan was drawn is real; a
+    // removal that resolved only its opening snapshot would commit and leave
+    // this one owned by a node that no longer exists.
+    let late_package = format!("{LATE_PACKAGE}-{target_node}");
     cluster
         .request(
             target,
-            Request::SeedOfflineWork {
-                node_id: format!("node-{target}"),
+            Request::SeedOfflineWorkDuringRemoval {
+                node_id: target_node.clone(),
+                media_dir: media_dir.to_string_lossy().to_string(),
+                user_id: offline_user,
+                delay_ms: LATE_PACKAGE_DELAY_MS,
             },
         )
         .await?
         .require_ok()?;
-    require_membership_error(
-        cluster
-            .request(
-                1,
-                Request::RemoveVoter {
-                    node_id: format!("node-{target}"),
-                },
-            )
-            .await?,
-        "node_owns_offline_work",
-    )?;
-    cluster
-        .request(1, Request::ResetContractState)
-        .await?
-        .require_ok()?;
+
     cluster
         .request(
             1,
             Request::RemoveVoter {
-                node_id: format!("node-{target}"),
+                node_id: target_node.clone(),
             },
         )
+        .await?
+        .require_ok()?;
+
+    // Either §6.7 outcome closes it — moved to a survivor, or failed with its
+    // reservation released. The outcome this exists to catch is the third one:
+    // still queued on a node that is now a tombstone, holding the traveller's
+    // byte budget until the seven-day expiry.
+    match offline_summary(&mut cluster, &late_package, offline_user).await? {
+        Response::OfflinePackageSummary {
+            state,
+            node_id,
+            error_code,
+            ..
+        } if state == "queued" && node_id != target_node && error_code.is_none() => {}
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0 => {}
+        response => bail!(
+            "a download requested while the removal was resolving was left owned by the removed \
+             node: {response:?}"
+        ),
+    }
+
+    // A survivor proved it reads the source, so the work moved rather than
+    // dying with the node.
+    let movable_package = format!("{MOVABLE_PACKAGE}-{target_node}");
+    let movable = offline_summary(&mut cluster, &movable_package, offline_user).await?;
+    match &movable {
+        Response::OfflinePackageSummary {
+            state,
+            node_id,
+            error_code,
+            ..
+        } if state == "queued" && *node_id != target_node && error_code.is_none() => {}
+        response => bail!("a verified package was not requeued on a survivor: {response:?}"),
+    }
+    let Response::OfflinePackageSummary {
+        node_id: new_owner, ..
+    } = movable
+    else {
+        unreachable!("matched above")
+    };
+
+    // No survivor could read this one, so it failed loudly with the stable
+    // code and gave its reservation back instead of holding the traveller's
+    // byte budget until the seven-day expiry.
+    match offline_summary(
+        &mut cluster,
+        &format!("{STRANDED_PACKAGE}-{target_node}"),
+        offline_user,
+    )
+    .await?
+    {
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0 => {}
+        response => bail!("an unverifiable package was not failed as node_removed: {response:?}"),
+    }
+
+    // A ready package whose bytes lived only on the removed node stops
+    // advertising itself as ready, even though its source is perfectly
+    // readable elsewhere. Requeueing it would risk handing a resuming
+    // downloader a different encoder's generation behind the same lease URL.
+    match offline_summary(
+        &mut cluster,
+        &format!("{READY_PACKAGE}-{target_node}"),
+        offline_user,
+    )
+    .await?
+    {
+        Response::OfflinePackageSummary {
+            state,
+            error_code,
+            reserved_bytes,
+            actual_bytes,
+            ..
+        } if state == "failed"
+            && error_code.as_deref() == Some("node_removed")
+            && reserved_bytes == 0
+            && actual_bytes.is_none() => {}
+        response => bail!("a ready package survived its node's removal: {response:?}"),
+    }
+
+    // The re-homed package is ordinary claimable work on its new owner, and
+    // the node that just left can no longer publish it.
+    let new_owner_voter = (1..=3)
+        .find(|voter| format!("node-{voter}") == new_owner)
+        .context("requeued package landed on a node outside the cluster")?;
+    // The package requested mid-removal can share this queue, so claim until
+    // the one under test comes out instead of assuming it is first.
+    let mut claimed_movable = false;
+    for _ in 0..2 {
+        match cluster
+            .request(
+                new_owner_voter,
+                Request::ClaimNextOfflinePackage {
+                    node_id: new_owner.clone(),
+                },
+            )
+            .await?
+        {
+            Response::ClaimedOfflinePackage {
+                package_id: Some(package_id),
+            } if package_id == movable_package => {
+                claimed_movable = true;
+                break;
+            }
+            Response::ClaimedOfflinePackage {
+                package_id: Some(package_id),
+            } if package_id == late_package => {}
+            response => {
+                bail!("the requeued package was not claimable on its new owner: {response:?}")
+            }
+        }
+    }
+    if !claimed_movable {
+        bail!("the requeued package never became claimable on its new owner");
+    }
+    match cluster
+        .request(
+            1,
+            Request::PublishOfflinePackage {
+                package_id: movable_package.clone(),
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("the removed node still published re-homed work: {response:?}"),
+    }
+    match cluster
+        .request(
+            new_owner_voter,
+            Request::PublishOfflinePackage {
+                package_id: movable_package,
+                node_id: new_owner,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("the new owner could not complete the requeued package: {response:?}"),
+    }
+
+    cluster
+        .request(1, Request::ResetContractState)
         .await?
         .require_ok()?;
     cluster
@@ -445,6 +697,22 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     Ok(())
 }
 
+async fn offline_summary(
+    cluster: &mut ClusterProcesses,
+    package_id: &str,
+    user_id: i64,
+) -> Result<Response> {
+    cluster
+        .request(
+            1,
+            Request::OfflinePackageSummary {
+                package_id: package_id.to_owned(),
+                user_id,
+            },
+        )
+        .await
+}
+
 fn require_membership_error(response: Response, expected: &str) -> Result<()> {
     match response {
         Response::MembershipError { code, .. } if code == expected => Ok(()),
@@ -468,11 +736,19 @@ async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
             .path()
             .to_path_buf()
     });
+    let reservation = allocate_nodes(1)?;
+    let (listeners, specs) = reservation.into_inner();
     let launch = NodeLaunch {
         node_id: 1,
         root,
-        nodes: allocate_nodes(1)?,
+        nodes: specs,
     };
+    // This voter runs hiqlite in-process rather than behind the stdin/stdout
+    // protocol, so a lost port would otherwise surface as a growth verdict.
+    // The reservation is dropped here: hiqlite binds its own sockets from the
+    // address strings, so we must release the port before it can bind it.
+    drop(listeners);
+    install_bind_failure_guard(BindFailureChannel::Stderr, voter_listen_addrs(&launch)?);
     let mut config = node_config(&launch)?;
     config.filename_db = Cow::Borrowed("growth.db");
     config.raft_config = NodeConfig::default_raft_config(GROWTH_COMPACTION_LOGS);
@@ -1045,18 +1321,66 @@ pub enum Request {
     Bootstrap,
     RejectIdentityDrift,
     Open,
-    IssueJoinToken { ttl_ms: u64 },
-    RedeemJoin { request: RedeemJoinRequest },
-    FinalizeJoin { request: FinalizeJoinRequest },
+    IssueJoinToken {
+        ttl_ms: u64,
+    },
+    RedeemJoin {
+        request: RedeemJoinRequest,
+    },
+    FinalizeJoin {
+        request: FinalizeJoinRequest,
+    },
     MembershipStatus,
-    HeartbeatPreservesTombstone { node_id: String },
-    RemoveVoter { node_id: String },
-    SeedOfflineWork { node_id: String },
+    HeartbeatPreservesTombstone {
+        node_id: String,
+    },
+    RemoveVoter {
+        node_id: String,
+    },
+    SeedOfflineRemovalWork {
+        node_id: String,
+        media_dir: String,
+    },
+    /// Request a download on this node `delay_ms` from now and answer
+    /// immediately, so the package lands while a removal started right after
+    /// this call is still resolving. Real operators do exactly this: the
+    /// departing node keeps serving its API until the membership change
+    /// commits.
+    SeedOfflineWorkDuringRemoval {
+        node_id: String,
+        media_dir: String,
+        user_id: i64,
+        delay_ms: u64,
+    },
+    DeleteOfflinePackage {
+        package_id: String,
+        user_id: i64,
+    },
+    OfflinePackageSummary {
+        package_id: String,
+        user_id: i64,
+    },
+    ClaimNextOfflinePackage {
+        node_id: String,
+    },
+    PublishOfflinePackage {
+        package_id: String,
+        node_id: String,
+    },
     ResetContractState,
-    RecordLocalTelemetry { marker: String },
-    CountLocalTelemetry { marker: String },
-    Exercise { ordinal: u64 },
-    PostLossWrite { target: String, position_ms: i64 },
+    RecordLocalTelemetry {
+        marker: String,
+    },
+    CountLocalTelemetry {
+        marker: String,
+    },
+    Exercise {
+        ordinal: u64,
+    },
+    PostLossWrite {
+        target: String,
+        position_ms: i64,
+    },
     VerifyProof,
     Dump,
     CatalogView,
@@ -1074,6 +1398,25 @@ pub enum Response {
         node_id: u64,
     },
     Ok,
+    Flag {
+        value: bool,
+    },
+    SeededOfflineRemovalWork {
+        user_id: i64,
+    },
+    /// Just enough of a package to assert a §6.7 outcome. Deliberately does
+    /// not carry `source_path`: a media path has no business crossing a
+    /// harness wire any more than it does a log line.
+    OfflinePackageSummary {
+        state: String,
+        node_id: String,
+        error_code: Option<String>,
+        reserved_bytes: i64,
+        actual_bytes: Option<i64>,
+    },
+    ClaimedOfflinePackage {
+        package_id: Option<String>,
+    },
     TelemetryCount {
         count: usize,
     },
@@ -1309,7 +1652,17 @@ impl ClusterProcesses {
     /// Start one voter process per spec from `executable` and wait for each to
     /// announce readiness. The executable is explicit rather than
     /// `current_exe()` so a test binary can start real harness voters.
-    pub async fn start(executable: &Path, root: &Path, specs: Vec<NodeSpec>) -> Result<Self> {
+    pub async fn start(
+        executable: &Path,
+        root: &Path,
+        reservation: PortReservation,
+    ) -> Result<Self> {
+        let (_listeners, specs) = reservation.into_inner();
+        // Listeners are dropped here: the child process must bind the same
+        // ports, so we cannot hold them across the spawn. The window between
+        // releasing the port and the child binding it is the residual race
+        // that [`install_bind_failure_guard`] + retry handle.
+        drop(_listeners);
         let mut nodes = Vec::with_capacity(specs.len());
         for node_id in 1..=specs.len() as u64 {
             let launch = NodeLaunch {
@@ -1622,6 +1975,32 @@ pub fn harness_executable() -> Result<PathBuf> {
     std::env::current_exe().context("cluster-check executable")
 }
 
+/// Retry a cluster start whose only failure was a port taken between
+/// allocation and bind.
+///
+/// `attempt` is handed the attempt number so it can allocate fresh ports and a
+/// fresh data root each time. Only [`is_port_collision`] errors are retried;
+/// every other failure is a verdict and is returned immediately, which is the
+/// whole point of classifying the collision rather than matching a message
+/// here.
+pub async fn with_port_retry<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut last_error = None;
+    for number in 1..=PORT_RETRY_ATTEMPTS {
+        match attempt(number).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_port_collision(&error) => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.with_context(|| {
+        format!("cluster ports stayed occupied across {PORT_RETRY_ATTEMPTS} allocations")
+    })?)
+}
+
 /// Allocate ports and start `voters` voter processes, retrying the whole
 /// allocation when a port was taken between binding it and using it.
 pub async fn start_cluster_with_port_retry(
@@ -1629,19 +2008,58 @@ pub async fn start_cluster_with_port_retry(
     root: &Path,
     voters: u64,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
-    let mut last_error = None;
-    for attempt in 1..=5 {
-        let specs = allocate_nodes(voters)?;
-        let attempt_root = root.join(format!("attempt-{attempt}"));
-        match ClusterProcesses::start(executable, &attempt_root, specs.clone()).await {
-            Ok(cluster) => return Ok((cluster, specs)),
-            Err(error) if format!("{error:#}").contains("Address already in use") => {
-                last_error = Some(error);
+    start_cluster_with_port_retry_using(
+        executable,
+        root,
+        voters,
+        |_| allocate_nodes(voters),
+        |_, _| Ok(()),
+    )
+    .await
+}
+
+/// Start a cluster with injectable allocation and pre-start seams.
+///
+/// This is public only so the integration harness can deterministically return
+/// a classified collision before the first start and prove the production
+/// retry wrapper performs a fresh allocation. The reservation remains held
+/// during that injection, so the regression does not recreate the
+/// release-to-bind race this wrapper exists to handle. Production callers
+/// should use [`start_cluster_with_port_retry`].
+#[doc(hidden)]
+pub async fn start_cluster_with_port_retry_using<A, B>(
+    executable: &Path,
+    root: &Path,
+    voters: u64,
+    mut allocate: A,
+    mut before_start: B,
+) -> Result<(ClusterProcesses, Vec<NodeSpec>)>
+where
+    A: FnMut(u32) -> Result<PortReservation>,
+    B: FnMut(u32, &PortReservation) -> Result<()>,
+{
+    with_port_retry(|attempt| {
+        let reservation = allocate(attempt);
+        let before_start = match reservation.as_ref() {
+            Ok(reservation) => before_start(attempt, reservation),
+            Err(_) => Ok(()),
+        };
+        async move {
+            let reservation = reservation?;
+            before_start?;
+            if reservation.specs.len() != voters as usize {
+                bail!(
+                    "cluster allocator returned {} voters, expected {voters}",
+                    reservation.specs.len()
+                );
             }
-            Err(error) => return Err(error),
+            let specs = reservation.specs.clone();
+            let attempt_root = root.join(format!("attempt-{attempt}"));
+            let cluster = ClusterProcesses::start(executable, &attempt_root, reservation).await?;
+            Ok((cluster, specs))
         }
-    }
-    Err(last_error.context("cluster ports stayed occupied across five allocations")?)
+    })
+    .await
 }
 
 /// Assert a voter's local dump carries every row the harness wrote: the
@@ -1732,7 +2150,12 @@ pub fn validate_known_dump(dump: &serde_json::Value) -> Result<()> {
 /// line-delimited request protocol until stdin closes.
 pub async fn node(launch: NodeLaunch) -> Result<()> {
     install_crypto_provider();
-    let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
+    // Arm this before hiqlite can spawn a listener, so a bind that lost its
+    // port is reported as a port collision rather than surviving as a voter
+    // that answers every later request with a durable-state symptom.
+    let listeners = voter_listen_addrs(&launch)?;
+    install_bind_failure_guard(BindFailureChannel::Protocol, listeners.clone());
+    let _ = ServerTlsConfig::server_config_self_signed(LISTEN_ADDR).await;
     let client = match hiqlite::start_node(node_config(&launch)?).await {
         Ok(client) => client,
         Err(error) => {
@@ -1746,6 +2169,13 @@ pub async fn node(launch: NodeLaunch) -> Result<()> {
     tokio::time::timeout(START_TIMEOUT, client.wait_until_healthy_db())
         .await
         .context("voter health timed out")?;
+    if let Err(error) = prove_listeners_bound(&listeners).await {
+        write_response(&Response::Error {
+            message: format!("{error:#}"),
+        })
+        .await?;
+        return Err(error);
+    }
     let replication = ReplicationMonitor::replicated(client.clone());
 
     write_response(&Response::Ready {
@@ -1804,7 +2234,9 @@ async fn handle_request(
             let opened = Arc::new(
                 HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID, telemetry_path).await?,
             );
-            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            let opened_membership = membership_manager(client, opened.clone(), launch).await?;
+            tokio::spawn(opened_membership.clone().offline_source_probe_loop());
+            *membership = Some(opened_membership);
             *store = Some(opened);
             Ok(Response::Ok)
         }
@@ -1819,7 +2251,9 @@ async fn handle_request(
         }
         Request::Open => {
             let opened = Arc::new(HiqliteAuthStore::open(client.clone(), telemetry_path).await?);
-            *membership = Some(membership_manager(client, opened.clone(), launch).await?);
+            let opened_membership = membership_manager(client, opened.clone(), launch).await?;
+            tokio::spawn(opened_membership.clone().offline_source_probe_loop());
+            *membership = Some(opened_membership);
             *store = Some(opened);
             Ok(Response::Ok)
         }
@@ -1861,10 +2295,75 @@ async fn handle_request(
             .await
             .map(|_| Response::Ok)
             .or_else(|error| Ok(membership_error_response(error))),
-        Request::SeedOfflineWork { node_id } => {
-            seed_offline_work(store_ref(store)?, &node_id).await?;
+        Request::SeedOfflineRemovalWork { node_id, media_dir } => {
+            let user_id =
+                seed_offline_removal_work(store_ref(store)?, &node_id, Path::new(&media_dir))
+                    .await?;
+            Ok(Response::SeededOfflineRemovalWork { user_id })
+        }
+        Request::SeedOfflineWorkDuringRemoval {
+            node_id,
+            media_dir,
+            user_id,
+            delay_ms,
+        } => {
+            // Answered before the package exists on purpose. The caller starts
+            // the removal next, so the request lands mid-resolution the way a
+            // real one would, rather than at a moment the harness chose.
+            let store = store.clone().context("node store is not open")?;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if let Err(error) = seed_offline_work_during_removal(
+                    &store,
+                    &node_id,
+                    Path::new(&media_dir),
+                    user_id,
+                )
+                .await
+                {
+                    eprintln!("cluster-check: mid-removal offline seed failed: {error:#}");
+                }
+            });
             Ok(Response::Ok)
         }
+        Request::DeleteOfflinePackage {
+            package_id,
+            user_id,
+        } => Ok(Response::Flag {
+            value: store_ref(store)?
+                .delete_offline_package(&package_id, user_id)
+                .await?,
+        }),
+        Request::OfflinePackageSummary {
+            package_id,
+            user_id,
+        } => {
+            let package = store_ref(store)?
+                .offline_package_for_user(&package_id, user_id)
+                .await?
+                .with_context(|| format!("offline package {package_id} disappeared"))?;
+            Ok(Response::OfflinePackageSummary {
+                state: package.state,
+                node_id: package.node_id,
+                error_code: package.error_code,
+                reserved_bytes: package.reserved_bytes,
+                actual_bytes: package.actual_bytes,
+            })
+        }
+        Request::ClaimNextOfflinePackage { node_id } => Ok(Response::ClaimedOfflinePackage {
+            package_id: store_ref(store)?
+                .claim_next_offline_package(&node_id)
+                .await?
+                .map(|package| package.id),
+        }),
+        Request::PublishOfflinePackage {
+            package_id,
+            node_id,
+        } => Ok(Response::Flag {
+            value: store_ref(store)?
+                .mark_offline_package_ready(&package_id, &node_id, "rehomed-recipe", 900, 90_000)
+                .await?,
+        }),
         Request::ResetContractState => {
             store_ref(store)?.validation_reset_contract_state().await?;
             Ok(Response::Ok)
@@ -2052,7 +2551,31 @@ async fn membership_manager(
     .map_err(Into::into)
 }
 
-async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()> {
+/// Package ids the removal scenario asserts on. Each names the §6.7 outcome
+/// it is there to pin down.
+const MOVABLE_PACKAGE: &str = "offline-movable";
+const STRANDED_PACKAGE: &str = "offline-stranded";
+const READY_PACKAGE: &str = "offline-ready";
+const TRANSFER_PACKAGE: &str = "offline-transfer";
+/// Requested after the removal has already drawn its plan.
+const LATE_PACKAGE: &str = "offline-late";
+/// Long enough to land after the removal snapshots the work it plans to
+/// resolve, and well inside the bounded probe wait that follows it.
+const LATE_PACKAGE_DELAY_MS: u64 = 250;
+
+/// Seed the four packages a node removal has to deal with, backed by real
+/// files on a real filesystem.
+///
+/// The sources are genuinely written to disk (and genuinely absent, for the
+/// stranded one) because the whole contract under test is that a survivor
+/// proves it can *read* the bytes. A fixture that only wrote rows would prove
+/// the requeue mechanics and skip the part §6.7 actually cares about.
+async fn seed_offline_removal_work(
+    store: &HiqliteAuthStore,
+    node_id: &str,
+    media_dir: &Path,
+) -> Result<i64> {
+    std::fs::create_dir_all(media_dir).context("offline removal fixture media directory")?;
     let user = store
         .create_user(&format!("membership-offline-{node_id}"), "hash", false)
         .await?;
@@ -2060,7 +2583,7 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
         .create_library(&NewLibrary {
             name: format!("Membership Offline {node_id}"),
             kind: LibraryKind::Movies,
-            paths: vec![PathBuf::from(format!("/cluster/membership/{node_id}"))],
+            paths: vec![media_dir.to_path_buf()],
             anime: false,
         })
         .await?;
@@ -2075,25 +2598,167 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
             episode_number: None,
         })
         .await?;
-    let source_path = format!("/cluster/membership/{node_id}/offline.mkv");
+
+    // Created and transitioned one at a time so exactly one package is
+    // claimable at each step: the fairness ordering in the queue is not what
+    // this scenario is proving.
+    for (package_id, present, target_state) in [
+        (MOVABLE_PACKAGE, true, "preparing"),
+        (READY_PACKAGE, true, "ready"),
+        (TRANSFER_PACKAGE, true, "ready"),
+        (STRANDED_PACKAGE, false, "queued"),
+    ] {
+        let source_path = media_dir.join(format!("{package_id}.mkv"));
+        let (source_size, source_mtime) = if present {
+            std::fs::write(&source_path, vec![0_u8; 4_096])
+                .with_context(|| format!("write offline fixture source for {package_id}"))?;
+            let metadata = std::fs::metadata(&source_path)?;
+            let mtime = i64::try_from(metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs())?;
+            (i64::try_from(metadata.len())?, mtime)
+        } else {
+            // Nothing is written here on purpose: no node can prove a source
+            // that does not exist, which is exactly the case that must resolve
+            // to `node_removed` instead of a hopeful reassignment.
+            (4_096, 1_700_000_000)
+        };
+        let source = source_path.to_string_lossy().to_string();
+        let file = store
+            .upsert_file(
+                item,
+                &source,
+                source_size,
+                source_mtime,
+                &ProbeResult::default(),
+            )
+            .await?;
+        let package = NewOfflinePackage {
+            id: format!("{package_id}-{node_id}"),
+            request_id: format!("{package_id}-request-{node_id}"),
+            user_id: user.id,
+            file_id: file,
+            node_id: node_id.to_owned(),
+            source_path: source,
+            source_size,
+            source_mtime,
+            effective_rate_control: "vbr".to_owned(),
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".to_owned(),
+            estimated_bytes: 700,
+            reserved_bytes: 900,
+            expires_at: unix_now()?.saturating_add(3_600),
+        };
+        if !matches!(
+            store
+                .create_offline_package(&package, 10, 100_000, 1_000_000)
+                .await?,
+            OfflineCreateOutcome::Created(_)
+        ) {
+            bail!("membership offline fixture {package_id} was not admitted");
+        }
+        if target_state == "queued" {
+            continue;
+        }
+        if store
+            .claim_next_offline_package(node_id)
+            .await?
+            .is_none_or(|claimed| claimed.id != package.id)
+        {
+            bail!("membership offline fixture {package_id} did not claim in order");
+        }
+        if target_state == "ready"
+            && !store
+                .mark_offline_package_ready(&package.id, node_id, package_id, 900, 90_000)
+                .await?
+        {
+            bail!("membership offline fixture {package_id} did not publish");
+        }
+    }
+
+    // One downloader is mid-transfer. A lease touched this recently is what
+    // the activity surface calls "sending", and removal refuses rather than
+    // cutting it off.
+    let expires_at = unix_now()?.saturating_add(3_600);
+    if !matches!(
+        store
+            .put_offline_lease(
+                &format!("{TRANSFER_PACKAGE}-{node_id}"),
+                user.id,
+                &format!("{:x}", Sha256::digest(b"membership-offline-transfer")),
+                expires_at,
+            )
+            .await?,
+        OfflineLeaseOutcome::Created(_) | OfflineLeaseOutcome::Renewed(_)
+    ) {
+        bail!("membership offline transfer lease was not admitted");
+    }
+    Ok(user.id)
+}
+
+/// Request one more download on the departing node, after that node's removal
+/// has already snapshotted the work it planned to resolve.
+///
+/// The source is a real, readable file so a survivor can genuinely prove it.
+/// What this fixture is about is whether the removal looks *again* before it
+/// commits — the probe protocol itself is already covered by the four packages
+/// seeded up front.
+async fn seed_offline_work_during_removal(
+    store: &HiqliteAuthStore,
+    node_id: &str,
+    media_dir: &Path,
+    user_id: i64,
+) -> Result<()> {
+    let dir = media_dir.join("late");
+    std::fs::create_dir_all(&dir).context("mid-removal offline fixture directory")?;
+    let library = store
+        .create_library(&NewLibrary {
+            name: format!("Membership Offline Late {node_id}"),
+            kind: LibraryKind::Movies,
+            paths: vec![dir.clone()],
+            anime: false,
+        })
+        .await?;
+    let item = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Membership Offline Late {node_id}"),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let source_path = dir.join(format!("{LATE_PACKAGE}.mkv"));
+    std::fs::write(&source_path, vec![0_u8; 4_096])
+        .context("mid-removal offline fixture source")?;
+    let metadata = std::fs::metadata(&source_path)?;
+    let source_size = i64::try_from(metadata.len())?;
+    let source_mtime = i64::try_from(metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs())?;
+    let source = source_path.to_string_lossy().to_string();
     let file = store
         .upsert_file(
             item,
-            &source_path,
-            1_000,
-            1_700_000_000,
+            &source,
+            source_size,
+            source_mtime,
             &ProbeResult::default(),
         )
         .await?;
     let package = NewOfflinePackage {
-        id: format!("membership-offline-{node_id}"),
-        request_id: format!("membership-offline-request-{node_id}"),
-        user_id: user.id,
+        id: format!("{LATE_PACKAGE}-{node_id}"),
+        request_id: format!("{LATE_PACKAGE}-request-{node_id}"),
+        user_id,
         file_id: file,
         node_id: node_id.to_owned(),
-        source_path,
-        source_size: 1_000,
-        source_mtime: 1_700_000_000,
+        source_path: source,
+        source_size,
+        source_mtime,
         effective_rate_control: "vbr".to_owned(),
         target_height: 720,
         output_width: Some(1280),
@@ -2113,7 +2778,7 @@ async fn seed_offline_work(store: &HiqliteAuthStore, node_id: &str) -> Result<()
             .await?,
         OfflineCreateOutcome::Created(_)
     ) {
-        bail!("membership offline fixture was not admitted");
+        bail!("the download requested during the removal was not admitted");
     }
     Ok(())
 }
@@ -2751,26 +3416,47 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .set_offline_package_recipe(&offline.id, &recipe_hash)
             .await?
         || !store
-            .update_offline_progress(&offline.id, "video", 500)
-            .await?
-        || !store
-            .mark_offline_package_ready(&offline.id, &recipe_hash, 800, 120_000)
+            .update_offline_progress(&offline.id, &node_id, "video", 500)
             .await?
     {
         bail!("replicated offline preparation state machine failed");
     }
+    // The producer fence, asserted while the package is genuinely
+    // mid-preparation: its writes belong to whichever node owns it *now*.
+    // Removal re-homes a package while the departing node's encoder may still
+    // be running, and an unfenced yield would knock the survivor's claimed
+    // work back to `queued` while its progress flapped.
     if store
-        .mark_offline_package_ready(&offline.id, &recipe_hash, 801, 120_001)
+        .requeue_offline_package(&offline.id, &wrong_node)
         .await?
-        || store.requeue_offline_package(&offline.id).await?
+        || store
+            .update_offline_progress(&offline.id, &wrong_node, "stolen", 999)
+            .await?
+        || store
+            .offline_package_for_user(&offline.id, user.id)
+            .await?
+            .is_none_or(|package| package.phase != "video" || package.progress_millis != 500)
+    {
+        bail!("replicated offline producer writes were not fenced to the owning node");
+    }
+    if !store
+        .mark_offline_package_ready(&offline.id, &node_id, &recipe_hash, 800, 120_000)
+        .await?
+    {
+        bail!("replicated offline preparation state machine failed");
+    }
+    if store
+        .mark_offline_package_ready(&offline.id, &node_id, &recipe_hash, 801, 120_001)
+        .await?
+        || store.requeue_offline_package(&offline.id, &node_id).await?
         || store
             .set_offline_package_recipe(&offline.id, "wrong-recipe")
             .await?
         || store
-            .update_offline_progress(&offline.id, "wrong-state", 999)
+            .update_offline_progress(&offline.id, &node_id, "wrong-state", 999)
             .await?
         || store
-            .fail_offline_package(&offline.id, "wrong-state", "wrong", "wrong")
+            .fail_offline_package(&offline.id, &node_id, "wrong-state", "wrong", "wrong")
             .await?
     {
         bail!("replicated offline terminal-state guards accepted a late mutation");
@@ -2861,13 +3547,13 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .claim_next_offline_package(&node_id)
             .await?
             .is_none_or(|package| package.id != work.id)
-        || !store.requeue_offline_package(&work.id).await?
+        || !store.requeue_offline_package(&work.id, &node_id).await?
         || store
             .claim_next_offline_package(&node_id)
             .await?
             .is_none_or(|package| package.id != work.id)
         || !store
-            .fail_offline_package(&work.id, "video", "proof", "expected")
+            .fail_offline_package(&work.id, &node_id, "video", "proof", "expected")
             .await?
         || !store.delete_offline_package(&work.id, user.id).await?
     {
@@ -3076,8 +3762,8 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
                 addr_api: node.api.clone(),
             })
             .collect(),
-        listen_addr_api: Cow::Borrowed("127.0.0.1"),
-        listen_addr_raft: Cow::Borrowed("127.0.0.1"),
+        listen_addr_api: Cow::Borrowed(LISTEN_ADDR),
+        listen_addr_raft: Cow::Borrowed(LISTEN_ADDR),
         data_dir: Cow::Owned(data_dir.to_string_lossy().into_owned()),
         filename_db: Cow::Borrowed("auth.db"),
         secret_raft: RAFT_SECRET.to_owned(),
@@ -3091,21 +3777,261 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
     })
 }
 
-/// Reserve a raft and an API port for each of `count` voters.
-pub fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
-    (1..=count)
+/// A reserved set of ports whose listeners stay alive so no other process
+/// can claim them before the intended voter binds.
+///
+/// Drop the reservation to release the ports. Pass it to
+/// [`ClusterProcesses::start`] so the cluster holds the ports until every
+/// voter has announced readiness, or to any call site that needs the
+/// guarantee that these ports will not be reallocated while the caller
+/// decides.
+pub struct PortReservation {
+    /// Held open so nothing else claims the port between allocation and bind.
+    #[allow(dead_code)]
+    listeners: Vec<TcpListener>,
+    /// The voter specs describing the reserved ports.
+    pub specs: Vec<NodeSpec>,
+}
+
+impl PortReservation {
+    /// An empty reservation that holds no ports. Useful for tests that
+    /// create a cluster with no voters.
+    pub fn empty() -> Self {
+        Self {
+            listeners: Vec::new(),
+            specs: Vec::new(),
+        }
+    }
+    /// The [`NodeSpec`] entries allocated for each voter.
+    pub fn specs(&self) -> &[NodeSpec] {
+        &self.specs
+    }
+
+    /// Consume the reservation and return only the specs, releasing the ports.
+    pub fn into_specs(self) -> Vec<NodeSpec> {
+        self.specs
+    }
+
+    /// Recreate an allocation after releasing its reservations.
+    ///
+    /// This deliberately provides no allocation guarantee and exists only for
+    /// the deterministic collision regression that takes one of these ports
+    /// before the voter binds it.
+    #[doc(hidden)]
+    pub fn unreserved(specs: Vec<NodeSpec>) -> Self {
+        Self {
+            listeners: Vec::new(),
+            specs,
+        }
+    }
+
+    /// Returns the listeners, consuming the reservation.
+    pub fn into_inner(self) -> (Vec<TcpListener>, Vec<NodeSpec>) {
+        (self.listeners, self.specs)
+    }
+}
+
+/// Reserve a raft and an API port for each of `count` voters, holding every
+/// listener open so another process cannot claim the port between allocation
+/// and bind.
+///
+/// Each port is bound to [`LISTEN_ADDR`] on a kernel-assigned port, the port
+/// number is recorded in a [`NodeSpec`], and the listener is kept alive until
+/// the [`PortReservation`] is consumed. Pass the reservation to
+/// [`ClusterProcesses::start`] so the ports stay reserved until every voter
+/// has announced readiness.
+pub fn allocate_nodes(count: u64) -> Result<PortReservation> {
+    let mut listeners = Vec::with_capacity(count as usize * 2);
+    for _ in 0..count * 2 {
+        listeners.push(TcpListener::bind((LISTEN_ADDR, 0)).context("reserve a harness port")?);
+    }
+    let mut ports = listeners
+        .iter()
+        .map(|listener| Ok(listener.local_addr()?.port()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter();
+    let specs = (1..=count)
         .map(|id| {
             Ok(NodeSpec {
                 id,
-                raft: format!("127.0.0.1:{}", free_port()?),
-                api: format!("127.0.0.1:{}", free_port()?),
+                raft: format!("{LISTEN_ADDR}:{}", ports.next().context("raft port")?),
+                api: format!("{LISTEN_ADDR}:{}", ports.next().context("api port")?),
             })
+        })
+        .collect::<Result<_>>()?;
+    Ok(PortReservation { listeners, specs })
+}
+
+/// Observe one free port.
+///
+/// The listener is released as the expression ends, so this reports a port
+/// that *was* free rather than one this process holds. Nothing that starts a
+/// voter may treat the result as a reservation; see [`allocate_nodes`].
+///
+/// # Correct use
+///
+/// `free_port` is for observation, not allocation. Use it to find a port for
+/// a squatter in a collision test, or to assert that the OS assigned a
+/// non-zero port. Never use it to choose a port a voter will later bind:
+/// that is what [`allocate_nodes`] / [`PortReservation`] are for.
+pub fn free_port() -> Result<u16> {
+    Ok(TcpListener::bind((LISTEN_ADDR, 0))?.local_addr()?.port())
+}
+
+/// The last port collision this process observed, recorded by
+/// [`install_bind_failure_guard`].
+static BIND_FAILURE: OnceLock<String> = OnceLock::new();
+
+/// Where a voter reports a listener that never bound.
+#[derive(Clone, Copy, Debug)]
+pub enum BindFailureChannel {
+    /// Write a [`Response::Error`] on the stdin/stdout voter protocol, so the
+    /// controller reads the collision as this voter's own startup verdict.
+    Protocol,
+    /// Print to stderr, for a harness voter that has no protocol peer.
+    Stderr,
+}
+
+/// Is this error a port taken between allocation and bind, rather than
+/// anything the cluster contract asserts?
+///
+/// A port is only ever observed free and then released, so a voter is always
+/// started on a port another process may have claimed in the meantime. That is
+/// an environment fact, not a durable-state fault. Classifying it here — once,
+/// by name — is what keeps "the port moved" from being read as "the store is
+/// un-migrated".
+pub fn is_port_collision(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains(PORT_COLLISION) || text.contains("Address already in use")
+}
+
+/// Make a listener that never bound the voter's own verdict.
+///
+/// hiqlite serves its raft and its API listener from detached `tokio::spawn`
+/// tasks that `.unwrap()` the serve future (`hiqlite-0.14.0/src/start.rs:148`
+/// and `:231`). A bind that loses its port panics one of those tasks and
+/// nothing else: `start_node` has already returned `Ok`,
+/// `wait_until_healthy_db` probes only the *local* database, and the process
+/// stays alive serving one dead listener. The collision then reached the
+/// controller as whatever the crippled voter failed at next — a replicated
+/// deadline for the API port, or `no such table: cluster_meta` for a
+/// linearizable read that never reached a state machine, which reads as an
+/// un-migrated store rather than a busy port.
+///
+/// This hook turns that panic into a classified verdict and stops the voter,
+/// so a port collision cannot go on to be reported as durable-state damage.
+/// Panics that are not bind failures keep their previous behaviour.
+pub fn install_bind_failure_guard(channel: BindFailureChannel, addresses: Vec<String>) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let Some(payload) = bind_failure_payload(info) else {
+            previous(info);
+            return;
+        };
+        let message = format!(
+            "{PORT_COLLISION}: a voter listener could not bind one of [{}]: {payload}",
+            addresses.join(", ")
+        );
+        let _ = BIND_FAILURE.set(message.clone());
+        match channel {
+            BindFailureChannel::Protocol => {
+                // A panic hook cannot drive the async writer, so emit the same
+                // newline framing the controller reads synchronously.
+                if let Ok(mut line) = serde_json::to_vec(&Response::Error { message }) {
+                    line.push(b'\n');
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(&line);
+                    let _ = stdout.flush();
+                }
+            }
+            BindFailureChannel::Stderr => eprintln!("{message}"),
+        }
+        // Leaving the voter alive is the defect being fixed: it would keep
+        // answering with downstream symptoms of the dead listener. `exit`
+        // rather than `abort` so an instrumented build still writes its
+        // coverage profile.
+        std::process::exit(BIND_FAILURE_EXIT);
+    }));
+}
+
+/// The panic message, when the panic is a listener that could not bind.
+fn bind_failure_payload(info: &PanicHookInfo<'_>) -> Option<String> {
+    let payload = info.payload_as_str()?;
+    (payload.contains("AddrInUse") || payload.contains("Address already in use"))
+        .then(|| payload.to_owned())
+}
+
+/// The addresses this voter's hiqlite node will bind.
+///
+/// hiqlite builds each listener from `listen_addr_*` and the port half of this
+/// node's own entry (`hiqlite-0.14.0/src/start.rs:318`), so these are the two
+/// addresses a collision can be a collision *with*.
+pub fn voter_listen_addrs(launch: &NodeLaunch) -> Result<Vec<String>> {
+    let node = launch
+        .nodes
+        .iter()
+        .find(|node| node.id == launch.node_id)
+        .with_context(|| format!("voter {} has no spec of its own", launch.node_id))?;
+    [&node.raft, &node.api]
+        .into_iter()
+        .map(|address| {
+            let (_, port) = address
+                .rsplit_once(':')
+                .with_context(|| format!("voter address {address} has no port"))?;
+            Ok(format!("{LISTEN_ADDR}:{port}"))
         })
         .collect()
 }
 
-pub fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+/// Prove both of a voter's listeners accept before it announces readiness.
+///
+/// Readiness used to depend on nothing but the local database, so a voter
+/// whose listener lost its port still wrote `Response::Ready`. Connecting to
+/// each address is the positive half of the proof — it catches a listener that
+/// is simply absent. The negative half is [`install_bind_failure_guard`],
+/// which is what separates "my listener is up" from "somebody else's listener
+/// is up on my port", because a squatter accepts connections too.
+async fn prove_listeners_bound(addresses: &[String]) -> Result<()> {
+    for address in addresses {
+        let deadline = TokioInstant::now() + LISTENER_PROOF_TIMEOUT;
+        loop {
+            if let Some(failure) = BIND_FAILURE.get() {
+                bail!("{failure}");
+            }
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(_) => break,
+                Err(error) if TokioInstant::now() >= deadline => {
+                    return Err(anyhow!(error)).with_context(|| {
+                        format!("voter listener {address} never accepted a connection")
+                    });
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        // A successful connection means *something* is listening on the port,
+        // but it may be a squatter rather than our own listener. Try to bind
+        // the same address to check whether the port is actually free.
+        // If we can bind, our listener never bound — the port was taken by
+        // another process between allocation and hiqlite's bind attempt.
+        // hiqlite's bind failure panics in a spawned task where the panic
+        // hook does not fire, so BIND_FAILURE would not be set. This check
+        // catches that case.
+        let probe = std::net::TcpListener::bind(address);
+        if let Ok(listener) = probe {
+            // The port is free — our listener never bound. Release the probe
+            // and report the collision so the controller can retry.
+            drop(listener);
+            bail!(
+                "{PORT_COLLISION}: voter listener {address} was never bound; the port was taken between allocation and bind"
+            );
+        }
+        // EADDRINUSE means someone has the port — either our listener or a
+        // squatter. Check BIND_FAILURE in case the panic guard caught it.
+        if let Some(failure) = BIND_FAILURE.get() {
+            bail!("{failure}");
+        }
+    }
+    Ok(())
 }
 
 pub fn unix_now() -> Result<i64> {

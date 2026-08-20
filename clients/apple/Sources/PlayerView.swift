@@ -631,6 +631,12 @@ struct PlayerView: View {
     var airDate: String? = nil
     var overview: String? = nil
     var offlineItem: OfflineItem? = nil
+    /// The detail screen's pre-play track choice, spent on this playback only.
+    var selection: PrePlaySelection = .none
+    /// Debug acceptance can choose a deterministic first rung without racing a
+    /// remote-control quality change against the initial session open.
+    var initialHeight: Int? = nil
+    var diagnosticProbesEnabled = false
     var onPlayNext: ((PlayContext) -> Void)?
     /// Hands the owning detail screen the last on-screen position immediately.
     /// The server progress write is intentionally best-effort and asynchronous;
@@ -787,7 +793,10 @@ struct PlayerView: View {
                     durationMs: durationMs,
                     progressOffsetMs: progressOffsetMs,
                     itemDurationMs: itemDurationMs,
-                    title: title
+                    title: title,
+                    selection: selection,
+                    initialHeight: initialHeight,
+                    diagnosticProbesEnabled: diagnosticProbesEnabled
                 )
             }
             #else
@@ -799,7 +808,10 @@ struct PlayerView: View {
                 durationMs: durationMs,
                 progressOffsetMs: progressOffsetMs,
                 itemDurationMs: itemDurationMs,
-                title: title
+                title: title,
+                selection: selection,
+                initialHeight: initialHeight,
+                diagnosticProbesEnabled: diagnosticProbesEnabled
             )
             #endif
             #if os(tvOS)

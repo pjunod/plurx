@@ -20,6 +20,14 @@
     cooldownMs: 20_000,
     upgradeHeadroom: 1.8,
     upgradeHoldMs: 45_000,
+    // The estimate alone is not evidence that a higher rung is sustainable.
+    // On a JIT server hls.js measures min(link, encode) of the CURRENT rung,
+    // so a fast 720p encode reads as ~200 Mb/s and clears any bandwidth bar
+    // the 1080p rung can set. What actually fails one rung up is ENCODE
+    // headroom, and the server reports it: `recent_speed` is its pace as a
+    // multiple of realtime. Predict the pace after the switch by the pixel
+    // ratio and require this much margin over realtime.
+    upgradeSpeedFloor: 1.15,
     stallWindowMs: 60_000,
     dwellMs: 60_000,
     nearEmptyRunwaySeconds: 1.5,
@@ -225,6 +233,22 @@
   // Pure restart-aware Auto policy. The caller owns sampling and feeds the
   // returned counters into the next sample; this function never reads hls.js,
   // the DOM, a clock, or persistence.
+  /// Predicted server encode pace after moving from `current` to `target`,
+  /// as a multiple of realtime, from the measured pace on the current rung.
+  ///
+  /// Encode cost tracks output pixels, so the ratio is by height squared (the
+  /// ladder keeps one aspect). Returns null when there is nothing measured —
+  /// absence must not block an upgrade, or a session that never reported
+  /// speed could never rise.
+  function predictedSpeed(recentSpeed, current, target) {
+    const measured = Number(recentSpeed);
+    if (!(measured > 0)) return null;
+    const from = Number(current && current.height);
+    const to = Number(target && target.height);
+    if (!(from > 0) || !(to > 0)) return null;
+    return measured * ((from * from) / (to * to));
+  }
+
   function decideRung({
     ladder,
     currentHeight,
@@ -242,6 +266,7 @@
     mildSamples = 0,
     upgradeSinceMs = null,
     playerHeight = Infinity,
+    blockedHeights = null,
     defaults = AUTO_DEFAULTS,
   }) {
     // Pressure decisions need the complete ladder. Filtering it by the player
@@ -371,14 +396,29 @@
       ? Number(playerHeight)
       : Infinity;
     const nextCandidate = available[currentIndex + 1];
-    const next = nextCandidate && nextCandidate.height <= playerCeiling
+    // A rung that already failed this playback is not a candidate. The
+    // dwell/hold timers alone cannot end a loop whose every cycle looks new:
+    // a rung that fails and is re-entered on schedule oscillates forever.
+    const blocked = blockedHeights instanceof Set
+      ? blockedHeights
+      : new Set(Array.isArray(blockedHeights) ? blockedHeights : []);
+    const next = nextCandidate
+      && nextCandidate.height <= playerCeiling
+      && !blocked.has(nextCandidate.height)
       ? nextCandidate
       : null;
+    // Encode headroom, not just bandwidth — see `upgradeSpeedFloor`.
+    const predicted = next
+      ? predictedSpeed(recentSpeed, current, next)
+      : null;
+    const encodeHeadroom =
+      predicted == null || predicted >= defaults.upgradeSpeedFloor;
     const stallFree =
       lastStallAtMs == null || nowMs - lastStallAtMs >= defaults.stallWindowMs;
     const upgradeReady =
       next &&
       estimate > next.total_kbps * defaults.upgradeHeadroom &&
+      encodeHeadroom &&
       stallFree &&
       !estimatePressure &&
       !serverPressure;

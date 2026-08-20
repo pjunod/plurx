@@ -68,6 +68,10 @@ pub struct StartResponse {
     /// requested position. Old clients continue using `start_seconds`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_origin_ms: Option<i64>,
+    /// The normalized output height this request actually received. For a
+    /// bound stall reopen this is the persisted one-rung-down answer, repeated
+    /// unchanged on a transport replay of the same `request_id`.
+    pub height: i64,
     pub encoder: String,
     /// The whole stream already exists on disk (a pre-transcode cache hit).
     /// The player treats it like direct play: seek by `currentTime`, and don't
@@ -105,11 +109,33 @@ pub struct CreateSession {
     pub playback_id: String,
     /// Optional idempotency key for this one attempt.
     pub request_id: Option<String>,
+    /// Exact predecessor for a typed recovery. Both fields are required for a
+    /// stall reopen, which also requires `request_id`; ordinary seeks and
+    /// track changes omit them.
+    pub previous_session_id: Option<String>,
+    pub reopen_reason: Option<crate::transcode::ReopenReason>,
     /// Target height for a transcode. Ignored when `copy` is set. Omitted
     /// means Auto, and Auto is the SERVER's decision: the rung depends on
     /// which encoder wins, and the player only learns that from the response
     /// to this request (see `TranscodeManager::auto_height`).
     pub height: Option<i64>,
+    /// Whether the VIEWER chose Auto quality. This is what decides stall
+    /// stickiness, and it is not the same question as "did this body carry a
+    /// `height`".
+    ///
+    /// A client sends a height for reasons unrelated to the quality menu: a
+    /// subtitle burn and Quality = Original both send the source's own height
+    /// as a promise about the output. Android's `sessionHeight` answers the
+    /// burn case *before* it consults quality, so an Auto viewer watching with
+    /// a burned subtitle posts a height and would otherwise be permanently
+    /// ineligible for the stall step-down — while the same viewer on Apple,
+    /// which never names a height, would be eligible. Same intent, opposite
+    /// recovery, decided by a field neither of them meant as a quality answer.
+    ///
+    /// Omitted keeps the old inference (`height` absent means Auto), so every
+    /// shipped client behaves exactly as before. A client that can state the
+    /// viewer's choice should send it, and then it is authoritative.
+    pub quality_auto: Option<bool>,
     /// Subtitle stream to burn into the picture. Only for the ones a client
     /// cannot render itself — a bitmap track (PGS/VobSub) has no text to send,
     /// so the only way to show it is to draw it into the frames.
@@ -130,6 +156,19 @@ pub struct CreateSession {
     /// With `copy`: retain Dolby Vision signaling and dynamic metadata because
     /// the decision established that this client supports the source profile.
     pub preserve_dolby_vision: Option<bool>,
+    /// For a transcode: this client decodes and presents HEVC Main10 PQ, so a
+    /// Dolby Vision source it cannot decode may be re-encoded to HDR10 rather
+    /// than tone-mapped to SDR. The create-body counterpart of `/decision`'s
+    /// `hdr10t=1`, exactly as `preserve_dolby_vision` is the counterpart of
+    /// `dv`.
+    ///
+    /// A request, never a verdict. The server refuses it for any source that
+    /// does not prove a Dolby Vision RPU through the production renderer, for
+    /// any rung other than 1080p, and for any build whose boot probe did not
+    /// clear the passthrough graph — every refusal lands on today's SDR
+    /// ladder. Absent means no, which is what every client that predates it
+    /// sends.
+    pub hdr10: Option<bool>,
     /// Manual A/V correction for this playback attempt only. Positive delays
     /// audio. It is carried into every seek/reopen by the client and is never
     /// written back to the media file.
@@ -137,13 +176,16 @@ pub struct CreateSession {
 }
 
 impl CreateSession {
-    /// `height` is fully resolved by the caller — Auto answered, explicit
-    /// rungs snapped, the source-height promise honored — because resolution
-    /// needs the store and the encoder choice, and because it must be settled
-    /// before the request is fingerprinted, or two identical requests could
-    /// not recognise each other.
+    /// `height` is initially resolved by the caller — Auto answered, explicit
+    /// rungs snapped, the source-height promise honored. A bound stall reopen
+    /// is the one later normalization: `claim_request` replaces this value
+    /// from the predecessor's resolved rung and persists it before supersede.
     fn into_request(self, file_id: i64, height: i64) -> crate::transcode::SessionRequest {
         use crate::transcode::SessionKind;
+        // Viewer intent when the client states it; otherwise the old
+        // wire-presence inference, which is right for every client that has
+        // no separate quality answer to give.
+        let automatic = self.quality_auto.unwrap_or(self.height.is_none());
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
                 aac: self.aac == Some(true),
@@ -156,11 +198,15 @@ impl CreateSession {
             file_id,
             playback_id: self.playback_id,
             request_id: self.request_id,
+            automatic,
+            previous_session_id: self.previous_session_id,
+            reopen_reason: self.reopen_reason,
             kind,
             start_seconds: self.start.unwrap_or(0.0).max(0.0),
             audio_index: self.audio.filter(|a| *a >= 0),
             subtitle_burn: self.subtitle_burn.filter(|s| *s >= 0),
             audio_offset_ms: self.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000),
+            hdr10: self.hdr10 == Some(true),
         }
     }
 }
@@ -190,6 +236,7 @@ fn hdr_subtitle_burn_is_refused(source: Option<&MediaFile>, subtitle_burn: Optio
 fn session_delivered_dynamic_range(
     source: Option<&MediaFile>,
     kind: &crate::transcode::SessionKind,
+    grade: plurx_core::transcode::OutputGrade,
 ) -> Option<&'static str> {
     use crate::transcode::SessionKind;
     let file = source?;
@@ -203,7 +250,7 @@ fn session_delivered_dynamic_range(
         SessionKind::Transcode { .. } => (PlaybackMethod::Transcode, false),
     };
     Some(plurx_core::playback::delivered_dynamic_range(
-        file, method, preserve,
+        file, method, preserve, grade,
     ))
 }
 
@@ -231,6 +278,10 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
+    let ladder_ceiling = state
+        .transcode
+        .capability_height_ceiling(source.as_ref())
+        .await;
     let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
@@ -241,7 +292,7 @@ pub async fn create(
         None => {
             state
                 .transcode
-                .auto_height(source_height, network_prior.as_ref())
+                .auto_height_for_file(source.as_ref(), network_prior.as_ref())
                 .await
         }
         // The source's own height is the Original/forced-burn promise
@@ -268,14 +319,22 @@ pub async fn create(
         }
     }
     let request = req.into_request(id, height);
-    let delivered = session_delivered_dynamic_range(source.as_ref(), &request.kind);
+    let info = state
+        .transcode
+        .create_session(&request, &user.username)
+        .await
+        // A reused request id asking for a different stream is the client's
+        // mistake, not the server's; say which it is.
+        .map_err(|error| session_start_error(id, error))?;
+    // The grade the session actually built, not the one the body asked for:
+    // the server refuses the HDR10 rung for a source or a rung that cannot
+    // prove it, and the badge has to follow the encoder.
+    let delivered = session_delivered_dynamic_range(source.as_ref(), &info.kind, info.grade);
     // A session being created is playback beginning — the honest moment for
-    // the scrobble that used to fire from `/decision`. The method is the one
-    // this request settled on rather than one read back off an encoder label:
-    // `encoder` says "cached" on a cache hit and changes under a
-    // hardware→software fallback, so a copy-remux inferred from it could
-    // report itself as a transcode.
-    let method = match request.kind {
+    // the scrobble that used to fire from `/decision`. Read the normalized
+    // route from the result: a bound Auto stall may have changed a copy request
+    // into a lower transcode before the session was spawned.
+    let method = match info.kind {
         crate::transcode::SessionKind::Copy { .. } => crate::delivery::Method::HlsCopy,
         crate::transcode::SessionKind::Transcode { .. } => crate::delivery::Method::Transcode,
     };
@@ -287,13 +346,6 @@ pub async fn create(
         method,
         Some(&request.playback_id),
     );
-    let info = state
-        .transcode
-        .create_session(&request, &user.username)
-        .await
-        // A reused request id asking for a different stream is the client's
-        // mistake, not the server's; say which it is.
-        .map_err(|error| session_start_error(id, error))?;
     let playlist_url = if native_subtitles {
         // Give the multivariant playlist its own path. AVPlayer caches HLS
         // resources by URL and can otherwise conflate `index.m3u8?native=1`
@@ -314,9 +366,14 @@ pub async fn create(
         duration_ms: info.duration_ms,
         start_seconds: info.start_seconds,
         media_origin_ms: Some((info.media_origin_seconds * 1000.0).round() as i64),
+        height: info.target_height,
         encoder: info.encoder.to_owned(),
         vod: info.vod,
-        ladder: crate::transcode::ladder(source_height),
+        // Capped at what this node can actually serve for this file, not just
+        // at the source height: an advertised rung is a promise, and the web
+        // ABR controller upgrades into any rung the ladder lists. See
+        // `capability_height_ceiling`.
+        ladder: crate::transcode::advertised_ladder(source_height, ladder_ceiling),
         prior_kbps: network_prior.and_then(|prior| prior.sustained_kbps),
         delivered_dynamic_range: delivered,
     }))
@@ -329,6 +386,9 @@ fn session_start_error(file_id: i64, error: String) -> ApiError {
     tracing::warn!(file = file_id, "session create failed: {error}");
     if crate::transcode::is_retryable_capacity_error(&error) {
         return ApiError::ServiceUnavailable(error);
+    }
+    if let Some(reason) = crate::transcode::invalid_reopen_reason(&error) {
+        return ApiError::BadRequest(reason.to_owned());
     }
     // A build that lacks a filter is not a server fault to be swallowed as
     // "internal server error" — it is a fact about this install that the
@@ -377,7 +437,12 @@ pub async fn start(
     let legacy = CreateSession {
         playback_id: format!("legacy:{}:{id}", user.username),
         request_id: None,
+        previous_session_id: None,
+        reopen_reason: None,
         height: q.height,
+        // The GET bridge has no quality-intent parameter, so it keeps the
+        // wire-presence inference it has always had.
+        quality_auto: None,
         subtitle_burn: None, // the deprecated GET bridge never offered a burn
         native_subtitles: None,
         subtitle: None,
@@ -386,6 +451,9 @@ pub async fn start(
         copy: Some(q.copy == Some(1)),
         aac: Some(q.aac == Some(1)),
         preserve_dolby_vision: Some(false),
+        // The deprecated GET bridge has no capability parameters at all, so
+        // it keeps the SDR ladder it has always had.
+        hdr10: None,
         audio_offset_ms: None,
     };
     create(
@@ -740,6 +808,16 @@ fn language_tag(raw: Option<&str>) -> &str {
 /// `hvcC` record (`H150`), and AVPlayer treats the only HDR variant as
 /// unsupported. The init segment is the canonical description of the bytes
 /// this session actually publishes, including any Dolby Vision stripping.
+///
+/// A `dvh1`/`dvhe` sample entry is NOT described by the HEVC form. Dolby
+/// Vision's HLS identifier is `dvh1.PP.LL` — two-digit profile, two-digit
+/// level — and the `hvcC` beside it describes only the base layer, so reading
+/// the tier out of it and emitting `dvh1.2.4.L150.90` produces a string no
+/// player can resolve. AVPlayer rejected exactly that on a Profile 5 title
+/// while the same session's media playlist, which carries no CODECS at all,
+/// played. Dolby Vision therefore reads its own `dvcC`/`dvvC` configuration
+/// record, which is also the canonical answer when the library row's probe
+/// carried no DOVI side data and the advertised codec came through bare.
 async fn exact_hls_context(
     state: &AppState,
     session: &str,
@@ -777,7 +855,12 @@ async fn exact_hls_context(
             return context;
         }
     }
-    let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
+    let derived = if matches!(sample_entry, "dvh1" | "dvhe") {
+        dolby_vision_codec_from_init(&init, sample_entry)
+    } else {
+        hevc_codec_from_init(&init, sample_entry)
+    };
+    let Some(video) = derived else {
         return context;
     };
     context.codecs = match context.codecs.split_once(',') {
@@ -785,6 +868,44 @@ async fn exact_hls_context(
         _ => video,
     };
     context
+}
+
+/// Apple's Dolby Vision HLS identifier from the `DOVIDecoderConfigurationRecord`.
+///
+/// The record is carried by `dvcC` (profiles up to 7) or `dvvC` (profiles 8
+/// and 9) inside the sample entry. Its payload begins with two version bytes
+/// and then packs the two fields the playlist needs across two more:
+///
+/// ```text
+/// byte 2: dv_profile (7 bits) | dv_level high bit
+/// byte 3: dv_level low 5 bits | rpu_present | el_present | bl_present
+/// ```
+///
+/// Apple's form is `dvh1.PP.LL` with both fields zero-padded to two digits —
+/// no tier letter, no constraint bytes, and nothing from `hvcC`.
+fn dolby_vision_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
+    let type_at = [b"dvcC", b"dvvC"]
+        .into_iter()
+        .find_map(|name| init.windows(4).position(|window| window == name))?;
+    let box_start = type_at.checked_sub(4)?;
+    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
+    let box_end = box_start.checked_add(box_size)?;
+    // 8-byte header plus the 24-byte record.
+    if box_size < 32 || box_end > init.len() {
+        return None;
+    }
+    let payload = init.get(type_at + 4..box_end)?;
+    if payload.len() < 4 {
+        return None;
+    }
+    let profile = payload[2] >> 1;
+    let level = ((payload[2] & 0x01) << 5) | (payload[3] >> 3);
+    // Profile 0 is not assigned and level 0 is not a real declaration; either
+    // means the record was not what this parser assumed.
+    if profile == 0 || level == 0 {
+        return None;
+    }
+    Some(format!("{sample_entry}.{profile:02}.{level:02}"))
 }
 
 /// RFC 6381 identifier from the HEVCDecoderConfigurationRecord in `hvcC`.
@@ -1932,6 +2053,100 @@ mod tests {
         ));
     }
 
+    /// §7.3 requirement 3 is about VIEWER intent, not wire presence. Android's
+    /// `sessionHeight` answers a subtitle burn with the source height before it
+    /// consults quality, so an Auto viewer with a burned subtitle posts a
+    /// height; inferring stickiness from that field alone makes the heaviest
+    /// session type there is permanently unsteppable on Android while the
+    /// identical Apple session steps. `quality_auto` is the intent itself.
+    #[test]
+    fn stall_stickiness_follows_stated_quality_intent_not_a_posted_height() {
+        let burn_under_auto = serde_json::json!({
+            "playback_id": "android-player",
+            // The Original/forced-burn source-height promise, not a rung pick.
+            "height": 2160,
+            "subtitle_burn": 3,
+            "quality_auto": true,
+        });
+        let create: CreateSession = serde_json::from_value(burn_under_auto).expect("create body");
+        let request = create.into_request(17, 2160);
+        assert!(
+            request.automatic,
+            "a burn's source-height promise is not a manual quality pick"
+        );
+        assert_eq!(
+            request.kind,
+            crate::transcode::SessionKind::Transcode { height: 2160 }
+        );
+
+        // The other direction is just as explicit: a viewer who picked a rung
+        // stays on it even though the body would otherwise read as Auto.
+        let manual_without_height = serde_json::json!({
+            "playback_id": "android-player",
+            "quality_auto": false,
+        });
+        let create: CreateSession =
+            serde_json::from_value(manual_without_height).expect("create body");
+        assert!(!create.into_request(17, 720).automatic);
+
+        // Every shipped client omits the field, so the old inference has to
+        // survive untouched in both of its arms.
+        let silent_auto = serde_json::json!({ "playback_id": "apple-player" });
+        let create: CreateSession = serde_json::from_value(silent_auto).expect("create body");
+        assert!(create.into_request(17, 720).automatic);
+
+        let silent_manual = serde_json::json!({ "playback_id": "apple-player", "height": 480 });
+        let create: CreateSession = serde_json::from_value(silent_manual).expect("create body");
+        assert!(!create.into_request(17, 480).automatic);
+    }
+
+    #[test]
+    fn a_typed_stall_reopen_reaches_the_claim_unchanged() {
+        let body = serde_json::json!({
+            "playback_id": "native-player",
+            "request_id": "stall-attempt",
+            "previous_session_id": "previous-session",
+            "reopen_reason": "stall",
+            "start": 42.5,
+            "audio": 2,
+            "subtitle_burn": 5
+        });
+        let create: CreateSession = serde_json::from_value(body).expect("typed create body");
+        let request = create.into_request(17, 1080);
+
+        assert!(request.automatic);
+        assert_eq!(
+            request.previous_session_id.as_deref(),
+            Some("previous-session")
+        );
+        assert_eq!(
+            request.reopen_reason,
+            Some(crate::transcode::ReopenReason::Stall)
+        );
+        assert_eq!(request.start_seconds, 42.5);
+        assert_eq!(request.audio_index, Some(2));
+        assert_eq!(request.subtitle_burn, Some(5));
+
+        let unknown = serde_json::json!({
+            "playback_id": "native-player",
+            "request_id": "future-attempt",
+            "previous_session_id": "previous-session",
+            "reopen_reason": "network_changed"
+        });
+        assert!(serde_json::from_value::<CreateSession>(unknown).is_err());
+    }
+
+    #[test]
+    fn an_invalid_bound_reopen_is_a_400_not_an_idempotency_conflict() {
+        let response = session_start_error(
+            42,
+            "invalid stall reopen: the previous session does not belong to this user, playback, and file"
+                .into(),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A build that cannot burn is a fact the viewer can act on, not an
     /// "internal server error" whose message is deliberately dropped.
     #[test]
@@ -2099,7 +2314,10 @@ mod tests {
         let request = CreateSession {
             playback_id: "player".into(),
             request_id: Some("attempt".into()),
+            previous_session_id: None,
+            reopen_reason: None,
             height: None,
+            quality_auto: None,
             subtitle_burn: None,
             native_subtitles: None,
             subtitle: None,
@@ -2108,6 +2326,7 @@ mod tests {
             copy: Some(false),
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: Some(20_000),
         }
         .into_request(7, 1080);
@@ -2121,7 +2340,10 @@ mod tests {
         let request = CreateSession {
             playback_id: "apple-bitmap".into(),
             request_id: None,
+            previous_session_id: None,
+            reopen_reason: None,
             height: Some(2160),
+            quality_auto: None,
             subtitle_burn: Some(5),
             native_subtitles: Some(true),
             subtitle: None,
@@ -2130,6 +2352,7 @@ mod tests {
             copy: None,
             aac: None,
             preserve_dolby_vision: None,
+            hdr10: None,
             audio_offset_ms: None,
         }
         .into_request(5615, 2160);
@@ -2167,28 +2390,45 @@ mod tests {
             aac: false,
             preserve_dolby_vision: preserve,
         };
+        use plurx_core::transcode::OutputGrade;
         assert_eq!(
-            session_delivered_dynamic_range(Some(&file), &copy(true)),
+            session_delivered_dynamic_range(Some(&file), &copy(true), OutputGrade::Sdr),
             Some("dolby_vision")
         );
         // Stripped: what reaches the client is the compatible base layer.
         let mut base = file.clone();
         base.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".into());
         assert_eq!(
-            session_delivered_dynamic_range(Some(&base), &copy(false)),
+            session_delivered_dynamic_range(Some(&base), &copy(false), OutputGrade::Sdr),
             Some("hdr10")
         );
         assert_eq!(
             session_delivered_dynamic_range(
                 Some(&file),
-                &crate::transcode::SessionKind::Transcode { height: 1080 }
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Sdr,
             ),
             Some("sdr"),
-            "every transcode is H.264 8-bit, whatever the source carried"
+            "an SDR-grade transcode is H.264 8-bit, whatever the source carried"
+        );
+        // …and the HDR10 rung of the same source says so, on the same helper.
+        // The session's grade is what decides it, so a rung the server refused
+        // cannot report HDR10 by having been asked for.
+        assert_eq!(
+            session_delivered_dynamic_range(
+                Some(&file),
+                &crate::transcode::SessionKind::Transcode { height: 1080 },
+                OutputGrade::Hdr10,
+            ),
+            Some("hdr10"),
+            "the Dolby Vision → HDR10 rung is not SDR"
         );
         // A file that vanished from the store mid-request says nothing at
         // all rather than guessing; the client keeps what it had.
-        assert_eq!(session_delivered_dynamic_range(None, &copy(true)), None);
+        assert_eq!(
+            session_delivered_dynamic_range(None, &copy(true), OutputGrade::Sdr),
+            None
+        );
     }
 
     #[test]
@@ -2269,6 +2509,40 @@ mod tests {
         assert!(hdr.contains("VIDEO-RANGE=PQ"));
         assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    /// The HDR10 rung's master, built from the codec string the session
+    /// actually advertises.
+    ///
+    /// The point is that **no new attribute logic was written for it**. The
+    /// existing rule — an `hvc1`/`hev1`/`dvh1`/`dvhe` prefix plus an HDR
+    /// source column — already emits `VIDEO-RANGE=PQ` and `CODECS`, and a
+    /// re-encoded HDR10 rung satisfies both. A second implementation of that
+    /// rule is a second thing to keep in step.
+    #[test]
+    fn the_hdr10_rungs_master_gets_pq_and_hevc_codecs_from_the_existing_rule() {
+        let file = hls_file(vec![]);
+        // Exactly what `transcode::transcoded_hls_codecs(OutputGrade::Hdr10)`
+        // puts on the session.
+        let context = hls_context("hvc1.2.4.H120.90,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &context);
+        assert!(master.contains("VIDEO-RANGE=PQ"), "{master}");
+        assert!(
+            master.contains("CODECS=\"hvc1.2.4.H120.90,mp4a.40.2\""),
+            "{master}"
+        );
+        // No SUPPLEMENTAL-CODECS: the RPU is consumed by the reshape, so
+        // there is no Dolby Vision enhancement left to declare, and the
+        // master stays at compatibility version 7.
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"), "{master}");
+        assert!(master.contains("#EXT-X-VERSION:7"), "{master}");
+
+        // The SDR rung of the same source is H.264, and its master must stay
+        // SDR — the source's `hdr` column alone is not permission to claim PQ
+        // for a tone-mapped picture.
+        let sdr = master_playlist(&file, None, &hls_context("avc1.640034,mp4a.40.2", None));
+        assert!(!sdr.contains("VIDEO-RANGE="), "{sdr}");
+        assert!(!sdr.contains("CODECS="), "{sdr}");
     }
 
     #[test]
@@ -2356,6 +2630,148 @@ mod tests {
             Some("hvc1.2.4.H150.B0")
         );
         assert!(hevc_codec_from_init(&init[..12], "hvc1").is_none());
+    }
+
+    /// A `dvcC` record laid out the way the Dexter Profile 5 title's init
+    /// segment carries it: version 1.0, profile 5, level 6, RPU and BL
+    /// present, no enhancement layer, compatibility id 0.
+    fn dolby_vision_init(profile: u8, level: u8) -> Vec<u8> {
+        let mut init = vec![0, 0, 0, 32];
+        init.extend_from_slice(b"dvcC");
+        init.extend_from_slice(&[
+            1,
+            0,
+            (profile << 1) | (level >> 5),
+            ((level & 0x1f) << 3) | 0b101,
+            0,
+        ]);
+        init.extend_from_slice(&[0; 19]);
+        init
+    }
+
+    #[test]
+    fn dolby_vision_codec_is_read_from_its_own_configuration_record() {
+        let init = dolby_vision_init(5, 6);
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvh1").as_deref(),
+            Some("dvh1.05.06")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&init, "dvhe").as_deref(),
+            Some("dvhe.05.06")
+        );
+        // Profile 8 level 10 exercises the level's high bit, which lives in
+        // the profile's byte.
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(8, 10), "dvh1").as_deref(),
+            Some("dvh1.08.10")
+        );
+        assert_eq!(
+            dolby_vision_codec_from_init(&dolby_vision_init(7, 33), "dvh1").as_deref(),
+            Some("dvh1.07.33")
+        );
+        // Truncated, absent and empty records decline rather than guess.
+        assert!(dolby_vision_codec_from_init(&init[..16], "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(b"nothing here at all", "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(0, 6), "dvh1").is_none());
+        assert!(dolby_vision_codec_from_init(&dolby_vision_init(5, 0), "dvh1").is_none());
+    }
+
+    /// The regression this milestone exists for. A preserved Profile 5 init
+    /// carries `dvh1` + `hvcC` + `dvcC`; reading the tier out of `hvcC` and
+    /// publishing `dvh1.2.4.L150.90` is what AVPlayer refused with CoreMedia
+    /// -15517 while the same session's CODECS-free media playlist played.
+    #[tokio::test]
+    async fn a_preserved_dolby_vision_master_keeps_its_dolby_vision_identifier() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv").await;
+        // The sample entry's `hvcC` describes the base layer only: Main 10,
+        // High tier, level 150 — the record the HEVC reader would have used.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        init.extend_from_slice(&dolby_vision_init(5, 6));
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv", context).await;
+        assert_eq!(
+            resolved.codecs, "dvh1.05.06,ec-3",
+            "a Dolby Vision master must not be rewritten into HEVC shape"
+        );
+    }
+
+    /// The same probe also heals the other half of the failure: when the
+    /// library row carried no DOVI side data, `copied_hls_codecs` advertises a
+    /// bare `dvh1`, which the code's own comment calls fatal during asset
+    /// preparation. The init knows the answer.
+    #[tokio::test]
+    async fn a_bare_dolby_vision_declaration_is_completed_from_the_init() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-bare").await;
+        tokio::fs::write(dir.path().join("init.mp4"), dolby_vision_init(5, 6))
+            .await
+            .expect("dolby vision init");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-bare", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    /// And a Dolby Vision init with no configuration record at all leaves the
+    /// advertised string alone rather than falling back to the HEVC reader.
+    #[tokio::test]
+    async fn a_dolby_vision_init_without_a_configuration_record_changes_nothing() {
+        let dir = tempfile::tempdir().expect("segment directory");
+        let fixture = HlsDeliveryFixture::publish(dir.path(), "dv-nodvcc").await;
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 150]);
+        tokio::fs::write(dir.path().join("init.mp4"), &init)
+            .await
+            .expect("init without dvcC");
+
+        let context = crate::transcode::HlsContext {
+            file_id: 1,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: "dvh1.05.06,ec-3".to_owned(),
+            supplemental_codecs: None,
+            frame_rate: None,
+        };
+        let resolved = exact_hls_context(&fixture.state, "dv-nodvcc", context).await;
+        assert_eq!(resolved.codecs, "dvh1.05.06,ec-3");
+    }
+
+    #[test]
+    fn a_profile_5_master_declares_dolby_vision_without_a_supplemental_codec() {
+        let file = hls_file(vec![]);
+        let profile5 = hls_context("dvh1.05.06,ec-3", None);
+        let master = master_playlist(&file, None, &profile5);
+
+        // Profile 5 has no compatible base layer to declare, so the master
+        // stays at version 7 — SUPPLEMENTAL-CODECS would drag it to 10, which
+        // this code already documents as rejection-prone.
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master.contains("CODECS=\"dvh1.05.06,ec-3\""));
+        assert!(!master.contains("SUPPLEMENTAL-CODECS"));
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's

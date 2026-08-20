@@ -9,10 +9,28 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-15): source is v0.2.7, Apple build 61. Native text
+> Status (2026-08-19): source is v0.2.7, Apple build 67. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 60 requires a concrete selected PGS track before treating the
+> landed. Build 67 adopts the bound same-session stall reopen: a sustained
+> stall on a growing session names its exact `previous_session_id` with
+> `reopen_reason: "stall"` so the server answers one rung down, every create
+> states `quality_auto`, and the ladder-floor retry budget the server
+> deliberately does not implement lives here (§ Quality row). Build 66 adds
+> unattended physical-device bandwidth acceptance with exact runway evidence.
+> Build 65 keeps the delivery watchdog honest about a player that is still
+> making progress. Build 64 corrects build 63's delivery watchdog, which fired on
+> healthy buffered playback and interrupted a 2160p session roughly every two
+> minutes; the film clock and buffered runway are now required to corroborate
+> the server's delivery meter. Build 63 hardens stall recovery against the tvOS freeze observed
+> on 2160p copy-HLS: a shared no-progress clock immune to
+> `timeControlStatus` flapping, a bounded unestablished leash instead of a
+> disarmed detector, a server-truth delivery watchdog on the status poll,
+> and a rolling automatic-reopen budget that ends storms at the visible
+> failure screen. Build 62 lists the audio and subtitle tracks a file
+> actually has on the detail screen and lets a viewer choose both before
+> pressing Play (§6).
+> Build 60 requires a concrete selected PGS track before treating the
 > overlay as active. Its physical non-PGS baseline reached active PiP and
 > returned or stopped cleanly on iPhone Air (iOS 26.6) and iPad Pro 13-inch
 > (M4, iPadOS 26.6); the separate PGS refusal remains unverified on hardware.
@@ -51,7 +69,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 61 has not reached
+> resolved status. Repository evidence still says build 67 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -80,12 +98,12 @@ Vision investigation are recorded in
 | Session | Local login and remembered token | Local login and silent reconnect; bearer in the Keychain; origin and token are written together, so changing servers cannot leave the previous server's credential on disk; a 401/403 on any request after bootstrap clears the token and returns to the login screen instead of printing "Server returned 401" on every screen | Verify Keychain behavior across device restore and app replacement |
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; in a season listing, artwork plays that episode while the copy opens its detail page on iOS/iPadOS, and tvOS keeps one focus target whose Select action plays; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
-| Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
+| Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery`, including the `delivery.audio` a selection-aware `/decision` puts in the plan (§6) | Real-device codec/HDR matrix, especially Dolby Vision profiles |
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; on tvOS the progress bar is an ordinary focus stop until Select engages scrubbing, so left/right cross between the transport and option groups without seeking, engaged left/right step by ±10 seconds, and Select/Menu leave scrubbing. Up reaches a visible skip marker above the bar and is deliberately inert when none is present. Hidden controls retain the separate four-direction remote seek path. A seek inside the growing playlist's advertised window moves the item's own clock instantly (`seekRoute`, mapped through `media_origin_ms`, held 1.5 s off the live edge), while out-of-window targets reopen the session at the film position after a 350 ms coalescing pause so a press burst costs one create; a copy-HLS replacement that starts on the preceding keyframe seeks its newly attached item forward by the origin delta, preventing a short replay after stall recovery. A seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped, and the predecessor item's supersession 404s no longer advance the recovery ladder mid-change. In a full-screen iOS window, the status bar and Home indicator stay while any player overlay is visible and retire after the last one leaves; windowed iPad status bars remain system-owned. | Device-verify in-window scrubs land without a spinner, out-of-window scrubs recover cleanly, iPad full-screen/Split View chrome, iPhone portrait/landscape, engage-to-scrub feel and hammered tvOS step-seeks during a quality change on a physical Siri Remote, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
-| Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, styled ASS/SSA, and unrecognized overlay versions retain burn-in/refusal; the menu labels Overlay and Burn-in separately; automatic selection never starts a burn except a forced track (see §2) | Run [the physical acceptance procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) on iPad Pro, then complete the separate iPhone and Apple TV rows |
-| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
+| Audio tracks | Select and restart when needed | Select and restart at the same position in the player; the detail screen also lists every track with language, codec, and channel layout, marks the server's `playback_defaults` pick, and lets a viewer choose one before pressing Play (§6) | Validate TrueHD/DTS fallback |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, styled ASS/SSA, and unrecognized overlay versions retain burn-in/refusal; the menu labels Overlay and Burn-in separately; automatic selection never starts a burn except a forced track (see §2); the detail screen lists every subtitle track with language, format, and Forced/SDH markers before playback and lets a viewer pick one — or Off — up front (§6) | Run [the physical acceptance procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) on iPad Pro, then complete the separate iPhone and Apple TV rows |
+| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing. A sustained stall on a growing session now reopens *bound*: the create names the exact `previous_session_id` with `reopen_reason: "stall"` under one `request_id` minted for that stall, so the server answers one rung down and a transport replay returns that same persisted answer instead of stepping twice. Every create also states `quality_auto`, so the promise height a subtitle burn posts is not misread as a sticky manual pick. The ladder floor is bounded here, not on the server: two consecutive reopens that fail to buy a strictly lower rung end in the ordinary stall failure, and a minute of recovered film starts a fresh episode so one blip does not disable recovery for the rest of the title. Direct play, VOD, and offline recovery stay unbound, a stall ticket is dropped once a seek or track change has superseded the session it names, and a refused bound create (`400`) is retried once unbound under a fresh `request_id`. The server-truth delivery watchdog shares this arm, so a wedge the player never reported also names its predecessor and stops at the floor with the delivery-specific message. Two independent bounds now guard it and their order matters: the ladder floor is consulted first because the rolling automatic-reopen storm cap records a timestamp when it admits, and a reopen the floor refuses must not spend a rolling slot a later unrelated stall would then be missing. | Continuous adaptation and an honest Original option when compatible; device-verify the step-down and the floor bound on a physically starved link, including a stall the player itself never reports |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery, and selected-subtitle route/state (`PGS overlay · preparing`, ready overlay, unavailable, native WebVTT, or burned in). Sustained and self-recovered stalls reach the bounded server log with HLS session and per-item attempt identity, contiguous loaded runway, AVPlayer wait/buffer flags, access-log request/transfer counters, and the aged last successful server supply snapshot; live ingest replaces it with fresher session state when possible. Recovery TTFF is a separate attempt. | Add frame presentation rate and build stamp; validate correlated stall ingest on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
@@ -388,6 +406,100 @@ The badge is a reporter. Nothing it computes reaches a decision, a capability
 query, or a session request; the audio and resolution badges stay source-only in
 this pass because their truth tables are not written yet. Detail pages stay
 source-only by design — there is no session there to report a downgrade against.
+
+### 6. Detail-screen track facts and the pre-play choice
+
+The detail screen answers "does this have my audio and subtitles?" before
+anything is played, and lets the viewer act on the answer. It renders the
+server's shared track facts and nothing else — `audio_streams`,
+`subtitle_streams`, and `playback_defaults` from item detail, exactly the
+contract in [docs/CLIENTS.md](CLIENTS.md) §1. No admin settings are fetched and
+`select_tracks` is not reimplemented, which is what makes Apple, web, and
+Android tell the same story about the same file.
+
+**What is shown.** Two lists, audio and subtitles. Each row reads language,
+format, and — for subtitles — its `Forced` and `SDH` markers, with SDH falling
+back to a title sniff when the container carries no `hearing_impaired`
+disposition. That sniff is the server's own list — `sdh`, `closed caption`,
+`closed-caption`, `hard of hearing`, `non udenti`, matching
+`subtitle_characteristics` in `crates/plurxd/src/http/hls.rs` — so a track
+cannot read as SDH on the detail screen and not on the HLS rendition the same
+server builds. A bare `cc` is deliberately absent: it is a substring of
+ordinary words ("Tracce", "Piccadilly"), the same over-eager match the forced
+sniff already avoids. The track `playback_defaults` selected is marked in each
+list. A file with no subtitle tracks says so in a sentence rather than
+presenting an empty box.
+
+**All five language states, worded apart.** Under each list sits the plain
+sentence for that side's `preferred_language_status`:
+
+| Status | What the Apple client says |
+|---|---|
+| `selected` | "English audio is selected." / "English subtitles are on." |
+| `available` | "English audio is here, but another track is selected." |
+| `missing` | "No English subtitles." |
+| `unknown` | "Can't tell whether there are English subtitles — some tracks carry no language tag." |
+| `no_tracks` | "This file has no subtitle tracks." |
+
+`unknown` is deliberately *not* `missing`. An untagged track means the server
+declined to claim the preferred language is absent, so this client declines
+too; an unrecognized future status decodes to `unknown` for the same reason.
+
+**Choosing before Play.** Two menus sit beside the Play button. The choice is a
+`PrePlaySelection` — an audio index, a subtitle index, or `-1` for Off — and it
+travels to `/decision` as `audio=` and `subtitle=`. An unmade choice sends
+neither parameter, so an ordinary play issues exactly the request it always did.
+
+**Executing the plan as given.** The returned plan carries the audio: a remux
+URL ends in `?audio=<index>` and both remux and transcode repeat it in
+`delivery.audio` for the HLS session-create body, which is where this client
+reads it (`PlayerController.sessionAudioIndex`, plan before policy default,
+below a later in-player change). The client does not re-add the index itself and
+does not assume the verdict survives a track change: selecting a track other
+than the container's own default is never `direct`, and the server says so. A
+pre-play choice is therefore *not* modelled as the in-player `audioOverride`,
+which forces a copy session — overriding would downgrade delivery past what the
+verdict states for a choice the server judged direct-playable. The subtitle
+travels separately, in the session-create body, as it always has.
+
+**One session, no restart.** The choice is known before the first `/decision`,
+so the first `open()` already carries it: a native text pick enters the session
+as `subtitle`, a bitmap pick as `subtitle_burn`. There is no start-then-restart
+and no visible re-buffer to apply something decided before playback began.
+
+**Disclosing the cost.** A bitmap or styled-text pick shows its burn-in warning
+on the detail screen, before Play, at least as plainly as the in-player path
+does after the fact. PGS is worded as "unless this server draws PGS subtitles as
+an overlay": the `pgs-v1` flag rides on `/decision`'s tracks, which a detail
+screen has not fetched, so the cost is disclosed without claiming a burn the
+server may avoid. When `/decision` answers
+`selection.subtitle_burn_in_blocked_by_hdr`, the HDR guard kept the existing
+delivery and the burn did not happen — the client reports that honestly with the
+existing HDR notice and leaves subtitles off rather than showing a checkmark
+against a track nobody is seeing.
+
+That flag is read **only when a subtitle choice actually traveled**. `/decision`
+emits its `selection` block whenever *either* parameter was sent, and the flag
+it carries is computed from the *policy* subtitle against the *source* dynamic
+range — so on an audio-only request it describes a burn the server never
+applied, since it only acts on one when `subtitle=` was sent. Honoring it there
+would silently switch off a forced track that the no-choice path starts: an HDR
+source tone-mapped to SDR, whose policy pick is forced PGS signs, would lose its
+signs merely because the viewer chose a Japanese audio track. The client's own
+never-start-a-burn veto, which reads the *delivered* range, is unchanged and
+still governs automatic selection.
+
+**Every affordance, every layout.** Play, Resume, and Start over all carry the
+choice, on tvOS and on both iOS layouts. Start over builds its context through a
+single shared constructor (`DetailView.startOverContext`) rather than one copy
+per layout, because the compact iPhone copy is exactly where a hand-assembled
+duplicate had dropped the selection while every other layout honored it.
+
+**One playback only.** The selection is held on the detail screen beside the
+file id it was made against, so it is discarded rather than spent when the file
+changes; autoplay's next episode builds its own context and inherits nothing.
+Nothing here writes the server's Playback defaults, and in-player audio and
+subtitle switching behaves exactly as it did before.
 
 ## Release gate
 

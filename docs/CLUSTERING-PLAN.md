@@ -593,18 +593,34 @@ an untracked WAL sidecar beside immutable source material.
 
 `HiqliteAuthStore::import_sqlite_backup` accepts only a fresh bootstrapped
 target whose `instance.id` matches the source. It imports all 17 shared durable
-tables in foreign-key order and 16-row Raft transactions, preserving explicit
-ids, timestamps, nullable text, and integer values. `IMPORT_CHUNK_ROWS` is 16
-as a WAL-payload safety bound rather than a throughput choice: one chunk
-becomes one Raft transaction, `files.probe_json` holds whole ffprobe documents,
-and 64 rows of a real library serialized to 3,137,236 bytes — past the
-2,097,118-byte payload capacity of the production 2 MiB WAL, which panicked
-activation into unreplicated SQLite recovery. Raising it back for import
-throughput re-opens that crash; a byte-measured chunk builder is the real fix.
-Items compute their parent-first id order in one recursive source pass, then
-load each bounded chunk through indexed point reads; numeric id order cannot
-violate their self-reference, and large catalogues do not re-run and re-sort
-the full tree for every 16 rows. A v14 source contributes empty
+tables in foreign-key order and byte-measured Raft transactions, preserving
+explicit ids, timestamps, nullable text, and integer values. Both chunk
+producers — offset paging and the parent-first item-id path — feed rows through
+one transaction builder that accumulates their serialized size and submits
+before the next row would cross a byte budget: a quarter of the 2,097,118-byte
+payload capacity that the production `wal_size: 2 * 1024 * 1024` leaves after
+the segment header. A quarter rather than the whole because the WAL is not the
+only bound on a submission — a transaction near the cap must also replicate to
+every voter inside the store's three-second timeout, which half the payload
+failed to do on a loaded host. A row count cannot bound this. One transaction
+becomes one Raft entry, `files.probe_json` holds whole ffprobe documents, and
+`hiqlite` panics its WAL writer on an entry past that capacity: 64 rows of a
+real library serialized to 3,137,236 bytes, and a 16-row bound still overflowed
+whenever 16 adjacent rows averaged more than ~131 KB — which is how node `m6`
+exited mid-import and restarted into unreplicated SQLite while reporting healthy.
+`IMPORT_CHUNK_ROWS` survives as a secondary bound only: it is the source read
+page and a ceiling on rows per transaction, no longer the safety property. A
+single row too large for any transaction is refused before submission, naming
+the table, an identifier that is never imported payload, the measured size, and
+the limit — an operator-actionable refusal beats a crash into a silently
+unreplicated backend. The WAL tuning itself still lives in `start_local_voter`
+and is mirrored, not shared, by the importer and the store contract; #304
+retires that duplication and raises the WAL. Items compute their parent-first
+id order in one recursive source pass, then load each bounded page through
+indexed point reads; numeric id order cannot violate their self-reference, and
+large catalogues do not re-run and re-sort the full tree for every page. A
+parent-first run split across several transactions still submits in order, so a
+child never precedes its parent. A v14 source contributes empty
 scan-reconciliation tables and zero outbox claim deadlines; v15–v17 preserve
 their newer durable facts.
 `playback_events`, `items_fts`, and `offline_lease_guards` never cross the
@@ -617,7 +633,7 @@ and SHA-256 for each table only after parity. Source validation, row loading,
 and digest scans share one blocking worker, so synchronous SQLite work never
 occupies an async runtime worker. Row data crosses that boundary in bounded
 chunks; one parent-first item-id ordering remains O(items) so the importer does
-not rebuild and re-sort the full item tree for every 16 rows. Target parity
+not rebuild and re-sort the full item tree for every read page. Target parity
 advances through 64-row `PARITY_PAGE_ROWS` primary-key pages — a separate
 constant that stays 64 because parity pages are consistent reads that never
 enter a Raft transaction, so the WAL payload cap does not apply to them — and
@@ -719,23 +735,77 @@ the resulting two-voter set reports `degraded_reconfiguration`, and any 2→1
 removal is deliberately refused with `removal_would_lose_quorum` until a later
 milestone proves a downgrade protocol.
 
-Node removal must also resolve offline work owned by that node. A `preparing`
-package cannot be silently re-homed because its replicated `source_path` does
-not prove the survivor has the same mount. Before removal commits, M3 must
-either verify an equivalent source and explicitly requeue on a chosen node, or
-mark the package failed with a stable `node_removed` code so its reservation is
-released and the client can retry. Leaving it preparing until seven-day expiry
-is an activation blocker. M3a takes the conservative first step: it refuses
-removal with `node_owns_offline_work` when any queued, preparing, ready, or
-failed package belongs to the target. A later M3 child owns the explicit
-re-home/fail policy; silent reassignment remains forbidden.
+**M3c delivered.** Node removal resolves the offline work owned by that node
+before the membership change commits, closing the activation blocker M3a
+answered with a blanket refusal. A package still cannot be silently re-homed,
+because its replicated `source_path` does not prove the survivor has the same
+mount — so the proof is made rather than assumed. The departing node's `queued`
+and `preparing` packages are probed against every reachable survivor, and each
+candidate answers by opening the snapshotted source and matching its size and
+mtime. Those answers live in `offline_source_probes`, a cluster-only table
+written by the node that actually looked.
+
+A package with a fresh affirmative answer is requeued on that node. Ownership
+of the *task* moves; the operator's file is never touched. Everything else is
+marked failed with the stable `node_removed` code, which releases its
+reservation so neither the user's nor the node's byte budget is held until the
+seven-day expiry. Silence is not proof: a survivor that does not answer inside
+the bounded wait is not a re-homing target, and unanimous refusal ends the wait
+immediately rather than burning it.
+
+A `ready` package is never requeued. Its bytes exist only in the departing
+node's cache, and §7 non-goal 4 declines to promise byte-identical transcodes
+across mixed encoders — so re-producing it behind its stable lease URL could
+hand a resuming downloader a different generation's bytes. It fails with
+`node_removed`, which stops the cluster advertising a package it can no longer
+serve; the client's retry creates a fresh package with a fresh URL. An already
+`failed` package is terminal, holds no reservation, and no longer blocks
+removal at all.
+
+One snapshot is not enough, because the departing node keeps serving its API
+until the change commits and a package is created owned by whichever node
+answered the request. A download requested during the bounded probe wait would
+exit a single-pass removal owned by a tombstone, holding its reservation until
+the seven-day expiry — the exact stranded state this section calls an
+activation blocker. So the removal re-reads the node's work after applying a
+plan and resolves again, for a bounded number of rounds; a node admitting new
+downloads faster than they can be resolved gets a refusal naming that reason
+rather than an unbounded wait. Anything created inside the last narrow window,
+between the final re-read and the committed change, is failed `node_removed`
+once the node is out of the roster: it was never probed, re-homing it would
+guess at a mount, and the membership change can no longer be refused.
+
+The refusal survives, narrowed to what the policy genuinely cannot resolve: a
+download in flight from that node right now. Cutting it off is neither allowed
+outcome, so removal refuses and names the count so the operator can wait or
+delete. Lifting the blanket refusal must not become "removal always succeeds".
+
+Re-homing also fences the old producer. `fail_offline_package`,
+`mark_offline_package_ready`, `requeue_offline_package`, and
+`update_offline_progress` all take the owning node id, because the departing
+node's encoder may still be running when ownership moves; without that guard
+its late write would terminate or publish work a survivor has taken over, yield
+a survivor's claimed package back to the queue, or flap the progress the
+survivor is reporting.
+
+None of this exists on a single-node SQLite install. There is no node to
+remove, no survivor to re-home onto, and no SQLite table backs the probe
+protocol. Its offline behavior is unchanged and remains a valid rollback
+target.
 
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
 node records under one logical identity/name; remove one follower while
-preserving quorum. The activity page aggregates direct-play and session rows
-from all healthy nodes instead of exposing only the process that answered the
-request.
+preserving quorum. Removing a node that owns offline work succeeds and resolves
+every package by the rule above: a verified source requeues and then completes
+on its new owner, an unverifiable one fails `node_removed` with its reservation
+released, a `ready` one stops advertising itself, and the departing node can no
+longer publish work a survivor has taken over. A download requested on that
+node *while the removal is resolving* is resolved too, not stranded by the
+opening snapshot. An in-flight transfer still refuses, with the reason visible
+to the operator. The activity page aggregates
+direct-play and session rows from all healthy nodes instead of exposing only
+the process that answered the request.
 
 ### 6.8 M4 — transactional fences and materialization ownership
 

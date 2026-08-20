@@ -60,7 +60,10 @@ for that viewer and keeps server administration out of the comparison.
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
 | Audio/subtitle choice | Embedded tracks are native; tracks the server marks `native` arrive as HLS renditions, and everything else burns on a session |
+| Detail-screen track facts | Every audio and subtitle track with language, format, and forced/SDH markers, the server's default markers, and its five-state preferred-language verdict |
+| Pre-play audio/subtitle choice | Both are chosen on the detail screen and applied on the first session open, with any burn-in cost disclosed before playback starts |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
+| Bound stall downgrade | Server contract available: one `request_id` can name its predecessor and typed stall cause, with the normalized height replayed. Android does not yet reopen from its passive stall detector. Adopting it requires sending `quality_auto` — `sessionHeight` posts the source height for any burn before it consults quality, so an Auto viewer with a burned subtitle is otherwise read as a sticky manual pick — plus a client-side retry budget, which the server deliberately does not bound at the ladder floor. |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
@@ -110,6 +113,60 @@ implemented and pinned by `PlaybackPolicyTest`:
 
 Do not side-load `/files/{id}/subs/{index}.vtt` into an offset HLS session: the
 whole-file endpoint has no resume offset and would make cue timing incorrect.
+
+## Detail-screen track facts and pre-play selection
+
+The detail screen answers "does this have my audio and subtitles?" before
+anything is decoded, and lets the viewer choose both. The whole policy boundary
+is [CLIENTS.md](CLIENTS.md) §"Shared track facts — clients render the server's
+answer"; nothing below re-derives it.
+
+- Each media card lists every `audio_streams` and `subtitle_streams` entry.
+  Audio rows carry language, title, channels, and codec; subtitle rows carry
+  language, title, format (`SRT`, `PGS`, `VobSub`, `ASS`, `MOV Text`), and the
+  forced and SDH markers. An untagged track is named `Unknown language` rather
+  than left blank — that track is the reason a status can be `unknown`. A file
+  with no subtitle tracks says "No subtitles in this file."
+- The server's own picks — `playback_defaults.audio.selected_index` and
+  `.subtitle.selected_index` — carry a **Default** chip, and each list is
+  followed by one sentence for its `preferred_language_status`. All five states
+  are distinct: `selected` ("English audio."), `available` ("English audio
+  available — Japanese plays by default.", the dual-audio anime case),
+  `missing` ("No English subtitles."), `unknown` ("Can't tell whether this has
+  English subtitles — a track has no language tag.") and `no_tracks`. `unknown`
+  is never folded into `missing`; a status this build does not recognize, and a
+  server that omits `playback_defaults` entirely, print no sentence at all
+  rather than an invented one.
+- A choice is per playback. It is held per file, keyed on the item, and travels
+  as optional `?audio=`/`?subtitle=` arguments on the player route — `-1` is
+  Off, and an omitted argument means "no choice, keep the server's policy". It
+  is never written back as a Playback setting, and the next item, the next
+  episode, and Play-next all start from their own defaults.
+- The choice reaches the **first** `/decision`, so the plan that comes back
+  already carries it and no restart or re-buffer is needed to apply it. That
+  plan is executed as given: the remux URL's `?audio=` is the server's, and the
+  client normalizes rather than appends that one parameter so a later in-player
+  switch cannot leave two of them on the wire. The subtitle travels in the HLS
+  session-create body, and `delivery.audio` is repeated there. A choice other
+  than the container's own default is never answered `direct`, so the verdict
+  is re-read from every selection-aware decision instead of assumed stable.
+- Direct play is the one transport that hands Media3 the whole container, so
+  the selected audio track is pinned there with a `TrackSelectionOverride`
+  matched by language and then by order within it. Without that pin ExoPlayer's
+  own `setPreferredAudioLanguage` could put a different track on the speakers
+  than the one the detail screen marks — the same reason text selection has
+  always been carried by the controller rather than by the selector.
+- Burn-in cost is disclosed before playback starts, from a selection-aware
+  `/decision` preflight rather than a codec table: bitmap tracks are priced by
+  `selection.subtitle_requires_burn_in`, and text tracks keep the existing
+  `native` flag because ASS/SSA and `mov_text` carry text and still burn. A true
+  `selection.subtitle_burn_in_blocked_by_hdr` is reported as "HDR playback is
+  kept unchanged, so they will not be shown" — not as subtitles-on. A preflight
+  that fails claims nothing; the in-player path still discloses the burn.
+
+`TrackFactsTest` and `TrackSelectionTest` (JVM) pin the vocabulary, the route
+encoding, the plan execution, and the pricing; `DetailTrackFactsTest`
+(androidTest) pins the rendering and the click behavior.
 
 ## Administrative boundary
 

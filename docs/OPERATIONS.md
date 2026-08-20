@@ -183,6 +183,29 @@ startup follows the lost-target refusal in
 [Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
 SQLite.
 
+**One daemon per data directory.** Separately from that state-machine lock,
+startup takes an advisory lock on `.plurxd.lock` in the data directory before
+anything else and holds it for the life of the process, then records its own
+process id in the file. Two servers pointed at one data directory is data loss,
+so the second one refuses to start.
+
+That lock is released by closing the handle, which is the last thing a
+departing server does, so a restart can genuinely arrive before its predecessor
+has finished leaving — `Restart=always`, `systemctl restart`, and a container
+recreated under its old volume all do this. Startup therefore re-attempts for
+five seconds before refusing. A quiet host never spends that time, because the
+first attempt succeeds; a second live server is refused just the same, because
+a running owner holds the lock for its whole lifetime and is still holding it
+when the window ends. The refusal never means "busy at this instant" — it means
+held continuously for five seconds.
+
+Two refusals come out of that path and they are not variants of one problem:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `another plurxd process already owns the data directory <dir> (pid N)` | A different live process owns it. This is the double-start the lock exists to stop. The recorded pid is a best-effort diagnostic and can be stale; only the advisory lock proves that another owner exists. | Use `ps -p N` as a lead for finding the other server, then confirm which process has the data directory open before stopping it; otherwise give one server its own data directory. An unavailable pid reads `(owner pid not recorded)` and means the same ownership conflict. |
+| `the data directory <dir> is still locked inside this plurxd process (pid N)` | This process never dropped an earlier activation's lock handle. | Nothing on the host will help — no second server exists. Report it with the log around startup; it is a defect in this code path. |
+
 ### Reading watch-state replication status
 
 Open **Settings → System** and read **Watch state** in the Server card's
@@ -246,10 +269,12 @@ displayed token exactly as the runbook treats the `curl` response: anyone
 holding it can join a node to this cluster until it is redeemed or expires.
 
 **Remove** calls the removal endpoint and renders its refusal as a sentence with
-a next step rather than a code. `node_owns_offline_work` is the one you are most
-likely to meet; it tells you to clear or expire those downloads first. The
-confirmation states what the terminal path states below — the removed machine's
-data directory is tombstoned, and rejoining means discarding it.
+a next step rather than a code. `node_owns_offline_work` tells you to let active
+transfers finish (or delete those packages), stop clients from creating new
+downloads on that node, and retry; ordinary queued work is resolved by the
+server as described below. The confirmation states what the terminal path
+states below — the removed machine's data directory is tombstoned, and
+rejoining means discarding it.
 
 ### Joining and removing voters
 
@@ -351,15 +376,71 @@ curl -fsS "$PLURX/api/v1/cluster/nodes" \
 ```
 
 **Remove a follower from three or more voters.** Use the node id from the
-roster, not its Raft id. The request refuses the current leader, any change
-that would leave fewer than two voters, and any node with queued, preparing,
-ready, or failed offline packages. That last refusal is conservative: a
-replicated source path does not prove another node mounts the same bytes.
+roster, not its Raft id. The request refuses the current leader and any change
+that would leave fewer than two voters.
 
 ```bash
 curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
   -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
 ```
+
+#### What removal does to the node's offline downloads
+
+Removal resolves the departing node's offline packages before the membership
+change commits, so it leaves nothing owned by a machine that no longer exists.
+You do not have to drain them by hand first, and you do not have to stop that
+node from serving downloads while you do it: it keeps answering requests until
+the change commits, and removal re-reads its work and resolves the new arrivals
+before committing rather than acting on the list it started with.
+
+**Stop the removed node once the removal returns**, or repoint its clients at a
+surviving server. Removal takes the machine out of the cluster roster; it does
+not switch the machine off, and a removed plurxd that is still running and still
+reachable can still accept a download request and record the package against
+itself. Nothing resolves those: the removal that would have failed or moved them
+has already finished. They hold their reservation against the requesting user's
+byte budget until the seven-day expiry, and a package that reaches `ready` on a
+node you later switch off will not download. This is the only offline case
+removal does not clean up for you.
+
+Before it commits, the cluster asks every other node whether it can actually
+read each package's source file — not whether the path looks the same, but
+whether opening it returns the same bytes, size, and modification time the
+request recorded. That question is asked and answered for real, because a
+replicated source path does not prove another node mounts the same media.
+
+| The package was | What removal does |
+|---|---|
+| queued or preparing, and another node proved it reads the source | Moved to that node and prepared there. The download continues; nothing is lost. |
+| queued or preparing, and no node could prove it | Failed with `node_removed`. Its reservation is released immediately. |
+| ready | Failed with `node_removed`. Its bytes only ever existed on the removed node. |
+| already failed | Left alone. It holds nothing and expires normally. |
+
+A ready package is failed rather than moved on purpose. The prepared bytes
+lived only on the departing node, and plurx does not promise byte-identical
+transcodes across machines with different encoders — so re-preparing it behind
+the same download URL could hand a partly-finished download a different set of
+bytes. Failing it is honest: the user's client sees the package is gone and
+requesting it again prepares a fresh one on a remaining server.
+
+`node_removed` is a stable code. Nothing is wrong with the media and nothing is
+wrong with the server: the machine that was preparing that download left. The
+fix is always the same — ask for it again.
+
+The removal still refuses while a client is downloading from that node right
+now, and the error says how many transfers are in flight. Wait for them to
+finish or delete those packages, then retry.
+
+Two other offline refusals exist, and both are "retry this", not "drain it by
+hand". A node that keeps admitting new downloads faster than the removal can
+resolve them refuses after a bounded number of rounds and says so; point those
+clients elsewhere and retry. A package that changes state while its resolution
+is being applied — a producer finishing at exactly the wrong moment — also
+refuses, because the removal will not commit on a plan it could not finish
+applying. In both cases the packages that were resolved stay resolved: moved
+work is claimable on its new node, failed work has already released its
+reservation, and the retry picks up whatever is left. Nothing is left half
+owned.
 
 `cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
 `node_owns_offline_work` are operator-facing refusal codes. After a successful

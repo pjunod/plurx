@@ -705,6 +705,16 @@
   .specs .trk{border:1px solid var(--line);border-radius:999px;padding:2px 9px;line-height:1.5}
   .specs .trk.on{border-color:var(--accent);color:var(--accent)}
   .specs .trk .tdef{font-weight:600}
+  /* Large subtitle inventories stay out of the way until they are wanted.
+     Native details/summary keeps the disclosure keyboard-accessible without
+     adding another page-level state machine. The server-selected track is the
+     one line that remains visible while the disclosure is closed. */
+  .specs .trkfold summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;width:max-content;max-width:100%}
+  .specs .trkfold summary::-webkit-details-marker{display:none}
+  .specs .trkfold summary::after{content:"▸";color:var(--muted);font-size:11px;transition:transform .12s}
+  .specs .trkfold[open] summary::after{transform:rotate(90deg)}
+  .specs .trkfold .trkmore{color:var(--muted);font-size:12px;white-space:nowrap}
+  .specs .trkfold .trkrest{margin-top:6px}
   .specs .langnote{color:var(--muted);font-size:12px;margin-top:4px}
   /* Pre-play pickers. Deliberately inside the version block: the tracks belong
      to one file, and a multi-version item must not offer one item-wide choice
@@ -2831,7 +2841,7 @@ function showStallRecoveryFailure(note){
 function reportRateChase(v){
   const p=PLAYER; if(!p||!p.hitches) return;
   const h=p.hitches, want=(v.playbackRate||1);
-  if(h.rate==null || want<=0 || h.rate>=want*CHASE_RATE_MAX) return;
+  if(h.rate==null || !(h.rate>0) || want<=0 || h.rate>=want*CHASE_RATE_MAX) return;
   const runway=bufferRunway(v);
   if(runway<CHASE_RUNWAY_SECS) return;       // starved — endWait's case, not this one
   const now=performance.now();
@@ -2922,6 +2932,12 @@ function artHtml(it, cls){
 function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working"); render(); }
 let SERVER=null;   // last /server response (name, version, android_app, …)
 async function boot(){
+  // Before anything can build a /decision URL: the MediaCapabilities refinement
+  // of PLAY_CAPS is async, and the server hears one capability answer per
+  // session with no way to correct it afterwards. Awaiting here — ahead of even
+  // the /server call — means the setup and login paths, which reach render()
+  // without coming back through boot(), are covered too.
+  try{ await PLAY_CAPS_READY; }catch(e){}
   let server;
   try{ server=await api("/server"); SERVER=server; }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
   if(server.setup_required){ return renderSetup(server); }
@@ -4177,10 +4193,21 @@ function audioFactLabel(a){
   return [langName(a.language)||"Untagged", a.codec&&a.codec.toUpperCase(),
           fmtChannels(a.channels), a.title].filter(Boolean).join(" · ");
 }
-function trackFactRow(label, tracks, selectedIndex, chip, note){
-  const chips=tracks.length
-    ? `<div class="trks">${tracks.map(t=>chip(t, t.index===selectedIndex)).join("")}</div>`
-    : `<div class="trks">None</div>`;
+function trackFactRow(label, tracks, selectedIndex, chip, note, collapse=false){
+  let chips=`<div class="trks">None</div>`;
+  if(tracks.length){
+    if(collapse&&tracks.length>1){
+      // Lead with what actually plays, rather than assuming the container's
+      // first subtitle is the useful one. The remaining source-ordered tracks
+      // stay present in the document and are one click/tap away.
+      const primary=tracks.find(t=>t.index===selectedIndex)||tracks[0];
+      const rest=tracks.filter(t=>t!==primary);
+      chips=`<details class="trkfold"><summary>${chip(primary,primary.index===selectedIndex)}<span class="trkmore">${rest.length} more</span></summary><div class="trks trkrest">${
+        rest.map(t=>chip(t,t.index===selectedIndex)).join("")}</div></details>`;
+    }else{
+      chips=`<div class="trks">${tracks.map(t=>chip(t,t.index===selectedIndex)).join("")}</div>`;
+    }
+  }
   return `<dt>${label}</dt><dd>${chips}${note?`<div class="langnote">${esc(note)}</div>`:""}</dd>`;
 }
 function specBlock(f){
@@ -4206,7 +4233,7 @@ function specBlock(f){
   const subRow=(!subs.length && !f.video_codec) ? ""
     : trackFactRow("Subtitles", subs, sd&&sd.selected_index!=null?sd.selected_index:-1,
         (s,on)=>trackChip(subFactLabel(s),on),
-        subs.length?preferredLanguageNote("subtitles",sd):"");
+        subs.length?preferredLanguageNote("subtitles",sd):"", true);
   return `<dl class="specs">
     ${vid||!auds.length?`<dt>Video</dt><dd>${esc(vid||"—")}</dd>`:''}
     ${audRow}
@@ -5264,6 +5291,14 @@ function attachSession(v, t, info, wantSec){
   // create whose source lookup came back None) keeps whatever we had: the
   // decision's value is still the best answer. MEDIA-BADGES-PLAN.md §3.2.
   if(info.delivered_dynamic_range) t.deliveredRange=info.delivered_dynamic_range;
+  // …and repaint, or the chip keeps its pre-session HTML forever while the
+  // one-second stats panel follows the new truth. That is how "DV P7 → HDR10"
+  // sat beside "Dynamic range: SDR" on a tone-mapped Dexter episode: both
+  // surfaces call dynamicRangeBadge() with the same arguments, but only the
+  // panel repaints. renderPlayerInfo() is otherwise painted once, at session
+  // open — before the route is chosen and before the forced-burn override.
+  // MEDIA-BADGES-PLAN.md requires the chip and the panel row to agree.
+  if(t===PLAYER) renderPlayerInfo();
   t.probeUrl=info.playlist_url;
   const into = t.vod ? Math.max(0, wantSec||0) : 0;
   attachHls(v, info.playlist_url, into);
@@ -5288,12 +5323,121 @@ function releaseSession(sessionId){
 // transcodes what it genuinely can't — Safari keeps HEVC, everyone keeps their
 // own audio codecs, etc. HDR is claimed only on an HDR display (else the server
 // tone-maps, since HDR-on-SDR looks washed-out).
-const PLAY_CAPS=(function(){
+
+// ---- HEVC decode tiers -----------------------------------------------------
+// The one question this file used to ask about HEVC was `hvc1.1.6.L93.B0` —
+// Main, 8-bit, level 3.1 (720p-class) — and a yes was reported to the server as
+// blanket `hevc` support with no height at all. That is probe-low/claim-high,
+// the exact shape that already cost this project a black picture with working
+// sound once (see MSE_VIDEO's comment further down for the transport half of
+// the same story): a 4K 10-bit Main10 stream handed to a decoder that only does
+// 8-bit at 720p is accepted by every layer above the decoder and rendered as
+// nothing. No error fires, so nothing falls back.
+//
+// So ask the two questions the server actually needs answered — how many
+// pixels, and how many bits — instead of one question that answers neither.
+// The profile field in the codec string is the ONLY place a decoder's answer
+// distinguishes bit depth (`hvc1.1.6.*` is Main/8-bit, `hvc1.2.4.*` is Main10),
+// and the level field is the height axis: L93 = 3.1 (720p), L120 = 4.0 (1080p),
+// L153 = 5.1 (4K). The 8-bit rungs above L93 are here so an ordinary 8-bit-only
+// decoder still reports the 1080p/4K ceiling it really has rather than being
+// pinned at 720p by the lowest rung we happen to ask about first.
+//
+// width/height/bitrate/framerate are only read by the MediaCapabilities path
+// (they are required members of its VideoConfiguration); the isTypeSupported
+// fallback has nowhere to put them.
+const HEVC_TIERS=[
+  {codec:"hvc1.1.6.L93.B0",  depth:8,  width:1280, height:720,  bitrate:4000000},
+  {codec:"hvc1.1.6.L120.B0", depth:8,  width:1920, height:1080, bitrate:8000000},
+  {codec:"hvc1.1.6.L153.B0", depth:8,  width:3840, height:2160, bitrate:25000000},
+  {codec:"hvc1.2.4.L120.B0", depth:10, width:1920, height:1080, bitrate:10000000},
+  {codec:"hvc1.2.4.L153.B0", depth:10, width:3840, height:2160, bitrate:30000000},
+];
+// Fold a per-tier pass/fail table into the three facts that go on the wire.
+//
+// `maxheight` is deliberately the height at which EVERY claimed HEVC profile
+// decodes, not the height of the tallest rung that passed. The server's
+// `max_height` is one codec-agnostic number (plurx-core/src/playback: a file
+// taller than it is transcoded, whatever its codec), so a client that decodes
+// 8-bit at 4K but Main10 only at 1080p cannot say "2160" and "hevc10" in the
+// same breath — that pair is precisely the black-screen claim. Taking the min
+// costs such a device a needless transcode of 4K 8-bit HEVC; over-claiming
+// costs it the picture. `pqPassed` is null when the probe had no way to ask
+// about the transfer function (isTypeSupported has no such axis).
+function hevcTierSummary(passed, pqPassed){
+  let depth8=0, depth10=0, pq=0;
+  HEVC_TIERS.forEach((t,i)=>{
+    if(!passed||!passed[i]) return;
+    if(t.depth>=10){
+      if(t.height>depth10) depth10=t.height;
+      if(pqPassed&&pqPassed[i]&&t.height>pq) pq=t.height;
+    }else if(t.height>depth8) depth8=t.height;
+  });
+  const maxheight=(depth8&&depth10)?Math.min(depth8,depth10):(depth8||depth10);
+  return {depth8, depth10, maxheight, pq10:!!(maxheight&&pq>=maxheight)};
+}
+// The fallback probe: `canPlayType`/`isTypeSupported`, one call per rung. Both
+// are synchronous and neither knows anything about transfer functions, so this
+// path can establish depth and height and never HDR presentation.
+function hevcTiersSync(can, mse){
+  return HEVC_TIERS.map(t=>{
+    const type=`video/mp4; codecs="${t.codec}"`;
+    return can(type)||mse(type);
+  });
+}
+// The real probe. `navigator.mediaCapabilities.decodingInfo` is the only API
+// that takes a resolution, a bitrate and a transfer function and answers about
+// the combination — which is what a decoder ceiling actually is. Each Main10
+// rung is asked twice: once plain (does the decoder do 10-bit at this size?)
+// and once with `transferFunction:'pq'` (can this machine PRESENT HDR10 at that
+// size?). Those differ: a 10-bit SDR anime rip decodes on hardware that cannot
+// put PQ on the wire, and folding the two together would either lose that file
+// to a transcode or claim HDR the display never gets.
+//
+// Returns null when the API is missing or every single query threw, which is
+// the caller's signal to use the synchronous ladder instead. It is async, and
+// that is why CAPS_Q is rebuilt rather than computed once: see PLAY_CAPS_READY.
+async function hevcTiersMediaCapabilities(){
+  let mc=null;
+  try{ mc=navigator&&navigator.mediaCapabilities; }catch(e){}
+  if(!mc||typeof mc.decodingInfo!=="function") return null;
+  let answered=false;
+  // `media-source` first because segmented remuxes are the demanding path, then
+  // `file` for progressive direct play — the same OR the sync probe does across
+  // isTypeSupported/canPlayType, so the two paths cannot disagree by shape.
+  const ask=async(t,pq)=>{
+    const video={contentType:`video/mp4; codecs="${t.codec}"`, width:t.width,
+      height:t.height, bitrate:t.bitrate, framerate:24};
+    if(pq) video.transferFunction="pq";
+    for(const type of ["media-source","file"]){
+      try{
+        const r=await mc.decodingInfo({type, video});
+        answered=true;
+        if(r&&r.supported) return true;
+      }catch(e){}
+    }
+    return false;
+  };
+  const passed=[], pqPassed=[];
+  for(const t of HEVC_TIERS){
+    const ok=await ask(t,false);
+    passed.push(ok);
+    pqPassed.push(!!(ok&&t.depth>=10&&await ask(t,true)));
+  }
+  return answered?{passed, pqPassed}:null;
+}
+function buildPlayCaps(hevc){
   let v=null; try{ v=document.createElement("video"); }catch(e){}
   const can=t=>{ try{ return !!v && v.canPlayType(t)!==""; }catch(e){ return false; } };
   const mse=t=>{ try{ return !!(window.MediaSource && MediaSource.isTypeSupported(t)); }catch(e){ return false; } };
   const vc=["h264"];
-  if(can('video/mp4; codecs="hvc1.1.6.L93.B0"')||mse('video/mp4; codecs="hvc1.1.6.L93.B0"')) vc.push("hevc");
+  // `hevc` still means "there is an HEVC decoder" and is what the server matches
+  // against ffprobe's codec_name; `hevc10` is the bit-depth half of the same
+  // answer, named to match the MSE_VIDEO ladder key so the two vocabularies stay
+  // one vocabulary. Sending 8-bit-only as bare `hevc` is what stops a Main10
+  // source from being direct-played to a decoder that would render it black.
+  if(hevc.depth8||hevc.depth10) vc.push("hevc");
+  if(hevc.depth10) vc.push("hevc10");
   if(can('video/mp4; codecs="av01.0.05M.08"')||mse('video/mp4; codecs="av01.0.05M.08"')) vc.push("av1");
   if(can('video/webm; codecs="vp9"')||mse('video/webm; codecs="vp9"')) vc.push("vp9");
   if(can('video/webm; codecs="vp8"')) vc.push("vp8");
@@ -5329,9 +5473,68 @@ const PLAY_CAPS=(function(){
   if(can('audio/ogg')) containers.push("ogg","opus");
   if(can('audio/wav')) containers.push("wav");
   return {vcodec:vc.join(","), acodec:ac.join(","), container:containers.join(","), hdr:hdr?1:0,
-    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay};
+    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay,
+    // Only ever the HEVC ceiling, and null when there is no HEVC decoder at
+    // all: the server's max_height is codec-agnostic, so a number here caps
+    // H.264 and AV1 too. Absent is today's behaviour and stays the answer for
+    // every browser that was never going to be sent HEVC anyway.
+    maxheight:hevc.maxheight||null,
+    hdr10t:(hevc.pq10&&hdrDisplay)?1:0};
+}
+// The boot-time answer, from the synchronous ladder so that CAPS_Q exists
+// before anything can ask for it. MediaCapabilities refines it below.
+let PLAY_CAPS=buildPlayCaps(hevcTierSummary(hevcTiersSync(
+  t=>{ try{ const v=document.createElement("video"); return v.canPlayType(t)!==""; }catch(e){ return false; } },
+  t=>{ try{ return !!(window.MediaSource && MediaSource.isTypeSupported(t)); }catch(e){ return false; } }
+), null));
+// The capability query string every /decision and /stream.mp4 carries.
+//
+//   vcodec     CSV of decodable video codecs. `hevc` = an HEVC decoder exists;
+//              `hevc10` = it does Main10 (10-bit). 8-bit-only clients send
+//              `hevc` without `hevc10`.
+//   acodec     CSV of decodable audio codecs.
+//   container  CSV of containers playable from a plain <video src>.
+//   hdr        1 when HDR may be sent as-is: an HDR-capable codec AND an HDR
+//              display. 0 asks the server to tone-map.
+//   dv         1 when this client decodes Dolby Vision at any profile.
+//   dvprofile  CSV of the DV profiles actually probed, e.g. `5,8`.
+//   maxheight  The tallest height every HEVC profile named in `vcodec` decodes.
+//              Omitted entirely when no HEVC is claimed, because the server
+//              applies max_height to every codec and an HEVC-derived cap must
+//              not quietly become an H.264 cap on a client sent no HEVC.
+//   hdr10t     1 means, exactly: this client can DECODE HEVC Main10 and PRESENT
+//              it as PQ, at the height reported in `maxheight`, on the display
+//              it is attached to right now. It is the conjunction of a
+//              MediaCapabilities query carrying `transferFunction:'pq'` and
+//              `(dynamic-range: high)`; either half failing sends 0, and so
+//              does a browser with no MediaCapabilities at all, because the
+//              fallback probe cannot ask about transfer functions and a guess
+//              here is the over-claim this whole probe exists to stop. 0 is
+//              therefore "not proven", never "proven false" — a server reading
+//              it must treat 0 as the safe/tone-mapped path. It is strictly
+//              narrower than `hdr`, which any HDR-capable codec satisfies.
+function capsQuery(c){
+  return `vcodec=${c.vcodec}&acodec=${c.acodec}&container=${c.container}&hdr=${c.hdr}`+
+    `&dv=${c.dv}&dvprofile=${c.dvprofile}`+
+    (c.maxheight?`&maxheight=${c.maxheight}`:"")+
+    `&hdr10t=${c.hdr10t}`;
+}
+let CAPS_Q=capsQuery(PLAY_CAPS);
+// Re-probe through MediaCapabilities and rebuild the wire string. Async because
+// decodingInfo is, and the server only ever hears one answer per session — so
+// boot() awaits this before it can route anything, and every consumer reads
+// CAPS_Q at call time rather than capturing it. A rejection anywhere leaves the
+// synchronous answer standing, which is the conservative one.
+const PLAY_CAPS_READY=(async()=>{
+  try{
+    const mc=await hevcTiersMediaCapabilities();
+    if(mc){
+      PLAY_CAPS=buildPlayCaps(hevcTierSummary(mc.passed, mc.pqPassed));
+      CAPS_Q=capsQuery(PLAY_CAPS);
+    }
+  }catch(e){}
+  return PLAY_CAPS;
 })();
-const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}&dvprofile=${PLAY_CAPS.dvprofile}`;
 
 // Manual quality override (player menu), persisted per browser. Auto runs the
 // automatic ladder; Original never transcodes video (direct/remux only); a
@@ -5580,7 +5783,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     abr:{lastSwitchAtMs:clickedAt,lastStallAtMs:null,mildSamples:0,
       upgradeSinceMs:null,previousRunway:null,stallEvents:{supply:[],decode:[]},
       recentEstimateKbps:null,recentEstimateAtMs:null,
-      switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false},
+      switches:[],switching:false,stableSinceMs:clickedAt,supplyRescued:false,
+      // Rungs this playback has already failed to open. Per playback, not
+      // persisted: a transient server failure must not cap quality forever.
+      failedHeights:new Set()},
     waitAt:null, waitRunway:null, waitTimer:null, waitReported:false,
     stallsByKind:null, stallRecoveries:0, recoveringStall:null, stallPrompt:false,
     burnedSub:preBurn, vod:false, };
@@ -5976,14 +6182,36 @@ function armHitchDetector(v){
   // spanning a seek measures the seek.
   const rateWin=[];
   const noteRate=(now, mediaTime, pf, h)=>{
+    // A ring that spans a timeline discontinuity measures the discontinuity.
+    // Pause and seek are cleared by the caller, but a SESSION REPLACEMENT is
+    // not: teardownHls()+attachHls() for a quality switch or a stall reopen
+    // rebases mediaTime and resets presentedFrames without ever setting
+    // v.paused or v.seeking. Sampling across that produced the nonsense in
+    // production — `rate=-53.307 of 1 fps=-91.5`, logged five seconds after a
+    // rung change — and those values feed the chase beacon and the stats
+    // panel. Any backwards step in either counter starts a new window.
+    const last=rateWin[rateWin.length-1];
+    if(last && (mediaTime<last.m || pf<last.p)){
+      rateWin.length=0;
+      h.rate=null; h.renderedFps=null;
+    }
     rateWin.push({w:now, m:mediaTime, p:pf});
     while(rateWin.length>240) rateWin.shift();
     const a=rateWin[0], b=rateWin[rateWin.length-1];
-    if(b.w-a.w>4000){
-      h.rate=+(((b.m-a.m)*1000)/(b.w-a.w)).toFixed(3);
+    const span=b.w-a.w;
+    if(span>4000){
+      const played=b.m-a.m, shown=b.p-a.p;
+      // Belt and braces: only publish figures that are physically possible.
+      // A rate or an fps that is negative, or not finite, is a measurement
+      // artefact and must not reach a beacon that reads it as evidence.
+      h.rate = played>=0 && Number.isFinite(played)
+        ? +((played*1000)/span).toFixed(3)
+        : null;
       // Frames that actually reached the screen, per second — the honest
       // "rendered" figure. Same window as the rate so they agree about time.
-      h.renderedFps=+(((b.p-a.p)*1000)/(b.w-a.w)).toFixed(1);
+      h.renderedFps = shown>=0 && Number.isFinite(shown)
+        ? +((shown*1000)/span).toFixed(1)
+        : null;
     }
   };
   const step=(now, meta)=>{
@@ -6779,6 +7007,13 @@ async function switchAutoRung(currentHeight,decision){
     try{
       info=await openSession(me.fileId,transcodeOpts(pos,aidx,decision.height));
     }catch(e){
+      // This rung is not available on this server for this file — a Dolby
+      // Vision reshape that cannot reach it, an encoder that will not start,
+      // a refusal. Remember it: the dwell and hold timers cannot end a loop
+      // whose every cycle looks new, and this one oscillated 720<->1080 on a
+      // ~2 minute period in production.
+      me.abr.failedHeights=me.abr.failedHeights||new Set();
+      me.abr.failedHeights.add(decision.height);
       if(live()){
         me.abr.switching=false;
         setLoading(true,"Quality adjustment failed.",e.message,
@@ -6868,7 +7103,8 @@ async function autoControllerTick(){
     activeSupplyStall,supplyStalls:p.abr.stallEvents.supply.length,
     lastStallAtMs:p.abr.lastStallAtMs,nowMs:now,
     lastSwitchAtMs:p.abr.lastSwitchAtMs,mildSamples:p.abr.mildSamples,
-    upgradeSinceMs:p.abr.upgradeSinceMs,playerHeight:playerPixelHeight(v)
+    upgradeSinceMs:p.abr.upgradeSinceMs,playerHeight:playerPixelHeight(v),
+    blockedHeights:p.abr.failedHeights
   });
   p.abr.previousRunway=runway;
   p.abr.mildSamples=result.mildSamples;
@@ -9127,8 +9363,9 @@ function clusterStateView(cluster){
 }
 // The refusals DELETE /cluster/nodes/{id} can return, as sentences that say
 // what to do next. `node_owns_offline_work` is expected to be the common one
-// until the offline-package resolution milestone lands, so it gets a route
-// forward rather than a statement of fact and a dead end.
+// when an active transfer or concurrent package creation prevents the server
+// from resolving the work safely, so it gets a route forward rather than a
+// statement of fact and a dead end.
 function membershipRefusalText(code,message){
   const REFUSALS={
     removal_would_lose_quorum:
@@ -9136,10 +9373,10 @@ function membershipRefusalText(code,message){
       "needs both machines, so plurx will not present an unproved downgrade as a rollback. Add a third "+
       "node first, then remove the one you don't want.",
     node_owns_offline_work:
-      "This node still owns offline downloads — packages that are queued, preparing, ready, or failed. "+
-      "A shared source path does not prove another node can reach the same files, so plurx will not "+
-      "silently move them to a machine that may not have them. On the devices holding those downloads, "+
-      "delete them or let them expire, then remove this node again.",
+      "This node still has offline download work that could not be resolved safely. Let any active "+
+      "downloads from this node finish or delete those packages, stop clients from starting new "+
+      "downloads here, then retry the removal. plurx will move work only when a surviving node proves "+
+      "it can read the source; otherwise it fails the package cleanly so the client can request it again.",
     cluster_leader_removal_refused:
       "This node is the cluster's current leader, and a leader cannot remove itself. Leadership moves to "+
       "another voter on its own when this node restarts or stops being reachable; wait for that, then "+

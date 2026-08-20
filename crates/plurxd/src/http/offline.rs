@@ -382,8 +382,15 @@ pub async fn create(
     let output_size = plurx_core::transcode::output_size(&file, rung.height);
     let effective_rate_control = state
         .transcode
-        .effective_rate_control_for_new_offline_package()
+        .effective_rate_control_for_new_offline_package(&file)
         .await
+        .map_err(|message| {
+            typed(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_media",
+                message,
+            )
+        })?
         .snapshot_value();
     let new = NewOfflinePackage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1204,7 +1211,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(id, id, 100, 90_000)
+            .mark_offline_package_ready(id, "test-node", id, 100, 90_000)
             .await
             .expect("mark ready"));
         fixture
@@ -1242,7 +1249,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "unused", 10, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "unused", 10, 90_000)
             .await
             .expect("mark ready"));
         let token = "1".repeat(64);
@@ -1583,7 +1590,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "ready-recipe", 456, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "ready-recipe", 456, 90_000)
             .await
             .expect("ready"));
 
