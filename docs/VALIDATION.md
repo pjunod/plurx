@@ -113,8 +113,8 @@ Every expensive fan-out job in the main CI workflow waits for that preflight.
 A documentation-only pull request stops after those executable documentation
 contracts; it does not compile the Rust workspace or provision browsers and
 native-client environments. A documentation change may include
-`validation/regressions.toml` and keep this lane because the file is consumed
-only by the history audit that preflight already runs; selector code and
+`validation/regressions.d/**` and keep this lane because those entries are
+consumed only by the history audit that preflight already runs; selector code and
 `validation/points.toml` still take the executable-change lane.
 
 For executable changes, the portable Rust and focused Linux contracts remain
@@ -414,8 +414,9 @@ evidence:
   the production-to-test relationship;
 - for other runtime corrections after that baseline, an explicit regression
   mapping or anchor names the current evidence; or
-- [`validation/regressions.toml`](../validation/regressions.toml) explicitly
-  maps the commit to a current functionality point and runnable check.
+- a fragment in [`validation/regressions.d/`](../validation/regressions.d/)
+  explicitly maps the commit to a current functionality point and runnable
+  check.
 
 The explicit mapping is for checks whose evidence lives outside the fixing
 patch: both Apple platforms compiling, a real container completing its
@@ -423,6 +424,38 @@ non-root lifecycle, the browser playback matrix, or the UI structural sweep.
 It is not an exemption. Unknown commits, checks, and points fail; duplicate
 claims fail; and a new corrective commit with neither a test nor a mapping
 fails the baseline.
+
+### One mapping, one file
+
+The mapping ledger is a directory, not a file. Each entry lives in its own
+`validation/regressions.d/<first-commit-prefix>-<slug>.toml`, holds exactly one
+`[[coverage]]` table, and repeats `version = 1`. The audit loads every `*.toml`
+there in file-name order and treats them as one ledger; entry order carries no
+meaning.
+
+```toml
+# validation/regressions.d/a1b2c3d4-playback-pipeline.toml
+version = 1
+
+[[coverage]]
+commits = ["a1b2c3d4"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "One sentence naming the current check that exercises the defect."
+```
+
+The file name is not cosmetic. The audit rejects a fragment whose name does not
+begin with its own first mapped commit, so two corrective changes can never
+choose the same path. That is the whole point of the directory: a single
+append-only `validation/regressions.toml` put every new entry at the same
+offset, so each merge to `main` conflicted every other open pull request
+carrying a mapping — and clearing that conflict with a rebase rewrote the SHAs a
+reviewer had pinned an approval to, spending a review cycle on nothing. Adding a
+file collides with nothing. The loader refuses to run while a shared
+`validation/regressions.toml` exists, so the hotspot cannot come back.
+
+[`validation/regressions.d/README.md`](../validation/regressions.d/README.md)
+carries the field-by-field format next to the entries themselves.
 
 ```bash
 make history-check

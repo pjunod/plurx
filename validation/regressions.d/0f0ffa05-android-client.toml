@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0f0ffa05"]
+points = ["android.client"]
+checks = ["android-device"]
+reason = "The instrumented Google TV suite exercises remote focus movement and focused-control presentation."

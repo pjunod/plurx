@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["64a24854"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "The retained budget contract pins the playlist wait strictly above FIRST_SEGMENT_GRACE + SOFTWARE_GRACE plus the recovery's own polling cadence, so restoring only the independently chosen 30 s fails while a stalled hardware start is still being rescued; the retained deadline, terminal-verdict, refusal-mapping, burn-preflight and overlay units prove each cause is answered immediately with its own status and named reason, that an unreadable filter listing refuses nothing, and that a still-starting stream is reported as retryable rather than as a permanent failure."

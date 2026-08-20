@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["3a387052"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained stop-versus-copy-fallback regression pauses an Unsupported replacement while retirement begins, requires teardown to kill the published successor, and refuses any later replacement even with stale scratch; reverting only the production correction lets a live untracked producer survive the stop."
