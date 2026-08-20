@@ -9,12 +9,19 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-18): source is v0.2.7, Apple build 66. Native text
+> Status (2026-08-20): source is v0.2.7, Apple build 68. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 66 marks a duration-estimated Skip Credits button as an
-> estimate, so it no longer reads exactly like a chapter-derived one.
-> Build 64 corrects build 63's delivery watchdog, which fired on
+> landed. Build 68 marks a duration-estimated Skip Credits button as an
+> estimate, so it no longer reads exactly like a chapter-derived one. Build 67
+> adopts the bound same-session stall reopen: a sustained
+> stall on a growing session names its exact `previous_session_id` with
+> `reopen_reason: "stall"` so the server answers one rung down, every create
+> states `quality_auto`, and the ladder-floor retry budget the server
+> deliberately does not implement lives here (§ Quality row). Build 66 adds
+> unattended physical-device bandwidth acceptance with exact runway evidence.
+> Build 65 keeps the delivery watchdog honest about a player that is still
+> making progress. Build 64 corrects build 63's delivery watchdog, which fired on
 > healthy buffered playback and interrupted a 2160p session roughly every two
 > minutes; the film clock and buffered runway are now required to corroborate
 > the server's delivery meter. Build 63 hardens stall recovery against the tvOS freeze observed
@@ -64,7 +71,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 65 has not reached
+> resolved status. Repository evidence still says build 67 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -98,7 +105,7 @@ Vision investigation are recorded in
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position in the player; the detail screen also lists every track with language, codec, and channel layout, marks the server's `playback_defaults` pick, and lets a viewer choose one before pressing Play (§6) | Validate TrueHD/DTS fallback |
 | Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, styled ASS/SSA, and unrecognized overlay versions retain burn-in/refusal; the menu labels Overlay and Burn-in separately; automatic selection never starts a burn except a forced track (see §2); the detail screen lists every subtitle track with language, format, and Forced/SDH markers before playback and lets a viewer pick one — or Off — up front (§6) | Run [the physical acceptance procedure](APPLE-PGS-OVERLAY-ACCEPTANCE.md) on iPad Pro, then complete the separate iPhone and Apple TV rows |
-| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing. The server can now normalize a bound stall reopen and return its resolved height, but this client does not yet send that cause. | P1: carry `previous_session_id` + typed stall cause through the precedence-aware reopen queue, with a client-side retry budget at the ladder floor (the server repeats that rung and bounds nothing); continuous adaptation and an honest Original option when compatible |
+| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing. A sustained stall on a growing session now reopens *bound*: the create names the exact `previous_session_id` with `reopen_reason: "stall"` under one `request_id` minted for that stall, so the server answers one rung down and a transport replay returns that same persisted answer instead of stepping twice. Every create also states `quality_auto`, so the promise height a subtitle burn posts is not misread as a sticky manual pick. The ladder floor is bounded here, not on the server: two consecutive reopens that fail to buy a strictly lower rung end in the ordinary stall failure, and a minute of recovered film starts a fresh episode so one blip does not disable recovery for the rest of the title. Direct play, VOD, and offline recovery stay unbound, a stall ticket is dropped once a seek or track change has superseded the session it names, and a refused bound create (`400`) is retried once unbound under a fresh `request_id`. The server-truth delivery watchdog shares this arm, so a wedge the player never reported also names its predecessor and stops at the floor with the delivery-specific message. Two independent bounds now guard it and their order matters: the ladder floor is consulted first because the rolling automatic-reopen storm cap records a timestamp when it admits, and a reopen the floor refuses must not spend a rolling slot a later unrelated stall would then be missing. | Continuous adaptation and an honest Original option when compatible; device-verify the step-down and the floor bound on a physically starved link, including a stall the player itself never reports |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery, and selected-subtitle route/state (`PGS overlay · preparing`, ready overlay, unavailable, native WebVTT, or burned in). Sustained and self-recovered stalls reach the bounded server log with HLS session and per-item attempt identity, contiguous loaded runway, AVPlayer wait/buffer flags, access-log request/transfer counters, and the aged last successful server supply snapshot; live ingest replaces it with fresher session state when possible. Recovery TTFF is a separate attempt. | Add frame presentation rate and build stamp; validate correlated stall ingest on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button that says which kind of marker it came from: a chapter-derived marker keeps the plain label and the solid `forward.end.fill` glyph, while the duration-based end-credits estimate the server flags `chapter: false` renders as `≈ Skip Credits` with the hollow `forward.end` glyph and the VoiceOver label "Skip Credits, estimated". The mark leads because this label is one line and an accessibility text size truncates its tail. A marker with no `chapter` field, as an older server sends, is treated as exact. | P1: persisted auto-skip and next-episode handling for end credits. The web reference does not yet distinguish an estimated marker, so this row is currently ahead of it |

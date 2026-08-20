@@ -183,6 +183,29 @@ startup follows the lost-target refusal in
 [Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
 SQLite.
 
+**One daemon per data directory.** Separately from that state-machine lock,
+startup takes an advisory lock on `.plurxd.lock` in the data directory before
+anything else and holds it for the life of the process, then records its own
+process id in the file. Two servers pointed at one data directory is data loss,
+so the second one refuses to start.
+
+That lock is released by closing the handle, which is the last thing a
+departing server does, so a restart can genuinely arrive before its predecessor
+has finished leaving — `Restart=always`, `systemctl restart`, and a container
+recreated under its old volume all do this. Startup therefore re-attempts for
+five seconds before refusing. A quiet host never spends that time, because the
+first attempt succeeds; a second live server is refused just the same, because
+a running owner holds the lock for its whole lifetime and is still holding it
+when the window ends. The refusal never means "busy at this instant" — it means
+held continuously for five seconds.
+
+Two refusals come out of that path and they are not variants of one problem:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `another plurxd process already owns the data directory <dir> (pid N)` | A different live process owns it. This is the double-start the lock exists to stop. The recorded pid is a best-effort diagnostic and can be stale; only the advisory lock proves that another owner exists. | Use `ps -p N` as a lead for finding the other server, then confirm which process has the data directory open before stopping it; otherwise give one server its own data directory. An unavailable pid reads `(owner pid not recorded)` and means the same ownership conflict. |
+| `the data directory <dir> is still locked inside this plurxd process (pid N)` | This process never dropped an earlier activation's lock handle. | Nothing on the host will help — no second server exists. Report it with the log around startup; it is a defect in this code path. |
+
 ### Reading watch-state replication status
 
 Open **Settings → System** and read **Watch state** in the Server card's

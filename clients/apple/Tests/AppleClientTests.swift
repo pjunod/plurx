@@ -987,7 +987,7 @@ final class AppleClientTests: XCTestCase {
 
         // Nothing in flight: the request opens immediately and queues nothing.
         let immediate = queue.request(10_000, changeInFlight: false)
-        XCTAssertEqual(immediate, 10_000)
+        XCTAssertEqual(immediate?.positionMs, 10_000)
         XCTAssertNil(queue.pendingMs)
 
         // A burst of tvOS 30-second step-seeks landing during that change. Each
@@ -1005,7 +1005,7 @@ final class AppleClientTests: XCTestCase {
         // not the one the change started from.
         let trailing = queue.takePending()
         let secondTrailing = queue.takePending()
-        XCTAssertEqual(trailing, 100_000)
+        XCTAssertEqual(trailing?.positionMs, 100_000)
         XCTAssertNil(secondTrailing, "the trailing reopen runs once, not once per request")
 
         // A track change naming the position already being opened must still
@@ -1013,10 +1013,10 @@ final class AppleClientTests: XCTestCase {
         let trackChangeStart = queue.request(100_000, changeInFlight: false)
         let queuedTrackChange = queue.request(100_000, changeInFlight: true)
         let trackChangeTrailing = queue.takePending()
-        XCTAssertEqual(trackChangeStart, 100_000)
+        XCTAssertEqual(trackChangeStart?.positionMs, 100_000)
         XCTAssertNil(queuedTrackChange)
         XCTAssertEqual(
-            trackChangeTrailing,
+            trackChangeTrailing?.positionMs,
             100_000,
             "a queued request at the same position still has to rebuild the session"
         )
@@ -1029,6 +1029,465 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(queue.pendingMs)
         let afterClear = queue.takePending()
         XCTAssertNil(afterClear)
+    }
+
+    // MARK: - Bound same-session stall reopen (§7.3 / ADAPTIVE-QUALITY.md)
+
+    private func stallIntent(
+        previousSessionId: String = "session-a",
+        requestId: String = "request-1"
+    ) -> PlayerOpenIntent {
+        .stallReopen(
+            StallReopenTicket(previousSessionId: previousSessionId, requestId: requestId)
+        )
+    }
+
+    private func createBody(height: Int? = nil) -> CreateSessionRequest {
+        CreateSessionRequest(playbackId: "playback-1", height: height)
+    }
+
+    /// The whole wire shape of one recovery: the exact predecessor, the typed
+    /// cause, and the ticket's own request id so a transport replay recovers
+    /// the persisted answer instead of stepping the ladder again.
+    func testAStallReopenNamesItsPredecessorAndCarriesTheTypedCause() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(),
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+
+        XCTAssertEqual(body.previousSessionId, "session-a")
+        XCTAssertEqual(body.reopenReason, "stall")
+        XCTAssertEqual(body.requestId, "request-1")
+        XCTAssertEqual(body.qualityAuto, true)
+    }
+
+    /// A seek, a quality change, or a recovery that finished first has already
+    /// replaced the session the ticket names. The server refuses a create
+    /// naming a session it no longer runs, so the binding is dropped rather
+    /// than sent into a guaranteed 400.
+    func testAStaleStallTicketReopensUnboundInsteadOfNamingADeadSession() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(previousSessionId: "session-a"),
+            currentSessionId: "session-b",
+            selectedHeight: nil
+        )
+
+        XCTAssertNil(body.previousSessionId)
+        XCTAssertNil(body.reopenReason)
+        XCTAssertEqual(body.qualityAuto, true)
+    }
+
+    /// Direct play has no session to name at all.
+    func testAStallTicketIsDroppedWhenNoSessionIsPlaying() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(),
+            currentSessionId: nil,
+            selectedHeight: nil
+        )
+
+        XCTAssertNil(body.previousSessionId)
+        XCTAssertNil(body.reopenReason)
+    }
+
+    /// The live defect this field exists for: a subtitle burn posts the source
+    /// height as a promise about the output while the viewer is still on Auto.
+    /// Without `quality_auto` the server reads that as a sticky manual pick and
+    /// the session can never be stepped down again.
+    func testAPromiseHeightUnderAutoStillDeclaresTheViewerChoseAuto() {
+        let burn = PlayerController.applyOpenIntent(
+            to: createBody(height: 2_160),
+            intent: .normal,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        XCTAssertEqual(burn.height, 2_160)
+        XCTAssertEqual(
+            burn.qualityAuto,
+            true,
+            "a burn's promise height is not an answer to the quality menu"
+        )
+
+        let manual = PlayerController.applyOpenIntent(
+            to: createBody(height: 720),
+            intent: .normal,
+            currentSessionId: "session-a",
+            selectedHeight: 720
+        )
+        XCTAssertEqual(
+            manual.qualityAuto,
+            false,
+            "an explicitly picked rung stays sticky across a stall"
+        )
+    }
+
+    /// The client owns the bound the server deliberately does not implement:
+    /// at or below the ladder floor the same rung comes back every time.
+    func testTheFloorBudgetStopsRecoveryOnceReopensStopBuyingALowerRung() {
+        var budget = StallReopenBudget()
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+
+        // A real descent down the ladder never spends budget.
+        budget.resolved(height: 720, previousHeight: 1_080, at: 600_000)
+        budget.resolved(height: 480, previousHeight: 720, at: 605_000)
+        budget.resolved(height: 360, previousHeight: 480, at: 610_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+        XCTAssertEqual(budget.floorAttempts, 0)
+
+        // The floor is the predecessor's own rung, not 360: a starved prior
+        // settles at MIN_HEIGHT and a sub-360 source resolves below the ladder.
+        budget.resolved(height: 144, previousHeight: 144, at: 615_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt, "one retry is still worth taking")
+        budget.resolved(height: 144, previousHeight: 144, at: 620_000)
+        XCTAssertFalse(
+            budget.allowsAnotherAttempt,
+            "the server repeats the floor rung forever; only this bound ends it"
+        )
+
+        // The tight loop cannot buy itself more attempts: five seconds of
+        // recovered playback rearms the stall detector, and that is exactly the
+        // interval this bound has to survive.
+        budget.observedStall(at: 625_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // Viewer intent — a seek, a quality change, a new title — retires it.
+        budget.reset()
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+    }
+
+    /// The bound is on one starvation episode, not on the whole film. A blip
+    /// ten minutes in must not leave the remaining hour with no automatic
+    /// recovery at all.
+    func testAMinuteOfRecoveredFilmStartsAFreshEpisode() {
+        var budget = StallReopenBudget()
+        budget.resolved(height: 144, previousHeight: 144, at: 600_000)
+        budget.resolved(height: 144, previousHeight: 144, at: 606_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // Still the same episode.
+        budget.observedStall(at: 640_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // A full minute of film later the link demonstrably recovered.
+        budget.observedStall(at: 666_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+    }
+
+    /// `StartResponse.height` is `0` for a remux of an unprobed source, and
+    /// absent entirely from a server predating the field. Neither is evidence
+    /// that a lower rung was bought, and reading them as progress would restore
+    /// the unbounded loop the budget exists to close.
+    func testAnUnstatedHeightIsNotEvidenceOfAStepDown() {
+        var unprobed = StallReopenBudget()
+        unprobed.resolved(height: 0, previousHeight: 0, at: 10_000)
+        unprobed.resolved(height: 0, previousHeight: 0, at: 15_000)
+        XCTAssertFalse(unprobed.allowsAnotherAttempt)
+
+        var legacyServer = StallReopenBudget()
+        legacyServer.resolved(height: nil, previousHeight: nil, at: 10_000)
+        legacyServer.resolved(height: nil, previousHeight: nil, at: 15_000)
+        XCTAssertFalse(legacyServer.allowsAnotherAttempt)
+
+        // A step up is not a step down either.
+        var stepUp = StallReopenBudget()
+        stepUp.resolved(height: 720, previousHeight: 480, at: 10_000)
+        XCTAssertEqual(stepUp.floorAttempts, 1)
+    }
+
+    /// The transition itself, not just the counter behind it: an exhausted
+    /// floor budget turns the recovery arm of the stall state machine into the
+    /// ordinary stall failure, and nothing else changes shape.
+    func testAnExhaustedFloorBudgetTurnsRecoveryIntoTheOrdinaryStallFailure() {
+        let stopped = PlayerController.stallRecoveryDecision(
+            .reopen,
+            transport: .serverSession,
+            budgetAllowsAnotherAttempt: false,
+            kind: .buffering
+        )
+        XCTAssertEqual(stopped, .stop(PlaybackStallKind.buffering.terminalState))
+
+        // With budget left, the reopen stands.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .buffering
+            ),
+            .reopen
+        )
+
+        // An offline package has no rung and no server; the ladder's floor
+        // budget must not decide anything about it.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .reopen,
+                transport: .offlineAsset,
+                budgetAllowsAnotherAttempt: false,
+                kind: .silent
+            ),
+            .reopen
+        )
+
+        // A decision that was already terminal keeps its own message.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .stop(PlaybackStallKind.silent.terminalState),
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: false,
+                kind: .silent
+            ),
+            .stop(PlaybackStallKind.silent.terminalState)
+        )
+    }
+
+    /// The two bounds landed independently — the ladder floor here, the
+    /// rolling storm cap on `main` — and the order the merge chose between
+    /// them is a behavioral decision, not a formatting one.
+    ///
+    /// `admit()` records a timestamp, so asking it first charges a rolling
+    /// slot to a reopen the floor then refuses. Reverting to that order leaves
+    /// the assertions below failing: the floor-stopped stall would consume a
+    /// slot, and the unrelated stall a minute later would find the cap already
+    /// two-thirds spent.
+    func testAFloorStoppedStallDoesNotSpendARollingReopenSlot() {
+        var storm = RecoveryReopenBudget()
+
+        // The floor is exhausted, so this stall stops. It must cost the storm
+        // cap nothing: no reopen was ever issued.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: false,
+                kind: .buffering,
+                reopenStorm: &storm,
+                now: 100
+            ),
+            .stop(PlaybackStallKind.buffering.terminalState)
+        )
+        XCTAssertTrue(storm.reopenTimes.isEmpty, "a reopen that never happened is not a reopen")
+
+        // All three rolling slots therefore remain for real reopens.
+        for (index, at) in [101.0, 102.0, 103.0].enumerated() {
+            XCTAssertEqual(
+                PlayerController.boundedStallRecoveryDecision(
+                    .reopen,
+                    transport: .serverSession,
+                    budgetAllowsAnotherAttempt: true,
+                    kind: .buffering,
+                    reopenStorm: &storm,
+                    now: at
+                ),
+                .reopen,
+                "rolling slot \(index + 1) of 3 must still be available"
+            )
+        }
+
+        // And the storm cap still closes on the fourth, with the message that
+        // belongs to the stall that hit it.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 104
+            ),
+            .stop(PlaybackStallKind.delivery.terminalState)
+        )
+    }
+
+    /// A reach expansion the merge created and neither side had on its own:
+    /// `main`'s server-truth delivery watchdog funnels into
+    /// `retrySameDeliveryAfterStall`, the exact arm this branch bound to the
+    /// ladder. So a wedge that AVPlayer never reported now also names its
+    /// predecessor and stops at the floor — which is the intent, since a tvOS
+    /// 2160p copy-HLS freeze is precisely a rung the link cannot hold.
+    func testTheDeliveryWatchdogAlsoStepsTheLadderDownAndStopsAtItsFloor() {
+        var storm = RecoveryReopenBudget()
+
+        // With floor budget left, a watchdog-detected starvation reopens, and
+        // that reopen is bound exactly like a buffering stall.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 200
+            ),
+            .reopen
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            stallIntent(),
+            "the watchdog arm mints the same predecessor binding"
+        )
+
+        // At the floor it stops with the delivery-specific message rather than
+        // the generic buffering one, so the failure screen still names what
+        // actually went wrong.
+        let stopped = PlayerController.boundedStallRecoveryDecision(
+            .reopen,
+            transport: .serverSession,
+            budgetAllowsAnotherAttempt: false,
+            kind: .delivery,
+            reopenStorm: &storm,
+            now: 201
+        )
+        XCTAssertEqual(stopped, .stop(PlaybackStallKind.delivery.terminalState))
+        XCTAssertNotEqual(
+            PlaybackStallKind.delivery.terminalState.message,
+            PlaybackStallKind.buffering.terminalState.message
+        )
+
+        // An offline package reaches this arm too and has no rung to step to;
+        // the floor must stay out of its way.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .offlineAsset,
+                budgetAllowsAnotherAttempt: false,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 202
+            ),
+            .reopen
+        )
+    }
+
+    /// Only a live growing session has a predecessor rung to name.
+    func testOnlyAGrowingServerSessionMintsABoundRecovery() {
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            stallIntent()
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: true,
+                requestId: "request-1"
+            ),
+            .normal,
+            "a completed cache entry has no ladder answer to give"
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: nil,
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            .normal,
+            "direct play holds no session at all"
+        )
+    }
+
+    /// One stall, one step. Whatever the drain loop replays after a bound
+    /// reopen carries its own cause, so a queued viewer command cannot be
+    /// reissued as a second step-down of the same recovery.
+    func testATransportReplayCannotStepTheLadderDownTwice() {
+        var queue = PlayerReopenQueue()
+        let ticket = stallIntent()
+
+        // The stall lands while a track change is in flight and is queued.
+        XCTAssertNil(queue.request(30_000, intent: ticket, changeInFlight: true))
+        XCTAssertEqual(queue.takePending(), PlayerReopenRequest(positionMs: 30_000, intent: ticket))
+
+        // Nothing bound survives to be replayed a second time.
+        XCTAssertNil(queue.takePending())
+
+        // And the create built from that one ticket is idempotent: the same
+        // request id, so a transport replay returns the answer already
+        // persisted for it rather than resolving a second rung down.
+        let first = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: ticket,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        let replay = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: ticket,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        XCTAssertEqual(first.requestId, replay.requestId)
+    }
+
+    /// A seek or track change racing a stall is deterministic: last writer
+    /// wins, cause included. The viewer's command builds its own session, which
+    /// supersedes the predecessor the stall ticket names — so carrying that
+    /// binding forward would post a create the server is bound to refuse.
+    func testAViewerCommandRacingAStallDropsTheStallBinding() {
+        var queue = PlayerReopenQueue()
+
+        // Stall first, then the viewer scrubs.
+        XCTAssertNil(queue.request(30_000, intent: stallIntent(), changeInFlight: true))
+        XCTAssertNil(queue.request(90_000, changeInFlight: true))
+        XCTAssertEqual(queue.takePending(), PlayerReopenRequest(positionMs: 90_000))
+
+        // The other order: a stall observed after the viewer's command is a
+        // genuine recovery and keeps its binding.
+        XCTAssertNil(queue.request(90_000, changeInFlight: true))
+        XCTAssertNil(queue.request(30_000, intent: stallIntent(), changeInFlight: true))
+        XCTAssertEqual(
+            queue.takePending(),
+            PlayerReopenRequest(positionMs: 30_000, intent: stallIntent())
+        )
+    }
+
+    /// The residual #247 left on record: a retryable failure that fires after
+    /// the claim was normalized replays as `400 invalid stall reopen` for the
+    /// same `request_id`. Recovery is still wanted, so the identical recipe is
+    /// re-posted unbound under a fresh identity.
+    func testARefusedStallReopenFallsBackToAnUnboundCreate() throws {
+        let bound = PlayerController.applyOpenIntent(
+            to: createBody(height: 1_080),
+            intent: stallIntent(),
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+
+        let retry = try XCTUnwrap(
+            PlayerController.unboundStallRetry(for: bound, after: APIError.http(400))
+        )
+        XCTAssertNil(retry.previousSessionId)
+        XCTAssertNil(retry.reopenReason)
+        XCTAssertNotEqual(
+            retry.requestId,
+            bound.requestId,
+            "the refused claim already consumed that identity"
+        )
+        // Everything about the delivery is unchanged; only the binding went.
+        XCTAssertEqual(retry.height, 1_080)
+        XCTAssertEqual(retry.qualityAuto, true)
+        XCTAssertEqual(retry.playbackId, bound.playbackId)
+
+        // Not a blanket retry: other statuses and unbound bodies keep the
+        // existing restore-and-surface path.
+        XCTAssertNil(PlayerController.unboundStallRetry(for: bound, after: APIError.http(503)))
+        XCTAssertNil(PlayerController.unboundStallRetry(for: bound, after: APIError.http(404)))
+        XCTAssertNil(
+            PlayerController.unboundStallRetry(
+                for: createBody(),
+                after: APIError.http(400)
+            ),
+            "an ordinary create's 400 is not a stall-binding failure"
+        )
     }
 
     func testRelativeSeeksAccumulateFromTheLatestTargetAndClampToTheFilm() {
@@ -1826,6 +2285,67 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(object["reason"] as? String, "resume")
         XCTAssertEqual(object["file_id"] as? Int, 42)
         XCTAssertEqual(object["height"] as? Int, 2_160)
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
+    }
+
+    func testPhysicalDeviceAcceptanceLaunchReadsOnlyExplicitDebugDefaults() throws {
+        let suite = "tv.plurx.acceptance-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(PlaybackAcceptanceLaunch.current(defaults: defaults))
+
+        defaults.set(42, forKey: "plurx.acceptance.fileId")
+        defaults.set(17, forKey: "plurx.acceptance.itemId")
+        defaults.set(91_000, forKey: "plurx.acceptance.startMs")
+        defaults.set(7_200_000, forKey: "plurx.acceptance.durationMs")
+        defaults.set("Acceptance movie", forKey: "plurx.acceptance.title")
+        defaults.set(480, forKey: "plurx.acceptance.height")
+        defaults.set(true, forKey: "plurx.acceptance.probe")
+
+        XCTAssertEqual(
+            PlaybackAcceptanceLaunch.current(defaults: defaults),
+            PlaybackAcceptanceLaunch(
+                itemId: 17,
+                fileId: 42,
+                startMs: 91_000,
+                durationMs: 7_200_000,
+                title: "Acceptance movie",
+                height: 480,
+                probesEnabled: true
+            )
+        )
+    }
+
+    func testApplePlaybackProbeCarriesRunwayAndNoCredentialSurface() throws {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = 90_000
+        snapshot.runway = 6.25
+        snapshot.timeControlStatus = "playing"
+        let payload = ApplePlaybackProbeLog(
+            method: "transcode",
+            title: "Acceptance movie",
+            fileId: 42,
+            vcodec: "hevc",
+            height: 480,
+            encoder: "videotoolbox",
+            sessionId: "session-17",
+            attempt: "attempt-2",
+            snapshot: snapshot
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "playback_probe")
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(object["height"] as? Int, 480)
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "attempt-2")
+        let encodedSnapshot = try XCTUnwrap(object["snapshot"] as? [String: Any])
+        XCTAssertEqual(encodedSnapshot["runway"] as? Double, 6.25)
+        XCTAssertEqual(encodedSnapshot["time_control_status"] as? String, "playing")
         XCTAssertNil(object["url"])
         XCTAssertNil(object["token"])
     }
