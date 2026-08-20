@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["617356c9", "ec7777dd"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static", "playback-exhaustive"]
+reason = "Playback routing units, browser policy tests, and the deterministic playback matrix pin segmented-remux eligibility, bounded persistent-stall recovery, true reconnects, per-track audio compatibility, and recovery telemetry."

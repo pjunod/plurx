@@ -1,0 +1,10 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "5559d9b3222a48851454f450b3c226a9c972af4b",
+  "e3689787903cdb1ce94c9fb7906fe51f0cf463e7",
+]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained web policy unit pins cap-stranded emergency downgrades, ladder-floor fallback, and backing-pixel height measurement; restoring only the prior controller policy strands a 720p session above the sustainable rung under the recorded cliff conditions."

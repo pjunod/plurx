@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d839b97c"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shared-claim units drive the shipped interval order against a session-open that stays pending, in both the decode-first and supply-first orders, and prove exactly one automatic fallback session is opened and that the claim is released on failure; restoring only the prior controller lets the second rescue start a second server session that only generation-supersession hides."

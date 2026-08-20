@@ -56,7 +56,7 @@ DOCS_ONLY_PATHS = (
     "LICENSE.*",
     "NOTICE",
     "NOTICE.*",
-    "validation/regressions.toml",
+    "validation/regressions.d/**",
 )
 
 # Markdown under a shipped source tree is still a release-path change. Client

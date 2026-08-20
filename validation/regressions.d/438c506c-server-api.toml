@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["438c506c"]
+points = ["server.api", "offline.viewing"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regression `an_uppercase_language_tag_selects_the_same_audio_on_every_surface` proves that a container language tag written in upper case resolves to one audio and subtitle selection across item detail, `/decision`, and the offline options quote, because all three fold case through the shared `prefers_original_audio` predicate; reverting only the production correction restores the offline path's own case-sensitive match, so it stops treating the file as dual-audio and recommends the container-default English track the detail screen never advertised."

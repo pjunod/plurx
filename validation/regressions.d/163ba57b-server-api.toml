@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["163ba57b"]
+points = ["server.api"]
+checks = ["rust-gate"]
+reason = "The server lifecycle and manager tests exercise bounded shutdown and task cleanup."

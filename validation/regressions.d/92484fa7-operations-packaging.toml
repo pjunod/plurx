@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["92484fa7"]
+points = ["operations.packaging"]
+checks = ["container-runtime"]
+reason = "The container smoke runs the non-root state lifecycle through final host cleanup."

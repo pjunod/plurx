@@ -6,7 +6,13 @@ import tempfile
 import textwrap
 import unittest
 
-from validation.history import ISSUE_RE, HistoryError, audit_history
+from validation.history import (
+    ISSUE_RE,
+    HistoryError,
+    audit_history,
+    load_coverage,
+    verify_migration_fidelity,
+)
 from validation.runner import load_catalog
 
 
@@ -48,9 +54,20 @@ class HistoryAuditCase(unittest.TestCase):
         (root / "docs").mkdir()
         catalog_path = root / "points.toml"
         catalog_path.write_text(CATALOG, encoding="utf-8")
-        coverage_path = root / "regressions.toml"
-        coverage_path.write_text("version = 1\n", encoding="utf-8")
-        return root, load_catalog(catalog_path), coverage_path
+        coverage_dir = root / "regressions.d"
+        coverage_dir.mkdir()
+        return root, load_catalog(catalog_path), coverage_dir
+
+    @staticmethod
+    def write_coverage(coverage: Path, name: str, body: str) -> Path:
+        """Write one `[[coverage]]` fragment, the way an author adds a mapping."""
+
+        path = coverage / name
+        path.write_text(
+            "version = 1\n\n[[coverage]]\n" + textwrap.dedent(body).lstrip(),
+            encoding="utf-8",
+        )
+        return path
 
     @staticmethod
     def commit(root: Path, subject: str):
@@ -88,19 +105,15 @@ class HistoryAuditCase(unittest.TestCase):
         missing = audit_history(root, catalog, coverage)
         self.assertTrue(any(sha[:8] in error for error in missing.errors))
 
-        coverage.write_text(
-            textwrap.dedent(
-                f"""
-                version = 1
-
-                [[coverage]]
-                commits = ["{sha[:8]}"]
-                points = ["app"]
-                checks = ["baseline"]
-                reason = "The current baseline exercises this generated behavior."
-                """
-            ),
-            encoding="utf-8",
+        self.write_coverage(
+            coverage,
+            f"{sha[:8]}-app.toml",
+            f"""
+            commits = ["{sha[:8]}"]
+            points = ["app"]
+            checks = ["baseline"]
+            reason = "The current baseline exercises this generated behavior."
+            """,
         )
         covered = audit_history(root, catalog, coverage)
         self.assertEqual(covered.errors, ())
@@ -111,19 +124,15 @@ class HistoryAuditCase(unittest.TestCase):
             "pub fn imported() -> bool { true }\n", encoding="utf-8"
         )
         sha = self.commit(root, "Import state into a fresh target (#119)")
-        coverage.write_text(
-            textwrap.dedent(
-                f"""
-                version = 1
-
-                [[coverage]]
-                commits = ["{sha[:8]}"]
-                points = ["app"]
-                checks = ["baseline"]
-                reason = "The current import contract exercises the squash-merged behavior."
-                """
-            ),
-            encoding="utf-8",
+        self.write_coverage(
+            coverage,
+            f"{sha[:8]}-app.toml",
+            f"""
+            commits = ["{sha[:8]}"]
+            points = ["app"]
+            checks = ["baseline"]
+            reason = "The current import contract exercises the squash-merged behavior."
+            """,
         )
 
         report = audit_history(root, catalog, coverage)
@@ -173,25 +182,21 @@ class HistoryAuditCase(unittest.TestCase):
         self.commit(root, "feat: seed")
         for prefix in ("", "a", "123456", "ABCDEF0", "123456g", "a" * 41):
             with self.subTest(prefix=prefix):
-                coverage.write_text(
-                    textwrap.dedent(
-                        f"""
-                        version = 1
-
-                        [[coverage]]
-                        commits = ["{prefix}"]
-                        points = ["app"]
-                        checks = ["baseline"]
-                        reason = "Invalid prefixes must fail before history inspection."
-                        """
-                    ),
-                    encoding="utf-8",
+                self.write_coverage(
+                    coverage,
+                    "candidate-app.toml",
+                    f"""
+                    commits = ["{prefix}"]
+                    points = ["app"]
+                    checks = ["baseline"]
+                    reason = "Invalid prefixes must fail before history inspection."
+                    """,
                 )
                 with self.assertRaises(HistoryError) as raised:
                     audit_history(root, catalog, coverage)
                 self.assertEqual(
                     str(raised.exception),
-                    "coverage[0].commits must contain Git SHA prefixes",
+                    "candidate-app.toml commits must contain Git SHA prefixes",
                 )
 
     def test_one_commit_cannot_use_two_client_anchor_prefixes(self):
@@ -231,25 +236,25 @@ class HistoryAuditCase(unittest.TestCase):
         root, catalog, coverage = self.repository()
         (root / "src/app.rs").write_text("pub fn answer() -> u8 { 1 }\n", encoding="utf-8")
         sha = self.commit(root, "fix: seed the corrected answer")
-        coverage.write_text(
-            textwrap.dedent(
-                f"""
-                version = 1
-
-                [[coverage]]
-                commits = ["{sha[:8]}"]
-                points = ["app"]
-                checks = ["missing"]
-                reason = "First claim."
-
-                [[coverage]]
-                commits = ["{sha[:8]}"]
-                points = ["app"]
-                checks = ["baseline"]
-                reason = "Duplicate claim."
-                """
-            ),
-            encoding="utf-8",
+        self.write_coverage(
+            coverage,
+            f"{sha[:8]}-first.toml",
+            f"""
+            commits = ["{sha[:8]}"]
+            points = ["app"]
+            checks = ["missing"]
+            reason = "First claim."
+            """,
+        )
+        self.write_coverage(
+            coverage,
+            f"{sha[:8]}-second.toml",
+            f"""
+            commits = ["{sha[:8]}"]
+            points = ["app"]
+            checks = ["baseline"]
+            reason = "Duplicate claim."
+            """,
         )
 
         report = audit_history(root, catalog, coverage)
@@ -261,18 +266,14 @@ class HistoryAuditCase(unittest.TestCase):
         root, catalog, coverage = self.repository()
         (root / "docs/plan.md").write_text("Correct explanation.\n", encoding="utf-8")
         sha = self.commit(root, "docs: correct the explanation")
-        coverage.write_text(
-            textwrap.dedent(
-                f"""
-                version = 1
-
-                [[coverage]]
-                commits = ["{sha[:8]}"]
-                reason = "Documentation only; no executable behavior changed."
-                ignore = true
-                """
-            ),
-            encoding="utf-8",
+        self.write_coverage(
+            coverage,
+            f"{sha[:8]}-non-runtime.toml",
+            f"""
+            commits = ["{sha[:8]}"]
+            reason = "Documentation only; no executable behavior changed."
+            ignore = true
+            """,
         )
 
         report = audit_history(root, catalog, coverage)
@@ -313,6 +314,186 @@ class HistoryAuditCase(unittest.TestCase):
             ),
             report.errors,
         )
+
+
+class CoverageDirectoryCase(unittest.TestCase):
+    """The regression ledger must survive concurrent corrective changes.
+
+    A shared append-only file made every merge to `main` conflict every other
+    open pull request that carried a mapping, and clearing that conflict with a
+    rebase stranded the reviewer's exact-SHA approval. One entry per file makes
+    the collision impossible instead of merely rare.
+    """
+
+    @staticmethod
+    def git(root: Path, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *arguments], cwd=root, check=True, text=True, stdout=subprocess.PIPE
+        )
+
+    @staticmethod
+    def fragment(root: Path, name: str, commit: str, reason: str) -> None:
+        (root / "validation/regressions.d" / name).write_text(
+            textwrap.dedent(
+                f"""
+                version = 1
+
+                [[coverage]]
+                commits = ["{commit}"]
+                points = ["app"]
+                checks = ["baseline"]
+                reason = "{reason}"
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+    def repository(self) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.git(root, "init", "-q", "-b", "main")
+        self.git(root, "config", "user.name", "Ledger Test")
+        self.git(root, "config", "user.email", "ledger@example.invalid")
+        (root / "validation/regressions.d").mkdir(parents=True)
+        self.fragment(root, "0000aa11-seed.toml", "0000aa11", "Seeded before either branch.")
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-qm", "seed the ledger")
+        return root
+
+    def branch_adding(self, root: Path, name: str, fragment: str, commit: str) -> None:
+        self.git(root, "checkout", "-q", "-b", name, "main")
+        self.fragment(root, fragment, commit, f"Added independently on {name}.")
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-qm", f"fix: map {commit}")
+
+    def merged(self, root: Path, name: str, first: str, second: str) -> tuple[str, ...]:
+        self.git(root, "checkout", "-q", "-b", name, "main")
+        for branch in (first, second):
+            merge = subprocess.run(
+                ["git", "merge", "--no-edit", "-q", branch],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            self.assertEqual(
+                merge.returncode,
+                0,
+                f"merging {branch} into {name} conflicted:\n{merge.stdout}",
+            )
+        entries = load_coverage(root / "validation/regressions.d")
+        return tuple(entry.commits[0] for entry in entries)
+
+    def test_independent_mappings_merge_cleanly_in_either_order(self):
+        root = self.repository()
+        self.branch_adding(root, "alpha", "1111bb22-app.toml", "1111bb22")
+        self.branch_adding(root, "beta", "2222cc33-app.toml", "2222cc33")
+
+        expected = ("0000aa11", "1111bb22", "2222cc33")
+        self.assertEqual(self.merged(root, "alpha-first", "alpha", "beta"), expected)
+        self.assertEqual(self.merged(root, "beta-first", "beta", "alpha"), expected)
+
+    def test_a_shared_append_only_ledger_is_what_conflicted(self):
+        root = self.repository()
+        shared = root / "validation/shared.toml"
+        shared.write_text("version = 1\n", encoding="utf-8")
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-qm", "seed a shared tail")
+        for branch, commit in (("gamma", "3333dd44"), ("delta", "4444ee55")):
+            self.git(root, "checkout", "-q", "-b", branch, "main")
+            shared.write_text(
+                shared.read_text(encoding="utf-8")
+                + f'\n[[coverage]]\ncommits = ["{commit}"]\n',
+                encoding="utf-8",
+            )
+            self.git(root, "add", "-A")
+            self.git(root, "commit", "-qm", f"fix: map {commit}")
+
+        self.git(root, "checkout", "-q", "gamma")
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", "-q", "delta"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        self.assertNotEqual(merge.returncode, 0)
+        self.assertIn("<<<<<<<", shared.read_text(encoding="utf-8"))
+
+    def test_a_fragment_must_be_named_after_its_first_mapped_commit(self):
+        root = self.repository()
+        self.fragment(root, "unrelated-name.toml", "5555ff66", "Named after nothing.")
+
+        with self.assertRaises(HistoryError) as raised:
+            load_coverage(root / "validation/regressions.d")
+
+        self.assertIn("5555ff66", str(raised.exception))
+
+    def test_a_fragment_holds_exactly_one_entry(self):
+        root = self.repository()
+        path = root / "validation/regressions.d/6666aa77-app.toml"
+        self.fragment(root, path.name, "6666aa77", "First.")
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + '\n[[coverage]]\ncommits = ["7777bb88"]\nreason = "Second."\nignore = true\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HistoryError) as raised:
+            load_coverage(root / "validation/regressions.d")
+
+        self.assertIn("exactly one", str(raised.exception))
+
+    def test_a_reintroduced_shared_ledger_is_refused(self):
+        root = self.repository()
+        (root / "validation/regressions.toml").write_text(
+            "version = 1\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(HistoryError) as raised:
+            load_coverage(root / "validation/regressions.d")
+
+        self.assertIn("no longer the regression ledger", str(raised.exception))
+
+    def test_migration_fidelity_catches_a_dropped_multi_commit_member(self):
+        root = self.repository()
+        legacy = root / "legacy-regressions.toml"
+        legacy.write_text(
+            textwrap.dedent(
+                """
+                version = 1
+
+                [[coverage]]
+                commits = ["0000aa11", "1111bb22"]
+                points = ["app"]
+                checks = ["baseline"]
+                reason = "Seeded before either branch."
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HistoryError) as raised:
+            verify_migration_fidelity(legacy, root / "validation/regressions.d")
+        self.assertIn("1 missing and 1 extra", str(raised.exception))
+
+        (root / "validation/regressions.d/0000aa11-seed.toml").write_text(
+            textwrap.dedent(
+                """
+                version = 1
+
+                [[coverage]]
+                commits = ["0000aa11", "1111bb22"]
+                points = ["app"]
+                checks = ["baseline"]
+                reason = "Seeded before either branch."
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        verify_migration_fidelity(legacy, root / "validation/regressions.d")
 
 
 if __name__ == "__main__":
