@@ -44,6 +44,10 @@ walkdir = "2"
 # XML: NFO sidecar parsing (home libraries). plurx-compat-plex hand-rolls a
 # *writer*; this is the reader, and real-world NFOs are too filthy to hand-roll.
 quick-xml = "0.41"
+# EPUB is an OCF ZIP container. Only the two formats EPUB requires in
+# practice (stored and deflate) are enabled; archive parsing is bounded again
+# in plurxd before any entry is allocated or served.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 # EXIF: capture dates for photos in home libraries (pure Rust, JPEG/TIFF).
 kamadak-exif = "0.6"
 notify = "6"
@@ -92,6 +96,13 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Test executables are replicated in every isolated swarm worker cache. Rust
+# debug info made each plurxd test binary hundreds of megabytes even though the
+# harness never attaches a debugger to them. Keep normal development builds
+# debuggable, but omit debug info from the disposable test artifacts.
+[profile.test]
+debug = 0
 
 [profile.release]
 lto = "thin"
