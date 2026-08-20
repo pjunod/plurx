@@ -1780,6 +1780,7 @@ COMMIT;"
 
     #[tokio::test]
     async fn credential_generation_isolates_same_id_delete_recreate() {
+        use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
@@ -1788,7 +1789,9 @@ COMMIT;"
 
         let store = SqliteStore::open(&db).expect("create");
 
-        let old_gen = CredentialGeneration::derive(1, 1000, "old-hash");
+        let old_hash = auth::hash_password("original-password").expect("hash");
+        let new_hash = auth::hash_password("replacement-password").expect("hash");
+        let old_gen = CredentialGeneration::derive(1, 1000, &old_hash);
         store
             .observe_network_prior(&NetworkPriorObservation {
                 credential_generation: old_gen.clone(),
@@ -1801,7 +1804,7 @@ COMMIT;"
             .await
             .expect("write prior under old generation");
 
-        let new_gen = CredentialGeneration::derive(1, 2000, "new-hash");
+        let new_gen = CredentialGeneration::derive(1, 2000, &new_hash);
         assert_ne!(
             old_gen, new_gen,
             "delete/recreate must produce different generation"
@@ -1826,6 +1829,7 @@ COMMIT;"
 
     #[tokio::test]
     async fn old_credential_generation_observation_racing_delete_recreate() {
+        use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
@@ -1834,9 +1838,10 @@ COMMIT;"
 
         let store = SqliteStore::open(&db).expect("create");
 
-        let old_gen = CredentialGeneration::derive(1, 1000, "pre-reset-hash");
-        let new_gen = CredentialGeneration::derive(1, 2000, "post-reset-hash");
-        assert_ne!(old_gen, new_gen);
+        let old_hash = auth::hash_password("pre-reset-password").expect("hash");
+        let new_hash = auth::hash_password("post-reset-password").expect("hash");
+        let old_gen = CredentialGeneration::derive(1, 1000, &old_hash);
+        let new_gen = CredentialGeneration::derive(1, 2000, &new_hash);
 
         store
             .observe_network_prior(&NetworkPriorObservation {
@@ -1869,6 +1874,7 @@ COMMIT;"
 
     #[tokio::test]
     async fn credential_generation_changes_on_password_reset_or_rehash() {
+        use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
@@ -1877,7 +1883,11 @@ COMMIT;"
 
         let store = SqliteStore::open(&db).expect("create");
 
-        let original_gen = CredentialGeneration::derive(2, 5000, "original-argon2-hash");
+        let original_hash = auth::hash_password("original-password").expect("hash");
+        let reset_hash = auth::hash_password("reset-password").expect("hash");
+        let rehash_hash = auth::hash_password("rehash-password").expect("hash");
+
+        let original_gen = CredentialGeneration::derive(2, 5000, &original_hash);
         store
             .observe_network_prior(&NetworkPriorObservation {
                 credential_generation: original_gen.clone(),
@@ -1890,7 +1900,7 @@ COMMIT;"
             .await
             .expect("write prior under original credential");
 
-        let reset_gen = CredentialGeneration::derive(2, 5000, "reset-argon2-hash");
+        let reset_gen = CredentialGeneration::derive(2, 5000, &reset_hash);
         assert_ne!(
             original_gen, reset_gen,
             "password reset must produce different generation"
@@ -1927,6 +1937,7 @@ COMMIT;"
 
     #[tokio::test]
     async fn admin_role_change_preserves_credential_generation() {
+        use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
@@ -1935,7 +1946,8 @@ COMMIT;"
 
         let store = SqliteStore::open(&db).expect("create");
 
-        let gen = CredentialGeneration::derive(3, 3000, "stable-hash");
+        let stable_hash = auth::hash_password("stable-password").expect("hash");
+        let gen = CredentialGeneration::derive(3, 3000, &stable_hash);
         store
             .observe_network_prior(&NetworkPriorObservation {
                 credential_generation: gen.clone(),
@@ -1948,7 +1960,7 @@ COMMIT;"
             .await
             .expect("write prior");
 
-        let after_admin_change = CredentialGeneration::derive(3, 3000, "stable-hash");
+        let after_admin_change = CredentialGeneration::derive(3, 3000, &stable_hash);
         assert_eq!(
             gen, after_admin_change,
             "admin-role change must preserve credential generation"
@@ -1960,6 +1972,84 @@ COMMIT;"
             .expect("lookup after admin change")
             .expect("admin role change must not make prior unreachable");
         assert_eq!(loaded.sustained_kbps, Some(10_000));
+    }
+
+    #[tokio::test]
+    /// Regression: the credential generation captured at authentication time
+    /// uses the real User lifecycle state (id, created_at, password_hash).
+    /// When a user is deleted and recreated, the previously captured
+    /// generation must still resolve the old prior and the replacement
+    /// user must not see it through its own generation.
+
+    async fn user_lifecycle_delete_recreate_isolates_captured_credential_generation() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::{NetworkPriorStore, UserStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        // Create the original user with a real Argon2 PHC hash.
+        let original_hash = auth::hash_password("user-password").expect("hash");
+        let user = store
+            .create_user("testuser", &original_hash, false)
+            .await
+            .expect("create user");
+
+        // Capture the credential generation at authentication time — this
+        // mirrors what the HTTP handler does with the authenticated user.
+        let captured_generation =
+            CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
+
+        // Observe a prior under the captured generation.
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: captured_generation.clone(),
+                client_class: "chrome".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(5_000),
+                observed_at_ms: 1_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write prior under captured generation");
+
+        // Delete the user.
+        store.delete_user(user.id).await.expect("delete user");
+
+        // Recreate the same user.
+        let new_hash = auth::hash_password("new-user-password").expect("hash");
+        let replacement = store
+            .create_user("testuser", &new_hash, false)
+            .await
+            .expect("recreate user");
+
+        // The old captured generation must still resolve the prior written
+        // before the delete.
+        let old_loaded = store
+            .network_prior(captured_generation.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup old generation")
+            .expect("old generation must still resolve its prior");
+        assert_eq!(old_loaded.sustained_kbps, Some(5_000));
+
+        // The replacement user's credential generation must not see the
+        // old prior.
+        let replacement_generation = CredentialGeneration::derive(
+            replacement.id,
+            replacement.created_at,
+            &replacement.password_hash,
+        );
+        let new_loaded = store
+            .network_prior(replacement_generation.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup after replacement");
+        assert!(
+            new_loaded.is_none(),
+            "replacement user must not see old prior through its credential generation"
+        );
     }
 
     #[tokio::test]
