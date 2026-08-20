@@ -183,14 +183,21 @@ inside one Books library while keeping their actions and metadata honest.
   through Hiqlite, rejects stale offline rewinds, and exposes authenticated
   get/save/clear routes to web and native clients. Replacing an edition cannot
   resume into the wrong text.
+- **EPUB publication serving is bounded and capability-scoped.** Cinema parses
+  EPUB 2 NCX and EPUB 3 navigation into one normalized manifest, then serves
+  only declared resources through a short-lived, revision-bound capability and
+  a bounded streaming decompressor rather than buffering whole child files.
+  Archive traversal, encryption, decompression bombs, scripts, and remote
+  publication network loads fail closed before the web reader depends on it.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
 - **No book metadata provider or built-in ebook renderer yet.** Titles/authors
   come from the file/folder layout and audio facts from the container. Reading
-  state is ready, but clients still hand ebook bytes to the browser/platform
-  viewer until the EPUB reader milestone lands. DRM-protected books are not
-  decrypted, and cover extraction is not yet implemented.
+  state and the secure EPUB publication layer are ready, but clients still
+  hand ebook bytes to the browser/platform viewer until the M2b reader surface
+  lands. DRM-protected books are not decrypted, and cover extraction is not
+  yet implemented.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters

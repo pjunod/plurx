@@ -91,6 +91,38 @@ user or login token prevents new server access but cannot erase bytes already
 downloaded to a device. Uninstalling the app removes those local downloads;
 a rooted or jailbroken device can read them.
 
+## EPUB publication sessions — one revision, no account bearer
+
+An EPUB is hostile archive and markup input, not trusted web UI. The signed-in
+client opens it through `POST /api/v1/files/<id>/publication`; that request
+checks the authenticated book request and exact file size/mtime, parses only
+bounded OCF, package, and navigation metadata, then returns a random two-hour
+sliding session. Publication markup receives URLs under:
+
+```text
+/api/v1/publication/<session>/<normalized resource>
+```
+
+The session can read only resources declared by that one EPUB manifest. It
+cannot browse the library or call authenticated JSON routes, and a changed
+source revision invalidates resource reads even before the session expires.
+The owner may close it early; node-local storage is capped at 64 live
+sessions. HTTP traces redact the session path just as they redact HLS and
+offline-media capabilities.
+
+Archive validation rejects unsafe or duplicate names, an escaping relative
+link, encryption, more than 20,000 entries, more than 1 GiB declared expanded
+data, a ratio above 1,000:1, package/navigation markup above 8 MiB, and any
+served child above 128 MiB. Resource responses use `nosniff`, no referrer,
+same-origin resource policy, and a CSP that blocks scripts, connections,
+forms, nested frames, objects, base changes, and non-local images/fonts/media.
+Child resources decompress through a two-chunk, 64 KiB channel, with no more
+than eight readers active per node, so concurrent requests cannot turn the
+per-resource ceiling into concurrent whole-file allocations.
+M2b still has to keep the iframe sandbox and browser network-refusal test
+green; the server headers are one half of that boundary, not a substitute for
+the rendering proof.
+
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 
 Passwords, login tokens, API keys, and offline lease capabilities are stored
