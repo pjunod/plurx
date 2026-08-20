@@ -2008,29 +2008,45 @@ pub async fn start_cluster_with_port_retry(
     root: &Path,
     voters: u64,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
-    start_cluster_with_port_retry_using(executable, root, voters, |_| allocate_nodes(voters)).await
+    start_cluster_with_port_retry_using(
+        executable,
+        root,
+        voters,
+        |_| allocate_nodes(voters),
+        |_, _| Ok(()),
+    )
+    .await
 }
 
-/// Start a cluster with an injectable allocator.
+/// Start a cluster with injectable allocation and pre-start seams.
 ///
-/// This is public only so the integration harness can deterministically take
-/// a port after the first reservation is released and prove the production
-/// retry wrapper performs a fresh allocation. Production callers should use
-/// [`start_cluster_with_port_retry`].
+/// This is public only so the integration harness can deterministically return
+/// a classified collision before the first start and prove the production
+/// retry wrapper performs a fresh allocation. The reservation remains held
+/// during that injection, so the regression does not recreate the
+/// release-to-bind race this wrapper exists to handle. Production callers
+/// should use [`start_cluster_with_port_retry`].
 #[doc(hidden)]
-pub async fn start_cluster_with_port_retry_using<A>(
+pub async fn start_cluster_with_port_retry_using<A, B>(
     executable: &Path,
     root: &Path,
     voters: u64,
     mut allocate: A,
+    mut before_start: B,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)>
 where
     A: FnMut(u32) -> Result<PortReservation>,
+    B: FnMut(u32, &PortReservation) -> Result<()>,
 {
     with_port_retry(|attempt| {
         let reservation = allocate(attempt);
+        let before_start = match reservation.as_ref() {
+            Ok(reservation) => before_start(attempt, reservation),
+            Err(_) => Ok(()),
+        };
         async move {
             let reservation = reservation?;
+            before_start?;
             if reservation.specs.len() != voters as usize {
                 bail!(
                     "cluster allocator returned {} voters, expected {voters}",

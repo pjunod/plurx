@@ -873,33 +873,34 @@ fn a_store_verdict_is_never_classified_as_a_port_collision() {
 
 /// The production start wrapper reallocates after a classified collision.
 ///
-/// The first allocator call releases its reservation and immediately occupies
-/// the raft port before the child binds. The real child start must report that
-/// collision to the real retry wrapper; the second call then returns a normal,
-/// fresh reservation and the cluster must become ready on different ports.
+/// The pre-start seam returns a classified collision on the first attempt while
+/// its reservation is still held. The second call then returns a normal, fresh
+/// reservation and the real cluster start must become ready on different ports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_cluster_with_port_retry_reallocates_after_a_collision() {
     let root = tempfile::tempdir().expect("port-collision retry test root");
     let mut allocations = Vec::new();
-    let mut squatter = None;
-    let (mut cluster, started_specs) =
-        start_cluster_with_port_retry_using(&harness_binary(), root.path(), 1, |attempt| {
+    let (mut cluster, started_specs) = start_cluster_with_port_retry_using(
+        &harness_binary(),
+        root.path(),
+        1,
+        |_| {
             let reservation = allocate_nodes(1).expect("allocate retry ports");
-            let specs = reservation.specs().to_vec();
-            allocations.push(specs.clone());
+            allocations.push(reservation.specs().to_vec());
+            Ok(reservation)
+        },
+        |attempt, reservation| {
             if attempt == 1 {
-                let raft: std::net::SocketAddr =
-                    specs[0].raft.parse().expect("raft socket address");
-                let unreserved = PortReservation::unreserved(reservation.into_specs());
-                squatter = Some(std::net::TcpListener::bind(raft).expect("take released port"));
-                Ok(unreserved)
-            } else {
-                drop(squatter.take());
-                Ok(reservation)
+                anyhow::bail!(
+                    "port collision: simulated bind refusal for {}",
+                    reservation.specs()[0].raft
+                );
             }
-        })
-        .await
-        .expect("a fresh allocation should start after the collision");
+            Ok(())
+        },
+    )
+    .await
+    .expect("a fresh allocation should start after the collision");
 
     assert!(
         allocations.len() >= 2,
