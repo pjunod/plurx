@@ -241,20 +241,37 @@ mod tests {
     async fn ordinary_bearer_and_missing_cluster_authority_are_rejected() {
         let (_, state) = crate::http::tests::test_app_with_state();
         let mut household = HeaderMap::new();
-        household.insert("authorization", "Bearer household-token".parse().unwrap());
+        household.insert(
+            "authorization",
+            "Bearer household-token"
+                .parse()
+                .expect("static household authorization is a valid header value"),
+        );
         assert_eq!(
-            snapshot(State(state.clone()), household).await.unwrap_err(),
+            snapshot(State(state.clone()), household)
+                .await
+                .expect_err("a household bearer must not authorize a cluster snapshot"),
             StatusCode::UNAUTHORIZED
         );
 
         let mut forged = HeaderMap::new();
         forged.insert(
             TIMESTAMP_HEADER,
-            unix_seconds().to_string().parse().unwrap(),
+            unix_seconds()
+                .to_string()
+                .parse()
+                .expect("a decimal timestamp is a valid header value"),
         );
-        forged.insert(SIGNATURE_HEADER, "00".repeat(32).parse().unwrap());
+        forged.insert(
+            SIGNATURE_HEADER,
+            "00".repeat(32)
+                .parse()
+                .expect("a hexadecimal signature is a valid header value"),
+        );
         assert_eq!(
-            snapshot(State(state), forged).await.unwrap_err(),
+            snapshot(State(state), forged)
+                .await
+                .expect_err("a forged signature must not authorize a cluster snapshot"),
             StatusCode::UNAUTHORIZED
         );
     }
