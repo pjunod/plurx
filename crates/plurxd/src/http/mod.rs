@@ -945,6 +945,49 @@ mod tests {
         assert_eq!(rec["source"], "monarr");
     }
 
+    /// Curator announces book imports through the same targeted-scan seam as
+    /// video. The hint carries no provider id: the resolved Books library and
+    /// the file extension decide whether this is a text book or audiobook.
+    #[tokio::test]
+    async fn a_curator_book_import_reaches_the_books_library() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let book = dir.path().join("Ursula K. Le Guin/The Dispossessed");
+        std::fs::create_dir_all(&book).expect("mkdir");
+        std::fs::write(book.join("The Dispossessed.epub"), b"epub fixture").expect("write");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Books", "kind": "books", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let body = scan_and_settle(
+            &app,
+            &key,
+            json!({
+                "path": book,
+                "hint": "book",
+                "correlation_id": "t-84-books",
+                "source": "monarr"
+            }),
+        )
+        .await;
+        assert_eq!(body["correlation_id"], "t-84-books");
+        let item_id = body["items"][0]["item_id"].as_i64().expect("item id");
+        let (status, detail) =
+            call(&app, get(&format!("/api/v1/items/{item_id}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["item"]["kind"], "book");
+        assert_eq!(detail["item"]["title"], "The Dispossessed");
+    }
+
     /// The rail is absent, not broken, when no monarr is paired — and a
     /// paired monarr that is down must not take the home screen with it.
     #[tokio::test]
