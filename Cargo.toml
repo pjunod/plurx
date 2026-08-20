@@ -93,6 +93,13 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
+# Test executables are replicated in every isolated swarm worker cache. Rust
+# debug info made each plurxd test binary hundreds of megabytes even though the
+# harness never attaches a debugger to them. Keep normal development builds
+# debuggable, but omit debug info from the disposable test artifacts.
+[profile.test]
+debug = 0
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

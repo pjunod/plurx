@@ -29,6 +29,19 @@ def workflow_job_blocks(path: str) -> dict[str, str]:
 
 
 class OperationsContractCase(unittest.TestCase):
+    def test_browser_validation_never_claims_host_audio_or_media_controls(self):
+        for path in ("scripts/playback-lab", "scripts/ui-baseline"):
+            with self.subTest(path=path):
+                script = read(path)
+                self.assertIn('"--mute-audio"', script)
+                self.assertIn("HardwareMediaKeyHandling", script)
+
+    def test_rust_test_artifacts_omit_replicated_debug_information(self):
+        cargo = read("Cargo.toml")
+        profile = cargo.split("[profile.test]", 1)[1].split("[", 1)[0]
+
+        self.assertRegex(profile, r"(?m)^debug = 0$")
+
     def test_swarm_runtime_keeps_network_quota_and_role_boundaries_explicit(self):
         config = json.loads(read("swarm/config.json"))
 
