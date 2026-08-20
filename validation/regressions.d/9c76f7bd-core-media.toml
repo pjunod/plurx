@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["9c76f7bd"]
+points = ["core.media", "operations.packaging", "validation.framework"]
+checks = ["rust-gate"]
+reason = "The pinned toolchain, formatting, and warnings-as-errors gate directly exercise this compiler compatibility correction."

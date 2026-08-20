@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["bc2cc577"]
+points = ["playback.pipeline", "persistence.upgrades"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "One wire test reports over /client-log and reads prior_kbps back from /decision and session-create under a single unmodified Chrome User-Agent, which fails when the class is derived from two different inputs; a classifier table pins real shipping browser strings against the AppleWebKit collision; store and consult tables pin the starvation verdict's expiry, re-arm, and replace-not-min rules; the three-voter store contract pins the verdict's stamp across both backends."

@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["476d390", "4a414bf", "0313d1b"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained graph regressions pin software decode, Vulkan initialization, explicit RPU application before any scale/color transform, BT.709 output arguments, even no-upscale dimensions, the independently named software-only renderer, and the absence of setparams/zscale or a CPU fallback while proving HDR10- and HLG-compatible Profile 8 inputs keep the correct base transfer. Manager regressions refuse unknown/unproven profiles, cap Profile 5 Auto at the software rung, and admit only the proved renderer/encoder pair; runtime admission additionally compares real-source frame hashes with RPU application enabled and disabled and refuses identical output. The recipe property test proves the effective session pipeline changes cache identity under cache format v2."

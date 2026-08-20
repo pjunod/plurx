@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["11918346", "24a14678"]
+points = ["web.experience"]
+checks = ["web-layout"]
+reason = "The structural sweep captures the settings repair action and mobile header on every registered layout."
