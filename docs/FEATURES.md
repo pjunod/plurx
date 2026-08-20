@@ -178,12 +178,18 @@ inside one Books library while keeping their actions and metadata honest.
   library cards and details. The web player also provides one cross-part
   scrubber; native scrubbers seek within the current physical part and advance
   automatically at its end.
+- **Ebook reading state is durable and profile-scoped.** Cinema stores a
+  versioned publication locator against the exact file revision, replicates it
+  through Hiqlite, rejects stale offline rewinds, and exposes authenticated
+  get/save/clear routes to web and native clients. Replacing an edition cannot
+  resume into the wrong text.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **No book metadata provider or built-in ebook renderer.** Titles/authors come
-  from the file/folder layout and audio facts from the container. The client
-  hands an ebook to the browser/platform viewer. DRM-protected books are not
+- **No book metadata provider or built-in ebook renderer yet.** Titles/authors
+  come from the file/folder layout and audio facts from the container. Reading
+  state is ready, but clients still hand ebook bytes to the browser/platform
+  viewer until the EPUB reader milestone lands. DRM-protected books are not
   decrypted, and cover extraction is not yet implemented.
 
 **How to read it:** a numbered set of audio tracks inside one title directory

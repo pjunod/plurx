@@ -339,9 +339,37 @@ final class AppleClientTests: XCTestCase {
         XCTAssertTrue(fixture.audiobookDetail.item.isAudiobook)
         XCTAssertEqual(fixture.audiobookDetail.files?.map(\.partOffsetMs), [0, 60_000, 180_000])
         XCTAssertEqual(fixture.audiobookDetail.files?.first?.chapters?.first?.title, "Opening")
+        XCTAssertNil(fixture.itemDetail.reading)
         XCTAssertEqual(fixture.page.items?.first?.rollup?.leaves, 20)
         XCTAssertEqual(fixture.decision.delivery?.mode, "remux")
         XCTAssertEqual(fixture.decision.deliveredDynamicRange, "dolby_vision")
+    }
+
+    func testReadingStateDecodesItsRevisionAndRendererNeutralLocator() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let detail = try decoder.decode(ItemDetail.self, from: Data(#"""
+        {
+          "item": {"id": 9, "kind": "book", "title": "Contract Book"},
+          "reading": {
+            "file_id": 90,
+            "revision": {"size": 4096, "mtime": 100},
+            "locator": {
+              "version": 1,
+              "href": "Text/chapter-3.xhtml",
+              "locations": {"progression": 0.6, "totalProgression": 0.55}
+            },
+            "progression": 0.55,
+            "completed": false,
+            "updated_at": 200
+          }
+        }
+        """#.utf8))
+
+        XCTAssertEqual(detail.reading?.fileId, 90)
+        XCTAssertEqual(detail.reading?.revision.size, 4096)
+        XCTAssertEqual(detail.reading?.locator.href, "Text/chapter-3.xhtml")
+        XCTAssertEqual(detail.reading?.locator.locations?.totalProgression, 0.55)
     }
 
     func testAppVersionLabelIncludesThePackageBuild() {
