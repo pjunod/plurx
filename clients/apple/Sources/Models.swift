@@ -416,11 +416,62 @@ struct BookChapter: Codable, Hashable {
     let endMs: Int
 }
 
+struct ReadingRevision: Codable, Hashable {
+    let size: Int
+    let mtime: Int
+}
+
+struct ReadingLocations: Codable, Hashable {
+    var fragments: [String]?
+    var progression: Double?
+    var totalProgression: Double?
+    var position: Int?
+}
+
+struct ReadingText: Codable, Hashable {
+    var before: String?
+    var highlight: String?
+    var after: String?
+}
+
+struct ReadingLocator: Codable, Hashable {
+    let version: Int
+    let href: String
+    var type: String?
+    var title: String?
+    var locations: ReadingLocations?
+    var text: ReadingText?
+}
+
+struct ReadingState: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    let updatedAt: Int
+}
+
+struct ReadingStateResponse: Codable, Hashable {
+    let state: ReadingState?
+    let stale: Bool
+}
+
+struct PutReadingStateRequest: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    var recordedAt: Int?
+}
+
 struct ItemDetail: Codable {
     let item: Item
     var files: [MediaFile]?
     var children: [Item]?
     var ancestors: [Item]?
+    var reading: ReadingState?
 }
 
 struct Marker: Codable, Hashable {
