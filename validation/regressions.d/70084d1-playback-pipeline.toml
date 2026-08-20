@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["70084d1"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained unrelated-session regression pins that playlist producer inspection releases the global session map before waiting on a child lock; reverting only the production correction makes an unrelated status request time out behind that lock."

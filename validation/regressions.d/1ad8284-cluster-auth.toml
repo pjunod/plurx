@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["1ad8284"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `a_voter_handed_an_occupied_port_reports_a_collision_not_a_store_verdict` holds a loopback port, hands it to a voter first as its raft listener and then as its API listener, and requires the startup failure to name the occupied address, to classify as a port collision so a cluster start may reallocate, and to contain none of `no such table`, `cluster_meta`, `replicated store operation timed out`, or `auth store has not been opened`. Reverting only the panic guard and the listener proof restores the defect exactly: hiqlite's detached serve tasks swallow the bind failure, the voter announces readiness with a dead listener, and the test fails on the announcement. Its companion `a_store_verdict_is_never_classified_as_a_port_collision` pins the opposite direction, so a genuine durable-state fault is never retried five times and then reported as a busy port."

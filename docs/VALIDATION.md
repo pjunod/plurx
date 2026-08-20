@@ -113,8 +113,8 @@ Every expensive fan-out job in the main CI workflow waits for that preflight.
 A documentation-only pull request stops after those executable documentation
 contracts; it does not compile the Rust workspace or provision browsers and
 native-client environments. A documentation change may include
-`validation/regressions.toml` and keep this lane because the file is consumed
-only by the history audit that preflight already runs; selector code and
+`validation/regressions.d/**` and keep this lane because those entries are
+consumed only by the history audit that preflight already runs; selector code and
 `validation/points.toml` still take the executable-change lane.
 
 For executable changes, the portable Rust and focused Linux contracts remain
@@ -162,6 +162,88 @@ parents, the second already on `main`, and an automatic merge whose tree is
 exactly what `git merge-tree` computes from the two parents. Anything Git cannot
 prove empty is reviewable content and takes a delta pass. The rule and its
 refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
+
+## Load-sensitive cluster checks — a timeout is not a verdict
+
+One check drives real replicated infrastructure rather than a library, so the
+host it runs on is part of the experiment. `cluster-auth` (`make
+cluster-check`, points `cluster.auth` and `persistence.upgrades`) starts voters
+as separate processes; the Rust gate's `plurx-cluster-check` harness tests do
+the same. Under a full `make validate` those voters compete with every other
+check for the same cores **and for the same ephemeral ports**.
+
+### A busy port is not an un-migrated store
+
+A voter's raft and API ports are chosen by binding port zero, reading the
+port, and releasing the listener. Nothing holds them: the process that binds
+them for real is a child started afterwards, and hiqlite binds its own sockets
+from an address string, so there is no listener to hand over. Under
+gate-parallel load another process can claim one of those ports in between,
+and that is an environment fact rather than durable-state evidence.
+
+It used not to read as one. hiqlite serves both listeners from detached
+`tokio::spawn` tasks that `.unwrap()` the serve future
+(`hiqlite-0.14.0/src/start.rs:148` and `:231`), so a losing bind panicked a
+background task and nothing else: `start_node` had already returned `Ok`,
+`wait_until_healthy_db` probes only the *local* database, and the voter
+announced readiness with a dead listener. The collision then surfaced as
+whatever the crippled voter failed at next:
+
+| Port lost | What the gate used to print |
+|---|---|
+| raft | `no such table: cluster_meta` — a linearizable read reaching a state machine that never applied the schema batch, which is exactly what a genuinely un-migrated store looks like |
+| API | `replicated store operation timed out`, then `auth store has not been opened` |
+
+Both of those are contract verdicts, and the first is a serious one. Neither
+was true. A voter now proves both of its listeners accept before it announces
+readiness, and a bind failure is reported as `port collision: …` and stops the
+voter, so a busy port cannot go on to be reported as durable-state damage.
+Cluster starts reallocate their ports up to five times on that classification
+and on nothing else — see `is_port_collision` and `with_port_retry` in
+`crates/plurx-cluster-check/src/lib.rs`.
+
+**How to tell them apart.** Read the verdict, never the elapsed time. A `port
+collision:` failure names the loopback address that collided and means nothing
+was proved; rerun the check alone. Anything else is the contract's own answer
+and is reproducible on an idle host. Note that the API-port case above shares
+its `replicated store operation timed out` text with an ordinary replicated
+deadline — the difference is that a collision now says so first, so a timeout
+arriving on its own is still the deadline it has always been.
+
+### PortReservation — the listener is held until the voter starts
+
+The residual race between `allocate_nodes` (which binds, reads the port, and
+releases the listener) and the child process binding the same port from its
+address string cannot be eliminated on a general OS: the child is a separate
+process, and there is no mechanism to hand a listening socket across
+`Command::spawn`. The race is made as short as possible in two ways:
+
+1. **`PortReservation`** (`crates/plurx-cluster-check/src/lib.rs`, added for
+   issue #381). `allocate_nodes` now returns a `PortReservation` whose
+   listeners are held alive until the caller consumes it. The site that starts
+   the child process — `ClusterProcesses::start` — holds the reservation
+   through the `NodeSpec` construction and drops it immediately before
+   spawning, so the window between "port released" and "child binds" is the
+   narrowest possible sequence of `drop` + `Command::spawn`.
+2. **`start_cluster_with_port_retry`** wraps every start in `with_port_retry`,
+   which retries the entire allocation up to five times on `is_port_collision`
+   and on nothing else. A collision on a transiently occupied port is
+   self-healing; a collision on a permanently held port fails with a message
+   naming the collision, never a durable-state verdict.
+
+The two mechanisms are complementary: `PortReservation` closes the window as
+far as the OS allows, and the retry loop answers any collision that still
+manages to slip through before the child binds.
+
+### Previous instances of the same defect shape
+
+This is the fourth issue whose root cause is a check that cannot tell its
+environment from the contract it asserts:
+
+- #315: benchmark wall clock reported as a performance regression.
+- #368: replicated deadline reported as a WAL-size violation.
+- #374: data-directory lock reported as a second daemon.
+- #381: port collision reported as an un-migrated store (this issue).
 
 ## The UI golden — a saved answer key, not a magic test
 
@@ -332,8 +414,9 @@ evidence:
   the production-to-test relationship;
 - for other runtime corrections after that baseline, an explicit regression
   mapping or anchor names the current evidence; or
-- [`validation/regressions.toml`](../validation/regressions.toml) explicitly
-  maps the commit to a current functionality point and runnable check.
+- a fragment in [`validation/regressions.d/`](../validation/regressions.d/)
+  explicitly maps the commit to a current functionality point and runnable
+  check.
 
 The explicit mapping is for checks whose evidence lives outside the fixing
 patch: both Apple platforms compiling, a real container completing its
@@ -341,6 +424,38 @@ non-root lifecycle, the browser playback matrix, or the UI structural sweep.
 It is not an exemption. Unknown commits, checks, and points fail; duplicate
 claims fail; and a new corrective commit with neither a test nor a mapping
 fails the baseline.
+
+### One mapping, one file
+
+The mapping ledger is a directory, not a file. Each entry lives in its own
+`validation/regressions.d/<first-commit-prefix>-<slug>.toml`, holds exactly one
+`[[coverage]]` table, and repeats `version = 1`. The audit loads every `*.toml`
+there in file-name order and treats them as one ledger; entry order carries no
+meaning.
+
+```toml
+# validation/regressions.d/a1b2c3d4-playback-pipeline.toml
+version = 1
+
+[[coverage]]
+commits = ["a1b2c3d4"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "One sentence naming the current check that exercises the defect."
+```
+
+The file name is not cosmetic. The audit rejects a fragment whose name does not
+begin with its own first mapped commit, so two corrective changes can never
+choose the same path. That is the whole point of the directory: a single
+append-only `validation/regressions.toml` put every new entry at the same
+offset, so each merge to `main` conflicted every other open pull request
+carrying a mapping — and clearing that conflict with a rebase rewrote the SHAs a
+reviewer had pinned an approval to, spending a review cycle on nothing. Adding a
+file collides with nothing. The loader refuses to run while a shared
+`validation/regressions.toml` exists, so the hotspot cannot come back.
+
+[`validation/regressions.d/README.md`](../validation/regressions.d/README.md)
+carries the field-by-field format next to the entries themselves.
 
 ```bash
 make history-check

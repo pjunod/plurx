@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["b4d9825e"]
+points = ["server.api", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained plurxd HTTP regressions `audio_only_selection_does_not_apply_the_policy_default_subtitle` and `item_detail_reports_policy_defaults_and_language_match_states` prove that an audio-only `/decision` selection leaves the delivery verdict free of the policy-default subtitle while still echoing that subtitle to the caller, and that an untagged-language track reports `unknown` instead of asserting `missing`; reverting only the production correction makes an audio-only selection burn the policy subtitle and makes an untagged track claim the preferred language is absent."
