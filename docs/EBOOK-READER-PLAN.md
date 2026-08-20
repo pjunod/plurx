@@ -1,7 +1,8 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0 complete · M1–M6 ready to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `810c3b16` and `monarr` `00bf7d9`
+**Status:** M0–M1 complete · M2a publication proof complete · M2b–M6 ready
+to build · **Written:**
+2026-08-20 · **Verified against:** `plurx` `43b7cb68` and `monarr` `a3f5fb8`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -73,7 +74,7 @@ Six decisions define the work:
 | Curator | Ebook and audiobook editions, metadata, profiles, search, import | M0 replaced its stale book decline with exact-path `hint:"book"` targeted scans. |
 | Runner | Downloads and unpacks Curator's payload | Nothing. Runner must remain unaware of reading. |
 | Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
-| Cinema server | Authenticated, range-capable `GET /api/v1/files/{id}/content` for original book bytes | No reading-state store or reader surface. |
+| Cinema server | Authenticated, range-capable original bytes plus revision-bound, per-user reading-state storage and API | No reader surface. |
 | Cinema web | Books shelf, detail, **Open book**, **Download** | Opens another browser/platform handler; no in-app EPUB renderer. |
 | Cinema native | Book detail on Apple and Android; external URL intent | No phone/tablet reader or ebook offline record. |
 | User state | Timed `watch_state` for movies, episodes, videos, and audiobooks | Text books are correctly excluded; a locator-shaped sibling is needed. |
@@ -134,11 +135,12 @@ product contract is decided separately.
 
 ## 4. Server contract — reading state is a locator, not a clock
 
-Re-verify the identifiers below against `crates/plurx-core/src/store/mod.rs`,
-`crates/plurx-core/src/store/sqlite/mod.rs`,
-`crates/plurx-core/src/store/hiqlite_catalog.rs`, and
-`crates/plurxd/src/http/mod.rs` when M1 begins. SQLite is schema v19 at this
-plan's baseline, so the append-only migration below is v20.
+The implementation lives in `crates/plurx-core/src/store/mod.rs`,
+`crates/plurx-core/src/store/sqlite/reading.rs`,
+`crates/plurx-core/src/store/hiqlite_reading.rs`, and
+`crates/plurxd/src/http/reading.rs`. M1 advanced SQLite from schema v19 to
+v20 and the authoritative Hiqlite schema from v5 to v6 without changing the
+replicated protocol version.
 
 ### 4.1 Durable model
 
@@ -176,7 +178,7 @@ resume locator until the current revision records one.
   "type": "application/xhtml+xml",
   "locations": {
     "progression": 0.42,
-    "total_progression": 0.19,
+    "totalProgression": 0.19,
     "position": 56
   }
 }
@@ -184,7 +186,7 @@ resume locator until the current revision records one.
 
 `href` names a manifest resource after archive-path normalization.
 `locations.progression` is the fraction within that resource;
-`total_progression` is the fraction through the full publication; `position`
+`totalProgression` is the fraction through the full publication; `position`
 is optional renderer output, never the sole resume authority. New fields are
 additive. A future incompatible representation increments `version` and keeps
 the v1 decoder until all shipped clients have crossed the migration window.
@@ -264,6 +266,38 @@ wire locator envelope from §4.1. Do not paper over a failed proof with a
 platform-specific locator hidden inside `locator_json`; that only postpones
 the incompatibility until a user changes devices.
 
+#### M2a verdict — stream the publication; do not expand it
+
+M2a adopts Readium Web's server boundary without importing an unfinished web
+navigator: Cinema turns the packaged EPUB into a manifest/resource API, then
+M2b's browser navigator consumes that API. This keeps the original file as the
+source of truth, lets web and native WebViews share normalized hrefs, and keeps
+the account bearer out of publication markup. The response shape follows the
+[Readium Web Publication Manifest](https://github.com/readium/webpub-manifest)
+names — `metadata`, `readingOrder`, `resources`, and `toc` — while remaining a
+Cinema API rather than claiming full Readium conformance.
+
+The only new parser dependency is
+[`zip` 8.6.0](https://github.com/zip-rs/zip2/releases/tag/v8.6.0), built with
+default features off and Deflate only. Cinema parses the OCF container,
+package, EPUB 3 navigation document, and EPUB 2 NCX itself with the existing
+`quick-xml` dependency. No renderer bundle or build step has been selected
+yet; M2b has to earn that choice with the browser proofs below.
+
+| Proof | M2a evidence | Remaining gate |
+|---|---|---|
+| Navigation | Generated EPUB 2 NCX and EPUB 3 nav fixtures preserve spine order, authored labels, fragments, and nested TOC entries. | Browser TOC interaction in M2b. |
+| Locator stability | Manifest hrefs are decoded, normalized, and revision-bound. | M2b must restore the same paragraph after font, margin, viewport, and mode changes. |
+| Security | Absolute, drive-prefixed, control, backslash, duplicate, encoded traversal, and container-escaping paths fail closed. Encrypted publications get a distinct protected-book refusal. Resource responses block script, connect, form, object, frame, and remote image/font/media loads. | Browser test proves scripts stay inert and remote requests never leave the page. |
+| Scale | The ignored/nightly 620 MiB EPUB (one 500 MiB refused child plus one 120 MiB streamed child) peaks at 19,382,272 bytes RSS on the M2a macOS proof run; child resources stream in 64 KiB chunks, stay below 128 MiB each, and share eight node-wide reader slots. | M2b observes the same ceiling while navigating/searching. |
+| Accessibility | Publication order and headings remain in authored XHTML rather than being flattened server-side. | VoiceOver/TalkBack and keyboard browser acceptance in M2b/M3. |
+| Offline identity | Manifest hrefs and M1 locators use the same file revision and normalized archive path. | M4 reopens those bytes and locators with the server absent. |
+
+The measured parser/stream ceiling is 256 MiB peak RSS for the 620 MiB fixture.
+The proof used 18.5 MiB while draining the 120 MiB child; the wider ceiling
+leaves room for allocator and platform variance without permitting a second
+expanded copy of the book.
+
 ### 5.2 The security boundary is stricter than the ordinary web app
 
 Publication markup renders in a sandboxed document without scripts, top-level
@@ -277,6 +311,28 @@ reader allocates them.
 The M2 spike records the chosen concrete limits against its large-book fixture
 instead of inventing numbers in this plan. Those limits become code constants,
 tests, and a user-facing failure message in the same milestone.
+
+M2a established the limits:
+
+| Boundary | Limit |
+|---|---:|
+| Archive entries | 20,000 |
+| Declared total uncompressed bytes | 1 GiB |
+| One served resource | 128 MiB |
+| Decompressed resource chunk | 64 KiB |
+| Concurrent resource reads per node | 8 |
+| Container/package/navigation XML | 8 MiB each |
+| Compression ratio | 1,000:1 |
+| Live publication sessions per node | 64 |
+| Sliding session lifetime | 2 hours |
+
+`POST /api/v1/files/{file_id}/publication` requires the user token, validates
+the current book revision, parses only bounded metadata, and mints a random
+session capability. Nested resources use
+`GET /api/v1/publication/{session}/{resource}` without the account token.
+Those path credentials are redacted from HTTP traces, slide while in use, can
+be closed early by their owner, and refuse a resource if the source size or
+mtime changes after the manifest was parsed.
 
 ## 6. Offline contract — save the original, not a video package
 
@@ -335,6 +391,10 @@ make check                            # Cinema repository baseline
 
 ### 7.2 M1 — replicated reading state and API
 
+**Status:** complete 2026-08-20. SQLite and three-voter Hiqlite run the same
+reading-state contract; full repository, cluster, Apple, and Android model
+gates are green.
+
 Add §4's `ReadingState` domain type, `ReadingStore`, SQLite v20 migration,
 Hiqlite catalogue table/dumps/import parity, three user-token routes, DTO
 summary, OpenAPI/native models, and backend-neutral tests. The server accepts
@@ -351,6 +411,14 @@ make cluster-check
 ```
 
 ### 7.3 M2 — EPUB proof and web reader
+
+**Status:** M2a publication API complete 2026-08-20; M2b reader UI remains.
+
+M2a ships §5's bounded OCF/package/nav parser, Readium-shaped manifest,
+revision-bound resource capability, security headers, generated EPUB 2/3
+fixtures, and 620 MiB memory proof. It deliberately stops before calling the
+feature a reader: locator stability, accessibility, search, and actual browser
+network refusal require a rendered page.
 
 Run §5.1's dependency/architecture proof and record the verdict in this plan.
 Then ship the authenticated web reader, **Read/Resume** detail actions, table
@@ -455,7 +523,7 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | Milestone | State | Evidence |
 |---|---|---|
 | M0 · Curator handoff | Complete | Curator `make test`; Cinema `make check`; focused cross-seam tests |
-| M1 · Reading state/API | Planned | §4 contract |
+| M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
 | M2 · EPUB proof/web | Planned | §5 proof matrix |
 | M3 · Native online | Planned | Simulator/emulator + accessibility acceptance |
 | M4 · Offline EPUB | Planned | Physical airplane-mode drill |

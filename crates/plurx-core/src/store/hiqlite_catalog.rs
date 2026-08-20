@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS watch_state (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_watch_updated ON watch_state(user_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS reading_state (
+    user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    file_id            INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    file_size          INTEGER NOT NULL,
+    file_mtime         INTEGER NOT NULL,
+    locator_json       TEXT NOT NULL,
+    progression_millis INTEGER NOT NULL CHECK (progression_millis BETWEEN 0 AND 1000000),
+    completed          INTEGER NOT NULL CHECK (completed IN (0, 1)),
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (user_id, item_id, file_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_reading_updated
+    ON reading_state(user_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS library_roots (
     library_id  INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
     fingerprint TEXT NOT NULL
@@ -172,6 +187,7 @@ struct CatalogDump {
     items: Vec<String>,
     files: Vec<String>,
     watch_state: Vec<String>,
+    reading_state: Vec<String>,
     library_roots: Vec<String>,
     scan_reconcile_guards: Vec<String>,
     scan_reconcile_items: Vec<String>,
@@ -185,6 +201,7 @@ struct CatalogTruthDump {
     items: Vec<String>,
     files: Vec<String>,
     watch_state: Vec<String>,
+    reading_state: Vec<String>,
     library_roots: Vec<String>,
     scan_reconcile_guards: Vec<String>,
     scan_reconcile_items: Vec<String>,
@@ -222,6 +239,13 @@ async fn authoritative_dump(client: &TimedClient) -> Result<CatalogTruthDump, St
              AS value FROM watch_state ORDER BY user_id, item_id",
         )
         .await?,
+        reading_state: rows(
+            client,
+            "SELECT json_array(user_id, item_id, file_id, file_size, file_mtime, \
+                    locator_json, progression_millis, completed, updated_at) \
+             AS value FROM reading_state ORDER BY user_id, item_id, file_id",
+        )
+        .await?,
         library_roots: rows(
             client,
             "SELECT json_array(library_id, fingerprint) AS value \
@@ -255,6 +279,7 @@ pub(super) async fn local_catalog_digest(client: &TimedClient) -> Result<String,
         items: truth.items,
         files: truth.files,
         watch_state: truth.watch_state,
+        reading_state: truth.reading_state,
         library_roots: truth.library_roots,
         scan_reconcile_guards: truth.scan_reconcile_guards,
         scan_reconcile_items: truth.scan_reconcile_items,
