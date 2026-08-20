@@ -116,9 +116,11 @@ remain attached to the server and keeps the existing streaming path.
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available
-to both native codebases. **Apple has adopted it**; the Android integration
-remains separate work, so that client is not yet claimed to step down on a
-stall.
+to both native codebases. **Apple and Android have adopted it.** Android sends
+`quality_auto: true` whenever the viewer selected Auto, including when subtitle
+burn-in posts a promise height, and stops after three consecutive bound reopens
+that do not resolve to a strictly lower rung. A user-initiated seek, quality
+change, or track change resets that budget and invalidates the stall request.
 
 Two obligations come with adopting it. A client that posts a *promise* height —
 the source height a subtitle burn or Quality = Original sends — while the
@@ -129,8 +131,8 @@ its live case, not a hypothetical one. And the retry budget at the ladder floor
 belongs to the client: the server repeats the floor rung indefinitely and
 raises no terminal error of its own, by design.
 
-Apple's shape of both, in `PlayerController`, is the reference for the Android
-half. `quality_auto` goes on *every* create as the viewer's own answer
+Apple's shape of both, in `PlayerController`, is the reference contract.
+`quality_auto` goes on *every* create as the viewer's own answer
 (`selectedHeight == nil`), never inferred from whether a height happened to be
 posted. `StallReopenBudget` counts consecutive bound reopens that failed to
 resolve a strictly lower rung and stops after two — deliberately independent of

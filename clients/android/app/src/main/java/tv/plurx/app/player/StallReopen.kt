@@ -50,7 +50,7 @@ internal class StallReopenBudget(private val maxNonDowngrades: Int = 3) {
  * must call [callCreate] directly rather than going through [create].
  */
 internal class SessionCreateCoordinator(
-    private val create: suspend (CreateSessionReq) -> HlsStart,
+    private val createSession: suspend (CreateSessionReq) -> HlsStart,
     private val isBadRequest: (Throwable) -> Boolean,
     private val freshRequestId: () -> String,
 ) {
@@ -69,7 +69,7 @@ internal class SessionCreateCoordinator(
      */
     private suspend fun callCreate(body: CreateSessionReq): HlsStart {
         try {
-            return create(body)
+            return createSession(body)
         } catch (cancelled: CancellationException) {
             throw cancelled
         }

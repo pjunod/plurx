@@ -195,7 +195,7 @@ class Controller(
      * the user request the server's final replacement as well as the UI's.
      */
     private val sessionCreateCoordinator = SessionCreateCoordinator(
-        create = { body -> vm.createHlsSession(plan.fileId, body) },
+        createSession = { body -> vm.createHlsSession(plan.fileId, body) },
         isBadRequest = { failure -> failure is HttpException && failure.code() == 400 },
         freshRequestId = { UUID.randomUUID().toString() },
     )
