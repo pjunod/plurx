@@ -273,8 +273,17 @@ data class Marker(
     val label: String,
     val start_ms: Long,
     val end_ms: Long,
-    val chapter: Boolean = false,
-)
+    val chapter: Boolean = true,
+) {
+    /**
+     * Label to display in the player skip button. Chapter-derived markers
+     * show the server's exact label; estimated markers (the duration-based
+     * end-credits fallback, chapter == false) append a hedge so the
+     * viewer knows it is a guess.
+     */
+    val displayLabel: String
+        get() = if (chapter) label else "$label (estimated)"
+}
 
 /**
  * The server-owned execution plan for a verdict (`DecisionResponse.delivery`

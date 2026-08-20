@@ -226,6 +226,8 @@ class ModelContractTest {
         assertEquals("transcode", decision.delivery!!.mode)
         assertEquals(50L, decision.audio_offset_ms)
         assertEquals("Skip intro", decision.markers.single().label)
+        // Pre-chapter-field markers default to chapter=true (chapter-derived).
+        assertEquals(true, decision.markers.single().chapter)
     }
 
     @Test
