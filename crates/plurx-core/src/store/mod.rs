@@ -145,6 +145,9 @@ pub mod keys {
     /// Opt-in node-local network history used to seed Auto quality. Missing
     /// and every value other than `"1"` are off.
     pub const PLAYBACK_NETWORK_PRIORS: &str = "playback.network_priors";
+    /// Opt-in web Auto controller. Missing and every value other than `"1"`
+    /// are off, leaving the server's initial Auto choice in place.
+    pub const PLAYBACK_AUTO_ABR: &str = "playback.auto_abr";
     /// Last successful bounded telemetry-prune pass, in unix seconds.
     pub const JOB_LAST_TELEMETRY_PRUNE: &str = "jobs.last_telemetry_prune";
     pub const TELEMETRY_RETAIN_DEFAULT_DAYS: i64 = 30;

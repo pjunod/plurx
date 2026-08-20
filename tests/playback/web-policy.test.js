@@ -680,7 +680,7 @@ test("every shipped stall report carries the wait's start as its identity", () =
 // session-open that stays pending until the test releases it — the ordering the
 // browser actually produces, where the cheap health GET returns before the
 // session-create POST.
-function autoRescueHarness(player) {
+function autoRescueHarness(player, autoAbr = true) {
   const opened = [];
   let releaseOpen = null;
   let openFails = false;
@@ -698,6 +698,7 @@ function autoRescueHarness(player) {
   const noop = () => {};
   const build = new Function(
     "PLAYER",
+    "SERVER",
     "document",
     "performance",
     "PlaybackPolicy",
@@ -734,6 +735,7 @@ function autoRescueHarness(player) {
 
   const shipped = build(
     player,
+    { playback_auto_abr: autoAbr },
     { getElementById: () => video },
     { now: () => 90_000 },
     policy,
@@ -780,6 +782,98 @@ function autoRescueHarness(player) {
     },
   };
 }
+
+async function autoRungTick(autoAbr) {
+  const switches = [];
+  let polls = 0;
+  const player = {
+    method: "transcode",
+    started: true,
+    offset: 0,
+    ladder: serverLadder,
+    autoHeight: 720,
+    health: { target_height: 720, recent_speed: 2 },
+    hls: { bandwidthEstimate: 1_000_000 },
+    abr: {
+      switching: false,
+      stallEvents: { supply: [], decode: [] },
+      recentEstimateKbps: null,
+      recentEstimateAtMs: null,
+      lastStallAtMs: null,
+      lastSwitchAtMs: 0,
+      mildSamples: 0,
+      upgradeSinceMs: null,
+      previousRunway: null,
+      stableSinceMs: 0,
+      failedHeights: new Set(),
+    },
+  };
+  const tick = new Function(
+    "PLAYER",
+    "SERVER",
+    "document",
+    "performance",
+    "PlaybackPolicy",
+    "qualityForce",
+    "SUPPLY_RUNWAY_SECS",
+    "pollSessionHealth",
+    "rescueAutoSupply",
+    "bufferRunway",
+    "playerPixelHeight",
+    "switchAutoRung",
+    "rememberAutoRung",
+    `${shippedSource("autoControllerTick")}\nreturn autoControllerTick;`,
+  )(
+    player,
+    { playback_auto_abr: autoAbr },
+    { getElementById: () => ({ currentTime: 12, paused: false, videoHeight: 720 }) },
+    { now: () => 90_000 },
+    policy,
+    () => "auto",
+    6,
+    async () => { polls += 1; },
+    async () => {},
+    () => 1,
+    () => 720,
+    async (from, decision) => { switches.push([from, decision.height]); },
+    () => {},
+  );
+
+  await tick();
+  return { polls, switches };
+}
+
+asyncTest("the Auto switch gates an automatic rung change", async () => {
+  const enabled = await autoRungTick(true);
+  assert.deepEqual(enabled.switches, [[720, 360]], "the enabled controller still acts");
+
+  const disabled = await autoRungTick(false);
+  assert.equal(disabled.polls, 0, "off must return before sampling controller health");
+  assert.deepEqual(disabled.switches, [], "off must not change the playback rung");
+});
+
+test("the disabled Auto controller leaves every manual ladder rung available", () => {
+  const build = new Function(
+    "PLAYER",
+    "SERVER",
+    "PlaybackPolicy",
+    [
+      shippedBinding("const", "QUALITY_MODES"),
+      shippedSource("qualityOptions"),
+      "return qualityOptions();",
+    ].join("\n"),
+  );
+  const options = build(
+    { ladder: serverLadder },
+    { playback_auto_abr: false },
+    policy,
+  );
+
+  assert.deepEqual(
+    options.map(([value]) => value),
+    ["auto", "original", "nomse", "1080", "720", "480", "360"],
+  );
+});
 
 function pressuredRemuxPlayer() {
   return {

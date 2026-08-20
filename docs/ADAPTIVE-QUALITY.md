@@ -138,6 +138,11 @@ upward half.
 
 ## Phase 2 — Auto (the actual feature; controller revised per review R3)
 
+The web controller is gated by the node-wide admin setting
+`playback.auto_abr`. It defaults off until the acceptance week is complete;
+off preserves the server-selected Auto stream and every manual ladder rung,
+but performs no client-side rung switch or supply-stall rescue.
+
 **Implementation status (2026-08-14):** the web controller is implemented in
 the pure playback-policy module and sampled by the embedded player every 5 s.
 The constants below are the live defaults. The browser shaping run remains the
