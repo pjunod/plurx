@@ -598,6 +598,19 @@ impl SettingsStore for HiqliteAuthStore {
         Ok(rows.into_iter().next().map(|row| row.value))
     }
 
+    async fn get_or_init_setting(&self, key: &str, seed: &str) -> Result<String, StoreError> {
+        let now = self.now()?;
+        self.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+             ON CONFLICT(key) DO NOTHING",
+            params!(key, seed, now),
+        )
+        .await?;
+        self.get_setting(key).await?.ok_or_else(|| {
+            StoreError::Database(format!("setting {key} missing after initialization"))
+        })
+    }
+
     async fn get_setting_pair(
         &self,
         first: &str,

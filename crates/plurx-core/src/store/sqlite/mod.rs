@@ -940,6 +940,24 @@ impl SettingsStore for SqliteStore {
         .await
     }
 
+    async fn get_or_init_setting(&self, key: &str, seed: &str) -> Result<String, StoreError> {
+        let key = key.to_owned();
+        let seed = seed.to_owned();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, unixepoch()) \
+                 ON CONFLICT(key) DO NOTHING",
+                params![key, seed],
+            )?;
+            Ok(conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
     async fn get_setting_pair(
         &self,
         first: &str,

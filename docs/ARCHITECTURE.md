@@ -45,6 +45,11 @@ streams, and transcodes.
               (NFS / SMB / cephfs)            cached locally, then offline
 ```
 
+The human-visible server name follows the **`Store` boundary** too.
+`server.name` in TOML seeds a new store once; the durable replicated setting is
+authoritative thereafter. Existing installs therefore retain their configured
+name on upgrade, while a joining node cannot silently rename the logical server.
+
 The load-bearing boundary is the **`Store` trait**: every read and write goes
 through it, so single-node SQLite and the replicated cluster store are the same
 call sites. That is what makes HA a backend swap (Phase 4) instead of a rewrite

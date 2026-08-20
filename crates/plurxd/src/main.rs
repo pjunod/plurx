@@ -360,7 +360,7 @@ struct Boot {
 /// installing a signal handler and registering on the LAN is what lets the
 /// whole sequence run in a test, on a temporary directory and a loopback port.
 async fn boot(
-    config: Config,
+    mut config: Config,
     parts: Boot,
     advertiser: MdnsAdvertiser,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -376,6 +376,14 @@ async fn boot(
         system,
         logs,
     } = parts;
+    // `server.name` predates clustering as a node-local config value. Seed it
+    // once so an existing installation keeps its name on upgrade, then use the
+    // replicated winner on every voter. A joining node's config can therefore
+    // never rename the logical server accidentally.
+    config.server.name = store
+        .get_or_init_setting(keys::SERVER_NAME, &config.server.name)
+        .await
+        .context("initializing replicated server name")?;
     log_startup(&config, &identity);
 
     let instance_id = identity.cluster_id;
