@@ -295,7 +295,7 @@ test_anchor = "test_repository_build_claims_match_release_inputs"
 
 [[fixes]]
 id = "android.bound-stall-downgrade"
-commits = ["c54f9411", "8a6d759"]
+commits = ["c54f9411"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "private fun onStall(positionMs: Long)"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
@@ -319,7 +319,16 @@ test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
 
 [[fixes]]
 id = "android.bound-stall-400-fallback"
-commits = ["95825c9"]
+commits = ["95825c9", "98c87fa"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
-test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
-test_anchor = "ordinarySeekOmitsStallFields"
+source_anchor = "// 400 fallback: retry once as an unbound create with a fresh request_id"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "boundStall400FallbackClearsStallFields"
+
+[[fixes]]
+id = "android.stall-budget-test-format"
+commits = ["afcc9bb"]
+source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+source_anchor = "class StallBudgetTest"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"

@@ -748,9 +748,7 @@ class Controller(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: HttpException) {
-                // 400 means the server refused the bound create (stale/foreign
-                // previous_session_id, unknown reopen_reason).  Retry once as
-                // an unbound create with a fresh request_id.
+                // 400 fallback: retry once as an unbound create with a fresh request_id
                 if (e.code() == 400 && requestVersion == sessionRequestVersion) {
                     val fallbackBody = body.copy(
                         requestId = UUID.randomUUID().toString(),
