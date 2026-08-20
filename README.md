@@ -56,6 +56,9 @@ out, so the next attempt starts where the last one stopped. If you run plurx
 beside monarr,
 [docs/INTEGRATION.md](docs/INTEGRATION.md) documents every seam between them —
 what each does, where you watch it, and the command that proves it works.
+[docs/EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md) finishes the Books loop:
+Curator's import handoff, Cinema-owned reading state, the EPUB renderer,
+phone/tablet clients, and offline originals, each behind an acceptance gate.
 Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md), with
@@ -291,10 +294,13 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [x] **Home video & photos.** A `home` library kind: mirrored folder trees,
   filename-verbatim titles, capture dates, seed-once `.nfo` sidecars, photo
   lightbox, local frame-grab artwork, and in-UI metadata editing.
-- [x] **Books.** A `books` library kind with separate ebook and audiobook
+- [~] **Books.** A `books` library kind with separate ebook and audiobook
   items, multipart audiobook grouping, chapter/codec/container/duration facts,
   authenticated ebook opening, and cross-client audio playback with one global
-  resume/progress timeline.
+  resume/progress timeline are shipped. The built-in EPUB reader,
+  locator-shaped reading state, and app-managed offline ebook copies are
+  planned in [EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md); M0 closes
+  Curator's stale book-import handoff.
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.
