@@ -583,3 +583,9 @@ points = []
 checks = []
 reason = "This commit only records the port-collision correction's current validation evidence in regressions.toml; it does not change runtime behavior."
 ignore = true
+
+[[coverage]]
+commits = ["0d56a300"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `start_cluster_with_port_retry_reallocates_after_a_collision` releases the first PortReservation, takes its raft port before the real voter binds, and requires the production retry wrapper to allocate different raft and API ports and successfully start on its second attempt. The direct-voter regression separately requires the bind-failure guard and listener proof to report the occupied address as a port collision rather than a durable-state verdict. Reverting the reservation or retry integration makes one of those mechanism checks fail."

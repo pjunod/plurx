@@ -20,10 +20,10 @@ use std::process::Command;
 use plurx_cluster_check::{
     allocate_nodes, free_port, harness_executable, install_crypto_provider, is_port_collision,
     node_config, prove_local_fts_rebuild, prove_local_telemetry_sidecars, require_dump_setting,
-    require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry, unix_now,
-    validate_compacted_growth, validate_known_dump, ClusterProcesses, CompactedGrowthReport,
-    NodeLaunch, NodeProcess, NodeSpec, PortReservation, Preflight, Request, Response,
-    GROWTH_BYTES_PER_BEAT_BUDGET, INSTANCE_ID,
+    require_quorum_error, run, run_incompatible_preflight, start_cluster_with_port_retry,
+    start_cluster_with_port_retry_using, unix_now, validate_compacted_growth, validate_known_dump,
+    ClusterProcesses, CompactedGrowthReport, NodeLaunch, NodeProcess, NodeSpec, PortReservation,
+    Preflight, Request, Response, GROWTH_BYTES_PER_BEAT_BUDGET, INSTANCE_ID,
 };
 use plurx_core::store::{ClusterCompatibility, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 use serde_json::json;
@@ -401,9 +401,10 @@ async fn a_voter_that_dies_during_startup_is_reported_not_awaited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_voter_is_an_error_rather_than_a_panic() {
     let root = tempfile::tempdir().expect("unknown-voter test root");
-    let mut cluster = ClusterProcesses::start(&harness_binary(), root.path(), PortReservation::empty())
-        .await
-        .expect("an empty cluster starts no processes");
+    let mut cluster =
+        ClusterProcesses::start(&harness_binary(), root.path(), PortReservation::empty())
+            .await
+            .expect("an empty cluster starts no processes");
     assert!(cluster.node_ids().is_empty());
 
     let error = format!(
@@ -870,60 +871,62 @@ fn a_store_verdict_is_never_classified_as_a_port_collision() {
     }
 }
 
-
-
-/// A cluster started with a port that is already occupied must fail with a
-/// port collision, not a store verdict.
+/// The production start wrapper reallocates after a classified collision.
 ///
-/// This is the regression for the production path that actually failed under
-/// gate-parallel load: `start_cluster_with_port_retry` allocates ports and
-/// retries, but the error used to surface as `no such table: cluster_meta`
-/// (a schema fault) instead of a port collision. The fix holds the allocated
-/// ports until the voter is spawned, so the window is as narrow as possible.
-/// When a collision still happens, the retry loop must classify it correctly.
+/// The first allocator call releases its reservation and immediately occupies
+/// the raft port before the child binds. The real child start must report that
+/// collision to the real retry wrapper; the second call then returns a normal,
+/// fresh reservation and the cluster must become ready on different ports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn start_cluster_with_port_retry_reports_a_port_collision() {
+async fn start_cluster_with_port_retry_reallocates_after_a_collision() {
     let root = tempfile::tempdir().expect("port-collision retry test root");
-    // Hold a port so every allocation attempt collides.
-    let _squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
-    let held_port = _squatter.local_addr().expect("held address").port();
-
-    // We cannot directly inject a port into start_cluster_with_port_retry
-    // because it uses allocate_nodes internally. Instead, verify that the
-    // existing collision-detection path classifies the error correctly by
-    // starting a voter with an occupied port and asserting the error is a
-    // port collision, not a store verdict.
-    let launch = NodeLaunch {
-        node_id: 1,
-        root: root.path().to_path_buf(),
-        nodes: vec![
-            NodeSpec {
-                id: 1,
-                raft: format!("127.0.0.1:{held_port}"),
-                api: format!("127.0.0.1:{}", free_port().expect("api port")),
-            },
-        ],
-    };
-    let mut voter = NodeProcess::spawn(&harness_binary(), &launch).expect("spawn the voter");
-    let error = voter
-        .wait_ready()
+    let mut allocations = Vec::new();
+    let mut squatter = None;
+    let (mut cluster, started_specs) =
+        start_cluster_with_port_retry_using(&harness_binary(), root.path(), 1, |attempt| {
+            let reservation = allocate_nodes(1).expect("allocate retry ports");
+            let specs = reservation.specs().to_vec();
+            allocations.push(specs.clone());
+            if attempt == 1 {
+                let raft: std::net::SocketAddr =
+                    specs[0].raft.parse().expect("raft socket address");
+                let unreserved = PortReservation::unreserved(reservation.into_specs());
+                squatter = Some(std::net::TcpListener::bind(raft).expect("take released port"));
+                Ok(unreserved)
+            } else {
+                drop(squatter.take());
+                Ok(reservation)
+            }
+        })
         .await
-        .expect_err("a voter that could not bind must not announce readiness");
-    assert!(
-        is_port_collision(&error),
-        "a busy port must be reported as a collision, got: {error:#}"
+        .expect("a fresh allocation should start after the collision");
+
+    assert_eq!(
+        allocations.len(),
+        2,
+        "the wrapper should retry exactly once"
     );
-    let text = format!("{error:#}");
-    for verdict in STORE_VERDICTS {
-        assert!(
-            !text.contains(verdict),
-            "a busy port was reported as {verdict:?}: {text}"
-        );
-    }
+    assert_ne!(
+        allocations[0][0].raft, allocations[1][0].raft,
+        "the retry must allocate a fresh raft port"
+    );
+    assert_ne!(
+        allocations[0][0].api, allocations[1][0].api,
+        "the retry must allocate a fresh API port"
+    );
+    assert_eq!(started_specs[0].id, allocations[1][0].id);
+    assert_eq!(started_specs[0].raft, allocations[1][0].raft);
+    assert_eq!(started_specs[0].api, allocations[1][0].api);
+    cluster
+        .shutdown_all()
+        .await
+        .expect("shut down retried cluster");
 }
 #[test]
 fn allocated_voters_get_distinct_loopback_ports() {
-    let specs = allocate_nodes(3).expect("allocate three voters").into_specs();
+    let specs = allocate_nodes(3)
+        .expect("allocate three voters")
+        .into_specs();
     assert_eq!(
         specs.iter().map(|node| node.id).collect::<Vec<_>>(),
         vec![1, 2, 3],
@@ -950,7 +953,10 @@ fn allocated_voters_get_distinct_loopback_ports() {
     );
 
     assert!(
-        allocate_nodes(0).expect("allocate nothing").into_specs().is_empty(),
+        allocate_nodes(0)
+            .expect("allocate nothing")
+            .into_specs()
+            .is_empty(),
         "asking for no voters allocates no ports"
     );
     assert_ne!(free_port().expect("a free port"), 0);
@@ -1114,9 +1120,12 @@ async fn a_candidate_that_does_not_exit_42_is_a_harness_failure() {
 
     let error = format!(
         "{:#}",
-        run_incompatible_preflight(&candidate, &allocate_nodes(1).expect("allocate a voter").into_specs())
-            .await
-            .expect_err("a candidate that does not exit 42 must not count as a refusal")
+        run_incompatible_preflight(
+            &candidate,
+            &allocate_nodes(1).expect("allocate a voter").into_specs()
+        )
+        .await
+        .expect_err("a candidate that does not exit 42 must not count as a refusal")
     );
     assert!(
         error.contains("incompatible voter exited Some(7)"),

@@ -251,11 +251,15 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         let attempt_root = root.path().join(format!("attempt-{attempt}"));
         async move {
             let (listeners, all_specs) = allocate_nodes(3)?.into_inner();
-            let cluster =
-                ClusterProcesses::start(&executable, &attempt_root, PortReservation {
+            let cluster = ClusterProcesses::start(
+                &executable,
+                &attempt_root,
+                PortReservation {
                     listeners,
                     specs: vec![all_specs[0].clone()],
-                }).await?;
+                },
+            )
+            .await?;
             Ok((cluster, all_specs, attempt_root))
         }
     })
@@ -1358,7 +1362,11 @@ impl ClusterProcesses {
     /// Start one voter process per spec from `executable` and wait for each to
     /// announce readiness. The executable is explicit rather than
     /// `current_exe()` so a test binary can start real harness voters.
-    pub async fn start(executable: &Path, root: &Path, reservation: PortReservation) -> Result<Self> {
+    pub async fn start(
+        executable: &Path,
+        root: &Path,
+        reservation: PortReservation,
+    ) -> Result<Self> {
         let (_listeners, specs) = reservation.into_inner();
         // Listeners are dropped here: the child process must bind the same
         // ports, so we cannot hold them across the spawn. The window between
@@ -1710,12 +1718,40 @@ pub async fn start_cluster_with_port_retry(
     root: &Path,
     voters: u64,
 ) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
-    with_port_retry(|attempt| async move {
-        let reservation = allocate_nodes(voters)?;
-        let specs = reservation.specs.clone();
-        let attempt_root = root.join(format!("attempt-{attempt}"));
-        let cluster = ClusterProcesses::start(executable, &attempt_root, reservation).await?;
-        Ok((cluster, specs))
+    start_cluster_with_port_retry_using(executable, root, voters, |_| allocate_nodes(voters)).await
+}
+
+/// Start a cluster with an injectable allocator.
+///
+/// This is public only so the integration harness can deterministically take
+/// a port after the first reservation is released and prove the production
+/// retry wrapper performs a fresh allocation. Production callers should use
+/// [`start_cluster_with_port_retry`].
+#[doc(hidden)]
+pub async fn start_cluster_with_port_retry_using<A>(
+    executable: &Path,
+    root: &Path,
+    voters: u64,
+    mut allocate: A,
+) -> Result<(ClusterProcesses, Vec<NodeSpec>)>
+where
+    A: FnMut(u32) -> Result<PortReservation>,
+{
+    with_port_retry(|attempt| {
+        let reservation = allocate(attempt);
+        async move {
+            let reservation = reservation?;
+            if reservation.specs.len() != voters as usize {
+                bail!(
+                    "cluster allocator returned {} voters, expected {voters}",
+                    reservation.specs.len()
+                );
+            }
+            let specs = reservation.specs.clone();
+            let attempt_root = root.join(format!("attempt-{attempt}"));
+            let cluster = ClusterProcesses::start(executable, &attempt_root, reservation).await?;
+            Ok((cluster, specs))
+        }
     })
     .await
 }
@@ -3214,6 +3250,19 @@ impl PortReservation {
         self.specs
     }
 
+    /// Recreate an allocation after releasing its reservations.
+    ///
+    /// This deliberately provides no allocation guarantee and exists only for
+    /// the deterministic collision regression that takes one of these ports
+    /// before the voter binds it.
+    #[doc(hidden)]
+    pub fn unreserved(specs: Vec<NodeSpec>) -> Self {
+        Self {
+            listeners: Vec::new(),
+            specs,
+        }
+    }
+
     /// Returns the listeners, consuming the reservation.
     pub fn into_inner(self) -> (Vec<TcpListener>, Vec<NodeSpec>) {
         (self.listeners, self.specs)
@@ -3411,7 +3460,7 @@ async fn prove_listeners_bound(addresses: &[String]) -> Result<()> {
             // and report the collision so the controller can retry.
             drop(listener);
             bail!(
-                "{PORT_COLLISION}: voter listener {address} was never bound;                  the port was taken between allocation and bind"
+                "{PORT_COLLISION}: voter listener {address} was never bound; the port was taken between allocation and bind"
             );
         }
         // EADDRINUSE means someone has the port — either our listener or a
