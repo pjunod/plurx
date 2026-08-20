@@ -358,25 +358,9 @@ test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt
 test_anchor = "subtitleTrackChangeResetsBudget"
 
 [[fixes]]
-id = "android.stall-budget-reset-count-production-seam"
+id = "android.stall-budget-reset-count-and-coordinator-invalidation"
 commits = ["241a08e"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "fun reset()"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 test_anchor = "resetInvalidatesTheOldFloorBudget"
-
-[[fixes]]
-id = "android.stall-budget-reset-then-coordinator-cycle"
-commits = ["241a08e"]
-source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
-source_anchor = "suspend fun reopenAfterStall("
-test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "budgetResetThenStallReopenThroughCoordinatorGuardsNewCycle"
-
-[[fixes]]
-id = "android.stall-budget-reset-coordinator-invalidation"
-commits = ["241a08e"]
-source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
-source_anchor = "if (!isCurrent()) return@withLock null"
-test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
-test_anchor = "budgetResetWithCoordinatorInvalidationDropsStaleFallback"
