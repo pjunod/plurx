@@ -575,10 +575,10 @@ reason = "Three corrections with three retained regressions. `profile5_renderer_
 
 
 [[coverage]]
-commits = ["49828817", "7202c297"]
+commits = ["49828817", "7202c297", "e68537d4"]
 points = ["playback.pipeline"]
 checks = ["rust-gate"]
-reason = "The retained `burst_probe_classifies_honoured_inert_and_failed_measurements` regression exercises the production classifier with honoured, inert, and failed behavioural measurements. It requires only a sub-threshold measurement to preserve `initial_burst=true`; inert and failed measurements must correct the declared capability to false and resolve to readrate-only pacing. Reverting the classifier correction restores `initial_burst=true` for ffmpeg builds that declare but ignore the option, and the regression fails because `resolve` emits a burst flag that does nothing. The integration test `a_client_fetch_releases_a_held_session_and_restarts_progress` separately pins that a real inert binary is diagnosed by build and skips only the assertions that require burst-published reserve."
+reason = "The retained `burst_probe_classifies_honoured_inert_and_failed_measurements` regression exercises the production classifier with honoured, inert, and failed behavioural measurements. It requires only a sub-threshold measurement to preserve `initial_burst=true`; inert and failed measurements must correct the declared capability to false and resolve to readrate-only pacing. Reverting the classifier correction restores `initial_burst=true` for ffmpeg builds that declare but ignore the option, and the regression fails because `resolve` emits a burst flag that does nothing. The retained `burst_probe_applies_pacing_to_the_input` regression requires both pacing options to precede `-i`, so reverting the input-option ordering correction makes the behavioural probe measure an unpaced synthetic source and fails the test. The integration test `a_client_fetch_releases_a_held_session_and_restarts_progress` separately pins that a real inert binary is diagnosed by build and skips only the assertions that require burst-published reserve."
 
 [[coverage]]
 commits = ["e52e7de9"]
