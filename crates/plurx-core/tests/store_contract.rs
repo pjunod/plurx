@@ -18,8 +18,6 @@ use std::path::PathBuf;
 #[cfg(feature = "hiqlite-store")]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-#[cfg(feature = "hiqlite-store")]
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "hiqlite-store")]
@@ -264,7 +262,8 @@ where
     #[cfg(feature = "hiqlite-store")]
     {
         let _case = HIQLITE_CASE.lock().await;
-        let store = open_contract_hiqlite_store().await;
+        let cluster = ContractCluster::start();
+        let store = open_contract_hiqlite_store(&cluster).await;
         store
             .validation_reset_contract_state()
             .await
@@ -274,8 +273,7 @@ where
 }
 
 #[cfg(feature = "hiqlite-store")]
-async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
-    let cluster = contract_cluster();
+async fn open_contract_hiqlite_store(cluster: &ContractCluster) -> HiqliteAuthStore {
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -320,12 +318,6 @@ struct ContractCluster {
     addresses: Vec<String>,
     _root: tempfile::TempDir,
     _nodes: Vec<ContractNodeProcess>,
-}
-
-#[cfg(feature = "hiqlite-store")]
-fn contract_cluster() -> &'static ContractCluster {
-    static CLUSTER: OnceLock<ContractCluster> = OnceLock::new();
-    CLUSTER.get_or_init(ContractCluster::start)
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -809,7 +801,8 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
@@ -923,7 +916,8 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
@@ -1006,7 +1000,8 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_probe_json_import_respects_the_production_wal_limit() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
@@ -1083,7 +1078,8 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
@@ -1149,7 +1145,8 @@ async fn a_probe_row_larger_than_the_wal_is_refused_instead_of_crashing_the_node
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cleartext_trakt_row_is_refused_before_any_row_reaches_raft() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
@@ -1815,7 +1812,8 @@ async fn hiqlite_activation_node_process() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_import_verification_refusals_have_teeth() {
     let _case = HIQLITE_CASE.lock().await;
-    let store = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let store = open_contract_hiqlite_store(&cluster).await;
     store
         .validation_reset_contract_state()
         .await
