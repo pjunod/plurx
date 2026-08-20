@@ -210,6 +210,78 @@ exactly what `git merge-tree` computes from the two parents. Anything Git cannot
 prove empty is reviewable content and takes a delta pass. The rule and its
 refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
 
+### A busy port is not an un-migrated store
+
+A voter's raft and API ports are chosen by binding port zero, reading the
+port, and releasing the listener. Nothing holds them: the process that binds
+them for real is a child started afterwards, and hiqlite binds its own sockets
+from an address string, so there is no listener to hand over. Under
+gate-parallel load another process can claim one of those ports in between,
+and that is an environment fact rather than durable-state evidence.
+
+It used not to read as one. hiqlite serves both listeners from detached
+`tokio::spawn` tasks that `.unwrap()` the serve future
+(`hiqlite-0.14.0/src/start.rs:148` and `:231`), so a losing bind panicked a
+background task and nothing else: `start_node` had already returned `Ok`,
+`wait_until_healthy_db` probes only the *local* database, and the voter
+announced readiness with a dead listener. The collision then surfaced as
+whatever the crippled voter failed at next:
+
+| Port lost | What the gate used to print |
+|---|---|
+| raft | `no such table: cluster_meta` — a linearizable read reaching a state machine that never applied the schema batch, which is exactly what a genuinely un-migrated store looks like |
+| API | `replicated store operation timed out`, then `auth store has not been opened` |
+
+Both of those are contract verdicts, and the first is a serious one. Neither
+was true. A voter now proves both of its listeners accept before it announces
+readiness, and a bind failure is reported as `port collision: …` and stops the
+voter, so a busy port cannot go on to be reported as durable-state damage.
+Cluster starts reallocate their ports up to five times on that classification
+and on nothing else — see `is_port_collision` and `with_port_retry` in
+`crates/plurx-cluster-check/src/lib.rs`.
+
+**How to tell them apart.** Read the verdict, never the elapsed time. A `port
+collision:` failure names the loopback address that collided and means nothing
+was proved; rerun the check alone. Anything else is the contract's own answer
+and is reproducible on an idle host. Note that the API-port case above shares
+its `replicated store operation timed out` text with an ordinary replicated
+deadline — the difference is that a collision now says so first, so a timeout
+arriving on its own is still the deadline it has always been.
+
+### PortReservation — the listener is held until the voter starts
+
+The residual race between `allocate_nodes` (which binds, reads the port, and
+releases the listener) and the child process binding the same port from its
+address string cannot be eliminated on a general OS: the child is a separate
+process, and there is no mechanism to hand a listening socket across
+`Command::spawn`. The race is made as short as possible in two ways:
+
+1. **`PortReservation`** (`crates/plurx-cluster-check/src/lib.rs`, added for
+   issue #381). `allocate_nodes` now returns a `PortReservation` whose
+   listeners are held alive until the caller consumes it. The site that starts
+   the child process — `ClusterProcesses::start` — holds the reservation
+   through the `NodeSpec` construction and drops it immediately before
+   spawning, so the window between "port released" and "child binds" is the
+   narrowest possible sequence of `drop` + `Command::spawn`.
+2. **`start_cluster_with_port_retry`** wraps every start in `with_port_retry`,
+   which retries the entire allocation up to five times on `is_port_collision`
+   and on nothing else. A collision on a transiently occupied port is
+   self-healing; a collision on a permanently held port fails with a message
+   naming the collision, never a durable-state verdict.
+
+The two mechanisms are complementary: `PortReservation` closes the window as
+far as the OS allows, and the retry loop answers any collision that still
+manages to slip through before the child binds.
+
+### Previous instances of the same defect shape
+
+This is the fourth issue whose root cause is a check that cannot tell its
+environment from the contract it asserts:
+
+- #315: benchmark wall clock reported as a performance regression.
+- #368: replicated deadline reported as a WAL-size violation.
+- #374: data-directory lock reported as a second daemon.
+- #381: port collision reported as an un-migrated store (this issue).
 
 ## The UI golden — a saved answer key, not a magic test
 

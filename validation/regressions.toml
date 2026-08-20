@@ -543,6 +543,12 @@ checks = ["rust-gate", "cluster-auth"]
 reason = "The retained `a_replicated_deadline_is_never_reported_as_a_wal_size_violation` regression runs in the ordinary Rust gate without the three-voter cluster, because the rule protecting a load-sensitive gate must not itself be load-sensitive. It proves the production `STORE_TIMEOUT` text classifies as a deadline rather than a store fault, that the deadline diagnosis never contains the size verdict `byte-bounded transactions must carry probe rows a row count cannot` and does name both itself and docs/VALIDATION.md, and that a genuine oversized write (`ClientWriteError: panicked`, which is how hiqlite-wal's byte refusal reaches the client) still earns that size verdict — as does a deadline whose voter then fails a consistent readiness read. It pins the sentinel against the real `src/store/hiqlite.rs` source with `include_str!` so a rewording cannot silently send every timeout back to the WAL verdict. Removing only the deadline class, which is the pre-fix behavior where one `.expect` collapsed every failure into the size verdict, fails the regression with `the production deadline text must classify as a deadline, not as a store fault`. `cluster-auth` remains the check that exercises the same classifier against the live three-voter import."
 
 [[coverage]]
+commits = ["72ec2024"]
+points = ["persistence.upgrades"]
+checks = ["rust-gate", "database-upgrades"]
+reason = "The retained `a_still_closing_predecessor_lock_is_not_reported_as_a_second_daemon` regression takes the data-directory lock, releases it 250ms later from another task, and requires the production `acquire_daemon_lock` entry point at its real five-second window to acquire rather than refuse. Reverting only the retry guard fails it immediately with `still locked inside this plurxd process ... after waiting 0.0s`, which is the pre-fix single non-blocking `try_lock`. The contract it must not weaken is covered in the other direction: `a_lock_held_for_the_whole_window_is_refused_without_blaming_another_process` proves a lock held for the whole window is still refused and that our own handle is never reported as a second daemon, `a_different_owner_is_still_reported_as_a_second_daemon` pins `another plurxd process already owns the data directory` to a foreign or unrecorded owner, and `subsequent_plurxd_run_reopens_the_completed_replicated_target` still runs two real daemons against one data directory and proves the live double-start is refused with that verdict and not misattributed to the contender itself. `database-upgrades` runs the same `cluster::migration` regressions, including `daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization`, which is the gate-parallel failure this corrects."
+
+[[coverage]]
 commits = ["b1132e8"]
 points = []
 checks = []
@@ -578,6 +584,25 @@ commits = ["406306b"]
 points = ["playback.pipeline", "web.experience"]
 checks = ["rust-gate", "web-static"]
 reason = "Three corrections with three retained regressions. `profile5_renderer_keeps_software_decode_and_may_encode_anywhere_probed` requires the reshape to keep `requires_software_decode` and to stay off the GPU end to end while allowing every hardware encoder to pair — reverting the pairing to software-only fails it, and deleting the software-decode requirement fails it in the other direction, which is the split that made a 4K Dolby Vision source 720p for non-DV clients. `the_advertised_ladder_never_offers_a_rung_the_pipeline_cannot_serve` still pins Auto onto the advertised ladder and now pins that an unproved hardware pairing falls back to the software rung rather than advertising a rung that would fail. `an upgrade needs encode headroom, not just a bandwidth estimate` drives `decideRung` with the production shape — a ~200 Mb/s JIT estimate at 720p — and requires the upgrade to be refused when the server's measured pace predicts under realtime one rung up, requires it to proceed on real headroom, requires an unmeasured session to stay able to rise, requires a rung that already failed to open never to be re-entered, and requires emergencies to keep falling past a blocked rung; reverting any one of those arms restores the 720<->1080 limit cycle."
+
+[[coverage]]
+commits = ["1ad8284"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `a_voter_handed_an_occupied_port_reports_a_collision_not_a_store_verdict` holds a loopback port, hands it to a voter first as its raft listener and then as its API listener, and requires the startup failure to name the occupied address, to classify as a port collision so a cluster start may reallocate, and to contain none of `no such table`, `cluster_meta`, `replicated store operation timed out`, or `auth store has not been opened`. Reverting only the panic guard and the listener proof restores the defect exactly: hiqlite's detached serve tasks swallow the bind failure, the voter announces readiness with a dead listener, and the test fails on the announcement. Its companion `a_store_verdict_is_never_classified_as_a_port_collision` pins the opposite direction, so a genuine durable-state fault is never retried five times and then reported as a busy port."
+
+[[coverage]]
+commits = ["02a42042"]
+points = []
+checks = []
+reason = "This commit only records the port-collision correction's current validation evidence in regressions.toml; it does not change runtime behavior."
+ignore = true
+
+[[coverage]]
+commits = ["0d56a300"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `start_cluster_with_port_retry_reallocates_after_a_collision` releases the first PortReservation, takes its raft port before the real voter binds, and requires the production retry wrapper to allocate different raft and API ports and successfully start on its second attempt. The direct-voter regression separately requires the bind-failure guard and listener proof to report the occupied address as a port collision rather than a durable-state verdict. Reverting the reservation or retry integration makes one of those mechanism checks fail."
 
 [[coverage]]
 commits = ["e52e7de9"]
