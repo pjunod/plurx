@@ -29,7 +29,8 @@
     "directory": ".swarm",
     "heartbeat_seconds": 30,
     "stuck_after_seconds": 900,
-    "clone_root": ".."
+    "clone_root": "..",
+    "worker_network_access": true
   },
   "providers": {
     "codex": {
@@ -124,6 +125,7 @@
       "reviewer": "swarm:reviewer"
     },
     "poll_seconds": 30,
+    "prefer_expiring_quota": true,
     "retry_seconds": 120,
     "limit": 100,
     "pull_request_limit": 1000,
@@ -149,8 +151,9 @@
     ],
     "reasoning_routes": {
       "deep": {
-        "provider": "claude",
-        "model": "fable"
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro-0813",
+        "reasoning_effort": "xhigh"
       }
     }
   },
@@ -172,49 +175,37 @@
       "model": "opus",
       "clone": "plurx-lead"
     },
-    "builder-sol-1": {
+    "builder-1": {
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
-      "clone": "plurx-builder-sol-1",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-sol-1"
     },
-    "builder-sol-2": {
+    "builder-2": {
       "role": "builder",
       "provider": "codex",
       "model": "gpt-5.6-sol",
-      "clone": "plurx-builder-sol-2",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-sol-2"
     },
-    "builder-opus-1": {
+    "builder-3": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
-      "clone": "plurx-builder-opus-1",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-opus-1"
     },
-    "builder-opus-2": {
+    "builder-4": {
       "role": "builder",
       "provider": "claude",
       "model": "opus",
-      "clone": "plurx-builder-opus-2",
-      "fallback_roles": [
-        "reviewer"
-      ]
+      "clone": "plurx-builder-opus-2"
     },
-    "reviewer-sol": {
+    "reviewer-1": {
       "role": "reviewer",
       "provider": "codex",
       "model": "gpt-5.6-sol",
       "clone": "plurx-reviewer-sol"
     },
-    "reviewer-opus": {
+    "reviewer-2": {
       "role": "reviewer",
       "provider": "claude",
       "model": "opus",

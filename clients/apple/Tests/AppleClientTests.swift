@@ -449,14 +449,8 @@ final class AppleClientTests: XCTestCase {
 
     @MainActor
     func testApplePlayerNeverTreatsBufferingOrTransportFailureAsCodecFailure() {
-        XCTAssertFalse(PlayerController.shouldMonitorSilentPlaybackStall(
-            timeControlStatus: .waitingToPlayAtSpecifiedRate
-        ))
         XCTAssertTrue(PlayerController.shouldMonitorBufferingStall(
             timeControlStatus: .waitingToPlayAtSpecifiedRate
-        ))
-        XCTAssertTrue(PlayerController.shouldMonitorSilentPlaybackStall(
-            timeControlStatus: .playing
         ))
         XCTAssertFalse(PlayerController.shouldMonitorBufferingStall(
             timeControlStatus: .playing
@@ -551,6 +545,266 @@ final class AppleClientTests: XCTestCase {
             ),
             .none,
             "the recovery ladder cannot loop either compatibility attempt"
+        )
+    }
+
+    /// The Dolby Vision Profile 5 black screen. A device with no Profile 5
+    /// decoder answers with one of two CoreMedia verdicts, and neither used to
+    /// reach the ladder — so the client stopped dead instead of asking the
+    /// server for a picture it could actually decode.
+    @MainActor
+    func testApplePlayerTreatsDolbyVisionRejectionsAsCompatibilityFailures() {
+        for status in [-12927, -15517] {
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: "CoreMediaErrorDomain",
+                        code: status,
+                        userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "CoreMediaErrorDomain:\(status) is a media verdict, not a transport fault"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: NSError(
+                        domain: AVFoundationErrorDomain,
+                        code: AVError.unknown.rawValue,
+                        userInfo: [NSUnderlyingErrorKey: NSError(
+                            domain: "CoreMediaErrorDomain",
+                            code: status,
+                            userInfo: [NSLocalizedDescriptionKey: "The operation could not be completed"]
+                        )]
+                    ),
+                    eventDomain: nil,
+                    eventStatus: nil,
+                    eventComment: nil
+                ),
+                "the verdict counts when it arrives underneath an opaque AVError"
+            )
+            XCTAssertTrue(
+                PlayerController.isCompatibilityPlaybackFailure(
+                    error: nil,
+                    eventDomain: "CoreMediaErrorDomain",
+                    eventStatus: status,
+                    eventComment: nil
+                ),
+                "the HLS error log carries the same verdict with no NSError at all"
+            )
+        }
+
+        // Widening pre-start classification must not have swallowed the
+        // transport and resource exclusions the ladder is protected by.
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.unknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(
+                    domain: NSURLErrorDomain,
+                    code: NSURLErrorTimedOut,
+                    userInfo: [NSLocalizedDescriptionKey: "The request timed out."]
+                )]
+            ),
+            eventDomain: NSURLErrorDomain,
+            eventStatus: NSURLErrorTimedOut,
+            eventComment: "segment request timed out"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.decoderTemporarilyUnavailable.rawValue,
+                userInfo: [:]
+            ),
+            eventDomain: nil,
+            eventStatus: nil,
+            eventComment: "decoder resources are temporarily unavailable"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(domain: "CoreMediaErrorDomain", code: -12660, userInfo: [:]),
+            eventDomain: "CoreMediaErrorDomain",
+            eventStatus: -12660,
+            eventComment: "HTTP 403"
+        ))
+    }
+
+    /// A resume was bounded only because it had a seek to run afterwards. A
+    /// fresh start had nothing to wait on and so waited forever — the exact
+    /// shape of the reported black screen.
+    @MainActor
+    func testApplePlayerBoundsAFreshStartsWaitForReadiness() {
+        XCTAssertEqual(PlayerController.itemReadinessDeadlineSeconds, 15)
+
+        XCTAssertTrue(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a VOD cold start has to give up eventually too"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 30_000,
+                seeksAfterAttach: true,
+                resumesPlayback: true
+            ),
+            "a resume is already bounded by the seek's own deadline"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: false,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: true
+            ),
+            "a growing session may still be filling its publish gate"
+        )
+        XCTAssertFalse(
+            PlayerController.shouldBoundFreshStartReadiness(
+                isVOD: true,
+                startMs: 0,
+                seeksAfterAttach: false,
+                resumesPlayback: false
+            ),
+            "an item deliberately prepared at rate 0 is nobody's black screen"
+        )
+    }
+
+    /// Audio advancing over a black screen is invisible to every other
+    /// detector: the film clock moves, so both stall detectors reset on each
+    /// sample and AVPlayer never reports a stall. The presentation size is the
+    /// only evidence that nothing was decoded.
+    @MainActor
+    func testBlackFrameWatchdogFiresOnlyWhenNothingIsEverDecoded() {
+        XCTAssertEqual(PlayerController.blackFrameDecodeFailureMs, 6_000)
+
+        var black = BlackFrameWatchdog()
+        black.opened()
+        for step in 0...11 {
+            XCTAssertFalse(
+                black.observe(
+                    positionMs: step * 500,
+                    presentationSize: .zero,
+                    hasVideoSource: true,
+                    playing: true
+                ),
+                "five and a half seconds of black is still inside the threshold"
+            )
+        }
+        XCTAssertTrue(black.observe(
+            positionMs: 6_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(
+            black.observe(
+                positionMs: 6_500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: true
+            ),
+            "one item enters the ladder once, not on every later sample"
+        )
+
+        // A decoded picture — of any size — is the end of the matter.
+        var decoding = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(decoding.observe(
+                positionMs: step * 500,
+                presentationSize: CGSize(width: 3840, height: 2160),
+                hasVideoSource: true,
+                playing: true
+            ))
+        }
+        XCTAssertTrue(decoding.presentedVideo)
+
+        // An audiobook's presentation size is legitimately zero forever.
+        var audioOnly = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(audioOnly.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: false,
+                playing: true
+            ))
+        }
+
+        // Neither a paused transport nor a seek is six seconds of black.
+        var paused = BlackFrameWatchdog()
+        for step in 0...20 {
+            XCTAssertFalse(paused.observe(
+                positionMs: step * 500,
+                presentationSize: .zero,
+                hasVideoSource: true,
+                playing: false
+            ))
+        }
+        var seeking = BlackFrameWatchdog()
+        XCTAssertFalse(seeking.observe(
+            positionMs: 0,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertFalse(seeking.observe(
+            positionMs: 600_000,
+            presentationSize: .zero,
+            hasVideoSource: true,
+            playing: true
+        ))
+        XCTAssertEqual(seeking.blackMs, 0)
+    }
+
+    /// A device log has to say which rung a failure bought, and what bought
+    /// it — the two client-observed verdicts carry no AVFoundation error to
+    /// print at all.
+    @MainActor
+    func testApplePlaybackFailureDetailNamesTheLadderRungItBought() {
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: NSError(domain: "CoreMediaErrorDomain", code: -12927, userInfo: [:]),
+                eventDomain: "CoreMediaErrorDomain",
+                eventStatus: -12927,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .itemFailure,
+                    fallback: .transcode
+                )
+            ),
+            "error=CoreMediaErrorDomain:-12927 · event=CoreMediaErrorDomain:-12927 · cause=item-failed · ladder=transcode"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .readinessTimeout,
+                    fallback: .hdrBase
+                )
+            ),
+            "cause=readiness-timeout · ladder=hdr-base"
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: nil,
+                eventDomain: nil,
+                eventStatus: nil,
+                eventComment: nil,
+                ladderStep: PlaybackCompatibilityLadderStep(
+                    cause: .blackFrames,
+                    fallback: .none
+                )
+            ),
+            "cause=black-frames · ladder=none",
+            "a verdict with no rung left still has to be visible in the log"
         )
     }
 
@@ -733,7 +987,7 @@ final class AppleClientTests: XCTestCase {
 
         // Nothing in flight: the request opens immediately and queues nothing.
         let immediate = queue.request(10_000, changeInFlight: false)
-        XCTAssertEqual(immediate, 10_000)
+        XCTAssertEqual(immediate?.positionMs, 10_000)
         XCTAssertNil(queue.pendingMs)
 
         // A burst of tvOS 30-second step-seeks landing during that change. Each
@@ -751,7 +1005,7 @@ final class AppleClientTests: XCTestCase {
         // not the one the change started from.
         let trailing = queue.takePending()
         let secondTrailing = queue.takePending()
-        XCTAssertEqual(trailing, 100_000)
+        XCTAssertEqual(trailing?.positionMs, 100_000)
         XCTAssertNil(secondTrailing, "the trailing reopen runs once, not once per request")
 
         // A track change naming the position already being opened must still
@@ -759,10 +1013,10 @@ final class AppleClientTests: XCTestCase {
         let trackChangeStart = queue.request(100_000, changeInFlight: false)
         let queuedTrackChange = queue.request(100_000, changeInFlight: true)
         let trackChangeTrailing = queue.takePending()
-        XCTAssertEqual(trackChangeStart, 100_000)
+        XCTAssertEqual(trackChangeStart?.positionMs, 100_000)
         XCTAssertNil(queuedTrackChange)
         XCTAssertEqual(
-            trackChangeTrailing,
+            trackChangeTrailing?.positionMs,
             100_000,
             "a queued request at the same position still has to rebuild the session"
         )
@@ -775,6 +1029,465 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(queue.pendingMs)
         let afterClear = queue.takePending()
         XCTAssertNil(afterClear)
+    }
+
+    // MARK: - Bound same-session stall reopen (§7.3 / ADAPTIVE-QUALITY.md)
+
+    private func stallIntent(
+        previousSessionId: String = "session-a",
+        requestId: String = "request-1"
+    ) -> PlayerOpenIntent {
+        .stallReopen(
+            StallReopenTicket(previousSessionId: previousSessionId, requestId: requestId)
+        )
+    }
+
+    private func createBody(height: Int? = nil) -> CreateSessionRequest {
+        CreateSessionRequest(playbackId: "playback-1", height: height)
+    }
+
+    /// The whole wire shape of one recovery: the exact predecessor, the typed
+    /// cause, and the ticket's own request id so a transport replay recovers
+    /// the persisted answer instead of stepping the ladder again.
+    func testAStallReopenNamesItsPredecessorAndCarriesTheTypedCause() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(),
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+
+        XCTAssertEqual(body.previousSessionId, "session-a")
+        XCTAssertEqual(body.reopenReason, "stall")
+        XCTAssertEqual(body.requestId, "request-1")
+        XCTAssertEqual(body.qualityAuto, true)
+    }
+
+    /// A seek, a quality change, or a recovery that finished first has already
+    /// replaced the session the ticket names. The server refuses a create
+    /// naming a session it no longer runs, so the binding is dropped rather
+    /// than sent into a guaranteed 400.
+    func testAStaleStallTicketReopensUnboundInsteadOfNamingADeadSession() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(previousSessionId: "session-a"),
+            currentSessionId: "session-b",
+            selectedHeight: nil
+        )
+
+        XCTAssertNil(body.previousSessionId)
+        XCTAssertNil(body.reopenReason)
+        XCTAssertEqual(body.qualityAuto, true)
+    }
+
+    /// Direct play has no session to name at all.
+    func testAStallTicketIsDroppedWhenNoSessionIsPlaying() {
+        let body = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: stallIntent(),
+            currentSessionId: nil,
+            selectedHeight: nil
+        )
+
+        XCTAssertNil(body.previousSessionId)
+        XCTAssertNil(body.reopenReason)
+    }
+
+    /// The live defect this field exists for: a subtitle burn posts the source
+    /// height as a promise about the output while the viewer is still on Auto.
+    /// Without `quality_auto` the server reads that as a sticky manual pick and
+    /// the session can never be stepped down again.
+    func testAPromiseHeightUnderAutoStillDeclaresTheViewerChoseAuto() {
+        let burn = PlayerController.applyOpenIntent(
+            to: createBody(height: 2_160),
+            intent: .normal,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        XCTAssertEqual(burn.height, 2_160)
+        XCTAssertEqual(
+            burn.qualityAuto,
+            true,
+            "a burn's promise height is not an answer to the quality menu"
+        )
+
+        let manual = PlayerController.applyOpenIntent(
+            to: createBody(height: 720),
+            intent: .normal,
+            currentSessionId: "session-a",
+            selectedHeight: 720
+        )
+        XCTAssertEqual(
+            manual.qualityAuto,
+            false,
+            "an explicitly picked rung stays sticky across a stall"
+        )
+    }
+
+    /// The client owns the bound the server deliberately does not implement:
+    /// at or below the ladder floor the same rung comes back every time.
+    func testTheFloorBudgetStopsRecoveryOnceReopensStopBuyingALowerRung() {
+        var budget = StallReopenBudget()
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+
+        // A real descent down the ladder never spends budget.
+        budget.resolved(height: 720, previousHeight: 1_080, at: 600_000)
+        budget.resolved(height: 480, previousHeight: 720, at: 605_000)
+        budget.resolved(height: 360, previousHeight: 480, at: 610_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+        XCTAssertEqual(budget.floorAttempts, 0)
+
+        // The floor is the predecessor's own rung, not 360: a starved prior
+        // settles at MIN_HEIGHT and a sub-360 source resolves below the ladder.
+        budget.resolved(height: 144, previousHeight: 144, at: 615_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt, "one retry is still worth taking")
+        budget.resolved(height: 144, previousHeight: 144, at: 620_000)
+        XCTAssertFalse(
+            budget.allowsAnotherAttempt,
+            "the server repeats the floor rung forever; only this bound ends it"
+        )
+
+        // The tight loop cannot buy itself more attempts: five seconds of
+        // recovered playback rearms the stall detector, and that is exactly the
+        // interval this bound has to survive.
+        budget.observedStall(at: 625_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // Viewer intent — a seek, a quality change, a new title — retires it.
+        budget.reset()
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+    }
+
+    /// The bound is on one starvation episode, not on the whole film. A blip
+    /// ten minutes in must not leave the remaining hour with no automatic
+    /// recovery at all.
+    func testAMinuteOfRecoveredFilmStartsAFreshEpisode() {
+        var budget = StallReopenBudget()
+        budget.resolved(height: 144, previousHeight: 144, at: 600_000)
+        budget.resolved(height: 144, previousHeight: 144, at: 606_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // Still the same episode.
+        budget.observedStall(at: 640_000)
+        XCTAssertFalse(budget.allowsAnotherAttempt)
+
+        // A full minute of film later the link demonstrably recovered.
+        budget.observedStall(at: 666_000)
+        XCTAssertTrue(budget.allowsAnotherAttempt)
+    }
+
+    /// `StartResponse.height` is `0` for a remux of an unprobed source, and
+    /// absent entirely from a server predating the field. Neither is evidence
+    /// that a lower rung was bought, and reading them as progress would restore
+    /// the unbounded loop the budget exists to close.
+    func testAnUnstatedHeightIsNotEvidenceOfAStepDown() {
+        var unprobed = StallReopenBudget()
+        unprobed.resolved(height: 0, previousHeight: 0, at: 10_000)
+        unprobed.resolved(height: 0, previousHeight: 0, at: 15_000)
+        XCTAssertFalse(unprobed.allowsAnotherAttempt)
+
+        var legacyServer = StallReopenBudget()
+        legacyServer.resolved(height: nil, previousHeight: nil, at: 10_000)
+        legacyServer.resolved(height: nil, previousHeight: nil, at: 15_000)
+        XCTAssertFalse(legacyServer.allowsAnotherAttempt)
+
+        // A step up is not a step down either.
+        var stepUp = StallReopenBudget()
+        stepUp.resolved(height: 720, previousHeight: 480, at: 10_000)
+        XCTAssertEqual(stepUp.floorAttempts, 1)
+    }
+
+    /// The transition itself, not just the counter behind it: an exhausted
+    /// floor budget turns the recovery arm of the stall state machine into the
+    /// ordinary stall failure, and nothing else changes shape.
+    func testAnExhaustedFloorBudgetTurnsRecoveryIntoTheOrdinaryStallFailure() {
+        let stopped = PlayerController.stallRecoveryDecision(
+            .reopen,
+            transport: .serverSession,
+            budgetAllowsAnotherAttempt: false,
+            kind: .buffering
+        )
+        XCTAssertEqual(stopped, .stop(PlaybackStallKind.buffering.terminalState))
+
+        // With budget left, the reopen stands.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .buffering
+            ),
+            .reopen
+        )
+
+        // An offline package has no rung and no server; the ladder's floor
+        // budget must not decide anything about it.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .reopen,
+                transport: .offlineAsset,
+                budgetAllowsAnotherAttempt: false,
+                kind: .silent
+            ),
+            .reopen
+        )
+
+        // A decision that was already terminal keeps its own message.
+        XCTAssertEqual(
+            PlayerController.stallRecoveryDecision(
+                .stop(PlaybackStallKind.silent.terminalState),
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: false,
+                kind: .silent
+            ),
+            .stop(PlaybackStallKind.silent.terminalState)
+        )
+    }
+
+    /// The two bounds landed independently — the ladder floor here, the
+    /// rolling storm cap on `main` — and the order the merge chose between
+    /// them is a behavioral decision, not a formatting one.
+    ///
+    /// `admit()` records a timestamp, so asking it first charges a rolling
+    /// slot to a reopen the floor then refuses. Reverting to that order leaves
+    /// the assertions below failing: the floor-stopped stall would consume a
+    /// slot, and the unrelated stall a minute later would find the cap already
+    /// two-thirds spent.
+    func testAFloorStoppedStallDoesNotSpendARollingReopenSlot() {
+        var storm = RecoveryReopenBudget()
+
+        // The floor is exhausted, so this stall stops. It must cost the storm
+        // cap nothing: no reopen was ever issued.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: false,
+                kind: .buffering,
+                reopenStorm: &storm,
+                now: 100
+            ),
+            .stop(PlaybackStallKind.buffering.terminalState)
+        )
+        XCTAssertTrue(storm.reopenTimes.isEmpty, "a reopen that never happened is not a reopen")
+
+        // All three rolling slots therefore remain for real reopens.
+        for (index, at) in [101.0, 102.0, 103.0].enumerated() {
+            XCTAssertEqual(
+                PlayerController.boundedStallRecoveryDecision(
+                    .reopen,
+                    transport: .serverSession,
+                    budgetAllowsAnotherAttempt: true,
+                    kind: .buffering,
+                    reopenStorm: &storm,
+                    now: at
+                ),
+                .reopen,
+                "rolling slot \(index + 1) of 3 must still be available"
+            )
+        }
+
+        // And the storm cap still closes on the fourth, with the message that
+        // belongs to the stall that hit it.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 104
+            ),
+            .stop(PlaybackStallKind.delivery.terminalState)
+        )
+    }
+
+    /// A reach expansion the merge created and neither side had on its own:
+    /// `main`'s server-truth delivery watchdog funnels into
+    /// `retrySameDeliveryAfterStall`, the exact arm this branch bound to the
+    /// ladder. So a wedge that AVPlayer never reported now also names its
+    /// predecessor and stops at the floor — which is the intent, since a tvOS
+    /// 2160p copy-HLS freeze is precisely a rung the link cannot hold.
+    func testTheDeliveryWatchdogAlsoStepsTheLadderDownAndStopsAtItsFloor() {
+        var storm = RecoveryReopenBudget()
+
+        // With floor budget left, a watchdog-detected starvation reopens, and
+        // that reopen is bound exactly like a buffering stall.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .serverSession,
+                budgetAllowsAnotherAttempt: true,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 200
+            ),
+            .reopen
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            stallIntent(),
+            "the watchdog arm mints the same predecessor binding"
+        )
+
+        // At the floor it stops with the delivery-specific message rather than
+        // the generic buffering one, so the failure screen still names what
+        // actually went wrong.
+        let stopped = PlayerController.boundedStallRecoveryDecision(
+            .reopen,
+            transport: .serverSession,
+            budgetAllowsAnotherAttempt: false,
+            kind: .delivery,
+            reopenStorm: &storm,
+            now: 201
+        )
+        XCTAssertEqual(stopped, .stop(PlaybackStallKind.delivery.terminalState))
+        XCTAssertNotEqual(
+            PlaybackStallKind.delivery.terminalState.message,
+            PlaybackStallKind.buffering.terminalState.message
+        )
+
+        // An offline package reaches this arm too and has no rung to step to;
+        // the floor must stay out of its way.
+        XCTAssertEqual(
+            PlayerController.boundedStallRecoveryDecision(
+                .reopen,
+                transport: .offlineAsset,
+                budgetAllowsAnotherAttempt: false,
+                kind: .delivery,
+                reopenStorm: &storm,
+                now: 202
+            ),
+            .reopen
+        )
+    }
+
+    /// Only a live growing session has a predecessor rung to name.
+    func testOnlyAGrowingServerSessionMintsABoundRecovery() {
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            stallIntent()
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: "session-a",
+                isVOD: true,
+                requestId: "request-1"
+            ),
+            .normal,
+            "a completed cache entry has no ladder answer to give"
+        )
+        XCTAssertEqual(
+            PlayerController.stallReopenIntent(
+                sessionId: nil,
+                isVOD: false,
+                requestId: "request-1"
+            ),
+            .normal,
+            "direct play holds no session at all"
+        )
+    }
+
+    /// One stall, one step. Whatever the drain loop replays after a bound
+    /// reopen carries its own cause, so a queued viewer command cannot be
+    /// reissued as a second step-down of the same recovery.
+    func testATransportReplayCannotStepTheLadderDownTwice() {
+        var queue = PlayerReopenQueue()
+        let ticket = stallIntent()
+
+        // The stall lands while a track change is in flight and is queued.
+        XCTAssertNil(queue.request(30_000, intent: ticket, changeInFlight: true))
+        XCTAssertEqual(queue.takePending(), PlayerReopenRequest(positionMs: 30_000, intent: ticket))
+
+        // Nothing bound survives to be replayed a second time.
+        XCTAssertNil(queue.takePending())
+
+        // And the create built from that one ticket is idempotent: the same
+        // request id, so a transport replay returns the answer already
+        // persisted for it rather than resolving a second rung down.
+        let first = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: ticket,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        let replay = PlayerController.applyOpenIntent(
+            to: createBody(),
+            intent: ticket,
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+        XCTAssertEqual(first.requestId, replay.requestId)
+    }
+
+    /// A seek or track change racing a stall is deterministic: last writer
+    /// wins, cause included. The viewer's command builds its own session, which
+    /// supersedes the predecessor the stall ticket names — so carrying that
+    /// binding forward would post a create the server is bound to refuse.
+    func testAViewerCommandRacingAStallDropsTheStallBinding() {
+        var queue = PlayerReopenQueue()
+
+        // Stall first, then the viewer scrubs.
+        XCTAssertNil(queue.request(30_000, intent: stallIntent(), changeInFlight: true))
+        XCTAssertNil(queue.request(90_000, changeInFlight: true))
+        XCTAssertEqual(queue.takePending(), PlayerReopenRequest(positionMs: 90_000))
+
+        // The other order: a stall observed after the viewer's command is a
+        // genuine recovery and keeps its binding.
+        XCTAssertNil(queue.request(90_000, changeInFlight: true))
+        XCTAssertNil(queue.request(30_000, intent: stallIntent(), changeInFlight: true))
+        XCTAssertEqual(
+            queue.takePending(),
+            PlayerReopenRequest(positionMs: 30_000, intent: stallIntent())
+        )
+    }
+
+    /// The residual #247 left on record: a retryable failure that fires after
+    /// the claim was normalized replays as `400 invalid stall reopen` for the
+    /// same `request_id`. Recovery is still wanted, so the identical recipe is
+    /// re-posted unbound under a fresh identity.
+    func testARefusedStallReopenFallsBackToAnUnboundCreate() throws {
+        let bound = PlayerController.applyOpenIntent(
+            to: createBody(height: 1_080),
+            intent: stallIntent(),
+            currentSessionId: "session-a",
+            selectedHeight: nil
+        )
+
+        let retry = try XCTUnwrap(
+            PlayerController.unboundStallRetry(for: bound, after: APIError.http(400))
+        )
+        XCTAssertNil(retry.previousSessionId)
+        XCTAssertNil(retry.reopenReason)
+        XCTAssertNotEqual(
+            retry.requestId,
+            bound.requestId,
+            "the refused claim already consumed that identity"
+        )
+        // Everything about the delivery is unchanged; only the binding went.
+        XCTAssertEqual(retry.height, 1_080)
+        XCTAssertEqual(retry.qualityAuto, true)
+        XCTAssertEqual(retry.playbackId, bound.playbackId)
+
+        // Not a blanket retry: other statuses and unbound bodies keep the
+        // existing restore-and-surface path.
+        XCTAssertNil(PlayerController.unboundStallRetry(for: bound, after: APIError.http(503)))
+        XCTAssertNil(PlayerController.unboundStallRetry(for: bound, after: APIError.http(404)))
+        XCTAssertNil(
+            PlayerController.unboundStallRetry(
+                for: createBody(),
+                after: APIError.http(400)
+            ),
+            "an ordinary create's 400 is not a stall-binding failure"
+        )
     }
 
     func testRelativeSeeksAccumulateFromTheLatestTargetAndClampToTheFilm() {
@@ -1130,25 +1843,25 @@ final class AppleClientTests: XCTestCase {
     func testStallDetectorIgnoresPausesAndRecoversOnlyAfterSustainedNoProgress() {
         var detector = PlaybackStallDetector()
 
-        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: false), .none)
-        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: false, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
 
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .nudge)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .reopen)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .nudge)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .reopen)
 
         // A deliberate pause resets the wall-clock evidence rather than
         // letting it carry into the next press of Play.
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false), .none)
-        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false, established: true, waitingRegime: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true, established: true, waitingRegime: false), .none)
     }
 
     @MainActor
-    func testBufferingWaitHasAnIndependentBoundedRecoveryTimer() {
+    func testBufferingWaitHasABoundedRecoveryTimer() {
         var monitor = PlaybackRecoveryMonitor()
         let beganAt: TimeInterval = 1_000
 
@@ -1185,33 +1898,51 @@ final class AppleClientTests: XCTestCase {
             }
         }
 
-        XCTAssertNil(monitor.silentDetector.lastPositionMs)
-        XCTAssertEqual(monitor.bufferingDetector.lastPositionMs, 30_000)
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 30_000)
     }
 
     @MainActor
-    func testBufferingRecoveryCannotStartBeforeTheFirstFiveSecondsPlay() {
+    func testUnestablishedBufferingGetsALongerLeashThenABoundedReopen() {
         var monitor = PlaybackRecoveryMonitor()
         let beganAt: TimeInterval = 2_000
 
-        for check in 0...10 {
+        // An unestablished item may be waiting on the server's publish gate,
+        // so no nudge and no reopen through fourteen stagnant samples — the
+        // established thresholds must not apply…
+        for check in 0...14 {
             XCTAssertNil(monitor.sample(
                 positionMs: 0,
                 timeControlStatus: .waitingToPlayAtSpecifiedRate,
                 shouldMonitor: true,
                 establishedPlayback: false,
                 observedAt: beganAt + Double(check * 2)
-            ))
+            ), "unexpected event at check \(check)")
         }
-        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+        // …but the clock was counting the whole time, not disarmed…
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 0)
 
+        // …and the fifteenth stagnant sample reopens. Before this leash
+        // existed the unestablished state had no detector at all, so a
+        // recovery reopen that landed into continued starvation froze
+        // forever with no error — the field failure this pins.
+        let fired = monitor.sample(
+            positionMs: 0,
+            timeControlStatus: .waitingToPlayAtSpecifiedRate,
+            shouldMonitor: true,
+            establishedPlayback: false,
+            observedAt: beganAt + 30
+        )
+        XCTAssertEqual(fired?.action, .reopen)
+        XCTAssertEqual(fired?.kind, .buffering)
+
+        // Establishment restores the short mid-playback ladder.
         for check in 0...6 {
             let event = monitor.sample(
                 positionMs: 30_000,
                 timeControlStatus: .waitingToPlayAtSpecifiedRate,
                 shouldMonitor: true,
                 establishedPlayback: true,
-                observedAt: beganAt + Double(30 + check * 2)
+                observedAt: beganAt + Double(40 + check * 2)
             )
             if check == 6 {
                 XCTAssertEqual(event?.kind, .buffering)
@@ -1245,7 +1976,8 @@ final class AppleClientTests: XCTestCase {
                 observedAt: 3_000 + Double(check * 2)
             ))
         }
-        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+        // Counting, not disarmed: the unestablished leash is longer, not off.
+        XCTAssertEqual(monitor.progressDetector.lastPositionMs, 90_000)
 
         attachment.observe(positionMs: 95_000, playing: true)
         XCTAssertTrue(attachment.establishedPlayback)
@@ -1287,25 +2019,169 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
-    func testPlaybackRecoveryPredicatesStayExclusiveAndBufferingWinsAMerge() {
-        for status in [
-            AVPlayer.TimeControlStatus.paused,
-            .waitingToPlayAtSpecifiedRate,
-            .playing,
-        ] {
-            XCTAssertNotEqual(
-                PlayerController.shouldMonitorSilentPlaybackStall(timeControlStatus: status),
-                PlayerController.shouldMonitorBufferingStall(timeControlStatus: status)
+    func testRegimeFlappingCannotResetTheStallClock() {
+        // The exact field failure this pins: AVPlayer alternates between
+        // `.playing` and `.waitingToPlayAtSpecifiedRate` faster than a
+        // per-regime detector's threshold. The old split design zeroed each
+        // leg on every crossing, so a real freeze never latched — sessions
+        // died server-side as `idle` with no stall beacon ever sent.
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 5_000
+        var fired: PlaybackStallEvent?
+
+        for check in 0...6 {
+            let event = monitor.sample(
+                positionMs: 42_000,
+                timeControlStatus: check % 2 == 0
+                    ? .waitingToPlayAtSpecifiedRate
+                    : .playing,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(check * 2)
+            )
+            if let event, event.action == .reopen { fired = event }
+        }
+
+        XCTAssertEqual(fired?.action, .reopen)
+        XCTAssertEqual(fired?.positionMs, 42_000)
+        // Half the stagnant samples were explicit waits; ambiguity routes to
+        // transport recovery, never the codec/HDR ladder.
+        XCTAssertEqual(fired?.kind, .buffering)
+    }
+
+    func testStallKindMajorityTiesGoToTransportRecovery() {
+        XCTAssertTrue(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 3, stagnantChecks: 6
+        ))
+        XCTAssertTrue(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 6, stagnantChecks: 6
+        ))
+        XCTAssertFalse(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 2, stagnantChecks: 6
+        ))
+        XCTAssertFalse(PlaybackStallDetector.waitingMajority(
+            waitingSamples: 0, stagnantChecks: 6
+        ))
+    }
+
+    func testDeliveryStarvationRequiresServerTruthAndConfirmation() {
+        var detector = DeliveryStarvationDetector()
+        // Wedge shape: film clock frozen at 40_000, nothing buffered.
+        func wedge(
+            _ idle: Int?, published: Int? = 200_000, fetched: Int? = 150_000,
+            eligible: Bool = true
+        ) -> Bool {
+            detector.observe(
+                deliveredIdleMs: idle, publishedEndMs: published, fetchedEndMs: fetched,
+                positionMs: 40_000, runwaySeconds: 0.5, eligible: eligible
             )
         }
 
-        XCTAssertEqual(
-            PlaybackRecoveryMonitor.select(
-                silentAction: .reopen,
-                bufferingAction: .nudge
-            ),
-            PlaybackStallSelection(kind: .buffering, action: .nudge)
-        )
+        // Baseline sample establishes the position; healthy delivery cadence.
+        XCTAssertFalse(wedge(6_000))
+        XCTAssertFalse(wedge(6_000))
+        // First qualifying poll only confirms; the second fires.
+        XCTAssertFalse(wedge(16_000))
+        XCTAssertTrue(wedge(18_000))
+
+        // Playing out the tail of a finished stream can never qualify:
+        // nothing is pending server-side.
+        XCTAssertFalse(wedge(60_000, published: 200_000, fetched: 195_000))
+
+        // Ineligible states (paused, change in flight, seek pending) reset
+        // the confirmation count rather than accumulating across them.
+        XCTAssertFalse(wedge(20_000, fetched: 100_000))
+        XCTAssertFalse(wedge(22_000, fetched: 100_000, eligible: false))
+        XCTAssertFalse(wedge(24_000, fetched: 100_000))
+
+        // Absent server fields — an old server, or a session with no
+        // delivery yet — never qualify.
+        XCTAssertFalse(wedge(nil))
+        XCTAssertFalse(wedge(30_000, published: nil, fetched: nil))
+
+        // The delivery kind reaches the server beacon as its own reason.
+        XCTAssertEqual(PlaybackStallKind.delivery.rawValue, "delivery")
+        XCTAssertFalse(PlaybackStallKind.delivery.terminalState.isPlaying)
+    }
+
+    /// The build 63 field regression, pinned. Server-side evidence alone —
+    /// "no completed delivery for 16+ s while published media is pending" —
+    /// is ALSO what a healthy player with a full forward buffer looks like:
+    /// `preferredForwardBufferDuration` is 60 s, so AVPlayer tops up and then
+    /// stops fetching for a long stretch while the producer parks at the
+    /// 180 s ahead-window cap. Build 63 fired on that and killed a healthy
+    /// 2160p session every ~2.4 minutes. The film clock is the discriminator.
+    func testDeliveryStarvationNeverFiresOnAHealthyBufferedPlayer() {
+        var detector = DeliveryStarvationDetector()
+
+        // A topped-up player: 55 s of runway, clock advancing 2 s per poll,
+        // server delivery meter idle for far longer than the threshold and a
+        // deep pending backlog (the ahead window is deliberately deep).
+        var positionMs = 40_000
+        var idleMs = 4_000
+        for _ in 0..<40 {
+            XCTAssertFalse(
+                detector.observe(
+                    deliveredIdleMs: idleMs,
+                    publishedEndMs: 600_000,
+                    fetchedEndMs: 420_000,
+                    positionMs: positionMs,
+                    runwaySeconds: 55,
+                    eligible: true
+                ),
+                "a player whose clock is advancing is not starving"
+            )
+            positionMs += 2_000
+            idleMs += 2_000
+        }
+
+        // Same server numbers, clock now frozen, buffer drained — that IS the
+        // wedge, and it must still be caught promptly.
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertFalse(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+        XCTAssertTrue(detector.observe(
+            deliveredIdleMs: idleMs, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+            positionMs: positionMs, runwaySeconds: 0, eligible: true
+        ))
+    }
+
+    /// A frozen clock with media still in hand is a decode/render stall, not
+    /// delivery starvation — the position ladder owns that case, and the
+    /// delivery watchdog must not claim it.
+    func testDeliveryStarvationIgnoresAFrozenClockThatStillHasBuffer() {
+        var detector = DeliveryStarvationDetector()
+        for _ in 0..<10 {
+            XCTAssertFalse(detector.observe(
+                deliveredIdleMs: 45_000, publishedEndMs: 600_000, fetchedEndMs: 420_000,
+                positionMs: 90_000, runwaySeconds: 42, eligible: true
+            ))
+        }
+    }
+
+    func testRecoveryReopenBudgetBrakesAStorm() {
+        var budget = RecoveryReopenBudget()
+
+        // The observed storm: automatic reopens ~1.5 s apart. Three are
+        // admitted, the fourth inside the rolling minute is refused.
+        XCTAssertTrue(budget.admit(at: 100))
+        XCTAssertTrue(budget.admit(at: 101.5))
+        XCTAssertTrue(budget.admit(at: 103))
+        XCTAssertFalse(budget.admit(at: 104.5))
+        XCTAssertFalse(budget.admit(at: 150))
+
+        // Outside the window the brake releases…
+        XCTAssertTrue(budget.admit(at: 165))
+
+        // …and an explicit viewer retry clears it entirely.
+        budget.reset()
+        XCTAssertTrue(budget.admit(at: 166))
+        XCTAssertTrue(budget.admit(at: 166.5))
     }
 
     func testRepeatedBufferingRecoveryStopsWithNetworkSpecificState() {
@@ -1409,6 +2285,67 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(object["reason"] as? String, "resume")
         XCTAssertEqual(object["file_id"] as? Int, 42)
         XCTAssertEqual(object["height"] as? Int, 2_160)
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
+    }
+
+    func testPhysicalDeviceAcceptanceLaunchReadsOnlyExplicitDebugDefaults() throws {
+        let suite = "tv.plurx.acceptance-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(PlaybackAcceptanceLaunch.current(defaults: defaults))
+
+        defaults.set(42, forKey: "plurx.acceptance.fileId")
+        defaults.set(17, forKey: "plurx.acceptance.itemId")
+        defaults.set(91_000, forKey: "plurx.acceptance.startMs")
+        defaults.set(7_200_000, forKey: "plurx.acceptance.durationMs")
+        defaults.set("Acceptance movie", forKey: "plurx.acceptance.title")
+        defaults.set(480, forKey: "plurx.acceptance.height")
+        defaults.set(true, forKey: "plurx.acceptance.probe")
+
+        XCTAssertEqual(
+            PlaybackAcceptanceLaunch.current(defaults: defaults),
+            PlaybackAcceptanceLaunch(
+                itemId: 17,
+                fileId: 42,
+                startMs: 91_000,
+                durationMs: 7_200_000,
+                title: "Acceptance movie",
+                height: 480,
+                probesEnabled: true
+            )
+        )
+    }
+
+    func testApplePlaybackProbeCarriesRunwayAndNoCredentialSurface() throws {
+        var snapshot = ApplePlaybackDiagnosticSnapshot()
+        snapshot.positionMs = 90_000
+        snapshot.runway = 6.25
+        snapshot.timeControlStatus = "playing"
+        let payload = ApplePlaybackProbeLog(
+            method: "transcode",
+            title: "Acceptance movie",
+            fileId: 42,
+            vcodec: "hevc",
+            height: 480,
+            encoder: "videotoolbox",
+            sessionId: "session-17",
+            attempt: "attempt-2",
+            snapshot: snapshot
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "playback_probe")
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(object["height"] as? Int, 480)
+        XCTAssertEqual(object["session_id"] as? String, "session-17")
+        XCTAssertEqual(object["attempt"] as? String, "attempt-2")
+        let encodedSnapshot = try XCTUnwrap(object["snapshot"] as? [String: Any])
+        XCTAssertEqual(encodedSnapshot["runway"] as? Double, 6.25)
+        XCTAssertEqual(encodedSnapshot["time_control_status"] as? String, "playing")
         XCTAssertNil(object["url"])
         XCTAssertNil(object["token"])
     }

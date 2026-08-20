@@ -12,10 +12,26 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `62` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `67` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 62 shows the audio and subtitle tracks a file
+> same regression suite. Build 67 gives stall recovery somewhere to go: a
+> reopen on a growing HLS session now names its exact predecessor with
+> `reopen_reason: "stall"`, so the server answers one rung *down* rather than
+> rebuilding the rung that just starved, states `quality_auto` so a subtitle
+> burn's promise height is not read as a sticky manual pick, and stops at the
+> ladder floor — the bound the server deliberately leaves to the client.
+> Build 66 adds unattended physical-device bandwidth acceptance with exact
+> runway evidence. Build 65 keeps the delivery watchdog honest about a player that is
+> still making progress. Build 64 stops the delivery watchdog firing on a
+> healthy player: a full forward buffer looks exactly like a wedge from the
+> server's delivery meter, so the film clock and the buffered runway now have
+> to agree before it recovers. Build 63 makes stall recovery un-foolable: one
+> shared no-progress clock that regime flapping cannot reset, a longer
+> bounded leash (then a visible error) where recovery used to disarm
+> forever, a server-truth delivery watchdog fed by the 2-second status
+> poll, and a rolling budget that turns automatic reopen storms into the
+> failure screen. Build 62 shows the audio and subtitle tracks a file
 > actually has on the detail screen and lets a viewer choose both before
 > pressing Play. Build 61 corrects copy-HLS recovery to seek past the
 > preceding keyframe and adds correlated AVPlayer, access-log, buffer, and

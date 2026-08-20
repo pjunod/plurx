@@ -143,6 +143,26 @@ jobs. Impact optimization therefore fails open: a bad diff base costs time;
 it never suppresses tests. The scheduled workflow still runs the `nightly`
 profile.
 
+### Base syncs — the gate revalidates, the reviewer does not
+
+`main` is protected with `required_status_checks.strict: true`, so a pull
+request has to be up to date before it merges. Clear that by merging `main`
+**into** the branch. Never rebase a branch that has a recorded approval: a merge
+keeps the approved commit an ancestor, while a rebase rewrites every sha and
+sends the whole reviewed range back through review.
+
+That base sync is revalidated but not re-reviewed. `PR validation gate` reruns
+at the new head — which is the point of `strict`, and is load-bearing here
+rather than ceremonial, because the required profile is itself versioned in
+`main`: this catalog and `validation/points.toml` can add a check to the `ci`
+profile after a branch was cut, so a byte-identical patch can legitimately face
+a check set that did not exist when it was approved. The independent approval,
+by contrast, is carried forward across a base sync Git proves empty — two
+parents, the second already on `main`, and an automatic merge whose tree is
+exactly what `git merge-tree` computes from the two parents. Anything Git cannot
+prove empty is reviewable content and takes a delta pass. The rule and its
+refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
+
 ## The UI golden — a saved answer key, not a magic test
 
 “Golden” is testing jargon for a reviewed, known-good output saved in the
