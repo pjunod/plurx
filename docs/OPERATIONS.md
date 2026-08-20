@@ -203,7 +203,7 @@ Two refusals come out of that path and they are not variants of one problem:
 
 | Refusal | What it means | What to do |
 |---|---|---|
-| `another plurxd process already owns the data directory <dir> (pid N)` | A different live process owns it. This is the double-start the lock exists to stop. | `ps -p N` to see which server it is, then stop one of them or give it its own data directory. An unrecorded pid reads `(owner pid not recorded)` and means the same thing. |
+| `another plurxd process already owns the data directory <dir> (pid N)` | A different live process owns it. This is the double-start the lock exists to stop. The recorded pid is a best-effort diagnostic and can be stale; only the advisory lock proves that another owner exists. | Use `ps -p N` as a lead for finding the other server, then confirm which process has the data directory open before stopping it; otherwise give one server its own data directory. An unavailable pid reads `(owner pid not recorded)` and means the same ownership conflict. |
 | `the data directory <dir> is still locked inside this plurxd process (pid N)` | This process never dropped an earlier activation's lock handle. | Nothing on the host will help — no second server exists. Report it with the log around startup; it is a defect in this code path. |
 
 ### Reading watch-state replication status
