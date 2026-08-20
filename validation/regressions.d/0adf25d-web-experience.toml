@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0adf25d"]
+points = ["web.experience"]
+checks = ["web-static"]
+reason = "The retained `a session that lands on a different range repaints the badge` runs the shipped `attachSession` against a player whose decision-time range disagrees with the session's, and requires the repaint; removing the `renderPlayerInfo()` call fails it on the stale chip rather than on a missing name. It also pins that a superseded generation never paints over the live player."

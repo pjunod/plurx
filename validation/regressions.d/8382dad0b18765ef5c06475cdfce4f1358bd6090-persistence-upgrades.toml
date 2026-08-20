@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["8382dad0b18765ef5c06475cdfce4f1358bd6090"]
+points = ["persistence.upgrades", "server.api", "validation.framework"]
+checks = ["rust-gate"]
+reason = "The shipped-binary regression `a_signal_during_startup_stops_the_daemon_before_it_boots` raises SIGTERM the moment store activation returns, which is before `boot` runs and long before any listener exists, then requires the daemon to exit 0 having recorded the startup-window signal and never logged `plurxd starting`. Watching the eagerly installed signal streams for the whole of startup stops the daemon at its next cancel-safe boundary; reverting only the production correction so the future is again handed straight to `boot` restores the buffer-until-serve behavior, and the daemon probes hardware, binds, serves and drains, so `plurxd starting` appears and the test fails. The covered guarantee starts after `select_daemon_store`, which renames directories and fsyncs activation markers in a fixed order and is deliberately never cancelled midway."

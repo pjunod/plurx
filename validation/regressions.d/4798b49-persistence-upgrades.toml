@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4798b49"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained workspace/process and three-voter activation contracts pin maintenance TLS, lost/ambiguous-target refusal, loopback listener selection, bounded backup retention, occupied-port refusal, and explicit SQLite-recovery selection."
