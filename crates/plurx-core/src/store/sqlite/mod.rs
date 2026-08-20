@@ -1915,7 +1915,7 @@ COMMIT;"
             "password reset must cold-start prior lookup"
         );
 
-        let rehash_gen = CredentialGeneration::derive(2, 5000, "rehashed-argon2-hash");
+        let rehash_gen = CredentialGeneration::derive(2, 5000, &rehash_hash);
         assert_ne!(
             original_gen, rehash_gen,
             "password rehash must produce different generation"
