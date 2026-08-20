@@ -108,7 +108,7 @@ internal class SessionCreateCoordinator(
         createMutex.withLock {
             if (!isCurrent()) return@withLock null
             try {
-                callCreate(body)
+                callCreate(body).takeIf { isCurrent() }
             } catch (failure: Throwable) {
                 if (!isBadRequest(failure)) throw failure
                 if (!isCurrent()) return@withLock null
@@ -118,7 +118,7 @@ internal class SessionCreateCoordinator(
                         previous_session_id = null,
                         reopen_reason = null,
                     ),
-                )
+                ).takeIf { isCurrent() }
             }
         }
 }

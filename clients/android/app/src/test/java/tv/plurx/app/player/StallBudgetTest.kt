@@ -147,6 +147,7 @@ class StallBudgetTest {
         val coordinator = SessionCreateCoordinator(
             createSession = {
                 calls++
+                budget.resetForUserAction()
                 throw badRequest
             },
             isBadRequest = { it === badRequest },
@@ -166,23 +167,34 @@ class StallBudgetTest {
     fun userActionMidStallInvalidatesViaSequenceAdvance() = runBlocking {
         val budget = StallReopenBudget()
         var calls = 0
+        val requestStarted = CompletableDeferred<Unit>()
+        val finishRequest = CompletableDeferred<Unit>()
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
             createSession = {
                 calls++
+                requestStarted.complete(Unit)
+                finishRequest.await()
                 throw badRequest
             },
             isBadRequest = { it === badRequest },
             freshRequestId = { "unused" },
         )
 
-        // Stall captures current sequence.  A user action (simulated by
-        // resetForUserAction) advances the sequence before the coordinator
-        // checks isCurrent, which invalidates the stall.
+        // Stall captures current sequence. A user action advances the
+        // sequence while the first request is in flight, before the
+        // coordinator considers the unbound fallback.
         val stallSeq = budget.userActionSequence
+        val stall = async {
+            coordinator.reopenAfterStall(stallBody()) {
+                stallSeq == budget.userActionSequence
+            }
+        }
+        requestStarted.await()
         budget.resetForUserAction()
+        finishRequest.complete(Unit)
 
-        assertNull(coordinator.reopenAfterStall(stallBody()) { stallSeq == budget.userActionSequence })
+        assertNull(stall.await())
         assertEquals(1, calls)
     }
 
@@ -338,12 +350,18 @@ class StallBudgetTest {
         val budget = StallReopenBudget()
         var callIndex = 0
         val calls = mutableListOf<CreateSessionReq>()
+        val requestStarted = CompletableDeferred<Unit>()
+        val finishRequest = CompletableDeferred<Unit>()
         val badRequest = TestBadRequest()
         val coordinator = SessionCreateCoordinator(
             createSession = { body ->
                 val idx = callIndex++
                 calls += body
-                if (idx == 0) throw badRequest
+                if (idx == 0) {
+                    requestStarted.complete(Unit)
+                    finishRequest.await()
+                    throw badRequest
+                }
                 response("fallback")
             },
             isBadRequest = { it === badRequest },
@@ -382,10 +400,12 @@ class StallBudgetTest {
 
         // User action advances the sequence before the fallback is sent,
         // causing isCurrent() to return false inside the coordinator.
+        requestStarted.await()
         budget.resetForUserAction()
+        finishRequest.complete(Unit)
 
-        assertEquals(1, calls.size)
         assertNull(stall.await())
+        assertEquals(1, calls.size)
     }
 
     private fun stallBody() = CreateSessionReq(
