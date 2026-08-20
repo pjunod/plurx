@@ -752,9 +752,9 @@ class Controller(
                 // 400 fallback: retry once as an unbound create with a fresh request_id
                 if (e.code() == 400 && requestVersion == sessionRequestVersion) {
                     val fallbackBody = body.copy(
-                        requestId = UUID.randomUUID().toString(),
-                        previousSessionId = null,
-                        reopenReason = null,
+                        request_id = UUID.randomUUID().toString(),
+                        previous_session_id = null,
+                        reopen_reason = null,
                     )
                     if (requestVersion != sessionRequestVersion) return@launch
                     val fallbackHls = try {
