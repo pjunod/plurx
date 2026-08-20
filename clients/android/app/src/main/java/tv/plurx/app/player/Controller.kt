@@ -70,6 +70,7 @@ import tv.plurx.app.ui.components.RequestInitialFocus
 import java.util.Locale
 import java.util.UUID
 
+import retrofit2.HttpException
 /**
  * A subtitle selection the viewer actually made, where `null` inside means
  * "Off". Distinct from no wrapper at all, which means nobody has chosen yet
@@ -187,13 +188,13 @@ class Controller(
     private var sameHdrRetryUsed = false
 
     /** Height resolved in the last stall reopen's `StartResponse`, or null at cold start. */
-    private var lastStallResolvedHeight: Int? = null
+    private var stallPredecessorHeight: Int? = null
 
     /** Consecutive stall-reopen responses at the same resolved rung. */
-    private var stallReopenSameRungCount = 0
+    private var stallReopenNonDowngradeCount = 0
 
     /** Max consecutive stall-reopen responses at the same rung before giving up. */
-    private val maxStallReopens = 3
+    private val maxStallNonDowngrade = 3
 
     /**
      * The delivery this plan would use with no subtitle in play. A manual A/V
@@ -519,8 +520,8 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        lastStallResolvedHeight = null
-        stallReopenSameRungCount = 0
+        stallPredecessorHeight = null
+        stallReopenNonDowngradeCount = 0
 
         player.removeListener(listener)
         mediaSession.release()
@@ -600,8 +601,8 @@ class Controller(
         // A user-initiated restart (seek, quality switch, track change) resets
         // the stall reopen budget — the viewer chose a new state, so any
         // previous floor is stale.
-        lastStallResolvedHeight = null
-        stallReopenSameRungCount = 0
+        stallPredecessorHeight = null
+        stallReopenNonDowngradeCount = 0
 
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
@@ -667,6 +668,9 @@ class Controller(
                 return@launch
             }
             sessionId = hls.session_id
+            // Save this session's resolved height so the stall-reopen budget
+            // can compare each stall response against the predecessor rung.
+            stallPredecessorHeight = hls.height
             encoder = hls.encoder
             sessionIsVod = hls.vod
             hls.delivered_dynamic_range?.let { deliveredRange = it }
@@ -700,7 +704,7 @@ class Controller(
         // If we have already exhausted the budget at the current floor rung,
         // stop reopening — the server cannot step further down and the client
         // must not churn forever.
-        if (stallReopenSameRungCount >= maxStallReopens) return
+        if (stallReopenNonDowngradeCount >= maxStallNonDowngrade) return
         val reason = "stall"
         val observedAtMs = monotonicNowMs()
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
@@ -709,6 +713,12 @@ class Controller(
         // those paths must NOT carry stall fields.
         val requestVersion = ++sessionRequestVersion
         val prevId = sessionId
+        // Capture the predecessor height for the same-rung budget
+        // before nulling the session ID.  The first stall reopen
+        // compares against this; subsequent stalls compare against
+        // each previous stall response.
+        val predecessorHeight = stallPredecessorHeight
+        stallPredecessorHeight = null
         // Keep the predecessor alive through the create request — the
         // server validates previous_session_id against a live session
         // map.  Session creation supersedes and kills the predecessor
@@ -737,6 +747,35 @@ class Controller(
                 vm.createHlsSession(plan.fileId, body)
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (e: HttpException) {
+                // 400 means the server refused the bound create (stale/foreign
+                // previous_session_id, unknown reopen_reason).  Retry once as
+                // an unbound create with a fresh request_id.
+                if (e.code() == 400 && requestVersion == sessionRequestVersion) {
+                    val fallbackBody = body.copy(
+                        requestId = UUID.randomUUID().toString(),
+                        previousSessionId = null,
+                        reopenReason = null,
+                    )
+                    val fallbackHls = try {
+                        vm.createHlsSession(plan.fileId, fallbackBody)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        if (requestVersion == sessionRequestVersion) {
+                            playbackTelemetry.cancel(attempt)
+                            onError("The stream stalled and recovery failed.")
+                        }
+                        return@launch
+                    }
+                    fallbackHls
+                } else {
+                    if (requestVersion == sessionRequestVersion) {
+                        playbackTelemetry.cancel(attempt)
+                        onError("The stream stalled and recovery failed.")
+                    }
+                    return@launch
+                }
             } catch (_: Exception) {
                 if (requestVersion == sessionRequestVersion) {
                     playbackTelemetry.cancel(attempt)
@@ -748,17 +787,21 @@ class Controller(
                 vm.endHlsSession(hls.session_id)
                 return@launch
             }
-            // Update the same-rung budget: if the server returned the same
-            // height as the last stall reopen, we are at the floor and may
-            // not keep churning forever.  A different height (successful
-            // downgrade) resets the count.
+            // Update the same-rung budget: the budget counts consecutive
+            // reopen responses that do NOT resolve a strictly lower rung than
+            // the predecessor (same rung, absent/zero height, or a higher
+            // rung).  A genuine strict downgrade resets the count.
+            // Absent or zero height counts as no step down — it is the server
+            // saying "this session is already at its answer" without a rung
+            // the client can compare.
             val resolvedHeight = hls.height
-            if (resolvedHeight != null && resolvedHeight == lastStallResolvedHeight) {
-                stallReopenSameRungCount++
+            val steppedDown = isStrictDowngrade(predecessorHeight, resolvedHeight)
+            if (steppedDown) {
+                stallReopenNonDowngradeCount = 0
             } else {
-                stallReopenSameRungCount = 0
+                stallReopenNonDowngradeCount++
             }
-            lastStallResolvedHeight = resolvedHeight
+            stallPredecessorHeight = resolvedHeight
             sessionId = hls.session_id
             encoder = hls.encoder
             sessionIsVod = hls.vod
@@ -910,13 +953,24 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        lastStallResolvedHeight = null
-        stallReopenSameRungCount = 0
+        stallPredecessorHeight = null
+        stallReopenNonDowngradeCount = 0
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —
         // otherwise a chip would keep reporting the session that just ended.
         deliveredRange = plan.deliveredDynamicRange
+    }
+
+    /**
+     * Pure stall-budget decision: whether one reopen response resolved a
+     * strictly lower rung than its predecessor.  Absent or zero height counts
+     * as no step down.  Tested in [StallBudgetTest].
+     */
+    internal companion object {
+        internal fun isStrictDowngrade(predecessorHeight: Int?, resolvedHeight: Int?): Boolean =
+            resolvedHeight != null && resolvedHeight > 0 &&
+                predecessorHeight != null && resolvedHeight < predecessorHeight
     }
 
     private fun remuxUri(ms: Long): String = progressiveRemuxUri(

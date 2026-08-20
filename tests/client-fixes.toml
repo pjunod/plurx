@@ -295,8 +295,32 @@ test_anchor = "test_repository_build_claims_match_release_inputs"
 
 [[fixes]]
 id = "android.bound-stall-downgrade"
-commits = ["c54f9411", "39eb38c7", "43dbf510"]
+commits = ["c54f9411", "39eb38c7", "43dbf510", "8a6d759"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
 source_anchor = "private fun onStall(positionMs: Long)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
+
+[[fixes]]
+id = "android.bound-stall-predecessor-alive"
+commits = ["4a0d61d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "// Keep the predecessor alive through the create request"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
 test_anchor = "stallReopenCarriesPreviousSessionIdAndReopenReason"
+
+[[fixes]]
+id = "android.bound-stall-budget-logic"
+commits = ["8a6d759"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "internal fun isStrictDowngrade(predecessorHeight: Int?, resolvedHeight: Int?)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
+
+[[fixes]]
+id = "android.bound-stall-400-fallback"
+commits = ["90b1a75"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "(e.code() == 400 && requestVersion == sessionRequestVersion)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "stallBudgetExercisesEveryAcceptanceCriterion"
