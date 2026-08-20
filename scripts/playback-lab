@@ -1490,10 +1490,14 @@ class CdpDriver {
       "--no-first-run",
       "--no-default-browser-check",
       "--autoplay-policy=no-user-gesture-required",
+      // Fixtures intentionally contain synthetic tones for audio-path checks;
+      // decode them in the browser without routing them to the host speakers.
+      "--mute-audio",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding",
-      "--disable-features=Translate,MediaRouter",
+      // Test playback must not claim the host's media keys or macOS Now Playing.
+      "--disable-features=Translate,MediaRouter,HardwareMediaKeyHandling",
       this.baseUrl,
     ].filter(Boolean);
     const logPath = path.join(this.runtime, "browser.log");

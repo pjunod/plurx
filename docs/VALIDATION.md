@@ -301,7 +301,11 @@ across every registered layout, route, and desktop/mobile viewport. A check
 rebuilds `plurxd` first so it cannot accidentally serve an old embedded web
 app, then runs a real browser sweep. It needs Python Playwright with Chromium,
 `ffmpeg`, and a buildable `plurxd`; expect it to take minutes rather than
-seconds.
+seconds. The generated player media includes a synthetic audio track so the
+browser exercises a real media timeline, but validation browsers always launch
+with host output muted and operating-system media-key integration disabled.
+Audio is still decoded and selectable; the gate neither sounds the workstation
+speakers nor claims macOS Now Playing.
 
 ```bash
 make ui-golden          # capture the current reviewed UI as the answer key
