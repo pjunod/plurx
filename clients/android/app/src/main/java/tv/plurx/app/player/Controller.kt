@@ -186,13 +186,13 @@ class Controller(
     /** One reconnect of the exact HDR recipe; a repeated failure is visible. */
     private var sameHdrRetryUsed = false
 
-    /** The predecessor session ID, set at each stall reopen for the next one. */
-    private var previousSessionId: String? = null
+    /** Height resolved in the last stall reopen's `StartResponse`, or null at cold start. */
+    private var lastStallResolvedHeight: Int? = null
 
-    /** How many times this playback has reopened due to a stall. */
-    private var stallReopenCount = 0
+    /** Consecutive stall-reopen responses at the same resolved rung. */
+    private var stallReopenSameRungCount = 0
 
-    /** Max consecutive stall reopens at the same rung before giving up. */
+    /** Max consecutive stall-reopen responses at the same rung before giving up. */
     private val maxStallReopens = 3
 
     /**
@@ -519,8 +519,8 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        previousSessionId = null
-        stallReopenCount = 0
+        lastStallResolvedHeight = null
+        stallReopenSameRungCount = 0
 
         player.removeListener(listener)
         mediaSession.release()
@@ -600,7 +600,8 @@ class Controller(
         // A user-initiated restart (seek, quality switch, track change) resets
         // the stall reopen budget — the viewer chose a new state, so any
         // previous floor is stale.
-        stallReopenCount = 0
+        lastStallResolvedHeight = null
+        stallReopenSameRungCount = 0
 
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
@@ -687,14 +688,19 @@ class Controller(
     /**
      * Called when a detected stall measurement is available. Reopens with the
      * stall-specific fields (previous_session_id, reopen_reason) and enforces
-     * the client-side retry budget: if the server returns the same height as
-     * the last stall reopen (the floor), we stop reopening after a bounded
-     * number of attempts.
+     * the client-side retry budget: the budget counts consecutive reopen
+     * responses at the same resolved rung (two or more stalls at 1080 that
+     * the server answers with 1080 each time).  A multi-rung downgrade —
+     * 2160 → 1080 → 720 — resets the count at each step, so it is never
+     * stopped early.  Once the budget is exhausted at the ladder floor the
+     * session stays on that rung without further reopen attempts.
      */
     private fun onStall(positionMs: Long) {
-        if (stallReopenCount >= maxStallReopens) return
         if (sessionId == null) return
-        stallReopenCount++
+        // If we have already exhausted the budget at the current floor rung,
+        // stop reopening — the server cannot step further down and the client
+        // must not churn forever.
+        if (stallReopenSameRungCount >= maxStallReopens) return
         val reason = "stall"
         val observedAtMs = monotonicNowMs()
         val attempt = beginPlaybackAttempt(reason, observedAtMs)
@@ -739,7 +745,17 @@ class Controller(
                 vm.endHlsSession(hls.session_id)
                 return@launch
             }
-            previousSessionId = hls.session_id
+            // Update the same-rung budget: if the server returned the same
+            // height as the last stall reopen, we are at the floor and may
+            // not keep churning forever.  A different height (successful
+            // downgrade) resets the count.
+            val resolvedHeight = hls.height
+            if (resolvedHeight != null && resolvedHeight == lastStallResolvedHeight) {
+                stallReopenSameRungCount++
+            } else {
+                stallReopenSameRungCount = 0
+            }
+            lastStallResolvedHeight = resolvedHeight
             sessionId = hls.session_id
             encoder = hls.encoder
             sessionIsVod = hls.vod
@@ -891,7 +907,8 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
-        previousSessionId = null
+        lastStallResolvedHeight = null
+        stallReopenSameRungCount = 0
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —
