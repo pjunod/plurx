@@ -537,6 +537,12 @@ checks = ["rust-gate"]
 reason = "The retained core regression `in_band_hevc_parameter_sets_fill_an_empty_dolby_vision_hvcc` reproduces the Dexter Profile 5 source's 23-byte hvcC with no VPS/SPS/PPS arrays, promotes the in-band parameter sets into a valid initialization record, reparses the result, and proves promotion is idempotent. The copy-argument regression requires non-backward-compatible Profile 5 to retain those units for the segmenter while ordinary HEVC and compatible-base Dolby Vision keep their existing normalization path; reverting only the production correction either leaves Apple TV without decoder configuration or regresses the established compatible-copy contract."
 
 [[coverage]]
+commits = ["72ec2024"]
+points = ["persistence.upgrades"]
+checks = ["rust-gate", "database-upgrades"]
+reason = "The retained `a_still_closing_predecessor_lock_is_not_reported_as_a_second_daemon` regression takes the data-directory lock, releases it 250ms later from another task, and requires the production `acquire_daemon_lock` entry point at its real five-second window to acquire rather than refuse. Reverting only the retry guard fails it immediately with `still locked inside this plurxd process ... after waiting 0.0s`, which is the pre-fix single non-blocking `try_lock`. The contract it must not weaken is covered in the other direction: `a_lock_held_for_the_whole_window_is_refused_without_blaming_another_process` proves a lock held for the whole window is still refused and that our own handle is never reported as a second daemon, `a_different_owner_is_still_reported_as_a_second_daemon` pins `another plurxd process already owns the data directory` to a foreign or unrecorded owner, and `subsequent_plurxd_run_reopens_the_completed_replicated_target` still runs two real daemons against one data directory and proves the live double-start is refused with that verdict and not misattributed to the contender itself. `database-upgrades` runs the same `cluster::migration` regressions, including `daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization`, which is the gate-parallel failure this corrects."
+
+[[coverage]]
 commits = ["b1132e8"]
 points = []
 checks = []

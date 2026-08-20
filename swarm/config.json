@@ -122,7 +122,14 @@
     "role_labels": {
       "lead": "swarm:lead",
       "builder": "swarm:builder",
-      "reviewer": "swarm:reviewer"
+      "reviewer": "swarm:reviewer",
+      "troubleshooter": "swarm:troubleshooter"
+    },
+    "diagnosis_role": "troubleshooter",
+    "diagnosis_fix_role": "builder",
+    "diagnosis_route": {
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4-pro-0813"
     },
     "poll_seconds": 30,
     "prefer_expiring_quota": true,
@@ -166,6 +173,9 @@
     },
     "reviewer": {
       "prompt": "swarm/reviewer.txt"
+    },
+    "troubleshooter": {
+      "prompt": "swarm/troubleshooter.txt"
     }
   },
   "workers": {
@@ -216,6 +226,12 @@
       "provider": "codex",
       "model": "gpt-5.6-sol",
       "clone": "plurx-core"
+    },
+    "troubleshooter": {
+      "role": "troubleshooter",
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4-pro-0813",
+      "clone": "plurx-troubleshooter"
     }
   }
 }
