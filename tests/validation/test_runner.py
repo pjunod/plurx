@@ -255,7 +255,7 @@ class CatalogCase(unittest.TestCase):
                 "docs/OFFLINE-VIEWING-PLAN.md",
                 "docs/OFFLINE-VIEWING-REVIEW.md",
                 "docs/STATUS.html",
-                "validation/regressions.toml",
+                "validation/regressions.d/a828a217-playback-pipeline.toml",
             ),
         )
 

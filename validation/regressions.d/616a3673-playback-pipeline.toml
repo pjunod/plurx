@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["616a3673"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained playlist regression pins that startup fails promptly when the child exits unsuccessfully before publishing usable output; reverting only the production correction restores the full poll-window hang."

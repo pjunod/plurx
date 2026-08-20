@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["647a6c9e"]
+points = ["cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained `a_replicated_deadline_is_never_reported_as_a_wal_size_violation` regression runs in the ordinary Rust gate without the three-voter cluster, because the rule protecting a load-sensitive gate must not itself be load-sensitive. It proves the production `STORE_TIMEOUT` text classifies as a deadline rather than a store fault, that the deadline diagnosis never contains the size verdict `byte-bounded transactions must carry probe rows a row count cannot` and does name both itself and docs/VALIDATION.md, and that a genuine oversized write (`ClientWriteError: panicked`, which is how hiqlite-wal's byte refusal reaches the client) still earns that size verdict — as does a deadline whose voter then fails a consistent readiness read. It pins the sentinel against the real `src/store/hiqlite.rs` source with `include_str!` so a rewording cannot silently send every timeout back to the WAL verdict. Removing only the deadline class, which is the pre-fix behavior where one `.expect` collapsed every failure into the size verdict, fails the regression with `the production deadline text must classify as a deadline, not as a store fault`. `cluster-auth` remains the check that exercises the same classifier against the live three-voter import."
