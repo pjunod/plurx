@@ -1876,7 +1876,7 @@ COMMIT;"
     async fn credential_generation_changes_on_password_reset_or_rehash() {
         use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
-        use crate::store::NetworkPriorStore;
+        use crate::store::{NetworkPriorStore, UserStore};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("plurx.db");
@@ -1886,8 +1886,13 @@ COMMIT;"
         let original_hash = auth::hash_password("original-password").expect("hash");
         let reset_hash = auth::hash_password("reset-password").expect("hash");
         let rehash_hash = auth::hash_password("rehash-password").expect("hash");
+        let user = store
+            .create_user("credential-owner", &original_hash, false)
+            .await
+            .expect("create user");
 
-        let original_gen = CredentialGeneration::derive(2, 5000, &original_hash);
+        let original_gen =
+            CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
         store
             .observe_network_prior(&NetworkPriorObservation {
                 credential_generation: original_gen.clone(),
@@ -1900,7 +1905,20 @@ COMMIT;"
             .await
             .expect("write prior under original credential");
 
-        let reset_gen = CredentialGeneration::derive(2, 5000, &reset_hash);
+        assert!(store
+            .set_password(user.id, &reset_hash)
+            .await
+            .expect("reset password"));
+        let reset_user = store
+            .get_user(user.id)
+            .await
+            .expect("load reset user")
+            .expect("reset user");
+        let reset_gen = CredentialGeneration::derive(
+            reset_user.id,
+            reset_user.created_at,
+            &reset_user.password_hash,
+        );
         assert_ne!(
             original_gen, reset_gen,
             "password reset must produce different generation"
@@ -1915,7 +1933,20 @@ COMMIT;"
             "password reset must cold-start prior lookup"
         );
 
-        let rehash_gen = CredentialGeneration::derive(2, 5000, &rehash_hash);
+        assert!(store
+            .set_password(user.id, &rehash_hash)
+            .await
+            .expect("rehash password"));
+        let rehashed_user = store
+            .get_user(user.id)
+            .await
+            .expect("load rehashed user")
+            .expect("rehashed user");
+        let rehash_gen = CredentialGeneration::derive(
+            rehashed_user.id,
+            rehashed_user.created_at,
+            &rehashed_user.password_hash,
+        );
         assert_ne!(
             original_gen, rehash_gen,
             "password rehash must produce different generation"
@@ -1939,7 +1970,7 @@ COMMIT;"
     async fn admin_role_change_preserves_credential_generation() {
         use crate::auth;
         use crate::domain::{CredentialGeneration, NetworkPriorObservation};
-        use crate::store::NetworkPriorStore;
+        use crate::store::{NetworkPriorStore, UserStore};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("plurx.db");
@@ -1947,7 +1978,11 @@ COMMIT;"
         let store = SqliteStore::open(&db).expect("create");
 
         let stable_hash = auth::hash_password("stable-password").expect("hash");
-        let gen = CredentialGeneration::derive(3, 3000, &stable_hash);
+        let user = store
+            .create_user("future-admin", &stable_hash, false)
+            .await
+            .expect("create user");
+        let gen = CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
         store
             .observe_network_prior(&NetworkPriorObservation {
                 credential_generation: gen.clone(),
@@ -1960,7 +1995,15 @@ COMMIT;"
             .await
             .expect("write prior");
 
-        let after_admin_change = CredentialGeneration::derive(3, 3000, &stable_hash);
+        assert!(store.set_admin(user.id, true).await.expect("promote user"));
+        let promoted = store
+            .get_user(user.id)
+            .await
+            .expect("load promoted user")
+            .expect("promoted user");
+        assert!(promoted.is_admin);
+        let after_admin_change =
+            CredentialGeneration::derive(promoted.id, promoted.created_at, &promoted.password_hash);
         assert_eq!(
             gen, after_admin_change,
             "admin-role change must preserve credential generation"
