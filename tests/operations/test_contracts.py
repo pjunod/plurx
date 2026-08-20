@@ -29,6 +29,15 @@ def workflow_job_blocks(path: str) -> dict[str, str]:
 
 
 class OperationsContractCase(unittest.TestCase):
+    def test_swarm_runtime_keeps_network_quota_and_role_boundaries_explicit(self):
+        config = json.loads(read("swarm/config.json"))
+
+        self.assertIs(config["runtime"]["worker_network_access"], True)
+        self.assertIs(config["queue"]["prefer_expiring_quota"], True)
+        for name, worker in config["workers"].items():
+            with self.subTest(worker=name):
+                self.assertNotIn("fallback_roles", worker)
+
     def test_compose_keeps_identity_data_and_host_ports_explicit(self):
         compose = read("deploy/docker-compose.yml")
         self.assertRegex(compose, r"(?m)^name: plurx$")
