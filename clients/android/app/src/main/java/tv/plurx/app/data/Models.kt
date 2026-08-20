@@ -199,11 +199,69 @@ data class BookChapter(
 )
 
 @Serializable
+data class ReadingRevision(
+    val size: Long,
+    val mtime: Long,
+)
+
+@Serializable
+data class ReadingLocations(
+    val fragments: List<String> = emptyList(),
+    val progression: Double? = null,
+    val totalProgression: Double? = null,
+    val position: Long? = null,
+)
+
+@Serializable
+data class ReadingText(
+    val before: String? = null,
+    val highlight: String? = null,
+    val after: String? = null,
+)
+
+@Serializable
+data class ReadingLocator(
+    val version: Int,
+    val href: String,
+    val type: String? = null,
+    val title: String? = null,
+    val locations: ReadingLocations? = null,
+    val text: ReadingText? = null,
+)
+
+@Serializable
+data class ReadingState(
+    val file_id: Long,
+    val revision: ReadingRevision,
+    val locator: ReadingLocator,
+    val progression: Double,
+    val completed: Boolean,
+    val updated_at: Long,
+)
+
+@Serializable
+data class ReadingStateResponse(
+    val state: ReadingState? = null,
+    val stale: Boolean,
+)
+
+@Serializable
+data class PutReadingStateRequest(
+    val file_id: Long,
+    val revision: ReadingRevision,
+    val locator: ReadingLocator,
+    val progression: Double,
+    val completed: Boolean,
+    val recorded_at: Long? = null,
+)
+
+@Serializable
 data class ItemDetail(
     val item: Item,
     val files: List<MediaFileDto> = emptyList(),
     val children: List<Item> = emptyList(),
     val ancestors: List<Item> = emptyList(),
+    val reading: ReadingState? = null,
 )
 
 @Serializable

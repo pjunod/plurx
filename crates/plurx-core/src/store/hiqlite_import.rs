@@ -529,6 +529,25 @@ const TABLES: &[TablePlan] = &[
         parent_first: false,
     },
     TablePlan {
+        name: "reading_state",
+        columns: &[
+            "user_id",
+            "item_id",
+            "file_id",
+            "file_size",
+            "file_mtime",
+            "locator_json",
+            "progression_millis",
+            "completed",
+            "updated_at",
+        ],
+        order_by: "user_id, item_id, file_id",
+        minimum_schema: 20,
+        import_filter: None,
+        sealed_columns: &[],
+        parent_first: false,
+    },
+    TablePlan {
         name: "trakt_auth",
         columns: &[
             "user_id",
@@ -1761,7 +1780,7 @@ mod tests {
         assert!(!names.contains(&"playback_events"));
         assert!(!names.contains(&"items_fts"));
         assert!(!names.contains(&"offline_lease_guards"));
-        assert_eq!(names.len(), 17, "review every imported durable table");
+        assert_eq!(names.len(), 18, "review every imported durable table");
     }
 
     #[test]

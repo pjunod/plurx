@@ -10,7 +10,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Query
+import retrofit2.http.DELETE
 
 @Serializable
 private data class NativeApiContractFixture(
@@ -26,6 +28,31 @@ class ModelContractTest {
     private val json = Json {
         ignoreUnknownKeys = true
         explicitNulls = false
+    }
+
+    @Test
+    fun readingStateRoutesMatchTheServerContract() {
+        val get = PlurxApi::class.java.declaredMethods.single { it.name == "readingState" }
+        assertEquals(
+            "items/{id}/reading-state",
+            requireNotNull(get.getAnnotation(GET::class.java)).value,
+        )
+        assertEquals(
+            listOf("file_id"),
+            get.parameterAnnotations
+                .flatMap { annotations -> annotations.filterIsInstance<Query>() }
+                .map(Query::value),
+        )
+        val put = PlurxApi::class.java.declaredMethods.single { it.name == "putReadingState" }
+        assertEquals(
+            "items/{id}/reading-state",
+            requireNotNull(put.getAnnotation(PUT::class.java)).value,
+        )
+        val delete = PlurxApi::class.java.declaredMethods.single { it.name == "deleteReadingState" }
+        assertEquals(
+            "items/{id}/reading-state",
+            requireNotNull(delete.getAnnotation(DELETE::class.java)).value,
+        )
     }
 
     @Test
@@ -66,6 +93,7 @@ class ModelContractTest {
             fixture.audiobook_detail.files.map(MediaFileDto::part_offset_ms),
         )
         assertEquals("Opening", fixture.audiobook_detail.files.first().chapters.first().title)
+        assertNull(fixture.item_detail.reading)
         assertEquals(20L, fixture.page.items.single().rollup!!.leaves)
         assertEquals("remux", fixture.decision.delivery!!.mode)
         assertEquals("dolby_vision", fixture.decision.delivered_dynamic_range)
@@ -76,6 +104,32 @@ class ModelContractTest {
         assertEquals("selected", defaults.audio.preferred_language_status)
         assertEquals(2L, defaults.subtitle.selected_index)
         assertEquals("eng", defaults.subtitle.preferred_language)
+    }
+
+    @Test
+    fun readingStateDecodesItsRevisionAndRendererNeutralLocator() {
+        val detail = json.decodeFromString<ItemDetail>(
+            """{
+              "item": {"id": 9, "kind": "book", "title": "Contract Book"},
+              "reading": {
+                "file_id": 90,
+                "revision": {"size": 4096, "mtime": 100},
+                "locator": {
+                  "version": 1,
+                  "href": "Text/chapter-3.xhtml",
+                  "locations": {"progression": 0.6, "totalProgression": 0.55}
+                },
+                "progression": 0.55,
+                "completed": false,
+                "updated_at": 200
+              }
+            }""".trimIndent(),
+        )
+
+        assertEquals(90L, detail.reading?.file_id)
+        assertEquals(4096L, detail.reading?.revision?.size)
+        assertEquals("Text/chapter-3.xhtml", detail.reading?.locator?.href)
+        assertEquals(0.55, detail.reading?.locator?.locations?.totalProgression)
     }
 
     /**

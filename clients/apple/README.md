@@ -12,10 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `67` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `68` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 67 gives stall recovery somewhere to go: a
+> same regression suite. Build 68 adds the revision-bound ebook reading-state
+> wire models and authenticated API routes without exposing a tvOS reader.
+> Build 67 gives stall recovery somewhere to go: a
 > reopen on a growing HLS session now names its exact predecessor with
 > `reopen_reason: "stall"`, so the server answers one rung *down* rather than
 > rebuilding the rung that just starved, states `quality_auto` so a subtitle
