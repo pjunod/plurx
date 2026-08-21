@@ -354,6 +354,7 @@ paths = [
   "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
+  "vendor/hiqlite/**",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
 ]
