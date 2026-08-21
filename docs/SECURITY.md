@@ -71,7 +71,10 @@ in-flight event cannot switch identities after a reset or delete/recreate.
 
 Password reset, password rehash, and delete/recreate start cold; an admin-role
 change preserves the generation. The digest is excluded from APIs, logs,
-metrics, telemetry payloads, and client diagnostics. SQLite v22 and the next
+metrics, telemetry payloads, and client diagnostics. A non-lookup numeric user
+id is retained beside each node-local row only to enforce the 64-network bound
+across credential generations; lookups remain scoped exclusively by the digest.
+SQLite v22 and the next
 node-local Hiqlite sidecar migration drop old numeric-key rows because they
 cannot be translated safely. This correction adds no replicated migration:
 replicated schema remains v6 and protocol remains v4.

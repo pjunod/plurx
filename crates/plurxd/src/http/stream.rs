@@ -1056,6 +1056,7 @@ pub async fn decision(
 ) -> Result<Json<DecisionResponse>, ApiError> {
     let mut identity = super::network::identity(&headers, remote);
     if let Some(ref mut id) = identity {
+        id.user_id = Some(user.id);
         id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
             user.id,
             user.created_at,

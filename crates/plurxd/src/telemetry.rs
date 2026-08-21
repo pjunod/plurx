@@ -238,6 +238,8 @@ pub(crate) struct NetworkIdentity {
     /// Credential-generation key used for prior storage lookups.
     /// Captured at authentication time and never exposed through APIs or logs.
     pub(crate) credential_generation: Option<CredentialGeneration>,
+    /// Non-lookup ownership metadata for cross-generation retention bounds.
+    pub(crate) user_id: Option<i64>,
 }
 
 /// Record metrics and persist an event without delaying the caller. The
@@ -299,6 +301,7 @@ fn prior_observation(
 ) -> Option<NetworkPriorObservation> {
     let network = network?;
     let credential_generation = network.credential_generation.as_ref()?;
+    let user_id = network.user_id?;
     let client_kbps = event
         .bandwidth_kbps
         .filter(|value| *value > 0)
@@ -325,6 +328,7 @@ fn prior_observation(
         None
     };
     (throughput_kbps.is_some() || starved_rung_height.is_some()).then(|| NetworkPriorObservation {
+        user_id,
         credential_generation: credential_generation.clone(),
         client_class: network.client_class.clone(),
         network_fingerprint: network.network_fingerprint.clone(),
@@ -395,6 +399,7 @@ mod tests {
             client_class: "chrome".to_owned(),
             network_fingerprint: "192.0.2.0/24".to_owned(),
             credential_generation: Some(CredentialGeneration::from("test-gen".to_owned())),
+            user_id: Some(42),
         };
         let event = PlaybackEvent {
             at_unix_ms: 123,

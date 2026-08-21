@@ -595,6 +595,7 @@ const MIGRATIONS: &[&str] = &[
     // cross-generation contamination this migration fixes.
     "DROP TABLE IF EXISTS network_priors;
     CREATE TABLE network_priors (
+        user_id               INTEGER NOT NULL,
         credential_generation TEXT NOT NULL,
         client_class          TEXT NOT NULL,
         network_fingerprint   TEXT NOT NULL,
@@ -606,7 +607,7 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (credential_generation, client_class, network_fingerprint)
     ) STRICT;
     CREATE INDEX network_priors_by_updated
-        ON network_priors(updated_at_ms, credential_generation, client_class);",
+        ON network_priors(updated_at_ms, user_id, client_class);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.

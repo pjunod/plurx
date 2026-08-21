@@ -2518,6 +2518,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
+                user_id: 42,
                 credential_generation: credential_generation.clone(),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: key.clone(),

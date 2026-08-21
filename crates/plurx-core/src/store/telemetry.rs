@@ -68,6 +68,7 @@ CREATE INDEX network_priors_by_updated
 #[cfg(any(test, feature = "hiqlite-store"))]
 pub(crate) const NETWORK_PRIORS_SCHEMA: &str = "
 CREATE TABLE network_priors (
+    user_id               INTEGER NOT NULL,
     credential_generation TEXT NOT NULL,
     client_class          TEXT NOT NULL,
     network_fingerprint   TEXT NOT NULL,
@@ -79,7 +80,7 @@ CREATE TABLE network_priors (
     PRIMARY KEY (credential_generation, client_class, network_fingerprint)
 ) STRICT;
 CREATE INDEX network_priors_by_updated
-    ON network_priors(updated_at_ms, credential_generation, client_class);";
+    ON network_priors(updated_at_ms, user_id, client_class);";
 
 #[cfg(any(test, feature = "hiqlite-store"))]
 const SIDECAR_SCHEMA_VERSION: i64 = 3;
@@ -233,13 +234,13 @@ pub(crate) fn observe_prior(
     // stays deterministic under test.
     transaction.execute(
         "INSERT INTO network_priors (
-             credential_generation, client_class, network_fingerprint, sustained_kbps,
+             user_id, credential_generation, client_class, network_fingerprint, sustained_kbps,
              worst_rung_height, starved_at_ms, sample_count, updated_at_ms
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5,
-             CASE WHEN ?5 IS NULL THEN NULL ELSE ?6 END,
-             CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END,
-             ?6
+             ?1, ?2, ?3, ?4, ?5, ?6,
+             CASE WHEN ?6 IS NULL THEN NULL ELSE ?7 END,
+             CASE WHEN ?5 IS NULL THEN 0 ELSE 1 END,
+             ?7
          )
          ON CONFLICT(credential_generation, client_class, network_fingerprint) DO UPDATE SET
              sustained_kbps = CASE
@@ -249,7 +250,7 @@ pub(crate) fn observe_prior(
              END,
              worst_rung_height = CASE
                  WHEN network_priors.starved_at_ms IS NULL
-                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?7
+                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?8
                      THEN excluded.worst_rung_height
                  WHEN excluded.worst_rung_height IS NULL THEN network_priors.worst_rung_height
                  ELSE min(network_priors.worst_rung_height, excluded.worst_rung_height)
@@ -257,7 +258,7 @@ pub(crate) fn observe_prior(
              starved_at_ms = CASE
                  WHEN excluded.starved_at_ms IS NOT NULL THEN excluded.starved_at_ms
                  WHEN network_priors.starved_at_ms IS NULL
-                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?7
+                      OR excluded.updated_at_ms - network_priors.starved_at_ms > ?8
                      THEN NULL
                  ELSE network_priors.starved_at_ms
              END,
@@ -269,6 +270,7 @@ pub(crate) fn observe_prior(
              updated_at_ms = excluded.updated_at_ms
          WHERE excluded.updated_at_ms >= network_priors.updated_at_ms",
         params![
+            observation.user_id,
             observation.credential_generation.as_str(),
             observation.client_class,
             observation.network_fingerprint,
@@ -280,15 +282,14 @@ pub(crate) fn observe_prior(
     )?;
     transaction.execute(
         "DELETE FROM network_priors
-         WHERE credential_generation = ?1 AND client_class = ?2
-           AND network_fingerprint IN (
-             SELECT network_fingerprint FROM network_priors
-             WHERE credential_generation = ?1 AND client_class = ?2
-             ORDER BY updated_at_ms DESC, network_fingerprint DESC
+         WHERE (credential_generation, client_class, network_fingerprint) IN (
+             SELECT credential_generation, client_class, network_fingerprint FROM network_priors
+             WHERE user_id = ?1 AND client_class = ?2
+             ORDER BY updated_at_ms DESC, credential_generation DESC, network_fingerprint DESC
              LIMIT -1 OFFSET ?3
            )",
         params![
-            observation.credential_generation.as_str(),
+            observation.user_id,
             observation.client_class,
             MAX_PRIORS_PER_USER_CLIENT,
         ],
@@ -529,6 +530,7 @@ mod tests {
         at_ms: i64,
     ) -> NetworkPriorObservation {
         NetworkPriorObservation {
+            user_id: 42,
             credential_generation: CredentialGeneration::from("test-gen".to_owned()),
             client_class: "safari".to_owned(),
             network_fingerprint: network.to_owned(),
@@ -732,6 +734,35 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
             .expect("remaining priors");
         assert_eq!(remaining, MAX_PRIORS_PER_USER_CLIENT - 3);
+    }
+
+    #[test]
+    fn prior_bound_spans_credential_generations_without_warming_the_replacement() {
+        let conn = prior_connection();
+        for generation in ["old-gen", "middle-gen"] {
+            for network in 0..40 {
+                let mut sample = observation(
+                    &format!("192.0.{network}.0/24"),
+                    Some(1_000),
+                    None,
+                    network + if generation == "old-gen" { 1 } else { 101 },
+                );
+                sample.credential_generation = CredentialGeneration::from(generation.to_owned());
+                observe_prior(&conn, &sample).expect("rotated-generation observation");
+            }
+        }
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_priors WHERE user_id = 42 AND client_class = 'safari'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count priors across generations");
+        assert_eq!(count, MAX_PRIORS_PER_USER_CLIENT);
+        assert!(get_prior(&conn, "new-gen", "safari", "192.0.39.0/24")
+            .expect("new generation lookup")
+            .is_none());
     }
 
     #[tokio::test]

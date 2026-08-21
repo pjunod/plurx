@@ -1069,6 +1069,9 @@ impl std::ops::Deref for CredentialGeneration {
 /// One telemetry-derived update to a [`NetworkPrior`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPriorObservation {
+    /// Non-lookup ownership metadata used only to enforce the bounded number
+    /// of retained priors across credential rotations.
+    pub user_id: i64,
     pub credential_generation: CredentialGeneration,
     pub client_class: String,
     pub network_fingerprint: String,

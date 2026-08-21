@@ -855,8 +855,8 @@ since adds:
 the conservative minimum of its client estimate and joined server delivery
 rate into a 25% EWMA. A supply/network stall records the lowest height known to
 starve, and when. Rows are node-local, retained for 30 days, and capped at 64
-networks per user/client class; a client routed to another cluster voter
-therefore starts cold, the tradeoff ratified in D9. The table stores only the
+networks per user/client class across credential generations; a client routed
+to another cluster voter therefore starts cold, the tradeoff ratified in D9. The table stores only the
 client class and IPv4 `/24`, never a full address. The class is derived from
 the request's own `User-Agent` on every path — the class is part of the primary
 key, so the reporting path and the consulting path must not derive it

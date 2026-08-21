@@ -659,6 +659,7 @@ pub async fn client_log(
     // read paths use, or the prior is written under a key nothing reads.
     let mut network = super::network::identity(&headers, remote);
     if let Some(ref mut id) = network {
+        id.user_id = Some(user.id);
         id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
             user.id,
             user.created_at,

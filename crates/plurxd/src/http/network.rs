@@ -49,6 +49,7 @@ pub(crate) fn identity(headers: &HeaderMap, remote: Option<SocketAddr>) -> Optio
         client_class: client_class(headers),
         network_fingerprint: format!("{a}.{b}.{c}.0/24"),
         credential_generation: None,
+        user_id: None,
     })
 }
 
