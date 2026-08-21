@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["99a29eef"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained classifier and three-voter failure regressions pin the last converged applied index as process-local state, so a missing voter's conservative worst-case lag survives a repeated status read and grows after a later acknowledged watch write; reverting only the production correction makes the second degraded sample drop the lag."

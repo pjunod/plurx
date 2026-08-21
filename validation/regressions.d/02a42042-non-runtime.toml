@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["02a42042"]
+points = []
+checks = []
+reason = "This commit only records the port-collision correction's current validation evidence in regressions.toml; it does not change runtime behavior."
+ignore = true

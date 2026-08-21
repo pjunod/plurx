@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0ec00529"]
+points = ["web.experience"]
+checks = ["web-membership"]
+reason = "The retained shipped-HTML regressions distinguish SQLite's explicit membership-unavailable state from real roster-read failures, require every late cluster completion to pass through the live Settings-route guard, and require a stale-node removal refusal to initiate the roster refresh its sentence promises; restoring the reviewed pre-correction index.html fails all three assertions."

@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["e85a33e4"]
+points = ["operations.packaging"]
+checks = ["operations-contract", "container-runtime"]
+reason = "The source contract pins cleanup between the two ffmpeg installs; the container smoke proves that image still builds and starts."

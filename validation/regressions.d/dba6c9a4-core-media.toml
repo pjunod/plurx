@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["dba6c9a4", "e237c918", "78b2fb8e"]
+points = ["core.media", "library.catalog", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The current workspace tests pin global HLS hold release, the restored prune assertion, and the small-library prune floor."
