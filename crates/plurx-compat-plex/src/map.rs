@@ -217,6 +217,10 @@ mod tests {
             artwork_attempted_at: None,
             artwork_error: None,
             genres: Vec::new(),
+            author: None,
+            book_work_id: None,
+            book_edition_id: None,
+            book_metadata_source: None,
         }
     }
 

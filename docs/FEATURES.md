@@ -215,11 +215,13 @@ inside one Books library while keeping their actions and metadata honest.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **Book metadata enrichment is not shipped yet.** **Open in…** remains
-  available for every supported escape path. Titles and authors come from the
-  file/folder layout or the EPUB package used by the reader; provider-backed
-  work/edition identity and durable package-cover extraction are not yet
-  implemented. DRM-protected books are not decrypted.
+- **Book facts and covers are durable.** Standalone EPUBs contribute bounded
+  package title, author, identifier, and embedded cover data without expanding
+  the archive; covers land only in Cinema's artwork cache. A paired Curator
+  handoff has higher precedence and supplies exact work/edition keys. Only a
+  shared explicit work key relates text and audio editions—title plus author
+  is never enough. **Open in…** remains available, and DRM-protected books are
+  not decrypted.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters
@@ -239,8 +241,10 @@ the physical Apple/Android device matrix remains a release acceptance step.
   shows filenames and no posters.
 - **AniList** agent for anime, **no key required**: absolute-numbering ordering,
   title variants, artwork.
-- **Books are local-only:** no provider lookup or guessed artwork. Audiobook
-  technical metadata and chapters come from the stored scan-time probe.
+- **Books use bounded local package facts or an explicit Curator handoff:** no
+  fuzzy provider lookup or guessed relation. Artwork is cached under Cinema's
+  data directory; media library paths remain read-only. Audiobook technical
+  metadata and chapters still come from the stored scan-time probe.
 - **Artwork cached locally** (posters, backdrops, season posters); provider JSON
   cached too. Once enriched, a library works **offline forever** — no provider
   is contacted to browse or play.
