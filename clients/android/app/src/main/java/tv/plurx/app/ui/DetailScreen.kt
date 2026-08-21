@@ -61,9 +61,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
 import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.data.ReadingState
 import tv.plurx.app.data.Session
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFactChip
@@ -108,6 +110,7 @@ fun DetailScreen(
     onPlay: (itemId: Long, fileId: Long, startMs: Long, tracks: PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onBack: () -> Unit,
 ) {
     var refresh by remember(itemId) { mutableIntStateOf(0) }
@@ -152,6 +155,7 @@ fun DetailScreen(
             onPlay = onPlay,
             onOpenItem = onOpenItem,
             onViewPhoto = onViewPhoto,
+            onRead = onRead,
             onWatchedChanged = { refresh++ },
             onBack = onBack,
         )
@@ -166,6 +170,7 @@ private fun DetailContent(
     onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onWatchedChanged: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -256,8 +261,10 @@ private fun DetailContent(
                         canResume = canResume,
                         trackChoices = trackChoices,
                         requestInitialFocus = formFactor == FormFactor.Television,
+                        reading = detail.reading,
                         onPlay = onPlay,
                         onViewPhoto = onViewPhoto,
+                        onRead = onRead,
                         onWatchedChanged = onWatchedChanged,
                     )
 
@@ -495,12 +502,15 @@ private fun Actions(
     canResume: Boolean,
     trackChoices: Map<Long, PreplayTracks>,
     requestInitialFocus: Boolean,
+    reading: ReadingState?,
     onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onWatchedChanged: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
+    val formFactor = currentFormFactor()
     val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -536,15 +546,24 @@ private fun Actions(
                     Text("  View full size")
                 }
             }
-        } else if (item.isBook && playable != null) {
-            item {
-                DetailPrimaryActionButton(
-                    onClick = {
-                        val url = Session.mediaUrl("/api/v1/files/${playable.id}/content")
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                    },
-                    requestInitialFocus = requestInitialFocus,
-                ) { Text("Open book", fontWeight = FontWeight.SemiBold) }
+        } else if (item.isBook) {
+            if (playable != null && formFactor != FormFactor.Television) {
+                if (offersBookReader(formFactor, playable)) {
+                    item {
+                        DetailPrimaryActionButton(
+                            onClick = { onRead(item.id, playable.id) },
+                            requestInitialFocus = requestInitialFocus,
+                        ) { Text(bookReadingLabel(reading, playable), fontWeight = FontWeight.SemiBold) }
+                    }
+                }
+                item {
+                    TvOutlinedButton(
+                        onClick = {
+                            val url = Session.mediaUrl("/api/v1/files/${playable.id}/content")
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        },
+                    ) { Text("Open in…", fontWeight = FontWeight.SemiBold) }
+                }
             }
         } else if (seriesPlayback != null) {
             item {
@@ -677,6 +696,16 @@ private fun Actions(
         }
     }
 }
+
+internal fun bookReadingLabel(reading: ReadingState?, file: MediaFileDto): String {
+    if (reading?.file_id != file.id) return "Read"
+    if (reading.completed) return "Read again"
+    val percent = (reading.progression.coerceIn(0.0, 1.0) * 100).roundToInt()
+    return if (percent > 0) "Resume reading · $percent%" else "Read"
+}
+
+internal fun offersBookReader(formFactor: FormFactor, file: MediaFileDto): Boolean =
+    formFactor != FormFactor.Television && file.available && file.isEpub
 
 @Composable
 internal fun DetailPrimaryActionButton(

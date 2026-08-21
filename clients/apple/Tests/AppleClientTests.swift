@@ -372,6 +372,78 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(detail.reading?.locator.locations?.totalProgression, 0.55)
     }
 
+    func testBookReaderPolicyAcceptsOnlyAvailablePhoneAndTabletEpubs() {
+        let epub = MediaFile(id: 90, filename: "Contract.EPUB", available: true)
+        let pdf = MediaFile(id: 91, filename: "Contract.pdf", available: true)
+        let missing = MediaFile(id: 92, filename: "Missing.epub", available: false)
+
+        XCTAssertTrue(BookReaderPolicy.canRead(epub, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(epub, onTelevision: true))
+        XCTAssertFalse(BookReaderPolicy.canRead(pdf, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(missing, onTelevision: false))
+    }
+
+    #if os(iOS)
+    func testNativeReaderHandoffKeepsTheBearerOutOfTheURLAndEscapesTheScript() throws {
+        let shell = try XCTUnwrap(NativeReaderHandoff.shellURL(origin: "https://cinema.example:9443"))
+        XCTAssertEqual(shell.absoluteString, "https://cinema.example:9443/?native-reader=1")
+        XCTAssertFalse(shell.absoluteString.contains("bearer"))
+
+        let script = try XCTUnwrap(NativeReaderHandoff.startScript(
+            token: "bearer\"\\line",
+            itemId: 9,
+            fileId: 90
+        ))
+        XCTAssertEqual(script, #"window.startNativeReader("bearer\"\\line",9,90);"#)
+        XCTAssertNil(NativeReaderHandoff.startScript(token: "", itemId: 9, fileId: 90))
+        XCTAssertNil(NativeReaderHandoff.shellURL(origin: "file:///tmp/cinema"))
+        XCTAssertTrue(NativeReaderHandoff.permitsNavigation(
+            URL(string: "https://cinema.example:9443/api/v1/publication/cap/Text/chapter.xhtml")!,
+            from: shell
+        ))
+        XCTAssertFalse(NativeReaderHandoff.permitsNavigation(
+            URL(string: "https://attacker.invalid/chapter.xhtml")!,
+            from: shell
+        ))
+        XCTAssertFalse(NativeReaderHandoff.permitsNavigation(
+            URL(string: "https://cinema.example:9443/api/v1/items/9")!,
+            from: shell
+        ))
+    }
+
+    func testNativeBookActionLabelsResumeAndExplicitCompletion() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let detail = try decoder.decode(ItemDetail.self, from: Data(#"""
+        {
+          "item":{"id":9,"kind":"book","title":"Contract Book"},
+          "files":[{"id":90,"filename":"contract.epub","available":true}],
+          "reading":{
+            "file_id":90,"revision":{"size":4096,"mtime":100},
+            "locator":{"version":1,"href":"Text/chapter.xhtml"},
+            "progression":0.42,"completed":false,"updated_at":200
+          }
+        }
+        """#.utf8))
+        let file = try XCTUnwrap(detail.files?.first)
+        XCTAssertEqual(DetailView.bookReadingLabel(detail, file: file), "Resume reading · 42%")
+
+        let finished = ItemDetail(
+            item: detail.item,
+            files: detail.files,
+            reading: ReadingState(
+                fileId: 90,
+                revision: ReadingRevision(size: 4096, mtime: 100),
+                locator: ReadingLocator(version: 1, href: "Text/chapter.xhtml"),
+                progression: 1,
+                completed: true,
+                updatedAt: 201
+            )
+        )
+        XCTAssertEqual(DetailView.bookReadingLabel(finished, file: file), "Read again")
+    }
+    #endif
+
     func testAppVersionLabelIncludesThePackageBuild() {
         XCTAssertEqual(
             AppBuildInfo.label(version: "0.2.0", build: "2"),
