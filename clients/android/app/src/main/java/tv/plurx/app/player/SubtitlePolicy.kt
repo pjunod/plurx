@@ -247,6 +247,7 @@ internal fun subtitleSessionBody(
     audioOffsetMs: Long,
     quality: PlaybackQuality,
     sourceHeight: Int?,
+    maxTranscodeHeight: Int? = null,
     deliveredDynamicRange: String? = null,
     previousSessionId: String? = null,
     reopenReason: ReopenReason? = null,
@@ -263,6 +264,7 @@ internal fun subtitleSessionBody(
         } else {
             sessionHeight(quality, delivery, sourceHeight, copyableVideo)
         },
+        max_height = maxTranscodeHeight?.takeIf { !copy && it > 0 },
         start = startSeconds,
         audio = audioIndex?.toInt(),
         subtitle_burn = subtitleIndex?.toInt().takeIf { delivery == SubtitleDelivery.Burn },

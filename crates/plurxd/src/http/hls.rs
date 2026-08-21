@@ -119,6 +119,11 @@ pub struct CreateSession {
     /// which encoder wins, and the player only learns that from the response
     /// to this request (see `TranscodeManager::auto_height`).
     pub height: Option<i64>,
+    /// Maximum output height this client proved for the decoder that receives
+    /// a normal SDR transcode. This bounds Auto without choosing its rung:
+    /// encoder capability and network history still decide below it. Manual
+    /// quality choices remain authoritative.
+    pub max_height: Option<i64>,
     /// Whether the VIEWER chose Auto quality. This is what decides stall
     /// stickiness, and it is not the same question as "did this body carry a
     /// `height`".
@@ -265,6 +270,18 @@ fn session_delivered_dynamic_range(
     ))
 }
 
+/** Bound an automatic rung by what the receiving decoder proved. */
+fn client_bounded_height(height: i64, automatic: bool, max_height: Option<i64>) -> i64 {
+    let bounded = if automatic {
+        max_height
+            .filter(|ceiling| *ceiling > 0)
+            .map_or(height, |ceiling| height.min(ceiling))
+    } else {
+        height
+    };
+    bounded.clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT)
+}
+
 /// POST /api/v1/files/:id/hls/sessions — create a stream, or recover the one
 /// an identical request already created.
 pub async fn create(
@@ -296,6 +313,7 @@ pub async fn create(
     let identity = super::network::identity(&headers, remote);
     let network_prior =
         super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+    let automatic = req.quality_auto.unwrap_or(req.height.is_none());
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately
@@ -314,6 +332,7 @@ pub async fn create(
         Some(h) => crate::transcode::snap_height(h),
     }
     .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT);
+    let height = client_bounded_height(height, automatic, req.max_height);
     let native_subtitles = req.native_subtitles == Some(true);
     let native_subtitle = req.subtitle.filter(|s| *s >= 0);
     if native_subtitles {
@@ -451,6 +470,7 @@ pub async fn start(
         previous_session_id: None,
         reopen_reason: None,
         height: q.height,
+        max_height: None,
         // The GET bridge has no quality-intent parameter, so it keeps the
         // wire-presence inference it has always had.
         quality_auto: None,
@@ -2113,6 +2133,19 @@ mod tests {
     }
 
     #[test]
+    fn automatic_height_respects_the_receiving_decoder_without_redefining_manual_quality() {
+        assert_eq!(client_bounded_height(2160, true, Some(2160)), 2160);
+        assert_eq!(client_bounded_height(2160, true, Some(1080)), 1080);
+        assert_eq!(client_bounded_height(720, true, Some(1080)), 720);
+        assert_eq!(
+            client_bounded_height(2160, false, Some(1080)),
+            2160,
+            "a manual Original/2160 choice remains authoritative"
+        );
+        assert_eq!(client_bounded_height(2160, true, Some(0)), 2160);
+    }
+
+    #[test]
     fn a_typed_stall_reopen_reaches_the_claim_unchanged() {
         let body = serde_json::json!({
             "playback_id": "native-player",
@@ -2329,6 +2362,7 @@ mod tests {
             previous_session_id: None,
             reopen_reason: None,
             height: None,
+            max_height: None,
             quality_auto: None,
             subtitle_burn: None,
             subtitle_burn_sdr: None,
@@ -2356,6 +2390,7 @@ mod tests {
             previous_session_id: None,
             reopen_reason: None,
             height: Some(2160),
+            max_height: None,
             quality_auto: None,
             subtitle_burn: Some(5),
             subtitle_burn_sdr: None,

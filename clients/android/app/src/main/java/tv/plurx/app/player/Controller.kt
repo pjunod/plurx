@@ -62,6 +62,7 @@ import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.SubTrack
 import tv.plurx.app.data.Net
 import tv.plurx.app.data.Session
+import tv.plurx.app.data.codecHeightCeiling
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
@@ -756,6 +757,7 @@ class Controller(
                 audioOffsetMs = audioOffsetMs,
                 quality = vm.preferences.value.playbackQuality,
                 sourceHeight = plan.sourceHeight,
+                maxTranscodeHeight = codecHeightCeiling(caps, "h264"),
                 deliveredDynamicRange = deliveredRange,
                 previousSessionId = prevId,
                 reopenReason = ReopenReason.Stall,
@@ -833,6 +835,7 @@ class Controller(
         audioOffsetMs = audioOffsetMs,
         quality = vm.preferences.value.playbackQuality,
         sourceHeight = plan.sourceHeight,
+        maxTranscodeHeight = codecHeightCeiling(caps, "h264"),
         deliveredDynamicRange = deliveredRange,
     )
 

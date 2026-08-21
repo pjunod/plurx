@@ -19,8 +19,10 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `37` — native viewer parity across phone, foldable,
-> and TV. Build 37 reports codec-specific decoder-height ceilings, acknowledges
+> Status: **v0.2.7**, build `38` — native viewer parity across phone, foldable,
+> and TV. Build 38 caps software-only video decoders at 1080p and carries the
+> proven H.264 ceiling into server Auto without turning it into a manual rung.
+> Build 37 reports codec-specific decoder-height ceilings, acknowledges
 > an already-SDR forced-subtitle plan explicitly, and persists redacted failures
 > that happen before Media3 starts. Build 36 consumes Cinema's server-owned ebook format/action registry
 > so detected-but-external formats cannot acquire a false **Read** or offline
