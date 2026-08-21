@@ -337,6 +337,9 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(fixture.server.name, "Contract server")
         XCTAssertEqual(fixture.itemDetail.item.title, "The Contract")
         XCTAssertTrue(fixture.audiobookDetail.item.isAudiobook)
+        XCTAssertEqual(fixture.audiobookDetail.item.author, "A. Contract")
+        XCTAssertEqual(fixture.audiobookDetail.item.bookWorkId, "curator:work:contract")
+        XCTAssertEqual(fixture.audiobookDetail.editions?.first?.bookEditionId, "curator:edition:ebook")
         XCTAssertEqual(fixture.audiobookDetail.files?.map(\.partOffsetMs), [0, 60_000, 180_000])
         XCTAssertEqual(fixture.audiobookDetail.files?.first?.chapters?.first?.title, "Opening")
         XCTAssertNil(fixture.itemDetail.reading)
@@ -5388,6 +5391,7 @@ final class AppleClientTests: XCTestCase {
             HomeLayoutPolicy.topLevelTabs,
             ["Home", "Libraries", "Search", "Downloads", "Settings"]
         )
+        XCTAssertEqual(HomeLayoutPolicy.offlineLaunchTab, .downloads)
         XCTAssertEqual(OfflineQuality.standard.maximumHeight, 720)
         XCTAssertEqual(OfflineQuality.high.maximumHeight, 1_080)
         XCTAssertEqual(OfflineNetworkPolicy.wifiOnly.label, "Wi-Fi only")

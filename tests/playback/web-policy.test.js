@@ -1537,6 +1537,36 @@ function detailHarness({ decisions = {} } = {}) {
   return { ...shipped, requested };
 }
 
+function bookMetadataHarness() {
+  const build = new Function(
+    "grid",
+    [
+      shippedSource("esc"),
+      shippedSource("bookByline"),
+      shippedSource("bookEditionSection"),
+      "return {bookByline, bookEditionSection};",
+    ].join("\n"),
+  );
+  return build((items) => `<div data-editions="${items.length}"></div>`);
+}
+
+test("book bylines escape provider text and edition rows use only server relations", () => {
+  const shipped = bookMetadataHarness();
+  const byline = shipped.bookByline({
+    kind: "book",
+    author: 'A. Reader <script src="https://example.com/x.js"></script>',
+  });
+  assert.match(byline, /^<div class="muted"[^>]*>By A\. Reader /);
+  assert.doesNotMatch(byline, /<script/);
+  assert.match(byline, /&lt;script/);
+  assert.equal(shipped.bookByline({ kind: "movie", author: "Wrong" }), "");
+  assert.equal(shipped.bookEditionSection({ editions: [] }), "");
+  assert.match(
+    shipped.bookEditionSection({ editions: [{ id: 2, kind: "audiobook" }] }),
+    /Other editions[\s\S]+data-editions="1"/,
+  );
+});
+
 const MOVIE_FILE = {
   id: 42,
   filename: "Arrival.2016.mkv",
