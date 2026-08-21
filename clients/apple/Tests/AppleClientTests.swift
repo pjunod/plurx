@@ -5391,6 +5391,7 @@ final class AppleClientTests: XCTestCase {
             HomeLayoutPolicy.topLevelTabs,
             ["Home", "Libraries", "Search", "Downloads", "Settings"]
         )
+        XCTAssertEqual(HomeLayoutPolicy.offlineLaunchTab, .downloads)
         XCTAssertEqual(OfflineQuality.standard.maximumHeight, 720)
         XCTAssertEqual(OfflineQuality.high.maximumHeight, 1_080)
         XCTAssertEqual(OfflineNetworkPolicy.wifiOnly.label, "Wi-Fi only")

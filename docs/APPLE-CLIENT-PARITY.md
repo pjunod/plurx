@@ -9,10 +9,11 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-21): source is v0.2.7, Apple build 72. Native text
+> Status (2026-08-21): source is v0.2.7, Apple build 73. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 72 displays bounded book author metadata and only exact
+> landed. Build 73 preserves the full tab shell when offline downloads open
+> first, so reconnect and Settings remain reachable. Build 72 displays bounded book author metadata and only exact
 > work-linked editions. Build 71 scopes newest pending offline reading state to the exact
 > item/file/revision edition. Build 70 adds profile-scoped, atomically published offline EPUBs,
 > token-free local reading, and newest-locator reconnect replay on iPhone/iPad.
