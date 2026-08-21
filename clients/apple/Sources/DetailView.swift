@@ -671,8 +671,11 @@ enum TVPlayableDetailMetrics {
 struct ReaderContext: Identifiable, Equatable {
     let itemId: Int
     let fileId: Int
+    let title: String
+    let format: String
+    let revision: ReadingRevision?
 
-    var id: String { "\(itemId):\(fileId)" }
+    var id: String { "\(itemId):\(fileId):\(format)" }
 }
 #endif
 
@@ -811,8 +814,13 @@ struct DetailView: View {
         .fullScreenCover(item: $reader, onDismiss: {
             Task { detail = try? await model.itemDetail(itemId) }
         }) { context in
-            ReaderView(context: context)
-                .environmentObject(model)
+            if context.format == "pdf", context.revision != nil {
+                PDFReaderView(context: context)
+                    .environmentObject(model)
+            } else {
+                ReaderView(context: context)
+                    .environmentObject(model)
+            }
         }
         .fullScreenCover(item: $offlineReader, onDismiss: {
             Task {
@@ -1802,6 +1810,10 @@ struct DetailView: View {
     /// Movies and single-file books keep the established first-file behavior.
     static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
         let files = detail.files ?? []
+        if detail.item.isBook {
+            return files.first { BookReaderPolicy.canRead($0, onTelevision: false) }
+                ?? files.first
+        }
         guard detail.item.isAudiobook else { return files.first }
         return AudiobookTimeline.file(at: positionMs, in: files)
     }
@@ -2160,7 +2172,13 @@ struct DetailView: View {
                 if let local = bookDownloads.books.first(where: { $0.fileId == file.id && $0.isPlayable }) {
                     offlineReader = local
                 } else {
-                    reader = ReaderContext(itemId: detail.item.id, fileId: file.id)
+                    reader = ReaderContext(
+                        itemId: detail.item.id,
+                        fileId: file.id,
+                        title: detail.item.title,
+                        format: file.reader?.format ?? "epub",
+                        revision: file.readerRevision
+                    )
                 }
             } label: {
                 Label(Self.bookReadingLabel(detail, file: file), systemImage: "book.fill")
@@ -2175,7 +2193,9 @@ struct DetailView: View {
             }
             .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: false))
 
-            mobileBookDownloadButton(detail: detail, file: file)
+            if BookReaderPolicy.canDownload(file, onTelevision: false) {
+                mobileBookDownloadButton(detail: detail, file: file)
+            }
         } else {
             Button {
                 openBookExternally(file)

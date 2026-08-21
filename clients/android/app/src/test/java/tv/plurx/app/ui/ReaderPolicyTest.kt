@@ -9,6 +9,8 @@ import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.data.ReadingLocator
 import tv.plurx.app.data.ReadingRevision
 import tv.plurx.app.data.ReadingState
+import tv.plurx.app.data.ReaderCapability
+import tv.plurx.app.data.ReaderSurfaceCapability
 
 class ReaderPolicyTest {
     private val epub = MediaFileDto(id = 90, filename = "Contract.EPUB")
@@ -59,11 +61,26 @@ class ReaderPolicyTest {
 
     @Test
     fun readerActionIsEpubOnlyAndNeverAppearsOnTelevision() {
+        val handoff = ReaderCapability(
+            format = "pdf",
+            web = ReaderSurfaceCapability(online = "open_in"),
+            apple = ReaderSurfaceCapability(online = "open_in"),
+            android = ReaderSurfaceCapability(online = "open_in"),
+        )
+        val disguised = epub.copy(filename = "LooksLike.epub", reader = handoff)
         assertTrue(offersBookReader(FormFactor.Compact, epub))
         assertTrue(offersBookReader(FormFactor.Expanded, epub))
         assertFalse(offersBookReader(FormFactor.Television, epub))
         assertFalse(offersBookReader(FormFactor.Compact, epub.copy(filename = "Contract.pdf")))
         assertFalse(offersBookReader(FormFactor.Compact, epub.copy(available = false)))
+        assertFalse(offersBookReader(FormFactor.Compact, disguised))
+        assertFalse(disguised.supportsOfflineBookReader)
+    }
+
+    @Test
+    fun bookFileSelectionPrefersTheRegisteredReaderOverListOrder() {
+        val pdf = epub.copy(id = 91, filename = "Contract.pdf")
+        assertEquals(epub, playbackFile(tv.plurx.app.data.Item(id = 1, kind = "book", title = "Contract"), listOf(pdf, epub), 0))
     }
 
     @Test
