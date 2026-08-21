@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use plurx_core::domain::{NetworkPriorObservation, PlaybackEvent};
+use plurx_core::domain::{CredentialGeneration, NetworkPriorObservation, PlaybackEvent};
 use plurx_core::store::{keys, Store};
 
 const TTFF_BUCKETS: [i64; 8] = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
@@ -235,6 +235,9 @@ static METRICS: LazyLock<PlaybackMetrics> = LazyLock::new(PlaybackMetrics::new);
 pub(crate) struct NetworkIdentity {
     pub(crate) client_class: String,
     pub(crate) network_fingerprint: String,
+    /// Credential-generation key used for prior storage lookups.
+    /// Captured at authentication time and never exposed through APIs or logs.
+    pub(crate) credential_generation: Option<CredentialGeneration>,
 }
 
 /// Record metrics and persist an event without delaying the caller. The
@@ -295,7 +298,7 @@ fn prior_observation(
     network: Option<&NetworkIdentity>,
 ) -> Option<NetworkPriorObservation> {
     let network = network?;
-    let user_id = event.user_id.filter(|value| *value > 0)?;
+    let credential_generation = network.credential_generation.as_ref()?;
     let client_kbps = event
         .bandwidth_kbps
         .filter(|value| *value > 0)
@@ -322,7 +325,7 @@ fn prior_observation(
         None
     };
     (throughput_kbps.is_some() || starved_rung_height.is_some()).then(|| NetworkPriorObservation {
-        user_id,
+        credential_generation: credential_generation.clone(),
         client_class: network.client_class.clone(),
         network_fingerprint: network.network_fingerprint.clone(),
         throughput_kbps,
@@ -391,6 +394,7 @@ mod tests {
         let network = NetworkIdentity {
             client_class: "chrome".to_owned(),
             network_fingerprint: "192.0.2.0/24".to_owned(),
+            credential_generation: Some(CredentialGeneration::from("test-gen".to_owned())),
         };
         let event = PlaybackEvent {
             at_unix_ms: 123,

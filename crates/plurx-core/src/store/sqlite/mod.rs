@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
-use crate::store::telemetry::{NETWORK_PRIORS_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
+use crate::store::telemetry::{NETWORK_PRIORS_V2_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -552,7 +552,7 @@ const MIGRATIONS: &[&str] = &[
     // v19: opt-in, bounded, node-local network priors. No foreign keys on
     // purpose: the hiqlite backend carries this exact table in its per-voter
     // telemetry sidecar rather than replicating observations through Raft.
-    NETWORK_PRIORS_SCHEMA,
+    NETWORK_PRIORS_V2_SCHEMA,
     // v20: per-user text-publication state. A locator is bound to one exact
     // file revision because the same chapter href in a replaced edition is
     // not evidence that it names the same text. Progress is millionths on
@@ -583,6 +583,30 @@ const MIGRATIONS: &[&str] = &[
         CHECK (book_metadata_source IN ('epub', 'curator'));
     CREATE INDEX idx_items_book_work ON items(book_work_id)
         WHERE book_work_id IS NOT NULL;",
+    // v22: isolate N4.2 network priors by credential generation. The old PK
+    // used a numeric user_id that survives delete/recreate unchanged, which
+    // lets a prior from the old identity contaminate the new one. Replacing
+    // it with an opaque SHA-256 credential-generation digest — derived from
+    // user.id, user.created_at, and the complete Argon2 PHC password_hash —
+    // makes each credential generation a separate prior namespace. Old
+    // numeric-key prior rows are dropped because they cannot be translated:
+    // the user_id alone is not enough material to recover the credential
+    // generation, and any translation scheme would preserve the very
+    // cross-generation contamination this migration fixes.
+    "DROP TABLE IF EXISTS network_priors;
+    CREATE TABLE network_priors (
+        credential_generation TEXT NOT NULL,
+        client_class          TEXT NOT NULL,
+        network_fingerprint   TEXT NOT NULL,
+        sustained_kbps        INTEGER,
+        worst_rung_height     INTEGER,
+        starved_at_ms         INTEGER,
+        sample_count          INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms         INTEGER NOT NULL,
+        PRIMARY KEY (credential_generation, client_class, network_fingerprint)
+    ) STRICT;
+    CREATE INDEX network_priors_by_updated
+        ON network_priors(updated_at_ms, credential_generation, client_class);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1267,7 +1291,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 21,
+            version, 22,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1413,7 +1437,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1468,7 +1492,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1490,7 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn v19_adds_node_local_network_priors_without_touching_v18_rows() {
-        use crate::domain::NetworkPriorObservation;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1521,7 +1545,7 @@ mod tests {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 1,
+                credential_generation: CredentialGeneration::from("v19-test-gen".to_owned()),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(6_000),
@@ -1536,7 +1560,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1614,7 +1638,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1675,7 +1699,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1688,6 +1712,65 @@ mod tests {
         assert_eq!(index, 1);
     }
 
+    #[tokio::test]
+    async fn v22_replaces_user_id_key_with_credential_generation() {
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(20) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.execute_batch(
+                "INSERT INTO network_priors
+                     (user_id, client_class, network_fingerprint, sample_count, updated_at_ms)
+                 VALUES (1, 'chrome', '192.0.2.0/24', 5, 1000);
+                 INSERT INTO settings (key, value)
+                 VALUES ('migration.proof', 'survives-v21');",
+            )
+            .expect("seed v20 rows");
+            conn.pragma_update(None, "user_version", 21)
+                .expect("version");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v21 to v22");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives-v21")
+        );
+        let prior = store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: CredentialGeneration::from("v22-test-gen".to_owned()),
+                client_class: "safari".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(8_000),
+                observed_at_ms: 2_000_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write v22 prior");
+        assert_eq!(prior.sustained_kbps, Some(8_000));
+        assert_eq!(prior.credential_generation.as_str(), "v22-test-gen");
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            22
+        );
+        let old_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
+            .expect("count new-format rows");
+        assert_eq!(old_rows, 1, "legacy numeric-key rows must be dropped");
+    }
     /// v13 adds a column to `items`, which is the migration shape with a
     /// silent failure mode: `ITEM_COLS` and `ITEM_COL_COUNT` are positional,
     /// and four queries select `ITEM_COLS` and then read their own trailing
