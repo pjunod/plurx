@@ -870,7 +870,6 @@ impl ActivationMarker {
     }
 
     fn validate(&self) -> Result<(), StoreError> {
-        if self.marker_version == 0 || self.marker_version > ACTIVATION_MARKER_VERSION {
             return Err(StoreError::Migration(format!(
                 "unsupported Hiqlite activation marker version {}",
                 self.marker_version

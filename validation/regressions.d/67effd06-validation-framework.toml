@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["67effd06"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "This metadata-only commit adds the 201f03fd regression evidence file. `make history-check` validates that the associated corrective commit resolves to retained evidence."
