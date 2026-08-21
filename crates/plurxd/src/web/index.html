@@ -2490,8 +2490,39 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 const PlaybackPolicy = window.PlurxPlaybackPolicy;
 const ReaderCore = window.PlurxReaderCore;
 const API = "/api/v1";
-let TOKEN = localStorage.getItem("plurx_token") || null;
+// Native phone/tablet shells load this trusted page at the server origin, then
+// hand their bearer directly into this JavaScript realm. It never enters a
+// URL, localStorage, or the authored publication frame. The query flag carries
+// no authority; it only keeps the ordinary sign-in screen from flashing while
+// the native WebView prepares the handoff.
+const NATIVE_READER_BOOT = new URLSearchParams(location.search).get("native-reader")==="1";
+let TOKEN = NATIVE_READER_BOOT ? null : (localStorage.getItem("plurx_token") || null);
 let ME = null;
+
+function nativeReaderPost(event,message=""){
+  if(!NATIVE_READER_BOOT) return false;
+  const payload={event,message:String(message||"")};
+  try{
+    const apple=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.cinemaReader;
+    if(apple&&typeof apple.postMessage==="function"){ apple.postMessage(payload); return true; }
+    if(window.CinemaNative&&typeof window.CinemaNative.postMessage==="function"){
+      window.CinemaNative.postMessage(JSON.stringify(payload)); return true;
+    }
+  }catch(e){}
+  return false;
+}
+
+async function startNativeReader(token,itemId,fileId){
+  const item=Number(itemId), file=Number(fileId);
+  if(!NATIVE_READER_BOOT||typeof token!=="string"||!token||!Number.isInteger(item)||item<1||!Number.isInteger(file)||file<1){
+    nativeReaderPost("error","Cinema could not validate this reader handoff."); return false;
+  }
+  TOKEN=token; ME=null;
+  history.replaceState(null,"",`${location.pathname}?native-reader=1#/read/${item}/${file}`);
+  await boot();
+  return true;
+}
+window.startNativeReader=startNativeReader;
 
 // ---- api helpers ----------------------------------------------------------
 async function api(path, {method="GET", body=null, raw=false}={}){
@@ -2933,7 +2964,14 @@ function artHtml(it, cls){
 }
 
 // ---- auth flows -----------------------------------------------------------
-function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working"); render(); }
+function logout(){
+  if(READER) destroyReader(false);
+  TOKEN=null; ME=null;
+  if(!NATIVE_READER_BOOT) localStorage.removeItem("plurx_token");
+  clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working");
+  if(NATIVE_READER_BOOT){ nativeReaderPost("session-ended"); return; }
+  render();
+}
 let SERVER=null;   // last /server response (name, version, android_app, …)
 async function boot(){
   // Before anything can build a /decision URL: the MediaCapabilities refinement
@@ -2943,10 +2981,20 @@ async function boot(){
   // without coming back through boot(), are covered too.
   try{ await PLAY_CAPS_READY; }catch(e){}
   let server;
-  try{ server=await api("/server"); SERVER=server; }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
-  if(server.setup_required){ return renderSetup(server); }
-  if(!TOKEN){ return renderLogin(server); }
-  try{ ME=await api("/me"); }catch(e){ return renderLogin(server); }
+  try{ server=await api("/server"); SERVER=server; }catch(e){
+    document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`;
+    if(NATIVE_READER_BOOT) nativeReaderPost("error","Cinema server unreachable.");
+    return;
+  }
+  if(server.setup_required){
+    if(NATIVE_READER_BOOT){ nativeReaderPost("error","Finish setting up this Cinema server before reading."); return; }
+    return renderSetup(server);
+  }
+  if(!TOKEN){
+    if(NATIVE_READER_BOOT){ nativeReaderPost("session-ended"); return; }
+    return renderLogin(server);
+  }
+  try{ ME=await api("/me"); }catch(e){ return NATIVE_READER_BOOT?undefined:renderLogin(server); }
   location.hash=location.hash||"#/";
   render();
 }
@@ -11385,6 +11433,7 @@ function destroyReader(flush){
 async function closeReader(){
   const r=READER; if(!r){ history.back(); return; }
   await saveReaderState(true); const itemId=r.item.id; destroyReader(false);
+  if(NATIVE_READER_BOOT){ TOKEN=null; ME=null; nativeReaderPost("close"); return; }
   location.hash=`#/item/${itemId}`;
 }
 async function viewReader(itemId,fileId){
@@ -11415,9 +11464,11 @@ async function viewReader(itemId,fileId){
     const start=saved&&saved.locator&&readingOrderIndex(saved.locator.href)>=0?saved.locator.href:READER.href;
     await navigateReader(start,saved&&saved.locator);
     READER.heartbeat=setInterval(()=>saveReaderState(true),30000);
+    nativeReaderPost("ready");
   }catch(error){
     if(!READER) READER={item,file,detail,open:null,locator:null,progression:0,completed:false};
     readerError(error.message);
+    nativeReaderPost("error",error.message);
   }
 }
 document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden"&&READER) readerFlushKeepalive(READER); });
@@ -11459,7 +11510,10 @@ async function render(){
 }
 window.addEventListener("hashchange",render);
 
-boot();
+if(NATIVE_READER_BOOT){
+  document.getElementById("app").innerHTML='<div class="center"><div class="card">Opening reader…</div></div>';
+  nativeReaderPost("shell-ready");
+}else boot();
 </script>
 </body>
 </html>
