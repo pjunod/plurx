@@ -9,12 +9,13 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-21): source is v0.2.7, Apple build 72. Native text
+> Status (2026-08-21): source is v0.2.7, Apple build 73. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 72 marks a duration-estimated Skip Credits button as an
-> estimate, so it no longer reads exactly like a chapter-derived one. Build 71
-> scopes newest pending offline reading state to the exact
+> landed. Build 73 marks a duration-estimated Skip Credits button as an
+> estimate, so it no longer reads exactly like a chapter-derived one. Build 72
+> displays bounded book author metadata and only exact work-linked editions.
+> Build 71 scopes newest pending offline reading state to the exact
 > item/file/revision edition. Build 70 adds profile-scoped, atomically published offline EPUBs,
 > token-free local reading, and newest-locator reconnect replay on iPhone/iPad.
 > Build 69 adds in-app online EPUB reading on iPhone/iPad through an

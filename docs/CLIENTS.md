@@ -134,6 +134,13 @@ exact edition is replayed after reconnect. Television clients remain
 intentionally excluded; the physical airplane-mode/reconnect device matrix
 remains an explicit, unclaimed release check.
 
+Book cards and details consume Cinema's durable author and exact related-
+edition fields. iPhone/iPad and Android phone/tablet show author beneath the
+title and an **Other editions** rail only when the server returns items with
+the same explicit work key. Clients do not perform title/author matching or
+fetch provider covers themselves; server-cached artwork remains the single
+image boundary.
+
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available

@@ -72,6 +72,10 @@ data class Item(
     val air_date: String? = null,
     val recorded_at: String? = null,
     val tags: List<String> = emptyList(),
+    val author: String? = null,
+    val book_work_id: String? = null,
+    val book_edition_id: String? = null,
+    val book_metadata_source: String? = null,
     val show_title: String? = null,
     val runtime_ms: Long? = null,
     val resolution: Long? = null,
@@ -324,6 +328,7 @@ data class ItemDetail(
     val children: List<Item> = emptyList(),
     val ancestors: List<Item> = emptyList(),
     val reading: ReadingState? = null,
+    val editions: List<Item> = emptyList(),
 )
 
 @Serializable
