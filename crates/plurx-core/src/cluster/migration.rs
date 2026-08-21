@@ -1626,7 +1626,7 @@ async fn start_voter(
     nodes.push(local.clone());
     nodes.sort_by_key(|peer| peer.raft_id);
     nodes.dedup_by_key(|peer| peer.raft_id);
-    let nodes = hiqlite_nodes_for_local(nodes, &local)?;
+    let nodes = hiqlite_nodes_for_voter(&nodes, local.raft_id)?;
 
     // The daemon lock guards one data directory, but these ports are host-wide
     // and default to fixed values, so two data directories on one host collide.
@@ -1704,43 +1704,27 @@ async fn start_voter(
     Ok((client, local))
 }
 
-/// Adapt OpenRaft's sparse node ids to Hiqlite 0.14's positional config.
-///
-/// Hiqlite validates `node_id <= nodes.len()` and selects this node with
-/// `nodes[node_id - 1]`. Membership ids are not vector positions, and join
-/// tokens can legitimately reserve id 2 while id 3 is redeemed first. Pad a
-/// sparse vector with copies of the local peer so the required slot exists and
-/// contains this node. The copies retain the same id, so they add no phantom
-/// node to committed Raft membership; Hiqlite also skips every entry whose id
-/// is `this_node` while asking an existing voter to admit the joiner.
+/// Build Hiqlite's connection roster without treating durable Raft ids as
+/// vector positions.
 #[cfg(feature = "hiqlite-store")]
-fn hiqlite_nodes_for_local(
-    mut peers: Vec<ClusterPeer>,
-    local: &ClusterPeer,
+fn hiqlite_nodes_for_voter(
+    peers: &[ClusterPeer],
+    local_raft_id: u64,
 ) -> Result<Vec<Node>, StoreError> {
-    let local_slot = usize::try_from(local.raft_id.saturating_sub(1)).map_err(|_| {
-        StoreError::Migration(format!(
-            "Raft id {} cannot be represented as a local Hiqlite node slot",
-            local.raft_id
-        ))
-    })?;
-    let local_index = peers
-        .iter()
-        .position(|peer| peer.raft_id == local.raft_id)
-        .ok_or_else(|| {
-            StoreError::Identity(format!(
-                "local Raft id {} is absent from the configured peer list",
-                local.raft_id
-            ))
-        })?;
-
-    if peers.len() <= local_slot {
-        peers.resize(local_slot + 1, local.clone());
-    } else if local_index != local_slot {
-        peers.swap(local_index, local_slot);
+    if !peers.iter().any(|peer| peer.raft_id == local_raft_id) {
+        return Err(StoreError::Identity(format!(
+            "local Raft id {local_raft_id} is absent from the configured peer list"
+        )));
     }
 
-    debug_assert_eq!(peers[local_slot].raft_id, local.raft_id);
+    let mut ids = BTreeSet::new();
+    if let Some(duplicate) = peers.iter().find(|peer| !ids.insert(peer.raft_id)) {
+        return Err(StoreError::Identity(format!(
+            "configured peer list contains duplicate Raft id {}",
+            duplicate.raft_id
+        )));
+    }
+
     Ok(peers.iter().map(Node::from).collect())
 }
 
@@ -2804,6 +2788,43 @@ mod tests {
     /// not observe a *different* live process may print it.
     #[cfg(feature = "hiqlite-store")]
     const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
+
+    /// Raft ids are durable identities, not positions in the bootstrap vector.
+    /// A live token can reserve id 2 while id 3 joins first, so Hiqlite must
+    /// accept the unique sparse roster rather than requiring a duplicate pad.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn hiqlite_accepts_a_unique_sparse_node_roster() {
+        let peers = [
+            ClusterPeer {
+                raft_id: 1,
+                raft_address: "127.0.0.1:32401".to_owned(),
+                api_address: "127.0.0.1:32402".to_owned(),
+            },
+            ClusterPeer {
+                raft_id: 3,
+                raft_address: "127.0.0.1:32501".to_owned(),
+                api_address: "127.0.0.1:32502".to_owned(),
+            },
+        ];
+        let nodes = hiqlite_nodes_for_voter(&peers, 3).expect("build sparse connection roster");
+        let config = NodeConfig {
+            node_id: 3,
+            nodes,
+            secret_raft: "0123456789abcdef".to_owned(),
+            secret_api: "fedcba9876543210".to_owned(),
+            ..NodeConfig::default()
+        };
+
+        config
+            .is_valid()
+            .expect("sparse Raft ids must be selected by id");
+        assert_eq!(
+            config.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the compatibility path must not duplicate a connection target"
+        );
+    }
 
     #[cfg(feature = "hiqlite-store")]
     #[test]
