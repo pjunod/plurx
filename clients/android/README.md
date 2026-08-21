@@ -19,8 +19,10 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `31` — native viewer parity across phone, foldable,
-> and TV. Build 31 visibly hedges estimated credits markers while preserving
+> Status: **v0.2.7**, build `32` — native viewer parity across phone, foldable,
+> and TV. Build 32 adds in-app online EPUB reading on phones and tablets with
+> an isolated, same-origin WebView, memory-only authentication, cross-device
+> locator resume, and no Android/Google TV reader action. Build 31 visibly hedges estimated credits markers while preserving
 > exact chapter-derived labels. Build 30 adds the revision-bound ebook reading-state wire models and
 > authenticated API routes without exposing a TV reader. Build 28 makes the
 > detail screen list every audio and subtitle track

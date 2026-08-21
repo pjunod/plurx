@@ -120,11 +120,15 @@ def add_book(host, epub):
     return books[0], files[0]
 
 
-def state(host, book, file):
-    return api(host.base_url, f"/items/{book['id']}/reading-state?file_id={file['id']}", host.token)
+def state(host, book, file, token=None):
+    return api(
+        host.base_url,
+        f"/items/{book['id']}/reading-state?file_id={file['id']}",
+        token or host.token,
+    )
 
 
-def run_browser(host, book, file, epub, probe):
+def run_browser(host, book, file, epub, probe, other_token):
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as error:
@@ -233,6 +237,96 @@ def run_browser(host, book, file, epub, probe):
         page.get_by_role("button", name="Back to book detail").click()
         page.wait_for_url(f"**/#/item/{book['id']}")
 
+        # The native clients load the same reader core in an isolated WebView.
+        # Model that seam in a fresh mobile-sized browser context: the bearer
+        # crosses through one direct function call, never a URL or persistent
+        # web storage, while the bridge can only emit lifecycle events.
+        native = browser.new_context(viewport={"width": 390, "height": 844})
+        native.add_init_script("""
+          window.__cinemaNativeEvents=[];
+          window.CinemaNative={postMessage(raw){window.__cinemaNativeEvents.push(JSON.parse(raw));}};
+        """)
+        native_page = native.new_page()
+        native_errors = []
+        native_page.on("pageerror", lambda error: native_errors.append(f"native page: {error}"))
+        native_page.goto(f"{host.base_url}/?native-reader=1", wait_until="networkidle")
+        assert host.token not in native_page.url, native_page.url
+        assert native_page.evaluate("localStorage.getItem('plurx_token')") is None, "native shell persisted bearer"
+        native_page.evaluate(
+            "([token,item,file])=>startNativeReader(token,item,file)",
+            [host.token, book["id"], file["id"]],
+        )
+        native_page.locator("#reader-loading").wait_for(state="hidden")
+        native_frame = native_page.frame_locator("#reader-frame")
+        native_frame.locator("#search-destination").wait_for()
+        native_frame.get_by_role("heading", name="Chapter Three", level=1).wait_for()
+        native_page.wait_for_function(
+            "window.__cinemaNativeEvents.some(event=>event.event==='ready')"
+        )
+        assert host.token not in native_page.url, native_page.url
+        assert native_page.evaluate("localStorage.getItem('plurx_token')") is None, "native reader persisted bearer"
+
+        # A phone rotation reflows the publication but keeps the authored
+        # paragraph locator, which is what the SwiftUI and Compose containers
+        # rely on instead of trying to preserve a nominal page number.
+        native_page.evaluate("""async () => {
+          await updateReaderPref('flow','scrolled');
+          await navigateReader('OEBPS/Text/two.xhtml#paragraph-42');
+        }""")
+        native_frame.locator("#paragraph-42").wait_for()
+        native_frame.locator("#paragraph-42").evaluate("el=>el.scrollIntoView({block:'start'})")
+        native_page.evaluate("READER.navigator.emitLocation()")
+        native_page.evaluate("updateReaderPref('font','accessible')")
+        native_page.wait_for_timeout(300)
+        native_before = native_page.evaluate("({text:READER.locator.cinema.text,href:READER.locator.href})")
+        native_page.set_viewport_size({"width": 844, "height": 390})
+        native_page.wait_for_timeout(400)
+        native_after = native_page.evaluate("({text:READER.locator.cinema.text,href:READER.locator.href})")
+        assert native_before == native_after and "paragraph-42" in native_after["href"], (
+            "native rotation", native_before, native_after,
+        )
+
+        native_page.evaluate("closeReader()")
+        native_page.wait_for_function(
+            "window.__cinemaNativeEvents.some(event=>event.event==='close')"
+        )
+        assert native_page.evaluate("TOKEN===null&&ME===null&&READER===null"), "native close retained authority"
+        admin_state = state(host, book, file)["state"]
+        assert "paragraph-42" in admin_state["locator"]["href"], admin_state
+        native.close()
+
+        # Reading state belongs to the authenticated Cinema profile, not the
+        # browser container or device. A second user's native handoff starts at
+        # chapter one even though the admin just closed at paragraph 42.
+        other_before = state(host, book, file, other_token)["state"]
+        assert other_before is None, ("profile state leaked", other_before)
+        other = browser.new_context(viewport={"width": 390, "height": 844})
+        other.add_init_script("""
+          window.__cinemaNativeEvents=[];
+          window.CinemaNative={postMessage(raw){window.__cinemaNativeEvents.push(JSON.parse(raw));}};
+        """)
+        other_page = other.new_page()
+        other_page.goto(f"{host.base_url}/?native-reader=1", wait_until="networkidle")
+        other_page.evaluate(
+            "([token,item,file])=>startNativeReader(token,item,file)",
+            [other_token, book["id"], file["id"]],
+        )
+        other_page.locator("#reader-loading").wait_for(state="hidden")
+        other_frame = other_page.frame_locator("#reader-frame")
+        other_frame.locator("#chapter-one").wait_for()
+        other_frame.get_by_role("heading", name="Chapter One", level=1).wait_for()
+        other_locator = other_page.evaluate("READER.locator")
+        assert "Text/one.xhtml" in other_locator["href"] and "paragraph-42" not in other_locator["href"], other_locator
+        assert other_page.evaluate("localStorage.getItem('plurx_token')") is None, "second profile persisted bearer"
+        other_page.evaluate("closeReader()")
+        other_page.wait_for_function(
+            "window.__cinemaNativeEvents.some(event=>event.event==='close')"
+        )
+        other.close()
+
+        if native_errors:
+            raise Fail("native browser errors:\n  " + "\n  ".join(native_errors))
+
         # Mutating bytes without a scan leaves the DB revision pinned to the
         # old file. Opening must fail as stale and keep both escape hatches.
         with epub.open("ab") as handle:
@@ -284,8 +378,14 @@ def main(argv):
         epub = Path(args.out).resolve() / "media" / "books" / "Cinema Reader Proof.epub"
         write_epub(epub, f"http://127.0.0.1:{probe_port}")
         book, file = add_book(host, epub)
-        run_browser(host, book, file, epub, probe)
-        print("reader-browser: open, restore, style, TOC, search, finish, stale revision, and hostile-content checks passed")
+        api(host.base_url, "/users", host.token, "POST", {
+            "username": "reader-other", "password": "reader-other-password", "is_admin": False,
+        })
+        other_token = api(host.base_url, "/auth/login", method="POST", body={
+            "username": "reader-other", "password": "reader-other-password",
+        })["token"]
+        run_browser(host, book, file, epub, probe, other_token)
+        print("reader-browser: browser/native handoff, profile isolation, restore, style, TOC, search, finish, stale revision, and hostile-content checks passed")
         return 0
     except (Fail, AssertionError) as error:
         print(f"reader-browser: {error}", file=sys.stderr)
