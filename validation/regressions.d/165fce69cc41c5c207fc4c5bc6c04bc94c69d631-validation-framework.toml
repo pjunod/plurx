@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["165fce69cc41c5c207fc4c5bc6c04bc94c69d631"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "Maps the chore commit that adds the f999dbb9 persistence-upgrades evidence. `make history-check` validates that matching corrective commits have retained evidence."

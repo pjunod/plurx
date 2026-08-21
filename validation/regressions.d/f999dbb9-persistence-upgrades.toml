@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["f999dbb9"]
+points = ["persistence.upgrades"]
+checks = ["rust-gate"]
+reason = "The retained `activation_marker_accepts_only_the_supported_upgrade_window` regression accepts prior valid markers (v5 through v7) while rejecting pre-v5, post-v7, marker version 0, and unknown marker formats."

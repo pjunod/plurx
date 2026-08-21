@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["201f03fd"]
+points = ["persistence.upgrades"]
+checks = ["rust-gate"]
+reason = "The retained `activation_marker_accepts_only_the_supported_upgrade_window` regression accepts the prior valid v5 marker for migration to v6 while rejecting older and future replicated schemas and unknown marker formats."

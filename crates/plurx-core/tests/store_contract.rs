@@ -2124,7 +2124,7 @@ async fn an_ambiguous_active_target_refuses_rather_than_reverting_to_sqlite() {
             cluster_id: prepared.cluster_id.clone(),
             source_backup_sha256: prepared.backup_sha256.clone(),
             source_schema_version: prepared.schema_version,
-            replicated_schema_version: 6,
+            replicated_schema_version: AUTH_SCHEMA_VERSION,
             imported_rows: 1,
             table_hashes: Vec::new(),
         }
