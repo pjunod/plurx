@@ -4,6 +4,7 @@ import android.app.Application
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import tv.plurx.app.data.Net
+import tv.plurx.app.data.offline.OfflineBooks
 import tv.plurx.app.data.offline.OfflineDownloads
 
 /**
@@ -15,6 +16,7 @@ class PlurxApp : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         OfflineDownloads.initialize(this)
+        OfflineBooks.initialize(this)
     }
 
     override fun newImageLoader(): ImageLoader =

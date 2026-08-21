@@ -37,6 +37,27 @@ class ReaderPolicyTest {
     }
 
     @Test
+    fun offlineReaderNeverPermitsPublisherNetworkNavigation() {
+        assertTrue(OfflineBookWebPolicy.permitsNavigation(OfflineBookWebPolicy.SHELL))
+        assertTrue(OfflineBookWebPolicy.permitsNavigation(
+            "${OfflineBookWebPolicy.ORIGIN}/publication/Text/chapter.xhtml",
+        ))
+        assertEquals(
+            "Text/a+b.xhtml",
+            OfflineBookWebPolicy.publicationPath(
+                "${OfflineBookWebPolicy.ORIGIN}/publication/Text/a+b.xhtml",
+            ),
+        )
+        assertFalse(OfflineBookWebPolicy.permitsNavigation("https://publisher.invalid/track"))
+        assertFalse(OfflineBookWebPolicy.permitsNavigation(
+            "${OfflineBookWebPolicy.ORIGIN}/publication/../reader.js",
+        ))
+        assertFalse(OfflineBookWebPolicy.permitsNavigation(
+            "${OfflineBookWebPolicy.ORIGIN}/offline-reader.html?remote=1",
+        ))
+    }
+
+    @Test
     fun readerActionIsEpubOnlyAndNeverAppearsOnTelevision() {
         assertTrue(offersBookReader(FormFactor.Compact, epub))
         assertTrue(offersBookReader(FormFactor.Expanded, epub))
