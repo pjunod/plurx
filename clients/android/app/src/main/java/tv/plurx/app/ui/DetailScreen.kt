@@ -584,7 +584,7 @@ private fun Actions(
                         ) { Text(bookReadingLabel(reading, playable), fontWeight = FontWeight.SemiBold) }
                     }
                 }
-                if (playable.isEpub && OfflineBooks.canUse(context)) {
+                if (playable.supportsOfflineBookReader && OfflineBooks.canUse(context)) {
                     item {
                         TvOutlinedButton(
                             enabled = offlineBook?.isPlayable != true,
@@ -770,7 +770,7 @@ internal fun bookReadingLabel(reading: ReadingState?, file: MediaFileDto): Strin
 }
 
 internal fun offersBookReader(formFactor: FormFactor, file: MediaFileDto): Boolean =
-    formFactor != FormFactor.Television && file.available && file.isEpub
+    formFactor != FormFactor.Television && file.available && file.supportsOnlineBookReader
 
 @Composable
 internal fun DetailPrimaryActionButton(
@@ -1089,6 +1089,8 @@ private fun fileSpecLine(file: MediaFileDto): String {
 
 internal fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
     val available = files.filter { it.available }
+    if (item.isBook) return available.firstOrNull { it.supportsOnlineBookReader }
+        ?: available.firstOrNull()
     if (!item.isAudiobook) return available.firstOrNull()
     return available.lastOrNull { positionMs >= it.part_offset_ms } ?: available.firstOrNull()
 }

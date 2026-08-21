@@ -328,6 +328,9 @@ struct MediaFile: Codable, Identifiable {
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+    /// The server's format/action registry for this exact file. Optional for
+    /// compatibility with servers that predate the registry.
+    var reader: ReaderCapability? = nil
 
     var isEpub: Bool {
         container?.lowercased() == "epub"
@@ -335,9 +338,36 @@ struct MediaFile: Codable, Identifiable {
     }
 }
 
+enum ReaderAction: String, Codable, Equatable {
+    case read
+    case openIn = "open_in"
+    case unavailable
+}
+
+struct ReaderSurfaceCapability: Codable, Equatable {
+    let online: ReaderAction
+    let offline: ReaderAction
+}
+
+struct ReaderCapability: Codable, Equatable {
+    let format: String
+    let web: ReaderSurfaceCapability
+    let apple: ReaderSurfaceCapability
+    let android: ReaderSurfaceCapability
+    let television: ReaderSurfaceCapability
+}
+
 enum BookReaderPolicy {
     static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
-        !onTelevision && file.available != false && file.isEpub
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader { return reader.apple.online == .read }
+        return file.isEpub
+    }
+
+    static func canDownload(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader { return reader.apple.offline == .read }
+        return file.isEpub
     }
 }
 

@@ -164,6 +164,21 @@ data class PlaybackDefaults(
 )
 
 @Serializable
+data class ReaderSurfaceCapability(
+    val online: String = "unavailable",
+    val offline: String = "unavailable",
+)
+
+@Serializable
+data class ReaderCapability(
+    val format: String = "",
+    val web: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val apple: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val android: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val television: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+)
+
+@Serializable
 data class MediaFileDto(
     val id: Long,
     val filename: String,
@@ -190,11 +205,19 @@ data class MediaFileDto(
     val part_offset_ms: Long = 0,
     val chapters: List<BookChapter> = emptyList(),
     val available: Boolean = true,
+    /** Server-owned format/action verdict; absent on older servers. */
+    val reader: ReaderCapability? = null,
     val probed: Boolean = true,
     val missing_path: String? = null,
 ) {
     val isEpub: Boolean
         get() = container.equals("epub", ignoreCase = true) || filename.endsWith(".epub", ignoreCase = true)
+
+    val supportsOnlineBookReader: Boolean
+        get() = reader?.android?.online?.equals("read", ignoreCase = true) ?: isEpub
+
+    val supportsOfflineBookReader: Boolean
+        get() = reader?.android?.offline?.equals("read", ignoreCase = true) ?: isEpub
 }
 
 @Serializable

@@ -1802,6 +1802,10 @@ struct DetailView: View {
     /// Movies and single-file books keep the established first-file behavior.
     static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
         let files = detail.files ?? []
+        if detail.item.isBook {
+            return files.first { BookReaderPolicy.canRead($0, onTelevision: false) }
+                ?? files.first
+        }
         guard detail.item.isAudiobook else { return files.first }
         return AudiobookTimeline.file(at: positionMs, in: files)
     }
@@ -2175,7 +2179,9 @@ struct DetailView: View {
             }
             .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: false))
 
-            mobileBookDownloadButton(detail: detail, file: file)
+            if BookReaderPolicy.canDownload(file, onTelevision: false) {
+                mobileBookDownloadButton(detail: detail, file: file)
+            }
         } else {
             Button {
                 openBookExternally(file)

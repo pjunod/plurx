@@ -379,11 +379,27 @@ final class AppleClientTests: XCTestCase {
         let epub = MediaFile(id: 90, filename: "Contract.EPUB", available: true)
         let pdf = MediaFile(id: 91, filename: "Contract.pdf", available: true)
         let missing = MediaFile(id: 92, filename: "Missing.epub", available: false)
+        let serverHandoff = ReaderCapability(
+            format: "pdf",
+            web: .init(online: .openIn, offline: .unavailable),
+            apple: .init(online: .openIn, offline: .unavailable),
+            android: .init(online: .openIn, offline: .unavailable),
+            television: .init(online: .unavailable, offline: .unavailable)
+        )
+        let disguised = MediaFile(
+            id: 93,
+            filename: "LooksLike.epub",
+            available: true,
+            reader: serverHandoff
+        )
 
         XCTAssertTrue(BookReaderPolicy.canRead(epub, onTelevision: false))
+        XCTAssertTrue(BookReaderPolicy.canDownload(epub, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canRead(epub, onTelevision: true))
         XCTAssertFalse(BookReaderPolicy.canRead(pdf, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canRead(missing, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(disguised, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canDownload(disguised, onTelevision: false))
     }
 
     #if os(iOS)
