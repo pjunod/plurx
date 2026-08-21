@@ -97,7 +97,7 @@ one.
 | `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
 | `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. The default served view becomes sliding only after retention deletes a prefix. The default-off iPad experiment instead serves a typeless playlist plus `EXT-X-START:TIME-OFFSET=0` from the first response, preserving one envelope across that boundary. Completed cached VOD stays whole. | Rust retention/serving integration + typeless shape-stability unit; physical-iPad comparison pending |
-| `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
+| `server.auto-rung` | Auto output height | Software follows the source up to 720p. Proven hardware preserves a known SDR source up to 2160p; HDR and unknown geometry stay at the separately-probed 1080p ceiling. A node-local network prior may step that choice down, but absence of a prior is not evidence for a resolution loss. Every route clamps to the source and never upscales. | Encoder-aware Rust matrix plus the 4K AV1 SDR regression |
 | `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
 | `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
 
@@ -1126,9 +1126,11 @@ covering the other.
   already chosen to send this client the full-resolution stream, so the burn
   adds an encode, not a downscale (and costs *less* bandwidth than the remux
   it replaces). Only a burn on a genuine transcode verdict keeps the server's
-  Auto rung (`min(source, 1080)` on hardware), where the cap is the bandwidth
-  call it was designed to be. A bitmap burn keeps the node's proven GPU
-  tone-map (PERF-PLAN §5): the graph scales and maps on the GPU pinned to the
+  Auto rung: hardware-backed SDR follows the source up to 2160p,
+  hardware-backed HDR stays at its measured 1080p output point, and software
+  stays at 720p. A stored network prior may lower those starting points. A
+  bitmap burn keeps the node's proven GPU tone-map (PERF-PLAN §5): the graph
+  scales and maps on the GPU pinned to the
   overlay's exact frame, comes down to system memory once for the composite,
   and the encoder's upload runs after it — and a Dolby Vision source whose
   base layer is HDR10-compatible counts as HDR10 for that routing, since
