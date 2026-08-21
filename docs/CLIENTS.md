@@ -117,8 +117,9 @@ remain attached to the server and keeps the existing streaming path.
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available
 to both native codebases. **Apple and Android have adopted it.** Android sends
-`quality_auto: true` whenever the viewer selected Auto, including when subtitle
-burn-in posts a promise height, and stops after three consecutive bound reopens
+`quality_auto: true` when an Auto viewer's subtitle burn-in posts a promise
+height; an Auto session that posts no height omits the field. Android stops
+after three consecutive bound reopens
 that do not resolve to a strictly lower rung. A user-initiated seek, quality
 change, or track change resets that budget and invalidates the stall request.
 
