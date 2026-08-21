@@ -350,6 +350,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt
 test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
 
 [[fixes]]
+id = "android.live-session-seek-stall-reset"
+commits = ["229a0f1f"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "stallGuard.liveSessionSeek { openSession(t, attempt) }"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "liveSessionSeekResetsExhaustedBudgetBeforeReopen"
+
+[[fixes]]
 id = "android.stall-response-invalidation-race"
 commits = ["038ee8f"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
