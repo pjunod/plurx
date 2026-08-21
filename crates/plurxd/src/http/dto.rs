@@ -333,6 +333,10 @@ pub struct FileDto {
     /// wrong container mount) — the client shows this and refuses to "play"
     /// something that isn't there. Set by the handler, not from the row.
     pub available: bool,
+    /// Server-owned reader actions for this exact detected format.  Clients
+    /// consume the surface entry instead of inferring Read from an extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader: Option<crate::reader_formats::ReaderCapability>,
     /// Did ffprobe ever succeed on this file? `false` means every media field
     /// above is empty because nothing was ever read — not because the file has
     /// no video. The item page says so and offers a re-analyze, since the usual
@@ -465,6 +469,7 @@ fn defaults_from_selection(
 impl FileDto {
     pub fn from_media_file(f: MediaFile, prefs: &LangPrefs) -> Self {
         let playback_defaults = playback_defaults(&f.audio_streams, &f.subtitle_streams, prefs);
+        let reader = crate::reader_formats::capability(&f.path, f.container.as_deref());
         let filename = f
             .path
             .file_name()
@@ -490,6 +495,7 @@ impl FileDto {
             part_offset_ms: 0,
             chapters: Vec::new(),
             available: true,
+            reader,
             probed: f.probed,
             missing_path: None,
         }

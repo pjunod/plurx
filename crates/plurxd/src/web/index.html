@@ -4565,10 +4565,9 @@ async function loadItem(id){
   // A multipart audiobook owns one global timeline. Pick the part containing
   // the saved item position and hand the player a local offset inside it.
   let playable=available[0]||null, playStart=resume;
-  // A book can carry several original formats. The built-in action must pick
-  // an EPUB rather than whichever file happened to sort first; every other
-  // format keeps the honest platform fallback.
-  if(it.kind==='book') playable=available.find(isEpubFile)||playable;
+  // A book can carry several original formats. The server registry, not list
+  // order or an extension guess, decides which file owns the built-in action.
+  if(it.kind==='book') playable=available.find(canReadBookFile)||playable;
   if(it.kind==='audiobook' && available.length){
     playable=available[0];
     for(const f of available){
@@ -4613,7 +4612,14 @@ function playCall(p,file,startMs){
 }
 function bookContentUrl(file){ return tok(`/api/v1/files/${file.id}/content`); }
 function isEpubFile(file){ return !!(file&&/\.epub$/i.test(file.filename||"")); }
-function readerFile(p){ return p.files.find(f=>f.available&&isEpubFile(f))||null; }
+function readerAction(file,surface,mode){
+  const capability=file&&file.reader&&file.reader[surface];
+  if(capability&&typeof capability[mode]==="string") return capability[mode];
+  // Compatibility with a server old enough not to advertise the registry.
+  return isEpubFile(file)?"read":"open_in";
+}
+function canReadBookFile(file){ return !!(file&&file.available&&readerAction(file,"web","online")==="read"); }
+function readerFile(p){ return p.files.find(canReadBookFile)||null; }
 function readingLabel(p,file){
   const state=p.reading;
   if(!state||state.file_id!==file.id) return "Read";
@@ -4625,9 +4631,9 @@ function bookActions(p){
   // action. A D-pad document reader is outside the product contract; phone,
   // tablet and desktop keep both the built-in action and the escape hatch.
   if(surfaceClass()==="tv") return "";
-  const original=p.playable, epub=readerFile(p);
+  const original=p.playable, readable=readerFile(p);
   if(!original) return `<div class="filemissing">⚠ No book file is currently available on the server.</div>`;
-  const read=epub?`<button class="btnplay" onclick="location.hash='#/read/${p.id}/${epub.id}'">${esc(readingLabel(p,epub))}</button>`:"";
+  const read=readable?`<button class="btnplay" onclick="location.hash='#/read/${p.id}/${readable.id}'">${esc(readingLabel(p,readable))}</button>`:"";
   return `<div class="actions">${read}
     <a class="ghost" href="${esc(bookContentUrl(original))}" target="_blank" rel="noopener">Open in…</a>
     <a class="ghost" href="${esc(bookContentUrl(original))}" download="${esc(original.filename||p.item.title)}">Download original</a></div>`;
@@ -11455,7 +11461,7 @@ async function viewReader(itemId,fileId){
   if(READER) return;
   const detail=await api(`/items/${itemId}`), item=detail.item;
   const file=(detail.files||[]).find(candidate=>candidate.id===Number(fileId));
-  if(!file||!file.available||!isEpubFile(file)) throw new Error("This EPUB is not available to read.");
+  if(!canReadBookFile(file)) throw new Error("This ebook format is not available in Cinema's reader.");
   document.getElementById("app").innerHTML=readerShell(item,file);
   try{
     const [opened,state]=await Promise.all([

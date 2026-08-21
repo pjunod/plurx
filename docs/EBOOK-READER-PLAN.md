@@ -1,8 +1,8 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M3 complete · M4 implementation complete, device acceptance
-pending · M5 implementation complete · M6 ready to build · **Written:** 2026-08-20 · **Verified against:** `plurx` `51df0ab3`
-and `monarr` `a3f5fb8`
+**Status:** M0–M5 complete · M4 physical-device acceptance pending · M6 format
+registry in progress · **Written:** 2026-08-20 · **Verified against:** `plurx`
+`3d56f4b2` and `monarr` `bd168b02`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -516,9 +516,10 @@ reclaims local bytes without touching the server file.
 
 ### 7.6 M5 — author, cover, and edition metadata
 
-**Status:** Cinema implementation complete 2026-08-21; Curator companion
-handoff pending. SQLite v21 and replicated schema v7 persist the source-ranked
-facts, and both backend migration paths have executable upgrade contracts.
+**Status:** complete 2026-08-21. Cinema and Curator now exchange the bounded,
+identifier-backed metadata handoff. SQLite v21 and replicated schema v7
+persist the source-ranked facts, and both backend migration paths have
+executable upgrade contracts.
 
 Make author and edition medium first-class Cinema facts. Prefer an explicit
 Curator handoff keyed by its book identifiers when paired; retain local EPUB
@@ -533,6 +534,12 @@ standalone EPUB gains the same fields from its package; two authors' identical
 titles remain separate; replacing artwork never mutates the library path.
 
 ### 7.7 M6 — formats, acceptance, and release truth
+
+**Status:** in progress. The first slice makes format/action support a
+server-owned per-file registry consumed by web, Apple, and Android, with the
+documented matrix contract-tested directly against that registry. It preserves
+EPUB behavior and keeps PDF/MOBI/AZW/FB2/comics on **Open in…** until the chosen
+renderer earns its own locator, security, accessibility, and offline evidence.
 
 Use measured demand and fixtures to choose the next renderer: PDF in-app,
 fixed-layout EPUB, or comics. Each format needs its own locator, security,
@@ -575,8 +582,8 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | M2 · EPUB proof/web | Complete | Node contracts; deterministic hostile-EPUB Chromium acceptance; 620 MiB stream proof |
 | M3 · Native online | Complete | iOS/tvOS simulator suites; Android JVM/lint; real-Chromium native handoff, heading semantics, profile isolation, font/rotation restore, and close flush |
 | M4 · Offline EPUB | Implementation complete · acceptance in progress | Apple catalogue/path/sync unit contracts and simulator build; Android catalogue/path/exact-edition sync JVM contracts, lint, instrumentation APK build, and packaged reader assets; shared-shell browser contract; physical airplane-mode/reconnect drill remains |
-| M5 · Metadata | Cinema implementation complete · Curator companion pending | SQLite v20→v21 and replicated v5/v6→v7 migrations; paired-source precedence; standalone EPUB package/cover fixtures; exact work relation contracts |
-| M6 · More formats/release | Planned | Contract-tested support matrix |
+| M5 · Metadata | Complete | SQLite v20→v21 and replicated v5/v6→v7 migrations; paired Curator precedence and notifier contract; standalone EPUB package/cover fixtures; exact work relation contracts |
+| M6 · More formats/release | Registry implementation in progress | One server-owned per-file registry; web/Apple/Android policy adoption; contract-tested support matrix |
 
 Update this table, the status header, [FEATURES.md](FEATURES.md), and
 [ROADMAP.md](ROADMAP.md) in the same change that advances a milestone. A plan

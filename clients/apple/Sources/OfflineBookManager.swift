@@ -70,6 +70,9 @@ final class OfflineBookManager: ObservableObject {
         title: String,
         posterPath: String?
     ) async throws {
+        guard BookReaderPolicy.canDownload(file, onTelevision: false) else {
+            throw APIError.transport("Cinema cannot download this ebook format for in-app reading")
+        }
         guard let instance = settings.instanceId, let user = settings.userId,
               !settings.origin.isEmpty else {
             throw APIError.transport("Connect once before downloading")
