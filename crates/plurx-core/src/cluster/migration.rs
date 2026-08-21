@@ -393,11 +393,11 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
     let token = read_join_token_file(&config.cluster.join_token_file)?;
     let payload = decode_join_token(&token)
         .map_err(|error| StoreError::Migration(format!("{}: {}", error.code(), error)))?;
-    if payload.expires_at <= unix_time_millis()? {
-        return Err(StoreError::Migration(
-            "join_token_expired: join token expired before it was redeemed".to_owned(),
-        ));
-    }
+    // The coordinator owns the expiry verdict. Locally, an unused expired
+    // token and an interrupted join already reserved to this node have the
+    // same payload; only the replicated token record can distinguish them.
+    // Rechecking the embedded timestamp here would strand an identity-bound
+    // voter that failed after redemption and restarted after the token TTL.
     if payload.schema_version != AUTH_SCHEMA_VERSION
         || payload.protocol_version != crate::store::AUTH_PROTOCOL_VERSION
     {
@@ -693,15 +693,6 @@ async fn post_join_request<T: Serialize>(
 struct JoinApiError {
     code: String,
     message: String,
-}
-
-#[cfg(feature = "hiqlite-store")]
-fn unix_time_millis() -> Result<i64, StoreError> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| StoreError::Database(error.to_string()))?
-        .as_millis();
-    i64::try_from(millis).map_err(|_| StoreError::Database("clock overflow".to_owned()))
 }
 
 /// Connect a maintenance command to an already-running activated voter.
@@ -1635,7 +1626,7 @@ async fn start_voter(
     nodes.push(local.clone());
     nodes.sort_by_key(|peer| peer.raft_id);
     nodes.dedup_by_key(|peer| peer.raft_id);
-    let nodes = nodes.iter().map(Node::from).collect::<Vec<_>>();
+    let nodes = hiqlite_nodes_for_voter(&nodes, local.raft_id)?;
 
     // The daemon lock guards one data directory, but these ports are host-wide
     // and default to fixed values, so two data directories on one host collide.
@@ -1711,6 +1702,30 @@ async fn start_voter(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok((client, local))
+}
+
+/// Build Hiqlite's connection roster without treating durable Raft ids as
+/// vector positions.
+#[cfg(feature = "hiqlite-store")]
+fn hiqlite_nodes_for_voter(
+    peers: &[ClusterPeer],
+    local_raft_id: u64,
+) -> Result<Vec<Node>, StoreError> {
+    if !peers.iter().any(|peer| peer.raft_id == local_raft_id) {
+        return Err(StoreError::Identity(format!(
+            "local Raft id {local_raft_id} is absent from the configured peer list"
+        )));
+    }
+
+    let mut ids = BTreeSet::new();
+    if let Some(duplicate) = peers.iter().find(|peer| !ids.insert(peer.raft_id)) {
+        return Err(StoreError::Identity(format!(
+            "configured peer list contains duplicate Raft id {}",
+            duplicate.raft_id
+        )));
+    }
+
+    Ok(peers.iter().map(Node::from).collect())
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -2774,6 +2789,43 @@ mod tests {
     #[cfg(feature = "hiqlite-store")]
     const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
 
+    /// Raft ids are durable identities, not positions in the bootstrap vector.
+    /// A live token can reserve id 2 while id 3 joins first, so Hiqlite must
+    /// accept the unique sparse roster rather than requiring a duplicate pad.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn hiqlite_accepts_a_unique_sparse_node_roster() {
+        let peers = [
+            ClusterPeer {
+                raft_id: 1,
+                raft_address: "127.0.0.1:32401".to_owned(),
+                api_address: "127.0.0.1:32402".to_owned(),
+            },
+            ClusterPeer {
+                raft_id: 3,
+                raft_address: "127.0.0.1:32501".to_owned(),
+                api_address: "127.0.0.1:32502".to_owned(),
+            },
+        ];
+        let nodes = hiqlite_nodes_for_voter(&peers, 3).expect("build sparse connection roster");
+        let config = NodeConfig {
+            node_id: 3,
+            nodes,
+            secret_raft: "0123456789abcdef".to_owned(),
+            secret_api: "fedcba9876543210".to_owned(),
+            ..NodeConfig::default()
+        };
+
+        config
+            .is_valid()
+            .expect("sparse Raft ids must be selected by id");
+        assert_eq!(
+            config.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the compatibility path must not duplicate a connection target"
+        );
+    }
+
     #[cfg(feature = "hiqlite-store")]
     #[test]
     fn activation_marker_accepts_only_the_supported_upgrade_window() {
@@ -3474,18 +3526,54 @@ mod tests {
         );
         assert!(!expired_dir.path().join(HIQLITE_ACTIVE_DIRNAME).exists());
 
-        let issued = coordinator
+        // A still-live token may reserve the next Raft id while another
+        // machine starts first. OpenRaft permits that sparse membership, and
+        // the production daemon must not confuse the assigned id with the
+        // length of its bootstrap vector (Hiqlite 0.14 does exactly that
+        // without the compatibility adapter in `start_voter`).
+        let held_gap = coordinator
             .issue_token(Duration::from_secs(120))
             .await
+            .expect("reserve the preceding Raft id");
+        let issued = coordinator
+            .issue_token(Duration::from_secs(1))
+            .await
             .expect("issue daemon join token");
+        assert_eq!(
+            issued.raft_id,
+            held_gap.raft_id + 1,
+            "daemon join fixture must exercise a sparse assigned id"
+        );
         let joining_dir = tempfile::tempdir().expect("joining data dir");
         let token_path = joining_dir.path().join("join.token");
         std::fs::write(&token_path, format!("{}\n", issued.token)).expect("joining token file");
         let mut joining_config = membership_test_config(joining_dir.path());
         joining_config.cluster.join_token_file = token_path.clone();
+        let staged_identity = crate::cluster::initialize_join_identity(
+            joining_dir.path(),
+            &cluster_id,
+            issued.raft_id,
+        )
+        .expect("stage the joining node identity");
+        let staged_local = configured_local_peer(&joining_config, issued.raft_id)
+            .expect("configure the staged peer");
+        let issued_digest = join_token_digest(&issued.token);
+        coordinator
+            .redeem(&RedeemJoinRequest {
+                token_digest: issued_digest.clone(),
+                raft_id: issued.raft_id,
+                node_id: staged_identity.node_id,
+                raft_address: staged_local.raft_address,
+                api_address: staged_local.api_address,
+                schema_version: AUTH_SCHEMA_VERSION,
+                protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("reserve the token to the staged node before its failed start");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         let joined = select_daemon_store(&joining_config)
             .await
-            .expect("join through daemon store selection");
+            .expect("resume an expired identity-bound join through daemon store selection");
         assert_eq!(joined.identity.cluster_id, cluster_id);
         assert_eq!(joined.identity.raft_id, issued.raft_id);
         assert!(
@@ -3495,7 +3583,6 @@ mod tests {
         let local = read_local_membership(joining_dir.path())
             .expect("read joined local membership")
             .expect("joined node persists local membership");
-        let issued_digest = join_token_digest(&issued.token);
         assert_eq!(
             local.join_token_digest.as_deref(),
             Some(issued_digest.as_str())
