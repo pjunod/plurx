@@ -40,6 +40,7 @@ use plurx_core::domain::{
     NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
     PlaybackEventQuery, ProbeResult, ReadingStateWrite, TraktAuth,
 };
+use plurx_core::error::StoreError;
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
@@ -1279,6 +1280,188 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
     );
 }
 
+/// The exact text `crates/plurx-core/src/store/hiqlite.rs` produces when its
+/// private per-operation `STORE_TIMEOUT` expires.
+///
+/// Duplicated rather than imported because it is a production internal, and
+/// pinned against the real source by
+/// [`a_replicated_deadline_is_never_reported_as_a_wal_size_violation`] so a
+/// reworded deadline cannot silently stop being recognized as one.
+const REPLICATED_DEADLINE_MESSAGE: &str = "replicated store operation timed out";
+
+/// The one claim the byte-bound contract is entitled to make. Nothing that did
+/// not actually observe an oversized Raft transaction may print it.
+///
+/// This is the live wording of
+/// [`large_probe_json_import_respects_the_production_wal_limit`]'s verdict.
+/// #282 replaced #279's row cap with a byte budget and reworded it from
+/// `large probe_json rows must fit the production 2 MiB WAL`; the claim being
+/// guarded is unchanged, so a later rewording should move this constant rather
+/// than reintroduce a second sentence for the same verdict.
+const WAL_SIZE_VERDICT: &str = "byte-bounded transactions must carry probe rows a row count cannot";
+
+/// How many times a replicated contract step re-attempts after the store
+/// reports its per-operation deadline.
+///
+/// This is a margin, not a measured budget. `STORE_TIMEOUT` is three seconds
+/// per operation, and it is a production safety bound this suite must not
+/// relax. Under `make validate` this gate runs beside every other check on one
+/// host, where a three-second slice is reachable by scheduling pressure alone;
+/// the same import that needs ~10s in isolation has been observed spending
+/// 47-52s losing a race against that deadline. Re-attempts cost nothing on a
+/// quiet machine because the first one succeeds, and the size contract itself
+/// is decided by the WAL writer's byte check, never by how long the host took.
+const REPLICATED_DEADLINE_ATTEMPTS: u32 = 5;
+
+/// What a replicated call actually told us, split by whether it is evidence
+/// about the contract under test.
+enum ReplicatedOutcome<T> {
+    /// The operation answered.
+    Ready(T),
+    /// The production per-operation deadline expired before the store answered.
+    ///
+    /// This says nothing about payload size, row parity, or any other durable
+    /// promise — it is the host reporting that it was too busy to finish in
+    /// three seconds. It is never a contract verdict on its own.
+    Deadline,
+    /// The store returned a real answer. This is the contract's verdict.
+    Fault(StoreError),
+}
+
+fn classify_replicated<T>(result: Result<T, StoreError>) -> ReplicatedOutcome<T> {
+    match result {
+        Ok(value) => ReplicatedOutcome::Ready(value),
+        Err(StoreError::Database(message)) if message.contains("timed out") => {
+            ReplicatedOutcome::Deadline
+        }
+        Err(error) => ReplicatedOutcome::Fault(error),
+    }
+}
+
+/// The panic text for a genuine size verdict.
+///
+/// An oversized transaction reaches the client as `ClientWriteError: panicked`
+/// because `hiqlite-wal` refuses the write in the leader with
+/// `` `data` length must not exceed `wal_size` ``. That is a byte comparison in
+/// the writer, so it is a structural fact about the payload and is reported the
+/// same way on an idle and a saturated host.
+fn wal_size_diagnosis(error: &StoreError) -> String {
+    format!("{WAL_SIZE_VERDICT}: {error}")
+}
+
+/// The panic text for a host that never let the import run to completion.
+///
+/// Deliberately does not contain [`WAL_SIZE_VERDICT`]: nothing here observed a
+/// transaction size, so claiming the WAL bound was violated would be a
+/// fabricated verdict — the defect #368 exists to remove.
+fn replicated_deadline_diagnosis(label: &str, attempts: u32) -> String {
+    format!(
+        "{label}: the replicated store reported {REPLICATED_DEADLINE_MESSAGE:?} on all \
+         {attempts} attempts while the voters stayed reachable. The host never let this \
+         operation finish, so the production 2 MiB WAL bound was neither proved nor \
+         violated and this run is not durable-state evidence either way. This is a \
+         load-sensitive cluster check: see \"Load-sensitive cluster checks\" in \
+         docs/VALIDATION.md, then rerun `make cluster-check` on an otherwise idle machine."
+    )
+}
+
+/// The panic text for a deadline whose voter then failed a consistent read.
+///
+/// This is the case that keeps deadline tolerance honest. An oversized
+/// transaction kills the leader's write task, and a client racing that death
+/// can see the deadline before it sees `ClientWriteError`. A merely busy voter
+/// still answers a consistent read, so a failed readiness probe separates the
+/// two by cluster state rather than by elapsed time, and this one does earn the
+/// size verdict.
+fn unreachable_voter_diagnosis(probe: &StoreError) -> String {
+    format!(
+        "{WAL_SIZE_VERDICT}: the import hit the replicated deadline and the voter then \
+         failed a consistent readiness read ({probe}), which is what an oversized Raft \
+         transaction does to the leader — a busy host still answers this probe"
+    )
+}
+
+/// Run one replicated read, re-attempting only while the store reports its
+/// per-operation deadline. Any real error is the contract's answer and fails
+/// immediately.
+#[cfg(feature = "hiqlite-store")]
+async fn replicated_read<T, F, Fut>(label: &str, mut operation: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    for _ in 0..REPLICATED_DEADLINE_ATTEMPTS {
+        match classify_replicated(operation().await) {
+            ReplicatedOutcome::Ready(value) => return value,
+            ReplicatedOutcome::Fault(error) => panic!("{label}: {error}"),
+            ReplicatedOutcome::Deadline => continue,
+        }
+    }
+    panic!(
+        "{}",
+        replicated_deadline_diagnosis(label, REPLICATED_DEADLINE_ATTEMPTS)
+    );
+}
+
+/// A busy host must never be able to print the WAL-size verdict.
+///
+/// Regression for #368: `make validate` reported
+/// `Database("replicated store operation timed out")` as [`WAL_SIZE_VERDICT`]
+/// on a branch whose entire diff was two JSON/text files, so a saturated worker
+/// was indistinguishable from a real durable-state regression. Runs without the
+/// cluster on purpose — the rule it protects must not itself be load-sensitive.
+#[test]
+fn a_replicated_deadline_is_never_reported_as_a_wal_size_violation() {
+    assert!(
+        include_str!("../src/store/hiqlite.rs").contains(REPLICATED_DEADLINE_MESSAGE),
+        "the production per-operation deadline no longer produces {REPLICATED_DEADLINE_MESSAGE:?}; \
+         update REPLICATED_DEADLINE_MESSAGE, or every timeout starts being reported as a \
+         durable-state contract violation again"
+    );
+
+    let deadline = classify_replicated::<()>(Err(StoreError::Database(
+        REPLICATED_DEADLINE_MESSAGE.to_owned(),
+    )));
+    assert!(
+        matches!(deadline, ReplicatedOutcome::Deadline),
+        "the production deadline text must classify as a deadline, not as a store fault"
+    );
+    let diagnosis =
+        replicated_deadline_diagnosis("large-probe import", REPLICATED_DEADLINE_ATTEMPTS);
+    assert!(
+        !diagnosis.contains(WAL_SIZE_VERDICT),
+        "a timeout must not be presented as a WAL-size violation, got: {diagnosis}"
+    );
+    assert!(
+        diagnosis.contains(REPLICATED_DEADLINE_MESSAGE) && diagnosis.contains("docs/VALIDATION.md"),
+        "a timeout must name itself and where its diagnosis is written down, got: {diagnosis}"
+    );
+
+    // The real violation still gets the verdict: `hiqlite-wal` refuses the
+    // oversized write in the leader and the client sees this exact string.
+    let violation = classify_replicated::<()>(Err(StoreError::Database(
+        "ClientWriteError: panicked".to_owned(),
+    )));
+    let ReplicatedOutcome::Fault(error) = violation else {
+        panic!("an oversized-transaction write error must classify as a store fault");
+    };
+    assert!(
+        wal_size_diagnosis(&error).contains(WAL_SIZE_VERDICT),
+        "an oversized Raft transaction must still be reported as a WAL-size violation"
+    );
+    assert!(
+        unreachable_voter_diagnosis(&error).contains(WAL_SIZE_VERDICT),
+        "a deadline whose voter stopped answering must be reported as a WAL-size violation"
+    );
+    assert!(
+        matches!(
+            classify_replicated(Ok::<_, StoreError>(())),
+            ReplicatedOutcome::Ready(())
+        ),
+        "a successful replicated call must stay a success"
+    );
+}
+
 /// Import transactions must be bounded by serialized bytes, not by a row count.
 ///
 /// The fixture is built to defeat a row count on purpose: the oversized band's
@@ -1295,10 +1478,6 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
 async fn large_probe_json_import_respects_the_production_wal_limit() {
     let _case = HIQLITE_CASE.lock().await;
     let store = open_contract_hiqlite_store().await;
-    store
-        .validation_reset_contract_state()
-        .await
-        .expect("reset replicated large-probe import target");
 
     let source = tempfile::tempdir().expect("large-probe SQLite fixture directory");
     let fixture_path = populated_current_import_fixture(source.path());
@@ -1316,14 +1495,45 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
     );
     let prepared = prepare_sqlite_import(source.path()).expect("prepare large-probe import backup");
 
-    let report = store
-        .import_sqlite_backup(
-            &prepared.backup_path,
-            &prepared.backup_sha256,
-            prepared.schema_version,
+    // Each attempt re-proves the whole contract from an empty target, so a
+    // deadline costs time and never partial state. Only the WAL writer's own
+    // byte refusal, or a voter that stops answering, decides the size contract.
+    let mut report = None;
+    for _ in 0..REPLICATED_DEADLINE_ATTEMPTS {
+        let attempt = match classify_replicated(store.validation_reset_contract_state().await) {
+            ReplicatedOutcome::Ready(()) => classify_replicated(
+                store
+                    .import_sqlite_backup(
+                        &prepared.backup_path,
+                        &prepared.backup_sha256,
+                        prepared.schema_version,
+                    )
+                    .await,
+            ),
+            ReplicatedOutcome::Deadline => ReplicatedOutcome::Deadline,
+            ReplicatedOutcome::Fault(error) => {
+                panic!("reset replicated large-probe import target: {error}")
+            }
+        };
+        match attempt {
+            ReplicatedOutcome::Ready(imported) => {
+                report = Some(imported);
+                break;
+            }
+            ReplicatedOutcome::Fault(error) => panic!("{}", wal_size_diagnosis(&error)),
+            ReplicatedOutcome::Deadline => {
+                if let ReplicatedOutcome::Fault(probe) = classify_replicated(store.ping().await) {
+                    panic!("{}", unreachable_voter_diagnosis(&probe));
+                }
+            }
+        }
+    }
+    let report = report.unwrap_or_else(|| {
+        panic!(
+            "{}",
+            replicated_deadline_diagnosis("large-probe import", REPLICATED_DEADLINE_ATTEMPTS)
         )
-        .await
-        .expect("byte-bounded transactions must carry probe rows a row count cannot");
+    });
     assert_eq!(
         report
             .tables
@@ -1347,12 +1557,12 @@ async fn large_probe_json_import_respects_the_production_wal_limit() {
     ] {
         for ordinal in 0..count {
             let id = first_id + ordinal;
+            let stored = replicated_read("read imported large probe", || {
+                store.get_file_probe_json(id)
+            })
+            .await;
             assert_eq!(
-                store
-                    .get_file_probe_json(id)
-                    .await
-                    .expect("read imported large probe")
-                    .as_deref(),
+                stored.as_deref(),
                 Some(large_probe_json(id, padding).as_str()),
                 "large probe_json row {id} must retain exact bytes"
             );
