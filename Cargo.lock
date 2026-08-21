@@ -2190,6 +2190,7 @@ dependencies = [
  "anyhow",
  "hex",
  "hiqlite",
+ "plurx-compat-plex",
  "plurx-core",
  "rusqlite",
  "rustls",

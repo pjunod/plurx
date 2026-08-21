@@ -96,11 +96,12 @@ pub async fn identity(State(state): State<AppState>) -> Result<Response, ApiErro
 /// GET / for Plex clients — server capabilities.
 pub async fn root(State(state): State<AppState>) -> Result<Response, ApiError> {
     let id = state.store.instance_id().await?;
-    Ok(xml(plex::root_container(
-        &id,
-        &state.server_name,
-        version(),
-    )))
+    let name = state
+        .store
+        .get_setting(plurx_core::store::keys::SERVER_NAME)
+        .await?
+        .unwrap_or_else(|| state.server_name.clone());
+    Ok(xml(plex::root_container(&id, &name, version())))
 }
 
 /// GET /library — the library root container clients load before sections.

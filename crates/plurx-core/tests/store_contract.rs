@@ -82,6 +82,7 @@ impl From<&mut Row<'_>> for I64Value {
 const SETTINGS_METHODS: &[&str] = &[
     "ping",
     "get_setting",
+    "get_or_init_setting",
     "get_setting_pair",
     "put_setting",
     "put_settings",
@@ -2216,7 +2217,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 144, "review the Store method count");
+    assert_eq!(declared.len(), 145, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -2348,6 +2349,22 @@ async fn settings_contract_runs_through_dyn_store() {
     for_each_backend(|store, backend| async move {
         store.ping().await.expect("ping");
         assert_eq!(store.get_setting("contract.key").await.expect("get"), None);
+        assert_eq!(
+            store
+                .get_or_init_setting("contract.seed", "first seed")
+                .await
+                .expect("seed setting"),
+            "first seed",
+            "backend {backend}"
+        );
+        assert_eq!(
+            store
+                .get_or_init_setting("contract.seed", "discarded seed")
+                .await
+                .expect("read seeded winner"),
+            "first seed",
+            "backend {backend}"
+        );
         store
             .put_setting("contract.key", "first")
             .await

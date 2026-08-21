@@ -494,7 +494,7 @@ membership addresses and token-file paths are intentionally file-only:
 | Env var | TOML | Default | What it does |
 |---|---|---|---|
 | `PLURX_BIND` | `server.bind` | `0.0.0.0:32400` | Address the HTTP API binds to |
-| `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
+| `PLURX_SERVER_NAME` | `server.name` | `plurx` | Bootstrap name for a new store. The replicated setting is authoritative after first boot; rename through the admin API so every voter converges |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
@@ -575,6 +575,14 @@ is the discovery label; an explicit server name replaces it. The LAN address
 is appended in either case (`m6 · 192.168.1.20`), so a picker remains
 identifiable even when several machines have similar names. This avoids making
 every host override repeat its own machine identity.
+
+Once `cluster.advertise_host` opts a node into clustering, the replicated
+server name replaces that node-local label. The companion reads the logical
+name, logical `instance.id`, local `node.id`, and cluster-advertisement flag
+from `/api/v1/server`; it does not read Hiqlite directly. Bonjour and GDM then
+publish distinct node records under the same logical name and id. Rename the
+server through the admin settings API, not TOML: TOML is only the first-store
+seed and changing it later deliberately does nothing.
 
 Do not add `network_mode: host` to `plurxd`: Compose rejects a service that also
 has a `networks:` attachment. The companion is a different service, so an

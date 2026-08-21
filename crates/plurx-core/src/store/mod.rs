@@ -82,6 +82,9 @@ pub mod keys {
     /// immutable thereafter; in a cluster it identifies the *cluster*, not a
     /// node (REQ-HA-5: one logical identity).
     pub const INSTANCE_ID: &str = "instance.id";
+    /// Human-visible name of the logical server. Configuration supplies only
+    /// the first value; thereafter this replicated key is authoritative.
+    pub const SERVER_NAME: &str = "server.name";
     /// TMDB API key (set by the admin; empty/absent disables the agent).
     pub const TMDB_API_KEY: &str = "tmdb.api_key";
     /// OMDb API key — powers review-site ratings (Rotten Tomatoes / Metacritic /
@@ -269,6 +272,8 @@ pub trait SettingsStore: Send + Sync + 'static {
     /// Cheap liveness probe of the backing storage (drives `/readyz`).
     async fn ping(&self) -> Result<(), StoreError>;
     async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError>;
+    /// Atomically seed an absent setting and return the durable winner.
+    async fn get_or_init_setting(&self, key: &str, seed: &str) -> Result<String, StoreError>;
     /// Read two related settings from one database snapshot.
     async fn get_setting_pair(
         &self,

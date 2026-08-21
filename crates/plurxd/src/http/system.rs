@@ -28,6 +28,9 @@ pub struct ServerInfo {
     /// Compile time, always present — the fallback when `build` is "unknown".
     pub built_at: &'static str,
     pub instance_id: String,
+    /// Stable local node identity used only to distinguish cluster records.
+    pub node_id: String,
+    pub cluster_advertisement: bool,
     pub uptime_seconds: u64,
     /// True when no users exist yet — the web app shows first-run setup.
     pub setup_required: bool,
@@ -39,14 +42,21 @@ pub struct ServerInfo {
 /// GET /api/v1/server — public; drives the client's setup-vs-login decision.
 pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
     let instance_id = state.store.instance_id().await?;
+    let name = state
+        .store
+        .get_setting(keys::SERVER_NAME)
+        .await?
+        .unwrap_or_else(|| state.server_name.clone());
     let setup_required = state.store.count_users().await? == 0;
     let android_app = super::web::android_apk_path(&state.system.data_dir).is_some();
     Ok(Json(ServerInfo {
-        name: state.server_name.clone(),
+        name,
         version: crate::version::SEMVER,
         build: crate::version::BUILD,
         built_at: crate::version::BUILT_AT,
         instance_id,
+        node_id: state.node_id.clone(),
+        cluster_advertisement: state.cluster_advertisement,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         setup_required,
         android_app,
@@ -161,8 +171,13 @@ pub async fn system_info(
     let (by_trigger, notifications) = state.jobs.metrics().snapshot();
     let (hw_in_use, hw_max) = state.transcode.hardware_slots().await;
     let replication = state.replication.status().await;
+    let name = state
+        .store
+        .get_setting(keys::SERVER_NAME)
+        .await?
+        .unwrap_or_else(|| state.server_name.clone());
     Ok(Json(SystemDto {
-        name: state.server_name.clone(),
+        name,
         version: crate::version::SEMVER,
         build: crate::version::BUILD,
         built_at: crate::version::BUILT_AT,
@@ -1008,6 +1023,8 @@ fn client_log_line(ev: &ClientLog, suppressed: u64) -> String {
 
 #[derive(Serialize)]
 pub struct SettingsDto {
+    /// Replicated logical name shared by every voter.
+    pub server_name: String,
     pub tmdb_configured: bool,
     /// The stored TMDB key itself. This endpoint is admin-only and the key is
     /// low-sensitivity (read-only metadata), so the admin who set it can see
@@ -1111,6 +1128,11 @@ pub struct SettingsDto {
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
+    let server_name = state
+        .store
+        .get_setting(keys::SERVER_NAME)
+        .await?
+        .unwrap_or_else(|| state.server_name.clone());
     let tmdb_api_key = state
         .store
         .get_setting(keys::TMDB_API_KEY)
@@ -1276,6 +1298,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .await?
         .is_some_and(|v| v.trim() == "1");
     Ok(SettingsDto {
+        server_name,
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
         omdb_configured: !omdb_api_key.is_empty(),
@@ -1336,6 +1359,9 @@ pub async fn get_settings(
 
 #[derive(Deserialize)]
 pub struct UpdateSettings {
+    /// Rename the logical server on every voter. Configuration is only the
+    /// bootstrap seed and is not edited by this operation.
+    pub server_name: Option<String>,
     /// Set the TMDB API key. Empty string clears it. Absent leaves it as-is.
     pub tmdb_api_key: Option<String>,
     /// Set the OMDb API key. Empty string clears it. Absent leaves it as-is.
@@ -1404,6 +1430,13 @@ pub async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsDto>, ApiError> {
+    if let Some(name) = &req.server_name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ApiError::BadRequest("server_name must not be empty".into()));
+        }
+        state.store.put_setting(keys::SERVER_NAME, name).await?;
+    }
     match (&req.transcode_rate_mode, req.transcode_quality) {
         (None, None) => {}
         (Some(requested_mode), Some(quality)) => {

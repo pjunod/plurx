@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 hiqlite = { workspace = true }
 hex = { workspace = true }
 plurx-core = { path = "../plurx-core", features = ["hiqlite-store"] }
+plurx-compat-plex = { path = "../plurx-compat-plex" }
 rusqlite = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }

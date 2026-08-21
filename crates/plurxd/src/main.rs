@@ -360,7 +360,7 @@ struct Boot {
 /// installing a signal handler and registering on the LAN is what lets the
 /// whole sequence run in a test, on a temporary directory and a loopback port.
 async fn boot(
-    config: Config,
+    mut config: Config,
     parts: Boot,
     advertiser: MdnsAdvertiser,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -376,12 +376,21 @@ async fn boot(
         system,
         logs,
     } = parts;
+    // `server.name` predates clustering as a node-local config value. Seed it
+    // once so an existing installation keeps its name on upgrade, then use the
+    // replicated winner on every voter. A joining node's config can therefore
+    // never rename the logical server accidentally.
+    config.server.name = store
+        .get_or_init_setting(keys::SERVER_NAME, &config.server.name)
+        .await
+        .context("initializing replicated server name")?;
     log_startup(&config, &identity);
 
     let instance_id = identity.cluster_id;
+    let node_id = identity.node_id;
     let state = build_state(
         &config,
-        identity.node_id,
+        node_id.clone(),
         credential_key,
         replication,
         membership,
@@ -401,7 +410,9 @@ async fn boot(
     let app = http::router(state);
     let listener = bind_listener(config.server.bind).await?;
     trigger_shutdown_registration_failpoint("after-listener-bind");
-    let mdns = start_discovery(&config, &instance_id, advertiser);
+    let discovery_node_id =
+        (!config.cluster.advertise_host.trim().is_empty()).then_some(node_id.as_str());
+    let mdns = start_discovery(&config, &instance_id, discovery_node_id, advertiser);
 
     serve(listener, app, progress, mdns, shutdown).await
 }
@@ -409,7 +420,8 @@ async fn boot(
 /// How a Bonjour record gets published. A parameter rather than a direct call
 /// because registering one puts a service on the local network, which a test
 /// must not do to check that discovery is best-effort.
-type MdnsAdvertiser = fn(&str, &str, SocketAddr, &str) -> anyhow::Result<mdns_sd::ServiceDaemon>;
+type MdnsAdvertiser =
+    fn(&str, &str, Option<&str>, SocketAddr, &str) -> anyhow::Result<mdns_sd::ServiceDaemon>;
 
 /// Console logging plus a bounded in-memory ring the admin UI can read.
 ///
@@ -482,15 +494,21 @@ async fn bind_listener(bind: SocketAddr) -> anyhow::Result<tokio::net::TcpListen
 fn start_discovery(
     config: &Config,
     instance_id: &str,
+    node_id: Option<&str>,
     advertiser: MdnsAdvertiser,
 ) -> Option<mdns_sd::ServiceDaemon> {
     let lan_discovery = !config.server.bind.ip().is_loopback();
     if let Some(gdm_port) = gdm_responder_port(lan_discovery, config.server.bind) {
         // GDM keeps direct-connect Plex clients working. Bonjour is the native
         // plurx contract used by the Apple apps.
-        spawn_gdm_responder(config, instance_id.to_owned(), gdm_port);
+        spawn_gdm_responder(
+            config,
+            instance_id.to_owned(),
+            node_id.map(str::to_owned),
+            gdm_port,
+        );
     }
-    start_bonjour(config, instance_id, advertiser, lan_discovery)
+    start_bonjour(config, instance_id, node_id, advertiser, lan_discovery)
 }
 
 /// The native plurx discovery contract, which the Apple clients browse for.
@@ -502,6 +520,7 @@ fn start_discovery(
 fn start_bonjour(
     config: &Config,
     instance_id: &str,
+    node_id: Option<&str>,
     advertiser: MdnsAdvertiser,
     lan_discovery: bool,
 ) -> Option<mdns_sd::ServiceDaemon> {
@@ -517,9 +536,15 @@ fn start_bonjour(
         system_hostname().as_deref(),
         primary_lan_address().as_ref(),
     );
+    let advertised_name = if node_id.is_some() {
+        config.server.name.as_str()
+    } else {
+        discovery_name.as_str()
+    };
     match advertiser(
         instance_id,
-        &discovery_name,
+        advertised_name,
+        node_id,
         config.server.bind,
         crate::version::SEMVER,
     ) {
@@ -535,11 +560,16 @@ fn start_bonjour(
 ///
 /// Best-effort by construction: a box where the multicast join is refused
 /// still serves HTTP, and the only trace is one warning.
-fn spawn_gdm_responder(config: &Config, instance_id: String, gdm_port: u16) {
+fn spawn_gdm_responder(
+    config: &Config,
+    instance_id: String,
+    node_id: Option<String>,
+    gdm_port: u16,
+) {
     let name = config.server.name.clone();
     let http_port = config.server.bind.port();
     tokio::spawn(async move {
-        if let Err(e) = gdm_responder(instance_id, name, http_port, gdm_port).await {
+        if let Err(e) = gdm_responder(instance_id, node_id, name, http_port, gdm_port).await {
             tracing::warn!(error = %e, "GDM discovery responder unavailable");
         }
     });
@@ -707,6 +737,7 @@ fn build_state(
         crate::state::AppConfig {
             server_name: config.server.name.clone(),
             node_id,
+            cluster_advertisement: !config.cluster.advertise_host.trim().is_empty(),
             scan_prune_percent: config.storage.scan_prune_percent,
             credential_key,
             replication,
@@ -954,6 +985,8 @@ struct DiscoveryServerInfo {
     name: String,
     version: String,
     instance_id: String,
+    node_id: String,
+    cluster_advertisement: bool,
 }
 
 /// Fetch identity from the running server, then publish that identity through
@@ -988,11 +1021,15 @@ async fn advertise_with(
 
     let host_name = system_hostname();
     let lan_address = primary_lan_address();
-    let discovery_name =
-        discovery_display_name(&info.name, host_name.as_deref(), lan_address.as_ref());
+    let discovery_name = if info.cluster_advertisement {
+        info.name.clone()
+    } else {
+        discovery_display_name(&info.name, host_name.as_deref(), lan_address.as_ref())
+    };
     let daemon = advertiser(
         &info.instance_id,
         &discovery_name,
+        info.cluster_advertisement.then_some(info.node_id.as_str()),
         SocketAddr::from(([0, 0, 0, 0], port)),
         &info.version,
     )?;
@@ -1153,6 +1190,7 @@ fn register_advertiser(
     daemon: &impl MdnsRegistrar,
     instance_id: &str,
     name: &str,
+    node_id: Option<&str>,
     bind: SocketAddr,
     version: &str,
 ) -> anyhow::Result<()> {
@@ -1162,7 +1200,7 @@ fn register_advertiser(
         .spawn(move || log_mdns_events(monitor))
         .context("starting mDNS monitor")?;
 
-    let service = mdns_service_info(instance_id, name, bind, version)?;
+    let service = mdns_service_info(instance_id, name, node_id, bind, version)?;
     daemon.register(service)?;
     tracing::info!(
         service = MDNS_SERVICE_TYPE,
@@ -1179,40 +1217,53 @@ fn register_advertiser(
 fn start_mdns_advertiser(
     instance_id: &str,
     name: &str,
+    node_id: Option<&str>,
     bind: SocketAddr,
     version: &str,
 ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
     let daemon = mdns_sd::ServiceDaemon::new().context("starting mDNS daemon")?;
-    register_advertiser(&daemon, instance_id, name, bind, version)?;
+    register_advertiser(&daemon, instance_id, name, node_id, bind, version)?;
     Ok(daemon)
 }
 
-/// Build one testable DNS-SD record. The stable instance id names the `.local`
-/// host; the human server name remains the service instance users see.
+/// Build one testable DNS-SD record. Cluster hosts derive from `node.id`; the
+/// logical name remains visible while the full node id stays in TXT metadata.
 fn mdns_service_info(
     instance_id: &str,
     name: &str,
+    node_id: Option<&str>,
     bind: SocketAddr,
     version: &str,
 ) -> anyhow::Result<mdns_sd::ServiceInfo> {
-    let suffix: String = instance_id
+    let host_identity = node_id.unwrap_or(instance_id);
+    let host_suffix: String = host_identity
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(12)
         .collect();
-    let suffix = if suffix.is_empty() { "server" } else { &suffix };
-    let hostname = format!("plurx-{suffix}.local.");
-    let instance_name = if name.trim().is_empty() {
+    let host_suffix = if host_suffix.is_empty() {
+        "server"
+    } else {
+        &host_suffix
+    };
+    let hostname = format!("plurx-{host_suffix}.local.");
+    let logical_name = if name.trim().is_empty() {
         "plurx"
     } else {
         name
     };
-    let properties = [
+    let instance_name = node_id
+        .map(|_| clustered_instance_name(logical_name, host_suffix))
+        .unwrap_or_else(|| logical_name.to_owned());
+    let mut properties = vec![
         ("id", instance_id),
-        ("name", instance_name),
+        ("name", logical_name),
         ("version", version),
         ("api", "/api/v1"),
     ];
+    if let Some(node_id) = node_id {
+        properties.push(("node_id", node_id));
+    }
     let addresses = if bind.ip().is_unspecified() {
         String::new()
     } else {
@@ -1220,17 +1271,35 @@ fn mdns_service_info(
     };
     let service = mdns_sd::ServiceInfo::new(
         MDNS_SERVICE_TYPE,
-        instance_name,
+        &instance_name,
         &hostname,
         addresses.as_str(),
         bind.port(),
-        &properties[..],
+        properties.as_slice(),
     )?;
     Ok(if bind.ip().is_unspecified() {
         service.enable_addr_auto()
     } else {
         service
     })
+}
+
+fn clustered_instance_name(logical_name: &str, node_suffix: &str) -> String {
+    const DNS_LABEL_BYTES: usize = 63;
+    let suffix = format!(" · {node_suffix}");
+    let name_budget = DNS_LABEL_BYTES.saturating_sub(suffix.len());
+    let mut name = String::new();
+    for ch in logical_name.chars() {
+        if name.len() + ch.len_utf8() > name_budget {
+            break;
+        }
+        name.push(ch);
+    }
+    if name.is_empty() {
+        node_suffix.to_owned()
+    } else {
+        format!("{name}{suffix}")
+    }
 }
 
 /// First line of `ffmpeg -version` (e.g. "ffmpeg version 6.1.1 …"), if the
@@ -1262,12 +1331,13 @@ fn first_version_line(stdout: &[u8]) -> Option<String> {
 /// this never answers WAN queries (avoids GDM/SSDP reflection abuse).
 async fn gdm_responder(
     instance_id: String,
+    node_id: Option<String>,
     name: String,
     http_port: u16,
     gdm_port: u16,
 ) -> anyhow::Result<()> {
     let socket = gdm_socket(gdm_port).await?;
-    gdm_serve(&socket, &instance_id, &name, http_port).await
+    gdm_serve(&socket, &instance_id, node_id.as_deref(), &name, http_port).await
 }
 
 /// Bind the GDM port and join the group Plex clients search on.
@@ -1300,6 +1370,7 @@ async fn gdm_socket(gdm_port: u16) -> anyhow::Result<tokio::net::UdpSocket> {
 async fn gdm_serve(
     socket: &tokio::net::UdpSocket,
     instance_id: &str,
+    node_id: Option<&str>,
     name: &str,
     http_port: u16,
 ) -> anyhow::Result<()> {
@@ -1310,7 +1381,15 @@ async fn gdm_serve(
     loop {
         let (n, addr) = socket.recv_from(&mut buf).await?;
         if plurx_compat_plex::gdm::is_search(&buf[..n]) {
-            let resp = plurx_compat_plex::gdm::response(instance_id, name, version, http_port);
+            let resp = plurx_compat_plex::gdm::response_for(
+                &plurx_compat_plex::gdm::Advertisement {
+                    instance_id,
+                    name,
+                    node_id,
+                },
+                version,
+                http_port,
+            );
             if let Err(e) = socket.send_to(&resp, addr).await {
                 tracing::warn!(error = %e, "GDM response send failed");
             }
@@ -1693,7 +1772,7 @@ mod startup_tests {
         (format!("http://{addr}"), handle)
     }
 
-    const SERVER_IDENTITY: &str = r#"{"name":"Living Room","version":"0.2.0","instance_id":"abc"}"#;
+    const SERVER_IDENTITY: &str = r#"{"name":"Living Room","version":"0.2.0","instance_id":"abc","node_id":"node-a","cluster_advertisement":false}"#;
 
     #[tokio::test]
     async fn the_companion_advertises_the_identity_the_server_reports() {
@@ -1928,7 +2007,7 @@ mod startup_tests {
             .expect("bind server");
         let server_addr = server.local_addr().expect("addr");
         let responder = tokio::spawn(async move {
-            let _ = gdm_serve(&server, "instance-id", "Living Room", 32400).await;
+            let _ = gdm_serve(&server, "instance-id", None, "Living Room", 32400).await;
         });
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -2455,6 +2534,7 @@ mod startup_tests {
     fn advertiser_that_fails(
         _instance_id: &str,
         _name: &str,
+        _node_id: Option<&str>,
         _bind: SocketAddr,
         _version: &str,
     ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
@@ -2468,6 +2548,7 @@ mod startup_tests {
     fn advertiser_without_a_record(
         _instance_id: &str,
         _name: &str,
+        _node_id: Option<&str>,
         _bind: SocketAddr,
         _version: &str,
     ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
@@ -2489,7 +2570,7 @@ mod startup_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = config_in(tmp.path());
         assert!(
-            start_discovery(&config, "instance-1", advertiser_that_fails).is_none(),
+            start_discovery(&config, "instance-1", None, advertiser_that_fails).is_none(),
             "a loopback bind must not be advertised"
         );
     }
@@ -2503,11 +2584,11 @@ mod startup_tests {
         let mut config = config_in(tmp.path());
         config.server.bind = "0.0.0.0:32400".parse().expect("addr");
         assert!(
-            start_bonjour(&config, "instance-1", advertiser_that_fails, true).is_none(),
+            start_bonjour(&config, "instance-1", None, advertiser_that_fails, true).is_none(),
             "a failed advertiser is a warning, not a boot failure"
         );
         // And a loopback server is not offered to the advertiser at all.
-        assert!(start_bonjour(&config, "instance-1", advertiser_that_fails, false).is_none());
+        assert!(start_bonjour(&config, "instance-1", None, advertiser_that_fails, false).is_none());
     }
 
     /// The whole boot below the ffmpeg probes: an empty data dir becomes a
@@ -2615,6 +2696,7 @@ mod startup_tests {
         fn record(
             instance_id: &str,
             name: &str,
+            _node_id: Option<&str>,
             bind: SocketAddr,
             version: &str,
         ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
@@ -2675,10 +2757,11 @@ mod startup_tests {
         fn daemon_without_a_record(
             instance_id: &str,
             name: &str,
+            node_id: Option<&str>,
             bind: SocketAddr,
             version: &str,
         ) -> anyhow::Result<mdns_sd::ServiceDaemon> {
-            let daemon = advertiser_without_a_record(instance_id, name, bind, version)?;
+            let daemon = advertiser_without_a_record(instance_id, name, node_id, bind, version)?;
             REGISTERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(daemon)
         }
@@ -2800,7 +2883,7 @@ mod startup_tests {
 
         // The full boot-time wiring: discovery starts the responder, and the
         // stub advertiser keeps Bonjour off the network.
-        assert!(start_discovery(&config, "instance-1", advertiser_that_fails).is_none());
+        assert!(start_discovery(&config, "instance-1", None, advertiser_that_fails).is_none());
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -2847,14 +2930,20 @@ mod startup_tests {
         // that dropped it here would leave the record on the LAN for as long
         // as it took to age out. Asserted in this test because it is the one
         // that owns `PLURX_MDNS_ADVERTISE` for the length of its run.
-        let daemon = start_bonjour(&config, "instance-1", advertiser_without_a_record, true)
-            .expect("an enabled, successful advertiser must yield its daemon");
+        let daemon = start_bonjour(
+            &config,
+            "instance-1",
+            None,
+            advertiser_without_a_record,
+            true,
+        )
+        .expect("an enabled, successful advertiser must yield its daemon");
         daemon.shutdown().expect("the returned daemon must be live");
 
         std::env::set_var("PLURX_MDNS_ADVERTISE", "0");
         assert!(!mdns_advertising_enabled());
         assert!(
-            start_bonjour(&config, "instance-1", advertiser_that_fails, true).is_none(),
+            start_bonjour(&config, "instance-1", None, advertiser_that_fails, true).is_none(),
             "a disabled advertiser is never even started"
         );
         std::env::remove_var("PLURX_MDNS_ADVERTISE");
@@ -2930,6 +3019,7 @@ mod startup_tests {
                 &daemon,
                 "plurxd-selftest-instance",
                 "Living Room",
+                None,
                 "192.168.1.9:32400".parse().expect("addr"),
                 "0.2.0",
             )
@@ -2976,6 +3066,7 @@ mod startup_tests {
                 &daemon,
                 "instance-1",
                 &"Living Room ".repeat(30),
+                None,
                 "192.168.1.9:32400".parse().expect("addr"),
                 "0.2.0",
             )
@@ -3026,7 +3117,7 @@ mod startup_tests {
         let _capture = capturing(&logs);
         // The responder is spawned, not awaited — a bind that fails must not be
         // something the caller waits on.
-        spawn_gdm_responder(&config, "instance-1".to_owned(), taken);
+        spawn_gdm_responder(&config, "instance-1".to_owned(), None, taken);
         for _ in 0..50 {
             if !logs.tail("warn", 8).is_empty() {
                 break;
@@ -3098,6 +3189,7 @@ mod startup_tests {
                 &daemon,
                 "instance-1",
                 "Living Room",
+                None,
                 "192.168.1.9:32400".parse().expect("addr"),
                 "0.2.0",
             )
@@ -3125,6 +3217,7 @@ mod startup_tests {
                 &daemon,
                 "instance-1",
                 "Living Room",
+                None,
                 "192.168.1.9:32400".parse().expect("addr"),
                 "0.2.0",
             )
@@ -3253,6 +3346,7 @@ mod startup_tests {
         let info = mdns_service_info(
             "",
             "   ",
+            None,
             "0.0.0.0:32400".parse().expect("socket address"),
             "0.2.0",
         )
@@ -3385,6 +3479,8 @@ mod startup_tests {
                 "version": "0.2.0",
                 "build": "v0.2.0-4-gabc",
                 "instance_id": "server-id",
+                "node_id": "node-a",
+                "cluster_advertisement": false,
                 "uptime_seconds": 12,
                 "setup_required": false,
                 "android_app": true
@@ -3424,6 +3520,7 @@ mod startup_tests {
         let info = mdns_service_info(
             "550e8400-e29b-41d4-a716-446655440000",
             "Living Room",
+            None,
             "0.0.0.0:32400".parse().expect("socket address"),
             "0.2.0",
         )
@@ -3439,11 +3536,37 @@ mod startup_tests {
     }
 
     #[test]
+    fn clustered_bonjour_record_has_logical_and_node_identity() {
+        let info = mdns_service_info(
+            "logical-server",
+            "Living Room",
+            Some("node-b"),
+            "0.0.0.0:32400".parse().expect("socket address"),
+            "0.2.0",
+        )
+        .expect("service info");
+
+        assert_eq!(info.get_hostname(), "plurx-nodeb.local.");
+        assert!(info.get_fullname().contains("Living Room · nodeb"));
+        assert_eq!(info.get_property_val_str("id"), Some("logical-server"));
+        assert_eq!(info.get_property_val_str("node_id"), Some("node-b"));
+        assert_eq!(info.get_property_val_str("name"), Some("Living Room"));
+    }
+
+    #[test]
+    fn clustered_instance_label_truncates_on_a_unicode_boundary() {
+        let label = clustered_instance_name(&"Cinema 🎬 ".repeat(12), "nodeb");
+        assert!(label.len() <= 63, "{label}");
+        assert!(label.ends_with(" · nodeb"), "{label}");
+    }
+
+    #[test]
     fn explicit_bind_advertises_only_that_address() {
         let address = "192.168.1.20".parse().expect("IP address");
         let info = mdns_service_info(
             "server-id",
             "plurx",
+            None,
             "192.168.1.20:32400".parse().expect("socket address"),
             "0.2.0",
         )
