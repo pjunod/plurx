@@ -202,14 +202,24 @@ inside one Books library while keeping their actions and metadata honest.
   to the Cinema origin and publication capability, closing flushes the newest
   locator, and a profile or server change dismisses the book. tvOS and
   Google TV deliberately expose no reader action.
+- **Cinema-managed EPUB downloads are built in on iPhone, iPad, and Android
+  phone/tablet.** Each app
+  records a recoverable intent before transfer, downloads the authenticated
+  original, reopens the publication to prove its exact size/mtime revision,
+  materializes only the server-bounded declared resources, and atomically
+  publishes the app-private result. Downloads opens with plurxd stopped; its
+  token-free private-scheme or synthetic-origin reader blocks all HTTP(S)
+  publication loads and queues the newest dated locator for reconnect. The
+  automated storage, reader, and sync contracts are green; the physical
+  airplane-mode/reconnect matrix remains an unclaimed release check.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **Native ebook downloads and book metadata enrichment are not shipped yet.**
-  Online EPUB reading is in-app; **Open in…** remains available for every
-  supported escape path. Titles and authors come from the file/folder layout;
-  DRM-protected books are not decrypted, and cover extraction is not yet
-  implemented.
+- **Book metadata enrichment is not shipped yet.** **Open in…** remains
+  available for every supported escape path. Titles and authors come from the
+  file/folder layout or the EPUB package used by the reader; provider-backed
+  work/edition identity and durable package-cover extraction are not yet
+  implemented. DRM-protected books are not decrypted.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters

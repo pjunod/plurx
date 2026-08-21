@@ -57,12 +57,15 @@ internal fun appVersionLabel(versionName: String, versionCode: Int): String =
 fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
+    val offlineBookRecords by vm.offlineBookRecords.collectAsStateWithLifecycle()
     val formFactor = currentFormFactor()
     val side = formFactor.horizontalPadding()
     var audio by remember { mutableStateOf(LANGS.firstOrNull { it.first == vm.audioLang } ?: LANGS.first()) }
     var sub by remember { mutableStateOf(SUB_LANGS.firstOrNull { it.first == vm.subLang } ?: SUB_LANGS.first()) }
     var confirmingSignOut by remember { mutableStateOf(false) }
     val currentProfileHasDownloads = offlineRecords.any {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId
+    } || offlineBookRecords.any {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId
     }
 

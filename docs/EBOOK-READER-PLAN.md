@@ -1,7 +1,8 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M3 complete · M4–M6 ready to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `5222dfd3` and `monarr` `a3f5fb8`
+**Status:** M0–M3 complete · M4 implementation complete, device acceptance
+pending · M5–M6 ready to build · **Written:** 2026-08-20 · **Verified against:** `plurx` `c66c7a77`
+and `monarr` `a3f5fb8`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -75,8 +76,8 @@ Six decisions define the work:
 | Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
 | Cinema server | Original bytes, revision-bound reading state, bounded EPUB manifest parsing, and capability-scoped resource streaming | Native/offline publication transport remains. |
 | Cinema web | Books shelf/detail plus in-app EPUB **Read/Resume**, TOC, search, preferences, explicit completion, and external/download fallbacks | Physical assistive-technology acceptance remains; other ebook formats still hand off. |
-| Cinema native | In-app online EPUB reading on iPhone/iPad and Android phone/tablet; external fallback; no TV reader action | No ebook offline record yet. |
-| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers | Offline clients do not replay the locator yet. |
+| Cinema native | In-app online and profile-scoped offline EPUB reading on iPhone/iPad and Android phone/tablet; external fallback; no TV reader action | Physical assistive-technology and airplane-mode/reconnect acceptance remain. |
+| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers; both mobile clients replay their newest dated offline locator | Physical cross-device reconnect acceptance remains. |
 
 The existing `/content` separation is load-bearing. Opening an EPUB is not a
 playback start, so it does not announce a viewer, allocate a playback session,
@@ -494,6 +495,15 @@ python3 -m validation.mobile_versions
 
 ### 7.5 M4 — Cinema-managed ebook downloads
 
+**Status:** implementation complete — Apple 2026-08-20, Android 2026-08-21;
+physical device acceptance remains. Both clients store the original EPUB plus
+a bounded local rendering cache, publish both atomically, open the catalogue
+before server reconnect, and replay the newest dated locator for the exact
+edition. Apple uses a private same-origin WebKit scheme and resource-loader
+rule. Android uses an all-intercepted synthetic HTTPS origin, a canonical
+app-private resolver, and a separate download owner from Media3. Neither
+offline reader has a login bearer, loopback listener, or network fallback.
+
 Implement §6 on Apple and Android: app-private original download, atomic local
 publication, profile-scoped catalogue, launch reconciliation, remove/retry,
 offline reader startup, and newest-state replay on reconnect. No server-side
@@ -560,7 +570,7 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
 | M2 · EPUB proof/web | Complete | Node contracts; deterministic hostile-EPUB Chromium acceptance; 620 MiB stream proof |
 | M3 · Native online | Complete | iOS/tvOS simulator suites; Android JVM/lint; real-Chromium native handoff, heading semantics, profile isolation, font/rotation restore, and close flush |
-| M4 · Offline EPUB | Planned | Physical airplane-mode drill |
+| M4 · Offline EPUB | Implementation complete · acceptance in progress | Apple catalogue/path/sync unit contracts and simulator build; Android catalogue/path/exact-edition sync JVM contracts, lint, instrumentation APK build, and packaged reader assets; shared-shell browser contract; physical airplane-mode/reconnect drill remains |
 | M5 · Metadata | Planned | Paired + standalone fixtures |
 | M6 · More formats/release | Planned | Contract-tested support matrix |
 
