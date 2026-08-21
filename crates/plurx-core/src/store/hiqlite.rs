@@ -26,10 +26,10 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 
-// v5 is a fresh-bootstrap/import schema. There is deliberately no in-place
-// replicated v4 migration here: existing clusters must fail compatibility
+// v6 is a fresh-bootstrap/import schema. There is deliberately no in-place
+// replicated v5 migration here: existing clusters must fail compatibility
 // until the clustering upgrade protocol owns that transition.
-pub const AUTH_SCHEMA_VERSION: i64 = 5;
+pub const AUTH_SCHEMA_VERSION: i64 = 6;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -349,6 +349,7 @@ impl HiqliteAuthStore {
     pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
         self.telemetry.clear().await?;
         let statements = [
+            "DELETE FROM offline_source_probes",
             "DELETE FROM offline_lease_guards",
             "DELETE FROM offline_package_leases",
             "DELETE FROM offline_packages",
@@ -357,6 +358,7 @@ impl HiqliteAuthStore {
             "DELETE FROM watched_outbox",
             "DELETE FROM trakt_auth",
             "DELETE FROM watch_state",
+            "DELETE FROM reading_state",
             "DELETE FROM scan_reconcile_items",
             "DELETE FROM scan_reconcile_guards",
             "DELETE FROM library_roots",
@@ -389,7 +391,9 @@ impl HiqliteAuthStore {
             (statements[14].to_owned(), params!()),
             (statements[15].to_owned(), params!()),
             (statements[16].to_owned(), params!()),
-            (statements[17].to_owned(), params!(keys::INSTANCE_ID)),
+            (statements[17].to_owned(), params!()),
+            (statements[18].to_owned(), params!()),
+            (statements[19].to_owned(), params!(keys::INSTANCE_ID)),
         ]))
         .await?
         .into_iter()

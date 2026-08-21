@@ -36,15 +36,16 @@ use plurx_core::config::Config;
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
     NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, TraktAuth,
+    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingStateWrite,
+    TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, TraktStore, UserStore,
-    WatchStore,
+    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore, TraktStore,
+    UserStore, WatchStore,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -151,6 +152,12 @@ const WATCH_METHODS: &[&str] = &[
     "next_up",
     "apply_remote_watch",
 ];
+const READING_METHODS: &[&str] = &[
+    "reading_state",
+    "current_reading_state",
+    "put_reading_state",
+    "delete_reading_state",
+];
 const TRAKT_METHODS: &[&str] = &[
     "get_trakt_auth",
     "list_trakt_auth",
@@ -204,6 +211,18 @@ const OFFLINE_METHODS: &[&str] = &[
     "mark_offline_package_ready",
     "delete_offline_package",
     "expire_offline_packages",
+    // Node removal (`CLUSTERING-PLAN.md` §6.7). Cluster-only behavior: the
+    // SQLite backend implements these inertly because a single-node install
+    // has no node to remove, so the real contract lives in the replicated
+    // case and in `plurx-cluster-check`.
+    "unresolved_offline_packages",
+    "offline_transfers_in_flight",
+    "request_offline_source_probes",
+    "pending_offline_source_probes",
+    "answer_offline_source_probe",
+    "outstanding_offline_source_probes",
+    "verified_offline_source_nodes",
+    "resolve_offline_packages_for_removal",
 ];
 const TELEMETRY_METHODS: &[&str] = &[
     "record_playback_event",
@@ -500,6 +519,11 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              INSERT INTO watch_state
                  (user_id, item_id, position_ms, duration_ms, watched, updated_at)
                  VALUES (7, 10, 120000, 3600000, 0, 117);
+             INSERT INTO reading_state
+                 (user_id, item_id, file_id, file_size, file_mtime, locator_json,
+                  progression_millis, completed, updated_at)
+                 VALUES (7, 10, 30, 4096, 115,
+                         '{\"version\":1,\"href\":\"chapter-2.xhtml\"}', 250000, 0, 118);
              INSERT INTO watched_outbox
                  (id, payload, attempts, last_error, status, next_at, created_at,
                   updated_at, claim_until)
@@ -765,6 +789,7 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE library_roots;
              DROP TABLE playback_events;
              DROP TABLE network_priors;
+             DROP TABLE reading_state;
              ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
@@ -818,8 +843,18 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
         .expect("import populated v14 backup");
     assert_eq!(report.source_schema_version, 14);
     assert_eq!(report.backup_sha256, prepared.backup_sha256);
-    assert_eq!(report.tables.len(), 17);
+    assert_eq!(report.tables.len(), 18);
     assert_eq!(report.search_rows, 2);
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "reading_state")
+            .expect("reading-state digest")
+            .row_count,
+        0,
+        "a v14 source predates reading state"
+    );
     assert!(
         report
             .tables
@@ -944,6 +979,23 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
         .await
         .expect("import populated current backup");
     assert_eq!(report.search_rows, 2);
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "reading_state")
+            .expect("reading-state digest")
+            .row_count,
+        1
+    );
+    let reading = store
+        .reading_state(7, 10, 30)
+        .await
+        .expect("read imported reading state")
+        .expect("imported reading state");
+    assert_eq!(reading.progression_millis, 250_000);
+    assert_eq!(reading.file_size, 4_096);
+    assert_eq!(reading.file_mtime, 115);
     assert_eq!(
         store
             .offline_package_for_user("fixture-package", 7)
@@ -1614,7 +1666,7 @@ async fn an_ambiguous_active_target_refuses_rather_than_reverting_to_sqlite() {
             cluster_id: prepared.cluster_id.clone(),
             source_backup_sha256: prepared.backup_sha256.clone(),
             source_schema_version: prepared.schema_version,
-            replicated_schema_version: 5,
+            replicated_schema_version: 6,
             imported_rows: 1,
             table_hashes: Vec::new(),
         }
@@ -1902,6 +1954,7 @@ fn contract_inventory_matches_every_store_method() {
         LIBRARY_METHODS,
         MEDIA_METHODS,
         WATCH_METHODS,
+        READING_METHODS,
         TRAKT_METHODS,
         API_KEY_METHODS,
         OUTBOX_METHODS,
@@ -1915,7 +1968,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 129, "review the Store method count");
+    assert_eq!(declared.len(), 141, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -2859,6 +2912,172 @@ async fn media_contract_runs_through_dyn_store() {
 }
 
 #[tokio::test]
+async fn reading_state_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let user = store
+            .create_user("reading-contract", "hash", false)
+            .await
+            .expect("user");
+        let books = store
+            .create_library(&NewLibrary {
+                name: "Reading Contract Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/reading/books")],
+                anime: false,
+            })
+            .await
+            .expect("books");
+        let book = store
+            .insert_item(&NewItem {
+                library_id: books.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "The Reading Contract".into(),
+                year: Some(2026),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file_id = store
+            .upsert_file(
+                book,
+                "/reading/books/contract.epub",
+                4_096,
+                100,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("raw reading state")
+            .is_none());
+        assert!(store
+            .current_reading_state(user.id, book)
+            .await
+            .expect("current reading state")
+            .is_none());
+
+        let newer = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_096,
+                    file_mtime: 100,
+                    locator_json: r#"{"version":1,"href":"chapter-3.xhtml"}"#.into(),
+                    progression_millis: 600_000,
+                    completed: false,
+                    recorded_at: Some(200),
+                },
+            )
+            .await
+            .expect("newer offline state");
+        assert_eq!(newer.progression_millis, 600_000);
+
+        let stale = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_096,
+                    file_mtime: 100,
+                    locator_json: r#"{"version":1,"href":"chapter-1.xhtml"}"#.into(),
+                    progression_millis: 100_000,
+                    completed: false,
+                    recorded_at: Some(100),
+                },
+            )
+            .await
+            .expect("stale offline state returns winner");
+        assert_eq!(stale, newer, "backend {backend} rewound newer state");
+        assert_eq!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("current state")
+                .expect("stored state"),
+            newer
+        );
+
+        let rescanned_file_id = store
+            .upsert_file(
+                book,
+                "/reading/books/contract.epub",
+                4_100,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("rescan book file");
+        assert_eq!(rescanned_file_id, file_id);
+        assert!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("stale revision lookup")
+                .is_none(),
+            "backend {backend} exposed state for an obsolete file revision"
+        );
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("raw stale state remains")
+            .is_some());
+
+        let current = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_100,
+                    file_mtime: 101,
+                    locator_json: r#"{"version":1,"href":"chapter-4.xhtml"}"#.into(),
+                    progression_millis: 950_000,
+                    completed: true,
+                    // A replaced edition starts a new ordering epoch. Its
+                    // first offline write must not lose to a timestamp that
+                    // belongs to the now-stale revision.
+                    recorded_at: Some(50),
+                },
+            )
+            .await
+            .expect("online revision state");
+        assert!(current.completed);
+        assert_eq!(current.updated_at, 50);
+        assert_eq!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("current revision lookup")
+                .expect("current revision state"),
+            current
+        );
+
+        store
+            .delete_reading_state(user.id, book, file_id)
+            .await
+            .expect("delete reading state");
+        store
+            .delete_reading_state(user.id, book, file_id)
+            .await
+            .expect("idempotent delete");
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("deleted state")
+            .is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn watch_contract_runs_through_dyn_store() {
     for_each_backend(|store, backend| async move {
         let user = store
@@ -3660,7 +3879,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .expect("claim after reset")
             .expect("package after reset");
         assert!(store
-            .requeue_offline_package(&first.id)
+            .requeue_offline_package(&first.id, "offline-node")
             .await
             .expect("requeue"));
         store
@@ -3683,7 +3902,7 @@ async fn offline_package_contract_runs_through_dyn_store() {
             Some("offline-recipe")
         );
         assert!(store
-            .update_offline_progress(&first.id, "video", 500)
+            .update_offline_progress(&first.id, "offline-node", "video", 500)
             .await
             .expect("progress"));
         let progressing = store
@@ -3694,7 +3913,13 @@ async fn offline_package_contract_runs_through_dyn_store() {
         assert_eq!(progressing.phase, "video");
         assert_eq!(progressing.progress_millis, 500);
         assert!(store
-            .mark_offline_package_ready(&first.id, "offline-recipe", 4_000, 7_200_000)
+            .mark_offline_package_ready(
+                &first.id,
+                "offline-node",
+                "offline-recipe",
+                4_000,
+                7_200_000
+            )
             .await
             .expect("ready"));
         assert!(matches!(
@@ -3723,7 +3948,13 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .await
             .expect("create failed fixture");
         assert!(store
-            .fail_offline_package(&failed.id, "video", "encoder", "contract failure")
+            .fail_offline_package(
+                &failed.id,
+                "offline-node",
+                "video",
+                "encoder",
+                "contract failure"
+            )
             .await
             .expect("fail package"));
         let failed_package = store

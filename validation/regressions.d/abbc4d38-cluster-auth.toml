@@ -1,0 +1,14 @@
+version = 1
+
+[[coverage]]
+commits = [
+  "abbc4d38",
+  "724711c2",
+  "e8b569df",
+  "1d794fdc",
+  "726b640f",
+  "e926ee80",
+]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The three-voter replicated-store contract pins JSON identity binding, reconcile races, SQL access, timeouts, and the reviewed M1d/PR90 corrections."

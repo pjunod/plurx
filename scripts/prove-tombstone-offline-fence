@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# prove-tombstone-offline-fence — regression: a removed node cannot create
+# offline packages.  Fails when the tombstone fence in
+# `create_offline_package` or the `cluster_nodes` INSERT guard is reverted.
+#
+# Run from the repo root.
+set -euo pipefail
+
+echo "=== prove-tombstone-offline-fence ==="
+
+# 1. The SQLite test proves single-node is unaffected (no cluster_nodes table).
+echo "--- SQLite: single-node create is unchanged ---"
+cargo test -p plurx-core -- \
+  store::sqlite::offline::tests::single_node_does_not_reject_packages_as_node_removed \
+  --nocapture 2>&1
+
+# 2. The cluster-check lifecycle test proves the real multi-voter fence.
+echo "--- Cluster: removed-but-running node creates package ---"
+cargo run --locked -p plurx-cluster-check -- membership 2>&1
+
+echo ""
+echo "=== prove-tombstone-offline-fence: PASS ==="

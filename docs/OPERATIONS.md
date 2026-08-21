@@ -183,6 +183,29 @@ startup follows the lost-target refusal in
 [Rolling back a deploy](#rolling-back-a-deploy) rather than importing stale
 SQLite.
 
+**One daemon per data directory.** Separately from that state-machine lock,
+startup takes an advisory lock on `.plurxd.lock` in the data directory before
+anything else and holds it for the life of the process, then records its own
+process id in the file. Two servers pointed at one data directory is data loss,
+so the second one refuses to start.
+
+That lock is released by closing the handle, which is the last thing a
+departing server does, so a restart can genuinely arrive before its predecessor
+has finished leaving — `Restart=always`, `systemctl restart`, and a container
+recreated under its old volume all do this. Startup therefore re-attempts for
+five seconds before refusing. A quiet host never spends that time, because the
+first attempt succeeds; a second live server is refused just the same, because
+a running owner holds the lock for its whole lifetime and is still holding it
+when the window ends. The refusal never means "busy at this instant" — it means
+held continuously for five seconds.
+
+Two refusals come out of that path and they are not variants of one problem:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `another plurxd process already owns the data directory <dir> (pid N)` | A different live process owns it. This is the double-start the lock exists to stop. The recorded pid is a best-effort diagnostic and can be stale; only the advisory lock proves that another owner exists. | Use `ps -p N` as a lead for finding the other server, then confirm which process has the data directory open before stopping it; otherwise give one server its own data directory. An unavailable pid reads `(owner pid not recorded)` and means the same ownership conflict. |
+| `the data directory <dir> is still locked inside this plurxd process (pid N)` | This process never dropped an earlier activation's lock handle. | Nothing on the host will help — no second server exists. Report it with the log around startup; it is a defect in this code path. |
+
 ### Reading watch-state replication status
 
 Open **Settings → System** and read **Watch state** in the Server card's
@@ -193,9 +216,9 @@ Raft progress facts, never users, titles, media paths, tokens, or library data.
 | Surface | What it means | What to do |
 |---|---|---|
 | `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
-| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
+| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. Add or remove nodes from **Settings → Cluster**. |
 | `Replicated in sync` | This node has applied its latest known entry. On the leader, every reporting peer has matched that point; on a follower, only this node's catch-up is confirmed and the explanation points you to the leader for peer status. | No action. Read the plain-language explanation before treating a follower's local catch-up as a cluster-wide all-clear. |
-| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter. Do not stop either voter until three are present and in sync. |
+| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter from **Settings → Cluster**, which reports the same state as a reconfiguration in progress. Do not stop either voter until three are present and in sync. |
 | `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
 
 **How to read the numbers:** `applied term T, index I` is this node's latest
@@ -213,11 +236,50 @@ endpoint observes an in-sync sample. The Settings page samples this when you
 open it; the timestamp does not claim that an unseen convergence happened
 between visits.
 
-This row is status, not membership control. The admin-only cluster endpoints
-below list, join, and remove voters. Their `replication` member is this exact
-projection rather than a second answer for lag.
+This row is status, not membership control. **Settings → Cluster** is the
+membership surface, and the admin-only cluster endpoints below are the same
+operations from a terminal. Their `replication` member is this exact projection
+rather than a second answer for lag.
+
+### The Cluster tab
+
+**Settings → Cluster** does everything the endpoints below do, and it is the
+easier path when you have a browser open. It is admin-only, matching the
+endpoints' own gating; a non-admin never sees the tab or its data. The roster is
+read when you open the tab, not on every Settings visit.
+
+| What you see | What it means |
+|---|---|
+| `Not clustered` | This server is on unreplicated SQLite and has no membership. Normal and complete for a single machine; there is nothing to fix and no join control to press. |
+| `One node` | Replicated, one voter. A supported configuration, not a half-built cluster. |
+| `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
+| `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
+
+The node table carries only what `GET /api/v1/cluster/nodes` exposes: node id,
+Raft id, voter/learner role, reachability, and last-seen. Addresses, media
+paths, and token material are not in that payload and are not shown.
+
+**Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
+displays it exactly once, with a lifetime you pick between 10 minutes and 1
+hour. plurx keeps only its digest, so the browser is the only copy: the panel
+never writes it to browser storage, a URL, or a log, and it is dropped when you
+leave the tab. Everything after that — the owner-only file, `join_token_file`,
+the fresh data directory — is the terminal procedure below, unchanged. Treat the
+displayed token exactly as the runbook treats the `curl` response: anyone
+holding it can join a node to this cluster until it is redeemed or expires.
+
+**Remove** calls the removal endpoint and renders its refusal as a sentence with
+a next step rather than a code. `node_owns_offline_work` tells you to let active
+transfers finish (or delete those packages), stop clients from creating new
+downloads on that node, and retry; ordinary queued work is resolved by the
+server as described below. The confirmation states what the terminal path
+states below — the removed machine's data directory is tombstoned, and
+rejoining means discarding it.
 
 ### Joining and removing voters
+
+The rest of this section is the terminal path. It is the same three endpoints
+the Cluster tab drives, and is the right path for a scripted or headless setup.
 
 Use one, three, or more voters. Two voters are useful only while adding or
 removing a node: they require both processes for every write and survive no
@@ -314,15 +376,73 @@ curl -fsS "$PLURX/api/v1/cluster/nodes" \
 ```
 
 **Remove a follower from three or more voters.** Use the node id from the
-roster, not its Raft id. The request refuses the current leader, any change
-that would leave fewer than two voters, and any node with queued, preparing,
-ready, or failed offline packages. That last refusal is conservative: a
-replicated source path does not prove another node mounts the same bytes.
+roster, not its Raft id. The request refuses the current leader and any change
+that would leave fewer than two voters.
 
 ```bash
 curl -fsS -X DELETE "$PLURX/api/v1/cluster/nodes/$NODE_ID" \
   -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
 ```
+
+#### What removal does to the node's offline downloads
+
+Removal resolves the departing node's offline packages before the membership
+change commits, so it leaves nothing owned by a machine that no longer exists.
+You do not have to drain them by hand first, and you do not have to stop that
+node from serving downloads while you do it: it keeps answering requests until
+the change commits, and removal re-reads its work and resolves the new arrivals
+before committing rather than acting on the list it started with.
+
+**Stop the removed node once the removal returns**, or repoint its clients at a
+surviving server. Removal takes the machine out of the cluster roster; it does
+not switch the machine off. A removed-but-still-running node that keeps
+receiving download requests is refused at the write path with a legible
+`node_removed` response — the durable insert checks the `cluster_nodes.removed_at`
+tombstone and returns `NodeIsTombstone` before any admission or quota step.
+Nothing ever reaches the encoder or holds a reservation against a tombstone.
+
+This is a fence on the offline package write path only. A removed-but-running
+node keeps its other write paths open, and the operator advice below still
+applies — but the offline case removal could not clean up for you is now closed.
+
+Before it commits, the cluster asks every other node whether it can actually
+read each package's source file — not whether the path looks the same, but
+whether opening it returns the same bytes, size, and modification time the
+request recorded. That question is asked and answered for real, because a
+replicated source path does not prove another node mounts the same media.
+
+| The package was | What removal does |
+|---|---|
+| queued or preparing, and another node proved it reads the source | Moved to that node and prepared there. The download continues; nothing is lost. |
+| queued or preparing, and no node could prove it | Failed with `node_removed`. Its reservation is released immediately. |
+| ready | Failed with `node_removed`. Its bytes only ever existed on the removed node. |
+| already failed | Left alone. It holds nothing and expires normally. |
+
+A ready package is failed rather than moved on purpose. The prepared bytes
+lived only on the departing node, and plurx does not promise byte-identical
+transcodes across machines with different encoders — so re-preparing it behind
+the same download URL could hand a partly-finished download a different set of
+bytes. Failing it is honest: the user's client sees the package is gone and
+requesting it again prepares a fresh one on a remaining server.
+
+`node_removed` is a stable code. Nothing is wrong with the media and nothing is
+wrong with the server: the machine that was preparing that download left. The
+fix is always the same — ask for it again.
+
+The removal still refuses while a client is downloading from that node right
+now, and the error says how many transfers are in flight. Wait for them to
+finish or delete those packages, then retry.
+
+Two other offline refusals exist, and both are "retry this", not "drain it by
+hand". A node that keeps admitting new downloads faster than the removal can
+resolve them refuses after a bounded number of rounds and says so; point those
+clients elsewhere and retry. A package that changes state while its resolution
+is being applied — a producer finishing at exactly the wrong moment — also
+refuses, because the removal will not commit on a plan it could not finish
+applying. In both cases the packages that were resolved stay resolved: moved
+work is claimable on its new node, failed work has already released its
+reservation, and the retry picks up whatever is left. Nothing is left half
+owned.
 
 `cluster_leader_removal_refused`, `removal_would_lose_quorum`, and
 `node_owns_offline_work` are operator-facing refusal codes. After a successful

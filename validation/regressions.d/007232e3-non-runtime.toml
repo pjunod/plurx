@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["007232e3"]
+points = []
+checks = []
+reason = "This commit records a measured defect in PERF-PLAN; the code correction and its tests landed in f3929700."
+ignore = true

@@ -174,37 +174,19 @@ jobs:
           path: target/validation
           if-no-files-found: warn
 
-  hiqlite_spike:
-    name: hiqlite M0 semantic proof
-    needs: [scope, preflight]
-    if: needs.scope.outputs.hiqlite_spike == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: hiqlite-spike
-          # The spike is its own workspace with its own lockfile and target
-          # dir; without this line its 400-crate build lands outside the cache
-          # and every run pays it cold.
-          workspaces: |
-            . -> target
-            spikes/hiqlite-m0 -> spikes/hiqlite-m0/target
-      - name: Compile and lint the isolated harness
-        run: cargo clippy --locked --manifest-path spikes/hiqlite-m0/Cargo.toml --all-targets -- -D warnings
-      - name: Run the three-voter semantic proof
-        run: make hiqlite-spike
-
   cluster_auth:
-    name: three-voter replicated store contracts
+    name: replicated storage contracts
     needs: [scope, preflight]
-    if: needs.scope.outputs.cluster_auth == 'true'
+    if: >-
+      needs.scope.outputs.cluster_auth == 'true' ||
+      needs.scope.outputs.hiqlite_spike == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    env:
+      # The M0 proof has its own manifest, but not its own dependency build.
+      # Sharing the root target lets it reuse the Hiqlite/OpenRaft graph that
+      # cluster-check just compiled instead of paying for ~400 crates twice.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -214,7 +196,14 @@ jobs:
         with:
           key: hiqlite-cluster-auth
       - name: Run separate-process replica and failure contracts
+        if: needs.scope.outputs.cluster_auth == 'true'
         run: make cluster-check
+      - name: Lint the isolated semantic harness
+        if: needs.scope.outputs.hiqlite_spike == 'true'
+        run: cargo clippy --locked --manifest-path spikes/hiqlite-m0/Cargo.toml --tests --no-deps -- -D warnings
+      - name: Run the three-voter semantic proof
+        if: needs.scope.outputs.hiqlite_spike == 'true'
+        run: make hiqlite-spike
 
   web_layout:
     name: web layout and accessibility
@@ -580,7 +569,6 @@ jobs:
       - mobile_version
       - preflight
       - check
-      - hiqlite_spike
       - cluster_auth
       - web_layout
       - android_jvm
@@ -597,7 +585,6 @@ jobs:
           MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           CHECK_RESULT: ${{ needs.check.result }}
-          HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}
           CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}
           WEB_LAYOUT_RESULT: ${{ needs.web_layout.result }}
           ANDROID_JVM_RESULT: ${{ needs.android_jvm.result }}
@@ -609,7 +596,7 @@ jobs:
           for result in \
             "$SCOPE_RESULT" "$MOBILE_VERSION_RESULT" \
             "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
-            "$HIQLITE_SPIKE_RESULT" "$CLUSTER_AUTH_RESULT" \
+            "$CLUSTER_AUTH_RESULT" \
             "$WEB_LAYOUT_RESULT" \
             "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \
             "$BUILD_RESULT" "$DOCKER_RESULT"; do

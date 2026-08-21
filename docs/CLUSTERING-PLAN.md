@@ -735,23 +735,89 @@ the resulting two-voter set reports `degraded_reconfiguration`, and any 2→1
 removal is deliberately refused with `removal_would_lose_quorum` until a later
 milestone proves a downgrade protocol.
 
-Node removal must also resolve offline work owned by that node. A `preparing`
-package cannot be silently re-homed because its replicated `source_path` does
-not prove the survivor has the same mount. Before removal commits, M3 must
-either verify an equivalent source and explicitly requeue on a chosen node, or
-mark the package failed with a stable `node_removed` code so its reservation is
-released and the client can retry. Leaving it preparing until seven-day expiry
-is an activation blocker. M3a takes the conservative first step: it refuses
-removal with `node_owns_offline_work` when any queued, preparing, ready, or
-failed package belongs to the target. A later M3 child owns the explicit
-re-home/fail policy; silent reassignment remains forbidden.
+**M3c delivered.** Node removal resolves the offline work owned by that node
+before the membership change commits, closing the activation blocker M3a
+answered with a blanket refusal. A package still cannot be silently re-homed,
+because its replicated `source_path` does not prove the survivor has the same
+mount — so the proof is made rather than assumed. The departing node's `queued`
+and `preparing` packages are probed against every reachable survivor, and each
+candidate answers by opening the snapshotted source and matching its size and
+mtime. Those answers live in `offline_source_probes`, a cluster-only table
+written by the node that actually looked.
+
+A package with a fresh affirmative answer is requeued on that node. Ownership
+of the *task* moves; the operator's file is never touched. Everything else is
+marked failed with the stable `node_removed` code, which releases its
+reservation so neither the user's nor the node's byte budget is held until the
+seven-day expiry. Silence is not proof: a survivor that does not answer inside
+the bounded wait is not a re-homing target, and unanimous refusal ends the wait
+immediately rather than burning it.
+
+A `ready` package is never requeued. Its bytes exist only in the departing
+node's cache, and §7 non-goal 4 declines to promise byte-identical transcodes
+across mixed encoders — so re-producing it behind its stable lease URL could
+hand a resuming downloader a different generation's bytes. It fails with
+`node_removed`, which stops the cluster advertising a package it can no longer
+serve; the client's retry creates a fresh package with a fresh URL. An already
+`failed` package is terminal, holds no reservation, and no longer blocks
+removal at all.
+
+One snapshot is not enough, because the departing node keeps serving its API
+until the change commits and a package is created owned by whichever node
+answered the request. A download requested during the bounded probe wait would
+exit a single-pass removal owned by a tombstone, holding its reservation until
+the seven-day expiry — the exact stranded state this section calls an
+activation blocker. So the removal re-reads the node's work after applying a
+plan and resolves again, for a bounded number of rounds; a node admitting new
+downloads faster than they can be resolved gets a refusal naming that reason
+rather than an unbounded wait.
+
+The durable INSERT in `create_offline_package` now includes an explicit
+`AND NOT EXISTS (SELECT 1 FROM cluster_nodes WHERE node_id = $node AND
+removed_at IS NOT NULL)` clause, so a removed-but-running node that keeps
+receiving download requests is refused at the write path before any admission
+or quota step. The response is `OfflineCreateOutcome::NodeIsTombstone`, which
+maps to HTTP 503 Service Unavailable with the stable `node_removed` code — the same code
+packages from a clean removal use. A package never enters the queue or holds a
+reservation against a tombstone. The single-node SQLite path has no
+`cluster_nodes` table and never returns this variant.
+
+Anything created inside the last narrow window, between the final re-read and
+the committed change, is still failed `node_removed` once the node is out of
+the roster: it was never probed, re-homing it would guess at a mount, and the
+membership change can no longer be refused.
+
+The refusal survives, narrowed to what the policy genuinely cannot resolve: a
+download in flight from that node right now. Cutting it off is neither allowed
+outcome, so removal refuses and names the count so the operator can wait or
+delete. Lifting the blanket refusal must not become "removal always succeeds".
+
+Re-homing also fences the old producer. `fail_offline_package`,
+`mark_offline_package_ready`, `requeue_offline_package`, and
+`update_offline_progress` all take the owning node id, because the departing
+node's encoder may still be running when ownership moves; without that guard
+its late write would terminate or publish work a survivor has taken over, yield
+a survivor's claimed package back to the queue, or flap the progress the
+survivor is reporting.
+
+None of this exists on a single-node SQLite install. There is no node to
+remove, no survivor to re-home onto, and no SQLite table backs the probe
+protocol. Its offline behavior is unchanged and remains a valid rollback
+target.
 
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
 node records under one logical identity/name; remove one follower while
-preserving quorum. The activity page aggregates direct-play and session rows
-from all healthy nodes instead of exposing only the process that answered the
-request.
+preserving quorum. Removing a node that owns offline work succeeds and resolves
+every package by the rule above: a verified source requeues and then completes
+on its new owner, an unverifiable one fails `node_removed` with its reservation
+released, a `ready` one stops advertising itself, and the departing node can no
+longer publish work a survivor has taken over. A download requested on that
+node *while the removal is resolving* is resolved too, not stranded by the
+opening snapshot. An in-flight transfer still refuses, with the reason visible
+to the operator. The activity page aggregates
+direct-play and session rows from all healthy nodes instead of exposing only
+the process that answered the request.
 
 ### 6.8 M4 — transactional fences and materialization ownership
 

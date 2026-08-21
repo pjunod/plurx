@@ -16,7 +16,8 @@ use super::{
 };
 use crate::domain::{
     CachedTranscode, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome, OfflineLease,
-    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, TraktAuth,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
+    OfflineRemovalReport, TraktAuth, OFFLINE_NODE_REMOVED_CODE,
 };
 use crate::error::StoreError;
 use crate::secrets::SealedSecret;
@@ -136,6 +137,32 @@ CREATE TABLE IF NOT EXISTS offline_lease_guards (
     token_hash TEXT NOT NULL,
     had_lease  INTEGER NOT NULL
 ) STRICT;
+
+-- One node's answer to "can you actually read this package's source?", asked
+-- while its owner is being removed (`CLUSTERING-PLAN.md` §6.7).
+--
+-- This table exists because `offline_packages.source_path` replicates and a
+-- mount does not. Only a node that opened the exact snapshotted bytes may be
+-- re-homed onto, so the proof has to be a durable fact somebody wrote after
+-- looking, not an inference from a path that travelled here.
+--
+-- It stores no media path: the answer is keyed to the package, which already
+-- holds the only copy of that path. `answered_at` is NULL until the node
+-- replies, and an answer is only evidence while it is fresh, so removal reads
+-- it with a recency bound rather than trusting whatever is on the row.
+--
+-- Cluster-only by construction. There is no SQLite counterpart because a
+-- single-node install has no removal path to run this protocol for.
+CREATE TABLE IF NOT EXISTS offline_source_probes (
+    package_id   TEXT NOT NULL REFERENCES offline_packages(id) ON DELETE CASCADE,
+    node_id      TEXT NOT NULL,
+    requested_at INTEGER NOT NULL,
+    answered_at  INTEGER,
+    readable     INTEGER CHECK (readable IN (0, 1)),
+    PRIMARY KEY (package_id, node_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS offline_source_probes_pending
+    ON offline_source_probes(node_id, answered_at, requested_at);
 "#;
 
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
@@ -167,6 +194,7 @@ struct DurableDump {
     offline_packages: Vec<String>,
     offline_package_leases: Vec<String>,
     offline_lease_guards: Vec<String>,
+    offline_source_probes: Vec<String>,
 }
 
 pub(super) async fn local_durable_digest(client: &TimedClient) -> Result<String, StoreError> {
@@ -230,6 +258,12 @@ pub(super) async fn local_durable_digest(client: &TimedClient) -> Result<String,
             client,
             "SELECT json_array(package_id, token_hash, had_lease) AS value \
              FROM offline_lease_guards ORDER BY package_id",
+        )
+        .await?,
+        offline_source_probes: rows(
+            client,
+            "SELECT json_array(package_id, node_id, requested_at, answered_at, readable) \
+                    AS value FROM offline_source_probes ORDER BY package_id, node_id",
         )
         .await?,
     };
@@ -932,6 +966,17 @@ struct OfflineAdmissionRow {
     node_used: i64,
 }
 
+struct MembershipTombstoneRow {
+    removed_at: Option<i64>,
+}
+
+impl From<&mut Row<'_>> for MembershipTombstoneRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            removed_at: row.get("removed_at"),
+        }
+    }
+}
 impl From<&mut Row<'_>> for OfflineAdmissionRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -1204,7 +1249,30 @@ impl OfflinePackageStore for HiqliteAuthStore {
             )));
         }
         let now = self.now()?;
-        let sql = "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
+        // The replicated Store can be exercised before MembershipManager owns
+        // and creates `cluster_nodes` (notably by the backend-neutral store
+        // contract). Once that schema exists, every insert must consult it in
+        // the same statement so removal cannot race package creation. If it is
+        // absent, there cannot yet be a membership tombstone to fence.
+        let membership_schema_exists = self
+            .client()
+            .query_consistent_map::<ScalarRow, _>(
+                "SELECT COUNT(*) AS value FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'cluster_nodes'",
+                params!(),
+            )
+            .await
+            .map_err(database_error)?
+            .first()
+            .is_some_and(|row| row.value > 0);
+        let tombstone_clause = if membership_schema_exists {
+            "AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
+                 WHERE node_id = $5 AND removed_at IS NOT NULL)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
                     source_path, source_size, source_mtime, effective_rate_control, \
                     target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
@@ -1225,19 +1293,21 @@ impl OfflinePackageStore for HiqliteAuthStore {
                    AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE node_id = $5 \
                        AND state IN ('queued', 'preparing', 'ready')) <= $24 - $19 \
+                   {tombstone_clause} \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
                     source_size, source_mtime, recipe_hash, effective_rate_control, \
                     target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
-                    error_message, created_at, updated_at, last_access_at, expires_at";
-        validate_sql(sql)?;
+                    error_message, created_at, updated_at, last_access_at, expires_at"
+        );
+        validate_sql(&sql)?;
         for attempt in 0..2 {
             let inserted = self
                 .client()
                 .execute_returning_map::<_, OfflinePackageRow>(
-                    sql,
+                    sql.clone(),
                     params!(
                         package.id.as_str(),
                         package.request_id.as_str(),
@@ -1291,6 +1361,25 @@ impl OfflinePackageStore for HiqliteAuthStore {
                 } else {
                     OfflineCreateOutcome::RequestConflict
                 });
+            }
+
+            // If the INSERT fell through AND no existing package was found, the
+            // node may have been removed. Fail early with a legible outcome
+            // rather than falling through to "admission changed concurrently".
+            if membership_schema_exists
+                && self
+                    .client()
+                    .query_consistent_map::<MembershipTombstoneRow, _>(
+                        "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                        hiqlite::macros::params!(package.node_id.as_str()),
+                    )
+                    .await
+                    .map_err(database_error)?
+                    .first()
+                    .and_then(|row| row.removed_at)
+                    .is_some()
+            {
+                return Ok(OfflineCreateOutcome::NodeIsTombstone);
             }
 
             let admission = self
@@ -1531,13 +1620,17 @@ impl OfflinePackageStore for HiqliteAuthStore {
         Ok(one_package(rows))
     }
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError> {
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError> {
         let now = self.now()?;
         Ok(self
             .execute(
                 "UPDATE offline_packages SET state = 'queued', phase = 'waiting_for_encoder', \
-                 updated_at = $1 WHERE id = $2 AND state = 'preparing'",
-                params!(now, package_id),
+                 updated_at = $1 WHERE id = $2 AND node_id = $3 AND state = 'preparing'",
+                params!(now, package_id, node_id),
             )
             .await?
             > 0)
@@ -1563,6 +1656,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError> {
@@ -1571,8 +1665,14 @@ impl OfflinePackageStore for HiqliteAuthStore {
             .execute(
                 "UPDATE offline_packages SET phase = $1, \
                  progress_millis = MAX(progress_millis, $2), updated_at = $3 \
-                 WHERE id = $4 AND state = 'preparing'",
-                params!(phase, progress_millis.clamp(0, 999), now, package_id),
+                 WHERE id = $4 AND node_id = $5 AND state = 'preparing'",
+                params!(
+                    phase,
+                    progress_millis.clamp(0, 999),
+                    now,
+                    package_id,
+                    node_id
+                ),
             )
             .await?
             > 0)
@@ -1581,6 +1681,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
     async fn fail_offline_package(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         code: &str,
         message: &str,
@@ -1590,8 +1691,8 @@ impl OfflinePackageStore for HiqliteAuthStore {
             .execute(
                 "UPDATE offline_packages SET state = 'failed', phase = $1, error_code = $2, \
                  error_message = $3, updated_at = $4 \
-                 WHERE id = $5 AND state IN ('queued', 'preparing')",
-                params!(phase, code, message, now, package_id),
+                 WHERE id = $5 AND node_id = $6 AND state IN ('queued', 'preparing')",
+                params!(phase, code, message, now, package_id, node_id),
             )
             .await?
             > 0)
@@ -1760,6 +1861,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
     async fn mark_offline_package_ready(
         &self,
         package_id: &str,
+        node_id: &str,
         recipe_hash: &str,
         actual_bytes: i64,
         duration_ms: i64,
@@ -1771,8 +1873,15 @@ impl OfflinePackageStore for HiqliteAuthStore {
                  progress_millis = 1000, recipe_hash = $1, actual_bytes = $2, \
                  duration_ms = $3, error_code = NULL, error_message = NULL, \
                  updated_at = $4, last_access_at = $4 \
-                 WHERE id = $5 AND state IN ('queued', 'preparing')",
-                params!(recipe_hash, actual_bytes, duration_ms, now, package_id),
+                 WHERE id = $5 AND node_id = $6 AND state IN ('queued', 'preparing')",
+                params!(
+                    recipe_hash,
+                    actual_bytes,
+                    duration_ms,
+                    now,
+                    package_id,
+                    node_id
+                ),
             )
             .await?
             > 0)
@@ -1799,6 +1908,285 @@ impl OfflinePackageStore for HiqliteAuthStore {
                 params!(now),
             )
             .await? as u64)
+    }
+
+    // --- Node removal (`CLUSTERING-PLAN.md` §6.7) -------------------------
+
+    async fn unresolved_offline_packages(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<OfflinePackage>, StoreError> {
+        let rows = self
+            .client()
+            .query_consistent_map::<OfflinePackageRow, _>(
+                format!(
+                    "SELECT {PACKAGE_COLS} FROM offline_packages WHERE node_id = $1 \
+                     AND state IN ('queued', 'preparing', 'ready') ORDER BY created_at, id"
+                ),
+                params!(node_id),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn offline_transfers_in_flight(
+        &self,
+        node_id: &str,
+        now: i64,
+        active_since: i64,
+    ) -> Result<i64, StoreError> {
+        let row = self
+            .client()
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM offline_package_leases l \
+                 JOIN offline_packages p ON p.id = l.package_id \
+                 WHERE p.node_id = $1 AND p.state = 'ready' \
+                   AND l.expires_at > $2 AND l.last_access_at >= $3",
+                params!(node_id, now, active_since),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                StoreError::Database("offline transfer count returned no row".to_owned())
+            })?;
+        Ok(row.count)
+    }
+
+    async fn request_offline_source_probes(
+        &self,
+        package_ids: &[String],
+        node_ids: &[String],
+        now: i64,
+    ) -> Result<u64, StoreError> {
+        if package_ids.is_empty() || node_ids.is_empty() {
+            return Ok(0);
+        }
+        // Re-asking clears any earlier answer in the same statement. A "yes"
+        // recorded before this removal describes a mount that may since have
+        // gone; treating it as evidence is exactly the silent reassignment
+        // §6.7 forbids.
+        let statements = package_ids
+            .iter()
+            .flat_map(|package_id| {
+                node_ids.iter().map(move |node_id| {
+                    (
+                        "INSERT INTO offline_source_probes \
+                           (package_id, node_id, requested_at, answered_at, readable) \
+                         VALUES ($1, $2, $3, NULL, NULL) \
+                         ON CONFLICT(package_id, node_id) DO UPDATE SET \
+                           requested_at = excluded.requested_at, \
+                           answered_at = NULL, readable = NULL",
+                        params!(package_id.as_str(), node_id.as_str(), now),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut requested = 0_u64;
+        for result in self.client().txn(statements).await? {
+            requested += result.map_err(database_error)? as u64;
+        }
+        Ok(requested)
+    }
+
+    async fn pending_offline_source_probes(
+        &self,
+        node_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<OfflinePackage>, StoreError> {
+        let rows = self
+            .client()
+            .query_consistent_map::<OfflinePackageRow, _>(
+                format!(
+                    "SELECT {} FROM offline_packages p \
+                     JOIN offline_source_probes probe ON probe.package_id = p.id \
+                     WHERE probe.node_id = $1 AND probe.answered_at IS NULL \
+                       AND probe.requested_at >= $2 \
+                     ORDER BY probe.requested_at, p.id",
+                    package_cols("p")
+                ),
+                params!(node_id, requested_since),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn answer_offline_source_probe(
+        &self,
+        package_id: &str,
+        node_id: &str,
+        readable: bool,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .execute(
+                "UPDATE offline_source_probes SET answered_at = $1, readable = $2 \
+                 WHERE package_id = $3 AND node_id = $4 AND answered_at IS NULL",
+                params!(now, i64::from(readable), package_id, node_id),
+            )
+            .await?
+            > 0)
+    }
+
+    async fn outstanding_offline_source_probes(
+        &self,
+        requested_at: i64,
+    ) -> Result<i64, StoreError> {
+        let row = self
+            .client()
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM offline_source_probes \
+                 WHERE requested_at >= $1 AND answered_at IS NULL",
+                params!(requested_at),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                StoreError::Database("outstanding probe count returned no row".to_owned())
+            })?;
+        Ok(row.count)
+    }
+
+    async fn verified_offline_source_nodes(
+        &self,
+        package_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows = self
+            .client()
+            .query_consistent_map::<NodeIdRow, _>(
+                // Freshness keys on `requested_at`, not `answered_at`, and the
+                // difference is load-bearing. Both columns are wall-clock
+                // seconds, but `requested_at` is written by the node running
+                // the removal while `answered_at` is written by the node that
+                // answered. Comparing across those two clocks would let a
+                // survivor that runs a second behind have a perfectly good
+                // answer thrown away, failing a package `node_removed` that
+                // should have been re-homed.
+                //
+                // No freshness is lost: re-asking clears `answered_at`, so a
+                // non-NULL answer on a row this removal asked for can only be
+                // this removal's answer.
+                "SELECT node_id FROM offline_source_probes \
+                 WHERE package_id = $1 AND readable = 1 \
+                   AND answered_at IS NOT NULL AND requested_at >= $2 \
+                 ORDER BY node_id",
+                params!(package_id, requested_since),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(rows.into_iter().map(|row| row.node_id).collect())
+    }
+
+    async fn resolve_offline_packages_for_removal(
+        &self,
+        node_id: &str,
+        plan: &[OfflineRemovalPlanEntry],
+        now: i64,
+    ) -> Result<OfflineRemovalReport, StoreError> {
+        if plan.is_empty() {
+            return Ok(OfflineRemovalReport::default());
+        }
+        let mut statements = Vec::with_capacity(plan.len());
+        for entry in plan {
+            match entry.requeue_to.as_deref() {
+                // Re-homing moves ownership of a task and nothing else. The
+                // operator's file is untouched; only `node_id` moves, and only
+                // onto a node that answered a probe by reading that file.
+                //
+                // `state = 'queued'` puts it back at the front of the ordinary
+                // queue rather than inventing a re-homed state, so the new
+                // owner claims it through the one code path that already
+                // re-checks the source before spending an encoder on it.
+                Some(target) => statements.push((
+                    "UPDATE offline_packages SET node_id = $1, state = 'queued', \
+                     phase = 'waiting_for_encoder', recipe_hash = NULL, progress_millis = 0, \
+                     error_code = NULL, error_message = NULL, updated_at = $2 \
+                     WHERE id = $3 AND node_id = $4 \
+                       AND state IN ('queued', 'preparing')",
+                    params!(target, now, entry.package_id.as_str(), node_id),
+                )),
+                // Releasing the reservation is the point, not bookkeeping: the
+                // bytes it accounted for were on the node that just left, so
+                // holding the user's and the node's byte budget against them
+                // until the seven-day expiry charges a traveller for storage
+                // nobody has.
+                None => statements.push((
+                    "UPDATE offline_packages SET state = 'failed', phase = 'node_removed', \
+                     error_code = $1, error_message = $2, reserved_bytes = 0, \
+                     actual_bytes = NULL, updated_at = $3 \
+                     WHERE id = $4 AND node_id = $5 \
+                       AND state IN ('queued', 'preparing', 'ready')",
+                    params!(
+                        OFFLINE_NODE_REMOVED_CODE,
+                        NODE_REMOVED_MESSAGE,
+                        now,
+                        entry.package_id.as_str(),
+                        node_id
+                    ),
+                )),
+            }
+        }
+        let results = self.client().txn(statements).await?;
+        let mut report = OfflineRemovalReport::default();
+        for (entry, result) in plan.iter().zip(results) {
+            let changed = result.map_err(database_error)?;
+            if changed == 0 {
+                // A no-op row means the package moved underneath the plan.
+                // This is not a rollback — hiqlite rolls back on a statement
+                // error, and matching no row is not an error, so the other
+                // entries stayed applied. Reporting it is still the honest
+                // and safe answer: every entry that did apply is a complete
+                // resolution on its own, the membership change does not
+                // commit, and the operator's retry re-reads what is left.
+                return Err(StoreError::Database(format!(
+                    "offline package {} changed while its removal plan was being applied",
+                    entry.package_id
+                )));
+            }
+            if entry.requeue_to.is_some() {
+                report.requeued += 1;
+            } else {
+                report.failed += 1;
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// The one operator- and client-visible sentence for a package that lost its
+/// node. Deliberately says nothing about the media: a path is exactly the kind
+/// of private fact that leaks through an error string.
+const NODE_REMOVED_MESSAGE: &str =
+    "The server that was preparing this download was removed from the cluster. \
+     Request it again to prepare it on a remaining server.";
+
+struct CountRow {
+    count: i64,
+}
+
+impl From<&mut Row<'_>> for CountRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            count: row.get("count"),
+        }
+    }
+}
+
+struct NodeIdRow {
+    node_id: String,
+}
+
+impl From<&mut Row<'_>> for NodeIdRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            node_id: row.get("node_id"),
+        }
     }
 }
 

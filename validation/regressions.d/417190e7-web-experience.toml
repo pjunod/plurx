@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["417190e7"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The retained shipped-web regressions execute the real `closePlayer()` and `playbackSelection()` to prove that a track choice belongs to an open playback rather than to the file: closing the player drops it, so the next cold start of the same file takes the detail-screen pickers the viewer is actually looking at, while an in-playback quality change still reproduces the tracks on screen. Reverting only the production correction fails `closing the player ends its track choice instead of arming the next play`, because `closePlayer()` does not replace `PLAYER` and the stale selection keeps matching after the playback ended."

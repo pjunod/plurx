@@ -10,6 +10,19 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Recording a regression mapping no longer conflicts every other open pull
+  request.** Every corrective change used to append a `[[coverage]]` block to
+  the tail of one `validation/regressions.toml`, so each merge to `main` put a
+  conflict in the same region of every other branch carrying a mapping —
+  and clearing it with a rebase rewrote the SHAs a reviewer had pinned an
+  approval to. The ledger is now a directory: one entry per file at
+  `validation/regressions.d/<first-commit-prefix>-<slug>.toml`, loaded and
+  concatenated by the history audit. Two changes cannot pick the same path, so
+  the collision is structurally impossible rather than merely rare, and the
+  loader refuses to run while a shared `validation/regressions.toml` exists.
+  All 66 existing entries moved across with their claims unchanged; the audit
+  reports the same 414 corrective commits and the same route for every one.
+
 - **Apple copy-HLS stall recovery no longer replays the preceding keyframe.**
   A replacement session still opens on the keyframe before the requested film
   position, but the client now seeks the attached item forward by that exact
@@ -91,6 +104,32 @@ bump may break compatibility and a **patch** bump never does.
   back to the pre-scrub position.
 
 ### Added
+
+- **The Apple clients step the quality ladder down when a stream stalls.** A
+  sustained freeze or buffering wait on a growing HLS session no longer rebuilds
+  the rung that just starved. The replacement create names the exact
+  `previous_session_id` with `reopen_reason: "stall"` under one `request_id`
+  minted for that stall, so the server resolves it one rung down and a transport
+  replay returns that same persisted answer rather than stepping the ladder
+  twice. Every create now also states `quality_auto`, which is the viewer's
+  answer to the quality menu and not an inference from whether a height was
+  posted — without it the source height a subtitle burn sends as a promise about
+  the output reads as a sticky manual pick, and that session could never be
+  stepped down again. The bound at the ladder floor is the client's, because the
+  server answers a floor session with the rung it is already on every time and
+  deliberately counts nothing: two consecutive reopens that fail to buy a
+  strictly lower rung now end in the ordinary stall failure instead of looping,
+  and a height the server could not state — `0` for a remux of an unprobed
+  source, or absent from an older server — counts as no step down. That bound
+  covers one starvation episode rather than the whole film: a minute of
+  recovered playback clears it, so a brief blip cannot leave the rest of a title
+  with no automatic recovery. Direct play,
+  VOD, and offline recovery stay unbound; a stall ticket is dropped once a seek
+  or track change has superseded the session it names, so a racing viewer
+  command is deterministic and never posts a create the server is bound to
+  refuse; and a bound create refused with `400` is re-posted once unbound under
+  a fresh id, which is what a claim normalized just before a retryable failure
+  looks like on replay.
 
 - **Android answers "does this have my audio and subtitles?" before anything
   plays, and lets you pick both.** Each media card on the detail screen now

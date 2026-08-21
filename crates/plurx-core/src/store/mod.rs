@@ -28,6 +28,8 @@ mod hiqlite_durable;
 mod hiqlite_import;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_reading;
 
 pub mod replicated;
 
@@ -47,8 +49,9 @@ use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
     MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
     NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, PlaybackEvent, PlaybackEventQuery,
-    ProbeResult, RecentItem, TraktAuth, User, WatchRollup, WatchState,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
+    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingState,
+    ReadingStateWrite, RecentItem, TraktAuth, User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -765,6 +768,46 @@ pub trait WatchStore: Send + Sync + 'static {
     ) -> Result<(), StoreError>;
 }
 
+/// Per-user text-publication state. It is separate from [`WatchStore`]
+/// because a reflowable locator is not timed playback and completion is an
+/// explicit reader action rather than a 95% threshold.
+#[async_trait]
+pub trait ReadingStore: Send + Sync + 'static {
+    /// Read the row for one edition, including a stale revision retained for
+    /// diagnosis. The HTTP boundary compares its revision to the current
+    /// file before offering a resume action.
+    async fn reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Newest state whose snapshotted revision still matches the current file.
+    /// Item detail uses this one query instead of looking up every edition.
+    async fn current_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Persist a locator. A dated offline write older than the durable row
+    /// returns the winner without rewinding it; an undated online write uses
+    /// the server clock and is authoritative now. A different file revision
+    /// begins a fresh ordering epoch because the previous locator is stale.
+    async fn put_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        state: &ReadingStateWrite,
+    ) -> Result<ReadingState, StoreError>;
+    /// Clear one edition's progress. Idempotent so Start over can be retried.
+    async fn delete_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
+    ) -> Result<(), StoreError>;
+}
+
 /// Trakt account links and the identity join sync needs.
 #[async_trait]
 pub trait TraktStore: Send + Sync + 'static {
@@ -1014,7 +1057,15 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         node_id: &str,
     ) -> Result<Option<OfflinePackage>, StoreError>;
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError>;
+    /// `node_id` fences the yield back to the queue to the current owner, for
+    /// the same reason [`Self::fail_offline_package`] is fenced: a re-homed
+    /// package the survivor has already claimed must not be knocked back to
+    /// `queued` by the departing node's producer finishing its last part.
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError>;
 
     /// Bind the content-addressed recipe as soon as production starts. The
     /// completed cache entry must become offline-owned before subtitle
@@ -1025,16 +1076,25 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         recipe_hash: &str,
     ) -> Result<bool, StoreError>;
 
+    /// `node_id` fences progress to the current owner so a doomed producer on
+    /// a departing node cannot flap the phase and percentage a survivor is
+    /// reporting for the same package.
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError>;
 
+    /// `node_id` fences the write to the current owner. Re-homing a package
+    /// during node removal changes its owner while the old node's producer may
+    /// still be running; without this guard that doomed producer's late
+    /// failure would terminate work a survivor has already taken over.
     async fn fail_offline_package(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         code: &str,
         message: &str,
@@ -1057,9 +1117,14 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         renewed_expires_at: i64,
     ) -> Result<Option<OfflinePackage>, StoreError>;
 
+    /// `node_id` fences publication to the current owner for the same reason
+    /// [`OfflinePackageStore::fail_offline_package`] does. A package re-homed
+    /// mid-production must not be advertised ready by bytes that live on the
+    /// node that just left.
     async fn mark_offline_package_ready(
         &self,
         package_id: &str,
+        node_id: &str,
         recipe_hash: &str,
         actual_bytes: i64,
         duration_ms: i64,
@@ -1072,6 +1137,101 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
 
     async fn expire_offline_packages(&self, now: i64) -> Result<u64, StoreError>;
+
+    // --- Node removal (`CLUSTERING-PLAN.md` §6.7) -------------------------
+    //
+    // Removing a node must resolve the offline work it owns before the
+    // membership change commits. A package's `source_path` replicates, but a
+    // mount does not, so re-homing is only allowed against a survivor that
+    // answered a probe by actually reading the snapshotted source. Everything
+    // below exists to make that proof durable rather than assumed.
+    //
+    // The single-node SQLite backend has no removal path at all. Its
+    // implementations are deliberately inert, and no SQLite table backs them.
+
+    /// Every package the node still owns that removal has to resolve —
+    /// `queued`, `preparing`, and `ready`. `failed` rows are terminal, hold no
+    /// reservation, and are left for the ordinary expiry sweep.
+    async fn unresolved_offline_packages(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<OfflinePackage>, StoreError>;
+
+    /// How many of the node's `ready` packages a client is fetching right now,
+    /// measured the way the activity surface measures it. Removal refuses
+    /// while a transfer is in flight rather than cutting a download off.
+    async fn offline_transfers_in_flight(
+        &self,
+        node_id: &str,
+        now: i64,
+        active_since: i64,
+    ) -> Result<i64, StoreError>;
+
+    /// Ask each candidate node to prove it can read each package's source.
+    /// Re-asking resets any previous answer: a mount that worked last week is
+    /// not evidence about this removal.
+    async fn request_offline_source_probes(
+        &self,
+        package_ids: &[String],
+        node_ids: &[String],
+        now: i64,
+    ) -> Result<u64, StoreError>;
+
+    /// Packages this node has been asked about and has not answered yet. The
+    /// full package row travels because the answer requires its snapshotted
+    /// path, size, and mtime — the probe row itself stores no media path.
+    async fn pending_offline_source_probes(
+        &self,
+        node_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<OfflinePackage>, StoreError>;
+
+    async fn answer_offline_source_probe(
+        &self,
+        package_id: &str,
+        node_id: &str,
+        readable: bool,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Probes asked at or after `requested_at` that nobody has answered yet.
+    /// Removal waits on this reaching zero rather than on a particular node
+    /// saying yes, so a unanimous "no" ends the wait immediately instead of
+    /// burning the whole timeout on a package no survivor can take.
+    async fn outstanding_offline_source_probes(&self, requested_at: i64)
+        -> Result<i64, StoreError>;
+
+    /// Nodes that answered "yes" to a probe asked at or after
+    /// `requested_since`. Scoped by when the question was asked rather than
+    /// when it was answered, because the asking node and the answering node
+    /// keep different clocks and only the former's is consistent here.
+    async fn verified_offline_source_nodes(
+        &self,
+        package_id: &str,
+        requested_since: i64,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Apply one whole removal plan in a single transaction, and report an
+    /// error if any entry did not apply.
+    ///
+    /// The error is not a rollback, and this deliberately does not claim to be
+    /// one: the transaction rolls back on a statement *error*, but an UPDATE
+    /// that matches no row succeeds, so a package that moved underneath the
+    /// plan leaves the rest of the plan applied. What keeps that safe is the
+    /// caller, not the transaction — the membership change never commits on an
+    /// error, the entries that did apply are individually correct resolutions
+    /// (requeued work is claimable, failed work has released its reservation),
+    /// and the operator's retry re-reads and finishes the job.
+    ///
+    /// Failing a package clears its reservation and completed size in the same
+    /// statement: the bytes it accounted for lived on the departing node and
+    /// reporting them as held would be a lie the operator cannot act on.
+    async fn resolve_offline_packages_for_removal(
+        &self,
+        node_id: &str,
+        plan: &[OfflineRemovalPlanEntry],
+        now: i64,
+    ) -> Result<OfflineRemovalReport, StoreError>;
 }
 
 /// Node-local playback telemetry.
@@ -1116,6 +1276,7 @@ pub trait Store:
     + LibraryStore
     + MediaStore
     + WatchStore
+    + ReadingStore
     + TraktStore
     + WatchedOutboxStore
     + TranscodeCacheStore
@@ -1135,6 +1296,7 @@ impl<T> Store for T where
         + LibraryStore
         + MediaStore
         + WatchStore
+        + ReadingStore
         + TraktStore
         + WatchedOutboxStore
         + TranscodeCacheStore

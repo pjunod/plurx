@@ -6,7 +6,8 @@ use rusqlite::{params, OptionalExtension};
 use super::SqliteStore;
 use crate::domain::{
     NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome, OfflineLease,
-    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
+    OfflineRemovalReport,
 };
 use crate::error::StoreError;
 use crate::store::OfflinePackageStore;
@@ -425,14 +426,18 @@ impl OfflinePackageStore for SqliteStore {
         .await
     }
 
-    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError> {
-        let id = package_id.to_owned();
+    async fn requeue_offline_package(
+        &self,
+        package_id: &str,
+        node_id: &str,
+    ) -> Result<bool, StoreError> {
+        let (id, node) = (package_id.to_owned(), node_id.to_owned());
         self.with_conn(move |conn| {
             Ok(conn.execute(
                 "UPDATE offline_packages SET state = 'queued', \
                  phase = 'waiting_for_encoder', updated_at = unixepoch() \
-                 WHERE id = ?1 AND state = 'preparing'",
-                [id],
+                 WHERE id = ?1 AND node_id = ?2 AND state = 'preparing'",
+                params![id, node],
             )? > 0)
         })
         .await
@@ -458,16 +463,18 @@ impl OfflinePackageStore for SqliteStore {
     async fn update_offline_progress(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         progress_millis: i64,
     ) -> Result<bool, StoreError> {
-        let (id, phase) = (package_id.to_owned(), phase.to_owned());
+        let (id, node, phase) = (package_id.to_owned(), node_id.to_owned(), phase.to_owned());
         self.with_conn(move |conn| {
             Ok(conn.execute(
-                "UPDATE offline_packages SET phase = ?2, \
-                 progress_millis = MAX(progress_millis, ?3), \
-                 updated_at = unixepoch() WHERE id = ?1 AND state = 'preparing'",
-                params![id, phase, progress_millis.clamp(0, 999)],
+                "UPDATE offline_packages SET phase = ?3, \
+                 progress_millis = MAX(progress_millis, ?4), \
+                 updated_at = unixepoch() \
+                 WHERE id = ?1 AND node_id = ?2 AND state = 'preparing'",
+                params![id, node, phase, progress_millis.clamp(0, 999)],
             )? > 0)
         })
         .await
@@ -476,22 +483,24 @@ impl OfflinePackageStore for SqliteStore {
     async fn fail_offline_package(
         &self,
         package_id: &str,
+        node_id: &str,
         phase: &str,
         code: &str,
         message: &str,
     ) -> Result<bool, StoreError> {
-        let (id, phase, code, message) = (
+        let (id, node, phase, code, message) = (
             package_id.to_owned(),
+            node_id.to_owned(),
             phase.to_owned(),
             code.to_owned(),
             message.to_owned(),
         );
         self.with_conn(move |conn| {
             Ok(conn.execute(
-                "UPDATE offline_packages SET state = 'failed', phase = ?2, \
-                 error_code = ?3, error_message = ?4, updated_at = unixepoch() \
-                 WHERE id = ?1 AND state IN ('queued', 'preparing')",
-                params![id, phase, code, message],
+                "UPDATE offline_packages SET state = 'failed', phase = ?3, \
+                 error_code = ?4, error_message = ?5, updated_at = unixepoch() \
+                 WHERE id = ?1 AND node_id = ?2 AND state IN ('queued', 'preparing')",
+                params![id, node, phase, code, message],
             )? > 0)
         })
         .await
@@ -633,19 +642,24 @@ impl OfflinePackageStore for SqliteStore {
     async fn mark_offline_package_ready(
         &self,
         package_id: &str,
+        node_id: &str,
         recipe_hash: &str,
         actual_bytes: i64,
         duration_ms: i64,
     ) -> Result<bool, StoreError> {
-        let (id, hash) = (package_id.to_owned(), recipe_hash.to_owned());
+        let (id, node, hash) = (
+            package_id.to_owned(),
+            node_id.to_owned(),
+            recipe_hash.to_owned(),
+        );
         self.with_conn(move |conn| {
             Ok(conn.execute(
                 "UPDATE offline_packages SET state = 'ready', phase = 'ready', \
-                 progress_millis = 1000, recipe_hash = ?2, actual_bytes = ?3, \
-                 duration_ms = ?4, error_code = NULL, error_message = NULL, \
+                 progress_millis = 1000, recipe_hash = ?3, actual_bytes = ?4, \
+                 duration_ms = ?5, error_code = NULL, error_message = NULL, \
                  updated_at = unixepoch(), last_access_at = unixepoch() \
-                 WHERE id = ?1 AND state IN ('queued', 'preparing')",
-                params![id, hash, actual_bytes, duration_ms],
+                 WHERE id = ?1 AND node_id = ?2 AND state IN ('queued', 'preparing')",
+                params![id, node, hash, actual_bytes, duration_ms],
             )? > 0)
         })
         .await
@@ -671,6 +685,91 @@ impl OfflinePackageStore for SqliteStore {
             Ok(conn.execute("DELETE FROM offline_packages WHERE expires_at <= ?1", [now])? as u64)
         })
         .await
+    }
+
+    // --- Node removal (`CLUSTERING-PLAN.md` §6.7) -------------------------
+    //
+    // A single-node SQLite install has no membership, so it has no node to
+    // remove and no survivor to re-home work onto. These answer honestly
+    // rather than pretending: nothing is unresolved because nothing can be
+    // removed, no probe can be asked because there is nobody to ask, and a
+    // removal plan is a programming error here rather than a policy outcome.
+    //
+    // No SQLite table backs any of this. Adding one would change the durable
+    // schema and the import parity plan for a path that cannot run, and §6.7
+    // requires single-node offline behavior to stay exactly as it is.
+
+    async fn unresolved_offline_packages(
+        &self,
+        _node_id: &str,
+    ) -> Result<Vec<OfflinePackage>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn offline_transfers_in_flight(
+        &self,
+        _node_id: &str,
+        _now: i64,
+        _active_since: i64,
+    ) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+
+    async fn request_offline_source_probes(
+        &self,
+        _package_ids: &[String],
+        _node_ids: &[String],
+        _now: i64,
+    ) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    async fn pending_offline_source_probes(
+        &self,
+        _node_id: &str,
+        _requested_since: i64,
+    ) -> Result<Vec<OfflinePackage>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn answer_offline_source_probe(
+        &self,
+        _package_id: &str,
+        _node_id: &str,
+        _readable: bool,
+        _now: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    async fn outstanding_offline_source_probes(
+        &self,
+        _requested_at: i64,
+    ) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+
+    async fn verified_offline_source_nodes(
+        &self,
+        _package_id: &str,
+        _requested_since: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve_offline_packages_for_removal(
+        &self,
+        _node_id: &str,
+        plan: &[OfflineRemovalPlanEntry],
+        _now: i64,
+    ) -> Result<OfflineRemovalReport, StoreError> {
+        if plan.is_empty() {
+            return Ok(OfflineRemovalReport::default());
+        }
+        Err(StoreError::Database(
+            "a single-node SQLite install has no node-removal path to resolve offline work for"
+                .to_owned(),
+        ))
     }
 }
 
@@ -785,6 +884,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_does_not_reject_packages_as_node_removed() {
+        // Single-node SQLite has no removal path and no `cluster_nodes`
+        // table. The `NodeIsTombstone` variant must never be returned.
+        let store = store().await;
+        let package = match store
+            .create_offline_package(&request("single-node"), 10, 1_000, 2_000)
+            .await
+            .expect("create")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("single-node create returned {other:?}"),
+        };
+        assert_eq!(package.request_id, "single-node");
+    }
+
+    #[tokio::test]
     async fn zero_quotas_disable_offline_admission() {
         let store = store().await;
         assert_eq!(
@@ -822,7 +937,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert!(store
-            .mark_offline_package_ready(&package.id, "recipe", 350, 90_000)
+            .mark_offline_package_ready(&package.id, "node-a", "recipe", 350, 90_000)
             .await
             .expect("ready"));
 
@@ -933,11 +1048,11 @@ mod tests {
         assert_eq!(claimed.state, "preparing");
         assert_eq!(claimed.effective_rate_control, "vbr");
         store
-            .update_offline_progress(&package.id, "transcoding", 600)
+            .update_offline_progress(&package.id, "node-a", "transcoding", 600)
             .await
             .expect("progress");
         store
-            .update_offline_progress(&package.id, "transcoding", 200)
+            .update_offline_progress(&package.id, "node-a", "transcoding", 200)
             .await
             .expect("stale progress");
         let current = store
@@ -996,7 +1111,13 @@ mod tests {
                 .expect("queued package");
             owners.push(package.user_id);
             assert!(store
-                .mark_offline_package_ready(&package.id, &format!("recipe-{turn}"), 400, 90_000,)
+                .mark_offline_package_ready(
+                    &package.id,
+                    "node-a",
+                    &format!("recipe-{turn}"),
+                    400,
+                    90_000,
+                )
                 .await
                 .expect("ready"));
         }
@@ -1034,7 +1155,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert!(store
-            .mark_offline_package_ready(&ready.id, "recipe", 350, 90_000)
+            .mark_offline_package_ready(&ready.id, "node-a", "recipe", 350, 90_000)
             .await
             .expect("ready"));
         assert!(matches!(
@@ -1054,7 +1175,13 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert!(store
-            .fail_offline_package(&failed.id, "transcoding", "encoder_failed", "failed")
+            .fail_offline_package(
+                &failed.id,
+                "node-a",
+                "transcoding",
+                "encoder_failed",
+                "failed"
+            )
             .await
             .expect("fail"));
         store

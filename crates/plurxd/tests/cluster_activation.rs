@@ -505,8 +505,19 @@ fn subsequent_plurxd_run_reopens_the_completed_replicated_target() {
         .output()
         .expect("run competing daemon");
     assert!(!contender.status.success());
-    assert!(String::from_utf8_lossy(&contender.stderr)
-        .contains("another plurxd process already owns the data directory"));
+    // The genuine double-start, and the only condition entitled to this text.
+    // Since #374 the contender waits out a departing owner before refusing, so
+    // it reaches this only because `first` is still running and still holding
+    // the lock. It must name that live process rather than blame its own.
+    let refusal = String::from_utf8_lossy(&contender.stderr);
+    assert!(
+        refusal.contains("another plurxd process already owns the data directory"),
+        "a second live daemon must still be refused as one: {refusal}"
+    );
+    assert!(
+        !refusal.contains("still locked inside this plurxd process"),
+        "a real second daemon was reported as this process's own leaked handle: {refusal}"
+    );
     first.stop();
 
     // The variable is meaningful only while activation is pending. A stale or

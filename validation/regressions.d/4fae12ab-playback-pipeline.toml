@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4fae12ab"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "The retained retirement regression begins a playlist wait with a 30-second budget, retires it through the production path, and requires prompt session_gone without a false producer failure; the shipped-web regressions drive the real api-to-openSession-to-burnSub rejection path into the persistent overlay and prove that only a matching successful level retry clears its earlier 503 while terminal refusals remain readable."

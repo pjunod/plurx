@@ -473,6 +473,11 @@ pub async fn create(
                 format!("The server has reserved {used} of {limit} offline bytes."),
             ))
         }
+        OfflineCreateOutcome::NodeIsTombstone => Err(typed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_removed",
+            "This node has been removed from the cluster and can no longer create offline downloads. Point your client at a surviving node.",
+        ))
     }
 }
 
@@ -1211,7 +1216,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(id, id, 100, 90_000)
+            .mark_offline_package_ready(id, "test-node", id, 100, 90_000)
             .await
             .expect("mark ready"));
         fixture
@@ -1249,7 +1254,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "unused", 10, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "unused", 10, 90_000)
             .await
             .expect("mark ready"));
         let token = "1".repeat(64);
@@ -1590,7 +1595,7 @@ mod tests {
         assert!(fixture
             .state
             .store
-            .mark_offline_package_ready(package_id, "ready-recipe", 456, 90_000)
+            .mark_offline_package_ready(package_id, "test-node", "ready-recipe", 456, 90_000)
             .await
             .expect("ready"));
 

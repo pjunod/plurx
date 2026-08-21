@@ -416,11 +416,62 @@ struct BookChapter: Codable, Hashable {
     let endMs: Int
 }
 
+struct ReadingRevision: Codable, Hashable {
+    let size: Int
+    let mtime: Int
+}
+
+struct ReadingLocations: Codable, Hashable {
+    var fragments: [String]?
+    var progression: Double?
+    var totalProgression: Double?
+    var position: Int?
+}
+
+struct ReadingText: Codable, Hashable {
+    var before: String?
+    var highlight: String?
+    var after: String?
+}
+
+struct ReadingLocator: Codable, Hashable {
+    let version: Int
+    let href: String
+    var type: String?
+    var title: String?
+    var locations: ReadingLocations?
+    var text: ReadingText?
+}
+
+struct ReadingState: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    let updatedAt: Int
+}
+
+struct ReadingStateResponse: Codable, Hashable {
+    let state: ReadingState?
+    let stale: Bool
+}
+
+struct PutReadingStateRequest: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    var recordedAt: Int?
+}
+
 struct ItemDetail: Codable {
     let item: Item
     var files: [MediaFile]?
     var children: [Item]?
     var ancestors: [Item]?
+    var reading: ReadingState?
 }
 
 struct Marker: Codable, Hashable {
@@ -566,6 +617,13 @@ struct HlsStart: Codable {
     var encoder: String?
     var vod: Bool?
     var ladder: [QualityRung]?
+    /// The normalized output height this session actually received — for a
+    /// bound stall reopen, the persisted one-rung-down answer, repeated
+    /// unchanged when the same `request_id` is replayed. Optional so an older
+    /// server that never sent it still decodes; `0` is the server's own answer
+    /// for a remux of an unprobed source, and both spellings of "unknown" are
+    /// read the same way by `StallReopenBudget`.
+    var height: Int?
     /// What the session that was actually created delivers. It overrides the
     /// decision's value the moment a session attaches, because a burn or a
     /// manually-picked rung forces a transcode the decision never promised.
@@ -624,7 +682,19 @@ struct CreateSessionRequest: Codable {
     /// Fresh per attempt: makes a replayed create return the same session
     /// instead of spawning a second encoder.
     var requestId: String? = UUID().uuidString
+    /// The exact session a typed recovery steps down from. Required together
+    /// with `reopenReason`; ordinary seeks and track changes omit both.
+    var previousSessionId: String?
+    /// Why this create replaces its predecessor. `"stall"` is the only value
+    /// the server accepts, and an unknown one is a client error.
+    var reopenReason: String?
     var height: Int?
+    /// Whether the VIEWER chose Auto quality — a different question from
+    /// "does this body carry a `height`". A subtitle burn posts the source
+    /// height as a promise about the output with no opinion about the quality
+    /// menu, and without this field the server would read that promise as a
+    /// sticky manual pick and never step the session down.
+    var qualityAuto: Bool?
     var start: Double?
     var audio: Int?
     /// A bitmap or styled-text subtitle the server must draw into the video.

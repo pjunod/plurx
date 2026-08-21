@@ -32,9 +32,10 @@ pub struct ScanRequestBody {
     pub path: String,
     #[serde(default)]
     pub ids: Option<Ids>,
-    /// `movie` | `episode` | `season`. Advisory: the library's own kind
+    /// `movie` | `episode` | `season` | `book`. Advisory: the library's own kind
     /// decides how a file is parsed, so this is only used to pick which
-    /// item an id applies to.
+    /// item an id applies to. `book` carries no provider id; it names the
+    /// Curator import honestly while the Books library derives file identity.
     #[serde(default)]
     pub hint: Option<String>,
     /// For episodes, the id of the SHOW — an episode's own tmdb id is not
