@@ -1291,7 +1291,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 21,
+            version, 22,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1437,7 +1437,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1492,7 +1492,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1560,7 +1560,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1638,7 +1638,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
