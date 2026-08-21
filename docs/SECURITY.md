@@ -135,9 +135,16 @@ forms, nested frames, objects, base changes, and non-local images/fonts/media.
 Child resources decompress through a two-chunk, 64 KiB channel, with no more
 than eight readers active per node, so concurrent requests cannot turn the
 per-resource ceiling into concurrent whole-file allocations.
-M2b still has to keep the iframe sandbox and browser network-refusal test
-green; the server headers are one half of that boundary, not a substitute for
-the rendering proof.
+
+The web reader supplies the other half. Its iframe grants only
+`allow-same-origin`: trusted Cinema code needs DOM inspection for pagination
+and locators, but publication markup gets no script, form, popup, download, or
+top-navigation grant. The resource CSP independently denies scripts and
+connections. A deterministic hostile-EPUB browser test proves inline script
+and event handlers stay inert, remote style/image/form targets make no probe
+request, and the account bearer never appears in a publication URL. The two
+locks are intentional—neither the sandbox nor the headers substitute for the
+other.
 
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 
