@@ -136,11 +136,29 @@ def _matches_release_path(
     return path in files or path.startswith(prefixes)
 
 
+def _merge_target_hint(baseline_label: str | None, baseline_build: int) -> str:
+    """Say which ref the counter has to clear, when that ref is the merge target.
+
+    Without this the failure reads as "bump it once" and stays ambiguous about
+    *which* baseline moved, which is exactly the confusion a base that advanced
+    under an open branch produces.
+    """
+    if not baseline_label:
+        return ""
+    return (
+        f". {baseline_label} is the merge target and already carries "
+        f"{baseline_build}, so re-bump above the current base rather than above "
+        "the commit this branch was cut from"
+    )
+
+
 def validate_versions(
     current: MobileVersions,
     *,
     baseline: MobileVersions | None = None,
+    scope_baseline: MobileVersions | None = None,
     changed_paths: tuple[str, ...] = (),
+    baseline_label: str | None = None,
 ) -> tuple[str, ...]:
     errors: list[str] = []
 
@@ -175,7 +193,14 @@ def validate_versions(
     if baseline is None:
         return tuple(errors)
 
-    workspace_changed = current.workspace != baseline.workspace
+    # "Did this branch bump the release?" is a property of the branch, so it is
+    # answered against the branch point even when the counters are answered
+    # against the merge target. Reading it off the target instead conflates "the
+    # branch released" with "the target released", which reds every open branch
+    # the moment a release lands and tells each one to bump counters it never
+    # touched.
+    scope = baseline if scope_baseline is None else scope_baseline
+    workspace_changed = current.workspace != scope.workspace
     apple_changed = workspace_changed or any(
         _matches_release_path(path, APPLE_RELEASE_PATHS, APPLE_RELEASE_FILES)
         for path in changed_paths
@@ -189,11 +214,13 @@ def validate_versions(
         errors.append(
             "Apple release inputs changed, so CURRENT_PROJECT_VERSION must increase "
             f"above {baseline.apple_build}; found {current.apple_build}"
+            + _merge_target_hint(baseline_label, baseline.apple_build)
         )
     if android_changed and current.android_build <= baseline.android_build:
         errors.append(
             "Android release inputs changed, so versionCode must increase "
             f"above {baseline.android_build}; found {current.android_build}"
+            + _merge_target_hint(baseline_label, baseline.android_build)
         )
 
     return tuple(errors)
@@ -237,8 +264,33 @@ def _changed_paths(root: Path, *diff_arguments: str) -> tuple[str, ...]:
 
 
 def check_repository(
-    root: Path = REPO_ROOT, *, mode: str = "all", base: str | None = None
+    root: Path = REPO_ROOT,
+    *,
+    mode: str = "all",
+    base: str | None = None,
+    merge_target: str | None = None,
 ) -> tuple[str, ...]:
+    """Compare the working revision's build counters against a Git baseline.
+
+    ``base`` scopes *which* release inputs the branch touched, and is the branch
+    point. ``merge_target`` supplies the counters to beat, and is the tip of the
+    branch this change will merge into. They are the same commit only while the
+    target has not moved; once it has, only the target tip answers the question
+    the store cares about, which is whether the counter is still an increase if
+    this merged right now.
+
+    Scope is the whole of scope: both the changed paths and the workspace-version
+    comparison are read against ``base``. Only the counters move to
+    ``merge_target``.
+    """
+    if merge_target and mode != "changed-from":
+        raise MobileVersionError(
+            "a merge target is only meaningful for changed-from validation; "
+            f"mode is {mode}"
+        )
+
+    baseline_label: str | None = None
+    scope_baseline: MobileVersions | None = None
     if mode == "staged":
         changed = _changed_paths(root, "--cached", "HEAD")
         current = read_versions(_git_reader(root, ""))
@@ -248,7 +300,15 @@ def check_repository(
             raise MobileVersionError("changed-from validation requires a Git base")
         changed = _changed_paths(root, f"{base}...HEAD")
         current = read_versions(_git_reader(root, "HEAD"))
-        baseline = read_versions(_git_reader(root, base))
+        baseline = scope_baseline = read_versions(_git_reader(root, base))
+        if merge_target:
+            # Scope stays on the branch point read above; only the counters move
+            # to the target. A missing or unreadable merge target fails the check
+            # rather than falling back to the branch point. Failing open here
+            # reproduces the exact defect this baseline exists to catch: a green
+            # result on a tree that cannot ship.
+            baseline = read_versions(_git_reader(root, merge_target))
+            baseline_label = merge_target
     elif mode in {"all", "paths", "point"}:
         changed = ()
         current = read_versions(_filesystem_reader(root))
@@ -256,14 +316,21 @@ def check_repository(
     else:
         raise MobileVersionError(f"unsupported validation mode: {mode}")
 
-    return validate_versions(current, baseline=baseline, changed_paths=changed)
+    return validate_versions(
+        current,
+        baseline=baseline,
+        scope_baseline=scope_baseline,
+        changed_paths=changed,
+        baseline_label=baseline_label,
+    )
 
 
 def main() -> int:
     mode = os.environ.get("PLURX_VALIDATION_MODE", "all")
     base = os.environ.get("PLURX_VALIDATION_BASE")
+    merge_target = os.environ.get("PLURX_VALIDATION_MERGE_TARGET") or None
     try:
-        errors = check_repository(mode=mode, base=base)
+        errors = check_repository(mode=mode, base=base, merge_target=merge_target)
     except (MobileVersionError, OSError) as exc:
         print(f"mobile version validation failed: {exc}", file=sys.stderr)
         return 1

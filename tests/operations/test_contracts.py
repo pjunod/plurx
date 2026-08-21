@@ -247,6 +247,23 @@ class OperationsContractCase(unittest.TestCase):
         mobile = workflow.split("  mobile_version:", 1)[1].split("\n  preflight:", 1)[0]
         self.assertIn("needs: scope", mobile)
         self.assertNotIn("needs: [scope, preflight]", mobile)
+
+        # The recorded base sha is the target tip at event time. Comparing build
+        # counters against it keeps a branch green after an unrelated release
+        # bump lands the same counter on the target, because identical literals
+        # auto-merge with no conflict. The counter baseline must be re-fetched
+        # at job time; the recorded base stays, but only to scope the diff.
+        self.assertIn("+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF", mobile)
+        self.assertIn('MERGE_TARGET=origin/$BASE_REF" >> "$GITHUB_ENV"', mobile)
+        self.assertIn('PLURX_VALIDATION_MERGE_TARGET="$MERGE_TARGET"', mobile)
+        self.assertIn(
+            "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+            mobile,
+        )
+        self.assertLess(
+            mobile.index("Resolve the current merge target"),
+            mobile.index("Check mobile release hygiene"),
+        )
         apple = workflow.split("\n  apple:\n", 1)[1].split(
             "\n  android_device:\n", 1
         )[0]
