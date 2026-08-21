@@ -763,11 +763,12 @@ fn apply_selected_subtitle(
         .map(|track| track.codec.as_str())
         .unwrap_or("unknown");
 
-    // The established HDR guard refuses an SDR burn rather than silently
-    // replacing HDR/Dolby Vision video. Selection-aware preflight discloses
-    // that separately in `DecisionSelection`; do not add a reason for a failure
-    // that did not change the returned playback method.
-    if matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg")) {
+    // Refuse only when adding the subtitle would downgrade the picture the
+    // base decision actually delivers. An HDR source that is already being
+    // tone-mapped to SDR (for example because the display has `hdr=0`) loses
+    // no dynamic range by drawing its forced PGS subtitle into that SDR
+    // transcode. Looking at `file.hdr` here used to reject that valid plan.
+    if subtitle_burn_would_discard_hdr(decision, requires_burn_in) {
         return;
     }
 
@@ -778,6 +779,14 @@ fn apply_selected_subtitle(
     decision
         .reasons
         .push(format!("selected subtitle codec {codec} requires burn-in"));
+}
+
+fn subtitle_burn_would_discard_hdr(decision: &Decision, requires_burn_in: bool) -> bool {
+    requires_burn_in
+        && matches!(
+            decision.delivered_dynamic_range,
+            "dolby_vision" | "hdr10" | "hlg"
+        )
 }
 
 /// Classify a chapter title as an intro or end-credits marker. Case-insensitive
@@ -993,11 +1002,11 @@ pub async fn decision(
     let selection_requested = q.audio.is_some() || q.subtitle.is_some();
     let selected_subtitle_requires_burn =
         subtitle_requires_burn_in(&file, selected_subtitle, state.pgs_overlay_enabled);
-    let subtitle_burn_in_blocked_by_hdr = selected_subtitle_requires_burn
-        && matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"));
     let container_default_audio = container_default_audio_index(&file.audio_streams);
     set_selected_audio_default(&mut file.audio_streams, selected_audio);
     let mut decision = q.decide(&file, dv_strippable(&state));
+    let subtitle_burn_in_blocked_by_hdr =
+        subtitle_burn_would_discard_hdr(&decision, selected_subtitle_requires_burn);
     // Only an explicit subtitle choice may change the delivery verdict. An
     // audio-only request still echoes the effective policy subtitle below,
     // but delivery does not burn that track unless the caller chose it.
@@ -2389,7 +2398,7 @@ mod tests {
                 ..Default::default()
             }
         }
-        let file = MediaFile {
+        let mut file = MediaFile {
             id: 1,
             item_id: 1,
             path: "/media/anime.mkv".into(),
@@ -2465,5 +2474,29 @@ mod tests {
                 plurx_core::tracks::is_native_text_subtitle(&source.codec)
             );
         }
+
+        // Bad Boys for Life's exact shape: HDR source, but `hdr=0` already
+        // made the base decision SDR before its forced PGS track was applied.
+        // Burning that track is not an HDR downgrade and must remain valid.
+        file.hdr = Some("hdr10".into());
+        let mut already_sdr = planned(playback::PlaybackMethod::Transcode);
+        already_sdr.delivered_dynamic_range = "sdr";
+        assert!(!subtitle_burn_would_discard_hdr(&already_sdr, true));
+        apply_selected_subtitle(&mut already_sdr, &file, Some(3), true);
+        assert_eq!(already_sdr.method, playback::PlaybackMethod::Transcode);
+        assert!(already_sdr
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("requires burn-in")));
+
+        let mut still_hdr = planned(playback::PlaybackMethod::Remux);
+        still_hdr.delivered_dynamic_range = "hdr10";
+        assert!(subtitle_burn_would_discard_hdr(&still_hdr, true));
+        apply_selected_subtitle(&mut still_hdr, &file, Some(3), true);
+        assert_eq!(still_hdr.method, playback::PlaybackMethod::Remux);
+        assert!(
+            still_hdr.reasons.is_empty(),
+            "a burn must not silently replace an HDR delivery with SDR"
+        );
     }
 }

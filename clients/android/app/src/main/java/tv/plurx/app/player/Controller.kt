@@ -744,6 +744,7 @@ class Controller(
                 audioOffsetMs = audioOffsetMs,
                 quality = vm.preferences.value.playbackQuality,
                 sourceHeight = plan.sourceHeight,
+                deliveredDynamicRange = deliveredRange,
                 previousSessionId = prevId,
                 reopenReason = ReopenReason.Stall,
             )
@@ -808,6 +809,7 @@ class Controller(
         audioOffsetMs = audioOffsetMs,
         quality = vm.preferences.value.playbackQuality,
         sourceHeight = plan.sourceHeight,
+        deliveredDynamicRange = deliveredRange,
     )
 
     private fun trackFor(index: Long?): SubTrack? =

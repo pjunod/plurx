@@ -404,3 +404,11 @@ source = "clients/apple/Sources/HomeView.swift"
 source_anchor = "static let offlineLaunchTab: HomeTab = .downloads"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testIOSExposesDownloadsAndUsesConservativeDefaults"
+
+[[fixes]]
+id = "android.per-codec-video-height-caps"
+commits = ["58fc89ea"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
+source_anchor = "internal data class VideoDecoderLimit("
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "videoCapsKeepTheBestHeightForEachCodec"

@@ -2432,6 +2432,10 @@ final class PlayerController: ObservableObject {
                     start: Double(startMs) / 1000.0,
                     audio: chosenAudio,
                     subtitleBurn: burnSubtitle,
+                    subtitleBurnSDR: Self.subtitleBurnSDRAcknowledgement(
+                        burnSubtitle,
+                        deliveredRange: decision.deliveredDynamicRange
+                    ),
                     nativeSubtitles: true,
                     subtitle: nativeSubtitle,
                     copy: copy ? true : nil,
@@ -3976,6 +3980,16 @@ final class PlayerController: ObservableObject {
     ) -> Bool {
         guard let index, isHDRDelivery(deliveredRange) else { return false }
         return subtitleRequiresBurn(index, in: tracks)
+    }
+
+    /// The session endpoint remains fail-closed for an HDR source unless the
+    /// selected plan proves the burn is being added to an already-SDR output.
+    nonisolated static func subtitleBurnSDRAcknowledgement(
+        _ index: Int?,
+        deliveredRange: String?
+    ) -> Bool? {
+        guard index != nil, deliveredRange?.lowercased() == "sdr" else { return nil }
+        return true
     }
 
     /// Whether the subtitle a starting playback wants must be dropped because

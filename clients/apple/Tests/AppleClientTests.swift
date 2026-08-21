@@ -4205,6 +4205,31 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
+    func testSubtitleBurnAcknowledgesOnlyAnAlreadySDRPlan() throws {
+        XCTAssertEqual(
+            PlayerController.subtitleBurnSDRAcknowledgement(2, deliveredRange: "sdr"),
+            true
+        )
+        XCTAssertNil(
+            PlayerController.subtitleBurnSDRAcknowledgement(2, deliveredRange: "hdr10")
+        )
+        XCTAssertNil(
+            PlayerController.subtitleBurnSDRAcknowledgement(nil, deliveredRange: "sdr")
+        )
+
+        let request = CreateSessionRequest(
+            playbackId: "player-sdr-burn",
+            subtitleBurn: 2,
+            subtitleBurnSDR: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual(json["subtitle_burn_sdr"] as? Bool, true)
+    }
+
     func testAppleCapsKeepGenericHDRSeparateFromDolbyVision() {
         func dictionary(_ query: [URLQueryItem]) -> [String: String] {
             Dictionary(uniqueKeysWithValues: query.compactMap { item in
