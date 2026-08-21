@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from validation.mobile_versions import (
+    MobileVersionError,
     MobileVersions,
     check_repository,
     validate_versions,
@@ -35,10 +36,10 @@ def versions(
     )
 
 
-def apple_project(build: int) -> str:
+def apple_project(build: int, name: str = "0.2.2") -> str:
     return f'''settings:
   base:
-    MARKETING_VERSION: "0.2.2"
+    MARKETING_VERSION: "{name}"
     CURRENT_PROJECT_VERSION: "{build}"
 targets:
   ios:
@@ -52,6 +53,324 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
 '''
+
+
+def git(root: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def android_gradle(build: int, name: str = "0.2.2") -> str:
+    return f'namespace = "org.plurx"\nversionCode = {build}\nversionName = "{name}"\n'
+
+
+def cargo_workspace(version: str = "0.2.2", *, dependency: bool = False) -> str:
+    manifest = f'[workspace]\n[workspace.package]\nversion = "{version}"\n'
+    if dependency:
+        manifest += '\n[workspace.dependencies]\nserde = "1"\n'
+    return manifest
+
+
+def seed_repository(root: Path, *, apple_build: int, android_build: int) -> None:
+    """Lay down a minimal repo on a ``main`` branch with both apps present."""
+    (root / "clients/apple/Sources").mkdir(parents=True)
+    (root / "clients/android/app/src/main").mkdir(parents=True)
+    (root / "Cargo.toml").write_text(cargo_workspace(), encoding="utf-8")
+    (root / "clients/apple/project.yml").write_text(
+        apple_project(apple_build), encoding="utf-8"
+    )
+    (root / "clients/apple/Sources/App.swift").write_text(
+        "let release = 1\n", encoding="utf-8"
+    )
+    (root / "clients/android/app/build.gradle.kts").write_text(
+        android_gradle(android_build), encoding="utf-8"
+    )
+    (root / "clients/android/app/src/main/AndroidManifest.xml").write_text(
+        "<manifest />\n", encoding="utf-8"
+    )
+    git(root, "init", "-q")
+    git(root, "checkout", "-qb", "main")
+    git(root, "config", "user.name", "Version Test")
+    git(root, "config", "user.email", "version@example.invalid")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "seed")
+
+
+class MergeTargetBaselineCase(unittest.TestCase):
+    """The counter has to clear what the merge target ships, not the branch point.
+
+    Reproduces the shape that let PR #294 sit green and unmergeable: the branch
+    bumped its counter to N for its own feature, then an unrelated release bump
+    landed the same N on the target. Both sides wrote the same literal, so Git
+    auto-merged with no conflict and no diff evidence, and the release-hygiene
+    check kept comparing against the branch point where the counter was still
+    N-1.
+    """
+
+    def collide(
+        self, root: Path, *, branch_edit: str, gradle: str, project: str
+    ) -> str:
+        """Bump one app to the same counter on both `main` and `feature`.
+
+        Returns the branch point, which is what CI records as the base sha.
+        """
+        seed_repository(root, apple_build=10, android_build=26)
+        branch_point = git(root, "rev-parse", "HEAD")
+
+        git(root, "checkout", "-qb", "feature")
+        (root / branch_edit).write_text("changed by the feature\n", encoding="utf-8")
+        (root / "clients/android/app/build.gradle.kts").write_text(
+            gradle, encoding="utf-8"
+        )
+        (root / "clients/apple/project.yml").write_text(project, encoding="utf-8")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "feature work and its build bump")
+
+        git(root, "checkout", "-q", "main")
+        (root / "clients/android/app/build.gradle.kts").write_text(
+            gradle, encoding="utf-8"
+        )
+        (root / "clients/apple/project.yml").write_text(project, encoding="utf-8")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "unrelated operator release bump")
+
+        git(root, "checkout", "-q", "feature")
+        return branch_point
+
+    def assert_collision_is_invisible_to_git(self, root: Path) -> None:
+        git(root, "checkout", "-qb", "merge-probe", "feature")
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", "main"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.assertEqual(merge.returncode, 0, merge.stdout)
+        self.assertNotIn(
+            "<<<<<<<", (root / "clients/android/app/build.gradle.kts").read_text()
+        )
+        git(root, "checkout", "-q", "feature")
+
+    def test_android_counter_the_target_already_ships_fails_against_the_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            branch_point = self.collide(
+                root,
+                branch_edit="clients/android/app/src/main/AndroidManifest.xml",
+                gradle=android_gradle(27),
+                project=apple_project(10),
+            )
+            self.assert_collision_is_invisible_to_git(root)
+
+            # The defect: baselined on the branch point, 27 > 26 and the branch
+            # is green on a tree that cannot ship.
+            self.assertEqual(
+                check_repository(root, mode="changed-from", base=branch_point), ()
+            )
+
+            errors = check_repository(
+                root, mode="changed-from", base=branch_point, merge_target="main"
+            )
+            failure = "\n".join(errors)
+            self.assertIn("versionCode must increase", failure)
+            self.assertIn("above 27", failure)
+            self.assertIn("found 27", failure)
+            self.assertIn("main is the merge target", failure)
+            self.assertNotIn("CURRENT_PROJECT_VERSION", failure)
+
+            # Re-bumping above the target, not above the branch point, clears it.
+            (root / "clients/android/app/build.gradle.kts").write_text(
+                android_gradle(28), encoding="utf-8"
+            )
+            git(root, "commit", "-qam", "re-bump above the current base")
+            self.assertEqual(
+                check_repository(
+                    root, mode="changed-from", base=branch_point, merge_target="main"
+                ),
+                (),
+            )
+
+    def test_apple_counter_the_target_already_ships_fails_against_the_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            branch_point = self.collide(
+                root,
+                branch_edit="clients/apple/Sources/App.swift",
+                gradle=android_gradle(26),
+                project=apple_project(11),
+            )
+
+            self.assertEqual(
+                check_repository(root, mode="changed-from", base=branch_point), ()
+            )
+
+            errors = check_repository(
+                root, mode="changed-from", base=branch_point, merge_target="main"
+            )
+            failure = "\n".join(errors)
+            self.assertIn("CURRENT_PROJECT_VERSION must increase", failure)
+            self.assertIn("above 11", failure)
+            self.assertIn("found 11", failure)
+            self.assertIn("main is the merge target", failure)
+            self.assertNotIn("versionCode must increase", failure)
+
+    def test_the_target_scopes_only_the_counter_not_which_app_changed(self):
+        """A target bump alone does not obligate an untouched app to re-bump."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed_repository(root, apple_build=10, android_build=26)
+            branch_point = git(root, "rev-parse", "HEAD")
+
+            git(root, "checkout", "-qb", "feature")
+            (root / "docs").mkdir()
+            (root / "docs/NOTES.md").write_text("prose only\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "documentation only")
+
+            git(root, "checkout", "-q", "main")
+            (root / "clients/android/app/build.gradle.kts").write_text(
+                android_gradle(27), encoding="utf-8"
+            )
+            git(root, "commit", "-qam", "operator release bump")
+            git(root, "checkout", "-q", "feature")
+
+            self.assertEqual(
+                check_repository(
+                    root, mode="changed-from", base=branch_point, merge_target="main"
+                ),
+                (),
+            )
+
+    def release_lands_on_the_target(self, root: Path) -> str:
+        """Ship release 0.2.3 on `main` under a branch that touched no client.
+
+        The branch appends a workspace dependency and nothing else. `Cargo.toml`
+        is in the `mobile.versioning` point paths, so this is the shape of an
+        ordinary dependency pull request, not a client change.
+        """
+        seed_repository(root, apple_build=10, android_build=26)
+        branch_point = git(root, "rev-parse", "HEAD")
+
+        git(root, "checkout", "-qb", "feature")
+        (root / "Cargo.toml").write_text(
+            cargo_workspace(dependency=True), encoding="utf-8"
+        )
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "add a workspace dependency")
+
+        git(root, "checkout", "-q", "main")
+        (root / "Cargo.toml").write_text(cargo_workspace("0.2.3"), encoding="utf-8")
+        (root / "clients/android/app/build.gradle.kts").write_text(
+            android_gradle(27, "0.2.3"), encoding="utf-8"
+        )
+        (root / "clients/apple/project.yml").write_text(
+            apple_project(11, "0.2.3"), encoding="utf-8"
+        )
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "release 0.2.3")
+        git(root, "checkout", "-q", "feature")
+        return branch_point
+
+    def test_a_release_on_the_target_does_not_obligate_a_branch_that_shipped_none(self):
+        """Whether *this branch* released is read at the branch point, not the target.
+
+        `workspace_changed` is a scope input — it answers "did this branch ship a
+        release", which is a property of the branch. Reading it off the merge
+        target instead conflates that with "the target shipped a release", so
+        every pull request open across a release goes red and is told to bump two
+        store counters it never touched.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            branch_point = self.release_lands_on_the_target(root)
+
+            self.assertEqual(
+                check_repository(
+                    root, mode="changed-from", base=branch_point, merge_target="main"
+                ),
+                (),
+            )
+
+    def test_the_target_release_still_raises_the_bar_for_a_branch_that_did_touch(self):
+        """Scoping on the branch point must not weaken the counter comparison.
+
+        The obvious wrong fix for the test above is to stop consulting the target
+        at all. This pins the other side: the same target release, but a branch
+        that genuinely edits an Android release input still has to clear the
+        counter the target ships, not the one its branch point had.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            branch_point = self.release_lands_on_the_target(root)
+
+            (root / "clients/android/app/src/main/AndroidManifest.xml").write_text(
+                "<manifest android:label=\"feature\" />\n", encoding="utf-8"
+            )
+            git(root, "commit", "-qam", "android feature work")
+
+            errors = check_repository(
+                root, mode="changed-from", base=branch_point, merge_target="main"
+            )
+            failure = "\n".join(errors)
+            self.assertIn("versionCode must increase", failure)
+            self.assertIn("above 27", failure)
+            self.assertIn("main is the merge target", failure)
+            # Apple was never touched by this branch, and the target's release
+            # bump is not this branch's, so Apple stays silent.
+            self.assertNotIn("CURRENT_PROJECT_VERSION must increase", failure)
+
+    def test_a_branch_that_ships_its_own_release_is_still_scoped_in(self):
+        """A workspace bump made *by the branch* still obligates both counters."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed_repository(root, apple_build=10, android_build=26)
+            branch_point = git(root, "rev-parse", "HEAD")
+
+            git(root, "checkout", "-qb", "feature")
+            (root / "Cargo.toml").write_text(cargo_workspace("0.2.3"), encoding="utf-8")
+            (root / "clients/android/app/build.gradle.kts").write_text(
+                android_gradle(26, "0.2.3"), encoding="utf-8"
+            )
+            (root / "clients/apple/project.yml").write_text(
+                apple_project(10, "0.2.3"), encoding="utf-8"
+            )
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "release 0.2.3 from the branch")
+
+            errors = check_repository(
+                root, mode="changed-from", base=branch_point, merge_target="main"
+            )
+            failure = "\n".join(errors)
+            self.assertIn("versionCode must increase", failure)
+            self.assertIn("CURRENT_PROJECT_VERSION must increase", failure)
+
+    def test_an_unreadable_merge_target_fails_instead_of_falling_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed_repository(root, apple_build=10, android_build=26)
+            branch_point = git(root, "rev-parse", "HEAD")
+
+            with self.assertRaises(MobileVersionError):
+                check_repository(
+                    root,
+                    mode="changed-from",
+                    base=branch_point,
+                    merge_target="origin/never-fetched",
+                )
+
+    def test_a_merge_target_without_a_branch_diff_is_rejected_not_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed_repository(root, apple_build=10, android_build=26)
+
+            with self.assertRaises(MobileVersionError):
+                check_repository(root, mode="all", merge_target="main")
 
 
 class MobileVersionCase(unittest.TestCase):

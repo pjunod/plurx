@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["fb3d8148"]
+points = ["web.experience", "playback.pipeline"]
+checks = ["web-static"]
+reason = "The shipped `renderSkip` regression in `tests/playback/web-policy.test.js` distinguishes chapter-derived credits from `chapter:false` estimates, preserves the exact chapter button, and counts DOM writes to prove repeated time updates do not rebuild either button; reverting only the production rendering correction restores an indistinguishable estimate and fails that check."
