@@ -38,7 +38,7 @@ use crate::secrets::{self, CredentialKey, SealedRowCensus};
 #[cfg(feature = "hiqlite-store")]
 use crate::store::{
     HiqliteAuthStore, SettingsStore, SqliteImportReport, SqliteImportTableDigest, SqliteStore,
-    Store, TraktStore, AUTH_SCHEMA_VERSION,
+    Store, TraktStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
@@ -81,6 +81,29 @@ const HIQLITE_READDRESS_BACKUP_DIRNAME: &str = "hiqlite.before-readdress";
 const HIQLITE_READDRESS_MARKER_FILENAME: &str = "hiqlite-readdress.json";
 #[cfg(feature = "hiqlite-store")]
 const HIQLITE_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Hiqlite Raft WAL segment size used by every plurx voter.
+///
+/// Hiqlite 0.14 accepts one serialized Raft entry up to `wal_size - 34` bytes:
+/// its WAL writer subtracts the fixed segment metadata before checking each
+/// entry independently. The 16 MiB segment therefore leaves 16,777,182 usable
+/// bytes. OpenRaft's configured `max_payload_entries = 128` limits the number
+/// of entries in one append request, not the size of an individual entry, and
+/// Hiqlite carries that request in a WebSocket binary frame whose length field
+/// supports this size without a smaller application cap.
+///
+/// Import transactions deliberately stay far below the usable entry capacity
+/// at the replication-time ceiling measured before this headroom increase.
+/// Keep all voters and import bounds tied to this constant so a retune cannot
+/// make the contract exercise a different limit than production.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+/// Bytes Hiqlite WAL 0.14 reserves before one serialized log entry.
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_WAL_SEGMENT_RESERVED_BYTES: usize = 34;
+/// Largest serialized Raft entry accepted by the configured production WAL.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_USABLE_PAYLOAD_BYTES: usize =
+    HIQLITE_WAL_SIZE_BYTES as usize - HIQLITE_WAL_SEGMENT_RESERVED_BYTES;
 #[cfg(feature = "hiqlite-store")]
 const ACTIVATION_MARKER_VERSION: u32 = 1;
 #[cfg(feature = "hiqlite-store")]
@@ -855,7 +878,8 @@ impl ActivationMarker {
         }
         if self.cluster_id.trim().is_empty()
             || self.source_schema_version <= 0
-            || self.replicated_schema_version != AUTH_SCHEMA_VERSION
+            || (self.replicated_schema_version != AUTH_SCHEMA_MIGRATION_SOURCE
+                && self.replicated_schema_version != AUTH_SCHEMA_VERSION)
             || !is_sha256(&self.source_backup_sha256)
             || self.table_hashes.is_empty()
         {
@@ -1219,7 +1243,7 @@ async fn open_active_store_with_key(
 ) -> Result<SelectedStore, StoreError> {
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     require_real_directory(&active)?;
-    let marker = read_activation_marker(&active)?;
+    let mut marker = read_activation_marker(&active)?;
     let mut local_membership = read_local_membership(&config.storage.data_dir)?;
     let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     if let Some(membership) = &local_membership {
@@ -1242,10 +1266,17 @@ async fn open_active_store_with_key(
         force_loopback,
     )
     .await?;
-    let store = match HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await {
-        Ok(store) => store,
-        Err(error) => return Err(error),
-    };
+    let store =
+        match HiqliteAuthStore::open_or_migrate(client.clone(), &active.join("telemetry.db")).await
+        {
+            Ok(store) => store,
+            Err(error) => return Err(error),
+        };
+    if marker.replicated_schema_version != AUTH_SCHEMA_VERSION {
+        marker.replicated_schema_version = AUTH_SCHEMA_VERSION;
+        write_activation_marker(&active, &marker)?;
+        sync_directory(&active)?;
+    }
     if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
         drop(store);
         return Err(error);
@@ -1632,7 +1663,7 @@ async fn start_voter(
         tls_raft: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     };
@@ -2742,6 +2773,36 @@ mod tests {
     /// not observe a *different* live process may print it.
     #[cfg(feature = "hiqlite-store")]
     const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn activation_marker_accepts_only_the_supported_upgrade_window() {
+        let marker = |replicated_schema_version| ActivationMarker {
+            marker_version: ACTIVATION_MARKER_VERSION,
+            cluster_id: "cluster-a".to_owned(),
+            source_backup_sha256: "0".repeat(64),
+            source_schema_version: 20,
+            replicated_schema_version,
+            imported_rows: 0,
+            table_hashes: vec![SqliteImportTableDigest {
+                table: "settings".to_owned(),
+                row_count: 0,
+                sha256: "0".repeat(64),
+            }],
+        };
+        marker(AUTH_SCHEMA_MIGRATION_SOURCE)
+            .validate()
+            .expect("v5 marker must reach the v6 daemon migration");
+        marker(AUTH_SCHEMA_VERSION)
+            .validate()
+            .expect("current marker");
+        for unsupported in [AUTH_SCHEMA_MIGRATION_SOURCE - 1, AUTH_SCHEMA_VERSION + 1] {
+            let error = marker(unsupported)
+                .validate()
+                .expect_err("unsupported marker must fail before voter startup");
+            assert!(error.to_string().contains("incomplete"), "{error}");
+        }
+    }
 
     /// A predecessor still closing its handle is not a second daemon.
     ///

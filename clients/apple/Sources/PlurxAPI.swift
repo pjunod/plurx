@@ -192,6 +192,33 @@ struct PlurxAPI {
         ])
     }
 
+    func openPublication(fileId: Int) async throws -> OpenPublicationResponse {
+        try await post("files/\(fileId)/publication")
+    }
+
+    func closePublication(sessionId: String) async throws {
+        try await deleteNoContent("publication/\(sessionId)")
+    }
+
+    func bookContentRequest(fileId: Int) throws -> URLRequest {
+        guard let url = makeURL("files/\(fileId)/content") else { throw APIError.badURL }
+        var request = URLRequest(url: url)
+        Session.shared.authorize(&request)
+        request.setValue("application/epub+zip", forHTTPHeaderField: "Accept")
+        return request
+    }
+
+    func publicationResourceRequest(base: String, path: String) throws -> URLRequest {
+        guard let root = URL(string: origin),
+              let baseURL = URL(string: base, relativeTo: root),
+              let url = URL(string: path, relativeTo: baseURL)?.absoluteURL,
+              url.scheme == root.scheme, url.host == root.host, url.port == root.port
+        else { throw APIError.badURL }
+        var request = URLRequest(url: url)
+        request.setValue("no-referrer", forHTTPHeaderField: "Referrer-Policy")
+        return request
+    }
+
     func putReadingState(itemId: Int, state: PutReadingStateRequest) async throws -> ReadingState {
         try await put("items/\(itemId)/reading-state", body: state)
     }

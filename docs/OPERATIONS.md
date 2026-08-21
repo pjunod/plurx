@@ -49,6 +49,26 @@ runbook. Until that work lands, a post-activation rollback means roll forward
 with an M2-capable binary against the retained active target. The commands
 below are only for the pre-activation SQLite case.
 
+### Upgrading an activated v5 cluster to v6
+
+The ebook reading-state release is the first implemented in-place replicated
+schema step. Stop application traffic and update every voter as one maintenance
+operation. The first v6 daemon that reaches quorum accepts an exact v5
+activation marker and commits the new `reading_state` table, its index, and the
+v6 compatibility row in one Raft transaction before it starts producers or
+binds HTTP. Each voter then atomically rewrites its local `activation.json`
+from v5 to v6 after the replicated transaction is visible. A death before the
+transaction leaves v5; a death between the transaction and local marker write
+replays only the marker write on the next boot.
+
+Do not restart a v5 binary after that transaction commits: its strict
+compatibility check correctly refuses schema v6. If a node fails during the
+maintenance window, leave the v6 quorum authoritative and roll that node
+forward with the same v6-or-newer binary. `reset-password`, `refresh-metadata`,
+and other maintenance clients do not own migration and will refuse until the
+running daemon has completed it. Replicated v4 has no supported direct path to
+v6 and remains refused.
+
 Every Ansible redeploy stops the Plurx Compose stack long enough to copy the
 closed SQLite database. The three newest copies stay on each node under
 `<PLURX_DATA>/backups/`, named
