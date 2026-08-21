@@ -324,6 +324,17 @@ struct MediaFile: Codable, Identifiable {
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+
+    var isEpub: Bool {
+        container?.lowercased() == "epub"
+            || filename?.lowercased().hasSuffix(".epub") == true
+    }
+}
+
+enum BookReaderPolicy {
+    static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        !onTelevision && file.available != false && file.isEpub
+    }
 }
 
 /// One subtitle stream exactly as item detail reports it (`FileDto`'s
