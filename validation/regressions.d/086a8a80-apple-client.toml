@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["086a8a80", "60911180", "134bf7bc"]
+points = ["apple.client"]
+checks = ["apple-simulators"]
+reason = "The shared XCTest job compiles every source and exercises policy on both iOS and tvOS, including platform-only APIs."

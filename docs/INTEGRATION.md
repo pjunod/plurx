@@ -158,6 +158,10 @@ whichever header the secret arrived in.
 {"path":"/media/movies/Some Film (1999)","hint":"movie",
  "ids":{"tmdb":603,"imdb":"tt0133093"},
  "correlation_id":"t-43-b1e207","source":"monarr"}
+
+// a book: the Books library derives text/audio and shelf identity from disk
+{"path":"/media/books/Andy Weir/Project Hail Mary","hint":"book",
+ "correlation_id":"t-44-c4d812","source":"monarr"}
 ```
 
 `path` is absolute and must resolve **under a configured library root** — a
@@ -167,7 +171,9 @@ unresolvable path and counts the rejection as a pass).
 
 `hint` is advisory. The library's own kind decides how a file is parsed; the
 hint only picks which item an id applies to. For an episode, `series.tmdb` is
-the **show's** id — an episode's own id does not identify the series.
+the **show's** id — an episode's own id does not identify the series. A book
+hint carries no provider ids: the resolved Books library decides ebook versus
+audiobook from the files and retains the author/title shelf path as identity.
 
 `correlation_id` is monarr's transfer id (`t-<downloadID>-<hex>`), echoed back
 in the response and written to the log, so one grep across three applications

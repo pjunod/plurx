@@ -118,6 +118,34 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   and active-reader eviction protection are shipped. Cached TTFF and seek
   measurements remain operational evidence, not unfinished implementation.
 
+## Ebook reader — consumption inside Cinema (IN PROGRESS)
+
+The executable plan is [EBOOK-READER-PLAN.md](EBOOK-READER-PLAN.md). Cinema
+owns the read/resume/offline loop while Curator keeps acquisition and Runner
+keeps transfer.
+
+- ✅ **M0 complete 2026-08-20:** Curator book imports now trigger an exact-path
+  Cinema Books scan and retain the returned item identity.
+- ✅ **M1 complete 2026-08-20:** revision-bound per-user locators, SQLite and
+  Hiqlite parity, authenticated reading-state routes, stale-write protection,
+  and Apple/Android API models are shipped.
+- ✅ **M2 complete 2026-08-20:** the bounded, revision-scoped EPUB publication
+  API and in-app web reader ship Read/Resume, TOC, search, preferences,
+  explicit completion, durable paragraph restoration, and hostile-content
+  browser proof without changing A/V playback.
+- ✅ **M3 complete 2026-08-20:** iPhone/iPad and Android phone/tablet now host
+  the shared reader behind memory-only authentication and same-origin native
+  navigation guards. Simulator/JVM plus real-browser contracts prove profile
+  isolation, semantic headings, close flushing, and the same paragraph after
+  font and orientation changes; tvOS and Google TV expose no reader action.
+- 🚧 **M4 acceptance in progress:** iPhone/iPad and Android phone/tablet now
+  keep an atomically published, profile/revision-scoped original EPUB, open it
+  through a token-free local publication surface with the server stopped, and
+  reconcile the newest offline locator when the server returns. Automated
+  storage, security, process-death, and sync contracts are green; the physical
+  airplane-mode/reconnect device drill remains. Televisions stay deliberately
+  excluded.
+
 ## Phase 4 — HA for real (IN PROGRESS)
 
 The executable handoff is

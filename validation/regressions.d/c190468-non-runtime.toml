@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["c190468", "c02b248"]
+points = []
+checks = []
+reason = "These commits only record the Profile 5 correction's current validation evidence; they do not change runtime behavior."
+ignore = true

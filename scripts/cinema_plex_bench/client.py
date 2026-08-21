@@ -201,6 +201,12 @@ class FfmpegClient:
                 process,
                 grace_seconds=max(0, min(0.25, deadline - time.monotonic())),
             )
+            # The direct child can exit after spawning a descendant that still
+            # owns the inherited stdout/stderr descriptors. The process has a
+            # private session, so close that group before waiting on reader EOF;
+            # otherwise four bounded joins serialize into a half-second leak.
+            if progress_reader.is_alive() or stderr_reader.is_alive():
+                self._signal_process_group(process, signal.SIGTERM)
             progress_reader.join(timeout=0.05)
             stderr_reader.join(timeout=0.05)
             if progress_reader.is_alive() or stderr_reader.is_alive():

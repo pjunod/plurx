@@ -171,9 +171,9 @@ tier instead of parallelizing the gate away.
 
 [`validation/ci_scope.py`](../validation/ci_scope.py) treats a non-empty diff as
 documentation-only when every path is Markdown, documentation content,
-license/notice material, or `validation/regressions.toml`. The last carve-out
-is safe because that file is read only by the history audit that always runs in
-T0; it cannot select or suppress a runtime suite. Selector code and
+license/notice material, or `validation/regressions.d/**`. The last carve-out
+is safe because those entries are read only by the history audit that always
+runs in T0; they cannot select or suppress a runtime suite. Selector code and
 `validation/points.toml` remain executable changes. The result disables Rust,
 browser, Apple, Android, cross-target, and container surfaces. An empty diff,
 unknown diff, push, or tag does not earn the shortcut.
@@ -227,8 +227,8 @@ Observable CI acceptance:
   gate;
 - a mixed `docs/**` plus `crates/**` change does not use the docs-only lane;
 - the literal PR #67 shape—its three documentation files plus
-  `validation/regressions.toml`—does use the lane, while replacing the mapping
-  file with `validation/points.toml` does not;
+  a `validation/regressions.d/**` fragment—does use the lane, while replacing
+  the mapping fragment with `validation/points.toml` does not;
 - a mixed docs-and-code PR still selects `docs-contract` for its docs paths;
 - every inapplicable job is `skipped`, while `PR validation gate` is `success`.
 
@@ -376,7 +376,7 @@ suites even though the PR no longer qualifies for the docs-only lane.
 ### 7.3 Keep docs-only classification narrow
 
 The shortcut is valid for `docs/**`, Markdown, license/notice material, and
-`validation/regressions.toml`. The mapping carve-out is narrow: only the
+`validation/regressions.d/**`. The mapping carve-out is narrow: only the
 always-run history audit consumes it, so it cannot suppress runtime evidence.
 These are deliberately not docs-only:
 
@@ -389,8 +389,9 @@ These are deliberately not docs-only:
 Acceptance: table-driven tests cover every allowed and rejected path family,
 including deletions, renames, and mixed diffs. The literal PR #67 set—
 `docs/OFFLINE-VIEWING-PLAN.md`, `docs/OFFLINE-VIEWING-REVIEW.md`,
-`docs/STATUS.html`, and `validation/regressions.toml`—must be docs-only;
-replacing the mapping file with `validation/points.toml` must not be.
+`docs/STATUS.html`, and a `validation/regressions.d/**` fragment—must be
+docs-only; replacing the mapping fragment with `validation/points.toml` must
+not be.
 
 ## 8. Milestone 4 — measure reuse before enforcing it
 

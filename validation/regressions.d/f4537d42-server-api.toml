@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["f4537d42"]
+points = ["server.api", "playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-layout"]
+reason = "The server HTTP suite refuses missing media and the browser sweep captures the corresponding disabled playback state."

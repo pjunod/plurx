@@ -28,6 +28,8 @@ mod hiqlite_durable;
 mod hiqlite_import;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_reading;
 
 pub mod replicated;
 
@@ -35,7 +37,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
-    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};
@@ -48,8 +51,8 @@ use crate::domain::{
     MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
     NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
     OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
-    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, RecentItem, TraktAuth,
-    User, WatchRollup, WatchState,
+    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingState,
+    ReadingStateWrite, RecentItem, TraktAuth, User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -771,6 +774,46 @@ pub trait WatchStore: Send + Sync + 'static {
     ) -> Result<(), StoreError>;
 }
 
+/// Per-user text-publication state. It is separate from [`WatchStore`]
+/// because a reflowable locator is not timed playback and completion is an
+/// explicit reader action rather than a 95% threshold.
+#[async_trait]
+pub trait ReadingStore: Send + Sync + 'static {
+    /// Read the row for one edition, including a stale revision retained for
+    /// diagnosis. The HTTP boundary compares its revision to the current
+    /// file before offering a resume action.
+    async fn reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Newest state whose snapshotted revision still matches the current file.
+    /// Item detail uses this one query instead of looking up every edition.
+    async fn current_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Persist a locator. A dated offline write older than the durable row
+    /// returns the winner without rewinding it; an undated online write uses
+    /// the server clock and is authoritative now. A different file revision
+    /// begins a fresh ordering epoch because the previous locator is stale.
+    async fn put_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        state: &ReadingStateWrite,
+    ) -> Result<ReadingState, StoreError>;
+    /// Clear one edition's progress. Idempotent so Start over can be retried.
+    async fn delete_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
+    ) -> Result<(), StoreError>;
+}
+
 /// Trakt account links and the identity join sync needs.
 #[async_trait]
 pub trait TraktStore: Send + Sync + 'static {
@@ -1239,6 +1282,7 @@ pub trait Store:
     + LibraryStore
     + MediaStore
     + WatchStore
+    + ReadingStore
     + TraktStore
     + WatchedOutboxStore
     + TranscodeCacheStore
@@ -1258,6 +1302,7 @@ impl<T> Store for T where
         + LibraryStore
         + MediaStore
         + WatchStore
+        + ReadingStore
         + TraktStore
         + WatchedOutboxStore
         + TranscodeCacheStore

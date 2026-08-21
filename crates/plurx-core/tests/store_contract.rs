@@ -25,26 +25,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
-use hiqlite::{Client, Node, NodeConfig};
+use hiqlite::{Client, Node, NodeConfig, Row};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::{
     connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
     SelectedBackend, ACTIVATED_SOURCE_FILENAME, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
+    HIQLITE_WAL_SIZE_BYTES, HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
 };
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
     NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, TraktAuth,
+    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingStateWrite,
+    TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, TraktStore, UserStore,
-    WatchStore,
+    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
+    SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -61,6 +64,20 @@ const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
 
 #[cfg(feature = "hiqlite-store")]
 static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(feature = "hiqlite-store")]
+struct I64Value {
+    value: i64,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl From<&mut Row<'_>> for I64Value {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            value: row.get("value"),
+        }
+    }
+}
 
 const SETTINGS_METHODS: &[&str] = &[
     "ping",
@@ -151,6 +168,12 @@ const WATCH_METHODS: &[&str] = &[
     "continue_watching",
     "next_up",
     "apply_remote_watch",
+];
+const READING_METHODS: &[&str] = &[
+    "reading_state",
+    "current_reading_state",
+    "put_reading_state",
+    "delete_reading_state",
 ];
 const TRAKT_METHODS: &[&str] = &[
     "get_trakt_auth",
@@ -294,6 +317,101 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
 }
 
 #[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect migration client");
+    let telemetry = cluster._root.path().join("schema-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .validation_reset_contract_state()
+        .await
+        .expect("empty migration fixture");
+    current
+        .put_setting("migration.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    let results = client
+        .txn([
+            (
+                "DROP INDEX IF EXISTS idx_reading_updated",
+                hiqlite::params!(),
+            ),
+            ("DROP TABLE IF EXISTS reading_state", hiqlite::params!()),
+            (
+                "UPDATE cluster_meta SET schema_version = $1 WHERE singleton = 1",
+                hiqlite::params!(AUTH_SCHEMA_MIGRATION_SOURCE),
+            ),
+        ])
+        .await
+        .expect("construct exact v5 fixture");
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v5 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 5 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v5 to v6 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.proof")
+            .await
+            .expect("read migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('reading_state')",
+            9,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_reading_updated'",
+            1,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ContractNodeSpec {
     id: u64,
@@ -429,11 +547,7 @@ async fn hiqlite_contract_node_process() {
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        // Production tuning, duplicated from `crates/plurx-core/src/cluster/migration.rs`
-        // (`start_one_voter`). The import chunk bound is sized against this WAL
-        // payload capacity, so a retune there must be mirrored here or the
-        // retained large-probe regression stops testing the production bound.
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     })
@@ -513,6 +627,11 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              INSERT INTO watch_state
                  (user_id, item_id, position_ms, duration_ms, watched, updated_at)
                  VALUES (7, 10, 120000, 3600000, 0, 117);
+             INSERT INTO reading_state
+                 (user_id, item_id, file_id, file_size, file_mtime, locator_json,
+                  progression_millis, completed, updated_at)
+                 VALUES (7, 10, 30, 4096, 115,
+                         '{\"version\":1,\"href\":\"chapter-2.xhtml\"}', 250000, 0, 118);
              INSERT INTO watched_outbox
                  (id, payload, attempts, last_error, status, next_at, created_at,
                   updated_at, claim_until)
@@ -583,18 +702,14 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     path
 }
 
-/// Largest Raft entry the production WAL accepts, derived the same way
-/// `crates/plurx-core/src/store/hiqlite_import.rs` derives its import bounds:
-/// the `wal_size` above, less the 34 bytes `hiqlite-wal` reserves per segment.
-/// Retiring this third copy of the tuning into one exported constant is #304.
-#[cfg(feature = "hiqlite-store")]
-const CONTRACT_WAL_USABLE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024 - 34;
-
 /// The row-count chunk bound #279 shipped and #282 replaced. Present only so
 /// the fixtures below can assert they sit *past* it: a fixture the old bound
 /// would also have carried proves nothing about a byte bound.
 #[cfg(feature = "hiqlite-store")]
 const SUPERSEDED_ROW_CHUNK_BOUND: usize = 16;
+/// Usable payload measured under the former 2 MiB production tuning.
+#[cfg(feature = "hiqlite-store")]
+const INCIDENT_WAL_USABLE_PAYLOAD_BYTES: usize = 2_097_118;
 
 /// The retained #279 band: adjacent rows with full-size probe documents.
 #[cfg(feature = "hiqlite-store")]
@@ -604,25 +719,26 @@ const LARGE_PROBE_PADDING_BYTES: usize = 48 * 1024;
 
 /// The band a row count cannot bound, and the reason this contract is about
 /// bytes: [`SUPERSEDED_ROW_CHUNK_BOUND`] adjacent rows of this size serialize
-/// past [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`], which is #290's production
-/// panic. Importing them proves the transaction builder split on bytes.
+/// past [`INCIDENT_WAL_USABLE_PAYLOAD_BYTES`], which is #290's production
+/// panic. Importing them proves the builder still splits the incident shape on
+/// bytes after the WAL is raised.
 #[cfg(feature = "hiqlite-store")]
 const OVERSIZED_PROBE_FILE_COUNT: i64 = 18;
 #[cfg(feature = "hiqlite-store")]
 const OVERSIZED_PROBE_PADDING_BYTES: usize = 144 * 1024;
 
 /// The importer's single-row ceiling, mirroring its derivation from
-/// [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`] less its encoding reserve and
+/// [`HIQLITE_WAL_USABLE_PAYLOAD_BYTES`] less its encoding reserve and
 /// transaction envelope. A row above this cannot be submitted in any
 /// transaction, so import refuses the backup.
 #[cfg(feature = "hiqlite-store")]
-const CONTRACT_IMPORT_MAX_ROW_BYTES: usize = CONTRACT_WAL_USABLE_PAYLOAD_BYTES - 64 * 1024 - 256;
+const CONTRACT_IMPORT_MAX_ROW_BYTES: usize = HIQLITE_WAL_USABLE_PAYLOAD_BYTES - 64 * 1024 - 256;
 
 /// A single probe document larger than the whole WAL payload capacity, so it is
 /// unimportable under any bound rather than merely past the reserve. Import must
 /// refuse it instead of handing it to the WAL writer.
 #[cfg(feature = "hiqlite-store")]
-const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = 2_100 * 1024;
+const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = HIQLITE_WAL_USABLE_PAYLOAD_BYTES + 1024;
 
 /// The premises the probe fixtures rest on, checked where they are declared so
 /// a later size tweak cannot quietly turn either regression into a test of
@@ -631,22 +747,22 @@ const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = 2_100 * 1024;
 const _: () = {
     assert!(
         OVERSIZED_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND
-            > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+            > INCIDENT_WAL_USABLE_PAYLOAD_BYTES,
         "the oversized band must exceed what the superseded row bound would have submitted, \
          or the regression re-proves the row count instead of the byte bound"
     );
     assert!(
-        LARGE_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        LARGE_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND < HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the retained #279 band must stay inside the superseded bound, so the two bands \
          test different things"
     );
     assert!(
-        UNIMPORTABLE_PROBE_PADDING_BYTES > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        UNIMPORTABLE_PROBE_PADDING_BYTES > HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the refused row must exceed the WAL itself, so the refusal is unarguable rather \
          than an artefact of the reserve held back from it"
     );
     assert!(
-        CONTRACT_IMPORT_MAX_ROW_BYTES < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        CONTRACT_IMPORT_MAX_ROW_BYTES < HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the single-row ceiling must sit under the capacity it is derived from"
     );
 };
@@ -778,6 +894,7 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE library_roots;
              DROP TABLE playback_events;
              DROP TABLE network_priors;
+             DROP TABLE reading_state;
              ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
@@ -831,8 +948,18 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
         .expect("import populated v14 backup");
     assert_eq!(report.source_schema_version, 14);
     assert_eq!(report.backup_sha256, prepared.backup_sha256);
-    assert_eq!(report.tables.len(), 17);
+    assert_eq!(report.tables.len(), 18);
     assert_eq!(report.search_rows, 2);
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "reading_state")
+            .expect("reading-state digest")
+            .row_count,
+        0,
+        "a v14 source predates reading state"
+    );
     assert!(
         report
             .tables
@@ -957,6 +1084,23 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
         .await
         .expect("import populated current backup");
     assert_eq!(report.search_rows, 2);
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "reading_state")
+            .expect("reading-state digest")
+            .row_count,
+        1
+    );
+    let reading = store
+        .reading_state(7, 10, 30)
+        .await
+        .expect("read imported reading state")
+        .expect("imported reading state");
+    assert_eq!(reading.progression_millis, 250_000);
+    assert_eq!(reading.file_size, 4_096);
+    assert_eq!(reading.file_mtime, 115);
     assert_eq!(
         store
             .offline_package_for_user("fixture-package", 7)
@@ -1627,7 +1771,7 @@ async fn an_ambiguous_active_target_refuses_rather_than_reverting_to_sqlite() {
             cluster_id: prepared.cluster_id.clone(),
             source_backup_sha256: prepared.backup_sha256.clone(),
             source_schema_version: prepared.schema_version,
-            replicated_schema_version: 5,
+            replicated_schema_version: 6,
             imported_rows: 1,
             table_hashes: Vec::new(),
         }
@@ -1915,6 +2059,7 @@ fn contract_inventory_matches_every_store_method() {
         LIBRARY_METHODS,
         MEDIA_METHODS,
         WATCH_METHODS,
+        READING_METHODS,
         TRAKT_METHODS,
         API_KEY_METHODS,
         OUTBOX_METHODS,
@@ -1928,7 +2073,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 138, "review the Store method count");
+    assert_eq!(declared.len(), 142, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -2883,6 +3028,172 @@ async fn media_contract_runs_through_dyn_store() {
                 .is_some(),
             "backend {backend}"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reading_state_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let user = store
+            .create_user("reading-contract", "hash", false)
+            .await
+            .expect("user");
+        let books = store
+            .create_library(&NewLibrary {
+                name: "Reading Contract Books".into(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/reading/books")],
+                anime: false,
+            })
+            .await
+            .expect("books");
+        let book = store
+            .insert_item(&NewItem {
+                library_id: books.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "The Reading Contract".into(),
+                year: Some(2026),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let file_id = store
+            .upsert_file(
+                book,
+                "/reading/books/contract.epub",
+                4_096,
+                100,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("book file");
+
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("raw reading state")
+            .is_none());
+        assert!(store
+            .current_reading_state(user.id, book)
+            .await
+            .expect("current reading state")
+            .is_none());
+
+        let newer = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_096,
+                    file_mtime: 100,
+                    locator_json: r#"{"version":1,"href":"chapter-3.xhtml"}"#.into(),
+                    progression_millis: 600_000,
+                    completed: false,
+                    recorded_at: Some(200),
+                },
+            )
+            .await
+            .expect("newer offline state");
+        assert_eq!(newer.progression_millis, 600_000);
+
+        let stale = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_096,
+                    file_mtime: 100,
+                    locator_json: r#"{"version":1,"href":"chapter-1.xhtml"}"#.into(),
+                    progression_millis: 100_000,
+                    completed: false,
+                    recorded_at: Some(100),
+                },
+            )
+            .await
+            .expect("stale offline state returns winner");
+        assert_eq!(stale, newer, "backend {backend} rewound newer state");
+        assert_eq!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("current state")
+                .expect("stored state"),
+            newer
+        );
+
+        let rescanned_file_id = store
+            .upsert_file(
+                book,
+                "/reading/books/contract.epub",
+                4_100,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("rescan book file");
+        assert_eq!(rescanned_file_id, file_id);
+        assert!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("stale revision lookup")
+                .is_none(),
+            "backend {backend} exposed state for an obsolete file revision"
+        );
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("raw stale state remains")
+            .is_some());
+
+        let current = store
+            .put_reading_state(
+                user.id,
+                book,
+                &ReadingStateWrite {
+                    file_id,
+                    file_size: 4_100,
+                    file_mtime: 101,
+                    locator_json: r#"{"version":1,"href":"chapter-4.xhtml"}"#.into(),
+                    progression_millis: 950_000,
+                    completed: true,
+                    // A replaced edition starts a new ordering epoch. Its
+                    // first offline write must not lose to a timestamp that
+                    // belongs to the now-stale revision.
+                    recorded_at: Some(50),
+                },
+            )
+            .await
+            .expect("online revision state");
+        assert!(current.completed);
+        assert_eq!(current.updated_at, 50);
+        assert_eq!(
+            store
+                .current_reading_state(user.id, book)
+                .await
+                .expect("current revision lookup")
+                .expect("current revision state"),
+            current
+        );
+
+        store
+            .delete_reading_state(user.id, book, file_id)
+            .await
+            .expect("delete reading state");
+        store
+            .delete_reading_state(user.id, book, file_id)
+            .await
+            .expect("idempotent delete");
+        assert!(store
+            .reading_state(user.id, book, file_id)
+            .await
+            .expect("deleted state")
+            .is_none());
     })
     .await;
 }

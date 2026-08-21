@@ -2,6 +2,7 @@ package tv.plurx.app.player
 
 import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.ReopenReason
 import tv.plurx.app.data.SubTrack
 import java.util.Locale
 
@@ -209,6 +210,18 @@ internal fun sessionHeight(
 }
 
 /**
+ * Whether the session's height is a promise from an Auto viewer rather than a
+ * manual quality pick. An Auto viewer that sends a promise-height — a burn, or
+ * Quality = Original — must carry this flag, or the server reads the posted
+ * height as a sticky manual pick and can never step that session down.
+ * See docs/ADAPTIVE-QUALITY.md §"Native stall-reopen server boundary".
+ */
+internal fun qualityAuto(
+    quality: PlaybackQuality,
+    delivery: SubtitleDelivery,
+): Boolean = quality == PlaybackQuality.Auto && delivery == SubtitleDelivery.Burn
+
+/**
  * The exact body each routing arm posts to `/files/{id}/hls/sessions`.
  *
  * [copyableVideo] is whether the server's verdict permits copying the video
@@ -230,6 +243,8 @@ internal fun subtitleSessionBody(
     audioOffsetMs: Long,
     quality: PlaybackQuality,
     sourceHeight: Int?,
+    previousSessionId: String? = null,
+    reopenReason: ReopenReason? = null,
 ): CreateSessionReq {
     val copy = copyableVideo && delivery != SubtitleDelivery.Burn
     val native = delivery == SubtitleDelivery.NativeSession
@@ -248,6 +263,9 @@ internal fun subtitleSessionBody(
         copy = true.takeIf { copy },
         aac = aac.takeIf { copy },
         preserve_dolby_vision = true.takeIf { copy && preserveDolbyVision },
+        previous_session_id = previousSessionId,
+        reopen_reason = reopenReason,
+        quality_auto = true.takeIf { qualityAuto(quality, delivery) },
     )
 }
 

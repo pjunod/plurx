@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["89c86ef"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained retired-session regression pins that an in-flight playlist ignores a producer exit after teardown removes the session; reverting only the production correction marks routine teardown failed and returns an error."
