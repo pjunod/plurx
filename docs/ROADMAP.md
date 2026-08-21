@@ -118,6 +118,20 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   and active-reader eviction protection are shipped. Cached TTFF and seek
   measurements remain operational evidence, not unfinished implementation.
 
+## Ebook reader — consumption inside Cinema (IN PROGRESS)
+
+The executable plan is [EBOOK-READER-PLAN.md](EBOOK-READER-PLAN.md). Cinema
+owns the read/resume/offline loop while Curator keeps acquisition and Runner
+keeps transfer.
+
+- ✅ **M0 complete 2026-08-20:** Curator book imports now trigger an exact-path
+  Cinema Books scan and retain the returned item identity.
+- ✅ **M1 complete 2026-08-20:** revision-bound per-user locators, SQLite and
+  Hiqlite parity, authenticated reading-state routes, stale-write protection,
+  and Apple/Android API models are shipped.
+- 📝 **M2 next:** prove the hostile-publication boundary, then ship the web
+  EPUB reader and Read/Resume experience without changing A/V playback.
+
 ## Phase 4 — HA for real (IN PROGRESS)
 
 The executable handoff is

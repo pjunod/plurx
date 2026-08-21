@@ -770,10 +770,22 @@ the seven-day expiry — the exact stranded state this section calls an
 activation blocker. So the removal re-reads the node's work after applying a
 plan and resolves again, for a bounded number of rounds; a node admitting new
 downloads faster than they can be resolved gets a refusal naming that reason
-rather than an unbounded wait. Anything created inside the last narrow window,
-between the final re-read and the committed change, is failed `node_removed`
-once the node is out of the roster: it was never probed, re-homing it would
-guess at a mount, and the membership change can no longer be refused.
+rather than an unbounded wait.
+
+The durable INSERT in `create_offline_package` now includes an explicit
+`AND NOT EXISTS (SELECT 1 FROM cluster_nodes WHERE node_id = $node AND
+removed_at IS NOT NULL)` clause, so a removed-but-running node that keeps
+receiving download requests is refused at the write path before any admission
+or quota step. The response is `OfflineCreateOutcome::NodeIsTombstone`, which
+maps to HTTP 503 Service Unavailable with the stable `node_removed` code — the same code
+packages from a clean removal use. A package never enters the queue or holds a
+reservation against a tombstone. The single-node SQLite path has no
+`cluster_nodes` table and never returns this variant.
+
+Anything created inside the last narrow window, between the final re-read and
+the committed change, is still failed `node_removed` once the node is out of
+the roster: it was never probed, re-homing it would guess at a mount, and the
+membership change can no longer be refused.
 
 The refusal survives, narrowed to what the policy genuinely cannot resolve: a
 download in flight from that node right now. Cutting it off is neither allowed
