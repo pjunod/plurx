@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["73e4c890"]
+points = []
+checks = []
+reason = "This commit removes one blank line from the cluster-check request handler so rustfmt passes; it changes no runtime behavior, so no regression needs pinning."
+ignore = true
