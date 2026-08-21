@@ -418,12 +418,19 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn('GITHUB_STEP_SUMMARY', action)
         self.assertIn('if [ "$got" != "$WANT_MAJOR" ]', action)
 
+        workflow_paths = sorted(
+            path.relative_to(ROOT).as_posix()
+            for pattern in ("*.yml", "*.yaml")
+            for path in (ROOT / ".github/workflows").glob(pattern)
+        )
+        # Discover workflows rather than maintaining an allowlist: a newly
+        # added workflow must not be able to reintroduce a direct ffmpeg install
+        # merely because this test predates it. Keep one formerly unlisted file
+        # explicit as regression evidence for that failure mode.
+        self.assertIn(".github/workflows/fix-evidence.yml", workflow_paths)
+
         majors = set()
-        for path in (
-            ".github/workflows/ci.yml",
-            ".github/workflows/release-readiness.yml",
-            ".github/workflows/validation-nightly.yml",
-        ):
+        for path in workflow_paths:
             with self.subTest(path=path):
                 self.assertNotRegex(
                     read(path),
