@@ -49,15 +49,6 @@ class CapsPolicyTest {
     }
 
     @Test
-    fun outputCodecCeilingIsReadFromTheWireCaps() {
-        val caps = mapOf("vmaxheight" to "h264:2160,hevc:1080,av1:bad,h264:1080")
-        assertEquals(2160, codecHeightCeiling(caps, "H264"))
-        assertEquals(1080, codecHeightCeiling(caps, "hevc"))
-        assertEquals(null, codecHeightCeiling(caps, "av1"))
-        assertEquals(null, codecHeightCeiling(emptyMap(), "h264"))
-    }
-
-    @Test
     fun capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed() {
         assertEquals(
             "display-no-dv",

@@ -321,30 +321,6 @@ class SubtitlePolicyTest {
     }
 
     @Test
-    fun autoTranscodeCarriesAReceiverCeilingWithoutPickingTheRung() {
-        val body = subtitleSessionBody(
-            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
-            delivery = SubtitleDelivery.Plan, subtitleIndex = null,
-            copyableVideo = false, aac = false, preserveDolbyVision = false,
-            audioIndex = 0, audioOffsetMs = 0,
-            quality = PlaybackQuality.Auto, sourceHeight = 2160,
-            maxTranscodeHeight = 2160,
-        )
-        assertNull("the server still owns Auto", body.height)
-        assertEquals(2160, body.max_height)
-
-        val copy = subtitleSessionBody(
-            playbackId = "pb", requestId = "copy", startSeconds = 4.0,
-            delivery = SubtitleDelivery.NativeSession, subtitleIndex = 1,
-            copyableVideo = true, aac = false, preserveDolbyVision = false,
-            audioIndex = 0, audioOffsetMs = 0,
-            quality = PlaybackQuality.Auto, sourceHeight = 2160,
-            maxTranscodeHeight = 1080,
-        )
-        assertNull("a copy has no output decoder rung", copy.max_height)
-    }
-
-    @Test
     fun overlayCarriesNoSubtitleSessionFields() {
         val body = subtitleSessionBody(
             playbackId = "pb", requestId = "rq", startSeconds = 4.0,

@@ -97,22 +97,6 @@ internal fun videoCodecCaps(limits: Iterable<VideoDecoderLimit>): VideoCodecCaps
     return VideoCodecCaps(ordered, ordered.associateWith(maxima::getValue))
 }
 
-/** Read one normalized `vmaxheight` entry back from the capability map. */
-internal fun codecHeightCeiling(caps: Map<String, String>, codec: String): Int? {
-    val wanted = codec.trim().lowercase()
-    return caps["vmaxheight"]
-        ?.split(',')
-        ?.asSequence()
-        ?.mapNotNull { entry ->
-            val parts = entry.split(':', limit = 2)
-            if (parts.size != 2 || parts[0].trim().lowercase() != wanted) {
-                return@mapNotNull null
-            }
-            parts[1].trim().toIntOrNull()?.takeIf { it > 0 }
-        }
-        ?.maxOrNull()
-}
-
 /**
  * Dolby Vision profile numbers this client is willing to claim, from the raw
  * profile constants a `video/dolby-vision` decoder advertises.

@@ -601,12 +601,6 @@ data class CreateSessionReq(
     /** Fresh per attempt: a replayed create recovers the same session. */
     val request_id: String? = null,
     val height: Int? = null,
-    /**
-     * Proven ceiling of the decoder that will receive a re-encoded stream.
-     * Unlike [height], this does not pick a rung: server Auto and its network
-     * prior still choose freely below the ceiling.
-     */
-    val max_height: Int? = null,
     val start: Double? = null,
     val audio: Int? = null,
     /**
