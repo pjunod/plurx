@@ -110,6 +110,30 @@ class StallBudgetTest {
     }
 
     @Test
+    fun liveSessionSeekResetsExhaustedBudgetBeforeReopen() {
+        val budget = StallReopenBudget()
+        budget.seed(240)
+        repeat(3) { budget.record(240) }
+        val guard = ControllerStallGuard(budget)
+        val staleStall = guard.beginRequest()
+        var reopened = false
+
+        // Controller.seekTo's non-VOD HLS branch routes through this helper
+        // before openSession. The reset and invalidation therefore happen
+        // exactly once before the replacement request starts.
+        guard.liveSessionSeek { reopened = true }
+        val replacement = guard.beginRequest()
+
+        assertTrue(reopened)
+        assertTrue(budget.canReopen())
+        assertEquals(0, budget.nonDowngradeCount)
+        assertNull(budget.predecessorHeight)
+        assertEquals(1, budget.resetCount)
+        assertFalse(guard.isCurrent(staleStall))
+        assertTrue(guard.isCurrent(replacement))
+    }
+
+    @Test
     fun inPlaceSubtitleChangeResetsBudgetAndCannotReuseAStallRequestToken() {
         val budget = StallReopenBudget()
         val guard = ControllerStallGuard(budget)

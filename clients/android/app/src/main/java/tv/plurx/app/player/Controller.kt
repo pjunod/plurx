@@ -508,7 +508,10 @@ class Controller(
                 beginPlaybackAttempt("seek")
                 stallGuard.vodSeek { player.seekTo(t) }
             }
-            else -> openSession(t, beginPlaybackAttempt("seek"))
+            else -> {
+                val attempt = beginPlaybackAttempt("seek")
+                stallGuard.liveSessionSeek { openSession(t, attempt) }
+            }
         }
     }
 

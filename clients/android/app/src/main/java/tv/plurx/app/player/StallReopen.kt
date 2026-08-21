@@ -93,6 +93,11 @@ internal class ControllerStallGuard(
         action()
     }
 
+    fun liveSessionSeek(action: () -> Unit) {
+        invalidateForUserAction()
+        action()
+    }
+
     fun inPlaceSubtitleChange(action: () -> Unit) {
         invalidateForUserAction()
         action()
