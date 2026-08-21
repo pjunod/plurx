@@ -138,8 +138,10 @@ keeps transfer.
   navigation guards. Simulator/JVM plus real-browser contracts prove profile
   isolation, semantic headings, close flushing, and the same paragraph after
   font and orientation changes; tvOS and Google TV expose no reader action.
-- 📝 **M4 next:** add profile-scoped, app-private EPUB downloads and reconcile
-  the newest offline locator when the server returns.
+- 🚧 **M4 in progress:** iPhone/iPad now keep an atomically published,
+  profile/revision-scoped original EPUB, open it with the server stopped, and
+  reconcile the newest offline locator when the server returns. Android mobile
+  is the remaining client; televisions stay deliberately excluded.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

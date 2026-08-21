@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -126,6 +127,135 @@ def state(host, book, file, token=None):
         f"/items/{book['id']}/reading-state?file_id={file['id']}",
         token or host.token,
     )
+
+
+def run_offline_shell(browser, epub, opened, locator):
+    """Prove the token-free shell restores and flushes the online locator.
+
+    Native WebKit supplies the custom-scheme transport and loader-level remote
+    block. This browser model supplies the same-origin files with the same CSP,
+    then force-recreates the entire context from the emitted local snapshot.
+    """
+    origin = "https://offline.cinema.invalid"
+    assets = {
+        "/offline-reader.html": (ROOT / "crates/plurxd/src/web/offline-reader.html", "text/html"),
+        "/reader.js": (ROOT / "crates/plurxd/src/web/reader.js", "text/javascript"),
+        "/offline-reader.js": (ROOT / "crates/plurxd/src/web/offline-reader.js", "text/javascript"),
+    }
+    types = {
+        urllib.parse.unquote(link["href"].split("#", 1)[0]): link["type"]
+        for link in opened["publication"]["readingOrder"] + opened["publication"]["resources"]
+    }
+    remote_attempts = []
+
+    def make_context():
+        context = browser.new_context(viewport={"width": 390, "height": 844})
+        context.add_init_script("window.__cinemaOfflineEvents=[]")
+
+        def route_request(route):
+            parsed = urllib.parse.urlparse(route.request.url)
+            if f"{parsed.scheme}://{parsed.netloc}" != origin:
+                remote_attempts.append(route.request.url)
+                route.abort()
+                return
+            if parsed.path in assets:
+                source, media_type = assets[parsed.path]
+                headers = {"content-type": media_type}
+                if parsed.path == "/offline-reader.html":
+                    headers["content-security-policy"] = (
+                        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; "
+                        "frame-src 'self'; connect-src 'self';"
+                    )
+                route.fulfill(status=200, headers=headers, body=source.read_bytes())
+                return
+            prefix = "/publication/"
+            if parsed.path.startswith(prefix):
+                name = urllib.parse.unquote(parsed.path[len(prefix):])
+                try:
+                    with zipfile.ZipFile(epub) as archive:
+                        body = archive.read(name)
+                except KeyError:
+                    route.fulfill(status=404, body=b"missing")
+                    return
+                route.fulfill(status=200, headers={
+                    "content-type": types.get(name, "application/octet-stream"),
+                    "content-security-policy": (
+                        "default-src 'none'; img-src 'self' data:; "
+                        "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
+                        "media-src 'self' data: blob:;"
+                    ),
+                }, body=body)
+                return
+            route.fulfill(status=404, body=b"missing")
+
+        context.route("**/*", route_request)
+        return context
+
+    payload = {
+        "publication": opened["publication"],
+        "limits": opened["limits"],
+        "resourceBase": origin + "/publication/",
+        "locator": locator,
+        "progression": locator.get("locations", {}).get("totalProgression", 0),
+        "completed": False,
+        "preferences": {
+            "font": "publisher", "fontSize": 100, "lineHeight": 1.55,
+            "margin": 7, "theme": "light", "flow": "scrolled",
+        },
+    }
+    first = make_context()
+    page = first.new_page()
+    page.goto(origin + "/offline-reader.html", wait_until="networkidle")
+    assert page.evaluate("localStorage.getItem('plurx_token')") is None
+    page.evaluate("payload=>startOfflineReader(payload)", payload)
+    page.locator("#loading").wait_for(state="hidden")
+    frame = page.frame_locator("#page")
+    frame.locator("#paragraph-42").wait_for()
+    assert page.evaluate("window.__cinemaOfflineEvents.some(event=>event.event==='ready')")
+    page.locator("#search").click()
+    page.locator("#search-query").fill("celestial needle")
+    page.locator("#search-form button").click()
+    page.locator("#search-results button").wait_for()
+    page.locator("#search-results button").click()
+    frame.locator("#search-destination").wait_for()
+    page.locator("#toc").click()
+    page.get_by_role("button", name="The stable paragraph", exact=True).click()
+    frame.locator("#paragraph-42").wait_for()
+    page.locator("#settings").click()
+    page.locator("#font").select_option("accessible")
+    page.locator("#font-size").evaluate(
+        "el=>{el.value='155';el.dispatchEvent(new Event('change',{bubbles:true}))}"
+    )
+    page.set_viewport_size({"width": 844, "height": 390})
+    page.wait_for_timeout(400)
+    frame.locator("#paragraph-42").wait_for()
+    page.locator("[data-close='settings-dialog']").click()
+    page.locator("#close").click()
+    page.wait_for_function(
+        "window.__cinemaOfflineEvents.some(event=>event.event==='close')"
+    )
+    snapshot = page.evaluate(
+        "window.__cinemaOfflineEvents.filter(event=>event.event==='progress').at(-1)"
+    )
+    assert snapshot and "paragraph-42" in snapshot["locator"]["href"], snapshot
+    first.close()
+
+    # Force-quit/relaunch model: a brand-new browser context receives only the
+    # app-private snapshot and must restore without the Cinema server/token.
+    second = make_context()
+    reopened = second.new_page()
+    reopened.goto(origin + "/offline-reader.html", wait_until="networkidle")
+    payload.update({
+        "locator": snapshot["locator"],
+        "progression": snapshot["progression"],
+        "preferences": snapshot["preferences"],
+    })
+    reopened.evaluate("payload=>startOfflineReader(payload)", payload)
+    reopened.locator("#loading").wait_for(state="hidden")
+    reopened.frame_locator("#page").locator("#paragraph-42").wait_for()
+    assert reopened.evaluate("localStorage.getItem('plurx_token')") is None
+    second.close()
+    assert not remote_attempts, f"offline publication escaped to network: {remote_attempts}"
 
 
 def run_browser(host, book, file, epub, probe, other_token):
@@ -295,6 +425,19 @@ def run_browser(host, book, file, epub, probe, other_token):
         assert "paragraph-42" in admin_state["locator"]["href"], admin_state
         native.close()
 
+        opened = api(host.base_url, f"/files/{file['id']}/publication", host.token, "POST")
+        try:
+            run_offline_shell(
+                browser, epub, opened, admin_state["locator"],
+            )
+        finally:
+            api(
+                host.base_url,
+                f"/publication/{opened['session_id']}",
+                host.token,
+                "DELETE",
+            )
+
         # Reading state belongs to the authenticated Cinema profile, not the
         # browser container or device. A second user's native handoff starts at
         # chapter one even though the admin just closed at paragraph 42.
@@ -385,7 +528,7 @@ def main(argv):
             "username": "reader-other", "password": "reader-other-password",
         })["token"]
         run_browser(host, book, file, epub, probe, other_token)
-        print("reader-browser: browser/native handoff, profile isolation, restore, style, TOC, search, finish, stale revision, and hostile-content checks passed")
+        print("reader-browser: online/native/offline handoff, profile isolation, force-relaunch restore, style, TOC, search, finish, stale revision, and hostile-content checks passed")
         return 0
     except (Fail, AssertionError) as error:
         print(f"reader-browser: {error}", file=sys.stderr)

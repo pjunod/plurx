@@ -141,6 +141,16 @@ only and accepts a small allowlist of lifecycle events—publication code has no
 native method that returns credentials. Dismissal destroys the reader,
 releases its publication session, and clears the JavaScript authority.
 
+Apple's offline EPUB surface removes network authority entirely. It stores the
+authenticated original and server-bounded declared resources under the
+profile/revision catalogue, atomically exposes the completed directory, and
+serves it only through `cinema-book://offline/`. A `WKContentRuleList` blocks
+all HTTP(S) resource loads before publisher CSS, images, or markup can reach a
+network; the iframe still omits script, forms, popups, downloads, and top
+navigation. The offline WebView receives a manifest, locator, and presentation
+preferences, never an account bearer. Android must repeat both the private
+resource boundary and remote-load refusal before its M4 action ships.
+
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 
 Passwords, login tokens, API keys, and offline lease capabilities are stored
