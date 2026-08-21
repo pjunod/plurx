@@ -35,10 +35,10 @@ use plurx_core::cluster::migration::{
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, BookMetadataPatch, BookMetadataSource, ItemEdit, ItemKind, ItemSort,
-    LibraryKind, MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
-    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
-    ReadingStateWrite, TraktAuth,
+    scopes, ArtworkAttempt, BookMetadataPatch, BookMetadataSource, CredentialGeneration, ItemEdit,
+    ItemKind, ItemSort, LibraryKind, MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary,
+    NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
+    PlaybackEventQuery, ProbeResult, ReadingStateWrite, TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
@@ -2298,13 +2298,17 @@ async fn playback_telemetry_contract_runs_through_dyn_store() {
 #[tokio::test]
 async fn network_prior_contract_runs_through_dyn_store() {
     for_each_backend(|store, backend| async move {
+        let credential_generation = CredentialGeneration::from(format!(
+            "store-contract-generation-{}",
+            if backend.contains("hiqlite") { 3 } else { 2 }
+        ));
         let key = format!(
             "192.0.{}.0/24",
             if backend.contains("hiqlite") { 3 } else { 2 }
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 71,
+                credential_generation: credential_generation.clone(),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: key.clone(),
                 throughput_kbps: Some(8_000),
@@ -2321,7 +2325,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}: the verdict's expiry stamp is part of the durable contract"
         );
         let loaded = store
-            .network_prior(71, "chrome", &key)
+            .network_prior(credential_generation.as_str(), "chrome", &key)
             .await
             .unwrap_or_else(|error| panic!("{backend}: load prior: {error}"))
             .expect("stored prior");
@@ -2335,7 +2339,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}"
         );
         assert!(store
-            .network_prior(71, "chrome", &key)
+            .network_prior(credential_generation.as_str(), "chrome", &key)
             .await
             .expect("post-prune lookup")
             .is_none());

@@ -2951,10 +2951,16 @@ mod tests {
                 );
                 request
             };
+        let credential_generation_str = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        )
+        .into_inner();
         let prior = || {
             state
                 .store
-                .network_prior(user.id, "safari", "198.51.100.0/24")
+                .network_prior(&credential_generation_str, "safari", "198.51.100.0/24")
         };
 
         let (status, _) = call(&app, report("ttff", 8_000, 1080, None)).await;
@@ -2995,6 +3001,115 @@ mod tests {
         let updated = updated.expect("second observation");
         assert_eq!(updated.sustained_kbps, Some(7_000));
         assert_eq!(updated.worst_rung_height, Some(720));
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_log_stays_bound_to_captured_credential_generation() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        state
+            .store
+            .put_setting(plurx_core::store::keys::PLAYBACK_NETWORK_PRIORS, "1")
+            .await
+            .expect("enable priors");
+        let original = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("original lookup")
+            .expect("original user");
+        let original_generation = plurx_core::domain::CredentialGeneration::derive(
+            original.id,
+            original.created_at,
+            &original.password_hash,
+        );
+
+        const CAPTURE_MESSAGE: &str = "credential-generation-capture-race";
+        let (captured, release) = system::pause_next_client_log_after_capture(CAPTURE_MESSAGE);
+        let mut request = post(
+            "/api/v1/client-log",
+            Some(&token),
+            json!({
+                "event": "ttff",
+                "message": CAPTURE_MESSAGE,
+                "bandwidth": 9_000,
+                "height": 1080
+            }),
+        );
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("198.51.100.88"),
+        );
+        request.headers_mut().insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static(super::test_agents::SAFARI_MACOS_UA),
+        );
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move { call(&app, request).await }
+        });
+        captured
+            .await
+            .expect("request reached post-auth capture point");
+
+        assert!(state
+            .store
+            .delete_user(original.id)
+            .await
+            .expect("delete user"));
+        let replacement_hash =
+            plurx_core::auth::hash_password("replacement-password").expect("replacement hash");
+        let replacement = state
+            .store
+            .create_user("paul", &replacement_hash, true)
+            .await
+            .expect("replacement user");
+        assert_eq!(replacement.id, original.id, "numeric id must be reused");
+        assert_eq!(
+            replacement.created_at, original.created_at,
+            "the regression must cover same-second replacement"
+        );
+        let replacement_generation = plurx_core::domain::CredentialGeneration::derive(
+            replacement.id,
+            replacement.created_at,
+            &replacement.password_hash,
+        );
+        assert_ne!(replacement_generation, original_generation);
+
+        release.send(()).expect("release captured request");
+        let (status, _) = request.await.expect("request task");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for _ in 0..100 {
+            if state
+                .store
+                .network_prior(original_generation.as_str(), "safari", "198.51.100.0/24")
+                .await
+                .expect("old-generation lookup")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .store
+                .network_prior(original_generation.as_str(), "safari", "198.51.100.0/24",)
+                .await
+                .expect("old-generation lookup")
+                .is_some(),
+            "the in-flight event must remain under the authenticated generation"
+        );
+        assert!(
+            state
+                .store
+                .network_prior(replacement_generation.as_str(), "safari", "198.51.100.0/24",)
+                .await
+                .expect("replacement-generation lookup")
+                .is_none(),
+            "the in-flight event must not contaminate the replacement generation"
+        );
     }
 
     #[tokio::test]
@@ -5734,10 +5849,15 @@ mod tests {
             .await
             .expect("admin lookup")
             .expect("admin user");
+        let credential_generation = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        );
         state
             .store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: user.id,
+                credential_generation: credential_generation.clone(),
                 client_class: "apple".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(20_000),
