@@ -61,9 +61,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
 import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.data.ReadingState
 import tv.plurx.app.data.Session
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFactChip
@@ -93,6 +95,7 @@ import tv.plurx.app.ui.theme.Bg
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Outline
 import tv.plurx.app.ui.theme.SurfaceHi
+import tv.plurx.app.data.offline.OfflineBooks
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.needsExplicitResume
 
@@ -108,6 +111,7 @@ fun DetailScreen(
     onPlay: (itemId: Long, fileId: Long, startMs: Long, tracks: PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onBack: () -> Unit,
 ) {
     var refresh by remember(itemId) { mutableIntStateOf(0) }
@@ -152,6 +156,7 @@ fun DetailScreen(
             onPlay = onPlay,
             onOpenItem = onOpenItem,
             onViewPhoto = onViewPhoto,
+            onRead = onRead,
             onWatchedChanged = { refresh++ },
             onBack = onBack,
         )
@@ -166,6 +171,7 @@ private fun DetailContent(
     onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onWatchedChanged: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -256,8 +262,10 @@ private fun DetailContent(
                         canResume = canResume,
                         trackChoices = trackChoices,
                         requestInitialFocus = formFactor == FormFactor.Television,
+                        reading = detail.reading,
                         onPlay = onPlay,
                         onViewPhoto = onViewPhoto,
+                        onRead = onRead,
                         onWatchedChanged = onWatchedChanged,
                     )
 
@@ -320,6 +328,28 @@ private fun DetailContent(
                                 trackChoices = trackChoices + (file.id to picked)
                             },
                         )
+                    }
+                }
+            }
+        }
+
+        if (detail.editions.isNotEmpty()) {
+            item {
+                Text(
+                    "Other editions",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(start = side, end = side, top = 16.dp, bottom = 10.dp),
+                )
+            }
+            item {
+                LazyRow(
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = side),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    items(detail.editions, key = { it.id }) { edition ->
+                        PosterCard(edition, width = if (formFactor == FormFactor.Television) 166.dp else 132.dp) {
+                            onOpenItem(edition.id)
+                        }
                     }
                 }
             }
@@ -495,13 +525,17 @@ private fun Actions(
     canResume: Boolean,
     trackChoices: Map<Long, PreplayTracks>,
     requestInitialFocus: Boolean,
+    reading: ReadingState?,
     onPlay: (Long, Long, Long, PreplayTracks) -> Unit,
     onViewPhoto: (Long) -> Unit,
+    onRead: (itemId: Long, fileId: Long) -> Unit,
     onWatchedChanged: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
+    val formFactor = currentFormFactor()
     val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
+    val offlineBookRecords by vm.offlineBookRecords.collectAsStateWithLifecycle()
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* denial is benign; Android still exposes foreground work */ }
@@ -521,6 +555,10 @@ private fun Actions(
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
             it.fileId == file.id
     } }
+    val offlineBook = playable?.let { file -> offlineBookRecords.firstOrNull {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
+            it.fileId == file.id
+    } }
     LazyRow(
         Modifier.padding(top = 16.dp),
         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
@@ -536,15 +574,61 @@ private fun Actions(
                     Text("  View full size")
                 }
             }
-        } else if (item.isBook && playable != null) {
-            item {
-                DetailPrimaryActionButton(
-                    onClick = {
-                        val url = Session.mediaUrl("/api/v1/files/${playable.id}/content")
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                    },
-                    requestInitialFocus = requestInitialFocus,
-                ) { Text("Open book", fontWeight = FontWeight.SemiBold) }
+        } else if (item.isBook) {
+            if (playable != null && formFactor != FormFactor.Television) {
+                if (offersBookReader(formFactor, playable)) {
+                    item {
+                        DetailPrimaryActionButton(
+                            onClick = { onRead(item.id, playable.id) },
+                            requestInitialFocus = requestInitialFocus,
+                        ) { Text(bookReadingLabel(reading, playable), fontWeight = FontWeight.SemiBold) }
+                    }
+                }
+                if (playable.supportsOfflineBookReader && OfflineBooks.canUse(context)) {
+                    item {
+                        TvOutlinedButton(
+                            enabled = offlineBook?.isPlayable != true,
+                            onClick = {
+                                when {
+                                    offlineBook == null || offlineBook.state in setOf("failed", "missing") -> {
+                                        downloadError = vm.queueOfflineBook(item, playable)
+                                    }
+                                    else -> {
+                                        downloadError = null
+                                        vm.removeOfflineBook(offlineBook)
+                                    }
+                                }
+                            },
+                        ) {
+                            Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Text(
+                                when {
+                                    offlineBook == null -> "  Download"
+                                    offlineBook.isPlayable -> "  Downloaded"
+                                    offlineBook.state in setOf("failed", "missing") -> "  Download again"
+                                    else -> "  Cancel download"
+                                },
+                            )
+                        }
+                    }
+                }
+                item {
+                    TvOutlinedButton(
+                        onClick = {
+                            val url = Session.mediaUrl("/api/v1/files/${playable.id}/content")
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        },
+                    ) { Text("Open in…", fontWeight = FontWeight.SemiBold) }
+                }
+                downloadError?.let { message ->
+                    item {
+                        Text(
+                            message,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
             }
         } else if (seriesPlayback != null) {
             item {
@@ -677,6 +761,16 @@ private fun Actions(
         }
     }
 }
+
+internal fun bookReadingLabel(reading: ReadingState?, file: MediaFileDto): String {
+    if (reading?.file_id != file.id) return "Read"
+    if (reading.completed) return "Read again"
+    val percent = (reading.progression.coerceIn(0.0, 1.0) * 100).roundToInt()
+    return if (percent > 0) "Resume reading · $percent%" else "Read"
+}
+
+internal fun offersBookReader(formFactor: FormFactor, file: MediaFileDto): Boolean =
+    formFactor != FormFactor.Television && file.available && file.supportsOnlineBookReader
 
 @Composable
 internal fun DetailPrimaryActionButton(
@@ -995,6 +1089,8 @@ private fun fileSpecLine(file: MediaFileDto): String {
 
 internal fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
     val available = files.filter { it.available }
+    if (item.isBook) return available.firstOrNull { it.supportsOnlineBookReader }
+        ?: available.firstOrNull()
     if (!item.isAudiobook) return available.firstOrNull()
     return available.lastOrNull { positionMs >= it.part_offset_ms } ?: available.firstOrNull()
 }
@@ -1007,6 +1103,7 @@ private fun metaLine(item: Item, durationMs: Long?): String = buildList {
         item.show_title?.let(::add)
         if (item.season_number != null && item.episode_number != null) add("S${item.season_number} E${item.episode_number}")
     }
+    if ((item.isBook || item.isAudiobook) && !item.author.isNullOrBlank()) add(item.author)
     item.recorded_at?.let(::add)
     item.year?.let { add(it.toString()) }
     durationMs?.takeIf { it > 0 }?.let { add(formatTime(it)) }

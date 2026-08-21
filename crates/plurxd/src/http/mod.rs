@@ -266,6 +266,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root_dispatch))
         .route("/assets/hls.min.js", get(web::hls_js))
         .route("/assets/playback-policy.js", get(web::playback_policy_js))
+        .route("/assets/reader.js", get(web::reader_js))
+        .route("/assets/reader.css", get(web::reader_css))
         .route("/connect.svg", get(web::connect_qr))
         // PWA install assets + the sideloadable Android APK.
         .route("/manifest.webmanifest", get(web::manifest))
@@ -974,8 +976,8 @@ mod tests {
     }
 
     /// Curator announces book imports through the same targeted-scan seam as
-    /// video. The hint carries no provider id: the resolved Books library and
-    /// the file extension decide whether this is a text book or audiobook.
+    /// video. The path identifies the local edition; explicit Curator keys are
+    /// the only evidence Cinema uses to relate text and audio editions.
     #[tokio::test]
     async fn a_curator_book_import_reaches_the_books_library() {
         let app = test_app();
@@ -1002,6 +1004,13 @@ mod tests {
             json!({
                 "path": book,
                 "hint": "book",
+                "book": {
+                    "title": "The Dispossessed",
+                    "author": "Ursula K. Le Guin",
+                    "medium": "ebook",
+                    "work_id": "curator:openlibrary:OL87320W",
+                    "edition_id": "curator:item:84:ebook"
+                },
                 "correlation_id": "t-84-books",
                 "source": "monarr"
             }),
@@ -1014,6 +1023,95 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert_eq!(detail["item"]["kind"], "book");
         assert_eq!(detail["item"]["title"], "The Dispossessed");
+        assert_eq!(detail["item"]["author"], "Ursula K. Le Guin");
+        assert_eq!(
+            detail["item"]["book_work_id"],
+            "curator:openlibrary:OL87320W"
+        );
+        assert_eq!(detail["item"]["book_edition_id"], "curator:item:84:ebook");
+        assert_eq!(detail["item"]["book_metadata_source"], "curator");
+    }
+
+    #[tokio::test]
+    async fn curator_book_metadata_is_bounded_and_books_only() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger"])).await;
+
+        let books = tempfile::tempdir().expect("books");
+        let book_path = books.path().join("Book");
+        std::fs::create_dir_all(&book_path).expect("book dir");
+        std::fs::write(book_path.join("Book.epub"), b"epub fixture").expect("book file");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Books", "kind": "books", "paths": [books.path()] }),
+            ),
+        )
+        .await;
+
+        let base = json!({
+            "path": book_path,
+            "hint": "book",
+            "book": {
+                "title": "Book",
+                "author": "Author",
+                "medium": "ebook",
+                "work_id": "curator:work:1",
+                "edition_id": "curator:edition:1"
+            }
+        });
+        let mut hostile_cover = base.clone();
+        hostile_cover["book"]["cover_url"] = json!("https://example.com/cover.jpg");
+        let (status, body) = call(&app, post("/api/v1/scan", Some(&key), hostile_cover)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Open Library"));
+
+        let mut wrong_medium = base;
+        wrong_medium["book"]["medium"] = json!("pdf");
+        let (status, body) = call(&app, post("/api/v1/scan", Some(&key), wrong_medium)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let movies = tempfile::tempdir().expect("movies");
+        std::fs::write(movies.path().join("Movie.mkv"), b"movie").expect("movie");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [movies.path()] }),
+            ),
+        )
+        .await;
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/scan",
+                Some(&key),
+                json!({
+                    "path": movies.path(),
+                    "hint": "book",
+                    "book": {
+                        "title": "Not a book",
+                        "author": "Author",
+                        "medium": "ebook",
+                        "work_id": "curator:work:2",
+                        "edition_id": "curator:edition:2"
+                    }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Books library"));
     }
 
     /// The rail is absent, not broken, when no monarr is paired — and a
@@ -5722,6 +5820,8 @@ mod tests {
             "/icons/apple-touch-icon.png",
             "/assets/hls.min.js",
             "/assets/playback-policy.js",
+            "/assets/reader.js",
+            "/assets/reader.css",
             "/healthz",
             "/readyz",
             "/metrics",

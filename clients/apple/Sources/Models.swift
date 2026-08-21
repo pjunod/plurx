@@ -60,6 +60,10 @@ struct Item: Codable, Identifiable, Hashable {
     var airDate: String?
     var recordedAt: String?
     var tags: [String]?
+    var author: String? = nil
+    var bookWorkId: String? = nil
+    var bookEditionId: String? = nil
+    var bookMetadataSource: String? = nil
     var resolution: Int?
     var media: ItemMedia?
     var childCount: Int?
@@ -324,6 +328,47 @@ struct MediaFile: Codable, Identifiable {
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+    /// The server's format/action registry for this exact file. Optional for
+    /// compatibility with servers that predate the registry.
+    var reader: ReaderCapability? = nil
+
+    var isEpub: Bool {
+        container?.lowercased() == "epub"
+            || filename?.lowercased().hasSuffix(".epub") == true
+    }
+}
+
+enum ReaderAction: String, Codable, Equatable {
+    case read
+    case openIn = "open_in"
+    case unavailable
+}
+
+struct ReaderSurfaceCapability: Codable, Equatable {
+    let online: ReaderAction
+    let offline: ReaderAction
+}
+
+struct ReaderCapability: Codable, Equatable {
+    let format: String
+    let web: ReaderSurfaceCapability
+    let apple: ReaderSurfaceCapability
+    let android: ReaderSurfaceCapability
+    let television: ReaderSurfaceCapability
+}
+
+enum BookReaderPolicy {
+    static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader { return reader.apple.online == .read }
+        return file.isEpub
+    }
+
+    static func canDownload(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader { return reader.apple.offline == .read }
+        return file.isEpub
+    }
 }
 
 /// One subtitle stream exactly as item detail reports it (`FileDto`'s
@@ -434,6 +479,11 @@ struct ReadingText: Codable, Hashable {
     var after: String?
 }
 
+struct ReadingCinemaLocator: Codable, Hashable {
+    var path: [Int]?
+    var text: String?
+}
+
 struct ReadingLocator: Codable, Hashable {
     let version: Int
     let href: String
@@ -441,6 +491,53 @@ struct ReadingLocator: Codable, Hashable {
     var title: String?
     var locations: ReadingLocations?
     var text: ReadingText?
+    var cinema: ReadingCinemaLocator?
+}
+
+struct PublicationMetadata: Codable, Hashable {
+    let title: String
+    var author: String?
+    var identifier: String?
+    var language: String?
+}
+
+struct PublicationLink: Codable, Hashable {
+    let href: String
+    let type: String
+    var title: String?
+}
+
+struct PublicationTocLink: Codable, Hashable {
+    let href: String
+    let title: String
+    var children: [PublicationTocLink]
+}
+
+struct PublicationManifest: Codable, Hashable {
+    let metadata: PublicationMetadata
+    let readingOrder: [PublicationLink]
+    let resources: [PublicationLink]
+    let toc: [PublicationTocLink]
+}
+
+struct PublicationLimits: Codable, Hashable {
+    let entries: Int
+    let totalUncompressedBytes: Int64
+    let resourceBytes: Int64
+    let markupBytes: Int64
+    let compressionRatio: Int64
+    let concurrentResourceReads: Int
+    let resourceChunkBytes: Int
+}
+
+struct OpenPublicationResponse: Codable, Hashable {
+    let sessionId: String
+    let resourceBase: String
+    let expiresIn: Int
+    let fileId: Int
+    let revision: ReadingRevision
+    let publication: PublicationManifest
+    let limits: PublicationLimits
 }
 
 struct ReadingState: Codable, Hashable {
@@ -472,6 +569,7 @@ struct ItemDetail: Codable {
     var children: [Item]?
     var ancestors: [Item]?
     var reading: ReadingState?
+    var editions: [Item]? = nil
 }
 
 struct Marker: Codable, Hashable {

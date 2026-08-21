@@ -44,7 +44,7 @@ const EPUB_MIMETYPE: &str = "application/epub+zip";
 const RESOURCE_CSP: &str = "default-src 'none'; script-src 'none'; connect-src 'none'; \
     img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; \
     media-src 'self'; frame-src 'none'; object-src 'none'; form-action 'none'; \
-    base-uri 'none'; navigate-to 'self'; frame-ancestors 'self'";
+    base-uri 'none'; frame-ancestors 'self'";
 
 #[derive(Debug)]
 enum PublicationError {
@@ -104,6 +104,8 @@ impl From<zip::result::ZipError> for PublicationError {
 #[derive(Clone, Debug, Serialize)]
 pub struct PublicationMetadata {
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -873,6 +875,7 @@ fn parse_package(xml: &[u8], package_path: &str) -> Result<ParsedPackage, Public
     let mut spine_toc = None;
     let mut capture = None;
     let mut title = String::new();
+    let mut author = None;
     let mut identifier = None;
     let mut language = None;
 
@@ -917,7 +920,7 @@ fn parse_package(xml: &[u8], package_path: &str) -> Result<ParsedPackage, Public
                         }
                     }
                     b"spine" => spine_toc = xml_attribute(&reader, &element, b"toc")?,
-                    b"title" | b"identifier" | b"language" => {
+                    b"title" | b"creator" | b"identifier" | b"language" => {
                         capture = Some(element.local_name().as_ref().to_vec())
                     }
                     _ => {}
@@ -927,6 +930,9 @@ fn parse_package(xml: &[u8], package_path: &str) -> Result<ParsedPackage, Public
                 let value = xml_text(text)?.trim().to_owned();
                 match capture.as_deref() {
                     Some(b"title") if !value.is_empty() => title.push_str(&value),
+                    Some(b"creator") if !value.is_empty() && author.is_none() => {
+                        author = Some(value)
+                    }
                     Some(b"identifier") if !value.is_empty() && identifier.is_none() => {
                         identifier = Some(value)
                     }
@@ -1005,6 +1011,7 @@ fn parse_package(xml: &[u8], package_path: &str) -> Result<ParsedPackage, Public
     Ok(ParsedPackage {
         metadata: PublicationMetadata {
             title: title.trim().to_owned(),
+            author,
             identifier,
             language,
         },
@@ -1209,7 +1216,7 @@ mod tests {
             ),
             (
                 "OEBPS/book.opf",
-                r#"<?xml version="1.0"?><package><metadata><title>Proof Book</title><identifier>urn:proof</identifier><language>en</language></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="one" href="Text/one.xhtml" media-type="application/xhtml+xml"/><item id="two" href="Text/two.xhtml" media-type="application/xhtml+xml"/><item id="img" href="Images/cover.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="one"/><itemref idref="two"/></spine></package>"#,
+                r#"<?xml version="1.0"?><package><metadata><title>Proof Book</title><creator>Proof Author</creator><identifier>urn:proof</identifier><language>en</language></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="one" href="Text/one.xhtml" media-type="application/xhtml+xml"/><item id="two" href="Text/two.xhtml" media-type="application/xhtml+xml"/><item id="img" href="Images/cover.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="one"/><itemref idref="two"/></spine></package>"#,
             ),
             (
                 "OEBPS/nav.xhtml",
@@ -1226,6 +1233,10 @@ mod tests {
         let file = fixture(&base_entries());
         let publication = parse_epub(file.path()).expect("valid EPUB 3");
         assert_eq!(publication.manifest.metadata.title, "Proof Book");
+        assert_eq!(
+            publication.manifest.metadata.author.as_deref(),
+            Some("Proof Author")
+        );
         assert_eq!(publication.manifest.reading_order.len(), 2);
         assert_eq!(
             publication.manifest.reading_order[0].href,
@@ -1374,6 +1385,7 @@ mod tests {
             manifest: PublicationManifest {
                 metadata: PublicationMetadata {
                     title: "Bounded".to_owned(),
+                    author: None,
                     identifier: None,
                     language: None,
                 },

@@ -129,8 +129,27 @@ keeps transfer.
 - ✅ **M1 complete 2026-08-20:** revision-bound per-user locators, SQLite and
   Hiqlite parity, authenticated reading-state routes, stale-write protection,
   and Apple/Android API models are shipped.
-- 📝 **M2 next:** prove the hostile-publication boundary, then ship the web
-  EPUB reader and Read/Resume experience without changing A/V playback.
+- ✅ **M2 complete 2026-08-20:** the bounded, revision-scoped EPUB publication
+  API and in-app web reader ship Read/Resume, TOC, search, preferences,
+  explicit completion, durable paragraph restoration, and hostile-content
+  browser proof without changing A/V playback.
+- ✅ **M3 complete 2026-08-20:** iPhone/iPad and Android phone/tablet now host
+  the shared reader behind memory-only authentication and same-origin native
+  navigation guards. Simulator/JVM plus real-browser contracts prove profile
+  isolation, semantic headings, close flushing, and the same paragraph after
+  font and orientation changes; tvOS and Google TV expose no reader action.
+- 🚧 **M4 acceptance in progress:** iPhone/iPad and Android phone/tablet now
+  keep an atomically published, profile/revision-scoped original EPUB, open it
+  through a token-free local publication surface with the server stopped, and
+  reconcile the newest offline locator when the server returns. Automated
+  storage, security, process-death, and sync contracts are green; the physical
+  airplane-mode/reconnect device drill remains. Televisions stay deliberately
+  excluded.
+- 🚧 **M5 companion integration in progress:** Cinema now persists source-ranked
+  author, cover, work, edition, and medium facts from bounded EPUB packages or
+  explicit Curator hints. SQLite v21 and replicated v7 have tested upgrade
+  paths; title/author similarity never creates an edition relation. Curator's
+  enriched handoff remains to land before the milestone is complete.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

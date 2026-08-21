@@ -10,8 +10,8 @@ use super::{
     file_from_row, item_cols, item_from_row, SqliteStore, FILE_COLS, ITEM_COLS, ITEM_COL_COUNT,
 };
 use crate::domain::{
-    sort_title_for, ArtworkAttempt, Item, ItemEdit, ItemKind, ItemPage, ItemSort, MediaFile,
-    MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
+    sort_title_for, ArtworkAttempt, BookMetadataPatch, Item, ItemEdit, ItemKind, ItemPage,
+    ItemSort, MediaFile, MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
 };
 use crate::error::StoreError;
 use crate::mediafacts::{FactsRow, MediaFacts};
@@ -153,12 +153,12 @@ impl MediaStore for SqliteStore {
                 &format!(
                     "SELECT {ITEM_COLS} FROM items
                      WHERE library_id = ?1 AND kind = ?2
-                       AND title = ?3 COLLATE NOCASE AND year IS ?4
-                       AND (?5 IS NULL OR EXISTS (
+                       AND ((?5 IS NOT NULL AND EXISTS (
                            SELECT 1 FROM files f WHERE f.item_id = items.id
                              AND (f.path = ?5 OR (
                                substr(f.path, 1, length(?5)) = ?5
-                               AND substr(f.path, length(?5) + 1, 1) = '/'))))"
+                               AND substr(f.path, length(?5) + 1, 1) = '/'))))
+                         OR (?5 IS NULL AND title = ?3 COLLATE NOCASE AND year IS ?4))"
                 ),
                 params![library_id, kind, title, year, identity_path],
             )?)
@@ -537,6 +537,103 @@ impl MediaStore for SqliteStore {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn apply_book_metadata(
+        &self,
+        item_id: i64,
+        patch: &BookMetadataPatch,
+    ) -> Result<(), StoreError> {
+        let patch = patch.clone();
+        self.with_conn(move |conn| {
+            let sort_title = patch.title.as_deref().map(sort_title_for);
+            let source = patch.source.as_str();
+            conn.execute(
+                "UPDATE items SET
+                     title = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                              OR book_metadata_source = 'epub')
+                                       THEN COALESCE(?2, title) ELSE title END,
+                     sort_title = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                                   OR book_metadata_source = 'epub')
+                                            THEN COALESCE(?3, sort_title) ELSE sort_title END,
+                     author = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                               OR book_metadata_source = 'epub')
+                                        THEN COALESCE(?4, author) ELSE author END,
+                     book_work_id = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                                     OR book_metadata_source = 'epub')
+                                              THEN COALESCE(?5, book_work_id) ELSE book_work_id END,
+                     book_edition_id = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                                        OR book_metadata_source = 'epub')
+                                                 THEN COALESCE(?6, book_edition_id) ELSE book_edition_id END,
+                     poster_path = CASE WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                                    OR book_metadata_source = 'epub')
+                                             THEN COALESCE(?7, poster_path) ELSE poster_path END,
+                     book_metadata_source = CASE
+                         WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                               OR book_metadata_source = 'epub') THEN ?8
+                         ELSE book_metadata_source END,
+                     updated_at = CASE
+                         WHEN (?8 = 'curator' OR book_metadata_source IS NULL
+                                               OR book_metadata_source = 'epub') THEN unixepoch()
+                         ELSE updated_at END
+                 WHERE id = ?1 AND kind IN ('book', 'audiobook')",
+                params![
+                    item_id,
+                    patch.title,
+                    sort_title,
+                    patch.author,
+                    patch.work_id,
+                    patch.edition_id,
+                    patch.poster_path,
+                    source,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn book_items(
+        &self,
+        library_id: i64,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<Item>, StoreError> {
+        let Some(narrow) = id_filter("id", only) else {
+            return Ok(Vec::new());
+        };
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {ITEM_COLS} FROM items
+                 WHERE library_id = ?1 AND kind IN ('book', 'audiobook'){narrow}
+                 ORDER BY id"
+            ))?;
+            let rows = statement
+                .query_map(params![library_id], |row| item_from_row(row, 0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn related_book_editions(
+        &self,
+        item_id: i64,
+        work_id: &str,
+    ) -> Result<Vec<Item>, StoreError> {
+        let work_id = work_id.to_owned();
+        self.with_read(move |conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {ITEM_COLS} FROM items
+                 WHERE id != ?1 AND book_work_id = ?2
+                   AND kind IN ('book', 'audiobook')
+                 ORDER BY kind, id"
+            ))?;
+            let rows = statement
+                .query_map(params![item_id, work_id], |row| item_from_row(row, 0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
         .await
     }

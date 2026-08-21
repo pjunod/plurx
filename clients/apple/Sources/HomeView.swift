@@ -1,8 +1,25 @@
 import SwiftUI
 
+#if os(iOS)
+enum HomeTab: Hashable {
+    case home
+    case libraries
+    case search
+    case downloads
+    case settings
+}
+#endif
+
 struct HomeView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    #if os(iOS)
+    @State private var selectedTab: HomeTab
+
+    init(initialTab: HomeTab = .home) {
+        _selectedTab = State(initialValue: initialTab)
+    }
+    #endif
 
     var body: some View {
         #if os(iOS)
@@ -24,44 +41,66 @@ struct HomeView: View {
 
     #if os(iOS)
     private var iOSTabs: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
-                HomeDashboard()
-                    .appDestinations()
+                if model.phase == .loading {
+                    ProgressView().tint(Palette.accent)
+                } else if model.phase == .reconnectFailed {
+                    ReconnectView()
+                } else {
+                    HomeDashboard()
+                        .appDestinations()
+                }
             }
             .tabItem { Label("Home", systemImage: "house") }
+            .tag(HomeTab.home)
 
             NavigationStack {
                 LibrariesDashboard()
                     .appDestinations()
             }
             .tabItem { Label("Libraries", systemImage: "rectangle.stack") }
+            .tag(HomeTab.libraries)
 
             NavigationStack {
                 SearchView()
                     .appDestinations()
             }
             .tabItem { Label("Search", systemImage: "magnifyingglass") }
+            .tag(HomeTab.search)
 
             NavigationStack {
                 DownloadsView()
             }
             .tabItem { Label("Downloads", systemImage: "arrow.down.circle") }
+            .tag(HomeTab.downloads)
 
             NavigationStack {
                 SettingsView()
             }
             .tabItem { Label("Settings", systemImage: "gearshape") }
+            .tag(HomeTab.settings)
         }
         .tint(Palette.accent)
-        .task { if model.homeLoading { await model.loadHome() } }
+        .task {
+            if model.phase == .ready && model.homeLoading {
+                await model.loadHome()
+            }
+        }
+        .onChange(of: model.phase) { _, phase in
+            guard phase == .ready else { return }
+            selectedTab = .home
+            if model.homeLoading {
+                Task { await model.loadHome() }
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             // Coming back to a foregrounded app should not show yesterday's
             // Continue Watching. An Apple TV in particular is suspended rather
             // than quit, so before this the tvOS dashboard only ever refreshed
             // by relaunching the app. `loadHome` coalesces overlapping refreshes
             // and no longer raises a spinner over content, so this is free.
-            guard phase == .active else { return }
+            guard phase == .active, model.phase == .ready else { return }
             Task { await model.loadHome() }
         }
     }
@@ -220,6 +259,7 @@ enum HomeLayoutPolicy {
     static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
     #if os(iOS)
     static let topLevelTabs = ["Home", "Libraries", "Search", "Downloads", "Settings"]
+    static let offlineLaunchTab: HomeTab = .downloads
     #else
     static let topLevelTabs = ["Home", "Libraries", "Search", "Settings"]
     #endif

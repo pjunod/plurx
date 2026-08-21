@@ -33,7 +33,7 @@ use plurx_core::cluster::membership::{
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
 };
-use plurx_core::cluster::migration::ActivationMarker;
+use plurx_core::cluster::migration::{ActivationMarker, HIQLITE_WAL_SIZE_BYTES};
 use plurx_core::cluster::ClusterIdentity;
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
@@ -3820,7 +3820,7 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     })
@@ -4091,4 +4091,26 @@ pub fn unix_now() -> Result<i64> {
 
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voter_config_uses_the_production_wal_size() {
+        let root = tempfile::tempdir().expect("config test root");
+        let launch = NodeLaunch {
+            node_id: 1,
+            root: root.path().to_path_buf(),
+            nodes: vec![NodeSpec {
+                id: 1,
+                raft: "127.0.0.1:19001".to_owned(),
+                api: "127.0.0.1:19002".to_owned(),
+            }],
+        };
+
+        let config = node_config(&launch).expect("build the voter config");
+        assert_eq!(config.wal_size, HIQLITE_WAL_SIZE_BYTES);
+    }
 }

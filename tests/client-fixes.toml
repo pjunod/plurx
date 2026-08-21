@@ -292,3 +292,115 @@ source = "clients/apple/project.yml"
 source_anchor = "CURRENT_PROJECT_VERSION:"
 test = "tests/operations/test_mobile_build_claims.py"
 test_anchor = "test_repository_build_claims_match_release_inputs"
+
+[[fixes]]
+id = "android.bound-stall-downgrade"
+commits = ["c54f9411"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "private fun onStall(positionMs: Long)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
+
+[[fixes]]
+id = "android.bound-stall-predecessor-alive"
+commits = ["4a0d61d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "// Keep the predecessor alive through the create request"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "stallReopenCarriesPreviousSessionIdAndReopenReason"
+
+[[fixes]]
+id = "android.bound-stall-budget-logic"
+commits = ["8a6d759", "c7b81c5"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "internal class StallReopenBudget"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
+
+[[fixes]]
+id = "android.bound-stall-400-fallback"
+commits = ["95825c9", "88ca951", "0a9201977b0717e7f6235290b1615003fdc3142b", "bd86a5a", "c5a8817"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "suspend fun reopenAfterStall("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "badRequestRetriesExactlyOnceUnboundWithFreshRequestId"
+
+[[fixes]]
+id = "android.stall-budget-test-format"
+commits = ["afcc9bb"]
+source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+source_anchor = "class StallBudgetTest"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "budgetStopsAfterThreeSameRungAnswers"
+
+[[fixes]]
+id = "android.stall-coordinator-create-callback"
+commits = ["12a1fdd"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "private val createSession: suspend (CreateSessionReq) -> HlsStart"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "createSession = { body ->"
+
+[[fixes]]
+id = "android.stall-budget-seek-reset"
+commits = ["1995a17d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "fun seekTo(targetMs: Long)"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
+
+[[fixes]]
+id = "android.live-session-seek-stall-reset"
+commits = ["229a0f1f"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "stallGuard.liveSessionSeek { openSession(t, attempt) }"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "liveSessionSeekResetsExhaustedBudgetBeforeReopen"
+
+[[fixes]]
+id = "android.stall-response-invalidation-race"
+commits = ["038ee8f"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = ".takeIf { isCurrent() }"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "newerUserCreateIsTheFinalServerMutationAfterInFlightFallback"
+
+[[fixes]]
+id = "android.stall-controller-monotonic-invalidation"
+commits = ["7482d42"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "class ControllerStallGuard("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "vodSeekResetsBudgetAndCannotReuseAStallRequestToken"
+
+[[fixes]]
+id = "android.stall-budget-subtitle-test-fix"
+commits = ["d0ebd112"]
+source = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+source_anchor = "class StallBudgetTest"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "consecutiveUserActionsAdvanceSequenceMonotonically"
+
+[[fixes]]
+id = "android.stall-budget-reset-count-and-coordinator-invalidation"
+commits = ["241a08e", "adcd84c"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
+source_anchor = "fun resetForUserAction()"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
+test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
+
+[[fixes]]
+id = "android.merge-resolution-fix"
+commits = ["4c9d964"]
+source = "clients/android/README.md"
+source_anchor = "**v0.2.7**, build"
+test = "tests/validation/test_history.py"
+test_anchor = "test_client_anchor_survives_a_non_corrective_squash_title"
+
+[[fixes]]
+id = "apple.offline-launch-navigation"
+commits = ["87927379"]
+source = "clients/apple/Sources/HomeView.swift"
+source_anchor = "static let offlineLaunchTab: HomeTab = .downloads"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testIOSExposesDownloadsAndUsesConservativeDefaults"

@@ -9,11 +9,20 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-20): source is v0.2.7, Apple build 68. Native text
+> Status (2026-08-21): source is v0.2.7, Apple build 74. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 68 adds revision-bound ebook reading-state wire models and
-> authenticated API routes without exposing a tvOS reader. Build 67 adopts the
+> landed. Build 74 consumes the server-owned ebook format/action registry and
+> keeps external formats out of the built-in and offline readers. Build 73
+> preserves the full tab shell when offline downloads open first, so reconnect
+> and Settings remain reachable. Build 72 displays bounded book author metadata and only exact
+> work-linked editions. Build 71 scopes newest pending offline reading state to the exact
+> item/file/revision edition. Build 70 adds profile-scoped, atomically published offline EPUBs,
+> token-free local reading, and newest-locator reconnect replay on iPhone/iPad.
+> Build 69 adds in-app online EPUB reading on iPhone/iPad through an
+> isolated same-origin WebView with memory-only authentication, shared locator
+> resume, and no tvOS reader action. Build 68 adds revision-bound ebook
+> reading-state wire models and authenticated API routes. Build 67 adopts the
 > bound same-session stall reopen: a sustained
 > stall on a growing session names its exact `previous_session_id` with
 > `reopen_reason: "stall"` so the server answers one rung down, every create
@@ -71,7 +80,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 68 has not reached
+> resolved status. Repository evidence still says build 70 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.

@@ -34,8 +34,10 @@ import tv.plurx.app.ui.DownloadsScreen
 import tv.plurx.app.ui.HomeScreen
 import tv.plurx.app.ui.LibraryScreen
 import tv.plurx.app.ui.LoginScreen
+import tv.plurx.app.ui.OfflineBookReaderScreen
 import tv.plurx.app.ui.Phase
 import tv.plurx.app.ui.PhotoScreen
+import tv.plurx.app.ui.ReaderScreen
 import tv.plurx.app.ui.SearchScreen
 import tv.plurx.app.ui.SettingsScreen
 import tv.plurx.app.ui.components.LoadingBox
@@ -129,7 +131,21 @@ private fun MainNav(vm: AppViewModel) {
                 },
                 onOpenItem = { id -> nav.navigate("detail/$id") },
                 onViewPhoto = { id -> nav.navigate("photo/$id") },
+                onRead = { itemId, fileId -> nav.navigate("reader/$itemId/$fileId") },
                 onBack = { nav.popBackStack() },
+            )
+        }
+        composable(
+            "reader/{itemId}/{fileId}",
+            arguments = listOf(
+                navArgument("itemId") { type = NavType.LongType },
+                navArgument("fileId") { type = NavType.LongType },
+            ),
+        ) { entry ->
+            ReaderScreen(
+                itemId = entry.arguments!!.getLong("itemId"),
+                fileId = entry.arguments!!.getLong("fileId"),
+                onExit = { nav.popBackStack() },
             )
         }
         composable(
@@ -148,7 +164,17 @@ private fun MainNav(vm: AppViewModel) {
             DownloadsScreen(
                 vm = vm,
                 onPlay = { id -> nav.navigate("offline/$id") },
+                onRead = { id -> nav.navigate("offline-book/$id") },
                 onBack = { nav.popBackStack() },
+            )
+        }
+        composable(
+            "offline-book/{id}",
+            arguments = listOf(navArgument("id") { type = NavType.StringType }),
+        ) { entry ->
+            OfflineBookReaderScreen(
+                bookId = entry.arguments!!.getString("id").orEmpty(),
+                onExit = { nav.popBackStack() },
             )
         }
         composable(

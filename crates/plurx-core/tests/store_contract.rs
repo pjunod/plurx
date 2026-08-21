@@ -25,27 +25,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
-use hiqlite::{Client, Node, NodeConfig};
+use hiqlite::{Client, Node, NodeConfig, Row};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::{
     connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
     SelectedBackend, ACTIVATED_SOURCE_FILENAME, ACTIVATION_MARKER_FILENAME, HIQLITE_ACTIVE_DIRNAME,
+    HIQLITE_WAL_SIZE_BYTES, HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
 };
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
-    NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingStateWrite,
-    TraktAuth,
+    scopes, ArtworkAttempt, BookMetadataPatch, BookMetadataSource, ItemEdit, ItemKind, ItemSort,
+    LibraryKind, MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
+    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
+    ReadingStateWrite, TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore, TraktStore,
-    UserStore, WatchStore,
+    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
+    SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -62,6 +64,20 @@ const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
 
 #[cfg(feature = "hiqlite-store")]
 static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(feature = "hiqlite-store")]
+struct I64Value {
+    value: i64,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl From<&mut Row<'_>> for I64Value {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            value: row.get("value"),
+        }
+    }
+}
 
 const SETTINGS_METHODS: &[&str] = &[
     "ping",
@@ -111,6 +127,9 @@ const MEDIA_METHODS: &[&str] = &[
     "recently_added",
     "search_items",
     "apply_metadata",
+    "apply_book_metadata",
+    "book_items",
+    "related_book_editions",
     "items_needing_metadata",
     "episodes_for_show",
     "items_needing_artwork",
@@ -300,6 +319,237 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
 }
 
 #[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect migration client");
+    let telemetry = cluster._root.path().join("schema-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .validation_reset_contract_state()
+        .await
+        .expect("empty migration fixture");
+    current
+        .put_setting("migration.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    let results = client
+        .txn([
+            (
+                "DROP INDEX IF EXISTS idx_items_book_work",
+                hiqlite::params!(),
+            ),
+            ("ALTER TABLE items DROP COLUMN author", hiqlite::params!()),
+            (
+                "ALTER TABLE items DROP COLUMN book_work_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_edition_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_metadata_source",
+                hiqlite::params!(),
+            ),
+            (
+                "DROP INDEX IF EXISTS idx_reading_updated",
+                hiqlite::params!(),
+            ),
+            ("DROP TABLE IF EXISTS reading_state", hiqlite::params!()),
+            (
+                "UPDATE cluster_meta SET schema_version = $1 WHERE singleton = 1",
+                hiqlite::params!(AUTH_SCHEMA_MIGRATION_SOURCE),
+            ),
+        ])
+        .await
+        .expect("construct exact v5 fixture");
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v5 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 5 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v5 through v7 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.proof")
+            .await
+            .expect("read migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('reading_state')",
+            9,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_reading_updated'",
+            1,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('items') \
+             WHERE name IN ('author', 'book_work_id', 'book_edition_id', \
+                            'book_metadata_source')",
+            4,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_items_book_work'",
+            1,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect v6 migration client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("schema-v6-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .put_setting("migration.v6.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    let results = client
+        .txn([
+            (
+                "DROP INDEX IF EXISTS idx_items_book_work",
+                hiqlite::params!(),
+            ),
+            ("ALTER TABLE items DROP COLUMN author", hiqlite::params!()),
+            (
+                "ALTER TABLE items DROP COLUMN book_work_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_edition_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_metadata_source",
+                hiqlite::params!(),
+            ),
+            (
+                "UPDATE cluster_meta SET schema_version = 6 WHERE singleton = 1",
+                hiqlite::params!(),
+            ),
+        ])
+        .await
+        .expect("construct exact v6 fixture");
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v6 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 6 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v6 to v7 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.v6.proof")
+            .await
+            .expect("read migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('items') \
+             WHERE name IN ('author', 'book_work_id', 'book_edition_id', \
+                            'book_metadata_source')",
+            4,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_items_book_work'",
+            1,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ContractNodeSpec {
     id: u64,
@@ -435,11 +685,7 @@ async fn hiqlite_contract_node_process() {
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        // Production tuning, duplicated from `crates/plurx-core/src/cluster/migration.rs`
-        // (`start_one_voter`). The import chunk bound is sized against this WAL
-        // payload capacity, so a retune there must be mirrored here or the
-        // retained large-probe regression stops testing the production bound.
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     })
@@ -594,18 +840,14 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
     path
 }
 
-/// Largest Raft entry the production WAL accepts, derived the same way
-/// `crates/plurx-core/src/store/hiqlite_import.rs` derives its import bounds:
-/// the `wal_size` above, less the 34 bytes `hiqlite-wal` reserves per segment.
-/// Retiring this third copy of the tuning into one exported constant is #304.
-#[cfg(feature = "hiqlite-store")]
-const CONTRACT_WAL_USABLE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024 - 34;
-
 /// The row-count chunk bound #279 shipped and #282 replaced. Present only so
 /// the fixtures below can assert they sit *past* it: a fixture the old bound
 /// would also have carried proves nothing about a byte bound.
 #[cfg(feature = "hiqlite-store")]
 const SUPERSEDED_ROW_CHUNK_BOUND: usize = 16;
+/// Usable payload measured under the former 2 MiB production tuning.
+#[cfg(feature = "hiqlite-store")]
+const INCIDENT_WAL_USABLE_PAYLOAD_BYTES: usize = 2_097_118;
 
 /// The retained #279 band: adjacent rows with full-size probe documents.
 #[cfg(feature = "hiqlite-store")]
@@ -615,25 +857,26 @@ const LARGE_PROBE_PADDING_BYTES: usize = 48 * 1024;
 
 /// The band a row count cannot bound, and the reason this contract is about
 /// bytes: [`SUPERSEDED_ROW_CHUNK_BOUND`] adjacent rows of this size serialize
-/// past [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`], which is #290's production
-/// panic. Importing them proves the transaction builder split on bytes.
+/// past [`INCIDENT_WAL_USABLE_PAYLOAD_BYTES`], which is #290's production
+/// panic. Importing them proves the builder still splits the incident shape on
+/// bytes after the WAL is raised.
 #[cfg(feature = "hiqlite-store")]
 const OVERSIZED_PROBE_FILE_COUNT: i64 = 18;
 #[cfg(feature = "hiqlite-store")]
 const OVERSIZED_PROBE_PADDING_BYTES: usize = 144 * 1024;
 
 /// The importer's single-row ceiling, mirroring its derivation from
-/// [`CONTRACT_WAL_USABLE_PAYLOAD_BYTES`] less its encoding reserve and
+/// [`HIQLITE_WAL_USABLE_PAYLOAD_BYTES`] less its encoding reserve and
 /// transaction envelope. A row above this cannot be submitted in any
 /// transaction, so import refuses the backup.
 #[cfg(feature = "hiqlite-store")]
-const CONTRACT_IMPORT_MAX_ROW_BYTES: usize = CONTRACT_WAL_USABLE_PAYLOAD_BYTES - 64 * 1024 - 256;
+const CONTRACT_IMPORT_MAX_ROW_BYTES: usize = HIQLITE_WAL_USABLE_PAYLOAD_BYTES - 64 * 1024 - 256;
 
 /// A single probe document larger than the whole WAL payload capacity, so it is
 /// unimportable under any bound rather than merely past the reserve. Import must
 /// refuse it instead of handing it to the WAL writer.
 #[cfg(feature = "hiqlite-store")]
-const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = 2_100 * 1024;
+const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = HIQLITE_WAL_USABLE_PAYLOAD_BYTES + 1024;
 
 /// The premises the probe fixtures rest on, checked where they are declared so
 /// a later size tweak cannot quietly turn either regression into a test of
@@ -642,22 +885,22 @@ const UNIMPORTABLE_PROBE_PADDING_BYTES: usize = 2_100 * 1024;
 const _: () = {
     assert!(
         OVERSIZED_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND
-            > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+            > INCIDENT_WAL_USABLE_PAYLOAD_BYTES,
         "the oversized band must exceed what the superseded row bound would have submitted, \
          or the regression re-proves the row count instead of the byte bound"
     );
     assert!(
-        LARGE_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        LARGE_PROBE_PADDING_BYTES * SUPERSEDED_ROW_CHUNK_BOUND < HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the retained #279 band must stay inside the superseded bound, so the two bands \
          test different things"
     );
     assert!(
-        UNIMPORTABLE_PROBE_PADDING_BYTES > CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        UNIMPORTABLE_PROBE_PADDING_BYTES > HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the refused row must exceed the WAL itself, so the refusal is unarguable rather \
          than an artefact of the reserve held back from it"
     );
     assert!(
-        CONTRACT_IMPORT_MAX_ROW_BYTES < CONTRACT_WAL_USABLE_PAYLOAD_BYTES,
+        CONTRACT_IMPORT_MAX_ROW_BYTES < HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
         "the single-row ceiling must sit under the capacity it is derived from"
     );
 };
@@ -790,6 +1033,11 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE playback_events;
              DROP TABLE network_priors;
              DROP TABLE reading_state;
+             DROP INDEX idx_items_book_work;
+             ALTER TABLE items DROP COLUMN book_metadata_source;
+             ALTER TABLE items DROP COLUMN book_edition_id;
+             ALTER TABLE items DROP COLUMN book_work_id;
+             ALTER TABLE items DROP COLUMN author;
              ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
@@ -1968,7 +2216,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 141, "review the Store method count");
+    assert_eq!(declared.len(), 144, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -2513,6 +2761,132 @@ async fn media_contract_runs_through_dyn_store() {
                 .expect("audiobook")
                 .id,
             audiobook
+        );
+        assert!(
+            store
+                .related_book_editions(ebook, "curator:work:shared")
+                .await
+                .expect("unlinked editions")
+                .is_empty(),
+            "title equality alone must never relate editions on {backend}"
+        );
+        store
+            .upsert_file(
+                ebook,
+                "/contract/books/shared.epub",
+                4096,
+                77,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("ebook file");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Package Title".into()),
+                    author: Some("Package Author".into()),
+                    work_id: None,
+                    edition_id: Some("urn:isbn:package".into()),
+                    poster_path: Some("books/epub-cover.jpg".into()),
+                    source: BookMetadataSource::Epub,
+                },
+            )
+            .await
+            .expect("EPUB metadata");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: Some("curator:edition:ebook".into()),
+                    poster_path: Some("books/curator-cover.jpg".into()),
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("Curator metadata");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Late Package Title".into()),
+                    author: Some("Late Package Author".into()),
+                    work_id: Some("untrusted:fuzzy-link".into()),
+                    edition_id: Some("urn:isbn:late".into()),
+                    poster_path: Some("books/late-cover.jpg".into()),
+                    source: BookMetadataSource::Epub,
+                },
+            )
+            .await
+            .expect("lower-precedence EPUB refresh");
+        store
+            .apply_book_metadata(
+                audiobook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: Some("curator:edition:audiobook".into()),
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("audiobook relation");
+
+        let enriched = store
+            .get_item(ebook)
+            .await
+            .expect("read enriched ebook")
+            .expect("enriched ebook");
+        assert_eq!(enriched.title, "Curator Title");
+        assert_eq!(enriched.author.as_deref(), Some("Curator Author"));
+        assert_eq!(
+            enriched.book_work_id.as_deref(),
+            Some("curator:work:shared")
+        );
+        assert_eq!(
+            enriched.book_edition_id.as_deref(),
+            Some("curator:edition:ebook")
+        );
+        assert_eq!(
+            enriched.poster_path.as_deref(),
+            Some("books/curator-cover.jpg")
+        );
+        assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
+        assert_eq!(
+            store
+                .find_book(
+                    books.id,
+                    ItemKind::Book,
+                    "stale scanner title",
+                    None,
+                    Some("/contract/books/shared.epub"),
+                )
+                .await
+                .expect("find enriched ebook by path")
+                .expect("enriched ebook identity")
+                .id,
+            ebook,
+            "metadata title replacement must not duplicate a scanned path on {backend}"
+        );
+        let editions = store
+            .related_book_editions(ebook, "curator:work:shared")
+            .await
+            .expect("related editions");
+        assert_eq!(editions.len(), 1, "backend {backend}");
+        assert_eq!(editions[0].id, audiobook, "backend {backend}");
+        assert_eq!(
+            store
+                .book_items(books.id, None)
+                .await
+                .expect("book items")
+                .len(),
+            2,
+            "backend {backend}"
         );
         assert_eq!(
             store
