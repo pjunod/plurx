@@ -878,8 +878,8 @@ impl ActivationMarker {
         }
         if self.cluster_id.trim().is_empty()
             || self.source_schema_version <= 0
-            || (self.replicated_schema_version != AUTH_SCHEMA_MIGRATION_SOURCE
-                && self.replicated_schema_version != AUTH_SCHEMA_VERSION)
+            || !(AUTH_SCHEMA_MIGRATION_SOURCE..=AUTH_SCHEMA_VERSION)
+                .contains(&self.replicated_schema_version)
             || !is_sha256(&self.source_backup_sha256)
             || self.table_hashes.is_empty()
         {
@@ -2792,7 +2792,10 @@ mod tests {
         };
         marker(AUTH_SCHEMA_MIGRATION_SOURCE)
             .validate()
-            .expect("v5 marker must reach the v6 daemon migration");
+            .expect("v5 marker must reach the complete daemon migration chain");
+        marker(AUTH_SCHEMA_MIGRATION_SOURCE + 1)
+            .validate()
+            .expect("v6 marker must reach the book-facts migration");
         marker(AUTH_SCHEMA_VERSION)
             .validate()
             .expect("current marker");

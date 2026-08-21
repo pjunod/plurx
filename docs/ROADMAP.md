@@ -145,6 +145,11 @@ keeps transfer.
   storage, security, process-death, and sync contracts are green; the physical
   airplane-mode/reconnect device drill remains. Televisions stay deliberately
   excluded.
+- 🚧 **M5 companion integration in progress:** Cinema now persists source-ranked
+  author, cover, work, edition, and medium facts from bounded EPUB packages or
+  explicit Curator hints. SQLite v21 and replicated v7 have tested upgrade
+  paths; title/author similarity never creates an edition relation. Curator's
+  enriched handoff remains to land before the milestone is complete.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

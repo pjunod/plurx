@@ -97,6 +97,14 @@ pub struct ItemDto {
     /// when unknown — a client that predates this field ignores it, and one
     /// that knows about it never has to distinguish "absent" from "none".
     pub genres: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_work_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_edition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_metadata_source: Option<String>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
@@ -212,6 +220,10 @@ impl From<Item> for ItemDto {
             recorded_at: item.recorded_at,
             tags: item.tags,
             genres: item.genres,
+            author: item.author,
+            book_work_id: item.book_work_id,
+            book_edition_id: item.book_edition_id,
+            book_metadata_source: item.book_metadata_source,
             tmdb_id: item.tmdb_id,
             imdb_id: item.imdb_id,
             poster: image_url(&item.poster_path),

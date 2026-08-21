@@ -60,6 +60,10 @@ struct Item: Codable, Identifiable, Hashable {
     var airDate: String?
     var recordedAt: String?
     var tags: [String]?
+    var author: String? = nil
+    var bookWorkId: String? = nil
+    var bookEditionId: String? = nil
+    var bookMetadataSource: String? = nil
     var resolution: Int?
     var media: ItemMedia?
     var childCount: Int?
@@ -535,6 +539,7 @@ struct ItemDetail: Codable {
     var children: [Item]?
     var ancestors: [Item]?
     var reading: ReadingState?
+    var editions: [Item]? = nil
 }
 
 struct Marker: Codable, Hashable {
