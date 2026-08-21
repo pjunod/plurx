@@ -445,6 +445,11 @@ struct ReadingText: Codable, Hashable {
     var after: String?
 }
 
+struct ReadingCinemaLocator: Codable, Hashable {
+    var path: [Int]?
+    var text: String?
+}
+
 struct ReadingLocator: Codable, Hashable {
     let version: Int
     let href: String
@@ -452,6 +457,53 @@ struct ReadingLocator: Codable, Hashable {
     var title: String?
     var locations: ReadingLocations?
     var text: ReadingText?
+    var cinema: ReadingCinemaLocator?
+}
+
+struct PublicationMetadata: Codable, Hashable {
+    let title: String
+    var author: String?
+    var identifier: String?
+    var language: String?
+}
+
+struct PublicationLink: Codable, Hashable {
+    let href: String
+    let type: String
+    var title: String?
+}
+
+struct PublicationTocLink: Codable, Hashable {
+    let href: String
+    let title: String
+    var children: [PublicationTocLink]
+}
+
+struct PublicationManifest: Codable, Hashable {
+    let metadata: PublicationMetadata
+    let readingOrder: [PublicationLink]
+    let resources: [PublicationLink]
+    let toc: [PublicationTocLink]
+}
+
+struct PublicationLimits: Codable, Hashable {
+    let entries: Int
+    let totalUncompressedBytes: Int64
+    let resourceBytes: Int64
+    let markupBytes: Int64
+    let compressionRatio: Int64
+    let concurrentResourceReads: Int
+    let resourceChunkBytes: Int
+}
+
+struct OpenPublicationResponse: Codable, Hashable {
+    let sessionId: String
+    let resourceBase: String
+    let expiresIn: Int
+    let fileId: Int
+    let revision: ReadingRevision
+    let publication: PublicationManifest
+    let limits: PublicationLimits
 }
 
 struct ReadingState: Codable, Hashable {
