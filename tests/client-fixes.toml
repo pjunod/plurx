@@ -412,3 +412,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
 source_anchor = "internal data class VideoDecoderLimit("
 test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
 test_anchor = "videoCapsKeepTheBestHeightForEachCodec"
+
+[[fixes]]
+id = "android.sdr-subtitle-burn-acknowledgement"
+commits = ["71edaf7c"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "subtitle_burn_sdr = true.takeIf {"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "autoBurnSendsQualityAutoTrue"
