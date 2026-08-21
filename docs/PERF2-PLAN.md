@@ -343,7 +343,7 @@ mutable global request. The replicated protocol remains v4 because no wire
 operation changes; schema v5 applies to fresh bootstrap/import, and an existing
 v4 cluster stays refused until the clustering upgrade protocol exists. D10
 preserves shipped reading state at SQLite v20 and replicated v6, applies the
-N4.2 credential-generation correction at SQLite v21, and moves N3 to v22.
+N4.2 credential-generation correction at SQLite v22, and moves N3 to v22.
 Production encoding still uses the deployed
 server's Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is
 behavior-probed and scores captured bytes on the controller only after the
@@ -1296,14 +1296,14 @@ All changes flow through the single `effective_recipe()` builder
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
 - N4.2: the original node-local network-priors table is SQLite **v19**. The
-  credential-generation correction is SQLite **v21**, after shipped reading
+  credential-generation correction is SQLite **v22**, after shipped reading
   state at SQLite **v20**. Replicated schema stays **v6** and protocol stays
   **v4**; another voter deliberately starts cold.
 - N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
   manifest on location rows (schema **v22**; N0's telemetry table is
   **v17**, N1's offline rate-control snapshot is **v18**, N4.2's original
   priors table is **v19**, reading state is **v20**, and credential-generation
-  isolation is **v21** — unique versions per slice, review R8); `prefix_secs` in
+  isolation is **v22** — unique versions per slice, review R8); `prefix_secs` in
   the recipe.
 - N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
   HEVC changes the `muxer`/`segment_policy` fields — its own
@@ -1448,7 +1448,7 @@ settings and may be amended without changing the contracts below.
    observations off Raft.
 10. **D10 — append-only reconciliation.** Ratified 2026-08-20 after reading
     state shipped: preserve reading state at SQLite v20 and replicated schema
-    v6; apply the N4.2 credential-generation correction at SQLite v21; move N3
+    v6; apply the N4.2 credential-generation correction at SQLite v22; move N3
     to SQLite v22. The correction adds no replicated migration, protocol stays
     v4, and old numeric-key prior rows are dropped rather than translated.
 

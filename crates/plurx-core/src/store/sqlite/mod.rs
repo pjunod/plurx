@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
-use crate::store::telemetry::{NETWORK_PRIORS_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
+use crate::store::telemetry::PLAYBACK_EVENTS_SCHEMA;
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -552,7 +552,20 @@ const MIGRATIONS: &[&str] = &[
     // v19: opt-in, bounded, node-local network priors. No foreign keys on
     // purpose: the hiqlite backend carries this exact table in its per-voter
     // telemetry sidecar rather than replicating observations through Raft.
-    NETWORK_PRIORS_SCHEMA,
+    // v19: opt-in, bounded, node-local network priors. No foreign keys on
+    "CREATE TABLE network_priors (
+        user_id             INTEGER NOT NULL,
+        client_class        TEXT NOT NULL,
+        network_fingerprint TEXT NOT NULL,
+        sustained_kbps      INTEGER,
+        worst_rung_height   INTEGER,
+        starved_at_ms       INTEGER,
+        sample_count        INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms       INTEGER NOT NULL,
+        PRIMARY KEY (user_id, client_class, network_fingerprint)
+    ) STRICT;
+    CREATE INDEX network_priors_by_updated
+        ON network_priors(updated_at_ms, user_id, client_class);",
     // v20: per-user text-publication state. A locator is bound to one exact
     // file revision because the same chapter href in a replaced edition is
     // not evidence that it names the same text. Progress is millionths on
@@ -606,7 +619,7 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (credential_generation, client_class, network_fingerprint)
     ) STRICT;
     CREATE INDEX network_priors_by_updated
-        ON network_priors(updated_at_ms, credential_generation, client_class);"
+        ON network_priors(updated_at_ms, credential_generation, client_class);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1291,7 +1304,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 21,
+            version, 22,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1437,7 +1450,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1492,7 +1505,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1514,7 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn v19_adds_node_local_network_priors_without_touching_v18_rows() {
-        use crate::domain::NetworkPriorObservation;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1545,7 +1558,7 @@ mod tests {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 1,
+                credential_generation: CredentialGeneration::from("v19-test-gen".to_owned()),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(6_000),
@@ -1560,7 +1573,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1638,7 +1651,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         assert!(conn
             .execute(
@@ -1699,7 +1712,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1711,7 +1724,6 @@ mod tests {
             .expect("book work index");
         assert_eq!(index, 1);
     }
-
 
     #[tokio::test]
     async fn v22_replaces_user_id_key_with_credential_generation() {
@@ -1757,7 +1769,7 @@ mod tests {
                 ..NetworkPriorObservation::default()
             })
             .await
-            .expect("write v21 prior");
+            .expect("write v22 prior");
         assert_eq!(prior.sustained_kbps, Some(8_000));
         assert_eq!(prior.credential_generation.as_str(), "v22-test-gen");
 
@@ -1765,7 +1777,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            21
+            22
         );
         let old_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
