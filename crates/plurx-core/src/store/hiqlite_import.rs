@@ -19,41 +19,31 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::hiqlite::{database_error, HiqliteAuthStore};
 use super::{keys, MediaStore, SettingsStore, SQLITE_SCHEMA_VERSION};
+use crate::cluster::migration::HIQLITE_WAL_USABLE_PAYLOAD_BYTES;
 use crate::error::StoreError;
 use crate::secrets::SealedSecret;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
-/// Raft WAL segment size configured for a production voter.
-///
-/// Mirrors `wal_size` in `start_local_voter`
-/// (`crates/plurx-core/src/cluster/migration.rs`), which is the production
-/// source of truth, and the contract voter in
-/// `crates/plurx-core/tests/store_contract.rs`. Retiring the three copies into
-/// one exported constant is issue #304; until then a retune there must be
-/// mirrored here, or every bound below silently computes the wrong margin.
-const PRODUCTION_WAL_SIZE_BYTES: usize = 2 * 1024 * 1024;
-/// Segment bytes `hiqlite-wal` reserves ahead of log payload, so the largest
-/// single entry it accepts is `wal_size` minus this: 34 under 0.14.0, whose
-/// writer computes `wal_size - offset_logs() - 2`. Exceeding it is a `panic!`
-/// on the WAL writer thread, which takes `plurxd` down mid-import.
-const WAL_SEGMENT_RESERVED_BYTES: usize = 34;
-/// Largest Raft entry the production WAL accepts: 2,097,118 bytes.
-const WAL_USABLE_PAYLOAD_BYTES: usize = PRODUCTION_WAL_SIZE_BYTES - WAL_SEGMENT_RESERVED_BYTES;
 /// Serialized bytes one import transaction accumulates to before it is
 /// submitted. This — not a row count — is what keeps a transaction inside the
 /// WAL, because `files.probe_json` holds whole ffprobe documents and adjacent
 /// rows vary by orders of magnitude.
 ///
-/// A quarter of the usable payload rather than all of it. Nothing forces a
-/// group of rows to travel together, so the budget can afford headroom that
-/// [`IMPORT_MAX_ROW_BYTES`] cannot, and it answers a second bound the WAL
-/// capacity says nothing about: every submission goes through the store's
-/// three-second `STORE_TIMEOUT`, and a transaction near the WAL cap has to
-/// replicate a megabyte to every voter inside it. A three-voter import of
-/// 200 KiB probe rows timed out at half the payload on a loaded host and
-/// completed at a quarter. The cost is more, smaller Raft entries — which a
-/// Raft log prefers anyway — for a bound that holds when the node is busy.
-const IMPORT_TXN_BUDGET_BYTES: usize = WAL_USABLE_PAYLOAD_BYTES / 4;
+/// This ceiling stays at the measured 512 KiB instead of scaling with WAL
+/// headroom. Every submission goes through the store's three-second
+/// `STORE_TIMEOUT`: a three-voter import of 200 KiB probe rows timed out near
+/// 1 MiB on a loaded host and completed near 512 KiB. Raising the WAL protects
+/// an indivisible large row; it is not permission to make routine replication
+/// eight times larger.
+const IMPORT_REPLICATION_CEILING_BYTES: usize = 512 * 1024;
+const IMPORT_TXN_BUDGET_BYTES: usize = {
+    let wal_fraction = HIQLITE_WAL_USABLE_PAYLOAD_BYTES / 4;
+    if wal_fraction < IMPORT_REPLICATION_CEILING_BYTES {
+        wal_fraction
+    } else {
+        IMPORT_REPLICATION_CEILING_BYTES
+    }
+};
 /// Bytes charged to a transaction before any row, covering the Raft entry
 /// header and `QueryWrite` framing wrapped around the statements.
 const IMPORT_TXN_ENVELOPE_BYTES: usize = 256;
@@ -72,7 +62,7 @@ const WAL_ENCODING_RESERVE_BYTES: usize = 64 * 1024;
 /// A row this large has no smaller transaction to travel in, so every byte
 /// shaved off here refuses an import the WAL would have accepted.
 const IMPORT_MAX_ROW_BYTES: usize =
-    WAL_USABLE_PAYLOAD_BYTES - WAL_ENCODING_RESERVE_BYTES - IMPORT_TXN_ENVELOPE_BYTES;
+    HIQLITE_WAL_USABLE_PAYLOAD_BYTES - WAL_ENCODING_RESERVE_BYTES - IMPORT_TXN_ENVELOPE_BYTES;
 /// Rows per source read page, and the secondary ceiling on one import `txn`.
 ///
 /// [`IMPORT_TXN_BUDGET_BYTES`] is the bound that keeps a transaction inside the
@@ -755,7 +745,7 @@ impl ImportTransactionBuilder {
             return Err(import_error(format!(
                 "table {} {} serializes to about {row_bytes} bytes, above the \
                  {IMPORT_MAX_ROW_BYTES}-byte single-row import limit derived from the \
-                 {WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity; \
+                 {HIQLITE_WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity; \
                  import refuses this backup instead of crashing the node mid-import. \
                  The source database is unchanged",
                 self.table.name,
@@ -1132,10 +1122,10 @@ impl HiqliteAuthStore {
                     insert_sql.len() + PER_STATEMENT_FRAMING_BYTES + estimated_row_bytes(row)
                 })
                 .sum::<usize>();
-        if estimated > WAL_USABLE_PAYLOAD_BYTES {
+        if estimated > HIQLITE_WAL_USABLE_PAYLOAD_BYTES {
             return Err(import_error(format!(
                 "table {} import transaction of {} row(s) serializes to about {estimated} bytes, \
-                 above the {WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity",
+                 above the {HIQLITE_WAL_USABLE_PAYLOAD_BYTES}-byte production WAL payload capacity",
                 table.name,
                 chunk.len(),
             )));
@@ -1941,7 +1931,7 @@ mod tests {
                     .map(|row| statement_bytes + estimated_row_bytes(row))
                     .sum::<usize>();
             assert!(
-                bytes <= WAL_USABLE_PAYLOAD_BYTES,
+                bytes <= HIQLITE_WAL_USABLE_PAYLOAD_BYTES,
                 "no emitted transaction may exceed the WAL payload capacity: {bytes} bytes"
             );
         }
@@ -1967,6 +1957,24 @@ mod tests {
             builder.finish().expect("oversized row still pending").len(),
             1,
             "a row larger than the budget travels as its own transaction"
+        );
+    }
+
+    /// The WAL increase is real single-entry headroom, not only a larger
+    /// segment allocation. This historical ceiling is the measured usable
+    /// payload from the former 2 MiB tuning; reverting the production constant
+    /// makes this row fail the importer's single-row check again.
+    #[test]
+    fn raised_wal_accepts_a_row_past_the_former_payload_ceiling() {
+        let statement_bytes = files_statement_bytes();
+        let table = files_plan();
+        let mut builder = ImportTransactionBuilder::new(table, &insert_sql(table));
+        builder
+            .push(sized_files_row(1, 2_100 * 1024, statement_bytes))
+            .expect("the raised WAL accepts a row beyond the former payload ceiling");
+        assert_eq!(
+            builder.finish().expect("raised-headroom row pending").len(),
+            1
         );
     }
 
