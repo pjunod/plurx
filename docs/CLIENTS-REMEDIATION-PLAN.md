@@ -224,7 +224,9 @@ the **absolute subtitle-stream index**, not a filtered ordinal), `start`,
 `audio`, `copy`, `aac`, `preserve_dolby_vision`, `audio_offset_ms`.
 
 Height semantics (`hls.rs:150-164`, the comment is the contract):
-`null` → server Auto (`auto_height`, min(source, 1080) on hardware);
+`null` → server Auto (known SDR follows the source up to 2160p on validated
+hardware, HDR/unknown geometry use the measured 1080p point, and software
+uses 720p; a stored network prior may lower the result);
 `height == source.height` → passes through unsnapped — **"the source's own
 height is the Original/forced-burn promise"**; any other explicit value →
 snapped onto the ladder.

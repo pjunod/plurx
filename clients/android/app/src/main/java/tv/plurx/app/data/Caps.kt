@@ -4,6 +4,7 @@ package tv.plurx.app.data
 
 import android.content.Context
 import android.hardware.display.DisplayManager
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
 import android.util.Log
@@ -34,14 +35,26 @@ object Caps {
 
     private const val DOLBY_VISION_MIME = "video/dolby-vision"
     private const val LOG_TAG = "plurx-capabilities"
+    private val VIDEO_CODEC_MIMES = mapOf(
+        "video/avc" to "h264",
+        "video/hevc" to "hevc",
+        "video/av01" to "av1",
+        "video/x-vnd.on2.vp9" to "vp9",
+    )
+    private val VIDEO_PROBE_SIZES = listOf(
+        3840 to 2160,
+        2560 to 1440,
+        1920 to 1080,
+        1280 to 720,
+        854 to 480,
+        640 to 360,
+    )
 
     suspend fun query(context: Context): Map<String, String> = withContext(Dispatchers.IO) {
         probe(context)
     }
 
     private fun probe(context: Context): Map<String, String> {
-        val video = linkedSetOf("h264")
-
         val codecs = try {
             MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
         } catch (_: Exception) {
@@ -52,15 +65,21 @@ object Caps {
                 if (!info.isEncoder) info.supportedTypes.forEach { add(it.lowercase()) }
             }
         }
-
-        if ("video/hevc" in decoderMimes) video.add("hevc")
-        if ("video/av01" in decoderMimes) video.add("av1")
-        if ("video/x-vnd.on2.vp9" in decoderMimes) video.add("vp9")
+        val videoLimits = videoDecoderLimits(codecs).toMutableList()
+        // AVC decoding is mandatory on Android. If a vendor registry is
+        // temporarily unreadable, retain that baseline conservatively instead
+        // of restoring the old, dangerous "codec present means uncapped 4K"
+        // claim.
+        if (videoLimits.none { it.codec == "h264" }) {
+            videoLimits += VideoDecoderLimit("h264", 1080)
+        }
+        val video = videoCodecCaps(videoLimits)
 
         val audio = audioCodecClaims(decoderMimes, sinkEncodings(context))
 
         val hdrTypes = displayHdrTypes(context)
-        val hdr = displayIsHdr(hdrTypes) && (video.contains("hevc") || video.contains("av1"))
+        val hdr = displayIsHdr(hdrTypes) &&
+            ("hevc" in video.codecs || "av1" in video.codecs)
         // Ask the same Media3 decoder selector that ExoPlayer uses. The raw
         // platform registry can omit aliases and device workarounds that
         // Media3 applies at playback time, which made capable Google TV boxes
@@ -80,10 +99,9 @@ object Caps {
             claimedProfiles = dolbyVisionProfiles,
         )
 
-        val result = mapOf(
+        val result = video.queryParams() + mapOf(
             "client" to "android",
             "device" to Build.MODEL,
-            "vcodec" to video.joinToString(","),
             "acodec" to audio.joinToString(","),
             // Media3's progressive extractors handle the audiobook containers
             // too. Leaving them out routes audio-only sources through the
@@ -100,6 +118,34 @@ object Caps {
         )
         return result
     }
+
+    /**
+     * Highest ordinary movie frame each registered decoder proves at 30 fps.
+     * `supportedHeights.upper` alone is not enough: it may describe a narrow
+     * frame that the decoder cannot sustain at the corresponding 16:9 width.
+     */
+    private fun videoDecoderLimits(codecs: Array<MediaCodecInfo>): List<VideoDecoderLimit> =
+        buildList {
+            codecs.filterNot { it.isEncoder }.forEach { info ->
+                info.supportedTypes.forEach typeLoop@{ advertisedType ->
+                    val codec = VIDEO_CODEC_MIMES[advertisedType.lowercase()]
+                        ?: return@typeLoop
+                    val video = try {
+                        info.getCapabilitiesForType(advertisedType).videoCapabilities
+                    } catch (_: Exception) {
+                        null
+                    } ?: return@typeLoop
+                    val maxHeight = VIDEO_PROBE_SIZES.firstOrNull { (width, height) ->
+                        try {
+                            video.areSizeAndRateSupported(width, height, 30.0)
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }?.second ?: return@typeLoop
+                    add(VideoDecoderLimit(codec, maxHeight))
+                }
+            }
+        }
 
     private data class DolbyVisionDecoderProbe(
         val names: List<String>,

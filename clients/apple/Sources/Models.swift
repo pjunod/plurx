@@ -803,6 +803,10 @@ struct CreateSessionRequest: Codable {
     var audio: Int?
     /// A bitmap or styled-text subtitle the server must draw into the video.
     var subtitleBurn: Int?
+    /// True only when the selected plan already delivers SDR. This lets an
+    /// HDR source keep a forced bitmap subtitle on an existing tone-map
+    /// without authorizing an HDR delivery to be silently downgraded.
+    var subtitleBurnSDR: Bool?
     /// Ask for an HLS master containing native WebVTT subtitle renditions.
     var nativeSubtitles: Bool?
     /// The initial native media-selection option. It does not alter video.

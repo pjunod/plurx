@@ -66,6 +66,30 @@ internal fun postPlaybackClientLog(scope: CoroutineScope, event: PlaybackClientL
     }
 }
 
+/**
+ * A failure before Controller/Media3 exists still belongs in playback
+ * telemetry. Keep exception messages out of the wire payload: HTTP failures
+ * can contain request URLs, and those URLs may carry capability or auth data.
+ */
+internal fun planLoadFailureEvent(
+    fileId: Long,
+    reason: String,
+    stage: String,
+    error: Throwable,
+): PlaybackClientLog = PlaybackClientLog(
+    level = "error",
+    event = "playback_error",
+    message = "playback failed before Media3 started",
+    fileId = fileId,
+    detail = redactedFailureDetail(stage, error),
+    ua = "Android preflight",
+    reason = reason,
+)
+
+/** A stable failure fingerprint that cannot carry URLs, tokens, or media paths. */
+internal fun redactedFailureDetail(stage: String, error: Throwable): String =
+    "stage=$stage type=${error.javaClass.simpleName.ifBlank { "Exception" }}"
+
 /** Player values the telemetry path reads, isolated so its wiring is JVM-testable. */
 internal interface PlaybackTelemetryPlayer {
     val buffering: Boolean
