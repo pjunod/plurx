@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
-use hiqlite::{Client, Node, NodeConfig};
+use hiqlite::{Client, Node, NodeConfig, Row};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::{
     connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
@@ -45,8 +45,9 @@ use plurx_core::secrets::CredentialKey;
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore, TraktStore,
-    UserStore, WatchStore,
+    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
+    SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -63,6 +64,20 @@ const CONTRACT_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000090";
 
 #[cfg(feature = "hiqlite-store")]
 static HIQLITE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(feature = "hiqlite-store")]
+struct I64Value {
+    value: i64,
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl From<&mut Row<'_>> for I64Value {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            value: row.get("value"),
+        }
+    }
+}
 
 const SETTINGS_METHODS: &[&str] = &[
     "ping",
@@ -298,6 +313,101 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
     HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID, &telemetry_path)
         .await
         .expect("bootstrap contract store")
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect migration client");
+    let telemetry = cluster._root.path().join("schema-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .validation_reset_contract_state()
+        .await
+        .expect("empty migration fixture");
+    current
+        .put_setting("migration.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    let results = client
+        .txn([
+            (
+                "DROP INDEX IF EXISTS idx_reading_updated",
+                hiqlite::params!(),
+            ),
+            ("DROP TABLE IF EXISTS reading_state", hiqlite::params!()),
+            (
+                "UPDATE cluster_meta SET schema_version = $1 WHERE singleton = 1",
+                hiqlite::params!(AUTH_SCHEMA_MIGRATION_SOURCE),
+            ),
+        ])
+        .await
+        .expect("construct exact v5 fixture");
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v5 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 5 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v5 to v6 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.proof")
+            .await
+            .expect("read migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('reading_state')",
+            9,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_reading_updated'",
+            1,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
 }
 
 #[cfg(feature = "hiqlite-store")]

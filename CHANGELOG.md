@@ -10,6 +10,17 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Existing replicated installs now have a real v5 → v6 upgrade path.** The
+  ebook reading-state release raised the Hiqlite compatibility marker to v6
+  but only defined that schema for fresh bootstrap/import, so an activated v5
+  install failed before the daemon could do anything about it. Daemon startup
+  now accepts that one predecessor and commits the `reading_state` table, its
+  index, and the v6 cluster marker in one Raft transaction before any producer
+  or HTTP listener starts. It then atomically advances each node's activation
+  marker; either crash boundary converges on the next boot. Maintenance
+  commands remain strict clients of a running daemon and cannot initiate the
+  migration. Replicated v4 and future schemas still fail closed.
+
 - **Recording a regression mapping no longer conflicts every other open pull
   request.** Every corrective change used to append a `[[coverage]]` block to
   the tail of one `validation/regressions.toml`, so each merge to `main` put a
