@@ -415,8 +415,29 @@ class SubtitlePolicyTest {
             copyableVideo = false, aac = false, preserveDolbyVision = false,
             audioIndex = 0, audioOffsetMs = 0,
             quality = PlaybackQuality.Auto, sourceHeight = 2160,
+            deliveredDynamicRange = "sdr",
         )
         assertEquals(true, body.quality_auto)
+        assertNull("an existing transcode keeps the server's Auto rung", body.height)
+        assertEquals(
+            "the forced PGS track does not downgrade an already-SDR plan",
+            true,
+            body.subtitle_burn_sdr,
+        )
+    }
+
+    @Test
+    fun otherwiseCopyableAutoBurnPreservesSourceHeight() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Burn, subtitleIndex = 1,
+            copyableVideo = true, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+        )
+        assertEquals(2160, body.height)
+        assertEquals(true, body.quality_auto)
+        assertNull("an unacknowledged HDR delivery stays protected", body.subtitle_burn_sdr)
     }
 
     @Test
@@ -506,15 +527,44 @@ class SubtitlePolicyTest {
     }
 
     @Test
-    fun heightIsAPromiseForBurnsAndOriginalAndARungOtherwise() {
-        assertEquals(2160, sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160))
-        assertEquals(2160, sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.Burn, 2160))
-        assertEquals(2160, sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Plan, 2160))
-        assertNull(sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Plan, 2160))
-        assertEquals(720, sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.NativeSession, 2160))
+    fun heightPromiseDistinguishesCopyableBurnFromExistingTranscode() {
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160, copyableVideo = true),
+        )
+        assertNull(
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.Burn, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Plan, 2160, copyableVideo = false),
+        )
+        assertNull(
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Plan, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            720,
+            sessionHeight(
+                PlaybackQuality.Q720,
+                SubtitleDelivery.NativeSession,
+                2160,
+                copyableVideo = false,
+            ),
+        )
         // An unknown source height leaves the promise unmade rather than
         // inventing a rung the server would then snap.
-        assertNull(sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Burn, null))
+        assertNull(
+            sessionHeight(
+                PlaybackQuality.Original,
+                SubtitleDelivery.Burn,
+                null,
+                copyableVideo = false,
+            ),
+        )
     }
 
     @Test

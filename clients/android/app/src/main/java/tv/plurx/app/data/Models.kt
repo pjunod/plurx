@@ -609,6 +609,13 @@ data class CreateSessionReq(
      */
     val subtitle_burn: Int? = null,
     /**
+     * Acknowledge that the plan selected before this request already delivers
+     * SDR. This lets an HDR source keep its forced bitmap subtitle when the
+     * base transcode was already tone-mapping; it is never sent for an HDR
+     * delivery, where the server's anti-downgrade guard must still win.
+     */
+    val subtitle_burn_sdr: Boolean? = null,
+    /**
      * Advertise the source's WebVTT-convertible tracks as HLS renditions in
      * the master playlist. Changes only HLS metadata, never the video recipe,
      * so it composes with `copy` — which is the entire point of §5.4.
@@ -641,9 +648,9 @@ data class CreateSessionReq(
     /**
      * When true, signals this session's height is a promise (the viewer is on
      * Auto), so the server must not treat the posted height as a sticky manual
-     * pick. Every Auto viewer that sends a promise-height — a burn or
-     * Original — must carry this flag, or the server can never step that
-     * session down.
+     * pick. Every Auto viewer that sends a promise-height — an otherwise-
+     * copyable burn or Original — must carry this flag, or the server can
+     * never step that session down.
      */
     val quality_auto: Boolean? = null,
 )

@@ -104,11 +104,13 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   the corrected contracts and a decisions ledger (PERF-PLAN §8.6).
 - ✅ **M1 complete 2026-07-28:** the correction pass (PERF-PLAN §2.8), the
   fixture-matrix benchmark, 2-second segments, bounded rate control on every
-  encoder family with a probe that runs the production arguments, and an Auto
-  rung that means `min(source, 1080)` on hardware instead of 720p for
-  everything. Measured on the corpus: the CPU tone-map chain costs a quarter
-  of the pipeline's throughput (0.98× → 0.71× at 4K), which is what takes a
-  4K HDR session below realtime.
+  encoder family with a probe that runs the production arguments, and the
+  first encoder-aware Auto rung instead of 720p for everything. The original
+  hardware ceiling was 1080p; the 2026-08-21 correction now preserves known
+  SDR source geometry up to 2160p and leaves HDR at the separately measured
+  1080p output point. Measured on the corpus: the CPU tone-map chain costs a
+  quarter of the pipeline's throughput (0.98× → 0.71× at 4K), which is what
+  takes a 4K HDR session below realtime.
 - ✅ **M2 complete 2026-07-29:** GPU tone-map candidate graphs, the real-HDR
   boot probe, per-session routing and downgrade, and racing-safe hardware
   admission all shipped. The nynuc acceptance run measured the QSV path at
