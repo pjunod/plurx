@@ -1626,7 +1626,7 @@ async fn start_voter(
     nodes.push(local.clone());
     nodes.sort_by_key(|peer| peer.raft_id);
     nodes.dedup_by_key(|peer| peer.raft_id);
-    let nodes = nodes.iter().map(Node::from).collect();
+    let nodes = hiqlite_nodes_for_voter(&nodes, local.raft_id)?;
 
     // The daemon lock guards one data directory, but these ports are host-wide
     // and default to fixed values, so two data directories on one host collide.
@@ -1702,6 +1702,30 @@ async fn start_voter(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok((client, local))
+}
+
+/// Build Hiqlite's connection roster without treating durable Raft ids as
+/// vector positions.
+#[cfg(feature = "hiqlite-store")]
+fn hiqlite_nodes_for_voter(
+    peers: &[ClusterPeer],
+    local_raft_id: u64,
+) -> Result<Vec<Node>, StoreError> {
+    if !peers.iter().any(|peer| peer.raft_id == local_raft_id) {
+        return Err(StoreError::Identity(format!(
+            "local Raft id {local_raft_id} is absent from the configured peer list"
+        )));
+    }
+
+    let mut ids = BTreeSet::new();
+    if let Some(duplicate) = peers.iter().find(|peer| !ids.insert(peer.raft_id)) {
+        return Err(StoreError::Identity(format!(
+            "configured peer list contains duplicate Raft id {}",
+            duplicate.raft_id
+        )));
+    }
+
+    Ok(peers.iter().map(Node::from).collect())
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -2783,9 +2807,10 @@ mod tests {
                 api_address: "127.0.0.1:32502".to_owned(),
             },
         ];
+        let nodes = hiqlite_nodes_for_voter(&peers, 3).expect("build sparse connection roster");
         let config = NodeConfig {
             node_id: 3,
-            nodes: peers.iter().map(Node::from).collect(),
+            nodes,
             secret_raft: "0123456789abcdef".to_owned(),
             secret_api: "fedcba9876543210".to_owned(),
             ..NodeConfig::default()
