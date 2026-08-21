@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""End-to-end EPUB reader contract in real Chromium.
+
+Boots Cinema with its existing deterministic self-host harness, adds a generated
+EPUB 3 fixture, and proves the reader seam from detail action through durable
+locator restore. The fixture is hostile on purpose: script, event-handler,
+remote image, remote stylesheet, form, and external-link attempts must remain
+inert while local chapters, CSS, TOC, and search keep working.
+"""
+
+import argparse
+import json
+import re
+import runpy
+import shutil
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parent.parent
+HARNESS = runpy.run_path(str(ROOT / "scripts" / "ui-baseline"), run_name="reader_fixture_harness")
+SelfHost = HARNESS["SelfHost"]
+api = HARNESS["api"]
+Fail = HARNESS["Fail"]
+free_port = HARNESS["free_port"]
+
+
+class ProbeHandler(BaseHTTPRequestHandler):
+    hits = []
+
+    def do_GET(self):
+        type(self).hits.append(self.path)
+        self.send_response(204)
+        self.end_headers()
+
+    def do_POST(self):
+        type(self).hits.append(self.path)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, *_args):
+        pass
+
+
+def write_epub(path, probe_origin):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    paragraphs = "\n".join(
+        f'<p id="paragraph-{index}">Paragraph {index}. The lighthouse keeps this authored block stable across typography and viewport changes.</p>'
+        for index in range(1, 81)
+    )
+    entries = {
+        "META-INF/container.xml": """<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles>
+<rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/>
+</rootfiles></container>""",
+        "OEBPS/book.opf": """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">urn:uuid:cinema-reader-proof</dc:identifier><dc:title>Cinema Reader Proof</dc:title><dc:language>en</dc:language></metadata>
+<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="one" href="Text/one.xhtml" media-type="application/xhtml+xml"/><item id="two" href="Text/two.xhtml" media-type="application/xhtml+xml"/><item id="three" href="Text/three.xhtml" media-type="application/xhtml+xml"/>
+<item id="css" href="Styles/book.css" media-type="text/css"/></manifest>
+<spine><itemref idref="one"/><itemref idref="two"/><itemref idref="three"/></spine></package>""",
+        "OEBPS/nav.xhtml": """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Contents</title></head><body>
+<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><ol>
+<li><a href="Text/one.xhtml#chapter-one">Chapter One</a></li>
+<li><a href="Text/two.xhtml#chapter-two">Chapter Two</a><ol><li><a href="Text/two.xhtml#paragraph-42">The stable paragraph</a></li></ol></li>
+<li><a href="Text/three.xhtml#chapter-three">Chapter Three</a></li>
+</ol></nav></body></html>""",
+        "OEBPS/Styles/book.css": f"""body{{font-family:serif}} .publisher-proof{{border-left:3px solid #567}}
+@import url('{probe_origin}/remote-import.css');
+.remote-css{{background-image:url('{probe_origin}/css-leak.png')}}""",
+        "OEBPS/Text/one.xhtml": f"""<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title><link rel="stylesheet" href="../Styles/book.css"/><link rel="stylesheet" href="{probe_origin}/remote.css"/></head><body>
+<h1 id="chapter-one">Chapter One</h1><p class="publisher-proof">A local stylesheet still renders.</p>
+<script>parent.__cinemaEpubScriptRan=true;fetch('{probe_origin}/script-fetch')</script>
+<img src="{probe_origin}/remote-image.png" onerror="parent.__cinemaEpubHandlerRan=true" alt="hostile remote"/>
+<form action="{probe_origin}/form" method="post"><button>Submit hostile form</button></form>
+<a href="{probe_origin}/external" target="_top">Escape the reader</a>
+<p>Ordinary authored text remains readable after executable markup is removed.</p></body></html>""",
+        "OEBPS/Text/two.xhtml": f"""<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Two</title><link rel="stylesheet" href="../Styles/book.css"/></head><body>
+<h1 id="chapter-two">Chapter Two</h1>{paragraphs}</body></html>""",
+        "OEBPS/Text/three.xhtml": """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Three</title></head><body>
+<h1 id="chapter-three">Chapter Three</h1><p id="search-destination">The celestial needle appears only in this final chapter.</p>
+</body></html>""",
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        for name, body in entries.items():
+            archive.writestr(name, body, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def add_book(host, epub):
+    library = api(host.base_url, "/libraries", host.token, "POST", {
+        "name": "Reader Proof Books", "kind": "books", "paths": [str(epub.parent)], "anime": False,
+    })
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        state = api(host.base_url, "/scan/status", host.token).get(str(library["id"]))
+        if state and not state["running"] and state.get("last_scan"):
+            break
+        time.sleep(0.25)
+    else:
+        raise Fail("reader fixture library never finished scanning")
+    listing = api(host.base_url, f"/libraries/{library['id']}/items?limit=20&sort=title", host.token)
+    books = [item for item in listing["items"] if item["kind"] == "book"]
+    if len(books) != 1:
+        raise Fail(f"expected one reader fixture book, got {books}")
+    detail = api(host.base_url, f"/items/{books[0]['id']}", host.token)
+    files = [file for file in detail["files"] if file["filename"].lower().endswith(".epub")]
+    if len(files) != 1:
+        raise Fail(f"expected one EPUB file, got {detail['files']}")
+    return books[0], files[0]
+
+
+def state(host, book, file):
+    return api(host.base_url, f"/items/{book['id']}/reading-state?file_id={file['id']}", host.token)
+
+
+def run_browser(host, book, file, epub, probe):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise Fail("python Playwright is required (python3 -m pip install playwright)") from error
+
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1180, "height": 820})
+        context.add_init_script(
+            "if(window===window.top){localStorage.setItem('plurx_token',"
+            + json.dumps(host.token)
+            + ");localStorage.setItem('plurx_layout','classic');localStorage.removeItem('plurx_reader_prefs')}"
+        )
+        page = context.new_page()
+        page.on("pageerror", lambda error: errors.append(f"page: {error}"))
+        page.on("console", lambda message: errors.append(f"console: {message.text}") if message.type == "error" else None)
+        page.goto(f"{host.base_url}/#/item/{book['id']}", wait_until="networkidle")
+        read = page.get_by_role("button", name="Read", exact=True)
+        read.wait_for()
+        read.click()
+        page.wait_for_url(f"**/#/read/{book['id']}/{file['id']}")
+        page.locator("#reader-loading").wait_for(state="hidden")
+        frame = page.frame_locator("#reader-frame")
+        frame.locator("#chapter-one").wait_for()
+
+        # Script, inline handler, remote image/style/import, and form actions
+        # stay inert. The CSP report appears in Chromium's console as an error,
+        # so only uncaught runtime errors are fatal below; explicit CSP refusal
+        # messages are evidence and are filtered here.
+        time.sleep(0.5)
+        assert not page.evaluate("Boolean(window.__cinemaEpubScriptRan||window.__cinemaEpubHandlerRan)")
+        assert ProbeHandler.hits == [], f"publication escaped to network: {ProbeHandler.hits}"
+        sandbox = page.locator("#reader-frame").get_attribute("sandbox")
+        assert sandbox == "allow-same-origin", sandbox
+
+        # Authored nested TOC destination.
+        page.get_by_role("button", name="Contents", exact=True).click()
+        page.get_by_role("button", name="The stable paragraph", exact=True).click()
+        frame.locator("#paragraph-42").wait_for()
+
+        # Switch to scroll mode, anchor paragraph 42, then change type, page
+        # theme, margins, and viewport. The durable locator must remain the
+        # same authored paragraph rather than a nominal page number.
+        page.get_by_role("button", name="Aa", exact=True).click()
+        page.locator("#reader-flow").select_option("scrolled")
+        page.wait_for_timeout(100)
+        frame.locator("#paragraph-42").evaluate("el=>el.scrollIntoView({block:'start'})")
+        # A programmatic scroll may not dispatch a DOM `scroll` event in every
+        # engine. Capture exactly as the reader's debounced listener does after
+        # a user gesture.
+        page.evaluate("READER.navigator.emitLocation()")
+        snapshot = page.evaluate("""() => { const d=READER.navigator.document(), p=d.getElementById('paragraph-42'), root=d.scrollingElement; return {
+          locator:READER.locator, rect:p.getBoundingClientRect().toJSON(), scrollTop:root.scrollTop,
+          bodyScrollTop:d.body.scrollTop, rootHeight:root.scrollHeight, clientHeight:root.clientHeight
+        }}""")
+        assert snapshot.get("locator", {}).get("cinema") and "Paragraph 42" in snapshot["locator"]["cinema"]["text"], snapshot
+        before = page.evaluate("READER.locator.cinema.text")
+        page.locator("#reader-font").select_option("accessible")
+        page.locator("#reader-theme").select_option("sepia")
+        page.locator("#reader-size").evaluate("el=>{el.value='155';el.dispatchEvent(new Event('input',{bubbles:true}))}")
+        page.locator("#reader-margin").evaluate("el=>{el.value='12';el.dispatchEvent(new Event('input',{bubbles:true}))}")
+        page.wait_for_timeout(400)
+        after_preferences = page.evaluate("READER.locator.cinema.text")
+        assert before == after_preferences and "Paragraph 42" in after_preferences, ("preferences", before, after_preferences)
+        page.set_viewport_size({"width": 900, "height": 700})
+        page.wait_for_timeout(400)
+        after = page.evaluate("READER.locator.cinema.text")
+        assert before == after and "Paragraph 42" in after, ("viewport", before, after)
+        rect = frame.locator("#paragraph-42").bounding_box()
+        assert rect and rect["y"] < 700 and rect["y"] + rect["height"] > 0, rect
+
+        # Close flushes synchronously enough for the detail action and native
+        # state API to agree, then reopening restores the same paragraph.
+        page.get_by_role("button", name="Back to book detail").click()
+        page.wait_for_url(f"**/#/item/{book['id']}")
+        saved = state(host, book, file)["state"]
+        assert saved and "paragraph-42" in saved["locator"]["href"], saved
+        page.get_by_role("button", name=re.compile(r"^Resume reading")).click()
+        page.locator("#reader-loading").wait_for(state="hidden")
+        frame.locator("#paragraph-42").wait_for()
+        restored = frame.locator("#paragraph-42").bounding_box()
+        assert restored and restored["y"] < 700 and restored["y"] + restored["height"] > 0, restored
+
+        # Publication-local search and explicit completion toggles.
+        page.get_by_role("button", name="Search", exact=True).click()
+        page.locator("#reader-search-query").fill("celestial needle")
+        page.locator(".reader-search button").click()
+        page.locator(".reader-search-results button").wait_for()
+        page.locator(".reader-search-results button").click()
+        frame.locator("#search-destination").wait_for()
+        page.get_by_role("button", name="Mark finished", exact=True).click()
+        page.get_by_role("button", name="Mark unfinished", exact=True).wait_for()
+        assert state(host, book, file)["state"]["completed"] is True
+        page.get_by_role("button", name="Mark unfinished", exact=True).click()
+        page.get_by_role("button", name="Mark finished", exact=True).wait_for()
+        assert state(host, book, file)["state"]["completed"] is False
+
+        # Two completion gestures in one request turn must serialize. The
+        # older response cannot overwrite the newer local intent or make close
+        # return before the coalesced write is durable.
+        page.evaluate("Promise.all([setReaderCompleted(true),setReaderCompleted(false)])")
+        assert state(host, book, file)["state"]["completed"] is False
+        page.get_by_role("button", name="Mark finished", exact=True).wait_for()
+
+        page.get_by_role("button", name="Back to book detail").click()
+        page.wait_for_url(f"**/#/item/{book['id']}")
+
+        # Mutating bytes without a scan leaves the DB revision pinned to the
+        # old file. Opening must fail as stale and keep both escape hatches.
+        with epub.open("ab") as handle:
+            handle.write(b"changed")
+        page.get_by_role("button", name=re.compile(r"^Resume reading")).click()
+        page.get_by_text("The book file changed", exact=False).wait_for()
+        fallback = page.locator("#reader-loading")
+        assert fallback.get_by_role("link", name="Open in…").is_visible()
+        assert fallback.get_by_role("link", name="Download original").is_visible()
+
+        assert ProbeHandler.hits == [], f"publication escaped to network: {ProbeHandler.hits}"
+        browser.close()
+
+    expected_errors = (
+        "Content Security Policy",
+        "Refused to",
+        "because the document's frame is sandboxed",
+        "status of 409 (Conflict)",
+    )
+    unexpected = [entry for entry in errors if not any(marker in entry for marker in expected_errors)]
+    if unexpected:
+        raise Fail("browser errors:\n  " + "\n  ".join(unexpected))
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", default=str(ROOT / "target" / "reader-browser"))
+    parser.add_argument("--port", type=int, default=32513)
+    parser.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
+    parser.add_argument("--server-bin")
+    parser.add_argument("--keep-server", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv):
+    args = parse_args(argv)
+    host_args = SimpleNamespace(
+        out=args.out, port=args.port, ffmpeg=args.ffmpeg, server_bin=args.server_bin,
+        library=None, item=None, player_item=None, search_query=None,
+    )
+    host = SelfHost(host_args)
+    probe_port = free_port(32514)
+    probe = ThreadingHTTPServer(("127.0.0.1", probe_port), ProbeHandler)
+    probe_thread = threading.Thread(target=probe.serve_forever, daemon=True)
+    probe_thread.start()
+    try:
+        ProbeHandler.hits.clear()
+        host.start()
+        epub = Path(args.out).resolve() / "media" / "books" / "Cinema Reader Proof.epub"
+        write_epub(epub, f"http://127.0.0.1:{probe_port}")
+        book, file = add_book(host, epub)
+        run_browser(host, book, file, epub, probe)
+        print("reader-browser: open, restore, style, TOC, search, finish, stale revision, and hostile-content checks passed")
+        return 0
+    except (Fail, AssertionError) as error:
+        print(f"reader-browser: {error}", file=sys.stderr)
+        return 1
+    finally:
+        probe.shutdown()
+        probe.server_close()
+        if not args.keep_server:
+            host.stop()
+        else:
+            print(f"server left running at {host.base_url} (token {host.token})")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
