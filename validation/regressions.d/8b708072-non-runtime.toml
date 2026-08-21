@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["8b708072"]
+points = []
+checks = []
+reason = "This commit re-adds the Intro/credits parity row approved in e5555745 that base-sync merge 4ec2dd10 replaced with main's generic row; it only restores documentation describing the estimated-marker behavior already implemented in f9ba32a7 and covered by the Apple client suite, so it has no runtime behavior of its own to validate."
+ignore = true
