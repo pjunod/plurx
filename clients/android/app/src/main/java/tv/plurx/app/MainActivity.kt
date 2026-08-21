@@ -34,6 +34,7 @@ import tv.plurx.app.ui.DownloadsScreen
 import tv.plurx.app.ui.HomeScreen
 import tv.plurx.app.ui.LibraryScreen
 import tv.plurx.app.ui.LoginScreen
+import tv.plurx.app.ui.OfflineBookReaderScreen
 import tv.plurx.app.ui.Phase
 import tv.plurx.app.ui.PhotoScreen
 import tv.plurx.app.ui.ReaderScreen
@@ -163,7 +164,17 @@ private fun MainNav(vm: AppViewModel) {
             DownloadsScreen(
                 vm = vm,
                 onPlay = { id -> nav.navigate("offline/$id") },
+                onRead = { id -> nav.navigate("offline-book/$id") },
                 onBack = { nav.popBackStack() },
+            )
+        }
+        composable(
+            "offline-book/{id}",
+            arguments = listOf(navArgument("id") { type = NavType.StringType }),
+        ) { entry ->
+            OfflineBookReaderScreen(
+                bookId = entry.arguments!!.getString("id").orEmpty(),
+                onExit = { nav.popBackStack() },
             )
         }
         composable(

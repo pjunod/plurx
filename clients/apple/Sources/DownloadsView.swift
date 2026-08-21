@@ -5,19 +5,33 @@ import UIKit
 struct DownloadsView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var downloads = OfflineDownloadManager.shared
+    @ObservedObject private var bookDownloads = OfflineBookManager.shared
     @State private var playing: OfflineItem?
+    @State private var reading: OfflineBook?
     @State private var profileToDelete: OfflineProfileSummary?
 
     var body: some View {
         Group {
-            if downloads.items.isEmpty && downloads.otherProfiles.isEmpty {
+            if downloads.items.isEmpty && bookDownloads.books.isEmpty && combinedOtherProfiles.isEmpty {
                 ContentUnavailableView(
                     "No downloads yet",
                     systemImage: "arrow.down.circle",
-                    description: Text("Tap Download on a movie or episode to watch it without a connection.")
+                    description: Text("Tap Download on a book, movie, or episode to use it without a connection.")
                 )
             } else {
                 List {
+                    if !bookDownloads.books.isEmpty {
+                        Section("Books") {
+                            ForEach(bookDownloads.books) { book in
+                                OfflineBookRow(book: book) {
+                                    if book.isPlayable { reading = book }
+                                } remove: {
+                                    Task { await bookDownloads.remove(book) }
+                                }
+                            }
+                        }
+                    }
+
                     if !downloads.items.isEmpty {
                         Section {
                             ForEach(downloads.items) { item in
@@ -36,9 +50,9 @@ struct DownloadsView: View {
                         }
                     }
 
-                    if !downloads.otherProfiles.isEmpty {
+                    if !combinedOtherProfiles.isEmpty {
                         Section("Other profiles") {
-                            ForEach(downloads.otherProfiles) { profile in
+                            ForEach(combinedOtherProfiles) { profile in
                                 HStack {
                                     Image(systemName: "person.crop.circle.badge.clock")
                                     VStack(alignment: .leading, spacing: 3) {
@@ -66,11 +80,15 @@ struct DownloadsView: View {
         .navigationTitle("Downloads")
         .task {
             await downloads.refresh()
+            await bookDownloads.refresh()
             await downloads.resumePendingPreparation()
+            await bookDownloads.syncPendingProgress()
         }
         .refreshable {
             await downloads.refresh()
+            await bookDownloads.refresh()
             await downloads.resumePendingPreparation()
+            await bookDownloads.syncPendingProgress()
         }
         .fullScreenCover(item: $playing) { item in
             PlayerView(
@@ -85,6 +103,9 @@ struct DownloadsView: View {
             .id(item.id)
             .environmentObject(model)
         }
+        .fullScreenCover(item: $reading) { book in
+            OfflineBookReaderView(book: book)
+        }
         .confirmationDialog(
             "Delete this profile's downloads?",
             isPresented: Binding(
@@ -95,7 +116,10 @@ struct DownloadsView: View {
         ) {
             Button("Delete downloads", role: .destructive) {
                 guard let profile = profileToDelete else { return }
-                Task { await downloads.removeOtherProfile(profile) }
+                Task {
+                    await downloads.removeOtherProfile(profile)
+                    await bookDownloads.removeProfile(profile)
+                }
                 profileToDelete = nil
             }
             Button("Keep", role: .cancel) { profileToDelete = nil }
@@ -109,8 +133,78 @@ struct DownloadsView: View {
         return "On this device · \(Self.bytes(bytes))"
     }
 
+    private var combinedOtherProfiles: [OfflineProfileSummary] {
+        var values: [String: OfflineProfileSummary] = [:]
+        for profile in downloads.otherProfiles + bookDownloads.otherProfiles {
+            let current = values[profile.id]
+            values[profile.id] = OfflineProfileSummary(
+                serverInstanceId: profile.serverInstanceId,
+                userId: profile.userId,
+                items: (current?.items ?? 0) + profile.items,
+                bytes: (current?.bytes ?? 0) + profile.bytes
+            )
+        }
+        return values.values.sorted { $0.id < $1.id }
+    }
+
     private static func bytes(_ value: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+}
+
+private struct OfflineBookRow: View {
+    let book: OfflineBook
+    let read: () -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 14) {
+            if let cover = book.coverRelativePath,
+               let image = UIImage(contentsOfFile: OfflineCatalog.localURL(for: cover).path) {
+                Image(uiImage: image).resizable().scaledToFill()
+                    .frame(width: 48, height: 72).clipShape(RoundedRectangle(cornerRadius: 7))
+            } else {
+                Image(systemName: book.isPlayable ? "book.fill" : stateIcon)
+                    .frame(width: 48, height: 72)
+                    .foregroundStyle(book.isPlayable ? Palette.accent : .secondary)
+                    .background(Palette.surfaceHi, in: RoundedRectangle(cornerRadius: 7))
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(book.title).font(.headline).foregroundStyle(Palette.onBg)
+                if let author = book.author { Text(author).font(.subheadline).foregroundStyle(.secondary) }
+                Text(stateLabel).font(.caption).foregroundStyle(.secondary)
+                if book.state == .downloading, book.bytesTotal > 0 {
+                    ProgressView(value: Double(book.bytesDownloaded), total: Double(book.bytesTotal))
+                        .tint(Palette.accent)
+                }
+                if let error = book.errorMessage { Text(error).font(.caption).foregroundStyle(.red) }
+            }
+            Spacer()
+            Button(role: .destructive, action: remove) { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
+        }
+        .contentShape(Rectangle()).onTapGesture(perform: read)
+    }
+
+    private var stateIcon: String {
+        switch book.state {
+        case .intent: return "clock"
+        case .downloading: return "arrow.down"
+        case .downloaded: return "book.fill"
+        case .failed, .missing: return "exclamationmark.triangle"
+        }
+    }
+
+    private var stateLabel: String {
+        switch book.state {
+        case .intent: return "Queued"
+        case .downloading: return "Downloading original EPUB"
+        case .downloaded:
+            let progress = Int((book.progression * 100).rounded())
+            return progress > 0 ? "Downloaded · \(progress)% read" : "Downloaded"
+        case .failed: return "Download failed"
+        case .missing: return "Download missing"
+        }
     }
 }
 

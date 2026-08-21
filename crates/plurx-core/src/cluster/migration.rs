@@ -38,7 +38,7 @@ use crate::secrets::{self, CredentialKey, SealedRowCensus};
 #[cfg(feature = "hiqlite-store")]
 use crate::store::{
     HiqliteAuthStore, SettingsStore, SqliteImportReport, SqliteImportTableDigest, SqliteStore,
-    Store, TraktStore, AUTH_SCHEMA_VERSION,
+    Store, TraktStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
@@ -878,7 +878,8 @@ impl ActivationMarker {
         }
         if self.cluster_id.trim().is_empty()
             || self.source_schema_version <= 0
-            || self.replicated_schema_version != AUTH_SCHEMA_VERSION
+            || (self.replicated_schema_version != AUTH_SCHEMA_MIGRATION_SOURCE
+                && self.replicated_schema_version != AUTH_SCHEMA_VERSION)
             || !is_sha256(&self.source_backup_sha256)
             || self.table_hashes.is_empty()
         {
@@ -1242,7 +1243,7 @@ async fn open_active_store_with_key(
 ) -> Result<SelectedStore, StoreError> {
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     require_real_directory(&active)?;
-    let marker = read_activation_marker(&active)?;
+    let mut marker = read_activation_marker(&active)?;
     let mut local_membership = read_local_membership(&config.storage.data_dir)?;
     let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     if let Some(membership) = &local_membership {
@@ -1265,10 +1266,17 @@ async fn open_active_store_with_key(
         force_loopback,
     )
     .await?;
-    let store = match HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await {
-        Ok(store) => store,
-        Err(error) => return Err(error),
-    };
+    let store =
+        match HiqliteAuthStore::open_or_migrate(client.clone(), &active.join("telemetry.db")).await
+        {
+            Ok(store) => store,
+            Err(error) => return Err(error),
+        };
+    if marker.replicated_schema_version != AUTH_SCHEMA_VERSION {
+        marker.replicated_schema_version = AUTH_SCHEMA_VERSION;
+        write_activation_marker(&active, &marker)?;
+        sync_directory(&active)?;
+    }
     if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
         drop(store);
         return Err(error);
@@ -2765,6 +2773,36 @@ mod tests {
     /// not observe a *different* live process may print it.
     #[cfg(feature = "hiqlite-store")]
     const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn activation_marker_accepts_only_the_supported_upgrade_window() {
+        let marker = |replicated_schema_version| ActivationMarker {
+            marker_version: ACTIVATION_MARKER_VERSION,
+            cluster_id: "cluster-a".to_owned(),
+            source_backup_sha256: "0".repeat(64),
+            source_schema_version: 20,
+            replicated_schema_version,
+            imported_rows: 0,
+            table_hashes: vec![SqliteImportTableDigest {
+                table: "settings".to_owned(),
+                row_count: 0,
+                sha256: "0".repeat(64),
+            }],
+        };
+        marker(AUTH_SCHEMA_MIGRATION_SOURCE)
+            .validate()
+            .expect("v5 marker must reach the v6 daemon migration");
+        marker(AUTH_SCHEMA_VERSION)
+            .validate()
+            .expect("current marker");
+        for unsupported in [AUTH_SCHEMA_MIGRATION_SOURCE - 1, AUTH_SCHEMA_VERSION + 1] {
+            let error = marker(unsupported)
+                .validate()
+                .expect_err("unsupported marker must fail before voter startup");
+            assert!(error.to_string().contains("incomplete"), "{error}");
+        }
+    }
 
     /// A predecessor still closing its handle is not a second daemon.
     ///

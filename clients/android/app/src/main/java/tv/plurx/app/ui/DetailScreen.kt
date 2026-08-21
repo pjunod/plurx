@@ -95,6 +95,7 @@ import tv.plurx.app.ui.theme.Bg
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Outline
 import tv.plurx.app.ui.theme.SurfaceHi
+import tv.plurx.app.data.offline.OfflineBooks
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.needsExplicitResume
 
@@ -512,6 +513,7 @@ private fun Actions(
     val context = androidx.compose.ui.platform.LocalContext.current
     val formFactor = currentFormFactor()
     val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
+    val offlineBookRecords by vm.offlineBookRecords.collectAsStateWithLifecycle()
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* denial is benign; Android still exposes foreground work */ }
@@ -528,6 +530,10 @@ private fun Actions(
     // two have to read the same choice.
     val chosenTracks = playable?.let { trackChoices[it.id] } ?: PreplayTracks.NONE
     val offline = playable?.let { file -> offlineRecords.firstOrNull {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
+            it.fileId == file.id
+    } }
+    val offlineBook = playable?.let { file -> offlineBookRecords.firstOrNull {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
             it.fileId == file.id
     } }
@@ -556,6 +562,34 @@ private fun Actions(
                         ) { Text(bookReadingLabel(reading, playable), fontWeight = FontWeight.SemiBold) }
                     }
                 }
+                if (playable.isEpub && OfflineBooks.canUse(context)) {
+                    item {
+                        TvOutlinedButton(
+                            enabled = offlineBook?.isPlayable != true,
+                            onClick = {
+                                when {
+                                    offlineBook == null || offlineBook.state in setOf("failed", "missing") -> {
+                                        downloadError = vm.queueOfflineBook(item, playable)
+                                    }
+                                    else -> {
+                                        downloadError = null
+                                        vm.removeOfflineBook(offlineBook)
+                                    }
+                                }
+                            },
+                        ) {
+                            Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Text(
+                                when {
+                                    offlineBook == null -> "  Download"
+                                    offlineBook.isPlayable -> "  Downloaded"
+                                    offlineBook.state in setOf("failed", "missing") -> "  Download again"
+                                    else -> "  Cancel download"
+                                },
+                            )
+                        }
+                    }
+                }
                 item {
                     TvOutlinedButton(
                         onClick = {
@@ -563,6 +597,15 @@ private fun Actions(
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                         },
                     ) { Text("Open in…", fontWeight = FontWeight.SemiBold) }
+                }
+                downloadError?.let { message ->
+                    item {
+                        Text(
+                            message,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
             }
         } else if (seriesPlayback != null) {

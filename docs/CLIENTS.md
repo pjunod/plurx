@@ -122,7 +122,17 @@ that origin's root, bundled assets, and one publication capability. Neither
 bridge offers JavaScript a token getter. Closing waits for the locator save,
 destroys the publication session, clears JavaScript authority, and returns to
 detail; profile loss dismisses the reader. tvOS and Google TV compile the
-shared models but never expose **Read**. Offline EPUB startup remains M4.
+shared models but never expose **Read**. iPhone, iPad, and Android phone/tablet
+also keep a profile/revision-scoped original EPUB in app-private storage. A
+bounded declared-resource cache is published beside it with one atomic rename.
+Apple serves it through a private same-origin WebKit scheme and blocks HTTP(S)
+at WebKit's loader boundary; Android serves it through a synthetic HTTPS origin
+whose shell and publication requests are all intercepted locally. Neither
+offline WebView contains a bearer or usable network origin. Reading positions
+remain local while disconnected and only the newest dated locator for the
+exact edition is replayed after reconnect. Television clients remain
+intentionally excluded; the physical airplane-mode/reconnect device matrix
+remains an explicit, unclaimed release check.
 
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized

@@ -411,6 +411,161 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    func testOfflineBookPathsStayInsideThePublicationAndPrivateScheme() throws {
+        XCTAssertEqual(
+            OfflineBookManager.safePublicationPath("OPS/Text/chapter%201.xhtml#part"),
+            "OPS/Text/chapter 1.xhtml"
+        )
+        XCTAssertEqual(
+            OfflineBookManager.safePublicationPath("OPS/Styles/../Text/chapter.xhtml"),
+            "OPS/Text/chapter.xhtml"
+        )
+        XCTAssertNil(OfflineBookManager.safePublicationPath("../../outside"))
+        XCTAssertNil(OfflineBookManager.safePublicationPath("OPS/C:\\secret"))
+
+        let local = URL(string: "cinema-book://offline/publication/OPS/Text/chapter.xhtml")!
+        XCTAssertEqual(
+            OfflineBookResourceResolver.publicationPath(for: local),
+            "OPS/Text/chapter.xhtml"
+        )
+        XCTAssertNil(OfflineBookResourceResolver.publicationPath(
+            for: URL(string: "https://attacker.invalid/publication/OPS/Text/chapter.xhtml")!
+        ))
+        XCTAssertNil(OfflineBookResourceResolver.publicationPath(
+            for: URL(string: "cinema-book://offline/publication/../../offline-reader.js")!
+        ))
+        XCTAssertTrue(OfflineBookNetworkPolicy.contentRuleList.contains("^https?://"))
+        XCTAssertTrue(OfflineBookNetworkPolicy.contentRuleList.contains("\"type\":\"block\""))
+    }
+
+    func testOfflineBookCatalogIsProfileScopedAndKeepsNewestPendingLocator() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-books-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let catalog = OfflineBookCatalog(directory: directory)
+
+        func book(
+            id: String,
+            server: String,
+            user: Int,
+            item: Int,
+            fileId: Int = 90,
+            revision: ReadingRevision = ReadingRevision(size: 4096, mtime: 100),
+            recordedAt: Int
+        ) -> OfflineBook {
+            OfflineBook(
+                id: id,
+                serverInstanceId: server,
+                userId: user,
+                itemId: item,
+                fileId: fileId,
+                revision: revision,
+                title: "Contract Book",
+                author: "A. Reader",
+                originalFilename: "contract.epub",
+                coverRelativePath: nil,
+                publication: PublicationManifest(
+                    metadata: PublicationMetadata(title: "Contract Book", author: "A. Reader"),
+                    readingOrder: [PublicationLink(
+                        href: "Text/chapter.xhtml", type: "application/xhtml+xml"
+                    )],
+                    resources: [],
+                    toc: []
+                ),
+                limits: PublicationLimits(
+                    entries: 1,
+                    totalUncompressedBytes: 8192,
+                    resourceBytes: 4096,
+                    markupBytes: 4096,
+                    compressionRatio: 100,
+                    concurrentResourceReads: 2,
+                    resourceChunkBytes: 1024
+                ),
+                state: .downloaded,
+                phase: "ready",
+                bytesDownloaded: 8192,
+                bytesTotal: 8192,
+                localPublicationRelativePath: "Library/Application Support/OfflineBooks/\(id)",
+                locator: ReadingLocator(
+                    version: 1,
+                    href: "Text/chapter.xhtml",
+                    locations: ReadingLocations(totalProgression: Double(recordedAt) / 100)
+                ),
+                progression: Double(recordedAt) / 100,
+                completed: false,
+                recordedAt: recordedAt,
+                pendingProgress: true,
+                preferences: OfflineBookPreferences(),
+                errorMessage: nil,
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(recordedAt))
+            )
+        }
+
+        try await catalog.upsert(book(id: "old", server: "server-a", user: 7, item: 11, recordedAt: 40))
+        try await catalog.upsert(book(id: "new", server: "server-a", user: 7, item: 11, recordedAt: 70))
+        try await catalog.upsert(book(
+            id: "other-edition",
+            server: "server-a",
+            user: 7,
+            item: 11,
+            fileId: 91,
+            revision: ReadingRevision(size: 8192, mtime: 200),
+            recordedAt: 60
+        ))
+        try await catalog.upsert(book(id: "other", server: "server-b", user: 7, item: 11, recordedAt: 90))
+
+        var recovering = book(
+            id: "recovered",
+            server: "server-a",
+            user: 7,
+            item: 12,
+            recordedAt: 50
+        )
+        recovering.state = .downloading
+        recovering.localPublicationRelativePath = nil
+        recovering.pendingProgress = false
+        let recoveredRoot = directory.appendingPathComponent("recovered", isDirectory: true)
+        let resourceRoot = recoveredRoot.appendingPathComponent("publication", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: resourceRoot.appendingPathComponent("Text", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x45, count: 4096).write(
+            to: recoveredRoot.appendingPathComponent("book.epub")
+        )
+        try JSONEncoder().encode(try XCTUnwrap(recovering.publication)).write(
+            to: recoveredRoot.appendingPathComponent("publication.json")
+        )
+        try Data("<html><body>Recovered</body></html>".utf8).write(
+            to: resourceRoot.appendingPathComponent("Text/chapter.xhtml")
+        )
+        try await catalog.upsert(recovering)
+
+        let current = await catalog.currentProfile(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(
+            Set(current.map(\.id)),
+            Set(["old", "new", "other-edition", "recovered"])
+        )
+        let pending = await catalog.newestPending(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(pending.map(\.id), ["other-edition", "new"])
+        let others = await catalog.otherProfiles(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(others.first?.items, 1)
+
+        let restored = OfflineBookCatalog(directory: directory)
+        let restoredCurrent = await restored.currentProfile(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(
+            Set(restoredCurrent.map(\.id)),
+            Set(["old", "new", "other-edition", "recovered"])
+        )
+        try await restored.reconcileLocalPublications()
+        let reconciled = await restored.book(id: "new")
+        XCTAssertEqual(reconciled?.state, .missing)
+        let recovered = await restored.book(id: "recovered")
+        XCTAssertEqual(recovered?.state, .downloaded)
+        XCTAssertNotNil(recovered?.localPublicationRelativePath)
+        XCTAssertGreaterThan(recovered?.bytesDownloaded ?? 0, 0)
+    }
+
     func testNativeBookActionLabelsResumeAndExplicitCompletion() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

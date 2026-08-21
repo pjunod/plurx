@@ -223,6 +223,12 @@ data class ReadingText(
 )
 
 @Serializable
+data class ReadingCinemaLocator(
+    val path: List<Int> = emptyList(),
+    val text: String? = null,
+)
+
+@Serializable
 data class ReadingLocator(
     val version: Int,
     val href: String,
@@ -230,6 +236,59 @@ data class ReadingLocator(
     val title: String? = null,
     val locations: ReadingLocations? = null,
     val text: ReadingText? = null,
+    val cinema: ReadingCinemaLocator? = null,
+)
+
+@Serializable
+data class PublicationMetadata(
+    val title: String,
+    val author: String? = null,
+    val identifier: String? = null,
+    val language: String? = null,
+)
+
+@Serializable
+data class PublicationLink(
+    val href: String,
+    val type: String,
+    val title: String? = null,
+)
+
+@Serializable
+data class PublicationTocLink(
+    val href: String,
+    val title: String,
+    val children: List<PublicationTocLink> = emptyList(),
+)
+
+@Serializable
+data class PublicationManifest(
+    val metadata: PublicationMetadata,
+    val readingOrder: List<PublicationLink>,
+    val resources: List<PublicationLink> = emptyList(),
+    val toc: List<PublicationTocLink> = emptyList(),
+)
+
+@Serializable
+data class PublicationLimits(
+    val entries: Int,
+    val total_uncompressed_bytes: Long,
+    val resource_bytes: Long,
+    val markup_bytes: Long,
+    val compression_ratio: Long,
+    val concurrent_resource_reads: Int,
+    val resource_chunk_bytes: Int,
+)
+
+@Serializable
+data class OpenPublicationResponse(
+    val session_id: String,
+    val resource_base: String,
+    val expires_in: Long,
+    val file_id: Long,
+    val revision: ReadingRevision,
+    val publication: PublicationManifest,
+    val limits: PublicationLimits,
 )
 
 @Serializable

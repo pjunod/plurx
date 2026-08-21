@@ -59,6 +59,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @ObservedObject private var downloads = OfflineDownloadManager.shared
+    @ObservedObject private var bookDownloads = OfflineBookManager.shared
     #endif
     #if DEBUG
     private let playbackAcceptance = PlaybackAcceptanceLaunch.current()
@@ -70,7 +71,7 @@ struct RootView: View {
             switch model.phase {
             case .loading:
                 #if os(iOS)
-                if downloads.items.isEmpty {
+                if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ProgressView().tint(Palette.accent)
                 } else {
                     NavigationStack { DownloadsView() }
@@ -84,7 +85,7 @@ struct RootView: View {
                 LoginView()
             case .reconnectFailed:
                 #if os(iOS)
-                if downloads.items.isEmpty {
+                if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ReconnectView()
                 } else {
                     NavigationStack { DownloadsView() }
@@ -116,10 +117,12 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task { await downloads.resumePendingPreparation() }
+            Task { await bookDownloads.syncPendingProgress() }
         }
         .onChange(of: model.phase) { _, phase in
             guard phase == .ready else { return }
             Task { await downloads.resumePendingPreparation() }
+            Task { await bookDownloads.syncPendingProgress() }
         }
         #endif
     }
