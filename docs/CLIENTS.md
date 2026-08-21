@@ -134,6 +134,14 @@ exact edition is replayed after reconnect. Television clients remain
 intentionally excluded; the physical airplane-mode/reconnect device matrix
 remains an explicit, unclaimed release check.
 
+**Native PDF reading** — iPhone and iPad use PDFKit for online PDFs. Cinema
+downloads the authenticated original into an app-private temporary directory,
+requires its byte count to match the server's exact size/mtime revision, and
+removes it when the reader closes. Page locators use the shared reading-state
+API, local search stays on the device, and password-protected or
+accessibility-restricted documents fail closed. PDF offline reading, web,
+Android, and television remain external handoff surfaces.
+
 **Ebook format actions** come from the server's per-file reader registry, not
 from whatever extension a client happens to recognize. **Read** means Cinema
 owns a renderer and locator on that surface. **Open in…** means Cinema serves
@@ -145,7 +153,7 @@ mode reading; it does not count a third-party app retaining an exported copy.
 | Format | Web online | Apple online / offline | Android online / offline | Television |
 |---|---|---|---|---|
 | EPUB | Read | Read / Read | Read / Read | — |
-| PDF | Open in… | Open in… / — | Open in… / — | — |
+| PDF | Open in… | Read / — | Open in… / — | — |
 | MOBI | Open in… | Open in… / — | Open in… / — | — |
 | AZW / AZW3 | Open in… | Open in… / — | Open in… / — | — |
 | FB2 | Open in… | Open in… / — | Open in… / — | — |
