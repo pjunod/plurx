@@ -18,6 +18,10 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 /// Pure playback-routing policy, separated from the player adapter so the
 /// decisions that change bytes or transport can run under Node unit tests.
 const PLAYBACK_POLICY_JS: &str = include_str!("../web/playback-policy.js");
+/// EPUB pagination, locator, and sandbox-frame policy. Kept out of the app
+/// shell so native WebViews can reuse the same navigator in M3.
+const READER_JS: &str = include_str!("../web/reader.js");
+const READER_CSS: &str = include_str!("../web/reader.css");
 /// hls.js (bundled for the transcode playback path; keeps the single-binary,
 /// works-offline promise instead of a CDN dependency).
 const HLS_JS: &str = include_str!("../web/hls.min.js");
@@ -56,6 +60,32 @@ pub async fn playback_policy_js() -> Response {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         PLAYBACK_POLICY_JS,
+    )
+        .into_response()
+}
+
+/// Serve the unit-tested EPUB navigator shared by the browser reader.
+pub async fn reader_js() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        READER_JS,
+    )
+        .into_response()
+}
+
+/// Serve the trusted reader chrome; publication styles stay inside the frame.
+pub async fn reader_css() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        READER_CSS,
     )
         .into_response()
 }
@@ -197,7 +227,7 @@ pub async fn fallback(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{connection_qr_svg, INDEX_HTML, PLAYBACK_POLICY_JS};
+    use super::{connection_qr_svg, INDEX_HTML, PLAYBACK_POLICY_JS, READER_JS};
 
     #[test]
     fn app_shell_shows_the_running_build_to_signed_in_and_signed_out_users() {
@@ -217,6 +247,17 @@ mod tests {
             .expect("player script");
         assert!(policy < player);
         assert!(PLAYBACK_POLICY_JS.contains("function initialRoute"));
+    }
+
+    #[test]
+    fn app_shell_loads_the_reader_boundary_before_its_route() {
+        let asset = INDEX_HTML.find("/assets/reader.js").expect("reader asset");
+        let route = INDEX_HTML
+            .find("async function viewReader")
+            .expect("reader route");
+        assert!(asset < route);
+        assert!(READER_JS.contains("class FrameNavigator"));
+        assert!(READER_JS.contains("stripExecutableMarkup"));
     }
 
     #[test]

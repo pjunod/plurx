@@ -266,6 +266,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root_dispatch))
         .route("/assets/hls.min.js", get(web::hls_js))
         .route("/assets/playback-policy.js", get(web::playback_policy_js))
+        .route("/assets/reader.js", get(web::reader_js))
+        .route("/assets/reader.css", get(web::reader_css))
         .route("/connect.svg", get(web::connect_qr))
         // PWA install assets + the sideloadable Android APK.
         .route("/manifest.webmanifest", get(web::manifest))
@@ -5722,6 +5724,8 @@ mod tests {
             "/icons/apple-touch-icon.png",
             "/assets/hls.min.js",
             "/assets/playback-policy.js",
+            "/assets/reader.js",
+            "/assets/reader.css",
             "/healthz",
             "/readyz",
             "/metrics",

@@ -252,8 +252,13 @@ therefore **the client's**. The Apple client implements one
 strictly lower rung end in the ordinary stall failure; an unstated height —
 `0`, or absent — counts as no step down; and a minute of recovered film starts
 a fresh episode, so one blip cannot disable recovery for the rest of a title).
-Android has not adopted the wire yet, so a client without that bound will keep
-being answered at the floor.
+Android client implements one too (`StallReopenBudget`: three consecutive
+reopens at the same resolved rung exhaust the budget; an explicit strict
+downgrade — a server response whose height is strictly lower than the
+predecessor — resets the count; a user-initiated seek, quality switch, or
+track change resets the budget; a 400 (bad request) fires an unbound retry
+with a fresh request id; and `quality_auto: true` is sent for an Auto viewer
+with a burned subtitle so the server does not make that session sticky).
 
 The floor is the predecessor's own rung, not 360. Auto is not
 ladder-constrained below 360 — a sub-360 source resolves there, and a starved
@@ -275,8 +280,8 @@ fields and keep their existing behavior. A client must therefore treat that
 `400` as fall-back-to-unbound-create rather than a playback failure: a
 retryable error that fires *after* the claim was normalized replays as
 `invalid stall reopen` for the same `request_id`, so the retry has to drop the
-binding and mint a fresh id. Apple does this; Android adoption remains a
-separate client change, and until then this endpoint addition is inert there.
+binding and mint a fresh id. Both Apple and Android do this;
+the unbound retry replaces an invalid reopen without a terminal failure.
 
 ## Phase 3 — seamless switching (optional, the majors' UX)
 

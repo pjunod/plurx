@@ -188,7 +188,10 @@ data class MediaFileDto(
     val available: Boolean = true,
     val probed: Boolean = true,
     val missing_path: String? = null,
-)
+) {
+    val isEpub: Boolean
+        get() = container.equals("epub", ignoreCase = true) || filename.endsWith(".epub", ignoreCase = true)
+}
 
 @Serializable
 data class BookChapter(
@@ -456,6 +459,11 @@ data class Decision(
 data class HlsStart(
     val session_id: String,
     val playlist_url: String,
+    /**
+     * The normalized height the server resolved for this session. The
+     * authoritative answer a stall reopen reads to detect the floor.
+     */
+    val height: Int? = null,
     val duration_ms: Long? = null,
     val start_seconds: Double = 0.0,
     /**
@@ -482,6 +490,16 @@ data class HlsStart(
      */
     val delivered_dynamic_range: String? = null,
 )
+
+/**
+ * Why a session is being reopened — typed so the server can tell a stall
+ * downgrade from an ordinary seek. See docs/ADAPTIVE-QUALITY.md §"Native
+ * stall-reopen server boundary".
+ */
+@Serializable
+enum class ReopenReason {
+    @kotlinx.serialization.SerialName("stall") Stall,
+}
 
 /**
  * Body for `POST /files/{id}/hls/sessions`. `height` stays null on purpose:
@@ -521,6 +539,26 @@ data class CreateSessionReq(
     val aac: Boolean? = null,
     /** With `copy`: the decision said this client can take the source's DV. */
     val preserve_dolby_vision: Boolean? = null,
+    /**
+     * The session this one replaces — set only on a stall-driven reopen so
+     * the server can step the resolved rung down. Omitted on ordinary seeks
+     * and track switches.
+     */
+    val previous_session_id: String? = null,
+    /**
+     * Why this session replaces its predecessor. Typed cause so the server
+     * distinguishes a stall downgrade from an ordinary restart. Omitted on
+     * ordinary seeks and track switches.
+     */
+    val reopen_reason: ReopenReason? = null,
+    /**
+     * When true, signals this session's height is a promise (the viewer is on
+     * Auto), so the server must not treat the posted height as a sticky manual
+     * pick. Every Auto viewer that sends a promise-height — a burn or
+     * Original — must carry this flag, or the server can never step that
+     * session down.
+     */
+    val quality_auto: Boolean? = null,
 )
 
 @Serializable
