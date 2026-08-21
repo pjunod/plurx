@@ -938,9 +938,16 @@ pub async fn decision(
     headers: HeaderMap,
     super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<DecisionResponse>, ApiError> {
-    let identity = super::network::identity(&headers, remote);
+    let mut identity = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = identity {
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
+    }
     let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+        super::network::stored_prior(state.store.as_ref(), identity.as_ref()).await?;
     let mut file = load_file(&state, id).await?;
     // Older builds stored this against the file. A fresh playback must never
     // inherit that historical value; its client starts at zero and carries

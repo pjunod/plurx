@@ -35,10 +35,10 @@ use plurx_core::cluster::migration::{
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch,
-    NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
-    OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingStateWrite,
-    TraktAuth,
+    scopes, ArtworkAttempt, CredentialGeneration, ItemEdit, ItemKind, ItemSort, LibraryKind,
+    MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
+    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
+    ReadingStateWrite, TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
@@ -2050,7 +2050,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 71,
+                credential_generation: CredentialGeneration::from("contract-test-gen".to_owned()),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: key.clone(),
                 throughput_kbps: Some(8_000),
@@ -2067,7 +2067,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}: the verdict's expiry stamp is part of the durable contract"
         );
         let loaded = store
-            .network_prior(71, "chrome", &key)
+            .network_prior("contract-test-gen", "chrome", &key)
             .await
             .unwrap_or_else(|error| panic!("{backend}: load prior: {error}"))
             .expect("stored prior");
@@ -2081,7 +2081,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}"
         );
         assert!(store
-            .network_prior(71, "chrome", &key)
+            .network_prior("contract-test-gen", "chrome", &key)
             .await
             .expect("post-prune lookup")
             .is_none());

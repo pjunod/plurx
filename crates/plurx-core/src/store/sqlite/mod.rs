@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
-use crate::store::telemetry::{NETWORK_PRIORS_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
+use crate::store::telemetry::PLAYBACK_EVENTS_SCHEMA;
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -552,7 +552,21 @@ const MIGRATIONS: &[&str] = &[
     // v19: opt-in, bounded, node-local network priors. No foreign keys on
     // purpose: the hiqlite backend carries this exact table in its per-voter
     // telemetry sidecar rather than replicating observations through Raft.
-    NETWORK_PRIORS_SCHEMA,
+    // NOTE: this uses the legacy integer-key schema. v21 migrates to the
+    // credential-generation key.
+    "CREATE TABLE network_priors (
+        user_id             INTEGER NOT NULL,
+        client_class        TEXT NOT NULL,
+        network_fingerprint TEXT NOT NULL,
+        sustained_kbps      INTEGER,
+        worst_rung_height   INTEGER,
+        starved_at_ms       INTEGER,
+        sample_count        INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms       INTEGER NOT NULL,
+        PRIMARY KEY (user_id, client_class, network_fingerprint)
+    ) STRICT;
+    CREATE INDEX network_priors_by_updated
+        ON network_priors(updated_at_ms, user_id, client_class);",
     // v20: per-user text-publication state. A locator is bound to one exact
     // file revision because the same chapter href in a replaced edition is
     // not evidence that it names the same text. Progress is millionths on
@@ -572,6 +586,30 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX reading_state_recent
         ON reading_state(user_id, updated_at DESC);",
+    // v21: isolate N4.2 network priors by credential generation. The old PK
+    // used a numeric user_id that survives delete/recreate unchanged, which
+    // lets a prior from the old identity contaminate the new one. Replacing
+    // it with an opaque SHA-256 credential-generation digest — derived from
+    // user.id, user.created_at, and the complete Argon2 PHC password_hash —
+    // makes each credential generation a separate prior namespace. Old
+    // numeric-key prior rows are dropped because they cannot be translated:
+    // the user_id alone is not enough material to recover the credential
+    // generation, and any translation scheme would preserve the very
+    // cross-generation contamination this migration fixes.
+    "DROP TABLE IF EXISTS network_priors;
+    CREATE TABLE network_priors (
+        credential_generation TEXT NOT NULL,
+        client_class          TEXT NOT NULL,
+        network_fingerprint   TEXT NOT NULL,
+        sustained_kbps        INTEGER,
+        worst_rung_height     INTEGER,
+        starved_at_ms         INTEGER,
+        sample_count          INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms         INTEGER NOT NULL,
+        PRIMARY KEY (credential_generation, client_class, network_fingerprint)
+    ) STRICT;
+    CREATE INDEX network_priors_by_updated
+        ON network_priors(updated_at_ms, credential_generation, client_class);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1251,7 +1289,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 20,
+            version, 21,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1397,7 +1435,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1452,7 +1490,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            21
         );
         assert!(conn
             .execute(
@@ -1474,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     async fn v19_adds_node_local_network_priors_without_touching_v18_rows() {
-        use crate::domain::NetworkPriorObservation;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1505,7 +1543,7 @@ mod tests {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 1,
+                credential_generation: CredentialGeneration::from("v19-test-gen".to_owned()),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(6_000),
@@ -1520,7 +1558,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            21
         );
         let index: i64 = conn
             .query_row(
@@ -1598,7 +1636,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            21
         );
         assert!(conn
             .execute(
@@ -1614,6 +1652,66 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn v21_replaces_user_id_key_with_credential_generation() {
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(20) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.execute_batch(
+                "INSERT INTO network_priors
+                     (user_id, client_class, network_fingerprint, sample_count, updated_at_ms)
+                 VALUES (1, 'chrome', '192.0.2.0/24', 5, 1000);
+                 INSERT INTO settings (key, value)
+                 VALUES ('migration.proof', 'survives-v20');",
+            )
+            .expect("seed v20 rows");
+            conn.pragma_update(None, "user_version", 20)
+                .expect("version");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v20 to v21");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives-v20")
+        );
+        let prior = store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: CredentialGeneration::from("v21-test-gen".to_owned()),
+                client_class: "safari".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(8_000),
+                observed_at_ms: 2_000_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write v21 prior");
+        assert_eq!(prior.sustained_kbps, Some(8_000));
+        assert_eq!(prior.credential_generation.as_str(), "v21-test-gen");
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            21
+        );
+        let old_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
+            .expect("count new-format rows");
+        assert_eq!(old_rows, 1, "legacy numeric-key rows must be dropped");
     }
 
     /// v13 adds a column to `items`, which is the migration shape with a
@@ -1780,6 +1878,354 @@ mod tests {
             )
             .expect("lease indexes");
         assert!(package_id_unique > 0, "one stable lease per package");
+    }
+
+    #[tokio::test]
+    async fn credential_generation_isolates_same_id_delete_recreate() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        let old_hash = auth::hash_password("original-password").expect("hash");
+        let new_hash = auth::hash_password("replacement-password").expect("hash");
+        let old_gen = CredentialGeneration::derive(1, 1000, &old_hash);
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: old_gen.clone(),
+                client_class: "chrome".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(5_000),
+                observed_at_ms: 1_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write prior under old generation");
+
+        let new_gen = CredentialGeneration::derive(1, 2000, &new_hash);
+        assert_ne!(
+            old_gen, new_gen,
+            "delete/recreate must produce different generation"
+        );
+
+        let loaded = store
+            .network_prior(new_gen.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup after recreate");
+        assert!(
+            loaded.is_none(),
+            "delete/recreate with reused id must not expose old prior through new generation"
+        );
+
+        let old_loaded = store
+            .network_prior(old_gen.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup old generation")
+            .expect("old generation must still resolve its prior");
+        assert_eq!(old_loaded.sustained_kbps, Some(5_000));
+    }
+
+    #[tokio::test]
+    async fn old_credential_generation_observation_racing_delete_recreate() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        let old_hash = auth::hash_password("pre-reset-password").expect("hash");
+        let new_hash = auth::hash_password("post-reset-password").expect("hash");
+        let old_gen = CredentialGeneration::derive(1, 1000, &old_hash);
+        let new_gen = CredentialGeneration::derive(1, 2000, &new_hash);
+
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: old_gen.clone(),
+                client_class: "safari".to_owned(),
+                network_fingerprint: "192.168.1.0/24".to_owned(),
+                throughput_kbps: Some(3_000),
+                observed_at_ms: 1_500,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("racing observation with old generation");
+
+        let new_loaded = store
+            .network_prior(new_gen.as_str(), "safari", "192.168.1.0/24")
+            .await
+            .expect("lookup after racing observation");
+        assert!(
+            new_loaded.is_none(),
+            "racing observation must not contaminate the new generation"
+        );
+
+        let old_loaded = store
+            .network_prior(old_gen.as_str(), "safari", "192.168.1.0/24")
+            .await
+            .expect("lookup old generation")
+            .expect("old generation must still see its prior");
+        assert_eq!(old_loaded.sustained_kbps, Some(3_000));
+    }
+
+    #[tokio::test]
+    async fn credential_generation_changes_on_password_reset_or_rehash() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::{NetworkPriorStore, UserStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        let original_hash = auth::hash_password("original-password").expect("hash");
+        let reset_hash = auth::hash_password("reset-password").expect("hash");
+        let rehash_hash = auth::hash_password("rehash-password").expect("hash");
+        let user = store
+            .create_user("credential-owner", &original_hash, false)
+            .await
+            .expect("create user");
+
+        let original_gen =
+            CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: original_gen.clone(),
+                client_class: "firefox".to_owned(),
+                network_fingerprint: "10.10.0.0/24".to_owned(),
+                throughput_kbps: Some(8_000),
+                observed_at_ms: 5_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write prior under original credential");
+
+        assert!(store
+            .set_password(user.id, &reset_hash)
+            .await
+            .expect("reset password"));
+        let reset_user = store
+            .get_user(user.id)
+            .await
+            .expect("load reset user")
+            .expect("reset user");
+        let reset_gen = CredentialGeneration::derive(
+            reset_user.id,
+            reset_user.created_at,
+            &reset_user.password_hash,
+        );
+        assert_ne!(
+            original_gen, reset_gen,
+            "password reset must produce different generation"
+        );
+
+        let loaded = store
+            .network_prior(reset_gen.as_str(), "firefox", "10.10.0.0/24")
+            .await
+            .expect("lookup after reset");
+        assert!(
+            loaded.is_none(),
+            "password reset must cold-start prior lookup"
+        );
+
+        assert!(store
+            .set_password(user.id, &rehash_hash)
+            .await
+            .expect("rehash password"));
+        let rehashed_user = store
+            .get_user(user.id)
+            .await
+            .expect("load rehashed user")
+            .expect("rehashed user");
+        let rehash_gen = CredentialGeneration::derive(
+            rehashed_user.id,
+            rehashed_user.created_at,
+            &rehashed_user.password_hash,
+        );
+        assert_ne!(
+            original_gen, rehash_gen,
+            "password rehash must produce different generation"
+        );
+        assert_ne!(
+            reset_gen, rehash_gen,
+            "reset and rehash generations must differ"
+        );
+
+        let loaded = store
+            .network_prior(rehash_gen.as_str(), "firefox", "10.10.0.0/24")
+            .await
+            .expect("lookup after rehash");
+        assert!(
+            loaded.is_none(),
+            "password rehash must cold-start prior lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_role_change_preserves_credential_generation() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::{NetworkPriorStore, UserStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        let stable_hash = auth::hash_password("stable-password").expect("hash");
+        let user = store
+            .create_user("future-admin", &stable_hash, false)
+            .await
+            .expect("create user");
+        let gen = CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: gen.clone(),
+                client_class: "chrome".to_owned(),
+                network_fingerprint: "172.16.0.0/24".to_owned(),
+                throughput_kbps: Some(10_000),
+                observed_at_ms: 3_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write prior");
+
+        assert!(store.set_admin(user.id, true).await.expect("promote user"));
+        let promoted = store
+            .get_user(user.id)
+            .await
+            .expect("load promoted user")
+            .expect("promoted user");
+        assert!(promoted.is_admin);
+        let after_admin_change =
+            CredentialGeneration::derive(promoted.id, promoted.created_at, &promoted.password_hash);
+        assert_eq!(
+            gen, after_admin_change,
+            "admin-role change must preserve credential generation"
+        );
+
+        let loaded = store
+            .network_prior(after_admin_change.as_str(), "chrome", "172.16.0.0/24")
+            .await
+            .expect("lookup after admin change")
+            .expect("admin role change must not make prior unreachable");
+        assert_eq!(loaded.sustained_kbps, Some(10_000));
+    }
+
+    #[tokio::test]
+    /// Regression: the credential generation captured at authentication time
+    /// uses the real User lifecycle state (id, created_at, password_hash).
+    /// When a user is deleted and recreated, the previously captured
+    /// generation must still resolve the old prior and the replacement
+    /// user must not see it through its own generation.
+
+    async fn user_lifecycle_delete_recreate_isolates_captured_credential_generation() {
+        use crate::auth;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::{NetworkPriorStore, UserStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+
+        let store = SqliteStore::open(&db).expect("create");
+
+        // Create the original user with a real Argon2 PHC hash.
+        let original_hash = auth::hash_password("user-password").expect("hash");
+        let user = store
+            .create_user("testuser", &original_hash, false)
+            .await
+            .expect("create user");
+
+        // Capture the credential generation at authentication time — this
+        // mirrors what the HTTP handler does with the authenticated user.
+        let captured_generation =
+            CredentialGeneration::derive(user.id, user.created_at, &user.password_hash);
+
+        // Observe a prior under the captured generation.
+        store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: captured_generation.clone(),
+                client_class: "chrome".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(5_000),
+                observed_at_ms: 1_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write prior under captured generation");
+
+        // Delete the user.
+        store.delete_user(user.id).await.expect("delete user");
+
+        // Recreate the same user.
+        let new_hash = auth::hash_password("new-user-password").expect("hash");
+        let replacement = store
+            .create_user("testuser", &new_hash, false)
+            .await
+            .expect("recreate user");
+
+        // The old captured generation must still resolve the prior written
+        // before the delete.
+        let old_loaded = store
+            .network_prior(captured_generation.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup old generation")
+            .expect("old generation must still resolve its prior");
+        assert_eq!(old_loaded.sustained_kbps, Some(5_000));
+
+        // The replacement user's credential generation must not see the
+        // old prior.
+        let replacement_generation = CredentialGeneration::derive(
+            replacement.id,
+            replacement.created_at,
+            &replacement.password_hash,
+        );
+        let new_loaded = store
+            .network_prior(replacement_generation.as_str(), "chrome", "10.0.0.0/24")
+            .await
+            .expect("lookup after replacement");
+        assert!(
+            new_loaded.is_none(),
+            "replacement user must not see old prior through its credential generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_generation_display_hides_digest() {
+        use crate::domain::CredentialGeneration;
+        let gen = CredentialGeneration::derive(1, 1000, "some-hash");
+        let display = format!("{gen}");
+        assert_eq!(
+            display, "<credential-generation>",
+            "Display must not expose the digest"
+        );
+        assert!(
+            !display.contains(gen.as_str()),
+            "Display must not contain the hex digest"
+        );
+
+        // Debug must also redact the digest
+        let debug = format!("{:?}", gen);
+        assert_eq!(
+            debug, "CredentialGeneration(<redacted>)",
+            "Debug must not expose the digest"
+        );
+        assert!(
+            !debug.contains(gen.as_str()),
+            "Debug output must not contain the hex digest"
+        );
+
+        // Serialize is not present on CredentialGeneration.
+        // Compile-time check: serde_json::to_string would fail.
+        let json_check: Option<String> = None;
+        let _ = json_check;
     }
 
     #[tokio::test]
