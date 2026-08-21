@@ -870,7 +870,7 @@ impl ActivationMarker {
     }
 
     fn validate(&self) -> Result<(), StoreError> {
-        if self.marker_version != ACTIVATION_MARKER_VERSION {
+        if self.marker_version == 0 || self.marker_version > ACTIVATION_MARKER_VERSION {
             return Err(StoreError::Migration(format!(
                 "unsupported Hiqlite activation marker version {}",
                 self.marker_version
@@ -2804,6 +2804,27 @@ mod tests {
                 .validate()
                 .expect_err("unsupported marker must fail before voter startup");
             assert!(error.to_string().contains("incomplete"), "{error}");
+        }
+
+        // Version 0 has never been a valid writer-produced marker format.
+        {
+            let zero = ActivationMarker {
+                marker_version: 0,
+                cluster_id: "cluster-a".to_owned(),
+                source_backup_sha256: "0".repeat(64),
+                source_schema_version: 20,
+                replicated_schema_version: AUTH_SCHEMA_VERSION,
+                imported_rows: 0,
+                table_hashes: vec![SqliteImportTableDigest {
+                    table: "settings".to_owned(),
+                    row_count: 0,
+                    sha256: "0".repeat(64),
+                }],
+            };
+            let error = zero
+                .validate()
+                .expect_err("marker version 0 must fail closed");
+            assert!(error.to_string().contains("unsupported"), "{error}");
         }
     }
 
