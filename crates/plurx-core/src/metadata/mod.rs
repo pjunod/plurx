@@ -6,6 +6,7 @@
 //! so a library keeps working offline once enriched (REQ-META-4).
 
 pub mod anilist;
+pub mod book;
 pub mod genres;
 pub mod local;
 pub mod tmdb;
