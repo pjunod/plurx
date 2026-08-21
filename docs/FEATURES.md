@@ -195,13 +195,21 @@ inside one Books library while keeping their actions and metadata honest.
   search, explicit finish/unfinish, revision-bound resume, and **Open in…** /
   **Download original** fallbacks. Publication scripts and remote requests
   stay inert inside the sandboxed frame.
+- **Native online EPUB reading is built in.** iPhone, iPad, and Android
+  phone/tablet details expose the same **Read**, **Resume reading**, and **Read
+  again** states, then host the proven web publication core in an isolated
+  WebView. The account bearer stays in memory, native navigation is restricted
+  to the Cinema origin and publication capability, closing flushes the newest
+  locator, and a profile or server change dismisses the book. tvOS and
+  Google TV deliberately expose no reader action.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **Native ebook readers and book metadata enrichment are not shipped yet.**
-  Apple and Android still hand ebook bytes to the platform viewer. Titles and
-  authors come from the file/folder layout; DRM-protected books are not
-  decrypted, and cover extraction is not yet implemented.
+- **Native ebook downloads and book metadata enrichment are not shipped yet.**
+  Online EPUB reading is in-app; **Open in…** remains available for every
+  supported escape path. Titles and authors come from the file/folder layout;
+  DRM-protected books are not decrypted, and cover extraction is not yet
+  implemented.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters

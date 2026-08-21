@@ -113,6 +113,17 @@ app-private cache, and a cache-only player for offline viewing. Android TV and
 Google TV deliberately hide offline controls; a television is expected to
 remain attached to the server and keeps the existing streaming path.
 
+**Native EPUB reading** — iPhone/iPad and Android phone/tablet use their native
+detail/navigation shells around the same bounded web publication core as the
+browser. SwiftUI presents an ephemeral `WKWebView`; Compose presents a locked
+down `WebView`. Each loads only the saved Cinema origin, hands the login token
+directly into JavaScript memory, and permits subsequent navigation only to
+that origin's root, bundled assets, and one publication capability. Neither
+bridge offers JavaScript a token getter. Closing waits for the locator save,
+destroys the publication session, clears JavaScript authority, and returns to
+detail; profile loss dismisses the reader. tvOS and Google TV compile the
+shared models but never expose **Read**. Offline EPUB startup remains M4.
+
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available

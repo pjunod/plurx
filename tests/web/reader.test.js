@@ -88,6 +88,27 @@ test("reader assets are embedded in the single binary and loaded before the rout
   assert.ok(INDEX.indexOf("/assets/reader.js") < INDEX.indexOf("async function viewReader"));
 });
 
+test("native handoff carries no bearer in its URL or durable browser storage", () => {
+  assert.match(INDEX, /new URLSearchParams\(location\.search\)\.get\("native-reader"\)==="1"/);
+  assert.match(INDEX, /let TOKEN = NATIVE_READER_BOOT \? null/);
+  const start = INDEX.slice(
+    INDEX.indexOf("async function startNativeReader"),
+    INDEX.indexOf("// ---- api helpers")
+  );
+  assert.match(start, /TOKEN=token/);
+  assert.match(start, /\?native-reader=1#\/read\/\$\{item\}\/\$\{file\}/);
+  assert.doesNotMatch(start, /localStorage|token=/);
+});
+
+test("native reader bridge is outbound-only and clears authority before dismissal", () => {
+  assert.match(INDEX, /window\.webkit\.messageHandlers\.cinemaReader/);
+  assert.match(INDEX, /window\.CinemaNative\.postMessage\(JSON\.stringify\(payload\)\)/);
+  const close = INDEX.slice(INDEX.indexOf("async function closeReader"), INDEX.indexOf("async function viewReader"));
+  assert.match(close, /TOKEN=null; ME=null; nativeReaderPost\("close"\)/);
+  assert.match(INDEX, /nativeReaderPost\("session-ended"\)/);
+  assert.doesNotMatch(INDEX, /CinemaNative\.(token|bearer|credential)/);
+});
+
 process.on("exit", () => {
   if (!process.exitCode) process.stdout.write("reader contracts passed\n");
 });
