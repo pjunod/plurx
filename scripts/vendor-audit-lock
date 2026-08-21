@@ -10,6 +10,7 @@ from pathlib import Path
 
 VENDORED = (
     ("hiqlite", "0.14.0"),
+    ("hiqlite-wal", "0.14.0"),
     ("s3-simple", "0.8.0"),
     ("rust_decimal", "1.42.1"),
 )
