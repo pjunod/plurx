@@ -380,3 +380,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/StallReopen.kt"
 source_anchor = "fun resetForUserAction()"
 test = "clients/android/app/src/test/java/tv/plurx/app/player/StallBudgetTest.kt"
 test_anchor = "resetForUserActionResetsBudgetAndAdvancesSequence"
+
+[[fixes]]
+id = "android.merge-resolution-fix"
+commits = ["4c9d964"]
+source = "clients/android/README.md"
+source_anchor = "**v0.2.7**, build"
+test = "tests/validation/test_history.py"
+test_anchor = "test_client_anchor_survives_a_non_corrective_squash_title"
