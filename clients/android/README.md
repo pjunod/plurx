@@ -19,8 +19,16 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `31` — native viewer parity across phone, foldable,
-> and TV. Build 31 visibly hedges estimated credits markers while preserving
+> Status: **v0.2.7**, build `34` — native viewer parity across phone, foldable,
+> and TV. Build 34 adds Cinema-managed offline EPUB reading on phones and
+> tablets: a profile/revision-scoped original and bounded publication are
+> published atomically in app-private storage, then served through a synthetic
+> HTTPS WebView origin with no account bearer or network fallback. Build 33
+> combined bounded stall recovery for adaptive playback with in-app online
+> EPUB reading on phones and tablets with
+> an isolated, same-origin WebView, memory-only authentication, cross-device
+> locator resume, and no Android/Google TV reader action. Build 31 visibly
+> hedges estimated credits markers while preserving
 > exact chapter-derived labels. Build 30 adds the revision-bound ebook reading-state wire models and
 > authenticated API routes without exposing a TV reader. Build 28 makes the
 > detail screen list every audio and subtitle track
@@ -109,7 +117,7 @@ recomputed on every decision, because unplugging HDMI changes the answer.
     watch state and the server-side **Trakt** scrobble.
 - **Viewer preferences** remember theme, appearance, poster size, home
   grouping, quality, audio/subtitle language, auto-skip, and autoplay-next.
-- **App-managed offline viewing on phones and tablets.** A detail-page action
+- **App-managed offline video viewing on phones and tablets.** A detail-page action
   creates a durable server preparation request, then Media3's foreground
   `DownloadService` transfers the prepared HLS package into one process-owned,
   non-evicting private cache. Wi-Fi-only is the default. Downloads restores
@@ -118,6 +126,16 @@ recomputed on every decision, because unplugging HDMI changes the answer.
   offline playback cannot silently reach the server. Progress is recorded
   locally and the newest timestamp per title syncs after reconnect. Android TV
   and Google TV hide the action and route.
+- **Cinema-managed offline EPUB reading on phones and tablets.** Download first
+  records a durable profile intent, saves the authenticated original, reopens
+  the publication to verify its exact revision and manifest, materializes only
+  bounded declared resources, and atomically publishes the app-private copy.
+  The local reader serves the bundled shell and publication through an
+  intercepted synthetic HTTPS origin; it has no account token and refuses
+  redirects, publisher network loads, file/content access, popups, and mixed
+  content. Process-death reconciliation, retry/remove, local locator updates,
+  and newest-dated reconnect replay are independent of Media3 video downloads.
+  Android TV and Google TV expose neither the download nor reader route.
 - **Android TV** ships a `LEANBACK_LAUNCHER` entry and TV banner; all viewer
   controls are D-pad focusable, focused cards grow and outline, and playback
   keys seek or toggle playback without stealing visible-control navigation.

@@ -120,22 +120,34 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Functionality-point selection can include real-browser contracts (for
+      # example the EPUB reader) in this job. Keep this provisioning beside
+      # the validator rather than relying on the parallel web-layout job: each
+      # selected check must be runnable in the process that claims it.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.62.0
       # plurxd shells out to ffmpeg, and the transcode and stream tests drive
       # that far enough to spawn it — they don't need it to succeed on the
       # placeholder fixtures, they need a child process to exist so there is a
       # session to make assertions about. The runner image doesn't ship ffmpeg,
       # so without this those tests fail on `No such file or directory`, which
       # is an absent dependency rather than anything wrong with the tree.
-      - name: Install ffmpeg
+      - name: Install ffmpeg and browser prerequisites
         run: |
           sudo sed -i \
             's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
             /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
+          python3 -m pip install playwright==1.62.0
+          python3 -m playwright install --with-deps chromium
       # Keep the portable baseline and focused Linux contracts in this job.
-      # Browser and Android JVM checks are selected by the same impact graph,
-      # but delegated to parallel jobs below instead of serializing the gate.
+      # The large UI-golden sweep and Android JVM checks are selected by the
+      # same impact graph, but delegated to parallel jobs below instead of
+      # serializing the gate. Focused browser contracts run here when selected.
       - name: Validate functionality points
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

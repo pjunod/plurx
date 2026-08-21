@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Pause
@@ -39,6 +40,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import tv.plurx.app.data.offline.OfflineBook
+import tv.plurx.app.data.offline.OfflineBooks
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.OfflineRecord
 import tv.plurx.app.data.offline.needsExplicitResume
@@ -53,14 +56,24 @@ import java.io.File
 fun DownloadsScreen(
     vm: AppViewModel,
     onPlay: (String) -> Unit,
+    onRead: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val all by OfflineDownloads.records.collectAsStateWithLifecycle()
+    val allBooks by OfflineBooks.records.collectAsStateWithLifecycle()
     val current = all.filter {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId
     }.sortedByDescending { it.updatedAt }
-    val otherProfiles = all.filterNot { it in current }
+    val currentBooks = allBooks.filter {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId
+    }.sortedByDescending { it.updatedAt }
+    val otherVideos = all.filterNot { it in current }
         .groupBy { it.serverInstanceId to it.userId }
+    val otherBooks = allBooks.filterNot { it in currentBooks }
+        .groupBy { it.serverInstanceId to it.userId }
+    val otherProfiles = (otherVideos.keys + otherBooks.keys).associateWith { profile ->
+        otherVideos[profile].orEmpty() to otherBooks[profile].orEmpty()
+    }
     val side = currentFormFactor().horizontalPadding()
     var profileToDelete by remember { mutableStateOf<Pair<String, Long>?>(null) }
 
@@ -79,6 +92,7 @@ fun DownloadsScreen(
                 TextButton(
                     onClick = {
                         OfflineDownloads.removeProfile(profile.first, profile.second)
+                        OfflineBooks.removeProfile(profile.first, profile.second)
                         profileToDelete = null
                     },
                 ) {
@@ -102,10 +116,16 @@ fun DownloadsScreen(
             }
             Text("Downloads", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.weight(1f))
-            Text(formatBytes(current.sumOf { it.bytesTotal ?: it.bytesDownloaded }), color = Muted)
+            Text(
+                formatBytes(
+                    current.sumOf { it.bytesTotal ?: it.bytesDownloaded } +
+                        currentBooks.sumOf(OfflineBook::bytesTotal),
+                ),
+                color = Muted,
+            )
         }
 
-        if (current.isEmpty() && otherProfiles.isEmpty()) {
+        if (current.isEmpty() && currentBooks.isEmpty() && otherProfiles.isEmpty()) {
             Column(
                 Modifier.fillMaxSize().padding(40.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -113,7 +133,7 @@ fun DownloadsScreen(
             ) {
                 Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(42.dp), tint = Muted)
                 Text("No downloads yet", style = MaterialTheme.typography.titleMedium)
-                Text("Tap Download on a movie or episode to watch it without a connection.", color = Muted)
+                Text("Tap Download on a video or book to use it without a connection.", color = Muted)
             }
             return@Column
         }
@@ -126,9 +146,9 @@ fun DownloadsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (current.isNotEmpty()) {
+            if (current.isNotEmpty() || currentBooks.isNotEmpty()) {
                 item { Text("On this device", style = MaterialTheme.typography.titleMedium) }
-                items(current, key = OfflineRecord::id) { record ->
+                items(current, key = { "video:${it.id}" }) { record ->
                     DownloadRow(
                         record = record,
                         onOpen = {
@@ -140,6 +160,18 @@ fun DownloadsScreen(
                         onRemove = { vm.removeOffline(record) },
                     )
                 }
+                items(currentBooks, key = { "book:${it.id}" }) { book ->
+                    BookDownloadRow(
+                        book = book,
+                        onOpen = {
+                            when {
+                                book.isPlayable -> onRead(book.id)
+                                book.state in setOf("failed", "missing") -> vm.retryOfflineBook(book)
+                            }
+                        },
+                        onRemove = { vm.removeOfflineBook(book) },
+                    )
+                }
             }
             if (otherProfiles.isNotEmpty()) {
                 item {
@@ -149,7 +181,8 @@ fun DownloadsScreen(
                         modifier = Modifier.padding(top = 18.dp),
                     )
                 }
-                otherProfiles.forEach { (profile, records) ->
+                otherProfiles.forEach { (profile, downloads) ->
+                    val (records, books) = downloads
                     item(key = "${profile.first}:${profile.second}") {
                         Row(
                             Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -158,7 +191,10 @@ fun DownloadsScreen(
                             Column(Modifier.weight(1f)) {
                                 Text("Another Cinema profile")
                                 Text(
-                                    "${records.size} items · ${formatBytes(records.sumOf { it.bytesTotal ?: it.bytesDownloaded })}",
+                                    "${records.size + books.size} items · ${formatBytes(
+                                        records.sumOf { it.bytesTotal ?: it.bytesDownloaded } +
+                                            books.sumOf(OfflineBook::bytesTotal)
+                                    )}",
                                     color = Muted,
                                     style = MaterialTheme.typography.labelMedium,
                                 )
@@ -174,6 +210,68 @@ fun DownloadsScreen(
             }
         }
     }
+}
+
+@Composable
+private fun BookDownloadRow(
+    book: OfflineBook,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val cover = OfflineBooks.cover(book)
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        if (cover?.isFile == true) {
+            AsyncImage(
+                model = cover,
+                contentDescription = null,
+                modifier = Modifier.width(48.dp).height(72.dp).clip(RoundedCornerShape(7.dp)),
+                contentScale = ContentScale.Crop,
+            )
+        } else {
+            Icon(
+                Icons.AutoMirrored.Filled.MenuBook,
+                contentDescription = null,
+                tint = if (book.isPlayable) Accent else Muted,
+                modifier = Modifier.width(48.dp),
+            )
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(book.title, style = MaterialTheme.typography.titleMedium)
+            book.author?.let { Text(it, color = Muted, style = MaterialTheme.typography.labelMedium) }
+            Text(bookDownloadStateLabel(book), color = Muted, style = MaterialTheme.typography.labelMedium)
+            if (book.state == "downloading" && book.bytesTotal > 0) {
+                LinearProgressIndicator(
+                    progress = {
+                        (book.bytesDownloaded.toFloat() / book.bytesTotal.toFloat()).coerceIn(0f, 1f)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            book.errorMessage?.takeIf { book.state in setOf("failed", "missing") }?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        TvIconButton(onClick = onRemove) {
+            Icon(Icons.Filled.Delete, contentDescription = "Remove book download")
+        }
+    }
+}
+
+internal fun bookDownloadStateLabel(book: OfflineBook): String = when {
+    book.isPlayable -> buildList {
+        add("Downloaded")
+        add(formatBytes(book.bytesTotal))
+        if (book.progression > 0) add("${(book.progression * 100).toInt().coerceIn(0, 100)}% read")
+    }.joinToString(" · ")
+    book.state == "intent" -> "Preparing book"
+    book.state == "downloading" -> "Downloading book"
+    book.state == "failed" -> "Download failed — tap to try again"
+    book.state == "missing" -> "Download missing — tap to download again"
+    else -> "Book download unavailable"
 }
 
 @Composable

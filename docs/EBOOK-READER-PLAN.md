@@ -1,8 +1,8 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M1 complete · M2a publication proof complete · M2b–M6 ready
-to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `43b7cb68` and `monarr` `a3f5fb8`
+**Status:** M0–M3 complete · M4 implementation complete, device acceptance
+pending · M5–M6 ready to build · **Written:** 2026-08-20 · **Verified against:** `plurx` `c66c7a77`
+and `monarr` `a3f5fb8`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -74,15 +74,16 @@ Six decisions define the work:
 | Curator | Ebook and audiobook editions, metadata, profiles, search, import | M0 replaced its stale book decline with exact-path `hint:"book"` targeted scans. |
 | Runner | Downloads and unpacks Curator's payload | Nothing. Runner must remain unaware of reading. |
 | Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
-| Cinema server | Authenticated, range-capable original bytes plus revision-bound, per-user reading-state storage and API | No reader surface. |
-| Cinema web | Books shelf, detail, **Open book**, **Download** | Opens another browser/platform handler; no in-app EPUB renderer. |
-| Cinema native | Book detail on Apple and Android; external URL intent | No phone/tablet reader or ebook offline record. |
-| User state | Timed `watch_state` for movies, episodes, videos, and audiobooks | Text books are correctly excluded; a locator-shaped sibling is needed. |
+| Cinema server | Original bytes, revision-bound reading state, bounded EPUB manifest parsing, and capability-scoped resource streaming | Native/offline publication transport remains. |
+| Cinema web | Books shelf/detail plus in-app EPUB **Read/Resume**, TOC, search, preferences, explicit completion, and external/download fallbacks | Physical assistive-technology acceptance remains; other ebook formats still hand off. |
+| Cinema native | In-app online and profile-scoped offline EPUB reading on iPhone/iPad and Android phone/tablet; external fallback; no TV reader action | Physical assistive-technology and airplane-mode/reconnect acceptance remain. |
+| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers; both mobile clients replay their newest dated offline locator | Physical cross-device reconnect acceptance remains. |
 
 The existing `/content` separation is load-bearing. Opening an EPUB is not a
-playback start, so it must not announce a viewer, allocate a playback session,
-or manufacture audio progress. The reader continues to fetch bytes through
-that route rather than teaching `/direct`, `/decision`, or HLS about books.
+playback start, so it does not announce a viewer, allocate a playback session,
+or manufacture audio progress. `/content` remains the original-file escape;
+the reader uses the separate publication capability and never teaches
+`/direct`, `/decision`, or HLS about books.
 
 ## 3. Product contract — reading behaves like reading
 
@@ -140,7 +141,9 @@ The implementation lives in `crates/plurx-core/src/store/mod.rs`,
 `crates/plurx-core/src/store/hiqlite_reading.rs`, and
 `crates/plurxd/src/http/reading.rs`. M1 advanced SQLite from schema v19 to
 v20 and the authoritative Hiqlite schema from v5 to v6 without changing the
-replicated protocol version.
+replicated protocol version. Existing activated v5 clusters apply that
+additive table/index/marker step atomically through Raft during daemon startup;
+fresh bootstrap and the migration share the same schema statements.
 
 ### 4.1 Durable model
 
@@ -235,11 +238,13 @@ playback and calculate a duration-based bar from it.
 
 ### 4.3 Original bytes remain the publication boundary
 
-The reader fetches `GET /api/v1/files/{id}/content`. M1 does not add an
-unauthenticated resource route, unpack EPUBs into the media library, or cache
-derived publication files beside the source. If the renderer needs extracted
-resources, they live in memory, the browser's private blob space, or Cinema's
-app/cache directory and are scoped to the authenticated file revision.
+`GET /api/v1/files/{id}/content` remains the authenticated original-file
+download and **Open in…** escape. The built-in reader opens the exact revision
+through `POST /api/v1/files/{id}/publication`, then fetches only declared child
+resources through its narrow session capability. Cinema does not unpack EPUBs
+into the media library or cache derived files beside the source. Temporary
+state lives in bounded memory or Cinema-owned app/cache storage and stays
+scoped to the authenticated file revision.
 
 ## 5. Renderer boundary — one publication model, hostile content inside
 
@@ -281,16 +286,35 @@ The only new parser dependency is
 [`zip` 8.6.0](https://github.com/zip-rs/zip2/releases/tag/v8.6.0), built with
 default features off and Deflate only. Cinema parses the OCF container,
 package, EPUB 3 navigation document, and EPUB 2 NCX itself with the existing
-`quick-xml` dependency. No renderer bundle or build step has been selected
-yet; M2b has to earn that choice with the browser proofs below.
+`quick-xml` dependency.
 
-| Proof | M2a evidence | Remaining gate |
+#### M2b verdict — keep the navigator small and Cinema-owned
+
+M2b does not import a general reader framework. Readium Web describes its web
+project as work in progress, and its TypeScript navigator arrives as a
+multi-package pnpm workspace; [Thorium Web](https://github.com/edrlab/thorium-web)
+is a React/Next.js reading application with a broad peer-dependency surface.
+[foliate-js](https://github.com/johnfactotum/foliate-js) fits Cinema's no-build
+shape better, but explicitly has no stable release or API and documents the
+same-origin iframe security problem. Those are useful upstreams to revisit,
+not sound dependencies for Cinema's single-binary shell today.
+
+Cinema therefore owns a small, readable navigator over M2a's normalized
+manifest: presentation CSS, spine/TOC movement, DOM-path + text-quote
+locators, bounded local search, and the sandbox bridge. It adds no package
+manager or archive parser to the browser, keeps the code reusable by M3
+WebViews, and makes the exact security policy reviewable beside the server
+headers. The [Readium TypeScript toolkit](https://github.com/readium/ts-toolkit)
+remains the preferred replacement if its integration and stability costs
+later become smaller than maintaining this bounded EPUB-only surface.
+
+| Proof | M2 evidence | Remaining gate |
 |---|---|---|
-| Navigation | Generated EPUB 2 NCX and EPUB 3 nav fixtures preserve spine order, authored labels, fragments, and nested TOC entries. | Browser TOC interaction in M2b. |
-| Locator stability | Manifest hrefs are decoded, normalized, and revision-bound. | M2b must restore the same paragraph after font, margin, viewport, and mode changes. |
-| Security | Absolute, drive-prefixed, control, backslash, duplicate, encoded traversal, and container-escaping paths fail closed. Encrypted publications get a distinct protected-book refusal. Resource responses block script, connect, form, object, frame, and remote image/font/media loads. | Browser test proves scripts stay inert and remote requests never leave the page. |
-| Scale | The ignored/nightly 620 MiB EPUB (one 500 MiB refused child plus one 120 MiB streamed child) peaks at 19,382,272 bytes RSS on the M2a macOS proof run; child resources stream in 64 KiB chunks, stay below 128 MiB each, and share eight node-wide reader slots. | M2b observes the same ceiling while navigating/searching. |
-| Accessibility | Publication order and headings remain in authored XHTML rather than being flattened server-side. | VoiceOver/TalkBack and keyboard browser acceptance in M2b/M3. |
+| Navigation | Generated EPUB 2 NCX and EPUB 3 nav fixtures preserve spine order, labels, fragments, and nested TOC entries; Chromium follows the nested authored destination. | Native bridge in M3. |
+| Locator stability | Chromium reopens paragraph 42 after rapid font/theme/size/margin changes, outer viewport reflow, close, and a fresh publication session. | Cross-device/native orientation proof in M3. |
+| Security | Parser traversal/bomb/encryption cases fail closed. A hostile rendered EPUB cannot execute script/handlers or reach the probe server; its iframe has no script, form, popup, download, or top-navigation grant. | WebKit/Android WebView repetition in M3. |
+| Scale | The 620 MiB proof peaks at 19,382,272 bytes RSS while streaming a 120 MiB child. Browser navigation fetches one child at a time; search accepts markup only and enforces the server's 8 MiB markup ceiling. | Offline storage/reopen proof in M4. |
+| Accessibility | Authored headings and reading order remain DOM semantics; trusted chrome has labelled controls, live status, keyboard page keys, scalable text, and responsive focus-visible styling. | Physical VoiceOver/TalkBack acceptance in M3. |
 | Offline identity | Manifest hrefs and M1 locators use the same file revision and normalized archive path. | M4 reopens those bytes and locators with the server absent. |
 
 The measured parser/stream ceiling is 256 MiB peak RSS for the 620 MiB fixture.
@@ -301,9 +325,14 @@ expanded copy of the book.
 ### 5.2 The security boundary is stricter than the ordinary web app
 
 Publication markup renders in a sandboxed document without scripts, top-level
-navigation, forms, downloads, popups, or same-origin access to Cinema. Remote
-HTTP(S) resources are blocked. The reader UI owns navigation and supplies only
-normalized local publication resources. Archive parsing rejects absolute
+navigation, forms, downloads, or popups. The frame deliberately grants
+`allow-same-origin` so trusted Cinema code can inspect the authored DOM for
+pagination and durable locators and so same-origin resource policy succeeds;
+it does **not** grant `allow-scripts`. The response CSP independently sets
+`script-src 'none'` and `connect-src 'none'`, so authored code cannot use that
+origin. Remote HTTP(S) resources are blocked. The trusted reader chrome owns
+navigation and supplies only normalized local publication resources. Archive
+parsing rejects absolute
 paths, drive prefixes, NULs, and any normalized `..` escape; entry count,
 uncompressed bytes, nesting, and per-resource reads are bounded before the
 reader allocates them.
@@ -412,16 +441,15 @@ make cluster-check
 
 ### 7.3 M2 — EPUB proof and web reader
 
-**Status:** M2a publication API complete 2026-08-20; M2b reader UI remains.
+**Status:** complete 2026-08-20. The bounded publication API and web reader
+pass parser, unit, syntax, and deterministic Chromium acceptance.
 
 M2a ships §5's bounded OCF/package/nav parser, Readium-shaped manifest,
 revision-bound resource capability, security headers, generated EPUB 2/3
-fixtures, and 620 MiB memory proof. It deliberately stops before calling the
-feature a reader: locator stability, accessibility, search, and actual browser
-network refusal require a rendered page.
+fixtures, and 620 MiB memory proof.
 
-Run §5.1's dependency/architecture proof and record the verdict in this plan.
-Then ship the authenticated web reader, **Read/Resume** detail actions, table
+M2b records §5.1's dependency verdict and ships the authenticated web reader,
+**Read/Resume** detail actions, table
 of contents, typography/theme controls, search, state heartbeat/close flush,
 explicit finish controls, security limits, and **Open in…** fallback. Keep
 reader assets outside the hand-written `index.html` when their lifecycle or
@@ -438,6 +466,13 @@ make validate                     # point-selected reader/browser contracts
 ```
 
 ### 7.4 M3 — Apple and Android online readers
+
+**Status:** complete 2026-08-20. iOS and Android phone/tablet detail screens
+open the shared publication reader in an isolated native WebView; television
+surfaces expose no reading action. Simulator, JVM, lint, and real-Chromium
+contracts cover the bridge, authentication containment, semantic headings,
+profile isolation, paragraph restore after font/rotation changes, and close
+flush. No physical VoiceOver/TalkBack claim is made by this milestone.
 
 Add phone/tablet reader destinations using M2's proven publication model and
 §4's API. App navigation owns dismissal and profile changes; a server switch
@@ -459,6 +494,15 @@ python3 -m validation.mobile_versions
 ```
 
 ### 7.5 M4 — Cinema-managed ebook downloads
+
+**Status:** implementation complete — Apple 2026-08-20, Android 2026-08-21;
+physical device acceptance remains. Both clients store the original EPUB plus
+a bounded local rendering cache, publish both atomically, open the catalogue
+before server reconnect, and replay the newest dated locator for the exact
+edition. Apple uses a private same-origin WebKit scheme and resource-loader
+rule. Android uses an all-intercepted synthetic HTTPS origin, a canonical
+app-private resolver, and a separate download owner from Media3. Neither
+offline reader has a login bearer, loopback listener, or network fallback.
 
 Implement §6 on Apple and Android: app-private original download, atomic local
 publication, profile-scoped catalogue, launch reconciliation, remove/retry,
@@ -524,9 +568,9 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 |---|---|---|
 | M0 · Curator handoff | Complete | Curator `make test`; Cinema `make check`; focused cross-seam tests |
 | M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
-| M2 · EPUB proof/web | Planned | §5 proof matrix |
-| M3 · Native online | Planned | Simulator/emulator + accessibility acceptance |
-| M4 · Offline EPUB | Planned | Physical airplane-mode drill |
+| M2 · EPUB proof/web | Complete | Node contracts; deterministic hostile-EPUB Chromium acceptance; 620 MiB stream proof |
+| M3 · Native online | Complete | iOS/tvOS simulator suites; Android JVM/lint; real-Chromium native handoff, heading semantics, profile isolation, font/rotation restore, and close flush |
+| M4 · Offline EPUB | Implementation complete · acceptance in progress | Apple catalogue/path/sync unit contracts and simulator build; Android catalogue/path/exact-edition sync JVM contracts, lint, instrumentation APK build, and packaged reader assets; shared-shell browser contract; physical airplane-mode/reconnect drill remains |
 | M5 · Metadata | Planned | Paired + standalone fixtures |
 | M6 · More formats/release | Planned | Contract-tested support matrix |
 
