@@ -12,13 +12,15 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `69` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `70` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 69 tells a viewer when a Skip Credits button
+> same regression suite. Build 70 tells a viewer when a Skip Credits button
 > came from a duration estimate rather than a real chapter, so a guess no
-> longer reads as an exact marker. Build 68 adds the revision-bound ebook reading-state
-> wire models and authenticated API routes without exposing a tvOS reader.
+> longer reads as an exact marker. Build 69 adds in-app online EPUB reading on iPhone
+> and iPad with an isolated, same-origin WebView, memory-only authentication,
+> cross-device locator resume, and no tvOS reader action. Build 68 adds the
+> revision-bound ebook reading-state wire models and authenticated API routes.
 > Build 67 gives stall recovery somewhere to go: a
 > reopen on a growing HLS session now names its exact predecessor with
 > `reopen_reason: "stall"`, so the server answers one rung *down* rather than

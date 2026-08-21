@@ -130,6 +130,17 @@ request, and the account bearer never appears in a publication URL. The two
 locks are intentional—neither the sandbox nor the headers substitute for the
 other.
 
+Native phone/tablet readers add a second trusted-container boundary without
+weakening that publication sandbox. Their `WKWebView`/Android `WebView` loads
+`?native-reader=1` at the configured Cinema origin, then receives the account
+bearer through one direct native-to-JavaScript call. The token is absent from
+the URL and web storage. Native navigation accepts only the same origin's root,
+bundled assets, and publication resources; popups, file/content access, mixed
+content, and unsafe browsing are refused. The JavaScript bridge is outbound
+only and accepts a small allowlist of lifecycle events—publication code has no
+native method that returns credentials. Dismissal destroys the reader,
+releases its publication session, and clears the JavaScript authority.
+
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 
 Passwords, login tokens, API keys, and offline lease capabilities are stored
