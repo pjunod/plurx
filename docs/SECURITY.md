@@ -148,8 +148,18 @@ serves it only through `cinema-book://offline/`. A `WKContentRuleList` blocks
 all HTTP(S) resource loads before publisher CSS, images, or markup can reach a
 network; the iframe still omits script, forms, popups, downloads, and top
 navigation. The offline WebView receives a manifest, locator, and presentation
-preferences, never an account bearer. Android must repeat both the private
-resource boundary and remote-load refusal before its M4 action ships.
+preferences, never an account bearer.
+
+Android's offline surface enforces the same authority boundary with a
+synthetic `https://offline.cinema.invalid` origin. `WebViewClient` intercepts
+every permitted shell and publication request and resolves it from packaged
+assets or the canonical app-private publication root; everything else receives
+a local denial and never reaches DNS. Publisher paths are manifest-declared,
+bounded per resource and in aggregate, and limited to two concurrent local
+streams. The WebView has file/content access, mixed content, popups, DOM
+storage, and redirects disabled. Capability downloads refuse redirects and
+same-origin escapes, and the offline bridge receives no bearer or credential
+getter.
 
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 
