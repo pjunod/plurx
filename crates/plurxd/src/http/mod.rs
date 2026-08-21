@@ -3329,6 +3329,17 @@ mod tests {
             )
             .await
             .expect("book file");
+        let pdf = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.pdf",
+                8_192,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("PDF file");
 
         let uri = format!("/api/v1/items/{book}/reading-state?file_id={file}");
         assert_eq!(
@@ -3395,6 +3406,19 @@ mod tests {
             call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert_eq!(detail["reading"]["progression"], 0.6);
+        let pdf_dto = detail["files"]
+            .as_array()
+            .expect("book files")
+            .iter()
+            .find(|entry| entry["id"] == pdf)
+            .expect("PDF DTO");
+        assert_eq!(pdf_dto["reader"]["format"], "pdf");
+        assert_eq!(pdf_dto["reader"]["apple"]["online"], "read");
+        assert_eq!(pdf_dto["reader"]["apple"]["offline"], "unavailable");
+        assert_eq!(
+            pdf_dto["reader_revision"],
+            json!({ "size": 8192, "mtime": 101 })
+        );
 
         let (status, conflict) = call(
             &app,
