@@ -293,9 +293,17 @@ pub async fn create(
         .transcode
         .capability_height_ceiling(source.as_ref())
         .await;
-    let identity = super::network::identity(&headers, remote);
+    let mut identity = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = identity {
+        id.user_id = Some(user.id);
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
+    }
     let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+        super::network::stored_prior(state.store.as_ref(), identity.as_ref()).await?;
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately
