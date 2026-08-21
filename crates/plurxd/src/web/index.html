@@ -7144,6 +7144,7 @@ async function rescueAutoSupply(){
 async function autoControllerTick(){
   const p=PLAYER, v=document.getElementById("video");
   if(!p||!v||!p.abr||qualityForce()!=='auto'||!p.started||v.paused||p.abr.switching) return;
+  if(!ME||!ME.playback_auto_abr) return;
   if(p.autoFallbackInFlight) return;
   await pollSessionHealth(true);
   // Re-checked after the poll for the same reason it is checked before it: the
@@ -9171,6 +9172,12 @@ function playbackPanel(settings){
         <div><label>Buffer limit</label><select id="pha" style="width:auto;min-width:200px">${presetOpts([["60","1 minute"],["180","3 minutes — recommended"],["600","10 minutes"],["0","No limit — needs disk"]], settings.hls_ahead_max_secs, v=>`${v} seconds`)}</select></div>
       </div>
       <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="phs" ${settings.hls_typeless_sliding?'checked':''} style="width:auto;margin-right:9px"> Experimental typeless sliding HLS <span class="muted" style="font-size:12px;margin-left:6px">· applies to new sessions; use only for the iPad control comparison</span></label>
+      <h2 class="section">Auto ABR</h2>
+      <p class="muted" style="margin-top:0">Client-side adaptive bitrate on Auto quality. Off by default: the acceptance-week
+        condition in §14 D2 has not been met, so Manual is the intended quality-control path.
+        Turn it on to let the controller choose rungs automatically — see
+        <a href="https://github.com/pjunod/plurx/blob/main/docs/ADAPTIVE-QUALITY.md" target="_blank" rel="noopener">docs/ADAPTIVE-QUALITY.md</a>.</p>
+      <label class="row" style="margin:0 0 12px;font-size:14px;color:var(--text)"><input type="checkbox" id="paa" ${settings.playback_auto_abr?'checked':''} style="width:auto;margin-right:9px"> Enable Auto ABR <span class="muted" style="font-size:12px;margin-left:6px">· experimental; off by default</span></label>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -9724,7 +9731,8 @@ async function savePlayback(){
       hls_readrate:document.getElementById("phr").value,
       hls_burst_secs:document.getElementById("phb").value,
       hls_ahead_max_secs:document.getElementById("pha").value,
-      hls_typeless_sliding:document.getElementById("phs").checked}});
+      hls_typeless_sliding:document.getElementById("phs").checked,
+      playback_auto_abr:document.getElementById("paa").checked}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }

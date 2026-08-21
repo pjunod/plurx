@@ -680,10 +680,11 @@ test("every shipped stall report carries the wait's start as its identity", () =
 // session-open that stays pending until the test releases it — the ordering the
 // browser actually produces, where the cheap health GET returns before the
 // session-create POST.
-function autoRescueHarness(player) {
+function autoRescueHarness(player, me) {
   const opened = [];
   let releaseOpen = null;
   let openFails = false;
+  const autoMe = me||{playback_auto_abr:true};
   const video = { currentTime: 12, paused: false, videoHeight: 720 };
 
   async function startTranscodeFallback(reason) {
@@ -697,6 +698,7 @@ function autoRescueHarness(player) {
 
   const noop = () => {};
   const build = new Function(
+    "ME",
     "PLAYER",
     "document",
     "performance",
@@ -733,6 +735,7 @@ function autoRescueHarness(player) {
   );
 
   const shipped = build(
+    autoMe,
     player,
     { getElementById: () => video },
     { now: () => 90_000 },
@@ -2338,6 +2341,45 @@ test("an upgrade needs encode headroom, not just a bandwidth estimate", () => {
   assert.equal(pressured.height, 480, "emergencies still fall");
   assert.equal(pressured.emergency, true);
 });
+
+
+asyncTest("auto ABR off suppresses controller rung decisions", async () => {
+  const player = pressuredRemuxPlayer();
+  // With playback_auto_abr false, the controller returns at its first check.
+  const h = autoRescueHarness(player, {playback_auto_abr: false});
+
+  // autoControllerTick should return immediately because ME.playback_auto_abr
+  // is false. No session-open should happen from the controller.
+  await h.autoControllerTick();
+  assert.equal(h.opened.length, 0, "no controller action with auto_abr off");
+
+  // The decode rescue is NOT gated by this toggle and runs independently.
+  // We just verify that autoControllerTick itself produces no action;
+  // maybeDecodeRescue is outside the gate.
+});
+
+asyncTest("auto ABR on leaves existing controller behaviour unchanged", async () => {
+  const player = pressuredRemuxPlayer();
+  const h = autoRescueHarness(player, {playback_auto_abr: true});
+
+  // Exactly the shipped 5-second interval: maybeDecodeRescue() is not awaited,
+  // and autoControllerTick() runs straight after it.
+  h.maybeDecodeRescue();
+  const tick = h.autoControllerTick();
+  await h.settle();
+
+  assert.equal(
+    h.opened.length, 1,
+    "with auto_abr on, the existing controller path is unchanged",
+  );
+  assert.equal(
+    h.opened[0], "decode-rescue",
+    "the decode rescue wins the race, same as before",
+  );
+  await h.finishOpen();
+  await tick;
+});
+
 
 // Drained last, in registration order, after every synchronous case has run.
 (async () => {

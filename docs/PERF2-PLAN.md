@@ -966,9 +966,9 @@ semantics, and the shaping harness below are real work; native deltas
 ride each client's normal release.
 **Risk:** low-medium; a mistuned controller is a visible switch, Manual
 stays one tap away, and `off` restores today exactly. **Toggles:**
-`playback.auto_abr` (web controller, default off until the acceptance
-week), `playback.network_priors` (default off first release),
-per-client reopen behavior rides client versions.
+`playback.auto_abr` (web controller, default off; §14 D2 acceptance
+week has not been met), `playback.network_priors` (default off first
+release), per-client reopen behavior rides client versions.
 
 **Acceptance:** playback-lab first grows the shaping layer it
 deliberately lacked (review R7 — the harness slice precedes the
@@ -1257,7 +1257,7 @@ effective default; hot-path reads snapshotted like `AheadLimits`
 | `transcode.per_title` | off | N2 | rungs stay pure height functions |
 | `cache.prefix_secs` | 0 (§14 D3) | N3 | producer makes whole-title entries only |
 | `jobs.prewarm_on_progress` | off | N3 | producer cadence = scheduled passes only |
-| `playback.auto_abr` | off (§14 D2) | N4 | manual quality menu only, today's behavior |
+| `playback.auto_abr` | off (§14 D2) | N4 | manual quality menu only, today's behavior (shipped in #272) |
 | `playback.network_priors` | off | N4 | cold-start estimates, today's behavior |
 | `transcode.output_codec` | `h264` | N5 | H.264 everywhere |
 | `cache.av1_lane` | off | N5 | producer encodes H.264/HEVC only |

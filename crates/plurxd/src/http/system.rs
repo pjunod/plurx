@@ -1085,6 +1085,8 @@ pub struct SettingsDto {
     /// Use coarse, node-local playback history to seed Auto quality.
     /// Explicit opt-in; missing is false.
     pub playback_network_priors: bool,
+    /// Client-side Auto ABR controller.
+    pub playback_auto_abr: bool,
     /// App-managed offline preparation has a separate reservation budget from
     /// the opportunistic playback cache above.
     pub offline_enabled: bool,
@@ -1233,6 +1235,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
         .await?
         .is_some_and(|value| value.trim() == "1");
+    let playback_auto_abr = state
+        .store
+        .get_setting(keys::PLAYBACK_AUTO_ABR)
+        .await?
+        .is_some_and(|value| value.trim() == "1");
     let offline_enabled = !matches!(
         state
             .store
@@ -1316,6 +1323,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         cache_used_bytes,
         telemetry_retain_days,
         playback_network_priors,
+        playback_auto_abr,
         offline_enabled,
         offline_max_gb,
         offline_max_gb_per_user,
@@ -1378,6 +1386,7 @@ pub struct UpdateSettings {
     pub cache_max_gb: Option<i64>,
     pub telemetry_retain_days: Option<i64>,
     pub playback_network_priors: Option<bool>,
+    pub playback_auto_abr: Option<bool>,
     pub offline_enabled: Option<bool>,
     pub offline_max_gb: Option<i64>,
     pub offline_max_gb_per_user: Option<i64>,
@@ -1627,6 +1636,12 @@ pub async fn update_settings(
                 keys::PLAYBACK_NETWORK_PRIORS,
                 if enabled { "1" } else { "0" },
             )
+            .await?;
+    }
+    if let Some(enabled) = req.playback_auto_abr {
+        state
+            .store
+            .put_setting(keys::PLAYBACK_AUTO_ABR, if enabled { "1" } else { "0" })
             .await?;
     }
     for (key, label, value) in [

@@ -617,6 +617,7 @@ pub struct UserDto {
     pub username: String,
     pub is_admin: bool,
     pub created_at: i64,
+    pub playback_auto_abr: bool,
 }
 
 impl From<User> for UserDto {
@@ -626,6 +627,7 @@ impl From<User> for UserDto {
             username: u.username,
             is_admin: u.is_admin,
             created_at: u.created_at,
+            playback_auto_abr: false,
         }
     }
 }

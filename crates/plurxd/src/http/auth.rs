@@ -11,6 +11,7 @@ use super::dto::UserDto;
 use super::error::ApiError;
 use super::extract::{AuthUser, RawToken};
 use crate::state::AppState;
+use plurx_core::store::keys;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -72,8 +73,22 @@ pub async fn logout(
 }
 
 /// GET /api/v1/me
-pub async fn me(AuthUser(user): AuthUser) -> Json<UserDto> {
-    Json(user.into())
+pub async fn me(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<UserDto>, ApiError> {
+    let playback_auto_abr = state
+        .store
+        .get_setting(keys::PLAYBACK_AUTO_ABR)
+        .await?
+        .is_some_and(|value| value.trim() == "1");
+    Ok(Json(UserDto {
+        id: user.id,
+        username: user.username,
+        is_admin: user.is_admin,
+        created_at: user.created_at,
+        playback_auto_abr,
+    }))
 }
 
 /// A real Argon2 hash (of a throwaway password), computed once, used to spend
