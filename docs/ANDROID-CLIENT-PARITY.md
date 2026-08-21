@@ -64,7 +64,7 @@ for that viewer and keeps server administration out of the comparison.
 | Pre-play audio/subtitle choice | Both are chosen on the detail screen and applied on the first session open, with any burn-in cost disclosed before playback starts |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
 | Bound stall downgrade | Android detects stalls via `PlaybackTelemetry`'s passive buffering-stall beacon and reopens the session with `previous_session_id`, `reopen_reason: "stall"`, and the server's normalized `StartResponse.height`. An Auto viewer with a burned subtitle sends `quality_auto: true` so the promise-height does not make the session sticky. The client enforces a retry budget of 3 consecutive reopen attempts at the ladder floor; at that point the session keeps playing at the floor rung without further reopen attempts. A seek, quality switch, or track change resets the budget. |
-| Intro/credits markers | Manual skip or automatic skip |
+| Intro/credits markers | Manual skip or automatic skip; estimated credits markers are visibly labelled while chapter-derived markers keep their exact label |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
 | Playback decision/stats | In-player information panel, including a "Dynamic range" row |
