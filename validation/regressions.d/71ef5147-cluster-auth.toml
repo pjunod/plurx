@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["71ef5147"]
+points = ["persistence.upgrades", "cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The vendored `single_file_snapshot_tail_restores_its_missing_purge_boundary` regression writes a first-file WAL whose first retained index is 10000 with no purge metadata, restarts the production writer, and requires index 9999 to be reconstructed. Restoring the upstream WAL-number guard leaves the metadata empty and the assertion fails before OpenRaft can request nonexistent log 0."

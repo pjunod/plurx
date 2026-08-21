@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d11f6604"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained hardware_auto_preserves_a_four_k_av1_sdr_source regression pins that a known 2160p AV1 SDR source stays 2160p on validated hardware when no network evidence requires a downgrade, while measured link history and the separately probed HDR ceiling may still select 1080p."

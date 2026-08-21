@@ -5684,18 +5684,18 @@ function transcodeHeight(){ return PlaybackPolicy.transcodeHeight(playQuality())
 // Original is that promise made explicitly, and it must survive the cases
 // where a transcode happens anyway — a bitmap-subtitle burn, or the browser
 // refusing the remux. Those sessions used to send no height at all, and the
-// server's Auto answered `min(source, 1080)`: the right bandwidth call for
-// Auto and the wrong one for a viewer who explicitly asked for max, which is
-// how a 4K film with forced PGS subs played at 1080p whatever the menu said.
+// server's old Auto answered `min(source, 1080)`: a separate policy cap and
+// the wrong answer for a viewer who explicitly asked for max, which is how a
+// 4K film with forced PGS subs played at 1080p whatever the menu said.
 //
 // An AUTO burn over a remux/direct verdict is the same promise made by the
 // server: the decision already chose to send this client the full-resolution
-// stream, so the burn may add a re-encode but not a downscale. The Auto cap
-// (PERF-PLAN §4.7) is about genuine transcodes — sessions whose client never
-// proved it could carry the source — and stays for them: a burn on top of a
-// transcode verdict keeps the Auto rung. Bandwidth agrees: the 4K rung's
-// 20 Mb/s is *less* than the 57 Mb/s remux it replaces, while on a genuine
-// transcode it would be 2.5× the rung Auto chose.
+// stream, so the burn may add a re-encode but not a downscale. Genuine
+// transcode verdicts still keep the server's Auto result rather than inheriting
+// that promise. Auto resolves encoder/pipeline capability first — preserving a
+// known SDR source on hardware — and lowers it only from stored network
+// evidence. Bandwidth still agrees for this burn: the 4K rung's 20 Mb/s is
+// *less* than the 57 Mb/s remux it replaces.
 //
 // A REFUSED original is that same promise again, and it was the case still
 // getting downscaled. When the browser rejects a remux outright the client

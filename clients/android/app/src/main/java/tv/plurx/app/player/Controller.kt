@@ -659,9 +659,21 @@ class Controller(
                 // Swallowing it here would show a failure state for a stream
                 // nobody is waiting for any more.
                 throw cancelled
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 if (stallGuard.isCurrent(requestVersion)) {
+                    playbackTelemetry.report(
+                        event = "playback_error",
+                        level = "error",
+                        message = "session create failed before Media3 started",
+                        code = (error as? HttpException)?.code(),
+                        detail = redactedFailureDetail("session_create", error),
+                        attempt = attempt,
+                    )
                     playbackTelemetry.cancel(attempt)
+                    Log.w(
+                        "PlurxPlayback",
+                        "session create failed ${redactedFailureDetail("session_create", error)}",
+                    )
                     onError("The server couldn't start this stream.")
                 }
                 return@launch
@@ -744,6 +756,7 @@ class Controller(
                 audioOffsetMs = audioOffsetMs,
                 quality = vm.preferences.value.playbackQuality,
                 sourceHeight = plan.sourceHeight,
+                deliveredDynamicRange = deliveredRange,
                 previousSessionId = prevId,
                 reopenReason = ReopenReason.Stall,
             )
@@ -754,9 +767,21 @@ class Controller(
                 ) ?: return@launch
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 if (stallGuard.isCurrent(requestVersion)) {
+                    playbackTelemetry.report(
+                        event = "playback_error",
+                        level = "error",
+                        message = "session reopen failed before Media3 started",
+                        code = (error as? HttpException)?.code(),
+                        detail = redactedFailureDetail("session_reopen", error),
+                        attempt = attempt,
+                    )
                     playbackTelemetry.cancel(attempt)
+                    Log.w(
+                        "PlurxPlayback",
+                        "session reopen failed ${redactedFailureDetail("session_reopen", error)}",
+                    )
                     onError("The stream stalled and recovery failed.")
                 }
                 return@launch
@@ -808,6 +833,7 @@ class Controller(
         audioOffsetMs = audioOffsetMs,
         quality = vm.preferences.value.playbackQuality,
         sourceHeight = plan.sourceHeight,
+        deliveredDynamicRange = deliveredRange,
     )
 
     private fun trackFor(index: Long?): SubTrack? =
