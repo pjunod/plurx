@@ -140,7 +140,9 @@ The implementation lives in `crates/plurx-core/src/store/mod.rs`,
 `crates/plurx-core/src/store/hiqlite_reading.rs`, and
 `crates/plurxd/src/http/reading.rs`. M1 advanced SQLite from schema v19 to
 v20 and the authoritative Hiqlite schema from v5 to v6 without changing the
-replicated protocol version.
+replicated protocol version. Existing activated v5 clusters apply that
+additive table/index/marker step atomically through Raft during daemon startup;
+fresh bootstrap and the migration share the same schema statements.
 
 ### 4.1 Durable model
 
