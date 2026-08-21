@@ -56,13 +56,19 @@ CREATE TABLE IF NOT EXISTS items (
     metadata_at          INTEGER,
     artwork_attempted_at INTEGER,
     artwork_error        TEXT,
-    genres               TEXT NOT NULL DEFAULT '[]'
+    genres               TEXT NOT NULL DEFAULT '[]',
+    author               TEXT,
+    book_work_id         TEXT,
+    book_edition_id      TEXT,
+    book_metadata_source TEXT CHECK (book_metadata_source IN ('epub', 'curator'))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_items_library_kind ON items(library_id, kind);
 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
 CREATE INDEX IF NOT EXISTS idx_items_added ON items(added_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_missing_artwork ON items(artwork_attempted_at)
     WHERE poster_path IS NULL;
+CREATE INDEX IF NOT EXISTS idx_items_book_work ON items(book_work_id)
+    WHERE book_work_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS files (
     id               INTEGER PRIMARY KEY,
@@ -136,9 +142,9 @@ CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, overview, tags 
 END;
 "#;
 
-// Kept as individual statements because the replicated v5 -> v6 migration
-// executes them and the cluster_meta bump in one Raft transaction. Fresh
-// bootstrap uses these exact strings too, so the two paths cannot drift.
+// Kept as individual statements because replicated migrations execute schema
+// changes and their cluster_meta bump in one Raft transaction. Fresh bootstrap
+// uses these exact strings too, so the two paths cannot drift.
 pub(super) const READING_STATE_TABLE_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS reading_state (
     user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -154,6 +160,15 @@ pub(super) const READING_STATE_TABLE_SCHEMA: &str = r#"CREATE TABLE IF NOT EXIST
 
 pub(super) const READING_STATE_INDEX_SCHEMA: &str = r#"CREATE INDEX IF NOT EXISTS idx_reading_updated
     ON reading_state(user_id, updated_at DESC)"#;
+
+pub(super) const BOOK_AUTHOR_SCHEMA: &str = "ALTER TABLE items ADD COLUMN author TEXT";
+pub(super) const BOOK_WORK_SCHEMA: &str = "ALTER TABLE items ADD COLUMN book_work_id TEXT";
+pub(super) const BOOK_EDITION_SCHEMA: &str = "ALTER TABLE items ADD COLUMN book_edition_id TEXT";
+pub(super) const BOOK_SOURCE_SCHEMA: &str =
+    "ALTER TABLE items ADD COLUMN book_metadata_source TEXT \
+    CHECK (book_metadata_source IN ('epub', 'curator'))";
+pub(super) const BOOK_WORK_INDEX_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS idx_items_book_work \
+    ON items(book_work_id) WHERE book_work_id IS NOT NULL";
 
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
     validate_sql(CATALOG_SCHEMA)?;

@@ -333,6 +333,28 @@ private fun DetailContent(
             }
         }
 
+        if (detail.editions.isNotEmpty()) {
+            item {
+                Text(
+                    "Other editions",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(start = side, end = side, top = 16.dp, bottom = 10.dp),
+                )
+            }
+            item {
+                LazyRow(
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = side),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    items(detail.editions, key = { it.id }) { edition ->
+                        PosterCard(edition, width = if (formFactor == FormFactor.Television) 166.dp else 132.dp) {
+                            onOpenItem(edition.id)
+                        }
+                    }
+                }
+            }
+        }
+
         if (detail.children.isNotEmpty()) {
             item {
                 Text(
@@ -1079,6 +1101,7 @@ private fun metaLine(item: Item, durationMs: Long?): String = buildList {
         item.show_title?.let(::add)
         if (item.season_number != null && item.episode_number != null) add("S${item.season_number} E${item.episode_number}")
     }
+    if ((item.isBook || item.isAudiobook) && !item.author.isNullOrBlank()) add(item.author)
     item.recorded_at?.let(::add)
     item.year?.let { add(it.toString()) }
     durationMs?.takeIf { it > 0 }?.let { add(formatTime(it)) }
