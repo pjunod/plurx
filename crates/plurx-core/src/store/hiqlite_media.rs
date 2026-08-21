@@ -10,9 +10,9 @@ use hiqlite::Row;
 use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore, TimedClient};
 use super::{MediaStore, ReconcileOutcome, RootFingerprintStatus, WatchStore};
 use crate::domain::{
-    sort_title_for, ArtworkAttempt, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort,
-    MediaFile, MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem, WatchRollup,
-    WatchState,
+    sort_title_for, ArtworkAttempt, BookMetadataPatch, InProgressItem, Item, ItemEdit, ItemKind,
+    ItemPage, ItemSort, MediaFile, MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
+    WatchRollup, WatchState,
 };
 use crate::error::StoreError;
 use crate::mediafacts::{FactsRow, MediaFacts};
@@ -20,7 +20,8 @@ use crate::mediafacts::{FactsRow, MediaFacts};
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
      tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms, \
      poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at, \
-     artwork_attempted_at, artwork_error, genres";
+     artwork_attempted_at, artwork_error, genres, author, book_work_id, book_edition_id, \
+     book_metadata_source";
 
 fn item_cols(alias: &str) -> String {
     ITEM_COLS
@@ -56,6 +57,10 @@ struct ItemRow {
     artwork_attempted_at: Option<i64>,
     artwork_error: Option<String>,
     genres: String,
+    author: Option<String>,
+    book_work_id: Option<String>,
+    book_edition_id: Option<String>,
+    book_metadata_source: Option<String>,
 }
 
 impl From<&mut Row<'_>> for ItemRow {
@@ -85,6 +90,10 @@ impl From<&mut Row<'_>> for ItemRow {
             artwork_attempted_at: row.get("artwork_attempted_at"),
             artwork_error: row.get("artwork_error"),
             genres: row.get("genres"),
+            author: row.get("author"),
+            book_work_id: row.get("book_work_id"),
+            book_edition_id: row.get("book_edition_id"),
+            book_metadata_source: row.get("book_metadata_source"),
         }
     }
 }
@@ -127,6 +136,10 @@ impl TryFrom<ItemRow> for Item {
             artwork_attempted_at: row.artwork_attempted_at,
             artwork_error: row.artwork_error,
             genres,
+            author: row.author,
+            book_work_id: row.book_work_id,
+            book_edition_id: row.book_edition_id,
+            book_metadata_source: row.book_metadata_source,
         })
     }
 }
@@ -682,13 +695,13 @@ impl MediaStore for HiqliteAuthStore {
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
-                         AND kind = $2 AND title = $3 COLLATE NOCASE AND year IS $4 \
-                         AND ($5 IS NULL OR EXISTS (SELECT 1 FROM files f \
-                           WHERE f.item_id = items.id AND (f.path = $5 OR ( \
-                             substr(f.path, 1, length($5)) = $5 AND \
-                             substr(f.path, length($5) + 1, 1) = '/'))))"
+                         AND kind = $2 AND (($3 IS NOT NULL AND EXISTS (SELECT 1 FROM files f \
+                           WHERE f.item_id = items.id AND (f.path = $3 OR ( \
+                             substr(f.path, 1, length($3)) = $3 AND \
+                             substr(f.path, length($3) + 1, 1) = '/')))) \
+                         OR ($3 IS NULL AND title = $4 COLLATE NOCASE AND year IS $5))"
                     ),
-                    params!(library_id, kind.as_str(), title, year, identity_path),
+                    params!(library_id, kind.as_str(), identity_path, title, year),
                 )
                 .await
                 .map_err(database_error)?,
@@ -1011,6 +1024,104 @@ impl MediaStore for HiqliteAuthStore {
         )
         .await?;
         Ok(())
+    }
+
+    async fn apply_book_metadata(
+        &self,
+        item_id: i64,
+        patch: &BookMetadataPatch,
+    ) -> Result<(), StoreError> {
+        let sort_title = patch.title.as_deref().map(sort_title_for);
+        let source = patch.source.as_str();
+        let now = self.now()?;
+        self.execute(
+            "UPDATE items SET \
+                 title = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                          OR book_metadata_source = 'epub') \
+                                   THEN COALESCE($2, title) ELSE title END, \
+                 sort_title = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                               OR book_metadata_source = 'epub') \
+                                        THEN COALESCE($3, sort_title) ELSE sort_title END, \
+                 author = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                           OR book_metadata_source = 'epub') \
+                                    THEN COALESCE($4, author) ELSE author END, \
+                 book_work_id = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                                 OR book_metadata_source = 'epub') \
+                                          THEN COALESCE($5, book_work_id) ELSE book_work_id END, \
+                 book_edition_id = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                                    OR book_metadata_source = 'epub') \
+                                             THEN COALESCE($6, book_edition_id) ELSE book_edition_id END, \
+                 poster_path = CASE WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                                OR book_metadata_source = 'epub') \
+                                         THEN COALESCE($7, poster_path) ELSE poster_path END, \
+                 book_metadata_source = CASE \
+                     WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                           OR book_metadata_source = 'epub') THEN $1 \
+                     ELSE book_metadata_source END, \
+                 updated_at = CASE \
+                     WHEN ($1 = 'curator' OR book_metadata_source IS NULL \
+                                           OR book_metadata_source = 'epub') THEN $8 \
+                     ELSE updated_at END \
+             WHERE id = $9 AND kind IN ('book', 'audiobook')",
+            params!(
+                source,
+                patch.title.as_deref(),
+                sort_title,
+                patch.author.as_deref(),
+                patch.work_id.as_deref(),
+                patch.edition_id.as_deref(),
+                patch.poster_path.as_deref(),
+                now,
+                item_id
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn book_items(
+        &self,
+        library_id: i64,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<Item>, StoreError> {
+        if only == Some(&[]) {
+            return Ok(Vec::new());
+        }
+        let only = only.map(ids_json).transpose()?;
+        items(
+            self.client()
+                .query_consistent_map::<ItemRow, _>(
+                    format!(
+                        "SELECT {ITEM_COLS} FROM items \
+                         WHERE library_id = $1 AND kind IN ('book','audiobook') \
+                           AND ($2 IS NULL OR id IN (SELECT value FROM json_each($2))) \
+                         ORDER BY id"
+                    ),
+                    params!(library_id, only),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
+    async fn related_book_editions(
+        &self,
+        item_id: i64,
+        work_id: &str,
+    ) -> Result<Vec<Item>, StoreError> {
+        items(
+            self.client()
+                .query_consistent_map::<ItemRow, _>(
+                    format!(
+                        "SELECT {ITEM_COLS} FROM items \
+                         WHERE id != $1 AND book_work_id = $2 \
+                           AND kind IN ('book','audiobook') ORDER BY kind, id"
+                    ),
+                    params!(item_id, work_id),
+                )
+                .await
+                .map_err(database_error)?,
+        )
     }
 
     async fn items_needing_metadata(

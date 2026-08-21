@@ -191,6 +191,19 @@ pub struct Item {
     /// provider files under nothing both read as `[]`; `metadata_at` is what
     /// says whether a provider has answered at all.
     pub genres: Vec<String>,
+    /// Human-readable book creator. `None` outside Books libraries and when
+    /// neither a paired Curator handoff nor the publication package named one.
+    pub author: Option<String>,
+    /// Proven work identity used to relate text and audio editions. Cinema
+    /// never synthesizes this from title + author: only an explicit Curator
+    /// relation (or a future equally strong provider relation) may set it.
+    pub book_work_id: Option<String>,
+    /// Identity of this exact edition. Standalone EPUBs use the package's
+    /// unique identifier; paired imports use Curator's medium-specific key.
+    pub book_edition_id: Option<String>,
+    /// `epub` or `curator`. The source is durable so a later scheduled scan
+    /// cannot replace explicit paired metadata with weaker package hints.
+    pub book_metadata_source: Option<String>,
 }
 
 /// What the scanner knows when it first sees a file — enough to place the
@@ -246,6 +259,37 @@ pub struct MetadataPatch {
     /// offered any. `None` = nothing was attempted, and the stored attempt
     /// columns are left alone.
     pub artwork: Option<ArtworkAttempt>,
+}
+
+/// Where first-class book facts came from. Ordering is intentional: an
+/// explicit paired handoff outranks a package embedded in the imported file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookMetadataSource {
+    Epub,
+    Curator,
+}
+
+impl BookMetadataSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Epub => "epub",
+            Self::Curator => "curator",
+        }
+    }
+}
+
+/// Add-or-replace facts for one book edition. This is deliberately separate
+/// from movie/show `MetadataPatch`: its source precedence and work-linking
+/// rules are part of the write contract, not conventions at individual call
+/// sites.
+#[derive(Debug, Clone)]
+pub struct BookMetadataPatch {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub work_id: Option<String>,
+    pub edition_id: Option<String>,
+    pub poster_path: Option<String>,
+    pub source: BookMetadataSource,
 }
 
 /// The outcome of one artwork download.

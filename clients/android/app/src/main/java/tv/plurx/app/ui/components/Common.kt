@@ -334,6 +334,7 @@ fun LoadingBox(modifier: Modifier = Modifier) {
 }
 
 private fun subtitleFor(item: Item): String = when {
+    (item.isBook || item.isAudiobook) && !item.author.isNullOrBlank() -> item.author
     item.kind == "folder" && item.child_count != null -> "${item.child_count} items"
     item.kind == "episode" && item.season_number != null && item.episode_number != null ->
         "S${item.season_number} E${item.episode_number}"

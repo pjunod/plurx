@@ -35,8 +35,8 @@ use plurx_core::cluster::migration::{
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::config::Config;
 use plurx_core::domain::{
-    scopes, ArtworkAttempt, CredentialGeneration, ItemEdit, ItemKind, ItemSort, LibraryKind,
-    MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
+    scopes, ArtworkAttempt, BookMetadataPatch, BookMetadataSource, ItemEdit, ItemKind, ItemSort,
+    LibraryKind, MetadataPatch, NetworkPriorObservation, NewItem, NewLibrary, NewOfflinePackage,
     OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
     ReadingStateWrite, TraktAuth,
 };
@@ -127,6 +127,9 @@ const MEDIA_METHODS: &[&str] = &[
     "recently_added",
     "search_items",
     "apply_metadata",
+    "apply_book_metadata",
+    "book_items",
+    "related_book_editions",
     "items_needing_metadata",
     "episodes_for_show",
     "items_needing_artwork",
@@ -317,7 +320,7 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
 
 #[cfg(feature = "hiqlite-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
+async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
     let cluster = contract_cluster();
     let client = Client::remote(
@@ -346,6 +349,23 @@ async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
 
     let results = client
         .txn([
+            (
+                "DROP INDEX IF EXISTS idx_items_book_work",
+                hiqlite::params!(),
+            ),
+            ("ALTER TABLE items DROP COLUMN author", hiqlite::params!()),
+            (
+                "ALTER TABLE items DROP COLUMN book_work_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_edition_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_metadata_source",
+                hiqlite::params!(),
+            ),
             (
                 "DROP INDEX IF EXISTS idx_reading_updated",
                 hiqlite::params!(),
@@ -376,7 +396,7 @@ async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
 
     let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
         .await
-        .expect("daemon v5 to v6 migration");
+        .expect("daemon v5 through v7 migration");
     assert_eq!(
         migrated
             .get_setting("migration.proof")
@@ -398,6 +418,125 @@ async fn replicated_v5_store_migrates_atomically_to_v6_on_daemon_open() {
         (
             "SELECT COUNT(*) AS value FROM sqlite_master \
              WHERE type = 'index' AND name = 'idx_reading_updated'",
+            1,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('items') \
+             WHERE name IN ('author', 'book_work_id', 'book_edition_id', \
+                            'book_metadata_source')",
+            4,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_items_book_work'",
+            1,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect v6 migration client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("schema-v6-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .put_setting("migration.v6.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    let results = client
+        .txn([
+            (
+                "DROP INDEX IF EXISTS idx_items_book_work",
+                hiqlite::params!(),
+            ),
+            ("ALTER TABLE items DROP COLUMN author", hiqlite::params!()),
+            (
+                "ALTER TABLE items DROP COLUMN book_work_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_edition_id",
+                hiqlite::params!(),
+            ),
+            (
+                "ALTER TABLE items DROP COLUMN book_metadata_source",
+                hiqlite::params!(),
+            ),
+            (
+                "UPDATE cluster_meta SET schema_version = 6 WHERE singleton = 1",
+                hiqlite::params!(),
+            ),
+        ])
+        .await
+        .expect("construct exact v6 fixture");
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v6 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 6 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v6 to v7 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.v6.proof")
+            .await
+            .expect("read migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('items') \
+             WHERE name IN ('author', 'book_work_id', 'book_edition_id', \
+                            'book_metadata_source')",
+            4,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_items_book_work'",
             1,
         ),
     ] {
@@ -894,6 +1033,11 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE playback_events;
              DROP TABLE network_priors;
              DROP TABLE reading_state;
+             DROP INDEX idx_items_book_work;
+             ALTER TABLE items DROP COLUMN book_metadata_source;
+             ALTER TABLE items DROP COLUMN book_edition_id;
+             ALTER TABLE items DROP COLUMN book_work_id;
+             ALTER TABLE items DROP COLUMN author;
              ALTER TABLE offline_packages DROP COLUMN effective_rate_control;
              DROP INDEX watched_outbox_due;
              ALTER TABLE watched_outbox RENAME TO watched_outbox_current;
@@ -2072,7 +2216,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 141, "review the Store method count");
+    assert_eq!(declared.len(), 144, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -2160,7 +2304,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                credential_generation: CredentialGeneration::from("contract-test-gen".to_owned()),
+                user_id: 71,
                 client_class: "chrome".to_owned(),
                 network_fingerprint: key.clone(),
                 throughput_kbps: Some(8_000),
@@ -2177,7 +2321,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}: the verdict's expiry stamp is part of the durable contract"
         );
         let loaded = store
-            .network_prior("contract-test-gen", "chrome", &key)
+            .network_prior(71, "chrome", &key)
             .await
             .unwrap_or_else(|error| panic!("{backend}: load prior: {error}"))
             .expect("stored prior");
@@ -2191,7 +2335,7 @@ async fn network_prior_contract_runs_through_dyn_store() {
             "{backend}"
         );
         assert!(store
-            .network_prior("contract-test-gen", "chrome", &key)
+            .network_prior(71, "chrome", &key)
             .await
             .expect("post-prune lookup")
             .is_none());
@@ -2617,6 +2761,132 @@ async fn media_contract_runs_through_dyn_store() {
                 .expect("audiobook")
                 .id,
             audiobook
+        );
+        assert!(
+            store
+                .related_book_editions(ebook, "curator:work:shared")
+                .await
+                .expect("unlinked editions")
+                .is_empty(),
+            "title equality alone must never relate editions on {backend}"
+        );
+        store
+            .upsert_file(
+                ebook,
+                "/contract/books/shared.epub",
+                4096,
+                77,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("ebook file");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Package Title".into()),
+                    author: Some("Package Author".into()),
+                    work_id: None,
+                    edition_id: Some("urn:isbn:package".into()),
+                    poster_path: Some("books/epub-cover.jpg".into()),
+                    source: BookMetadataSource::Epub,
+                },
+            )
+            .await
+            .expect("EPUB metadata");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: Some("curator:edition:ebook".into()),
+                    poster_path: Some("books/curator-cover.jpg".into()),
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("Curator metadata");
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Late Package Title".into()),
+                    author: Some("Late Package Author".into()),
+                    work_id: Some("untrusted:fuzzy-link".into()),
+                    edition_id: Some("urn:isbn:late".into()),
+                    poster_path: Some("books/late-cover.jpg".into()),
+                    source: BookMetadataSource::Epub,
+                },
+            )
+            .await
+            .expect("lower-precedence EPUB refresh");
+        store
+            .apply_book_metadata(
+                audiobook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: Some("curator:edition:audiobook".into()),
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("audiobook relation");
+
+        let enriched = store
+            .get_item(ebook)
+            .await
+            .expect("read enriched ebook")
+            .expect("enriched ebook");
+        assert_eq!(enriched.title, "Curator Title");
+        assert_eq!(enriched.author.as_deref(), Some("Curator Author"));
+        assert_eq!(
+            enriched.book_work_id.as_deref(),
+            Some("curator:work:shared")
+        );
+        assert_eq!(
+            enriched.book_edition_id.as_deref(),
+            Some("curator:edition:ebook")
+        );
+        assert_eq!(
+            enriched.poster_path.as_deref(),
+            Some("books/curator-cover.jpg")
+        );
+        assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
+        assert_eq!(
+            store
+                .find_book(
+                    books.id,
+                    ItemKind::Book,
+                    "stale scanner title",
+                    None,
+                    Some("/contract/books/shared.epub"),
+                )
+                .await
+                .expect("find enriched ebook by path")
+                .expect("enriched ebook identity")
+                .id,
+            ebook,
+            "metadata title replacement must not duplicate a scanned path on {backend}"
+        );
+        let editions = store
+            .related_book_editions(ebook, "curator:work:shared")
+            .await
+            .expect("related editions");
+        assert_eq!(editions.len(), 1, "backend {backend}");
+        assert_eq!(editions[0].id, audiobook, "backend {backend}");
+        assert_eq!(
+            store
+                .book_items(books.id, None)
+                .await
+                .expect("book items")
+                .len(),
+            2,
+            "backend {backend}"
         );
         assert_eq!(
             store
