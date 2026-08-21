@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["81897029"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "The history audit requires a fragment filename to begin with its first mapped correction SHA. Commit `81897029` renames the issue #368 classifier fragment from the superseded original SHA to `2fb988b7-cluster-auth.toml`; `history-regressions` directly rejects the old name, so reverting only the rename reproduces the failure."

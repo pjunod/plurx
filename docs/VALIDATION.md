@@ -166,11 +166,48 @@ refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
 ## Load-sensitive cluster checks — a timeout is not a verdict
 
 One check drives real replicated infrastructure rather than a library, so the
-host it runs on is part of the experiment. `cluster-auth` (`make
-cluster-check`, points `cluster.auth` and `persistence.upgrades`) starts voters
-as separate processes; the Rust gate's `plurx-cluster-check` harness tests do
-the same. Under a full `make validate` those voters compete with every other
-check for the same cores **and for the same ephemeral ports**.
+host it runs on is part of the experiment:
+
+| Check | Point | What the host can change |
+|---|---|---|
+| `cluster-auth` (`make cluster-check`) | `cluster.auth` · `persistence.upgrades` | Three voters run as separate processes and every call carries a three-second per-operation deadline (`STORE_TIMEOUT` in `crates/plurx-core/src/store/hiqlite.rs`). Under a full `make validate` those voters compete with every other check for the same cores, and that deadline is reachable by scheduling pressure alone |
+
+**What a timeout there means.** `Database("replicated store operation timed out")`
+is the host reporting that it could not finish an operation in three seconds.
+It is not durable-state evidence in either direction: nothing was proved and
+nothing was found broken. The production deadline stays at three seconds
+because it is a server safety bound, so the suite absorbs load by re-attempting
+a deadlined step from a reset target instead of by relaxing it.
+
+**Why this check reaches that deadline before the others do.** The import
+contract and the production bound push against each other by design. The
+byte-budget transaction builder (#282) sizes every transaction as close to the
+WAL payload capacity as it can, because a transaction that stays comfortably
+small would not prove the bound it exists to prove. Maximising the payload also
+maximises how long one replicated operation takes, so this check spends most of
+its time on operations deliberately sized to sit near the three-second ceiling.
+That is not only a test-harness concern: a real library import on a busy server
+runs the same builder against the same fixed bound, so an operator seeing this
+timeout in production is seeing the same interaction, not a different bug.
+
+**How to tell it from a real regression.** The failures look different at the
+client, and the check now says which of these three it saw:
+
+- A **replicated deadline** names itself, states that the bound was neither
+  proved nor violated, and points back at this section. Rerun `make
+  cluster-check` alone on an idle machine; it takes about ten seconds.
+- A **durable-state or size violation** carries the contract's own verdict.
+  An oversized Raft transaction, for example, is refused by `hiqlite-wal` in
+  the leader (`` `data` length must not exceed `wal_size` ``) and reaches the
+  client as `ClientWriteError: panicked` — a byte comparison that reports
+  identically on an idle and a saturated host.
+- A deadline whose voter then **fails a consistent readiness read** is treated
+  as the violation, not as load: a busy voter still answers that probe, while
+  a leader killed by an oversized transaction does not.
+
+Never re-diagnose a red `cluster-auth` from elapsed time. Read which of those
+three the failure text claims, and reproduce it in isolation before treating it
+as a durable-state regression.
 
 ### A busy port is not an un-migrated store
 
