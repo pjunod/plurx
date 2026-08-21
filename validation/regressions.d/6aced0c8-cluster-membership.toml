@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["6aced0c8"]
+points = ["cluster.membership", "persistence.upgrades"]
+checks = ["cluster-auth"]
+reason = "The retained `daemon_join_refuses_occupied_and_expired_targets_then_resumes_finalization` regression reserves one join token to create a sparse Raft-id gap, binds the next token to a staged node, waits past its TTL, and requires the real daemon store-selection path to start and finalize that voter. Reverting the Hiqlite node-vector adapter restores `Config: 'node_id' not found in 'nodes'`; restoring either local or coordinator expiry rejection strands the identity-bound restart. The same regression first proves that an unused expired token is still refused, so recovery cannot revive expired bearer authority."

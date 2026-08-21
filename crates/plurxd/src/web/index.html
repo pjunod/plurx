@@ -7567,11 +7567,12 @@ function checkMarkers(){
 function renderSkip(m){
   const c=document.getElementById("pskip"); if(!c) return;
   if(!m){ if(c.dataset.k){ c.innerHTML=""; c.dataset.k=""; } return; }
-  const key=m.kind+m.start_ms;
+  const estimated=m.chapter===false;
+  const key=m.kind+m.start_ms+(estimated?"e":"");
   if(c.dataset.k===key) return; // avoid rebuilding every timeupdate tick
   c.dataset.k=key;
   const label=m.label||(m.kind==="intro"?"Skip Intro":"Skip Credits");
-  c.innerHTML=`<button onclick="skipCurrent()">${esc(label)} ›</button>`;
+  c.innerHTML=`<button onclick="skipCurrent()">${esc(label)}${estimated?" · Estimated":""} ›</button>`;
 }
 function skipCurrent(){
   const pos=markerNowMs();

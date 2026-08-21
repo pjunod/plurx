@@ -145,11 +145,17 @@ keeps transfer.
   storage, security, process-death, and sync contracts are green; the physical
   airplane-mode/reconnect device drill remains. Televisions stay deliberately
   excluded.
-- 🚧 **M5 companion integration in progress:** Cinema now persists source-ranked
-  author, cover, work, edition, and medium facts from bounded EPUB packages or
-  explicit Curator hints. SQLite v21 and replicated v7 have tested upgrade
-  paths; title/author similarity never creates an edition relation. Curator's
-  enriched handoff remains to land before the milestone is complete.
+- ✅ **M5 complete 2026-08-21:** Cinema persists source-ranked author, cover,
+  work, edition, and medium facts from bounded EPUB packages or explicit
+  Curator hints. SQLite v21 and replicated v7 have tested upgrade paths;
+  title/author similarity never creates an edition relation, and the paired
+  Curator handoff carries the exact identifiers.
+- 🚧 **M6 format expansion in progress:** one server-owned registry now drives
+  every client action and the checked-in support table. iPhone and iPad add
+  online PDFKit reading with authenticated exact-revision temporary bytes,
+  page-locator resume, local search, explicit completion, redirect confinement,
+  and protected-document refusal. Simulator/source acceptance is automated;
+  physical VoiceOver and representative-device PDF acceptance remain.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

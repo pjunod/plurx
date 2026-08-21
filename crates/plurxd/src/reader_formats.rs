@@ -58,6 +58,10 @@ const READ_OFFLINE: ReaderSurfaceCapability = ReaderSurfaceCapability {
     online: ReaderAction::Read,
     offline: ReaderAction::Read,
 };
+const READ_ON_APPLE: ReaderSurfaceCapability = ReaderSurfaceCapability {
+    online: ReaderAction::Read,
+    offline: ReaderAction::Unavailable,
+};
 const HANDOFF: ReaderSurfaceCapability = ReaderSurfaceCapability {
     online: ReaderAction::OpenIn,
     offline: ReaderAction::Unavailable,
@@ -92,7 +96,13 @@ pub static FORMAT_REGISTRY: &[ReaderFormat] = &[
     ReaderFormat {
         label: "PDF",
         extensions: &["pdf"],
-        capability: handoff("pdf"),
+        capability: ReaderCapability {
+            format: "pdf",
+            web: HANDOFF,
+            apple: READ_ON_APPLE,
+            android: HANDOFF,
+            television: NONE,
+        },
     },
     ReaderFormat {
         label: "MOBI",
@@ -210,6 +220,8 @@ mod tests {
         let pdf = capability(Path::new("book.pdf"), None).expect("PDF");
         let value = serde_json::to_value(pdf).expect("serialize PDF capability");
         assert_eq!(value["web"]["online"], "open_in");
+        assert_eq!(value["apple"]["online"], "read");
+        assert_eq!(value["apple"]["offline"], "unavailable");
     }
 
     #[test]

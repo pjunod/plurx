@@ -331,6 +331,9 @@ struct MediaFile: Codable, Identifiable {
     /// The server's format/action registry for this exact file. Optional for
     /// compatibility with servers that predate the registry.
     var reader: ReaderCapability? = nil
+    /// Exact edition identity required by a native document reader when it
+    /// saves a locator. Older servers omit it and never advertise PDF Read.
+    var readerRevision: ReadingRevision? = nil
 
     var isEpub: Bool {
         container?.lowercased() == "epub"
@@ -360,7 +363,10 @@ struct ReaderCapability: Codable, Equatable {
 enum BookReaderPolicy {
     static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
         guard !onTelevision, file.available != false else { return false }
-        if let reader = file.reader { return reader.apple.online == .read }
+        if let reader = file.reader {
+            guard reader.apple.online == .read else { return false }
+            return reader.format != "pdf" || file.readerRevision != nil
+        }
         return file.isEpub
     }
 
