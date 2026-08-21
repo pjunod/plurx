@@ -37,7 +37,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
-    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};

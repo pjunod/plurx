@@ -99,21 +99,6 @@ CREATE TABLE IF NOT EXISTS watch_state (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_watch_updated ON watch_state(user_id, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS reading_state (
-    user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    file_id            INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    file_size          INTEGER NOT NULL,
-    file_mtime         INTEGER NOT NULL,
-    locator_json       TEXT NOT NULL,
-    progression_millis INTEGER NOT NULL CHECK (progression_millis BETWEEN 0 AND 1000000),
-    completed          INTEGER NOT NULL CHECK (completed IN (0, 1)),
-    updated_at         INTEGER NOT NULL,
-    PRIMARY KEY (user_id, item_id, file_id)
-) STRICT;
-CREATE INDEX IF NOT EXISTS idx_reading_updated
-    ON reading_state(user_id, updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS library_roots (
     library_id  INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
     fingerprint TEXT NOT NULL
@@ -151,10 +136,33 @@ CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, overview, tags 
 END;
 "#;
 
+// Kept as individual statements because the replicated v5 -> v6 migration
+// executes them and the cluster_meta bump in one Raft transaction. Fresh
+// bootstrap uses these exact strings too, so the two paths cannot drift.
+pub(super) const READING_STATE_TABLE_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS reading_state (
+    user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    file_id            INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    file_size          INTEGER NOT NULL,
+    file_mtime         INTEGER NOT NULL,
+    locator_json       TEXT NOT NULL,
+    progression_millis INTEGER NOT NULL CHECK (progression_millis BETWEEN 0 AND 1000000),
+    completed          INTEGER NOT NULL CHECK (completed IN (0, 1)),
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (user_id, item_id, file_id)
+) STRICT"#;
+
+pub(super) const READING_STATE_INDEX_SCHEMA: &str = r#"CREATE INDEX IF NOT EXISTS idx_reading_updated
+    ON reading_state(user_id, updated_at DESC)"#;
+
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
     validate_sql(CATALOG_SCHEMA)?;
     for result in timeout_store(client.batch(CATALOG_SCHEMA)).await? {
         result.map_err(database_error)?;
+    }
+    for sql in [READING_STATE_TABLE_SCHEMA, READING_STATE_INDEX_SCHEMA] {
+        validate_sql(sql)?;
+        timeout_store(client.execute(sql, params!())).await?;
     }
     Ok(())
 }
