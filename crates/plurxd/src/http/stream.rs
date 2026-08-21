@@ -172,6 +172,10 @@ pub struct Caps {
     /// Max height to direct-play (omit = uncapped; a decodable 4K stream
     /// direct-plays and the browser downscales).
     pub maxheight: Option<i64>,
+    /// Per-codec direct-play height ceilings, e.g.
+    /// `h264:1080,hevc:2160,av1:1080`. A codec entry narrows `maxheight` for
+    /// that codec, while omission keeps older clients byte-for-byte stable.
+    pub vmaxheight: Option<String>,
     /// 1 when HDR may be shown directly (browser decodes it AND display is HDR).
     pub hdr: Option<u8>,
     /// `1` when this client decodes Dolby Vision (Safari does; Chrome does
@@ -226,6 +230,19 @@ fn csv(s: &Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn codec_max_heights(s: &Option<String>) -> std::collections::HashMap<String, i64> {
+    s.as_deref()
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|entry| {
+            let (codec, height) = entry.split_once(':')?;
+            let codec = codec.trim().to_ascii_lowercase();
+            let height = height.trim().parse::<i64>().ok()?;
+            (!codec.is_empty() && height > 0).then_some((codec, height))
+        })
+        .collect()
+}
+
 impl Caps {
     /// True when the client reported real capabilities (vs. only a named profile).
     fn has_caps(&self) -> bool {
@@ -268,6 +285,7 @@ impl Caps {
                 self.hdr == Some(1),
                 self.dvprofile.is_none() && self.dv == Some(1),
             );
+            profile.video_max_heights = codec_max_heights(&self.vmaxheight);
             profile.dolby_vision_profiles = csv(&self.dvprofile)
                 .into_iter()
                 .filter_map(|value| value.parse::<u8>().ok())
@@ -926,8 +944,8 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
     v.get("chapters")?.as_array().cloned()
 }
 
-/// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
-/// container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime browser
+/// GET /api/v1/files/:id/decision — players send `?vcodec=…&vmaxheight=…&
+/// acodec=…&container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime
 /// capabilities + request-local track/quality choices); native clients still
 /// pass `?profile=`. `subtitle=-1` explicitly selects Off.
 pub async fn decision(
@@ -1011,6 +1029,7 @@ pub async fn decision(
         client = q.client.as_deref().unwrap_or("unknown"),
         device = q.device.as_deref().unwrap_or("unknown"),
         vcodec = q.vcodec.as_deref().unwrap_or(""),
+        vmaxheight = q.vmaxheight.as_deref().unwrap_or(""),
         acodec = q.acodec.as_deref().unwrap_or(""),
         container = q.container.as_deref().unwrap_or(""),
         hdr = q.hdr.unwrap_or_default(),
@@ -1275,6 +1294,7 @@ pub struct StreamQuery {
     pub device: Option<String>,
     pub profile: Option<String>,
     pub vcodec: Option<String>,
+    pub vmaxheight: Option<String>,
     pub acodec: Option<String>,
     pub container: Option<String>,
     pub maxheight: Option<i64>,
@@ -1345,6 +1365,7 @@ impl StreamQuery {
             device: self.device.clone(),
             profile: self.profile.clone(),
             vcodec: self.vcodec.clone(),
+            vmaxheight: self.vmaxheight.clone(),
             acodec: self.acodec.clone(),
             container: self.container.clone(),
             maxheight: self.maxheight,
@@ -2075,6 +2096,25 @@ mod tests {
         assert!(!profile.supports_dolby_vision);
         assert_eq!(profile.dolby_vision_profiles, vec![5, 8]);
         assert!(profile.remux_dolby_vision);
+    }
+
+    #[test]
+    fn runtime_caps_parse_per_codec_height_limits() {
+        let caps = Caps {
+            vcodec: Some("h264,hevc,av1".into()),
+            acodec: Some("aac".into()),
+            container: Some("mp4".into()),
+            maxheight: Some(2160),
+            vmaxheight: Some(" H264:1080,hevc:2160,av1:bad,empty:0,broken ".into()),
+            ..Default::default()
+        };
+
+        let profile = caps.profile();
+        assert_eq!(profile.max_height, Some(2160));
+        assert_eq!(profile.video_max_heights.get("h264"), Some(&1080));
+        assert_eq!(profile.video_max_heights.get("hevc"), Some(&2160));
+        assert!(!profile.video_max_heights.contains_key("av1"));
+        assert!(!profile.video_max_heights.contains_key("empty"));
     }
 
     /// ffmpeg's `-progress` shares stderr with its diagnostics here, because
