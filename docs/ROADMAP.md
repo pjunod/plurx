@@ -129,8 +129,17 @@ keeps transfer.
 - ✅ **M1 complete 2026-08-20:** revision-bound per-user locators, SQLite and
   Hiqlite parity, authenticated reading-state routes, stale-write protection,
   and Apple/Android API models are shipped.
-- 📝 **M2 next:** prove the hostile-publication boundary, then ship the web
-  EPUB reader and Read/Resume experience without changing A/V playback.
+- ✅ **M2 complete 2026-08-20:** the bounded, revision-scoped EPUB publication
+  API and in-app web reader ship Read/Resume, TOC, search, preferences,
+  explicit completion, durable paragraph restoration, and hostile-content
+  browser proof without changing A/V playback.
+- ✅ **M3 complete 2026-08-20:** iPhone/iPad and Android phone/tablet now host
+  the shared reader behind memory-only authentication and same-origin native
+  navigation guards. Simulator/JVM plus real-browser contracts prove profile
+  isolation, semantic headings, close flushing, and the same paragraph after
+  font and orientation changes; tvOS and Google TV expose no reader action.
+- 📝 **M4 next:** add profile-scoped, app-private EPUB downloads and reconcile
+  the newest offline locator when the server returns.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

@@ -44,7 +44,7 @@ const EPUB_MIMETYPE: &str = "application/epub+zip";
 const RESOURCE_CSP: &str = "default-src 'none'; script-src 'none'; connect-src 'none'; \
     img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; \
     media-src 'self'; frame-src 'none'; object-src 'none'; form-action 'none'; \
-    base-uri 'none'; navigate-to 'self'; frame-ancestors 'self'";
+    base-uri 'none'; frame-ancestors 'self'";
 
 #[derive(Debug)]
 enum PublicationError {

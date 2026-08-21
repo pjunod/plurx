@@ -155,6 +155,16 @@ missing = "fail"
 timeout_seconds = 120
 
 [[checks]]
+id = "reader-browser"
+title = "EPUB reader restore, navigation, search, and hostile-content boundary"
+command = "scripts/reader-browser"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["python3", "cargo"]
+preflight = "python3 -c 'import playwright'"
+missing = "skip"
+timeout_seconds = 1800
+
+[[checks]]
 id = "apple-simulators"
 title = "Shared iOS and tvOS XCTest suite"
 command = "make apple-test"
@@ -536,12 +546,13 @@ paths = [
   "docs/UI-*.md",
   "scripts/contrast-*",
   "scripts/js-check",
+  "scripts/reader-browser",
   "scripts/themes-proposed.json",
   "scripts/ui-baseline",
   "tests/ui-structure.golden",
   "tests/web/**",
 ]
-checks = ["rust-gate", "web-static", "web-membership", "web-layout", "playback-smoke", "playback-exhaustive"]
+checks = ["rust-gate", "web-static", "web-membership", "reader-browser", "web-layout", "playback-smoke", "playback-exhaustive"]
 depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
