@@ -12,10 +12,11 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `71` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `72` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 71 keeps pending offline reading state separate
+> same regression suite. Build 72 displays bounded book author metadata and
+> exact work-linked editions on browse and detail surfaces. Build 71 keeps pending offline reading state separate
 > for each exact item/file/revision edition. Build 70 adds profile-scoped, atomically published
 > offline EPUB reading and newest-locator replay on iPhone and iPad, with no
 > tvOS action. Build 69 adds in-app online EPUB reading on iPhone

@@ -159,8 +159,12 @@ whichever header the secret arrived in.
  "ids":{"tmdb":603,"imdb":"tt0133093"},
  "correlation_id":"t-43-b1e207","source":"monarr"}
 
-// a book: the Books library derives text/audio and shelf identity from disk
+// a book: the path identifies local bytes; Curator supplies exact relations
 {"path":"/media/books/Andy Weir/Project Hail Mary","hint":"book",
+ "book":{"title":"Project Hail Mary","author":"Andy Weir","medium":"ebook",
+         "work_id":"curator:openlibrary:OL20631799W",
+         "edition_id":"curator:item:44:ebook",
+         "cover_url":"https://covers.openlibrary.org/b/olid/OL12345M-L.jpg"},
  "correlation_id":"t-44-c4d812","source":"monarr"}
 ```
 
@@ -172,8 +176,12 @@ unresolvable path and counts the rejection as a pass).
 `hint` is advisory. The library's own kind decides how a file is parsed; the
 hint only picks which item an id applies to. For an episode, `series.tmdb` is
 the **show's** id — an episode's own id does not identify the series. A book
-hint carries no provider ids: the resolved Books library decides ebook versus
-audiobook from the files and retains the author/title shelf path as identity.
+request may add a `book` object. `medium` is `ebook` or `audiobook`; `work_id`
+and `edition_id` are bounded opaque Curator keys; `cover_url`, when present,
+must be an HTTPS Open Library cover URL. Cinema accepts this object only below
+a Books root and never invents a relation from title plus author. Older callers
+may omit it; the Books library still derives local file identity from disk and
+standalone EPUBs contribute bounded package metadata.
 
 `correlation_id` is monarr's transfer id (`t-<downloadID>-<hex>`), echoed back
 in the response and written to the log, so one grep across three applications

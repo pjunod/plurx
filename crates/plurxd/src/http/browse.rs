@@ -246,6 +246,9 @@ pub struct ItemDetail {
     pub ancestors: Vec<ItemDto>,
     pub children: Vec<ItemDto>,
     pub files: Vec<FileDto>,
+    /// Other text/audio editions sharing a proven work id. Empty when no
+    /// explicit relation exists; title + author never populate this list.
+    pub editions: Vec<ItemDto>,
     /// Current revision-bound locator for text books. `None` means unread or
     /// that the saved locator belongs to a replaced file revision.
     pub reading: Option<ReadingDto>,
@@ -384,6 +387,14 @@ pub async fn item_detail(
     } else {
         None
     };
+    let editions = if matches!(item.kind, ItemKind::Book | ItemKind::Audiobook) {
+        match item.book_work_id.as_deref() {
+            Some(work_id) => state.store.related_book_editions(item.id, work_id).await?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     let item_dto = ItemDto::from(item)
         .with_watch(watch.get(&id).copied())
         .with_rollup(rollup);
@@ -392,6 +403,7 @@ pub async fn item_detail(
         ancestors: ancestors.into_iter().map(Into::into).collect(),
         children: annotate_with_counts(children, &watch, &child_counts, &mut child_media),
         files: file_dtos,
+        editions: editions.into_iter().map(Into::into).collect(),
         reading,
     }))
 }
