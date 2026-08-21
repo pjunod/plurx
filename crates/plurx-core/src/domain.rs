@@ -933,10 +933,13 @@ pub struct PlaybackEventQuery {
 ///
 /// The fingerprint is deliberately opaque outside the storage boundary. It is
 /// derived from a coarse client class and an IPv4 /24, never a full address,
-/// and must not be returned by an API or written to application logs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// and must not be returned by an API or written to application logs. The
+/// credential generation is also opaque — it is the stable node-local prior
+/// identity derived from the user's credential material and must never be
+/// exposed through APIs, logs, or telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPrior {
-    pub user_id: i64,
+    pub credential_generation: CredentialGeneration,
     pub client_class: String,
     pub network_fingerprint: String,
     /// Conservative sustained throughput estimate, in decimal kilobits/s.
@@ -979,15 +982,115 @@ impl NetworkPrior {
     }
 }
 
+/// An opaque node-local credential-generation key for network priors.
+///
+/// Lowercase hex-encoded SHA-256, domain-separated and length-delimited with
+/// domain `plurx/network-prior-user/v1`. Derived from the authenticated user's
+/// id, created_at, and complete Argon2 PHC password_hash. Never exposed
+/// through APIs, logs, metrics, telemetry payloads, or client-visible
+/// diagnostics.
+///
+/// A delete/recreate, password reset, or password rehash produces a different
+/// generation, so a prior bound to the old generation is unreachable through
+/// the new one. An admin-role change preserves the generation because the
+/// inputs do not change.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+pub struct CredentialGeneration(String);
+
+impl CredentialGeneration {
+    /// Domain-separated, length-delimited encoding domain.
+    const DOMAIN: &'static [u8] = b"plurx/network-prior-user/v1";
+
+    /// Derive a credential-generation key from the three stable inputs.
+    ///
+    /// Uses domain-separated, length-delimited encoding so that field
+    /// boundaries are unambiguous even when one field's content could be
+    /// confused with another's.
+    pub fn derive(user_id: i64, created_at: i64, password_hash: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(Self::DOMAIN);
+        let id_bytes = user_id.to_be_bytes();
+        hasher.update((id_bytes.len() as u64).to_be_bytes());
+        hasher.update(id_bytes);
+        let created_bytes = created_at.to_be_bytes();
+        hasher.update((created_bytes.len() as u64).to_be_bytes());
+        hasher.update(created_bytes);
+        let pw_bytes = password_hash.as_bytes();
+        hasher.update((pw_bytes.len() as u64).to_be_bytes());
+        hasher.update(pw_bytes);
+        Self(hex::encode(hasher.finalize()))
+    }
+
+    /// Borrow the inner hex string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume and return the inner hex string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for CredentialGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialGeneration(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for CredentialGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<credential-generation>")
+    }
+}
+
+impl From<String> for CredentialGeneration {
+    fn from(inner: String) -> Self {
+        Self(inner)
+    }
+}
+
+impl AsRef<str> for CredentialGeneration {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CredentialGeneration {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One telemetry-derived update to a [`NetworkPrior`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPriorObservation {
+    /// Non-lookup ownership metadata used only to enforce the bounded number
+    /// of retained priors across credential rotations.
     pub user_id: i64,
+    pub credential_generation: CredentialGeneration,
     pub client_class: String,
     pub network_fingerprint: String,
     pub throughput_kbps: Option<u32>,
     pub starved_rung_height: Option<i64>,
     pub observed_at_ms: i64,
+}
+
+/// The set of fields that must be supplied to build a
+/// [`NetworkPriorObservation`].
+///
+/// At the HTTP boundary the authenticated user's credential generation is
+/// captured once, during authentication, and threaded to the telemetry path
+/// alongside the user_id used for other purposes. This struct bundles the
+/// three prior-specific inputs so callers do not fetch the password hash
+/// inside spawned work.
+#[derive(Debug, Clone)]
+pub struct PriorCredential {
+    pub credential_generation: CredentialGeneration,
 }
 
 /// A user's linked Trakt account (tokens + sync bookkeeping).
