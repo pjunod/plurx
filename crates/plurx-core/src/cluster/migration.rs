@@ -870,7 +870,7 @@ impl ActivationMarker {
     }
 
     fn validate(&self) -> Result<(), StoreError> {
-        if self.marker_version != ACTIVATION_MARKER_VERSION {
+        if self.marker_version > ACTIVATION_MARKER_VERSION {
             return Err(StoreError::Migration(format!(
                 "unsupported Hiqlite activation marker version {}",
                 self.marker_version
@@ -878,8 +878,8 @@ impl ActivationMarker {
         }
         if self.cluster_id.trim().is_empty()
             || self.source_schema_version <= 0
-            || (self.replicated_schema_version != AUTH_SCHEMA_MIGRATION_SOURCE
-                && self.replicated_schema_version != AUTH_SCHEMA_VERSION)
+            || self.replicated_schema_version < AUTH_SCHEMA_MIGRATION_SOURCE
+            || self.replicated_schema_version > AUTH_SCHEMA_VERSION
             || !is_sha256(&self.source_backup_sha256)
             || self.table_hashes.is_empty()
         {
