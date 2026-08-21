@@ -200,11 +200,14 @@ struct PlurxAPI {
         try await deleteNoContent("publication/\(sessionId)")
     }
 
-    func bookContentRequest(fileId: Int) throws -> URLRequest {
+    func bookContentRequest(
+        fileId: Int,
+        accept: String = "application/epub+zip"
+    ) throws -> URLRequest {
         guard let url = makeURL("files/\(fileId)/content") else { throw APIError.badURL }
         var request = URLRequest(url: url)
         Session.shared.authorize(&request)
-        request.setValue("application/epub+zip", forHTTPHeaderField: "Accept")
+        request.setValue(accept, forHTTPHeaderField: "Accept")
         return request
     }
 

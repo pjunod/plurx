@@ -399,7 +399,7 @@ test_anchor = "test_client_anchor_survives_a_non_corrective_squash_title"
 
 [[fixes]]
 id = "apple.offline-launch-navigation"
-commits = ["bcc39c31"]
+commits = ["87927379"]
 source = "clients/apple/Sources/HomeView.swift"
 source_anchor = "static let offlineLaunchTab: HomeTab = .downloads"
 test = "clients/apple/Tests/AppleClientTests.swift"
