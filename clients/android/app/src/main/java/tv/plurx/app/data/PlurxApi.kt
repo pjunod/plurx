@@ -42,6 +42,24 @@ interface PlurxApi {
     @GET("items/{id}")
     suspend fun item(@Path("id") id: Long): ItemDetail
 
+    @GET("items/{id}/reading-state")
+    suspend fun readingState(
+        @Path("id") id: Long,
+        @Query("file_id") fileId: Long,
+    ): ReadingStateResponse
+
+    @PUT("items/{id}/reading-state")
+    suspend fun putReadingState(
+        @Path("id") id: Long,
+        @Body body: PutReadingStateRequest,
+    ): ReadingState
+
+    @DELETE("items/{id}/reading-state")
+    suspend fun deleteReadingState(
+        @Path("id") id: Long,
+        @Query("file_id") fileId: Long,
+    )
+
     @GET("search")
     suspend fun search(@Query("q") query: String, @Query("limit") limit: Int = 200): SearchResponse
 

@@ -1388,6 +1388,11 @@ def run_capture(base_url, token, routes, args, out_dir):
                 "--font-render-hinting=none",
                 "--disable-lcd-text",
                 "--disable-font-subpixel-positioning",
+                # Player fixtures contain a synthetic sine track. The visual
+                # baseline needs playback state, never audible host output.
+                "--mute-audio",
+                # Keep automation out of macOS Now Playing and media-key state.
+                "--disable-features=HardwareMediaKeyHandling",
                 # A backgrounded renderer throttles timers, so the app's pollers
                 # fire late and the "settled" state is not the settled state.
                 "--disable-background-timer-throttling",

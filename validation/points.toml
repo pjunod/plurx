@@ -279,7 +279,7 @@ timeout_seconds = 1800
 [[checks]]
 id = "resource-bounds"
 title = "Session registries, hardware slots, and memory work stay bounded"
-command = "cargo test -p plurxd cannot_grow_the_registry_without_bound -- --nocapture && cargo test -p plurxd transcode::tests::concurrent_starts_cannot_exceed_the_hardware_slot_cap -- --exact --nocapture"
+command = "cargo test -p plurxd cannot_grow_the_registry_without_bound -- --nocapture && cargo test -p plurxd transcode::tests::concurrent_starts_cannot_exceed_the_hardware_slot_cap -- --exact --nocapture && cargo test -p plurxd http::publication::tests::epub_manifest_does_not_expand_large_resource -- --exact --ignored --nocapture"
 profiles = ["nightly"]
 requires = ["cargo"]
 missing = "fail"
@@ -307,6 +307,7 @@ paths = [
   "crates/plurx-core/src/store/mod.rs",
   "crates/plurx-core/src/store/replicated.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
+  "crates/plurx-core/src/store/sqlite/reading.rs",
   "crates/plurx-core/src/store/sqlite/telemetry.rs",
   "crates/plurx-core/src/store/telemetry.rs",
   "crates/plurx-core/tests/store_contract.rs",
@@ -339,6 +340,7 @@ paths = [
   "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
   "vendor/rust_decimal/**",
@@ -365,10 +367,10 @@ contract = "The single server binary exposes stable native endpoints and coordin
 paths = [
   "crates/plurxd/Cargo.toml",
   "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
-  "crates/plurxd/src/http/{dto,error,extract,mod,network,system}.rs",
+  "crates/plurxd/src/http/{dto,error,extract,mod,network,publication,reading,system}.rs",
   "plurx.example.toml",
 ]
-checks = ["rust-gate", "api-wire", "user-journey"]
+checks = ["rust-gate", "api-wire", "user-journey", "resource-bounds"]
 depends_on = ["core.media", "persistence.upgrades"]
 
 [[points]]
