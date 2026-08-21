@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["761ede79"]
+points = ["apple.client"]
+checks = ["apple-simulators"]
+reason = "The tvOS XCTest build and navigation suite exercise the current playback badge view and its focusable layout."

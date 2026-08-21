@@ -14,6 +14,7 @@ mod library;
 mod media;
 mod offline;
 mod outbox;
+mod reading;
 mod telemetry;
 mod trakt;
 mod users;
@@ -552,6 +553,25 @@ const MIGRATIONS: &[&str] = &[
     // purpose: the hiqlite backend carries this exact table in its per-voter
     // telemetry sidecar rather than replicating observations through Raft.
     NETWORK_PRIORS_SCHEMA,
+    // v20: per-user text-publication state. A locator is bound to one exact
+    // file revision because the same chapter href in a replaced edition is
+    // not evidence that it names the same text. Progress is millionths on
+    // purpose: stable integer ordering/storage with an exact [0,1] wire range.
+    "CREATE TABLE reading_state (
+        user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        file_id            INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        file_size          INTEGER NOT NULL,
+        file_mtime         INTEGER NOT NULL,
+        locator_json       TEXT NOT NULL,
+        progression_millis INTEGER NOT NULL
+                           CHECK (progression_millis BETWEEN 0 AND 1000000),
+        completed          INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+        updated_at         INTEGER NOT NULL,
+        PRIMARY KEY (user_id, item_id, file_id)
+    ) STRICT;
+    CREATE INDEX reading_state_recent
+        ON reading_state(user_id, updated_at DESC);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1017,8 +1037,10 @@ impl SettingsStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::MetadataPatch;
-    use crate::store::{MediaStore, PlaybackTelemetryStore, SettingsStore, WatchStore};
+    use crate::domain::{MetadataPatch, ReadingStateWrite};
+    use crate::store::{
+        MediaStore, PlaybackTelemetryStore, ReadingStore, SettingsStore, WatchStore,
+    };
 
     /// The §3.2 pair: a write on the writer connection is visible to the
     /// read pool at once (WAL read-your-writes across connections), and a
@@ -1229,7 +1251,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 19,
+            version, 20,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1375,7 +1397,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1430,7 +1452,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            19
+            20
         );
         assert!(conn
             .execute(
@@ -1498,7 +1520,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            19
+            20
         );
         let index: i64 = conn
             .query_row(
@@ -1509,6 +1531,89 @@ mod tests {
             )
             .expect("index lookup");
         assert_eq!(index, 1);
+    }
+
+    #[tokio::test]
+    async fn v20_adds_revision_bound_reading_state_without_touching_v19_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(19) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 19)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO settings (key, value) VALUES ('migration.proof', 'survives');
+                 INSERT INTO users (id, username, password_hash, is_admin)
+                     VALUES (1, 'reader', 'hash', 0);
+                 INSERT INTO libraries (id, name, kind, paths, anime)
+                     VALUES (1, 'Books', 'books', '[\"/books\"]', 0);
+                 INSERT INTO items (id, library_id, kind, title, sort_title)
+                     VALUES (10, 1, 'book', 'Migration Book', 'migration book');
+                 INSERT INTO files (id, item_id, path, size, mtime)
+                     VALUES (100, 10, '/books/migration.epub', 4096, 77);",
+            )
+            .expect("seed v19 rows");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v19 to v20");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives")
+        );
+        let state = store
+            .put_reading_state(
+                1,
+                10,
+                &ReadingStateWrite {
+                    file_id: 100,
+                    file_size: 4096,
+                    file_mtime: 77,
+                    locator_json: r#"{"version":1,"href":"chapter.xhtml"}"#.into(),
+                    progression_millis: 500_000,
+                    completed: false,
+                    recorded_at: Some(123),
+                },
+            )
+            .await
+            .expect("write v20 reading state");
+        assert_eq!(state.progression_millis, 500_000);
+        assert_eq!(
+            store
+                .current_reading_state(1, 10)
+                .await
+                .expect("read v20 state")
+                .expect("state"),
+            state
+        );
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            20
+        );
+        assert!(conn
+            .execute(
+                "UPDATE reading_state SET progression_millis = 1000001 \
+                 WHERE user_id = 1 AND item_id = 10 AND file_id = 100",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE reading_state SET completed = 2 \
+                 WHERE user_id = 1 AND item_id = 10 AND file_id = 100",
+                [],
+            )
+            .is_err());
     }
 
     /// v13 adds a column to `items`, which is the migration shape with a

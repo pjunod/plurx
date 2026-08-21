@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["a37f3f5"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog replacement-race regressions pause after stale Done and Stall observations, require the replacement to survive with coverage intact, then require a later successor stall to fail; reverting only the production correction either kills the successor or abandons its watchdog."

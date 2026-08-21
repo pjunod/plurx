@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["e52e7de9"]
+points = ["cluster.membership", "offline.viewing"]
+checks = ["cluster-auth"]
+reason = "The three-voter `membership` scenario seeds four packages on a real follower against real files on disk and removes it: a source every survivor can read is requeued onto one of them and then claimed and published there, a source that exists nowhere fails `node_removed` with `reserved_bytes` back at zero, a `ready` package fails the same way despite a perfectly readable source because its bytes lived only on the removed node, and the removed node can no longer publish the work its successor took over. Restoring the pre-fix production files removes the probe protocol the scenario depends on, so it cannot pass without them. Three separate policy mutations were also each rejected by a distinct assertion: requeueing without a verified probe answer trips the `node_removed` case, and admitting `ready` into the movable set trips first the atomic-plan guard and then, once the requeue statement is widened to accept `ready` too, the ready-state assertion itself."

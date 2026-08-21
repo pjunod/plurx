@@ -33,6 +33,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 flate2 = { workspace = true }
 crc32fast = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 # `fixtures` builds plurx-core's shared media-fixture helper for the copyseg

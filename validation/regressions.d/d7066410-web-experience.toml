@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d7066410"]
+points = ["web.experience", "library.catalog"]
+checks = ["web-layout", "playback-smoke"]
+reason = "The browser structure and playback sweeps cover the mobile overlay across themes and active media."

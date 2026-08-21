@@ -473,6 +473,11 @@ pub async fn create(
                 format!("The server has reserved {used} of {limit} offline bytes."),
             ))
         }
+        OfflineCreateOutcome::NodeIsTombstone => Err(typed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_removed",
+            "This node has been removed from the cluster and can no longer create offline downloads. Point your client at a surviving node.",
+        ))
     }
 }
 

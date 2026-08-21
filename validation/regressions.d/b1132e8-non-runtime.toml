@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["b1132e8"]
+points = []
+checks = []
+reason = "This commit adds a startup operator warning naming unstamped builds and how to stamp them (make docker-up / PLURX_BUILD_REF); its only surface is that log line. The packaging contract that produces stamped images is already covered by the operations contract, and the deploy-path fix lives in the fleet playbook, not in runtime assertions."
+ignore = true

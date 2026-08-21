@@ -3,14 +3,14 @@
 //! watch state can be attached per user.
 
 use plurx_core::domain::{
-    AudioStream, InProgressItem, Item, ItemKind, Library, MediaFile, RecentItem, SubtitleStream,
-    User, WatchRollup, WatchState,
+    AudioStream, InProgressItem, Item, ItemKind, Library, MediaFile, ReadingState, RecentItem,
+    SubtitleStream, User, WatchRollup, WatchState,
 };
 use plurx_core::mediafacts::MediaFacts;
 use plurx_core::tracks::{
     lang_matches, prefers_original_audio, select_tracks, LangPrefs, TrackSelection,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Build the API URL for a cached artwork filename.
 fn image_url(filename: &Option<String>) -> Option<String> {
@@ -33,6 +33,40 @@ impl From<WatchState> for WatchDto {
             watched: w.watched,
             updated_at: w.updated_at,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct RevisionDto {
+    pub size: i64,
+    pub mtime: i64,
+}
+
+#[derive(Serialize)]
+pub struct ReadingDto {
+    pub file_id: i64,
+    pub revision: RevisionDto,
+    pub locator: serde_json::Value,
+    pub progression: f64,
+    pub completed: bool,
+    pub updated_at: i64,
+}
+
+impl TryFrom<ReadingState> for ReadingDto {
+    type Error = serde_json::Error;
+
+    fn try_from(state: ReadingState) -> Result<Self, Self::Error> {
+        Ok(Self {
+            file_id: state.file_id,
+            revision: RevisionDto {
+                size: state.file_size,
+                mtime: state.file_mtime,
+            },
+            locator: serde_json::from_str(&state.locator_json)?,
+            progression: state.progression_millis as f64 / 1_000_000.0,
+            completed: state.completed,
+            updated_at: state.updated_at,
+        })
     }
 }
 

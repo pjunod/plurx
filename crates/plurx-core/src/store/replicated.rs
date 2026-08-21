@@ -351,6 +351,7 @@ mod tests {
         ("mod.rs", include_str!("sqlite/mod.rs")),
         ("offline.rs", include_str!("sqlite/offline.rs")),
         ("outbox.rs", include_str!("sqlite/outbox.rs")),
+        ("reading.rs", include_str!("sqlite/reading.rs")),
         ("telemetry.rs", include_str!("sqlite/telemetry.rs")),
         ("trakt.rs", include_str!("sqlite/trakt.rs")),
         ("users.rs", include_str!("sqlite/users.rs")),
