@@ -202,6 +202,14 @@ inside one Books library while keeping their actions and metadata honest.
   to the Cinema origin and publication capability, closing flushes the newest
   locator, and a profile or server change dismisses the book. tvOS and
   Google TV deliberately expose no reader action.
+- **Native online PDF reading is built in on iPhone and iPad.** PDFKit renders
+  authenticated originals from an app-private temporary directory, page
+  changes save revision-bound locators, and local search never leaves the
+  device. The loader rejects an edition whose byte count changed, PDFs above
+  1 GiB, password-protected documents, and files that prohibit accessibility
+  extraction. The temporary copy is removed on close. Web, Android, offline,
+  and television PDF actions remain **Open in…** or unavailable as the support
+  registry states.
 - **Cinema-managed EPUB downloads are built in on iPhone, iPad, and Android
   phone/tablet.** Each app
   records a recoverable intent before transfer, downloads the authenticated

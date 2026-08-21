@@ -13,6 +13,7 @@ mod playstart;
 mod produce;
 mod progress;
 mod progressive;
+mod reader_formats;
 mod schedule;
 mod state;
 mod storeprobe;

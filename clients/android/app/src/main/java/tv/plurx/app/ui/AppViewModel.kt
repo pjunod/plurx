@@ -482,7 +482,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         title: String,
         posterPath: String?,
     ): String? {
-        if (!file.isEpub) return "Cinema can currently download EPUB books only"
+        if (!file.supportsOfflineBookReader) {
+            return "Cinema cannot download this ebook format for in-app reading"
+        }
         val instance = serverInstanceId
             ?: return "Reconnect to this Cinema server before downloading"
         val user = currentUserId
