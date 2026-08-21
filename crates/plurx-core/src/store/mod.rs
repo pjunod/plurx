@@ -1262,7 +1262,7 @@ pub trait NetworkPriorStore: Send + Sync + 'static {
     ) -> Result<NetworkPrior, StoreError>;
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError>;

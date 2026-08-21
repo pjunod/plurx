@@ -41,14 +41,20 @@ impl NetworkPriorStore for SqliteStore {
 
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError> {
+        let credential_generation = credential_generation.to_owned();
         let client_class = client_class.to_owned();
         let network_fingerprint = network_fingerprint.to_owned();
         self.with_read(move |conn| {
-            crate::store::telemetry::get_prior(conn, user_id, &client_class, &network_fingerprint)
+            crate::store::telemetry::get_prior(
+                conn,
+                &credential_generation,
+                &client_class,
+                &network_fingerprint,
+            )
         })
         .await
     }

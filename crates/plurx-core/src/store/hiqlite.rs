@@ -613,13 +613,13 @@ impl NetworkPriorStore for HiqliteAuthStore {
 
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError> {
         self.telemetry
             .prior(
-                user_id,
+                credential_generation.to_owned(),
                 client_class.to_owned(),
                 network_fingerprint.to_owned(),
             )
