@@ -1,7 +1,0 @@
-version = 1
-
-[[coverage]]
-commits = ["727eee23"]
-points = ["validation.framework"]
-checks = ["history-regressions"]
-reason = "The append-only regression fragment maps the corrective web commit to its shipped production-coupled policy test; the history audit verifies that mapping remains valid and complete."
