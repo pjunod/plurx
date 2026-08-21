@@ -74,7 +74,9 @@ struct RootView: View {
                 if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ProgressView().tint(Palette.accent)
                 } else {
-                    NavigationStack { DownloadsView() }
+                    // Keep Downloads inside the shared shell. A durable failed
+                    // row must not hide Home's session-recovery controls.
+                    HomeView(initialTab: HomeLayoutPolicy.offlineLaunchTab)
                 }
                 #else
                 ProgressView().tint(Palette.accent)
@@ -88,7 +90,9 @@ struct RootView: View {
                 if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ReconnectView()
                 } else {
-                    NavigationStack { DownloadsView() }
+                    // Start in the local library without making it a dead-end
+                    // root when the saved server is still unreachable.
+                    HomeView(initialTab: HomeLayoutPolicy.offlineLaunchTab)
                 }
                 #else
                 ReconnectView()
