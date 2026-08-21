@@ -83,6 +83,51 @@ function test(name, run) {
   }
 }
 
+test("estimated skip markers are hedged without rebuilding each tick", () => {
+  let writes = 0;
+  const skip = {
+    dataset: {},
+    value: "",
+    get innerHTML() {
+      return this.value;
+    },
+    set innerHTML(value) {
+      writes += 1;
+      this.value = value;
+    },
+  };
+  const renderSkip = new Function(
+    "document",
+    "esc",
+    `${shippedSource("renderSkip")}
+return renderSkip;`,
+  )(
+    { getElementById: (id) => (id === "pskip" ? skip : null) },
+    (value) => value,
+  );
+  const exact = {
+    kind: "credits",
+    start_ms: 6_000,
+    chapter: true,
+  };
+  renderSkip(exact);
+  assert.equal(
+    skip.innerHTML,
+    '<button onclick="skipCurrent()">Skip Credits ›</button>',
+  );
+  renderSkip(exact);
+  assert.equal(writes, 1, "the exact marker should not rebuild on timeupdate");
+
+  const estimated = { ...exact, chapter: false };
+  renderSkip(estimated);
+  assert.equal(
+    skip.innerHTML,
+    '<button onclick="skipCurrent()">Skip Credits · Estimated ›</button>',
+  );
+  renderSkip(estimated);
+  assert.equal(writes, 2, "the estimated marker should not rebuild on timeupdate");
+});
+
 test("every server verdict reaches exactly one initial web transport", () => {
   const rows = [
     [{ method: "direct_play" }, "direct"],
