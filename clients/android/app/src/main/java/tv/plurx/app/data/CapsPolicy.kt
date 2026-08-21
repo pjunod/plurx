@@ -52,7 +52,18 @@ internal object AudioSinkEncoding {
 internal data class VideoDecoderLimit(
     val codec: String,
     val maxHeight: Int,
+    /** False for platform/software components such as `c2.android.av1-dav1d.decoder`. */
+    val hardwareAccelerated: Boolean = true,
 )
+
+/**
+ * A registered software decoder is useful capability evidence, but its
+ * advertised size range is not a realtime performance guarantee. Android's
+ * dav1d component can report 3840x2160 on a mid-grade CPU while dropping a
+ * material share of the frames. Keep the software fallback for ordinary HD;
+ * require hardware evidence above it.
+ */
+internal const val SOFTWARE_VIDEO_MAX_HEIGHT = 1080
 
 internal data class VideoCodecCaps(
     val codecs: List<String>,
@@ -75,7 +86,12 @@ internal fun videoCodecCaps(limits: Iterable<VideoDecoderLimit>): VideoCodecCaps
     for (limit in limits) {
         val codec = limit.codec.lowercase()
         if (codec !in supported || limit.maxHeight <= 0) continue
-        maxima[codec] = maxOf(maxima[codec] ?: 0, limit.maxHeight)
+        val effectiveHeight = if (limit.hardwareAccelerated) {
+            limit.maxHeight
+        } else {
+            minOf(limit.maxHeight, SOFTWARE_VIDEO_MAX_HEIGHT)
+        }
+        maxima[codec] = maxOf(maxima[codec] ?: 0, effectiveHeight)
     }
     val ordered = listOf("h264", "hevc", "av1", "vp9").filter(maxima::containsKey)
     return VideoCodecCaps(ordered, ordered.associateWith(maxima::getValue))

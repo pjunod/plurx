@@ -142,10 +142,35 @@ object Caps {
                             false
                         }
                     }?.second ?: return@typeLoop
-                    add(VideoDecoderLimit(codec, maxHeight))
+                    add(
+                        VideoDecoderLimit(
+                            codec = codec,
+                            maxHeight = maxHeight,
+                            hardwareAccelerated = isHardwareAccelerated(info),
+                        ),
+                    )
                 }
             }
         }
+
+    /**
+     * API 29 made this classification authoritative. Before that, use the
+     * component naming convention Android and Media3 use for software codecs;
+     * unknown vendor components remain eligible instead of disabling hardware
+     * playback on an old device merely because its vendor chose a novel name.
+     */
+    private fun isHardwareAccelerated(info: MediaCodecInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return info.isHardwareAccelerated
+        }
+        val name = info.name.lowercase()
+        return !(
+            name.startsWith("omx.google.") ||
+                name.startsWith("c2.android.") ||
+                name.startsWith("c2.google.") ||
+                name.startsWith("omx.ffmpeg.")
+        )
+    }
 
     private data class DolbyVisionDecoderProbe(
         val names: List<String>,
