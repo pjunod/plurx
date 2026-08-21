@@ -444,14 +444,22 @@ final class AppleClientTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let catalog = OfflineBookCatalog(directory: directory)
 
-        func book(id: String, server: String, user: Int, item: Int, recordedAt: Int) -> OfflineBook {
+        func book(
+            id: String,
+            server: String,
+            user: Int,
+            item: Int,
+            fileId: Int = 90,
+            revision: ReadingRevision = ReadingRevision(size: 4096, mtime: 100),
+            recordedAt: Int
+        ) -> OfflineBook {
             OfflineBook(
                 id: id,
                 serverInstanceId: server,
                 userId: user,
                 itemId: item,
-                fileId: 90,
-                revision: ReadingRevision(size: 4096, mtime: 100),
+                fileId: fileId,
+                revision: revision,
                 title: "Contract Book",
                 author: "A. Reader",
                 originalFilename: "contract.epub",
@@ -495,6 +503,15 @@ final class AppleClientTests: XCTestCase {
 
         try await catalog.upsert(book(id: "old", server: "server-a", user: 7, item: 11, recordedAt: 40))
         try await catalog.upsert(book(id: "new", server: "server-a", user: 7, item: 11, recordedAt: 70))
+        try await catalog.upsert(book(
+            id: "other-edition",
+            server: "server-a",
+            user: 7,
+            item: 11,
+            fileId: 91,
+            revision: ReadingRevision(size: 8192, mtime: 200),
+            recordedAt: 60
+        ))
         try await catalog.upsert(book(id: "other", server: "server-b", user: 7, item: 11, recordedAt: 90))
 
         var recovering = book(
@@ -525,9 +542,12 @@ final class AppleClientTests: XCTestCase {
         try await catalog.upsert(recovering)
 
         let current = await catalog.currentProfile(serverInstanceId: "server-a", userId: 7)
-        XCTAssertEqual(Set(current.map(\.id)), Set(["old", "new", "recovered"]))
+        XCTAssertEqual(
+            Set(current.map(\.id)),
+            Set(["old", "new", "other-edition", "recovered"])
+        )
         let pending = await catalog.newestPending(serverInstanceId: "server-a", userId: 7)
-        XCTAssertEqual(pending.map(\.id), ["new"])
+        XCTAssertEqual(pending.map(\.id), ["other-edition", "new"])
         let others = await catalog.otherProfiles(serverInstanceId: "server-a", userId: 7)
         XCTAssertEqual(others.first?.items, 1)
 
@@ -535,7 +555,7 @@ final class AppleClientTests: XCTestCase {
         let restoredCurrent = await restored.currentProfile(serverInstanceId: "server-a", userId: 7)
         XCTAssertEqual(
             Set(restoredCurrent.map(\.id)),
-            Set(["old", "new", "recovered"])
+            Set(["old", "new", "other-edition", "recovered"])
         )
         try await restored.reconcileLocalPublications()
         let reconciled = await restored.book(id: "new")
