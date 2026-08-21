@@ -12,10 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `69` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `70` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 69 adds in-app online EPUB reading on iPhone
+> same regression suite. Build 70 adds profile-scoped, atomically published
+> offline EPUB reading and newest-locator replay on iPhone and iPad, with no
+> tvOS action. Build 69 adds in-app online EPUB reading on iPhone
 > and iPad with an isolated, same-origin WebView, memory-only authentication,
 > cross-device locator resume, and no tvOS reader action. Build 68 adds the
 > revision-bound ebook reading-state wire models and authenticated API routes.
@@ -110,6 +112,16 @@ only what this hardware genuinely can't play.
   Another signed-in profile cannot play the saved title but can remove its
   device storage from the Other Profiles section. tvOS exposes none of these
   controls.
+- **App-managed offline EPUB reading on iPhone and iPad.** Cinema downloads the
+  authenticated original, proves the same revision again after transfer,
+  writes the bounded publication into a staging directory, and publishes it
+  with one atomic rename. The Downloads catalogue opens before the server
+  reconnects. Its private-scheme WebView has no bearer or network origin,
+  blocks remote publisher resources, preserves type/layout preferences, and
+  replays only the newest dated locator when the profile reconnects.
+  Interrupted transfers become explicit **Download again** rows; removal
+  touches only the app-private copy. tvOS exposes no reader or ebook-download
+  action.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's
