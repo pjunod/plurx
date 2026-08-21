@@ -422,6 +422,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
 test_anchor = "softwareDecoderClaimsStopAtHdUnlessHardwareProvesMore"
 
 [[fixes]]
+id = "android.transcode-output-remains-server-owned"
+commits = ["37008d1d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "internal fun subtitleSessionBody("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "aPlanSessionCarriesNoSubtitleFieldsAtAll"
+
+[[fixes]]
 id = "android.sdr-subtitle-burn-acknowledgement"
 commits = ["71edaf7c"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
