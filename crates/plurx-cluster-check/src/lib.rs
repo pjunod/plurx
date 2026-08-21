@@ -2452,7 +2452,6 @@ async fn handle_request(
                 ),
                 Err(error) => bail!("tombstone offline fence failed: {error:#}"),
             }
-
         }
         Request::HeartbeatPreservesTombstone { node_id } => {
             membership_ref(membership)?.heartbeat().await?;
