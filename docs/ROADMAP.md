@@ -138,10 +138,13 @@ keeps transfer.
   navigation guards. Simulator/JVM plus real-browser contracts prove profile
   isolation, semantic headings, close flushing, and the same paragraph after
   font and orientation changes; tvOS and Google TV expose no reader action.
-- 🚧 **M4 in progress:** iPhone/iPad now keep an atomically published,
-  profile/revision-scoped original EPUB, open it with the server stopped, and
-  reconcile the newest offline locator when the server returns. Android mobile
-  is the remaining client; televisions stay deliberately excluded.
+- 🚧 **M4 acceptance in progress:** iPhone/iPad and Android phone/tablet now
+  keep an atomically published, profile/revision-scoped original EPUB, open it
+  through a token-free local publication surface with the server stopped, and
+  reconcile the newest offline locator when the server returns. Automated
+  storage, security, process-death, and sync contracts are green; the physical
+  airplane-mode/reconnect device drill remains. Televisions stay deliberately
+  excluded.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

@@ -45,6 +45,15 @@ for that viewer and keeps server administration out of the comparison.
 > Task Manager and timeout stops persist as an explicit Resume state. An active
 > build-24 transfer cannot be retroactively given a persisted UIDT registration
 > after upgrade without a foreground user action, so it needs one Resume tap.
+>
+> Build 34 adds app-managed offline EPUB reading on phones and tablets. The
+> download owner is separate from Media3, records intent before I/O, verifies
+> the exact publication revision after transferring the original, and
+> atomically publishes only bounded declared resources. The local WebView has
+> no bearer or network fallback: every request to its synthetic HTTPS origin is
+> intercepted from packaged assets or app-private files, and all other origins
+> receive a local denial. JVM, lint, instrumentation-build, and APK-asset checks
+> are green; the physical airplane-mode/reconnect drill remains unclaimed.
 
 ## Viewer surface
 
@@ -58,6 +67,8 @@ for that viewer and keeps server administration out of the comparison.
 | Movie/show/season/episode hierarchy | Native detail and episode rows |
 | Home-video folders and photos | Folder navigation and photo viewer |
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
+| In-app EPUB Read/Resume | Phone/tablet detail opens the shared bounded reader in an isolated same-origin WebView; television surfaces expose no action |
+| App-managed offline EPUB | Profile/revision catalogue, atomic private publication, token-free synthetic-origin reader, process-death reconciliation, and newest-dated exact-edition replay |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
 | Audio/subtitle choice | Embedded tracks are native; tracks the server marks `native` arrive as HLS renditions, and everything else burns on a session |
 | Detail-screen track facts | Every audio and subtitle track with language, format, and forced/SDH markers, the server's default markers, and its five-state preferred-language verdict |

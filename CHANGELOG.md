@@ -8,6 +8,20 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Android phones and tablets can keep EPUBs inside Cinema for offline
+  reading.** A durable profile-scoped catalogue records intent before I/O,
+  downloads the authenticated original, reopens the server publication to
+  verify the exact revision and manifest, materializes only bounded declared
+  resources, and atomically publishes the app-private copy. The local WebView
+  serves packaged reader assets and publication bytes through an intercepted
+  synthetic HTTPS origin with no account bearer, DNS fallback, redirects,
+  file/content access, mixed content, or publisher network loads. Local
+  locator changes survive process death and the newest dated state for the
+  exact edition replays after reconnect. Android TV and Google TV remain
+  deliberately excluded.
+
 ### Fixed
 
 - **Existing replicated installs now have a real v5 → v6 upgrade path.** The

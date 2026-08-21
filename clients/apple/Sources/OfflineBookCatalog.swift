@@ -1,6 +1,12 @@
 #if os(iOS)
 import Foundation
 
+private struct PendingBookEdition: Hashable {
+    let itemId: Int
+    let fileId: Int
+    let revision: ReadingRevision?
+}
+
 /// Durable, profile-scoped truth for original EPUB downloads and their
 /// renderer-neutral reading state. The catalog never depends on the server to
 /// list or open a completed book.
@@ -91,11 +97,16 @@ actor OfflineBookCatalog {
     }
 
     func newestPending(serverInstanceId: String, userId: Int) -> [OfflineBook] {
-        var newest: [Int: OfflineBook] = [:]
+        var newest: [PendingBookEdition: OfflineBook] = [:]
         for book in books.values where book.serverInstanceId == serverInstanceId
             && book.userId == userId && book.pendingProgress {
-            if (newest[book.itemId]?.recordedAt ?? .min) < (book.recordedAt ?? .min) {
-                newest[book.itemId] = book
+            let edition = PendingBookEdition(
+                itemId: book.itemId,
+                fileId: book.fileId,
+                revision: book.revision
+            )
+            if (newest[edition]?.recordedAt ?? .min) < (book.recordedAt ?? .min) {
+                newest[edition] = book
             }
         }
         return newest.values.sorted { ($0.recordedAt ?? 0) < ($1.recordedAt ?? 0) }
