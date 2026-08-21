@@ -475,6 +475,10 @@ const TABLES: &[TablePlan] = &[
             "artwork_attempted_at",
             "artwork_error",
             "genres",
+            "author",
+            "book_work_id",
+            "book_edition_id",
+            "book_metadata_source",
         ],
         order_by: "id",
         minimum_schema: 13,
@@ -1603,6 +1607,14 @@ fn value_projection(table: TablePlan, schema_version: i64, qualify: bool) -> Str
         .map(|column| {
             if table.name == "watched_outbox" && *column == "claim_until" && schema_version < 16 {
                 "0".to_owned()
+            } else if table.name == "items"
+                && matches!(
+                    *column,
+                    "author" | "book_work_id" | "book_edition_id" | "book_metadata_source"
+                )
+                && schema_version < 21
+            {
+                "NULL".to_owned()
             } else if table.name == "offline_packages"
                 && *column == "effective_rate_control"
                 && schema_version < 18
@@ -1772,6 +1784,21 @@ mod tests {
         let current = value_projection(table, SQLITE_SCHEMA_VERSION, false);
         assert!(v17.contains("recipe_hash, 'vbr', target_height"));
         assert!(current.contains("recipe_hash, effective_rate_control, target_height"));
+    }
+
+    #[test]
+    fn pre_v21_item_projection_supplies_null_book_facts() {
+        let table = TABLES
+            .iter()
+            .find(|table| table.name == "items")
+            .copied()
+            .expect("items table plan");
+        let v20 = value_projection(table, 20, false);
+        let current = value_projection(table, SQLITE_SCHEMA_VERSION, false);
+        assert!(v20.ends_with("artwork_error, genres, NULL, NULL, NULL, NULL"));
+        assert!(current.ends_with(
+            "artwork_error, genres, author, book_work_id, book_edition_id, book_metadata_source"
+        ));
     }
 
     #[test]

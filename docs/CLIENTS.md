@@ -134,6 +134,36 @@ exact edition is replayed after reconnect. Television clients remain
 intentionally excluded; the physical airplane-mode/reconnect device matrix
 remains an explicit, unclaimed release check.
 
+**Ebook format actions** come from the server's per-file reader registry, not
+from whatever extension a client happens to recognize. **Read** means Cinema
+owns a renderer and locator on that surface. **Open in…** means Cinema serves
+the authenticated original to an external handler. An em dash means Cinema
+offers neither action there. The offline column names app-managed, airplane-
+mode reading; it does not count a third-party app retaining an exported copy.
+
+<!-- reader-support:start -->
+| Format | Web online | Apple online / offline | Android online / offline | Television |
+|---|---|---|---|---|
+| EPUB | Read | Read / Read | Read / Read | — |
+| PDF | Open in… | Open in… / — | Open in… / — | — |
+| MOBI | Open in… | Open in… / — | Open in… / — | — |
+| AZW / AZW3 | Open in… | Open in… / — | Open in… / — | — |
+| FB2 | Open in… | Open in… / — | Open in… / — | — |
+| CBZ | Open in… | Open in… / — | Open in… / — | — |
+| CBR | Open in… | Open in… / — | Open in… / — | — |
+<!-- reader-support:end -->
+
+The daemon contract-tests this table against the same registry serialized on
+each file DTO. A newly detected format therefore remains **Open in…** until a
+renderer change updates the registry and its platform acceptance evidence.
+
+Book cards and details consume Cinema's durable author and exact related-
+edition fields. iPhone/iPad and Android phone/tablet show author beneath the
+title and an **Other editions** rail only when the server returns items with
+the same explicit work key. Clients do not perform title/author matching or
+fetch provider covers themselves; server-cached artwork remains the single
+image boundary.
+
 **Native stall recovery contract** — The server accepts a bound
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available

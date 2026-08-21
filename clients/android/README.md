@@ -19,8 +19,11 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `34` — native viewer parity across phone, foldable,
-> and TV. Build 34 adds Cinema-managed offline EPUB reading on phones and
+> Status: **v0.2.7**, build `36` — native viewer parity across phone, foldable,
+> and TV. Build 36 consumes Cinema's server-owned ebook format/action registry
+> so detected-but-external formats cannot acquire a false **Read** or offline
+> action. Build 35 displays bounded book author metadata and exact work-linked
+> editions on browse and detail surfaces. Build 34 adds Cinema-managed offline EPUB reading on phones and
 > tablets: a profile/revision-scoped original and bounded publication are
 > published atomically in app-private storage, then served through a synthetic
 > HTTPS WebView origin with no account bearer or network fallback. Build 33

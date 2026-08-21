@@ -72,6 +72,10 @@ data class Item(
     val air_date: String? = null,
     val recorded_at: String? = null,
     val tags: List<String> = emptyList(),
+    val author: String? = null,
+    val book_work_id: String? = null,
+    val book_edition_id: String? = null,
+    val book_metadata_source: String? = null,
     val show_title: String? = null,
     val runtime_ms: Long? = null,
     val resolution: Long? = null,
@@ -160,6 +164,21 @@ data class PlaybackDefaults(
 )
 
 @Serializable
+data class ReaderSurfaceCapability(
+    val online: String = "unavailable",
+    val offline: String = "unavailable",
+)
+
+@Serializable
+data class ReaderCapability(
+    val format: String = "",
+    val web: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val apple: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val android: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+    val television: ReaderSurfaceCapability = ReaderSurfaceCapability(),
+)
+
+@Serializable
 data class MediaFileDto(
     val id: Long,
     val filename: String,
@@ -186,11 +205,19 @@ data class MediaFileDto(
     val part_offset_ms: Long = 0,
     val chapters: List<BookChapter> = emptyList(),
     val available: Boolean = true,
+    /** Server-owned format/action verdict; absent on older servers. */
+    val reader: ReaderCapability? = null,
     val probed: Boolean = true,
     val missing_path: String? = null,
 ) {
     val isEpub: Boolean
         get() = container.equals("epub", ignoreCase = true) || filename.endsWith(".epub", ignoreCase = true)
+
+    val supportsOnlineBookReader: Boolean
+        get() = reader?.android?.online?.equals("read", ignoreCase = true) ?: isEpub
+
+    val supportsOfflineBookReader: Boolean
+        get() = reader?.android?.offline?.equals("read", ignoreCase = true) ?: isEpub
 }
 
 @Serializable
@@ -324,6 +351,7 @@ data class ItemDetail(
     val children: List<Item> = emptyList(),
     val ancestors: List<Item> = emptyList(),
     val reading: ReadingState? = null,
+    val editions: List<Item> = emptyList(),
 )
 
 @Serializable

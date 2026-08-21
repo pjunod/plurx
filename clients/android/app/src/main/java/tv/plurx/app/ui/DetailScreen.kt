@@ -333,6 +333,28 @@ private fun DetailContent(
             }
         }
 
+        if (detail.editions.isNotEmpty()) {
+            item {
+                Text(
+                    "Other editions",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(start = side, end = side, top = 16.dp, bottom = 10.dp),
+                )
+            }
+            item {
+                LazyRow(
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = side),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    items(detail.editions, key = { it.id }) { edition ->
+                        PosterCard(edition, width = if (formFactor == FormFactor.Television) 166.dp else 132.dp) {
+                            onOpenItem(edition.id)
+                        }
+                    }
+                }
+            }
+        }
+
         if (detail.children.isNotEmpty()) {
             item {
                 Text(
@@ -562,7 +584,7 @@ private fun Actions(
                         ) { Text(bookReadingLabel(reading, playable), fontWeight = FontWeight.SemiBold) }
                     }
                 }
-                if (playable.isEpub && OfflineBooks.canUse(context)) {
+                if (playable.supportsOfflineBookReader && OfflineBooks.canUse(context)) {
                     item {
                         TvOutlinedButton(
                             enabled = offlineBook?.isPlayable != true,
@@ -748,7 +770,7 @@ internal fun bookReadingLabel(reading: ReadingState?, file: MediaFileDto): Strin
 }
 
 internal fun offersBookReader(formFactor: FormFactor, file: MediaFileDto): Boolean =
-    formFactor != FormFactor.Television && file.available && file.isEpub
+    formFactor != FormFactor.Television && file.available && file.supportsOnlineBookReader
 
 @Composable
 internal fun DetailPrimaryActionButton(
@@ -1067,6 +1089,8 @@ private fun fileSpecLine(file: MediaFileDto): String {
 
 internal fun playbackFile(item: Item, files: List<MediaFileDto>, positionMs: Long): MediaFileDto? {
     val available = files.filter { it.available }
+    if (item.isBook) return available.firstOrNull { it.supportsOnlineBookReader }
+        ?: available.firstOrNull()
     if (!item.isAudiobook) return available.firstOrNull()
     return available.lastOrNull { positionMs >= it.part_offset_ms } ?: available.firstOrNull()
 }
@@ -1079,6 +1103,7 @@ private fun metaLine(item: Item, durationMs: Long?): String = buildList {
         item.show_title?.let(::add)
         if (item.season_number != null && item.episode_number != null) add("S${item.season_number} E${item.episode_number}")
     }
+    if ((item.isBook || item.isAudiobook) && !item.author.isNullOrBlank()) add(item.author)
     item.recorded_at?.let(::add)
     item.year?.let { add(it.toString()) }
     durationMs?.takeIf { it > 0 }?.let { add(formatTime(it)) }

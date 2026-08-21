@@ -4,6 +4,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
     enum Kind: String, Equatable {
         case series
         case episode
+        case author
         case year
         case runtime
         case resolution
@@ -80,7 +81,7 @@ struct ItemMetadataBadgeRow: View {
         switch badge.kind {
         case .resolution, .video, .dynamicRange, .audio:
             return true
-        case .series, .episode, .year, .runtime:
+        case .series, .episode, .year, .runtime, .author:
             return false
         }
     }
@@ -1083,6 +1084,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1256,6 +1262,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1370,6 +1381,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1456,6 +1472,9 @@ struct DetailView: View {
 
         if item.kind == "episode", let season = item.seasonNumber, let episode = item.episodeNumber {
             parts.append("Season \(season), Episode \(episode)")
+        }
+        if (item.isBook || item.isAudiobook), let author = item.author, !author.isEmpty {
+            parts.append("By \(author)")
         }
         if item.kind != "episode", let year = item.year { parts.append(String(year)) }
         if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
@@ -1783,6 +1802,10 @@ struct DetailView: View {
     /// Movies and single-file books keep the established first-file behavior.
     static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
         let files = detail.files ?? []
+        if detail.item.isBook {
+            return files.first { BookReaderPolicy.canRead($0, onTelevision: false) }
+                ?? files.first
+        }
         guard detail.item.isAudiobook else { return files.first }
         return AudiobookTimeline.file(at: positionMs, in: files)
     }
@@ -1919,6 +1942,14 @@ struct DetailView: View {
                 symbol: "rectangle.stack.fill",
                 mark: "S\(season) E\(episode)",
                 accessibilityLabel: "Season \(season), Episode \(episode)"
+            ))
+        }
+        if (item.isBook || item.isAudiobook), let author = item.author, !author.isEmpty {
+            badges.append(ItemMetadataBadge(
+                kind: .author,
+                symbol: "person.fill",
+                mark: author,
+                accessibilityLabel: "By \(author)"
             ))
         }
         if item.kind != "episode", let year = item.year {
@@ -2148,7 +2179,9 @@ struct DetailView: View {
             }
             .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: false))
 
-            mobileBookDownloadButton(detail: detail, file: file)
+            if BookReaderPolicy.canDownload(file, onTelevision: false) {
+                mobileBookDownloadButton(detail: detail, file: file)
+            }
         } else {
             Button {
                 openBookExternally(file)
