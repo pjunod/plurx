@@ -48,6 +48,39 @@ internal object AudioSinkEncoding {
     const val E_AC3_JOC = 18
 }
 
+/** One codec decoder's highest movie-sized frame proven by MediaCodec. */
+internal data class VideoDecoderLimit(
+    val codec: String,
+    val maxHeight: Int,
+)
+
+internal data class VideoCodecCaps(
+    val codecs: List<String>,
+    val maxHeights: Map<String, Int>,
+) {
+    fun queryParams(): Map<String, String> = mapOf(
+        "vcodec" to codecs.joinToString(","),
+        "vmaxheight" to codecs.joinToString(",") { "$it:${maxHeights.getValue(it)}" },
+    )
+}
+
+/**
+ * Normalize MediaCodec evidence into the two server capability fields.
+ * Duplicate decoders are intentional — the best decoder for a codec wins —
+ * while unknown codecs and non-positive limits are not capability evidence.
+ */
+internal fun videoCodecCaps(limits: Iterable<VideoDecoderLimit>): VideoCodecCaps {
+    val supported = setOf("h264", "hevc", "av1", "vp9")
+    val maxima = mutableMapOf<String, Int>()
+    for (limit in limits) {
+        val codec = limit.codec.lowercase()
+        if (codec !in supported || limit.maxHeight <= 0) continue
+        maxima[codec] = maxOf(maxima[codec] ?: 0, limit.maxHeight)
+    }
+    val ordered = listOf("h264", "hevc", "av1", "vp9").filter(maxima::containsKey)
+    return VideoCodecCaps(ordered, ordered.associateWith(maxima::getValue))
+}
+
 /**
  * Dolby Vision profile numbers this client is willing to claim, from the raw
  * profile constants a `video/dolby-vision` decoder advertises.

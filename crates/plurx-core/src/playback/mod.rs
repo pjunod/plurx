@@ -63,6 +63,7 @@ pub fn caps_profile(
         video_codecs,
         audio_codecs,
         max_height,
+        video_max_heights: HashMap::new(),
         max_bitrate: None,
         supports_hdr,
         supports_dolby_vision,
@@ -109,6 +110,14 @@ pub struct DeviceProfile {
     pub audio_codecs: Vec<String>,
     #[serde(default)]
     pub max_height: Option<i64>,
+    /// Runtime-probed direct-play ceilings keyed by normalized video codec.
+    ///
+    /// `max_height` remains the backwards-compatible all-codec ceiling. A
+    /// codec-specific value narrows it for clients such as Android where one
+    /// hardware decoder may accept 4K HEVC while another only accepts 1080p
+    /// AV1. Empty keeps every named profile and older client unchanged.
+    #[serde(default)]
+    pub video_max_heights: HashMap<String, i64>,
     #[serde(default)]
     pub max_bitrate: Option<i64>,
     #[serde(default)]
@@ -251,7 +260,17 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
         ));
     }
 
-    let height_ok = match (profile.max_height, file.height) {
+    let codec_height = file.video_codec.as_ref().and_then(|codec| {
+        profile
+            .video_max_heights
+            .get(&codec.to_ascii_lowercase())
+            .copied()
+    });
+    let height_ceiling = match (profile.max_height, codec_height) {
+        (Some(global), Some(codec)) => Some(global.min(codec)),
+        (global, codec) => global.or(codec),
+    };
+    let height_ok = match (height_ceiling, file.height) {
         (Some(max), Some(h)) => h <= max,
         _ => true,
     };
@@ -1643,6 +1662,53 @@ mod tests {
             false,
         );
         assert_eq!(decide(&f, &caps, true).method, PlaybackMethod::DirectPlay);
+    }
+
+    #[test]
+    fn runtime_height_ceiling_is_specific_to_the_source_codec() {
+        let mut caps = caps_profile(
+            vec!["mp4".into()],
+            vec!["h264".into(), "hevc".into()],
+            vec!["aac".into()],
+            None,
+            false,
+            false,
+        );
+        caps.video_max_heights.insert("h264".into(), 1080);
+        caps.video_max_heights.insert("hevc".into(), 2160);
+
+        let mut h264 = file("mp4", "h264", "aac");
+        h264.height = Some(2160);
+        let mut hevc = file("mp4", "hevc", "aac");
+        hevc.height = Some(2160);
+
+        let rejected = decide(&h264, &caps, true);
+        assert_eq!(rejected.method, PlaybackMethod::Transcode);
+        assert!(rejected
+            .reasons
+            .iter()
+            .any(|reason| reason == "resolution above device maximum"));
+        assert_eq!(
+            decide(&hevc, &caps, true).method,
+            PlaybackMethod::DirectPlay
+        );
+    }
+
+    #[test]
+    fn global_height_ceiling_still_narrows_codec_specific_limit() {
+        let mut caps = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            Some(1080),
+            false,
+            false,
+        );
+        caps.video_max_heights.insert("hevc".into(), 2160);
+        let mut hevc = file("mp4", "hevc", "aac");
+        hevc.height = Some(2160);
+
+        assert_eq!(decide(&hevc, &caps, true).method, PlaybackMethod::Transcode);
     }
 
     #[test]
