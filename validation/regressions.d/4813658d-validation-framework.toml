@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4813658d"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "This metadata-only correction records the retained cluster-membership and persistence evidence for the sparse join recovery. `make history-check` proves that the mapped runtime commit resolves to the current cluster gate and that the provenance fragment remains schema-valid."
