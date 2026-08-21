@@ -414,6 +414,14 @@ test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
 test_anchor = "videoCapsKeepTheBestHeightForEachCodec"
 
 [[fixes]]
+id = "android.software-video-decoder-ceiling"
+commits = ["5af63e13"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
+source_anchor = "val hardwareAccelerated: Boolean = true"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "softwareDecoderClaimsStopAtHdUnlessHardwareProvesMore"
+
+[[fixes]]
 id = "android.sdr-subtitle-burn-acknowledgement"
 commits = ["71edaf7c"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
