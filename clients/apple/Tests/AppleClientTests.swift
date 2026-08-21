@@ -1,10 +1,37 @@
 import AVFoundation
 import Darwin
 import Foundation
+#if os(iOS)
+import PDFKit
+#endif
 import SwiftUI
 import UIKit
 import XCTest
 @testable import plurx
+
+#if os(iOS)
+private final class PDFReaderURLProtocol: URLProtocol {
+    static var body = Data()
+    static var statusCode = 200
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: Self.statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/pdf"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+#endif
 
 private struct LayoutWidthPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -392,6 +419,26 @@ final class AppleClientTests: XCTestCase {
             available: true,
             reader: serverHandoff
         )
+        let pdfRead = ReaderCapability(
+            format: "pdf",
+            web: .init(online: .openIn, offline: .unavailable),
+            apple: .init(online: .read, offline: .unavailable),
+            android: .init(online: .openIn, offline: .unavailable),
+            television: .init(online: .unavailable, offline: .unavailable)
+        )
+        let nativePDF = MediaFile(
+            id: 94,
+            filename: "Readable.pdf",
+            available: true,
+            reader: pdfRead,
+            readerRevision: ReadingRevision(size: 4_096, mtime: 100)
+        )
+        let unverifiablePDF = MediaFile(
+            id: 95,
+            filename: "No-revision.pdf",
+            available: true,
+            reader: pdfRead
+        )
 
         XCTAssertTrue(BookReaderPolicy.canRead(epub, onTelevision: false))
         XCTAssertTrue(BookReaderPolicy.canDownload(epub, onTelevision: false))
@@ -400,9 +447,102 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(BookReaderPolicy.canRead(missing, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canRead(disguised, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canDownload(disguised, onTelevision: false))
+        XCTAssertTrue(BookReaderPolicy.canRead(nativePDF, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canDownload(nativePDF, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(nativePDF, onTelevision: true))
+        XCTAssertFalse(BookReaderPolicy.canRead(unverifiablePDF, onTelevision: false))
     }
 
     #if os(iOS)
+    func testPDFPageLocatorIsNormalizedBoundedAndRendererNeutral() throws {
+        let locator = PDFPageLocator.locator(pageIndex: 4, pageCount: 10)
+        XCTAssertEqual(locator.href, "pdf/pages/5")
+        XCTAssertEqual(locator.type, "application/pdf")
+        XCTAssertEqual(locator.locations?.position, 5)
+        XCTAssertEqual(locator.locations?.progression ?? -1, 4.0 / 9.0, accuracy: 0.000_001)
+        XCTAssertEqual(PDFPageLocator.pageIndex(from: locator, pageCount: 10), 4)
+        XCTAssertNil(PDFPageLocator.pageIndex(
+            from: ReadingLocator(version: 1, href: "pdf/pages/0"),
+            pageCount: 10
+        ))
+        XCTAssertNil(PDFPageLocator.pageIndex(
+            from: ReadingLocator(version: 1, href: "https://attacker.invalid/book.pdf"),
+            pageCount: 10
+        ))
+        XCTAssertEqual(PDFPageLocator.progression(pageIndex: 0, pageCount: 1), 0)
+    }
+
+    func testPDFTransportRejectsCrossOriginAndSchemeChangingRedirects() throws {
+        let origin = try XCTUnwrap(URL(string: "https://cinema.example:9443"))
+        XCTAssertTrue(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "https://cinema.example:9443/api/v1/files/9/content")!
+        ))
+        XCTAssertFalse(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "https://attacker.invalid/book.pdf")!
+        ))
+        XCTAssertFalse(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "http://cinema.example:9443/book.pdf")!
+        ))
+        XCTAssertNil(PDFReaderTransport.session(origin: "file:///tmp/book.pdf"))
+    }
+
+    func testPDFLoaderUsesExactTemporaryBytesAndProducesSearchablePages() async throws {
+        let bounds = CGRect(x: 0, y: 0, width: 300, height: 400)
+        let data = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+            context.beginPage()
+            NSString(string: "Cinema PDF reader contract").draw(
+                at: CGPoint(x: 24, y: 24),
+                withAttributes: [.font: UIFont.systemFont(ofSize: 18)]
+            )
+        }
+        PDFReaderURLProtocol.body = data
+        PDFReaderURLProtocol.statusCode = 200
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PDFReaderURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let payload = try await PDFReaderLoader.download(
+            request: URLRequest(url: URL(string: "https://cinema.example/api/v1/files/9/content")!),
+            revision: ReadingRevision(size: data.count, mtime: 100),
+            session: session
+        )
+        XCTAssertEqual(payload.document.pageCount, 1)
+        XCTAssertEqual(
+            payload.document.findString("reader contract", withOptions: .caseInsensitive).count,
+            1
+        )
+        let directory = payload.directory
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        payload.remove()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPDFLoaderRejectsAnEditionSizeMismatch() async throws {
+        PDFReaderURLProtocol.body = Data("not the advertised edition".utf8)
+        PDFReaderURLProtocol.statusCode = 200
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PDFReaderURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        do {
+            _ = try await PDFReaderLoader.download(
+                request: URLRequest(url: URL(string: "https://cinema.example/api/v1/files/9/content")!),
+                revision: ReadingRevision(size: PDFReaderURLProtocol.body.count + 1, mtime: 100),
+                session: session
+            )
+            XCTFail("a truncated edition must not reach PDFKit")
+        } catch PDFReaderError.incompleteDownload {
+            // Expected.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testNativeReaderHandoffKeepsTheBearerOutOfTheURLAndEscapesTheScript() throws {
         let shell = try XCTUnwrap(NativeReaderHandoff.shellURL(origin: "https://cinema.example:9443"))
         XCTAssertEqual(shell.absoluteString, "https://cinema.example:9443/?native-reader=1")
