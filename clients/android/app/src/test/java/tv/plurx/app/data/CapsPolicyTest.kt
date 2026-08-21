@@ -30,6 +30,25 @@ class CapsPolicyTest {
     }
 
     @Test
+    fun softwareDecoderClaimsStopAtHdUnlessHardwareProvesMore() {
+        val softwareOnly = videoCodecCaps(
+            listOf(
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = false),
+                VideoDecoderLimit("hevc", 2160, hardwareAccelerated = true),
+            ),
+        )
+        assertEquals(mapOf("hevc" to 2160, "av1" to 1080), softwareOnly.maxHeights)
+
+        val withHardwareAv1 = videoCodecCaps(
+            listOf(
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = false),
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = true),
+            ),
+        )
+        assertEquals(2160, withHardwareAv1.maxHeights["av1"])
+    }
+
+    @Test
     fun capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed() {
         assertEquals(
             "display-no-dv",
