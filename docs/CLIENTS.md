@@ -134,6 +134,37 @@ exact edition is replayed after reconnect. Television clients remain
 intentionally excluded; the physical airplane-mode/reconnect device matrix
 remains an explicit, unclaimed release check.
 
+**Native PDF reading** — iPhone and iPad use PDFKit for online PDFs. Cinema
+downloads the authenticated original into an app-private temporary directory,
+requires its byte count to match the server's exact size/mtime revision, and
+removes it when the reader closes. Page locators use the shared reading-state
+API, local search stays on the device, and password-protected or
+accessibility-restricted documents fail closed. PDF offline reading, web,
+Android, and television remain external handoff surfaces.
+
+**Ebook format actions** come from the server's per-file reader registry, not
+from whatever extension a client happens to recognize. **Read** means Cinema
+owns a renderer and locator on that surface. **Open in…** means Cinema serves
+the authenticated original to an external handler. An em dash means Cinema
+offers neither action there. The offline column names app-managed, airplane-
+mode reading; it does not count a third-party app retaining an exported copy.
+
+<!-- reader-support:start -->
+| Format | Web online | Apple online / offline | Android online / offline | Television |
+|---|---|---|---|---|
+| EPUB | Read | Read / Read | Read / Read | — |
+| PDF | Open in… | Read / — | Open in… / — | — |
+| MOBI | Open in… | Open in… / — | Open in… / — | — |
+| AZW / AZW3 | Open in… | Open in… / — | Open in… / — | — |
+| FB2 | Open in… | Open in… / — | Open in… / — | — |
+| CBZ | Open in… | Open in… / — | Open in… / — | — |
+| CBR | Open in… | Open in… / — | Open in… / — | — |
+<!-- reader-support:end -->
+
+The daemon contract-tests this table against the same registry serialized on
+each file DTO. A newly detected format therefore remains **Open in…** until a
+renderer change updates the registry and its platform acceptance evidence.
+
 Book cards and details consume Cinema's durable author and exact related-
 edition fields. iPhone/iPad and Android phone/tablet show author beneath the
 title and an **Other editions** rail only when the server returns items with
