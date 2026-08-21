@@ -232,6 +232,7 @@ ui-golden: ## Rewrite tests/ui-structure.golden after an intended UI change
 .PHONY: web-check
 web-check: ## Test playback policy, embedded JS, and every shipped theme
 	@node tests/playback/web-policy.test.js
+	@node tests/web/reader.test.js
 	@scripts/js-check
 	@scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
 		--foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad' \
