@@ -666,6 +666,15 @@ enum TVPlayableDetailMetrics {
 }
 #endif
 
+#if os(iOS)
+struct ReaderContext: Identifiable, Equatable {
+    let itemId: Int
+    let fileId: Int
+
+    var id: String { "\(itemId):\(fileId)" }
+}
+#endif
+
 struct DetailView: View {
     #if os(tvOS)
     private enum TVDetailFocus: Hashable { case primaryAction }
@@ -692,6 +701,7 @@ struct DetailView: View {
     @State private var pendingTrackSelectionFileId: Int?
     #if os(iOS)
     @State private var downloadBusy = false
+    @State private var reader: ReaderContext?
     #endif
     #if os(tvOS)
     @State private var seriesPlayback: PlayContext?
@@ -794,6 +804,14 @@ struct DetailView: View {
                 .id(ctx.id)
                 .environmentObject(model)
         }
+        #if os(iOS)
+        .fullScreenCover(item: $reader, onDismiss: {
+            Task { detail = try? await model.itemDetail(itemId) }
+        }) { context in
+            ReaderView(context: context)
+                .environmentObject(model)
+        }
+        #endif
     }
 
     /// The pre-play choice as it applies to `file`. A choice recorded against
@@ -2046,7 +2064,7 @@ struct DetailView: View {
         ) {
             HStack(spacing: 10) {
                 if let file, item.isBook {
-                    openBookButton(file)
+                    bookButtons(detail, file: file)
                 }
                 if let file, item.isPlayable {
                     resumeButton(
@@ -2069,7 +2087,7 @@ struct DetailView: View {
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 if let file, item.isBook {
-                    openBookButton(file)
+                    bookButtons(detail, file: file)
                 }
                 if let file, item.isPlayable {
                     resumeButton(
@@ -2098,16 +2116,45 @@ struct DetailView: View {
         }
     }
 
-    private func openBookButton(_ file: MediaFile) -> some View {
-        return Button {
-            if let url = Session.shared.mediaURL("/api/v1/files/\(file.id)/content") {
-                openURL(url)
+    @ViewBuilder
+    private func bookButtons(_ detail: ItemDetail, file: MediaFile) -> some View {
+        if BookReaderPolicy.canRead(file, onTelevision: false) {
+            Button {
+                reader = ReaderContext(itemId: detail.item.id, fileId: file.id)
+            } label: {
+                Label(Self.bookReadingLabel(detail, file: file), systemImage: "book.fill")
+                    .font(.subheadline.weight(.semibold))
             }
-        } label: {
-            Label("Open book", systemImage: "book.fill")
-                .font(.subheadline.weight(.semibold))
+            .buttonStyle(IOSDetailPrimaryActionButtonStyle())
+
+            Button {
+                openBookExternally(file)
+            } label: {
+                Label("Open in…", systemImage: "square.and.arrow.up")
+            }
+            .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: false))
+        } else {
+            Button {
+                openBookExternally(file)
+            } label: {
+                Label("Open in…", systemImage: "square.and.arrow.up")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(IOSDetailPrimaryActionButtonStyle())
         }
-        .buttonStyle(IOSDetailPrimaryActionButtonStyle())
+    }
+
+    private func openBookExternally(_ file: MediaFile) {
+        if let url = Session.shared.mediaURL("/api/v1/files/\(file.id)/content") {
+            openURL(url)
+        }
+    }
+
+    static func bookReadingLabel(_ detail: ItemDetail, file: MediaFile) -> String {
+        guard let reading = detail.reading, reading.fileId == file.id else { return "Read" }
+        if reading.completed { return "Read again" }
+        let percent = Int((min(1, max(0, reading.progression)) * 100).rounded())
+        return percent > 0 ? "Resume reading · \(percent)%" : "Read"
     }
 
     private func mobileStartOverButton(

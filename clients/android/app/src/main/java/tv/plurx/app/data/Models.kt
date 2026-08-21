@@ -188,7 +188,10 @@ data class MediaFileDto(
     val available: Boolean = true,
     val probed: Boolean = true,
     val missing_path: String? = null,
-)
+) {
+    val isEpub: Boolean
+        get() = container.equals("epub", ignoreCase = true) || filename.endsWith(".epub", ignoreCase = true)
+}
 
 @Serializable
 data class BookChapter(

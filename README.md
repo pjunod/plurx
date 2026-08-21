@@ -299,9 +299,10 @@ Phases are gates — each ends with something you actually use. Full detail in
   authenticated ebook opening, and cross-client audio playback with one global
   resume/progress timeline are shipped. Revision-bound, replicated ebook
   reading state and its authenticated API are also shipped. The bounded,
-  capability-scoped EPUB publication layer is complete; the built-in reader
-  UI and app-managed offline ebook copies remain in
-  [EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md); M0–M2a are complete.
+  capability-scoped EPUB publication layer and built-in web/iOS/Android online
+  readers are complete. App-managed offline ebook copies and metadata
+  enrichment remain in [EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md);
+  M0–M3 are complete.
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.

@@ -1,7 +1,7 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M2 complete · M3–M6 ready to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `e9fd65a7` and `monarr` `a3f5fb8`
+**Status:** M0–M3 complete · M4–M6 ready to build · **Written:**
+2026-08-20 · **Verified against:** `plurx` `5222dfd3` and `monarr` `a3f5fb8`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -75,8 +75,8 @@ Six decisions define the work:
 | Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
 | Cinema server | Original bytes, revision-bound reading state, bounded EPUB manifest parsing, and capability-scoped resource streaming | Native/offline publication transport remains. |
 | Cinema web | Books shelf/detail plus in-app EPUB **Read/Resume**, TOC, search, preferences, explicit completion, and external/download fallbacks | Physical assistive-technology acceptance remains; other ebook formats still hand off. |
-| Cinema native | Book detail on Apple and Android; external URL intent | No phone/tablet reader or ebook offline record. |
-| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions | Native and offline clients do not consume the locator yet. |
+| Cinema native | In-app online EPUB reading on iPhone/iPad and Android phone/tablet; external fallback; no TV reader action | No ebook offline record yet. |
+| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers | Offline clients do not replay the locator yet. |
 
 The existing `/content` separation is load-bearing. Opening an EPUB is not a
 playback start, so it does not announce a viewer, allocate a playback session,
@@ -464,6 +464,13 @@ make validate                     # point-selected reader/browser contracts
 
 ### 7.4 M3 — Apple and Android online readers
 
+**Status:** complete 2026-08-20. iOS and Android phone/tablet detail screens
+open the shared publication reader in an isolated native WebView; television
+surfaces expose no reading action. Simulator, JVM, lint, and real-Chromium
+contracts cover the bridge, authentication containment, semantic headings,
+profile isolation, paragraph restore after font/rotation changes, and close
+flush. No physical VoiceOver/TalkBack claim is made by this milestone.
+
 Add phone/tablet reader destinations using M2's proven publication model and
 §4's API. App navigation owns dismissal and profile changes; a server switch
 or sign-out clears live publication credentials and cannot leave another
@@ -550,7 +557,7 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | M0 · Curator handoff | Complete | Curator `make test`; Cinema `make check`; focused cross-seam tests |
 | M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
 | M2 · EPUB proof/web | Complete | Node contracts; deterministic hostile-EPUB Chromium acceptance; 620 MiB stream proof |
-| M3 · Native online | Planned | Simulator/emulator + accessibility acceptance |
+| M3 · Native online | Complete | iOS/tvOS simulator suites; Android JVM/lint; real-Chromium native handoff, heading semantics, profile isolation, font/rotation restore, and close flush |
 | M4 · Offline EPUB | Planned | Physical airplane-mode drill |
 | M5 · Metadata | Planned | Paired + standalone fixtures |
 | M6 · More formats/release | Planned | Contract-tested support matrix |
