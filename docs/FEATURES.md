@@ -188,16 +188,20 @@ inside one Books library while keeping their actions and metadata honest.
   only declared resources through a short-lived, revision-bound capability and
   a bounded streaming decompressor rather than buffering whole child files.
   Archive traversal, encryption, decompression bombs, scripts, and remote
-  publication network loads fail closed before the web reader depends on it.
+  publication network loads fail closed.
+- **Web EPUB reading is built in.** An available EPUB exposes **Read** or
+  **Resume reading** on non-TV web surfaces. The reader provides authored TOC
+  navigation, paginated/scrolled layouts, type/theme controls, bounded local
+  search, explicit finish/unfinish, revision-bound resume, and **Open in…** /
+  **Download original** fallbacks. Publication scripts and remote requests
+  stay inert inside the sandboxed frame.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **No book metadata provider or built-in ebook renderer yet.** Titles/authors
-  come from the file/folder layout and audio facts from the container. Reading
-  state and the secure EPUB publication layer are ready, but clients still
-  hand ebook bytes to the browser/platform viewer until the M2b reader surface
-  lands. DRM-protected books are not decrypted, and cover extraction is not
-  yet implemented.
+- **Native ebook readers and book metadata enrichment are not shipped yet.**
+  Apple and Android still hand ebook bytes to the platform viewer. Titles and
+  authors come from the file/folder layout; DRM-protected books are not
+  decrypted, and cover extraction is not yet implemented.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters
