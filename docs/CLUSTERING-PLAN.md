@@ -597,25 +597,34 @@ tables in foreign-key order and byte-measured Raft transactions, preserving
 explicit ids, timestamps, nullable text, and integer values. Both chunk
 producers — offset paging and the parent-first item-id path — feed rows through
 one transaction builder that accumulates their serialized size and submits
-before the next row would cross a byte budget: a quarter of the 2,097,118-byte
-payload capacity that the production `wal_size: 2 * 1024 * 1024` leaves after
-the segment header. A quarter rather than the whole because the WAL is not the
-only bound on a submission — a transaction near the cap must also replicate to
-every voter inside the store's three-second timeout, which half the payload
-failed to do on a loaded host. A row count cannot bound this. One transaction
-becomes one Raft entry, `files.probe_json` holds whole ffprobe documents, and
-`hiqlite` panics its WAL writer on an entry past that capacity: 64 rows of a
-real library serialized to 3,137,236 bytes, and a 16-row bound still overflowed
-whenever 16 adjacent rows averaged more than ~131 KB — which is how node `m6`
-exited mid-import and restarted into unreplicated SQLite while reporting healthy.
+before the next row would cross a byte budget derived from
+`HIQLITE_WAL_SIZE_BYTES`: one quarter of the usable per-entry payload, capped
+at the measured replication ceiling. The production segment is 16 MiB, whose
+exact usable payload is 16,777,182 bytes. Routine import transactions therefore
+remain at 512 KiB rather than scaling to 4 MiB with the larger WAL; the extra
+capacity exists for an indivisible large row, not to spend the store's
+three-second timeout. OpenRaft's
+`max_payload_entries = 128` limits entries per append request rather than bytes
+inside one entry, and Hiqlite transports append requests in WebSocket binary
+frames without a smaller configured byte cap. The cap remains because a
+transaction must still replicate to every voter inside the store's three-second
+timeout, and about 1 MiB failed to do so on a loaded host while about 512 KiB
+completed. A row count cannot bound this. One transaction becomes one Raft
+entry, `files.probe_json` holds whole ffprobe documents, and `hiqlite` panics its
+WAL writer on an entry past the usable capacity: 64 rows of a real library
+serialized to 3,137,236 bytes, and a 16-row bound overflowed the former 2 MiB
+segment whenever 16 adjacent rows averaged more than ~131 KB — which is how
+node `m6` exited mid-import and restarted into unreplicated SQLite while
+reporting healthy.
 `IMPORT_CHUNK_ROWS` survives as a secondary bound only: it is the source read
 page and a ceiling on rows per transaction, no longer the safety property. A
 single row too large for any transaction is refused before submission, naming
 the table, an identifier that is never imported payload, the measured size, and
 the limit — an operator-actionable refusal beats a crash into a silently
-unreplicated backend. The WAL tuning itself still lives in `start_local_voter`
-and is mirrored, not shared, by the importer and the store contract; #304
-retires that duplication and raises the WAL. Items compute their parent-first
+unreplicated backend. The WAL tuning, importer budget, and three-voter contract
+now derive from the single exported `HIQLITE_WAL_SIZE_BYTES` production
+constant, so a retune moves the runtime and its regression together. Items
+compute their parent-first
 id order in one recursive source pass, then load each bounded page through
 indexed point reads; numeric id order cannot violate their self-reference, and
 large catalogues do not re-run and re-sort the full tree for every page. A
@@ -770,10 +779,22 @@ the seven-day expiry — the exact stranded state this section calls an
 activation blocker. So the removal re-reads the node's work after applying a
 plan and resolves again, for a bounded number of rounds; a node admitting new
 downloads faster than they can be resolved gets a refusal naming that reason
-rather than an unbounded wait. Anything created inside the last narrow window,
-between the final re-read and the committed change, is failed `node_removed`
-once the node is out of the roster: it was never probed, re-homing it would
-guess at a mount, and the membership change can no longer be refused.
+rather than an unbounded wait.
+
+The durable INSERT in `create_offline_package` now includes an explicit
+`AND NOT EXISTS (SELECT 1 FROM cluster_nodes WHERE node_id = $node AND
+removed_at IS NOT NULL)` clause, so a removed-but-running node that keeps
+receiving download requests is refused at the write path before any admission
+or quota step. The response is `OfflineCreateOutcome::NodeIsTombstone`, which
+maps to HTTP 503 Service Unavailable with the stable `node_removed` code — the same code
+packages from a clean removal use. A package never enters the queue or holds a
+reservation against a tombstone. The single-node SQLite path has no
+`cluster_nodes` table and never returns this variant.
+
+Anything created inside the last narrow window, between the final re-read and
+the committed change, is still failed `node_removed` once the node is out of
+the roster: it was never probed, re-homing it would guess at a mount, and the
+membership change can no longer be refused.
 
 The refusal survives, narrowed to what the policy genuinely cannot resolve: a
 download in flight from that node right now. Cutting it off is neither allowed

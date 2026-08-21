@@ -33,7 +33,7 @@ use plurx_core::cluster::membership::{
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
 };
-use plurx_core::cluster::migration::ActivationMarker;
+use plurx_core::cluster::migration::{ActivationMarker, HIQLITE_WAL_SIZE_BYTES};
 use plurx_core::cluster::ClusterIdentity;
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
@@ -638,6 +638,15 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         .request(
             target,
             Request::HeartbeatPreservesTombstone {
+                node_id: format!("node-{target}"),
+            },
+        )
+        .await?
+        .require_ok()?;
+    cluster
+        .request(
+            target,
+            Request::TombstoneOfflineFence {
                 node_id: format!("node-{target}"),
             },
         )
@@ -1331,6 +1340,9 @@ pub enum Request {
         request: FinalizeJoinRequest,
     },
     MembershipStatus,
+    TombstoneOfflineFence {
+        node_id: String,
+    },
     HeartbeatPreservesTombstone {
         node_id: String,
     },
@@ -2277,6 +2289,43 @@ async fn handle_request(
             .await
             .map(|status| Response::MembershipStatus { status })
             .or_else(|error| Ok(membership_error_response(error))),
+        Request::TombstoneOfflineFence { ref node_id } => {
+            let store = store_ref(store)?;
+            let now = unix_now()?;
+            let package = NewOfflinePackage {
+                id: format!("tombstone-fence-{node_id}"),
+                request_id: format!("fence-{node_id}-{now}"),
+                user_id: 1,
+                file_id: 0,
+                node_id: node_id.clone(),
+                source_path: "/dev/null/tombstone-proof".to_owned(),
+                source_size: 10,
+                source_mtime: 1_700_000_000,
+                effective_rate_control: "vbr".to_owned(),
+                target_height: 720,
+                output_width: Some(1280),
+                output_height: Some(720),
+                audio_index: None,
+                audio_offset_ms: 0,
+                subtitle_index: None,
+                subtitle_language: None,
+                subtitle_mode: "none".to_owned(),
+                estimated_bytes: 700,
+                reserved_bytes: 900,
+                expires_at: now.saturating_add(3_600),
+            };
+            match store
+                .create_offline_package(&package, 10, 100_000, 1_000_000)
+                .await
+            {
+                Ok(OfflineCreateOutcome::NodeIsTombstone) => Ok(Response::Ok),
+                Ok(other) => bail!(
+                    "removed node was not refused as tombstone: expected \
+                     NodeIsTombstone, got {other:?}"
+                ),
+                Err(error) => bail!("tombstone offline fence failed: {error:#}"),
+            }
+        }
         Request::HeartbeatPreservesTombstone { node_id } => {
             membership_ref(membership)?.heartbeat().await?;
             let rows = client
@@ -3771,7 +3820,7 @@ pub fn node_config(launch: &NodeLaunch) -> Result<NodeConfig> {
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     })
@@ -4042,4 +4091,26 @@ pub fn unix_now() -> Result<i64> {
 
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voter_config_uses_the_production_wal_size() {
+        let root = tempfile::tempdir().expect("config test root");
+        let launch = NodeLaunch {
+            node_id: 1,
+            root: root.path().to_path_buf(),
+            nodes: vec![NodeSpec {
+                id: 1,
+                raft: "127.0.0.1:19001".to_owned(),
+                api: "127.0.0.1:19002".to_owned(),
+            }],
+        };
+
+        let config = node_config(&launch).expect("build the voter config");
+        assert_eq!(config.wal_size, HIQLITE_WAL_SIZE_BYTES);
+    }
 }

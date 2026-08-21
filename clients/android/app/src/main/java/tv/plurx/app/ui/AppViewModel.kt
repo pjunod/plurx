@@ -43,6 +43,9 @@ import tv.plurx.app.data.ServerDiscovery
 import tv.plurx.app.data.Server
 import tv.plurx.app.data.SettingsStore
 import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.data.offline.OfflineBook
+import tv.plurx.app.data.offline.OfflineBookQueueRequest
+import tv.plurx.app.data.offline.OfflineBooks
 import tv.plurx.app.data.offline.OfflineDownloads
 import tv.plurx.app.data.offline.OfflineQueueRequest
 import tv.plurx.app.data.offline.OfflineRecord
@@ -110,6 +113,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _preferences = MutableStateFlow(ViewerPreferences())
     val preferences: StateFlow<ViewerPreferences> = _preferences.asStateFlow()
     val offlineRecords = OfflineDownloads.records
+    val offlineBookRecords = OfflineBooks.records
 
     var origin: String = ""
         private set
@@ -168,7 +172,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             if (
-                OfflineDownloads.catalog.profile(saved.instanceId, saved.userId).isNotEmpty()
+                OfflineDownloads.catalog.profile(saved.instanceId, saved.userId).isNotEmpty() ||
+                OfflineBooks.profile(saved.instanceId, saved.userId).isNotEmpty()
             ) {
                 // Downloads is a local library. Do not hold it behind the
                 // saved server's reachability check on an airplane launch.
@@ -362,8 +367,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val instance = serverInstanceId
             val user = currentUserId
+            OfflineBooks.interruptProfile(instance, user)
             if (removeDownloads && instance != null && user != null) {
-                OfflineDownloads.removeProfileNow(instance, user, api())
+                OfflineDownloads.removeProfileNow(instance, user, api)
+                OfflineBooks.removeProfileNow(instance, user)
             }
             settings.clearToken()
             Session.token = null
@@ -380,6 +387,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * relaunch before the next login must not offer it to a different one.
      */
     fun changeServer() {
+        OfflineBooks.interruptProfile(serverInstanceId, currentUserId)
         Session.token = null
         currentUser = null
         currentUserId = null
@@ -449,6 +457,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return null
     }
 
+    fun queueOfflineBook(item: Item, file: MediaFileDto): String? = queueOfflineBook(
+        itemId = item.id,
+        file = file,
+        title = item.title,
+        posterPath = item.poster,
+    )
+
+    fun retryOfflineBook(book: OfflineBook): String? = queueOfflineBook(
+        itemId = book.itemId,
+        file = MediaFileDto(
+            id = book.fileId,
+            filename = book.originalFilename,
+            size = book.revision?.size ?: book.bytesTotal,
+            container = "epub",
+        ),
+        title = book.title,
+        posterPath = null,
+    )
+
+    private fun queueOfflineBook(
+        itemId: Long,
+        file: MediaFileDto,
+        title: String,
+        posterPath: String?,
+    ): String? {
+        if (!file.isEpub) return "Cinema can currently download EPUB books only"
+        val instance = serverInstanceId
+            ?: return "Reconnect to this Cinema server before downloading"
+        val user = currentUserId
+            ?: return "Sign in again before downloading"
+        val token = Session.token
+            ?: return "Sign in again before downloading"
+        OfflineBooks.enqueue(
+            OfflineBookQueueRequest(
+                origin = origin,
+                token = token,
+                serverInstanceId = instance,
+                userId = user,
+                itemId = itemId,
+                file = file,
+                title = title,
+                posterPath = posterPath,
+                network = _preferences.value.offlineNetwork,
+            ),
+        )
+        return null
+    }
+
     fun resumeOffline(record: OfflineRecord) =
         resumeOffline(record, OfflineResumeTrigger.UserControl)
 
@@ -489,9 +545,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_phase.value != Phase.Ready || api == null) return
         resumeOfflineProfile()
         syncOfflineProgress()
+        syncOfflineBookProgress()
     }
 
     fun removeOffline(record: OfflineRecord) = OfflineDownloads.remove(record, api)
+
+    fun removeOfflineBook(book: OfflineBook) = OfflineBooks.remove(book)
 
     private fun syncOfflineProgress() {
         val instance = serverInstanceId ?: return
@@ -517,6 +576,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    private fun syncOfflineBookProgress() {
+        val instance = serverInstanceId ?: return
+        val user = currentUserId ?: return
+        val boundApi = api ?: return
+        viewModelScope.launch { OfflineBooks.syncPending(boundApi, instance, user) }
     }
 
     private fun updatePreferences(change: ViewerPreferences.() -> ViewerPreferences) {

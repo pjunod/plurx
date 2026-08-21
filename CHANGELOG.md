@@ -8,7 +8,45 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Android phones and tablets can keep EPUBs inside Cinema for offline
+  reading.** A durable profile-scoped catalogue records intent before I/O,
+  downloads the authenticated original, reopens the server publication to
+  verify the exact revision and manifest, materializes only bounded declared
+  resources, and atomically publishes the app-private copy. The local WebView
+  serves packaged reader assets and publication bytes through an intercepted
+  synthetic HTTPS origin with no account bearer, DNS fallback, redirects,
+  file/content access, mixed content, or publisher network loads. Local
+  locator changes survive process death and the newest dated state for the
+  exact edition replays after reconnect. Android TV and Google TV remain
+  deliberately excluded.
+
 ### Fixed
+
+- **Existing replicated installs now have a real v5 → v6 upgrade path.** The
+  ebook reading-state release raised the Hiqlite compatibility marker to v6
+  but only defined that schema for fresh bootstrap/import, so an activated v5
+  install failed before the daemon could do anything about it. Daemon startup
+  now accepts that one predecessor and commits the `reading_state` table, its
+  index, and the v6 cluster marker in one Raft transaction before any producer
+  or HTTP listener starts. It then atomically advances each node's activation
+  marker; either crash boundary converges on the next boot. Maintenance
+  commands remain strict clients of a running daemon and cannot initiate the
+  migration. Replicated v4 and future schemas still fail closed.
+
+- **Recording a regression mapping no longer conflicts every other open pull
+  request.** Every corrective change used to append a `[[coverage]]` block to
+  the tail of one `validation/regressions.toml`, so each merge to `main` put a
+  conflict in the same region of every other branch carrying a mapping —
+  and clearing it with a rebase rewrote the SHAs a reviewer had pinned an
+  approval to. The ledger is now a directory: one entry per file at
+  `validation/regressions.d/<first-commit-prefix>-<slug>.toml`, loaded and
+  concatenated by the history audit. Two changes cannot pick the same path, so
+  the collision is structurally impossible rather than merely rare, and the
+  loader refuses to run while a shared `validation/regressions.toml` exists.
+  All 66 existing entries moved across with their claims unchanged; the audit
+  reports the same 414 corrective commits and the same route for every one.
 
 - **Apple copy-HLS stall recovery no longer replays the preceding keyframe.**
   A replacement session still opens on the keyframe before the requested film

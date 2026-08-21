@@ -1,0 +1,8 @@
+version = 1
+
+[[coverage]]
+commits = ["885073b"]
+points = []
+checks = []
+reason = "This commit only records the Profile 5 renderer correction's current validation evidence; it does not change runtime behavior."
+ignore = true

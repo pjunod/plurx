@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0a7c0823", "0d253f61"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The HLS master unit tests assert the current WebVTT codec and rendition signaling."

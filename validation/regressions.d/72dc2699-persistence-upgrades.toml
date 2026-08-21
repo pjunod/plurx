@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["72dc2699"]
+points = ["persistence.upgrades", "server.api"]
+checks = ["rust-gate"]
+reason = "The retained shipped-binary regression `m2_ignores_explicit_non_loopback_cluster_listener_hosts` proves that explicit future-M3 host settings cannot expose either one-voter M2 listener; the helper regression also preserves IPv4 and IPv6 address-family selection."

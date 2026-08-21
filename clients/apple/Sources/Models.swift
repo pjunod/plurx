@@ -324,6 +324,17 @@ struct MediaFile: Codable, Identifiable {
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+
+    var isEpub: Bool {
+        container?.lowercased() == "epub"
+            || filename?.lowercased().hasSuffix(".epub") == true
+    }
+}
+
+enum BookReaderPolicy {
+    static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        !onTelevision && file.available != false && file.isEpub
+    }
 }
 
 /// One subtitle stream exactly as item detail reports it (`FileDto`'s
@@ -416,11 +427,114 @@ struct BookChapter: Codable, Hashable {
     let endMs: Int
 }
 
+struct ReadingRevision: Codable, Hashable {
+    let size: Int
+    let mtime: Int
+}
+
+struct ReadingLocations: Codable, Hashable {
+    var fragments: [String]?
+    var progression: Double?
+    var totalProgression: Double?
+    var position: Int?
+}
+
+struct ReadingText: Codable, Hashable {
+    var before: String?
+    var highlight: String?
+    var after: String?
+}
+
+struct ReadingCinemaLocator: Codable, Hashable {
+    var path: [Int]?
+    var text: String?
+}
+
+struct ReadingLocator: Codable, Hashable {
+    let version: Int
+    let href: String
+    var type: String?
+    var title: String?
+    var locations: ReadingLocations?
+    var text: ReadingText?
+    var cinema: ReadingCinemaLocator?
+}
+
+struct PublicationMetadata: Codable, Hashable {
+    let title: String
+    var author: String?
+    var identifier: String?
+    var language: String?
+}
+
+struct PublicationLink: Codable, Hashable {
+    let href: String
+    let type: String
+    var title: String?
+}
+
+struct PublicationTocLink: Codable, Hashable {
+    let href: String
+    let title: String
+    var children: [PublicationTocLink]
+}
+
+struct PublicationManifest: Codable, Hashable {
+    let metadata: PublicationMetadata
+    let readingOrder: [PublicationLink]
+    let resources: [PublicationLink]
+    let toc: [PublicationTocLink]
+}
+
+struct PublicationLimits: Codable, Hashable {
+    let entries: Int
+    let totalUncompressedBytes: Int64
+    let resourceBytes: Int64
+    let markupBytes: Int64
+    let compressionRatio: Int64
+    let concurrentResourceReads: Int
+    let resourceChunkBytes: Int
+}
+
+struct OpenPublicationResponse: Codable, Hashable {
+    let sessionId: String
+    let resourceBase: String
+    let expiresIn: Int
+    let fileId: Int
+    let revision: ReadingRevision
+    let publication: PublicationManifest
+    let limits: PublicationLimits
+}
+
+struct ReadingState: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    let updatedAt: Int
+}
+
+struct ReadingStateResponse: Codable, Hashable {
+    let state: ReadingState?
+    let stale: Bool
+}
+
+struct PutReadingStateRequest: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    var recordedAt: Int?
+}
+
 struct ItemDetail: Codable {
     let item: Item
     var files: [MediaFile]?
     var children: [Item]?
     var ancestors: [Item]?
+    var reading: ReadingState?
 }
 
 struct Marker: Codable, Hashable {

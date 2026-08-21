@@ -70,7 +70,7 @@ check: validation-lint history-check operations-check benchmark-check rust-check
 
 .PHONY: hiqlite-spike
 hiqlite-spike: ## Run the isolated M0 raft/SQLite semantic proof
-	$(CARGO) test --manifest-path spikes/hiqlite-m0/Cargo.toml \
+	$(CARGO) test --locked --manifest-path spikes/hiqlite-m0/Cargo.toml \
 	  --test hiqlite_m0 -- --nocapture
 
 .PHONY: hiqlite-baseline
@@ -232,6 +232,7 @@ ui-golden: ## Rewrite tests/ui-structure.golden after an intended UI change
 .PHONY: web-check
 web-check: ## Test playback policy, embedded JS, and every shipped theme
 	@node tests/playback/web-policy.test.js
+	@node tests/web/reader.test.js
 	@scripts/js-check
 	@scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
 		--foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad' \
