@@ -268,16 +268,33 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release -p plurxd --target ${{ matrix.target }}",
             workflow,
         )
-        self.assertEqual(
-            workflow.count(
-                "s|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g",
-            ),
-            4,
-        )
-        self.assertEqual(
-            workflow.count("sudo apt-get -o Acquire::Retries=3"),
-            8,
-        )
+        # apt on a hosted image points at a mirror list that fails often enough
+        # to matter on a required gate, so every apt use rewrites it to the
+        # archive and retries. Counting invocations rather than asserting a
+        # fixed total keeps this true as jobs move: the ffmpeg lanes now satisfy
+        # it once inside ./.github/actions/ffmpeg instead of per job.
+        for name in (
+            ".github/workflows/ci.yml",
+            ".github/actions/ffmpeg/action.yml",
+        ):
+            with self.subTest(source=name):
+                source = read(name)
+                self.assertIn(
+                    "s|mirror+file:/etc/apt/apt-mirrors.txt"
+                    "|https://archive.ubuntu.com/ubuntu|g",
+                    source,
+                )
+                self.assertEqual(
+                    [],
+                    [
+                        line.strip()
+                        for line in source.splitlines()
+                        if "apt-get" in line
+                        and not line.lstrip().startswith("#")
+                        and "-o Acquire::Retries=3" not in line
+                    ],
+                    f"{name} runs apt-get without the retry policy",
+                )
         self.assertNotIn("sudo apt-get update", workflow)
         self.assertNotIn("sudo apt-get install", workflow)
         self.assertNotIn(
@@ -387,6 +404,60 @@ class OperationsContractCase(unittest.TestCase):
                     and "\n    uses:" not in block
                 ]
                 self.assertEqual([], missing, f"jobs without timeouts in {path}")
+
+    def test_every_ffmpeg_lane_pins_the_build_it_asserts_against(self):
+        # An unpinned `apt-get install -y ffmpeg` on `ubuntu-latest` made the
+        # gate's ffmpeg whichever build GitHub promoted that week — which is why
+        # ffmpeg 8 dropping the `-readrate_initial_burst` behaviour (#380) was
+        # invisible to CI and would have arrived on `main` as a green-to-red
+        # flip with no diff to blame. The pin is only worth as much as this
+        # test: it is what keeps a change of ffmpeg build a reviewable diff.
+        action = read(".github/actions/ffmpeg/action.yml")
+        self.assertIn("apt-get -o Acquire::Retries=3 install -y ffmpeg", action)
+        self.assertIn("WANT_MAJOR", action)
+        self.assertIn('GITHUB_STEP_SUMMARY', action)
+        self.assertIn('if [ "$got" != "$WANT_MAJOR" ]', action)
+
+        majors = set()
+        for path in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/release-readiness.yml",
+            ".github/workflows/validation-nightly.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertNotRegex(
+                    read(path),
+                    r"(?m)^\s*[^#\n]*apt-get[^\n]*install[^\n]*\bffmpeg\b",
+                    f"{path} installs ffmpeg outside ./.github/actions/ffmpeg",
+                )
+                for name, block in workflow_job_blocks(path).items():
+                    if "uses: ./.github/actions/ffmpeg" not in block:
+                        continue
+                    major = re.search(r'(?m)^ +major: "(\d+)"$', block)
+                    self.assertIsNotNone(
+                        major, f"{path}:{name} provisions ffmpeg without naming a major"
+                    )
+                    majors.add(major.group(1))
+                    # A named major is a claim about the environment, so the
+                    # environment has to be nameable too: a concrete runner
+                    # image, or a container tag that overrides it.
+                    self.assertTrue(
+                        "runs-on: ubuntu-latest" not in block
+                        or "\n    container:" in block,
+                        f"{path}:{name} asserts an ffmpeg major on a floating image",
+                    )
+
+        # Both sides of the #380 split stay covered: the gate lanes on the major
+        # their timing assumptions were written against, and a nightly lane on
+        # the one every worker host already runs. Changing this set is allowed
+        # and is the point — it is how a decision to move the fleet's ffmpeg
+        # arrives as a reviewed diff rather than as a Tuesday.
+        self.assertEqual(
+            {"6", "8"},
+            majors,
+            "the ffmpeg majors CI covers changed; update docs/VALIDATION.md's "
+            "'Which ffmpeg the profiles assume' in the same commit",
+        )
 
     def test_ci_flake_ledger_records_real_job_outcomes_and_durations(self):
         script = ROOT / "scripts/ci-flake-report"

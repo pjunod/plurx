@@ -14,7 +14,9 @@ env:
 jobs:
   release-check:
     name: current version is ready to tag
-    runs-on: ubuntu-latest
+    # Readiness answers "would the gate pass if we tagged now", so it has to run
+    # the gate's ffmpeg rather than the week's. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -24,10 +26,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install media and browser prerequisites
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
           python3 -m pip install playwright
           python3 -m playwright install --with-deps chromium
       - name: Verify release readiness
