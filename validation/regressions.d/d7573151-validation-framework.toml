@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d7573151"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "This metadata-only correction replaces the stale pre-repair web commit ID with the published provenance-repair commit. `make history-check` verifies that the corrective mapping resolves to retained evidence and rejects stale or cross-contract mappings."

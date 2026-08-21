@@ -202,6 +202,14 @@ inside one Books library while keeping their actions and metadata honest.
   to the Cinema origin and publication capability, closing flushes the newest
   locator, and a profile or server change dismisses the book. tvOS and
   Google TV deliberately expose no reader action.
+- **Native online PDF reading is built in on iPhone and iPad.** PDFKit renders
+  authenticated originals from an app-private temporary directory, page
+  changes save revision-bound locators, and local search never leaves the
+  device. The loader rejects an edition whose byte count changed, PDFs above
+  1 GiB, password-protected documents, and files that prohibit accessibility
+  extraction. The temporary copy is removed on close. Web, Android, offline,
+  and television PDF actions remain **Open in…** or unavailable as the support
+  registry states.
 - **Cinema-managed EPUB downloads are built in on iPhone, iPad, and Android
   phone/tablet.** Each app
   records a recoverable intent before transfer, downloads the authenticated
@@ -452,9 +460,9 @@ decoding shows what the file is versus what your browser is actually rendering.
 - **Method-aware seek:** direct play seeks natively; remux and transcode restart
   the server stream at the new offset.
 
-**How to read it:** a "Skip Credits" button that reads as an estimate exists
-because that file had no end-credits chapter — it's a guess and the timeline
-knows it. Chapter-derived buttons are exact.
+**How to read it:** a "Skip Credits · Estimated" button exists because that
+file had no end-credits chapter — the button labels the duration-based guess.
+Chapter-derived buttons keep the exact chapter label.
 
 **How to read the Server block:** encode speed below 1× means the server
 cannot produce the stream as fast as you are watching it, and a stall is only

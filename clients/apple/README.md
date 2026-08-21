@@ -12,11 +12,15 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `73` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `75` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 73 keeps reconnect and Settings reachable when
-> an offline download opens first. Build 72 displays bounded book author metadata and
+> same regression suite. Build 75 adds online PDFKit reading on iPhone and
+> iPad with exact-revision temporary bytes, page resume, local search, and
+> protected-document refusal. Build 74 consumes Cinema's server-owned ebook
+> format/action registry so detected-but-external formats cannot acquire a
+> false **Read** or offline action. Build 73 keeps reconnect and Settings
+> reachable when an offline download opens first. Build 72 displays bounded book author metadata and
 > exact work-linked editions on browse and detail surfaces. Build 71 keeps pending offline reading state separate
 > for each exact item/file/revision edition. Build 70 adds profile-scoped, atomically published
 > offline EPUB reading and newest-locator replay on iPhone and iPad, with no
@@ -125,6 +129,14 @@ only what this hardware genuinely can't play.
   Interrupted transfers become explicit **Download again** rows; removal
   touches only the app-private copy. tvOS exposes no reader or ebook-download
   action.
+- **Online PDF reading on iPhone and iPad.** Cinema downloads the authenticated
+  original into an app-private temporary directory, requires the exact
+  server-advertised revision, and renders it with PDFKit. Page navigation,
+  pinch zoom, selection, local search, explicit completion, and cross-device
+  page resume are built in. Cross-origin redirects, password-protected files,
+  accessibility-restricted files, editions above 1 GiB, and changed byte counts
+  fail closed; the temporary file is removed when the reader closes. Offline
+  PDF and tvOS remain external handoff surfaces.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's
