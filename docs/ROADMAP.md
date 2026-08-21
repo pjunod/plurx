@@ -133,9 +133,13 @@ keeps transfer.
   API and in-app web reader ship Read/Resume, TOC, search, preferences,
   explicit completion, durable paragraph restoration, and hostile-content
   browser proof without changing A/V playback.
-- 📝 **M3 next:** reuse the proven publication model for Apple and Android
-  phone/tablet readers, with physical VoiceOver/TalkBack acceptance and no TV
-  reader action.
+- ✅ **M3 complete 2026-08-20:** iPhone/iPad and Android phone/tablet now host
+  the shared reader behind memory-only authentication and same-origin native
+  navigation guards. Simulator/JVM plus real-browser contracts prove profile
+  isolation, semantic headings, close flushing, and the same paragraph after
+  font and orientation changes; tvOS and Google TV expose no reader action.
+- 📝 **M4 next:** add profile-scoped, app-private EPUB downloads and reconcile
+  the newest offline locator when the server returns.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 
