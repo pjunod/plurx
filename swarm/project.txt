@@ -5,10 +5,14 @@ Repository: https://github.com/pjunod/plurx
 
 PURPOSE AND AUTHORITY
 
-Plurx is a self-hosted media server and native-client project. GitHub issues,
-pull requests, reviews, and required checks are authoritative. The repo-local
-.swarm state is operational telemetry only; never use it as a task queue or as
-evidence that an issue is complete.
+Plurx is a self-hosted media server and native-client project. The project-local
+`.swarm/state.db` is authoritative for queue lifecycle, worker state, and
+handoffs. GitHub issues and pull requests supply work contracts, discussion,
+change state, reviews, and required checks; `swarm:*` labels are an outbound
+projection after an item enters SQLite, not lifecycle authority. Never edit
+those lifecycle labels directly. Use the launcher-supplied `SWARMCTL_PATH` for
+every transition so SQLite, the delivery outbox, worker release, and queue wake
+commit together.
 
 If a GitHub issue conflicts with a checked-in product, architecture, security,
 or validation contract, stop and report the conflict. Do not silently reinterpret
@@ -34,10 +38,12 @@ existing evidence, and decomposes only independently executable work. This is
 the path for multi-stage investigations such as playback performance and for
 importing a planned body of work such as cinema clustering.
 
-An implementation issue is eligible only when it is open and has `swarm:ready`
-plus exactly one role label: `swarm:lead` or `swarm:builder`. Priority favors
-explicit dependencies first, then older and less recently active work so stale
-items cannot remain indefinitely. Do not mine TODO comments or invent product
+An implementation item is eligible only when its canonical SQLite lifecycle is
+`ready` and it has exactly one assigned role: `lead` or `builder`. GitHub's
+`swarm:ready` plus one role label bootstraps a new issue into that ledger; after
+admission, later GitHub label edits cannot move it. Priority favors explicit
+dependencies first, then older and less recently active work so stale items
+cannot remain indefinitely. Do not mine TODO comments or invent product
 priorities when the eligible queue is empty.
 
 An operator-created project adoption enters coordinator intake before the ready
@@ -55,22 +61,24 @@ children and report the existing issue or pull request as the routing result.
 Normal workers start only after lead reports that the authoritative queue fully
 represents the remainder.
 
-An explicit `swarmctl adopt --role <role>` is the narrower exception for work
-that should continue as one role-bound worker without decomposition. That worker
-must reconcile or create its matching issue before new implementation, add its
-role plus `swarm:active`, and record the adoption ID and original task link. It
-owns only its captured branch, path scope, and acceptance criteria.
+An explicit `"$SWARMCTL_PATH" adopt --role <role>` is the narrower exception for
+work that should continue as one role-bound worker without decomposition. That
+worker must reconcile or create its matching issue before new implementation,
+transition the canonical item to `active`, and record the adoption ID and
+original task link. It owns only its captured branch, path scope, and acceptance
+criteria.
 
 Before editing:
 
 1. Confirm no open pull request, active issue comment, or branch already owns the
    same acceptance criteria.
-2. Comment `CLAIMED: <agent> / <SWARM_SESSION_ID> / <planned branch>` on the
-   issue.
-3. Remove `swarm:ready`, add `swarm:active`, and create
+2. Record `CLAIMED: <agent> / <SWARM_SESSION_ID> / <planned branch>` on the
+   issue as external coordination evidence.
+3. Run `"$SWARMCTL_PATH" transition --issue "$SWARM_QUEUE_NUMBER" --state
+   active`; never substitute `gh issue edit` or a direct label mutation. Create
    `agent/<role>/issue-<number>-<short-slug>` from current `origin/main`.
-4. Report the issue number, phase, and next concrete action through `swarmctl
-   progress`.
+4. Report the issue number, phase, and next concrete action through
+   `"$SWARMCTL_PATH" progress`.
 
 Open a draft pull request once the implementation direction and affected files
 are known. Use `Closes #<number>` only when the pull request satisfies the whole
@@ -95,13 +103,13 @@ verifies the exact head, marks drafts ready, merges automatically, and
 reconciles issues. Only branch protection, failed checks, or changes-requested
 review may stop that merge.
 
-When blocked, comment with the symptom, evidence, attempts, and exact unblocker;
-replace `swarm:active` with `swarm:blocked`; report `swarmctl block`; then release
-the task. When a task returns to the queue, a human or lead replaces
-`swarm:blocked` with `swarm:ready`.
+When blocked, record the symptom, evidence, attempts, and exact unblocker with
+`"$SWARMCTL_PATH" block`, then release the task. When a task can run again, Lead
+uses `"$SWARMCTL_PATH" transition --issue <number> --state ready`; nobody repairs
+the queue by editing GitHub labels.
 
-No eligible issue means report the queue as empty with `swarmctl done` and exit.
-Do not create speculative changes merely to keep a session busy.
+No eligible issue means report the queue as empty with `"$SWARMCTL_PATH" done`
+and exit. Do not create speculative changes merely to keep a session busy.
 
 OWNERSHIP — ONE PRIMARY WRITER PER CHANGE
 
