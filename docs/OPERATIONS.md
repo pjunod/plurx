@@ -278,8 +278,10 @@ read when you open the tab, not on every Settings visit.
 | `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
 | `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
 
-The node table carries only what `GET /api/v1/cluster/nodes` exposes: node id,
-Raft id, voter/learner role, reachability, and last-seen. Addresses, media
+The node table leads with each advertised hostname so you can recognize the
+machine, labels the current leader beside that hostname, and keeps the stable
+node id underneath for copy/paste. `GET /api/v1/cluster/nodes` also exposes the
+Raft id, voter/learner role, reachability, and last-seen. Listener ports, media
 paths, and token material are not in that payload and are not shown.
 
 **Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
