@@ -1,7 +1,13 @@
 version = 1
 
 [[coverage]]
-commits = ["0d6b1701", "0ba4bb42"]
+commits = ["0d6b1701"]
 points = ["cluster.auth", "metadata.enrichment"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The Rust gate compiles the legacy-client removal-fence commands against the actual Hiqlite parameter macro and membership error type, and applies current Clippy policy to the local artwork rematerialization regressions. The three-voter contract then executes the raw preceding-release lease SQL, exhausted-token delayed publication, and tombstone-backfill cases; restoring the missing imports prevents those proofs from compiling, while restoring cloned one-element slices violates the workspace lint gate before the metadata behavior checks can run."
+
+[[coverage]]
+commits = ["0ba4bb42"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "The corrective-history audit reads this ledger entry and requires the compilation correction to name its retained Rust and three-voter checks. Removing the mapping reproduces the policy failure, so the validation framework prevents a repair to cluster regression coverage from landing without durable evidence."
