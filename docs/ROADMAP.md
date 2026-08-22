@@ -104,11 +104,13 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   the corrected contracts and a decisions ledger (PERF-PLAN §8.6).
 - ✅ **M1 complete 2026-07-28:** the correction pass (PERF-PLAN §2.8), the
   fixture-matrix benchmark, 2-second segments, bounded rate control on every
-  encoder family with a probe that runs the production arguments, and an Auto
-  rung that means `min(source, 1080)` on hardware instead of 720p for
-  everything. Measured on the corpus: the CPU tone-map chain costs a quarter
-  of the pipeline's throughput (0.98× → 0.71× at 4K), which is what takes a
-  4K HDR session below realtime.
+  encoder family with a probe that runs the production arguments, and the
+  first encoder-aware Auto rung instead of 720p for everything. The original
+  hardware ceiling was 1080p; the 2026-08-21 correction now preserves known
+  SDR source geometry up to 2160p and leaves HDR at the separately measured
+  1080p output point. Measured on the corpus: the CPU tone-map chain costs a
+  quarter of the pipeline's throughput (0.98× → 0.71× at 4K), which is what
+  takes a 4K HDR session below realtime.
 - ✅ **M2 complete 2026-07-29:** GPU tone-map candidate graphs, the real-HDR
   boot probe, per-session routing and downgrade, and racing-safe hardware
   admission all shipped. The nynuc acceptance run measured the QSV path at
@@ -138,8 +140,24 @@ keeps transfer.
   navigation guards. Simulator/JVM plus real-browser contracts prove profile
   isolation, semantic headings, close flushing, and the same paragraph after
   font and orientation changes; tvOS and Google TV expose no reader action.
-- 📝 **M4 next:** add profile-scoped, app-private EPUB downloads and reconcile
-  the newest offline locator when the server returns.
+- 🚧 **M4 acceptance in progress:** iPhone/iPad and Android phone/tablet now
+  keep an atomically published, profile/revision-scoped original EPUB, open it
+  through a token-free local publication surface with the server stopped, and
+  reconcile the newest offline locator when the server returns. Automated
+  storage, security, process-death, and sync contracts are green; the physical
+  airplane-mode/reconnect device drill remains. Televisions stay deliberately
+  excluded.
+- ✅ **M5 complete 2026-08-21:** Cinema persists source-ranked author, cover,
+  work, edition, and medium facts from bounded EPUB packages or explicit
+  Curator hints. SQLite v21 and replicated v7 have tested upgrade paths;
+  title/author similarity never creates an edition relation, and the paired
+  Curator handoff carries the exact identifiers.
+- 🚧 **M6 format expansion in progress:** one server-owned registry now drives
+  every client action and the checked-in support table. iPhone and iPad add
+  online PDFKit reading with authenticated exact-revision temporary bytes,
+  page-locator resume, local search, explicit completion, redirect confinement,
+  and protected-document refusal. Simulator/source acceptance is automated;
+  physical VoiceOver and representative-device PDF acceptance remain.
 
 ## Phase 4 — HA for real (IN PROGRESS)
 

@@ -83,6 +83,51 @@ function test(name, run) {
   }
 }
 
+test("estimated skip markers are hedged without rebuilding each tick", () => {
+  let writes = 0;
+  const skip = {
+    dataset: {},
+    value: "",
+    get innerHTML() {
+      return this.value;
+    },
+    set innerHTML(value) {
+      writes += 1;
+      this.value = value;
+    },
+  };
+  const renderSkip = new Function(
+    "document",
+    "esc",
+    `${shippedSource("renderSkip")}
+return renderSkip;`,
+  )(
+    { getElementById: (id) => (id === "pskip" ? skip : null) },
+    (value) => value,
+  );
+  const exact = {
+    kind: "credits",
+    start_ms: 6_000,
+    chapter: true,
+  };
+  renderSkip(exact);
+  assert.equal(
+    skip.innerHTML,
+    '<button onclick="skipCurrent()">Skip Credits ›</button>',
+  );
+  renderSkip(exact);
+  assert.equal(writes, 1, "the exact marker should not rebuild on timeupdate");
+
+  const estimated = { ...exact, chapter: false };
+  renderSkip(estimated);
+  assert.equal(
+    skip.innerHTML,
+    '<button onclick="skipCurrent()">Skip Credits · Estimated ›</button>',
+  );
+  renderSkip(estimated);
+  assert.equal(writes, 2, "the estimated marker should not rebuild on timeupdate");
+});
+
 test("every server verdict reaches exactly one initial web transport", () => {
   const rows = [
     [{ method: "direct_play" }, "direct"],
@@ -1536,6 +1581,36 @@ function detailHarness({ decisions = {} } = {}) {
   );
   return { ...shipped, requested };
 }
+
+function bookMetadataHarness() {
+  const build = new Function(
+    "grid",
+    [
+      shippedSource("esc"),
+      shippedSource("bookByline"),
+      shippedSource("bookEditionSection"),
+      "return {bookByline, bookEditionSection};",
+    ].join("\n"),
+  );
+  return build((items) => `<div data-editions="${items.length}"></div>`);
+}
+
+test("book bylines escape provider text and edition rows use only server relations", () => {
+  const shipped = bookMetadataHarness();
+  const byline = shipped.bookByline({
+    kind: "book",
+    author: 'A. Reader <script src="https://example.com/x.js"></script>',
+  });
+  assert.match(byline, /^<div class="muted"[^>]*>By A\. Reader /);
+  assert.doesNotMatch(byline, /<script/);
+  assert.match(byline, /&lt;script/);
+  assert.equal(shipped.bookByline({ kind: "movie", author: "Wrong" }), "");
+  assert.equal(shipped.bookEditionSection({ editions: [] }), "");
+  assert.match(
+    shipped.bookEditionSection({ editions: [{ id: 2, kind: "audiobook" }] }),
+    /Other editions[\s\S]+data-editions="1"/,
+  );
+});
 
 const MOVIE_FILE = {
   id: 42,

@@ -353,6 +353,8 @@ paths = [
   "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
+  "vendor/hiqlite/**",
+  "vendor/hiqlite-wal/**",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
 ]
@@ -377,6 +379,7 @@ contract = "The single server binary exposes stable native endpoints and coordin
 paths = [
   "crates/plurxd/Cargo.toml",
   "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
+  "crates/plurxd/src/reader_formats.rs",
   "crates/plurxd/src/http/{dto,error,extract,mod,network,publication,reading,system}.rs",
   "plurx.example.toml",
 ]

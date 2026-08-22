@@ -153,8 +153,11 @@ struct SettingsView: View {
                 Button("Sign out", role: .destructive) {
                     #if os(iOS)
                     Task {
-                        profileHasDownloads = await OfflineDownloadManager.shared
-                            .hasCurrentProfileDownloads()
+                        async let video = OfflineDownloadManager.shared.hasCurrentProfileDownloads()
+                        async let books = OfflineBookManager.shared.hasCurrentProfileDownloads()
+                        let hasVideo = await video
+                        let hasBooks = await books
+                        profileHasDownloads = hasVideo || hasBooks
                         if profileHasDownloads {
                             confirmingSignOut = true
                         } else {
@@ -187,6 +190,7 @@ struct SettingsView: View {
             Button("Remove downloads and sign out", role: .destructive) {
                 Task {
                     await OfflineDownloadManager.shared.removeCurrentProfile()
+                    await OfflineBookManager.shared.removeCurrentProfile()
                     model.logout()
                 }
             }

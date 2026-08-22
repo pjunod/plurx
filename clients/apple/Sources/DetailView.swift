@@ -4,6 +4,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
     enum Kind: String, Equatable {
         case series
         case episode
+        case author
         case year
         case runtime
         case resolution
@@ -80,7 +81,7 @@ struct ItemMetadataBadgeRow: View {
         switch badge.kind {
         case .resolution, .video, .dynamicRange, .audio:
             return true
-        case .series, .episode, .year, .runtime:
+        case .series, .episode, .year, .runtime, .author:
             return false
         }
     }
@@ -670,8 +671,11 @@ enum TVPlayableDetailMetrics {
 struct ReaderContext: Identifiable, Equatable {
     let itemId: Int
     let fileId: Int
+    let title: String
+    let format: String
+    let revision: ReadingRevision?
 
-    var id: String { "\(itemId):\(fileId)" }
+    var id: String { "\(itemId):\(fileId):\(format)" }
 }
 #endif
 
@@ -686,6 +690,7 @@ struct DetailView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @ObservedObject private var downloads = OfflineDownloadManager.shared
+    @ObservedObject private var bookDownloads = OfflineBookManager.shared
     #endif
     let itemId: Int
     @State private var detail: ItemDetail?
@@ -702,6 +707,7 @@ struct DetailView: View {
     #if os(iOS)
     @State private var downloadBusy = false
     @State private var reader: ReaderContext?
+    @State private var offlineReader: OfflineBook?
     #endif
     #if os(tvOS)
     @State private var seriesPlayback: PlayContext?
@@ -808,8 +814,21 @@ struct DetailView: View {
         .fullScreenCover(item: $reader, onDismiss: {
             Task { detail = try? await model.itemDetail(itemId) }
         }) { context in
-            ReaderView(context: context)
-                .environmentObject(model)
+            if context.format == "pdf", context.revision != nil {
+                PDFReaderView(context: context)
+                    .environmentObject(model)
+            } else {
+                ReaderView(context: context)
+                    .environmentObject(model)
+            }
+        }
+        .fullScreenCover(item: $offlineReader, onDismiss: {
+            Task {
+                await bookDownloads.refresh()
+                detail = try? await model.itemDetail(itemId)
+            }
+        }) { book in
+            OfflineBookReaderView(book: book)
         }
         #endif
     }
@@ -1073,6 +1092,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1246,6 +1270,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1360,6 +1389,11 @@ struct DetailView: View {
 
             audiobookContents(detail)
 
+            if let editions = detail.editions, !editions.isEmpty {
+                MediaRow(title: "Other editions", items: editions)
+                .padding(.top, 18)
+            }
+
             if let children = detail.children, !children.isEmpty {
                 MediaRow(
                     title: childrenHeading(item.kind),
@@ -1446,6 +1480,9 @@ struct DetailView: View {
 
         if item.kind == "episode", let season = item.seasonNumber, let episode = item.episodeNumber {
             parts.append("Season \(season), Episode \(episode)")
+        }
+        if (item.isBook || item.isAudiobook), let author = item.author, !author.isEmpty {
+            parts.append("By \(author)")
         }
         if item.kind != "episode", let year = item.year { parts.append(String(year)) }
         if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
@@ -1773,6 +1810,10 @@ struct DetailView: View {
     /// Movies and single-file books keep the established first-file behavior.
     static func playbackFile(in detail: ItemDetail, positionMs: Int) -> MediaFile? {
         let files = detail.files ?? []
+        if detail.item.isBook {
+            return files.first { BookReaderPolicy.canRead($0, onTelevision: false) }
+                ?? files.first
+        }
         guard detail.item.isAudiobook else { return files.first }
         return AudiobookTimeline.file(at: positionMs, in: files)
     }
@@ -1909,6 +1950,14 @@ struct DetailView: View {
                 symbol: "rectangle.stack.fill",
                 mark: "S\(season) E\(episode)",
                 accessibilityLabel: "Season \(season), Episode \(episode)"
+            ))
+        }
+        if (item.isBook || item.isAudiobook), let author = item.author, !author.isEmpty {
+            badges.append(ItemMetadataBadge(
+                kind: .author,
+                symbol: "person.fill",
+                mark: author,
+                accessibilityLabel: "By \(author)"
             ))
         }
         if item.kind != "episode", let year = item.year {
@@ -2120,7 +2169,17 @@ struct DetailView: View {
     private func bookButtons(_ detail: ItemDetail, file: MediaFile) -> some View {
         if BookReaderPolicy.canRead(file, onTelevision: false) {
             Button {
-                reader = ReaderContext(itemId: detail.item.id, fileId: file.id)
+                if let local = bookDownloads.books.first(where: { $0.fileId == file.id && $0.isPlayable }) {
+                    offlineReader = local
+                } else {
+                    reader = ReaderContext(
+                        itemId: detail.item.id,
+                        fileId: file.id,
+                        title: detail.item.title,
+                        format: file.reader?.format ?? "epub",
+                        revision: file.readerRevision
+                    )
+                }
             } label: {
                 Label(Self.bookReadingLabel(detail, file: file), systemImage: "book.fill")
                     .font(.subheadline.weight(.semibold))
@@ -2133,6 +2192,10 @@ struct DetailView: View {
                 Label("Open in…", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: false))
+
+            if BookReaderPolicy.canDownload(file, onTelevision: false) {
+                mobileBookDownloadButton(detail: detail, file: file)
+            }
         } else {
             Button {
                 openBookExternally(file)
@@ -2141,6 +2204,62 @@ struct DetailView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(IOSDetailPrimaryActionButtonStyle())
+        }
+    }
+
+    @ViewBuilder
+    private func mobileBookDownloadButton(detail: ItemDetail, file: MediaFile) -> some View {
+        let existing = bookDownloads.books.first { $0.fileId == file.id }
+        Button {
+            if let existing, [.intent, .downloading].contains(existing.state) {
+                Task { await bookDownloads.remove(existing) }
+                return
+            }
+            guard !downloadBusy else { return }
+            guard existing?.isPlayable != true else { return }
+            downloadBusy = true
+            actionError = nil
+            Task {
+                do {
+                    try await bookDownloads.queue(
+                        itemId: detail.item.id,
+                        file: file,
+                        title: detail.item.title,
+                        posterPath: detail.item.poster
+                    )
+                } catch is CancellationError {
+                    // A second tap intentionally removed the in-flight intent.
+                } catch {
+                    actionError = error.localizedDescription
+                }
+                downloadBusy = false
+            }
+        } label: {
+            Label(bookDownloadLabel(existing), systemImage: bookDownloadSymbol(existing))
+                .lineLimit(1)
+        }
+        .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: existing?.isPlayable == true))
+        .disabled(existing?.isPlayable == true)
+        .accessibilityLabel(bookDownloadLabel(existing))
+    }
+
+    private func bookDownloadLabel(_ book: OfflineBook?) -> String {
+        guard let book else { return "Download" }
+        switch book.state {
+        case .intent: return "Queued — tap to cancel"
+        case .downloading: return "Downloading — tap to cancel"
+        case .downloaded: return "Downloaded"
+        case .failed, .missing: return "Download again"
+        }
+    }
+
+    private func bookDownloadSymbol(_ book: OfflineBook?) -> String {
+        guard let book else { return "arrow.down.circle" }
+        switch book.state {
+        case .intent: return "clock"
+        case .downloading: return "arrow.down.circle.fill"
+        case .downloaded: return "checkmark.circle.fill"
+        case .failed, .missing: return "arrow.clockwise.circle"
         }
     }
 

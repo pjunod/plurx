@@ -1,7 +1,9 @@
 # Ebook reader — Cinema reads what Curator acquires
 
-**Status:** M0–M3 complete · M4–M6 ready to build · **Written:**
-2026-08-20 · **Verified against:** `plurx` `5222dfd3` and `monarr` `a3f5fb8`
+**Status:** M0–M5 complete · M4 physical-device acceptance pending · M6
+registry complete, Apple PDF implementation complete, physical acceptance
+pending · **Written:** 2026-08-20 · **Verified against:** `plurx` `e0af2a04`
+and `monarr` `bd168b02`
 
 Companion to [FEATURES.md](FEATURES.md) (what Books libraries do today),
 [INTEGRATION.md](INTEGRATION.md) (the Curator → Cinema handoff),
@@ -53,10 +55,13 @@ Six decisions define the work:
    profiles, and offline-storage patterns, but not playback sessions,
    transcoding, now-playing, Trakt scrobbles, millisecond progress, or the 95%
    watched threshold.
-3. **EPUB is the first rendered format.** It is reflowable, carries a spine
-   and navigation model, and is Curator's default ebook quality. PDF keeps its
-   platform/browser viewer in v1. MOBI, AZW/AZW3, FB2, CBZ, and CBR retain
-   **Open in…** until a later format milestone earns each renderer.
+3. **EPUB is the first rendered format; PDF follows one surface at a time.**
+   EPUB is reflowable, carries a spine and navigation model, and is Curator's
+   default ebook quality. iPhone and iPad add PDFKit only after defining page
+   locators, exact-revision temporary storage, redirect confinement, search,
+   accessibility refusal, and explicit completion. Web, Android, offline PDF,
+   MOBI, AZW/AZW3, FB2, CBZ, and CBR retain **Open in…** until their own
+   renderer acceptance exists.
 4. **Online and offline use the same publication bytes and locator.** An
    offline reader must not fork pagination or invent a second progress model.
 5. **Publication content is hostile input.** Book scripts and remote network
@@ -72,13 +77,13 @@ Six decisions define the work:
 |---|---|---|
 | Curator | Ebook and audiobook editions, metadata, profiles, search, import | M0 replaced its stale book decline with exact-path `hint:"book"` targeted scans. |
 | Runner | Downloads and unpacks Curator's payload | Nothing. Runner must remain unaware of reading. |
-| Cinema scanner | `books` library kind; `book` and `audiobook` items; author-preserving path identity | M0 proved Curator's targeted scan reaches the Books library. Author is identity context, not a first-class display field. |
-| Cinema server | Original bytes, revision-bound reading state, bounded EPUB manifest parsing, and capability-scoped resource streaming | Native/offline publication transport remains. |
+| Cinema scanner | `books` library kind; `book` and `audiobook` items; stable path identity; bounded EPUB title/author/identifier/cover extraction | The Curator companion must send its explicit work/edition keys. |
+| Cinema server | Original bytes, revision-bound reading state, bounded EPUB publication parsing, durable book facts, exact related-edition queries, capability-scoped resource streaming, and one per-file format/action registry | Additional formats beyond EPUB and Apple online PDF remain external handoffs. |
 | Cinema web | Books shelf/detail plus in-app EPUB **Read/Resume**, TOC, search, preferences, explicit completion, and external/download fallbacks | Physical assistive-technology acceptance remains; other ebook formats still hand off. |
-| Cinema native | In-app online EPUB reading on iPhone/iPad and Android phone/tablet; external fallback; no TV reader action | No ebook offline record yet. |
-| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers | Offline clients do not replay the locator yet. |
+| Cinema native | In-app online and profile-scoped offline EPUB reading on iPhone/iPad and Android phone/tablet; online PDFKit reading on iPhone/iPad; external fallback; no TV reader action | Physical assistive-technology, representative PDF, and airplane-mode/reconnect acceptance remain. |
+| User state | Timed `watch_state` for A/V plus profile-scoped `reading_state` locators for exact book revisions, consumed by web and native readers; both mobile clients replay their newest dated offline locator | Physical cross-device reconnect acceptance remains. |
 
-The existing `/content` separation is load-bearing. Opening an EPUB is not a
+The existing `/content` separation is load-bearing. Opening an ebook is not a
 playback start, so it does not announce a viewer, allocate a playback session,
 or manufacture audio progress. `/content` remains the original-file escape;
 the reader uses the separate publication capability and never teaches
@@ -128,7 +133,7 @@ product contract is decided separately.
 | Input | Version-1 action | Reason |
 |---|---|---|
 | Valid EPUB without DRM | Read in Cinema · Open in… · Download original | The built-in contract. |
-| PDF | Open in platform/browser viewer · Download original | Fixed-layout PDF is already handled well by platform surfaces; consistent in-app PDF pagination is not required for EPUB launch. |
+| PDF | iPhone/iPad: Read in PDFKit · Open in…; web/Android: Open in…; television: unavailable | The iOS renderer owns page locators, exact-revision temporary bytes, local search, explicit completion, and protected-document refusal. Offline PDF remains out of scope. |
 | MOBI · AZW/AZW3 · FB2 · CBZ · CBR | Open in… · Download original | Detection is not a renderer promise. |
 | DRM/encrypted publication | Explain **This book is protected and Cinema cannot open it** · Open in… | Cinema does not acquire keys, remove DRM, or imply that unreadable bytes are corrupt. |
 | Malformed or over-limit EPUB | Explain the parse/security failure · Open in… · Download original | The original remains available even when the built-in boundary refuses it. |
@@ -140,7 +145,9 @@ The implementation lives in `crates/plurx-core/src/store/mod.rs`,
 `crates/plurx-core/src/store/hiqlite_reading.rs`, and
 `crates/plurxd/src/http/reading.rs`. M1 advanced SQLite from schema v19 to
 v20 and the authoritative Hiqlite schema from v5 to v6 without changing the
-replicated protocol version.
+replicated protocol version. Existing activated v5 clusters apply that
+additive table/index/marker step atomically through Raft during daemon startup;
+fresh bootstrap and the migration share the same schema statements.
 
 ### 4.1 Durable model
 
@@ -492,6 +499,15 @@ python3 -m validation.mobile_versions
 
 ### 7.5 M4 — Cinema-managed ebook downloads
 
+**Status:** implementation complete — Apple 2026-08-20, Android 2026-08-21;
+physical device acceptance remains. Both clients store the original EPUB plus
+a bounded local rendering cache, publish both atomically, open the catalogue
+before server reconnect, and replay the newest dated locator for the exact
+edition. Apple uses a private same-origin WebKit scheme and resource-loader
+rule. Android uses an all-intercepted synthetic HTTPS origin, a canonical
+app-private resolver, and a separate download owner from Media3. Neither
+offline reader has a login bearer, loopback listener, or network fallback.
+
 Implement §6 on Apple and Android: app-private original download, atomic local
 publication, profile-scoped catalogue, launch reconciliation, remove/retry,
 offline reader startup, and newest-state replay on reconnect. No server-side
@@ -503,6 +519,11 @@ then reconnect and observe the same locator on web. Removing the download
 reclaims local bytes without touching the server file.
 
 ### 7.6 M5 — author, cover, and edition metadata
+
+**Status:** complete 2026-08-21. Cinema and Curator now exchange the bounded,
+identifier-backed metadata handoff. SQLite v21 and replicated schema v7
+persist the source-ranked facts, and both backend migration paths have
+executable upgrade contracts.
 
 Make author and edition medium first-class Cinema facts. Prefer an explicit
 Curator handoff keyed by its book identifiers when paired; retain local EPUB
@@ -518,16 +539,37 @@ titles remain separate; replacing artwork never mutates the library path.
 
 ### 7.7 M6 — formats, acceptance, and release truth
 
-Use measured demand and fixtures to choose the next renderer: PDF in-app,
-fixed-layout EPUB, or comics. Each format needs its own locator, security,
-accessibility, and offline acceptance before the action changes from **Open
-in…** to **Read**. Update FEATURES, ROADMAP, STATUS, client docs, screenshots,
-and release notes to claim only the formats and physical devices actually
-verified.
+**Status:** registry complete; Apple PDF implementation complete; physical
+acceptance pending. The first slice makes format/action support a server-owned
+per-file registry consumed by web, Apple, and Android, with the documented
+matrix contract-tested directly against that registry. The second slice adds
+online PDFKit reading on iPhone and iPad. PDF remains **Open in…** on web and
+Android and has no app-managed offline action; MOBI/AZW/FB2/comics remain
+**Open in…** everywhere a non-TV client can hand off.
+
+Measured demand and Curator's quality ladder selected PDF as the next renderer.
+The iOS implementation uses one-based `pdf/pages/<n>` locators, a 1 GiB exact-
+revision download bound, an ephemeral same-origin session, app-private
+temporary storage removed on close, PDFKit's page/search/selection surface,
+and explicit **Mark finished**. Password-protected, inaccessible, empty,
+changed, and invalid documents fail closed. The source and simulator contracts
+do not claim VoiceOver or representative-device success; those remain physical
+acceptance rows.
+
+Fixed-layout EPUB or comics can follow only after measured demand and fixtures
+justify them. Each format needs its own locator, security, accessibility, and
+offline acceptance before the action changes from **Open in…** to **Read**.
+Update FEATURES, ROADMAP, STATUS, client docs, screenshots, and release notes
+to claim only the formats and physical devices actually verified.
 
 **Accept:** the documented support matrix is generated or contract-tested
 against the same extension/action registry clients use; no detected format is
 accidentally labeled built-in merely because `/content` can serve its bytes.
+On iPhone and iPad, open a representative unprotected PDF, search it, resume an
+exact page after relaunch and on another profile device, explicitly finish it,
+and verify the temporary file disappears on close. Repeat with VoiceOver. A
+password-protected PDF and a changed revision must explain the refusal and
+leave **Open in…** available.
 
 ## 8. Non-goals — doors this initiative keeps shut
 
@@ -558,9 +600,9 @@ accidentally labeled built-in merely because `/content` can serve its bytes.
 | M1 · Reading state/API | Complete | `make check`; `make cluster-check`; Apple/Android native model contracts |
 | M2 · EPUB proof/web | Complete | Node contracts; deterministic hostile-EPUB Chromium acceptance; 620 MiB stream proof |
 | M3 · Native online | Complete | iOS/tvOS simulator suites; Android JVM/lint; real-Chromium native handoff, heading semantics, profile isolation, font/rotation restore, and close flush |
-| M4 · Offline EPUB | Planned | Physical airplane-mode drill |
-| M5 · Metadata | Planned | Paired + standalone fixtures |
-| M6 · More formats/release | Planned | Contract-tested support matrix |
+| M4 · Offline EPUB | Implementation complete · acceptance in progress | Apple catalogue/path/sync unit contracts and simulator build; Android catalogue/path/exact-edition sync JVM contracts, lint, instrumentation APK build, and packaged reader assets; shared-shell browser contract; physical airplane-mode/reconnect drill remains |
+| M5 · Metadata | Complete | SQLite v20→v21 and replicated v5/v6→v7 migrations; paired Curator precedence and notifier contract; standalone EPUB package/cover fixtures; exact work relation contracts |
+| M6 · More formats/release | Registry and Apple PDF implementation complete · physical acceptance in progress | One server-owned per-file registry; web/Apple/Android policy adoption; contract-tested support matrix; iOS PDFKit exact-byte loader, page locator, search, completion, redirect, protection, and cleanup contracts; physical VoiceOver/representative-PDF drill remains |
 
 Update this table, the status header, [FEATURES.md](FEATURES.md), and
 [ROADMAP.md](ROADMAP.md) in the same change that advances a milestone. A plan

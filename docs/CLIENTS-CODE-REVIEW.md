@@ -159,8 +159,8 @@ parse correctly.
 
 `Controller.openSession` sends
 `height = playbackQuality.storageValue.toIntOrNull()` (`Controller.kt:220`)
-— `"original".toIntOrNull()` is null, which the server documents as *its*
-Auto rung: `min(source, 1080)` on hardware (`hls.rs:152-157`). The server
+— `"original".toIntOrNull()` is null, which at this review's snapshot selected
+the server's then-current Auto rung: `min(source, 1080)` on hardware. The server
 comment states the contract the client is missing (`hls.rs:158-159`): "The
 source's own height is the Original/forced-burn promise." So under Quality =
 Original, selecting a subtitle that burns (§3.1) restarts the 4K stream as a
@@ -206,8 +206,11 @@ burn for bitmap/styled; **the Android client burns everything.**
 `openSession` sends `subtitle_burn` (`Controller.kt:222`). Two compounding
 losses on, say, a 4K HDR remux with an SRT track:
 
-- **Resolution:** the session is created with `height = null` under Auto
-  (§2.4), so the server picks `min(source, 1080)` — 4K becomes 1080p.
+- **Resolution:** at this review's snapshot, the session was created with
+  `height = null` under Auto (§2.4), so the server picked
+  `min(source, 1080)` — 4K became 1080p. Hardware-backed SDR Auto now
+  preserves known source geometry; the explicit height remains necessary for
+  the stronger Original promise and for routes with a lower capability cap.
 - **Dynamic range:** the transcode chain is H.264 SDR (tone-mapped), so HDR
   is gone too — for a *text* subtitle that the server would have handed over
   as a WebVTT rendition or a side-loaded VTT for free.

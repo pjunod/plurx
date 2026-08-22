@@ -1331,8 +1331,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hiqlite"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8711815c093414290a5fcbc0bf74e1e70e3d6ef37e21735000178d25cee6fcf0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1393,8 +1391,6 @@ dependencies = [
 [[package]]
 name = "hiqlite-wal"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247fc29e082f38fdf25270f6a5d7148284c9710384c3bce21636608dc104fddf"
 dependencies = [
  "bincode",
  "byteorder",
@@ -2221,6 +2217,8 @@ dependencies = [
  "axum",
  "bincode",
  "chacha20poly1305",
+ "flate2",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
  "hiqlite",
@@ -2241,6 +2239,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

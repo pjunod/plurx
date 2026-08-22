@@ -82,7 +82,7 @@ id = "server.hdr-subtitle-burn-guard"
 source = "crates/plurxd/src/http/hls.rs"
 source_anchor = "fn hdr_subtitle_burn_is_refused("
 test = "crates/plurxd/src/http/mod.rs"
-test_anchor = "hls_create_refuses_hdr_subtitle_burns_at_the_server_boundary"
+test_anchor = "hls_create_refuses_hdr_downgrades_but_accepts_an_existing_sdr_plan"
 
 [[decisions]]
 id = "server.pgs-overlay"
@@ -110,7 +110,7 @@ id = "server.auto-rung"
 source = "crates/plurxd/src/transcode.rs"
 source_anchor = "pub async fn auto_height("
 test = "crates/plurxd/src/transcode.rs"
-test_anchor = "auto_follows_the_source_only_when_hardware_can_carry_it"
+test_anchor = "hardware_auto_preserves_a_four_k_av1_sdr_source"
 
 [[decisions]]
 id = "server.encoder"
@@ -316,7 +316,7 @@ id = "android.session-height"
 source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
 source_anchor = "internal fun sessionHeight("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
-test_anchor = "heightIsAPromiseForBurnsAndOriginalAndARungOtherwise"
+test_anchor = "heightPromiseDistinguishesCopyableBurnFromExistingTranscode"
 
 [[decisions]]
 id = "android.subtitle-route"

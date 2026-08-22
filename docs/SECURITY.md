@@ -60,6 +60,25 @@ and is checked identically; it exists only because browsers won't attach
 headers to `<img>`/`<video>` requests. Treat a URL with `?token=` as a
 credential — it grants exactly what the bearer does.
 
+## Network priors — credential generations, never reusable user ids
+
+Node-local network priors are keyed by a lowercase SHA-256 credential-generation
+digest, not by the reusable numeric user id. The digest uses the
+`plurx/network-prior-user/v1` domain and length-delimited `user.id`,
+`user.created_at`, and complete Argon2 PHC `password_hash` inputs. Authentication
+captures it once and carries it internally through lookup and observation, so an
+in-flight event cannot switch identities after a reset or delete/recreate.
+
+Password reset, password rehash, and delete/recreate start cold; an admin-role
+change preserves the generation. The digest is excluded from APIs, logs,
+metrics, telemetry payloads, and client diagnostics. A non-lookup numeric user
+id is retained beside each node-local row only to enforce the 64-network bound
+across credential generations; lookups remain scoped exclusively by the digest.
+SQLite v22 and the next
+node-local Hiqlite sidecar migration drop old numeric-key rows because they
+cannot be translated safely. This correction adds no replicated migration:
+replicated schema remains v6 and protocol remains v4.
+
 ## Offline media leases — one package, one narrow capability
 
 The signed-in JSON API owns package creation, status, lease issue, and
@@ -140,6 +159,26 @@ content, and unsafe browsing are refused. The JavaScript bridge is outbound
 only and accepts a small allowlist of lifecycle events—publication code has no
 native method that returns credentials. Dismissal destroys the reader,
 releases its publication session, and clears the JavaScript authority.
+
+Apple's offline EPUB surface removes network authority entirely. It stores the
+authenticated original and server-bounded declared resources under the
+profile/revision catalogue, atomically exposes the completed directory, and
+serves it only through `cinema-book://offline/`. A `WKContentRuleList` blocks
+all HTTP(S) resource loads before publisher CSS, images, or markup can reach a
+network; the iframe still omits script, forms, popups, downloads, and top
+navigation. The offline WebView receives a manifest, locator, and presentation
+preferences, never an account bearer.
+
+Android's offline surface enforces the same authority boundary with a
+synthetic `https://offline.cinema.invalid` origin. `WebViewClient` intercepts
+every permitted shell and publication request and resolves it from packaged
+assets or the canonical app-private publication root; everything else receives
+a local denial and never reaches DNS. Publisher paths are manifest-declared,
+bounded per resource and in aggregate, and limited to two concurrent local
+streams. The WebView has file/content access, mixed content, popups, DOM
+storage, and redirects disabled. Capability downloads refuse redirects and
+same-origin escapes, and the offline bridge receives no bearer or credential
+getter.
 
 ## Cluster voter disks — the Trakt credential is encrypted at rest
 

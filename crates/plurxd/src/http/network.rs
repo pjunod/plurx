@@ -48,6 +48,8 @@ pub(crate) fn identity(headers: &HeaderMap, remote: Option<SocketAddr>) -> Optio
     Some(NetworkIdentity {
         client_class: client_class(headers),
         network_fingerprint: format!("{a}.{b}.{c}.0/24"),
+        credential_generation: None,
+        user_id: None,
     })
 }
 
@@ -152,7 +154,6 @@ fn client_class(headers: &HeaderMap) -> String {
 
 pub(crate) async fn stored_prior(
     store: &dyn Store,
-    user_id: i64,
     identity: Option<&NetworkIdentity>,
 ) -> Result<Option<NetworkPrior>, ApiError> {
     let enabled = store
@@ -162,9 +163,12 @@ pub(crate) async fn stored_prior(
     let Some(identity) = identity.filter(|_| enabled) else {
         return Ok(None);
     };
+    let Some(credential_generation) = &identity.credential_generation else {
+        return Ok(None);
+    };
     Ok(store
         .network_prior(
-            user_id,
+            credential_generation.as_str(),
             &identity.client_class,
             &identity.network_fingerprint,
         )

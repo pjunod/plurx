@@ -1,10 +1,37 @@
 import AVFoundation
 import Darwin
 import Foundation
+#if os(iOS)
+import PDFKit
+#endif
 import SwiftUI
 import UIKit
 import XCTest
 @testable import plurx
+
+#if os(iOS)
+private final class PDFReaderURLProtocol: URLProtocol {
+    static var body = Data()
+    static var statusCode = 200
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: Self.statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/pdf"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+#endif
 
 private struct LayoutWidthPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -337,6 +364,9 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(fixture.server.name, "Contract server")
         XCTAssertEqual(fixture.itemDetail.item.title, "The Contract")
         XCTAssertTrue(fixture.audiobookDetail.item.isAudiobook)
+        XCTAssertEqual(fixture.audiobookDetail.item.author, "A. Contract")
+        XCTAssertEqual(fixture.audiobookDetail.item.bookWorkId, "curator:work:contract")
+        XCTAssertEqual(fixture.audiobookDetail.editions?.first?.bookEditionId, "curator:edition:ebook")
         XCTAssertEqual(fixture.audiobookDetail.files?.map(\.partOffsetMs), [0, 60_000, 180_000])
         XCTAssertEqual(fixture.audiobookDetail.files?.first?.chapters?.first?.title, "Opening")
         XCTAssertNil(fixture.itemDetail.reading)
@@ -376,14 +406,143 @@ final class AppleClientTests: XCTestCase {
         let epub = MediaFile(id: 90, filename: "Contract.EPUB", available: true)
         let pdf = MediaFile(id: 91, filename: "Contract.pdf", available: true)
         let missing = MediaFile(id: 92, filename: "Missing.epub", available: false)
+        let serverHandoff = ReaderCapability(
+            format: "pdf",
+            web: .init(online: .openIn, offline: .unavailable),
+            apple: .init(online: .openIn, offline: .unavailable),
+            android: .init(online: .openIn, offline: .unavailable),
+            television: .init(online: .unavailable, offline: .unavailable)
+        )
+        let disguised = MediaFile(
+            id: 93,
+            filename: "LooksLike.epub",
+            available: true,
+            reader: serverHandoff
+        )
+        let pdfRead = ReaderCapability(
+            format: "pdf",
+            web: .init(online: .openIn, offline: .unavailable),
+            apple: .init(online: .read, offline: .unavailable),
+            android: .init(online: .openIn, offline: .unavailable),
+            television: .init(online: .unavailable, offline: .unavailable)
+        )
+        let nativePDF = MediaFile(
+            id: 94,
+            filename: "Readable.pdf",
+            available: true,
+            reader: pdfRead,
+            readerRevision: ReadingRevision(size: 4_096, mtime: 100)
+        )
+        let unverifiablePDF = MediaFile(
+            id: 95,
+            filename: "No-revision.pdf",
+            available: true,
+            reader: pdfRead
+        )
 
         XCTAssertTrue(BookReaderPolicy.canRead(epub, onTelevision: false))
+        XCTAssertTrue(BookReaderPolicy.canDownload(epub, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canRead(epub, onTelevision: true))
         XCTAssertFalse(BookReaderPolicy.canRead(pdf, onTelevision: false))
         XCTAssertFalse(BookReaderPolicy.canRead(missing, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(disguised, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canDownload(disguised, onTelevision: false))
+        XCTAssertTrue(BookReaderPolicy.canRead(nativePDF, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canDownload(nativePDF, onTelevision: false))
+        XCTAssertFalse(BookReaderPolicy.canRead(nativePDF, onTelevision: true))
+        XCTAssertFalse(BookReaderPolicy.canRead(unverifiablePDF, onTelevision: false))
     }
 
     #if os(iOS)
+    func testPDFPageLocatorIsNormalizedBoundedAndRendererNeutral() throws {
+        let locator = PDFPageLocator.locator(pageIndex: 4, pageCount: 10)
+        XCTAssertEqual(locator.href, "pdf/pages/5")
+        XCTAssertEqual(locator.type, "application/pdf")
+        XCTAssertEqual(locator.locations?.position, 5)
+        XCTAssertEqual(locator.locations?.progression ?? -1, 4.0 / 9.0, accuracy: 0.000_001)
+        XCTAssertEqual(PDFPageLocator.pageIndex(from: locator, pageCount: 10), 4)
+        XCTAssertNil(PDFPageLocator.pageIndex(
+            from: ReadingLocator(version: 1, href: "pdf/pages/0"),
+            pageCount: 10
+        ))
+        XCTAssertNil(PDFPageLocator.pageIndex(
+            from: ReadingLocator(version: 1, href: "https://attacker.invalid/book.pdf"),
+            pageCount: 10
+        ))
+        XCTAssertEqual(PDFPageLocator.progression(pageIndex: 0, pageCount: 1), 0)
+    }
+
+    func testPDFTransportRejectsCrossOriginAndSchemeChangingRedirects() throws {
+        let origin = try XCTUnwrap(URL(string: "https://cinema.example:9443"))
+        XCTAssertTrue(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "https://cinema.example:9443/api/v1/files/9/content")!
+        ))
+        XCTAssertFalse(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "https://attacker.invalid/book.pdf")!
+        ))
+        XCTAssertFalse(PDFReaderTransport.permitsRedirect(
+            from: origin,
+            to: URL(string: "http://cinema.example:9443/book.pdf")!
+        ))
+        XCTAssertNil(PDFReaderTransport.session(origin: "file:///tmp/book.pdf"))
+    }
+
+    func testPDFLoaderUsesExactTemporaryBytesAndProducesSearchablePages() async throws {
+        let bounds = CGRect(x: 0, y: 0, width: 300, height: 400)
+        let data = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+            context.beginPage()
+            NSString(string: "Cinema PDF reader contract").draw(
+                at: CGPoint(x: 24, y: 24),
+                withAttributes: [.font: UIFont.systemFont(ofSize: 18)]
+            )
+        }
+        PDFReaderURLProtocol.body = data
+        PDFReaderURLProtocol.statusCode = 200
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PDFReaderURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let payload = try await PDFReaderLoader.download(
+            request: URLRequest(url: URL(string: "https://cinema.example/api/v1/files/9/content")!),
+            revision: ReadingRevision(size: data.count, mtime: 100),
+            session: session
+        )
+        XCTAssertEqual(payload.document.pageCount, 1)
+        XCTAssertEqual(
+            payload.document.findString("reader contract", withOptions: .caseInsensitive).count,
+            1
+        )
+        let directory = payload.directory
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        payload.remove()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPDFLoaderRejectsAnEditionSizeMismatch() async throws {
+        PDFReaderURLProtocol.body = Data("not the advertised edition".utf8)
+        PDFReaderURLProtocol.statusCode = 200
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PDFReaderURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        do {
+            _ = try await PDFReaderLoader.download(
+                request: URLRequest(url: URL(string: "https://cinema.example/api/v1/files/9/content")!),
+                revision: ReadingRevision(size: PDFReaderURLProtocol.body.count + 1, mtime: 100),
+                session: session
+            )
+            XCTFail("a truncated edition must not reach PDFKit")
+        } catch PDFReaderError.incompleteDownload {
+            // Expected.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testNativeReaderHandoffKeepsTheBearerOutOfTheURLAndEscapesTheScript() throws {
         let shell = try XCTUnwrap(NativeReaderHandoff.shellURL(origin: "https://cinema.example:9443"))
         XCTAssertEqual(shell.absoluteString, "https://cinema.example:9443/?native-reader=1")
@@ -409,6 +568,161 @@ final class AppleClientTests: XCTestCase {
             URL(string: "https://cinema.example:9443/api/v1/items/9")!,
             from: shell
         ))
+    }
+
+    func testOfflineBookPathsStayInsideThePublicationAndPrivateScheme() throws {
+        XCTAssertEqual(
+            OfflineBookManager.safePublicationPath("OPS/Text/chapter%201.xhtml#part"),
+            "OPS/Text/chapter 1.xhtml"
+        )
+        XCTAssertEqual(
+            OfflineBookManager.safePublicationPath("OPS/Styles/../Text/chapter.xhtml"),
+            "OPS/Text/chapter.xhtml"
+        )
+        XCTAssertNil(OfflineBookManager.safePublicationPath("../../outside"))
+        XCTAssertNil(OfflineBookManager.safePublicationPath("OPS/C:\\secret"))
+
+        let local = URL(string: "cinema-book://offline/publication/OPS/Text/chapter.xhtml")!
+        XCTAssertEqual(
+            OfflineBookResourceResolver.publicationPath(for: local),
+            "OPS/Text/chapter.xhtml"
+        )
+        XCTAssertNil(OfflineBookResourceResolver.publicationPath(
+            for: URL(string: "https://attacker.invalid/publication/OPS/Text/chapter.xhtml")!
+        ))
+        XCTAssertNil(OfflineBookResourceResolver.publicationPath(
+            for: URL(string: "cinema-book://offline/publication/../../offline-reader.js")!
+        ))
+        XCTAssertTrue(OfflineBookNetworkPolicy.contentRuleList.contains("^https?://"))
+        XCTAssertTrue(OfflineBookNetworkPolicy.contentRuleList.contains("\"type\":\"block\""))
+    }
+
+    func testOfflineBookCatalogIsProfileScopedAndKeepsNewestPendingLocator() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-books-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let catalog = OfflineBookCatalog(directory: directory)
+
+        func book(
+            id: String,
+            server: String,
+            user: Int,
+            item: Int,
+            fileId: Int = 90,
+            revision: ReadingRevision = ReadingRevision(size: 4096, mtime: 100),
+            recordedAt: Int
+        ) -> OfflineBook {
+            OfflineBook(
+                id: id,
+                serverInstanceId: server,
+                userId: user,
+                itemId: item,
+                fileId: fileId,
+                revision: revision,
+                title: "Contract Book",
+                author: "A. Reader",
+                originalFilename: "contract.epub",
+                coverRelativePath: nil,
+                publication: PublicationManifest(
+                    metadata: PublicationMetadata(title: "Contract Book", author: "A. Reader"),
+                    readingOrder: [PublicationLink(
+                        href: "Text/chapter.xhtml", type: "application/xhtml+xml"
+                    )],
+                    resources: [],
+                    toc: []
+                ),
+                limits: PublicationLimits(
+                    entries: 1,
+                    totalUncompressedBytes: 8192,
+                    resourceBytes: 4096,
+                    markupBytes: 4096,
+                    compressionRatio: 100,
+                    concurrentResourceReads: 2,
+                    resourceChunkBytes: 1024
+                ),
+                state: .downloaded,
+                phase: "ready",
+                bytesDownloaded: 8192,
+                bytesTotal: 8192,
+                localPublicationRelativePath: "Library/Application Support/OfflineBooks/\(id)",
+                locator: ReadingLocator(
+                    version: 1,
+                    href: "Text/chapter.xhtml",
+                    locations: ReadingLocations(totalProgression: Double(recordedAt) / 100)
+                ),
+                progression: Double(recordedAt) / 100,
+                completed: false,
+                recordedAt: recordedAt,
+                pendingProgress: true,
+                preferences: OfflineBookPreferences(),
+                errorMessage: nil,
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(recordedAt))
+            )
+        }
+
+        try await catalog.upsert(book(id: "old", server: "server-a", user: 7, item: 11, recordedAt: 40))
+        try await catalog.upsert(book(id: "new", server: "server-a", user: 7, item: 11, recordedAt: 70))
+        try await catalog.upsert(book(
+            id: "other-edition",
+            server: "server-a",
+            user: 7,
+            item: 11,
+            fileId: 91,
+            revision: ReadingRevision(size: 8192, mtime: 200),
+            recordedAt: 60
+        ))
+        try await catalog.upsert(book(id: "other", server: "server-b", user: 7, item: 11, recordedAt: 90))
+
+        var recovering = book(
+            id: "recovered",
+            server: "server-a",
+            user: 7,
+            item: 12,
+            recordedAt: 50
+        )
+        recovering.state = .downloading
+        recovering.localPublicationRelativePath = nil
+        recovering.pendingProgress = false
+        let recoveredRoot = directory.appendingPathComponent("recovered", isDirectory: true)
+        let resourceRoot = recoveredRoot.appendingPathComponent("publication", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: resourceRoot.appendingPathComponent("Text", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x45, count: 4096).write(
+            to: recoveredRoot.appendingPathComponent("book.epub")
+        )
+        try JSONEncoder().encode(try XCTUnwrap(recovering.publication)).write(
+            to: recoveredRoot.appendingPathComponent("publication.json")
+        )
+        try Data("<html><body>Recovered</body></html>".utf8).write(
+            to: resourceRoot.appendingPathComponent("Text/chapter.xhtml")
+        )
+        try await catalog.upsert(recovering)
+
+        let current = await catalog.currentProfile(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(
+            Set(current.map(\.id)),
+            Set(["old", "new", "other-edition", "recovered"])
+        )
+        let pending = await catalog.newestPending(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(pending.map(\.id), ["other-edition", "new"])
+        let others = await catalog.otherProfiles(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(others.first?.items, 1)
+
+        let restored = OfflineBookCatalog(directory: directory)
+        let restoredCurrent = await restored.currentProfile(serverInstanceId: "server-a", userId: 7)
+        XCTAssertEqual(
+            Set(restoredCurrent.map(\.id)),
+            Set(["old", "new", "other-edition", "recovered"])
+        )
+        try await restored.reconcileLocalPublications()
+        let reconciled = await restored.book(id: "new")
+        XCTAssertEqual(reconciled?.state, .missing)
+        let recovered = await restored.book(id: "recovered")
+        XCTAssertEqual(recovered?.state, .downloaded)
+        XCTAssertNotNil(recovered?.localPublicationRelativePath)
+        XCTAssertGreaterThan(recovered?.bytesDownloaded ?? 0, 0)
     }
 
     func testNativeBookActionLabelsResumeAndExplicitCompletion() throws {
@@ -3891,6 +4205,31 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
+    func testSubtitleBurnAcknowledgesOnlyAnAlreadySDRPlan() throws {
+        XCTAssertEqual(
+            PlayerController.subtitleBurnSDRAcknowledgement(2, deliveredRange: "sdr"),
+            true
+        )
+        XCTAssertNil(
+            PlayerController.subtitleBurnSDRAcknowledgement(2, deliveredRange: "hdr10")
+        )
+        XCTAssertNil(
+            PlayerController.subtitleBurnSDRAcknowledgement(nil, deliveredRange: "sdr")
+        )
+
+        let request = CreateSessionRequest(
+            playbackId: "player-sdr-burn",
+            subtitleBurn: 2,
+            subtitleBurnSDR: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual(json["subtitle_burn_sdr"] as? Bool, true)
+    }
+
     func testAppleCapsKeepGenericHDRSeparateFromDolbyVision() {
         func dictionary(_ query: [URLQueryItem]) -> [String: String] {
             Dictionary(uniqueKeysWithValues: query.compactMap { item in
@@ -5233,6 +5572,7 @@ final class AppleClientTests: XCTestCase {
             HomeLayoutPolicy.topLevelTabs,
             ["Home", "Libraries", "Search", "Downloads", "Settings"]
         )
+        XCTAssertEqual(HomeLayoutPolicy.offlineLaunchTab, .downloads)
         XCTAssertEqual(OfflineQuality.standard.maximumHeight, 720)
         XCTAssertEqual(OfflineQuality.high.maximumHeight, 1_080)
         XCTAssertEqual(OfflineNetworkPolicy.wifiOnly.label, "Wi-Fi only")

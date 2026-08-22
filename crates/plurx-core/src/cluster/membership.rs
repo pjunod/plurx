@@ -478,9 +478,6 @@ impl MembershipManager {
         }
         let now = unix_ms()?;
         let record = self.token_record(&request.token_digest).await?;
-        if record.expires_at <= now {
-            return Err(MembershipError::ExpiredToken);
-        }
         if record.raft_id != request.raft_id as i64 {
             return Err(MembershipError::InvalidToken);
         }
@@ -489,7 +486,12 @@ impl MembershipManager {
             "redeeming" if record.node_id.as_deref() != Some(&request.node_id) => {
                 return Err(MembershipError::ReservedToken)
             }
+            // Redemption reserves the credential to one generated node id.
+            // That same staged node may resume after the original TTL; expiry
+            // still refuses an unused token below, and a different node id is
+            // refused above, so this does not restore bearer authority.
             "redeeming" => return Ok(()),
+            "issued" if record.expires_at <= now => return Err(MembershipError::ExpiredToken),
             "issued" => {}
             _ => return Err(MembershipError::InvalidToken),
         }

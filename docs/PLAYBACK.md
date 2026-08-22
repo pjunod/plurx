@@ -18,8 +18,8 @@ and the player says so out loud in `/decision`.
  you press Play
       │
       ▼
- probe THIS browser's decoders (once, cached)  ─▶  vcodec, acodec, container, hdr
-      │            canPlayType() / MediaSource.isTypeSupported()
+ probe THIS client's decoders/display/route ─▶ vcodec, vmaxheight, acodec, container, hdr
+      │            browser APIs / platform codec APIs / active audio sink
       ▼
  GET /api/v1/files/{id}/decision?<caps>&force=<auto|original|transcode>
                                       &audio=<index>&subtitle=<index|-1>
@@ -93,11 +93,11 @@ one.
 | `server.segmented-remux` | Progressive vs segmented remux hint | Every probed remux prefers segments. Average bitrate and storage speed cannot predict a transient path gap, while progressive fMP4 has only about 2.2 s of browser runway. The browser must still prove MSE accepts the exact codec pair; **Original · one stream** remains an explicit veto. | Eligibility units in `playback/mod.rs`; browser policy matrix |
 | `server.track-selection` | Initial audio/subtitle | Item detail exposes the cold-start result from one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. A request-local `/decision` choice overrides it without changing settings. | Track-policy Rust matrix plus selection-aware HTTP regressions |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
-| `server.hdr-subtitle-burn-guard` | Old-client burn request on HDR | Session creation independently refuses `subtitle_burn` for a probed DV, HDR10, or HLG source with a machine-readable 422 before playback accounting or encoder creation. SDR and unprobed sources retain burn support. There is deliberately no override: missing client-plan context is not permission to replace HDR with SDR. | Rust HTTP refusal contract plus helper matrix |
+| `server.hdr-subtitle-burn-guard` | Old-client burn request on HDR | Session creation independently refuses `subtitle_burn` for a probed DV, HDR10, or HLG source with a machine-readable 422 before playback accounting or encoder creation. A client whose selected plan already delivers SDR may send `subtitle_burn_sdr: true`; this keeps a forced bitmap track on an existing tone-map without authorizing an HDR-to-SDR downgrade. SDR and unprobed sources retain burn support. | Rust HTTP refusal/acknowledgement contract plus helper matrix |
 | `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
 | `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. The default served view becomes sliding only after retention deletes a prefix. The default-off iPad experiment instead serves a typeless playlist plus `EXT-X-START:TIME-OFFSET=0` from the first response, preserving one envelope across that boundary. Completed cached VOD stays whole. | Rust retention/serving integration + typeless shape-stability unit; physical-iPad comparison pending |
-| `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
+| `server.auto-rung` | Auto output height | Software follows the source up to 720p. Proven hardware preserves a known SDR source up to 2160p; HDR and unknown geometry stay at the separately-probed 1080p ceiling. A node-local network prior may step that choice down, but absence of a prior is not evidence for a resolution loss. Every route clamps to the source and never upscales. | Encoder-aware Rust matrix plus the 4K AV1 SDR regression |
 | `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
 | `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
 
@@ -132,13 +132,13 @@ one.
 | `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. A recognized PGS overlay stays on the current item. Entering from direct, selecting/leaving a burn, or changing a burn reopens; other bitmap/styled tracks still burn. | XCTest route matrix |
 | `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | A recognized PGS overlay is allowed because it does not change video. Unknown overlay versions, VobSub, and styled tracks are refused while the current delivery is DV, HDR10, or HLG. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
 | `apple.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the authenticated manifest/PNG renderer. It schedules complete compositions against the current `AVPlayerItem`, maps authored coordinates into `videoRect`, and never sends subtitle/burn session fields or reopens video. PiP and external playback are blocked while active rather than falling back to an SDR burn. | XCTest manifest, timeline, layout, item-replacement, and no-reopen policy suite |
-| `android.capability-profile` | Decoder/display/sink claims | Claim DV only when both decoder profile and display agree, never claim dual-layer P7, and claim passthrough audio when either the decoder or active sink can take it. | JVM capability matrix |
+| `android.capability-profile` | Decoder/display/sink claims | Claim DV only when both decoder profile and display agree, never claim dual-layer P7, apply each video decoder's own 30 fps height ceiling, and claim passthrough audio when either the decoder or active sink can take it. | JVM capability matrix + Rust per-codec decision regressions |
 | `android.compatibility-fallback` | Media3 startup decode recovery | Before a frame renders, failed preserving direct DV first gets a normalized remux; any remaining direct/remux failure gets one compatibility transcode; a failed transcode is terminal. | JVM fallback matrix |
 | `android.established-hdr-recovery` | Interruption after HDR rendered | Once Media3 renders a frame, a later HDR error retries the same delivery once. A repeat is terminal instead of silently becoming the SDR compatibility stream. | JVM established-delivery matrix |
 | `android.manual-quality` | Auto/Original/rung force | Auto asks for the normal verdict, Original forbids video re-encode, and every server-advertised rung requests a transcode. The menu never invents a rung above the source. | JVM force and ladder matrix |
-| `android.session-height` | Quality/burn to session height | A burn and Original preserve source height; Auto omits height; an explicit rung sends that height. A copy session omits height because copied video cannot honor a rung. | JVM height and session-body matrix |
+| `android.session-height` | Quality/burn to session height | Original and a burn that alone turns copyable video into a transcode preserve source height. A burn on an existing Auto transcode omits height, so subtitles cannot promote the server's 720/1080 rung back to 4K. Explicit quality retains its established burn promise; a copy session omits height because copied video cannot honor a rung. | JVM height and session-body matrix |
 | `android.subtitle-route` | Embedded vs native session vs overlay vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Recognized PGS stays on the plan video as an application overlay; unsupported bitmap and styled tracks retain burn/refusal behavior. | JVM subtitle, overlay, and session-body matrix |
-| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | Recognized `pgs-v1` is allowed because it does not mutate video. Unsupported bitmap/styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. Native text still selects, and SDR playback may still burn. | JVM subtitle/dynamic-range matrix |
+| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | Recognized `pgs-v1` is allowed because it does not mutate video. Unsupported bitmap/styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. If the base plan already tone-maps an HDR source to SDR, Android sends `subtitle_burn_sdr: true` and the forced burn may proceed without changing dynamic range. Native text still selects. | JVM subtitle/dynamic-range and session-body matrix plus Rust HTTP regression |
 | `android.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the bounded authenticated manifest/PNG renderer. It binary-searches source-time cues, schedules exact boundaries, maps authored coordinates into the video content rectangle, and rejects stale selection/item/window work. PiP is blocked while active rather than falling back to SDR burn-in. | JVM manifest, timeline, memory, layout, and policy suite plus Compose switch/off instrumentation |
 
 <!-- playback-routing-inventory:end -->
@@ -160,6 +160,7 @@ genuinely can't play it — not because a fixed profile guessed conservatively.
 | Cap | Probed with | Notes |
 |---|---|---|
 | `vcodec` | `canPlayType` + `MediaSource.isTypeSupported` | `h264` always; `hevc`/`av1`/`vp9` when the browser answers. Safari says yes to HEVC; Chrome-on-macOS via the OS decoder. |
+| `vmaxheight` | Android `MediaCodecInfo.VideoCapabilities` | Per-codec direct-play ceilings such as `h264:1080,hevc:2160`. Each grade must support its 16:9 frame at 30 fps; a weak AV1 decoder therefore cannot cap a stronger HEVC decoder or receive an unsupported 4K source. Older clients omit the field and retain uncapped behavior. |
 | `acodec` | `canPlayType` | `aac`,`mp3` always; `ac3`/`eac3` where supported (Safari), `opus`/`flac` per browser. |
 | `container` | fixed | `mp4,webm,mov` — what a browser `<video>` accepts as a file. Notably **not** `mkv`. |
 | `hdr` | `matchMedia("(dynamic-range: high)")` | `1` only on an HDR display *and* an HDR-capable codec — else the server tone-maps, because HDR on an SDR screen looks washed-out. |
@@ -243,10 +244,16 @@ An audio-only request may echo the policy-default subtitle
 in `selection`, but only an explicit `subtitle=` choice can let that subtitle
 change delivery. On SDR, selecting a bitmap subtitle with no enabled PGS
 overlay changes the plan to transcode and names the burn-in reason.
-The established HDR guard remains stricter: it reports both
+The established HDR guard follows the picture the base decision will actually
+deliver, not merely the source label. While that delivery is HDR it reports both
 `subtitle_requires_burn_in: true` and
 `subtitle_burn_in_blocked_by_hdr: true`, but keeps the HDR delivery unchanged,
 because a caller choice is not permission to replace Dolby Vision/HDR with SDR.
+If another incompatibility already made the plan SDR, the blocked field is
+false and the burn-in reason is added normally. The native session body then
+acknowledges that established grade with `subtitle_burn_sdr: true`; the session
+endpoint accepts that acknowledgement while continuing to reject an HDR-source
+burn from an old or unguarded client.
 Text sidecars and an enabled `pgs-v1` overlay report both fields as false. For
 native HLS, clients still consult each track's `native` flag: ASS/SSA and
 `mov_text` are extractable text but require a burn rather than a native
@@ -511,7 +518,7 @@ make.
 | Transcode | HLS session | HLS session |
 | Native text subtitle needs a session | Copy HLS for a direct/remux plan; existing rendition switches stay in AVPlayer | Direct keeps an embedded text track; remux/transcode opens a native-rendition HLS session |
 | PGS with recognized `pgs-v1` capability | Authenticated application overlay synchronized to the unchanged player item; PiP/external playback unavailable while active | Authenticated PNG composition scheduled from `realPosition()` and drawn in the video content rectangle; PiP unavailable while active |
-| Other bitmap/styled subtitle | HLS transcode with burn-in on SDR; refused on HDR/DV | HLS transcode with burn-in on SDR; refused on HDR/DV |
+| Other bitmap/styled subtitle | HLS transcode with burn-in when the current delivery is SDR; refused while it is HDR/DV | HLS transcode with burn-in when the current delivery is SDR; refused while it is HDR/DV. An HDR source already tone-mapped by the base plan is an SDR delivery. |
 | Direct + manual A/V correction | Not currently exposed by the Apple player | Progressive remux, because ffmpeg must apply the correction |
 | Finished cache hit | HLS VOD; seek in place | HLS VOD; seek in place |
 
@@ -1121,9 +1128,11 @@ covering the other.
   already chosen to send this client the full-resolution stream, so the burn
   adds an encode, not a downscale (and costs *less* bandwidth than the remux
   it replaces). Only a burn on a genuine transcode verdict keeps the server's
-  Auto rung (`min(source, 1080)` on hardware), where the cap is the bandwidth
-  call it was designed to be. A bitmap burn keeps the node's proven GPU
-  tone-map (PERF-PLAN §5): the graph scales and maps on the GPU pinned to the
+  Auto rung: hardware-backed SDR follows the source up to 2160p,
+  hardware-backed HDR stays at its measured 1080p output point, and software
+  stays at 720p. A stored network prior may lower those starting points. A
+  bitmap burn keeps the node's proven GPU tone-map (PERF-PLAN §5): the graph
+  scales and maps on the GPU pinned to the
   overlay's exact frame, comes down to system memory once for the composite,
   and the encoder's upload runs after it — and a Dolby Vision source whose
   base layer is HDR10-compatible counts as HDR10 for that routing, since

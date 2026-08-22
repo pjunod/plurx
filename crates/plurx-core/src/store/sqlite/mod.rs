@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
-use crate::store::telemetry::{NETWORK_PRIORS_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
+use crate::store::telemetry::{NETWORK_PRIORS_V2_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -552,7 +552,7 @@ const MIGRATIONS: &[&str] = &[
     // v19: opt-in, bounded, node-local network priors. No foreign keys on
     // purpose: the hiqlite backend carries this exact table in its per-voter
     // telemetry sidecar rather than replicating observations through Raft.
-    NETWORK_PRIORS_SCHEMA,
+    NETWORK_PRIORS_V2_SCHEMA,
     // v20: per-user text-publication state. A locator is bound to one exact
     // file revision because the same chapter href in a replaced edition is
     // not evidence that it names the same text. Progress is millionths on
@@ -572,6 +572,42 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX reading_state_recent
         ON reading_state(user_id, updated_at DESC);",
+    // v21: first-class book facts. The source column is load-bearing: a
+    // scheduled EPUB pass is weaker than an explicit Curator handoff and must
+    // not overwrite it. Work ids are nullable because title + author is never
+    // sufficient evidence that text and audio files are editions of one work.
+    "ALTER TABLE items ADD COLUMN author TEXT;
+    ALTER TABLE items ADD COLUMN book_work_id TEXT;
+    ALTER TABLE items ADD COLUMN book_edition_id TEXT;
+    ALTER TABLE items ADD COLUMN book_metadata_source TEXT
+        CHECK (book_metadata_source IN ('epub', 'curator'));
+    CREATE INDEX idx_items_book_work ON items(book_work_id)
+        WHERE book_work_id IS NOT NULL;",
+    // v22: isolate N4.2 network priors by credential generation. The old PK
+    // used a numeric user_id that survives delete/recreate unchanged, which
+    // lets a prior from the old identity contaminate the new one. Replacing
+    // it with an opaque SHA-256 credential-generation digest — derived from
+    // user.id, user.created_at, and the complete Argon2 PHC password_hash —
+    // makes each credential generation a separate prior namespace. Old
+    // numeric-key prior rows are dropped because they cannot be translated:
+    // the user_id alone is not enough material to recover the credential
+    // generation, and any translation scheme would preserve the very
+    // cross-generation contamination this migration fixes.
+    "DROP TABLE IF EXISTS network_priors;
+    CREATE TABLE network_priors (
+        user_id               INTEGER NOT NULL,
+        credential_generation TEXT NOT NULL,
+        client_class          TEXT NOT NULL,
+        network_fingerprint   TEXT NOT NULL,
+        sustained_kbps        INTEGER,
+        worst_rung_height     INTEGER,
+        starved_at_ms         INTEGER,
+        sample_count          INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms         INTEGER NOT NULL,
+        PRIMARY KEY (credential_generation, client_class, network_fingerprint)
+    ) STRICT;
+    CREATE INDEX network_priors_by_updated
+        ON network_priors(updated_at_ms, user_id, client_class);",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -586,7 +622,8 @@ pub const SQLITE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
      tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms, \
      poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at, \
-     artwork_attempted_at, artwork_error, genres";
+     artwork_attempted_at, artwork_error, genres, author, book_work_id, book_edition_id, \
+     book_metadata_source";
 
 /// How many columns [`ITEM_COLS`] selects — the offset of the first column a
 /// query appends after it. Keep in step with [`ITEM_COLS`].
@@ -597,7 +634,7 @@ const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, yea
 /// makes all four read the *new* column as if it were their first appended
 /// one — no error, no type failure when both are TEXT, just a show title that
 /// is quietly a JSON array of genres. Add and bump together, always.
-const ITEM_COL_COUNT: usize = 24;
+const ITEM_COL_COUNT: usize = 28;
 
 /// `ITEM_COLS` qualified with a table alias (e.g. `i.id, i.library_id, ...`).
 fn item_cols(alias: &str) -> String {
@@ -650,6 +687,10 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
         artwork_error: row.get(base + 22)?,
         genres: serde_json::from_str(&genres_json)
             .map_err(|e| conversion_err(base + 23, format!("genres: {e}")))?,
+        author: row.get(base + 24)?,
+        book_work_id: row.get(base + 25)?,
+        book_edition_id: row.get(base + 26)?,
+        book_metadata_source: row.get(base + 27)?,
     })
 }
 
@@ -1251,7 +1292,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 20,
+            version, 22,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1397,7 +1438,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 20);
+        assert_eq!(version, 22);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1452,7 +1493,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            22
         );
         assert!(conn
             .execute(
@@ -1474,7 +1515,7 @@ mod tests {
 
     #[tokio::test]
     async fn v19_adds_node_local_network_priors_without_touching_v18_rows() {
-        use crate::domain::NetworkPriorObservation;
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
         use crate::store::NetworkPriorStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1505,7 +1546,7 @@ mod tests {
         );
         let prior = store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: 1,
+                credential_generation: CredentialGeneration::from("v19-test-gen".to_owned()),
                 client_class: "chrome".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(6_000),
@@ -1520,7 +1561,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            22
         );
         let index: i64 = conn
             .query_row(
@@ -1598,7 +1639,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            20
+            22
         );
         assert!(conn
             .execute(
@@ -1616,6 +1657,121 @@ mod tests {
             .is_err());
     }
 
+    #[tokio::test]
+    async fn v21_adds_book_facts_without_touching_v20_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(20) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 20)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO libraries (id, name, kind, paths, anime)
+                     VALUES (1, 'Books', 'books', '[\"/books\"]', 0);
+                 INSERT INTO items (id, library_id, kind, title, sort_title)
+                     VALUES (10, 1, 'book', 'Migration Book', 'migration book');
+                 INSERT INTO files (id, item_id, path, size, mtime)
+                     VALUES (100, 10, '/books/migration.epub', 4096, 77);",
+            )
+            .expect("seed v20 rows");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v20 to v21");
+        let item = store
+            .get_item(10)
+            .await
+            .expect("read migrated item")
+            .expect("migrated item");
+        assert_eq!(item.title, "Migration Book");
+        assert_eq!(item.author, None);
+        assert_eq!(item.book_work_id, None);
+        assert_eq!(item.book_edition_id, None);
+        assert_eq!(item.book_metadata_source, None);
+        assert_eq!(
+            store.files_for_item(10).await.expect("read migrated file")[0].path,
+            std::path::PathBuf::from("/books/migration.epub")
+        );
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            22
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_items_book_work'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("book work index");
+        assert_eq!(index, 1);
+    }
+
+    #[tokio::test]
+    async fn v22_replaces_user_id_key_with_credential_generation() {
+        use crate::domain::{CredentialGeneration, NetworkPriorObservation};
+        use crate::store::NetworkPriorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(20) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.execute_batch(
+                "INSERT INTO network_priors
+                     (user_id, client_class, network_fingerprint, sample_count, updated_at_ms)
+                 VALUES (1, 'chrome', '192.0.2.0/24', 5, 1000);
+                 INSERT INTO settings (key, value)
+                 VALUES ('migration.proof', 'survives-v21');",
+            )
+            .expect("seed v20 rows");
+            conn.pragma_update(None, "user_version", 21)
+                .expect("version");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v21 to v22");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives-v21")
+        );
+        let prior = store
+            .observe_network_prior(&NetworkPriorObservation {
+                credential_generation: CredentialGeneration::from("v22-test-gen".to_owned()),
+                client_class: "safari".to_owned(),
+                network_fingerprint: "10.0.0.0/24".to_owned(),
+                throughput_kbps: Some(8_000),
+                observed_at_ms: 2_000_000_000_000,
+                ..NetworkPriorObservation::default()
+            })
+            .await
+            .expect("write v22 prior");
+        assert_eq!(prior.sustained_kbps, Some(8_000));
+        assert_eq!(prior.credential_generation.as_str(), "v22-test-gen");
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            22
+        );
+        let old_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
+            .expect("count new-format rows");
+        assert_eq!(old_rows, 1, "legacy numeric-key rows must be dropped");
+    }
     /// v13 adds a column to `items`, which is the migration shape with a
     /// silent failure mode: `ITEM_COLS` and `ITEM_COL_COUNT` are positional,
     /// and four queries select `ITEM_COLS` and then read their own trailing

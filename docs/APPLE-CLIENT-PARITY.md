@@ -9,10 +9,21 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-20): source is v0.2.7, Apple build 69. Native text
+> Status (2026-08-21): source is v0.2.7, Apple build 76. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 69 adds in-app online EPUB reading on iPhone/iPad through an
+> landed. Build 76 carries the explicit delivered-SDR acknowledgement required
+> for a forced bitmap-subtitle session over an HDR source while refusing an
+> unplanned HDR downgrade. Build 75 adds online PDFKit reading on iPhone/iPad with
+> exact-revision temporary bytes, page resume, local search, and protected-
+> document refusal. Build 74 consumes the server-owned ebook format/action registry and
+> keeps external formats out of the built-in and offline readers. Build 73
+> preserves the full tab shell when offline downloads open first, so reconnect
+> and Settings remain reachable. Build 72 displays bounded book author metadata and only exact
+> work-linked editions. Build 71 scopes newest pending offline reading state to the exact
+> item/file/revision edition. Build 70 adds profile-scoped, atomically published offline EPUBs,
+> token-free local reading, and newest-locator reconnect replay on iPhone/iPad.
+> Build 69 adds in-app online EPUB reading on iPhone/iPad through an
 > isolated same-origin WebView with memory-only authentication, shared locator
 > resume, and no tvOS reader action. Build 68 adds revision-bound ebook
 > reading-state wire models and authenticated API routes. Build 67 adopts the
@@ -73,7 +84,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 69 has not reached
+> resolved status. Repository evidence still says build 70 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -101,6 +112,7 @@ Vision investigation are recorded in
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode | Sorting, filters, denser iPad/tvOS layouts |
 | Session | Local login and remembered token | Local login and silent reconnect; bearer in the Keychain; origin and token are written together, so changing servers cannot leave the previous server's credential on disk; a 401/403 on any request after bootstrap clears the token and returns to the login screen instead of printing "Server returned 401" on every screen | Verify Keychain behavior across device restore and app replacement |
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; in a season listing, artwork plays that episode while the copy opens its detail page on iOS/iPadOS, and tvOS keeps one focus target whose Select action plays; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
+| Books and ebooks | In-app EPUB plus external PDF handoff | iPhone/iPad read EPUB online/offline and PDF online; PDFKit uses exact-revision temporary bytes, page locators, local search, and explicit completion. tvOS exposes no text reader. | Physical VoiceOver and representative PDF/device acceptance; PDF offline remains external handoff |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery`, including the `delivery.audio` a selection-aware `/decision` puts in the plan (§6) | Real-device codec/HDR matrix, especially Dolby Vision profiles |
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; on tvOS the progress bar is an ordinary focus stop until Select engages scrubbing, so left/right cross between the transport and option groups without seeking, engaged left/right step by ±10 seconds, and Select/Menu leave scrubbing. Up reaches a visible skip marker above the bar and is deliberately inert when none is present. Hidden controls retain the separate four-direction remote seek path. A seek inside the growing playlist's advertised window moves the item's own clock instantly (`seekRoute`, mapped through `media_origin_ms`, held 1.5 s off the live edge), while out-of-window targets reopen the session at the film position after a 350 ms coalescing pause so a press burst costs one create; a copy-HLS replacement that starts on the preceding keyframe seeks its newly attached item forward by the origin delta, preventing a short replay after stall recovery. A seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped, and the predecessor item's supersession 404s no longer advance the recovery ladder mid-change. In a full-screen iOS window, the status bar and Home indicator stay while any player overlay is visible and retire after the last one leaves; windowed iPad status bars remain system-owned. | Device-verify in-window scrubs land without a spinner, out-of-window scrubs recover cleanly, iPad full-screen/Split View chrome, iPhone portrait/landscape, engage-to-scrub feel and hammered tvOS step-seeks during a quality change on a physical Siri Remote, and long transcodes |

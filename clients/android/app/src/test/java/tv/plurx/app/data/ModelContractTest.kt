@@ -88,6 +88,9 @@ class ModelContractTest {
         assertEquals("Contract server", fixture.server.name)
         assertEquals("The Contract", fixture.item_detail.item.title)
         assertTrue(fixture.audiobook_detail.item.isAudiobook)
+        assertEquals("A. Contract", fixture.audiobook_detail.item.author)
+        assertEquals("curator:work:contract", fixture.audiobook_detail.item.book_work_id)
+        assertEquals("curator:edition:ebook", fixture.audiobook_detail.editions.first().book_edition_id)
         assertEquals(
             listOf(0L, 60_000L, 180_000L),
             fixture.audiobook_detail.files.map(MediaFileDto::part_offset_ms),

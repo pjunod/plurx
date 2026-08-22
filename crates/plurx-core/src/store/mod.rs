@@ -37,7 +37,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
-    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};
@@ -46,9 +47,9 @@ pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 use async_trait::async_trait;
 
 use crate::domain::{
-    CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
-    MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
-    NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
+    BookMetadataPatch, CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage,
+    ItemSort, Library, MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation,
+    NewItem, NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
     OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
     OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingState,
     ReadingStateWrite, RecentItem, TraktAuth, User, WatchRollup, WatchState,
@@ -447,6 +448,29 @@ pub trait MediaStore: Send + Sync + 'static {
 
     // --- metadata enrichment ---
     async fn apply_metadata(&self, item_id: i64, patch: &MetadataPatch) -> Result<(), StoreError>;
+    /// Apply first-class facts for one book with source precedence enforced by
+    /// the backend. A Curator handoff outranks EPUB package metadata; title +
+    /// author alone never creates a work relation.
+    async fn apply_book_metadata(
+        &self,
+        item_id: i64,
+        patch: &BookMetadataPatch,
+    ) -> Result<(), StoreError>;
+    /// Book rows in one library, optionally narrowed to the exact ids a
+    /// targeted scan placed. `Some(&[])` means no rows.
+    async fn book_items(
+        &self,
+        library_id: i64,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<Item>, StoreError>;
+    /// Other text/audio editions carrying the same proven work id. The
+    /// current row is excluded, and a missing work id is represented by the
+    /// caller not asking at all—not by fuzzy title/author matching.
+    async fn related_book_editions(
+        &self,
+        item_id: i64,
+        work_id: &str,
+    ) -> Result<Vec<Item>, StoreError>;
     /// Movies and shows to enrich: normally those no provider has answered
     /// for yet, which is *not* the same as "those with no TMDB id" — an item
     /// can arrive carrying an id from another application (a monarr scan
@@ -1261,7 +1285,7 @@ pub trait NetworkPriorStore: Send + Sync + 'static {
     ) -> Result<NetworkPrior, StoreError>;
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError>;

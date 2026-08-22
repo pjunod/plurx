@@ -97,6 +97,14 @@ pub struct ItemDto {
     /// when unknown — a client that predates this field ignores it, and one
     /// that knows about it never has to distinguish "absent" from "none".
     pub genres: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_work_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_edition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_metadata_source: Option<String>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
@@ -212,6 +220,10 @@ impl From<Item> for ItemDto {
             recorded_at: item.recorded_at,
             tags: item.tags,
             genres: item.genres,
+            author: item.author,
+            book_work_id: item.book_work_id,
+            book_edition_id: item.book_edition_id,
+            book_metadata_source: item.book_metadata_source,
             tmdb_id: item.tmdb_id,
             imdb_id: item.imdb_id,
             poster: image_url(&item.poster_path),
@@ -321,6 +333,15 @@ pub struct FileDto {
     /// wrong container mount) — the client shows this and refuses to "play"
     /// something that isn't there. Set by the handler, not from the row.
     pub available: bool,
+    /// Server-owned reader actions for this exact detected format.  Clients
+    /// consume the surface entry instead of inferring Read from an extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader: Option<crate::reader_formats::ReaderCapability>,
+    /// Exact file identity a native document reader must echo when it saves a
+    /// locator.  It is present only for recognized ebook formats, alongside
+    /// `reader`, so clients never have to infer a revision from HTTP dates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader_revision: Option<RevisionDto>,
     /// Did ffprobe ever succeed on this file? `false` means every media field
     /// above is empty because nothing was ever read — not because the file has
     /// no video. The item page says so and offers a re-analyze, since the usual
@@ -453,6 +474,11 @@ fn defaults_from_selection(
 impl FileDto {
     pub fn from_media_file(f: MediaFile, prefs: &LangPrefs) -> Self {
         let playback_defaults = playback_defaults(&f.audio_streams, &f.subtitle_streams, prefs);
+        let reader = crate::reader_formats::capability(&f.path, f.container.as_deref());
+        let reader_revision = reader.map(|_| RevisionDto {
+            size: f.size,
+            mtime: f.mtime,
+        });
         let filename = f
             .path
             .file_name()
@@ -478,6 +504,8 @@ impl FileDto {
             part_offset_ms: 0,
             chapters: Vec::new(),
             available: true,
+            reader,
+            reader_revision,
             probed: f.probed,
             missing_path: None,
         }

@@ -26,10 +26,16 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 
-// v6 is a fresh-bootstrap/import schema. There is deliberately no in-place
-// replicated v5 migration here: existing clusters must fail compatibility
-// until the clustering upgrade protocol owns that transition.
-pub const AUTH_SCHEMA_VERSION: i64 = 6;
+// v6 adds revision-bound ebook reading state; v7 adds first-class book facts.
+// Both additive steps are applied through Raft before the daemon opens the
+// store. v5 remains a supported direct-upgrade source so an offline node is
+// not forced to install every intermediate Cinema release; older or future
+// schemas still fail closed.
+pub const AUTH_SCHEMA_VERSION: i64 = 7;
+/// Oldest schema this binary can advance through the complete migration chain.
+pub const AUTH_SCHEMA_MIGRATION_SOURCE: i64 = 5;
+const READING_SCHEMA_VERSION: i64 = 6;
+const BOOK_SCHEMA_MIGRATION_SOURCE: i64 = READING_SCHEMA_VERSION;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -293,6 +299,96 @@ impl HiqliteAuthStore {
         Ok(store)
     }
 
+    /// Open the daemon's already-activated cluster, applying every supported
+    /// additive schema step through the replicated state machine first.
+    ///
+    /// This path is intentionally separate from [`open`]: maintenance clients
+    /// attach to a running voter and must never become a second migration
+    /// coordinator. Every version step is one Raft transaction: a crash leaves
+    /// either the prior version or a complete next version, and the next boot
+    /// resumes the chain from the durable marker.
+    pub async fn open_or_migrate(
+        client: Client,
+        telemetry_path: &Path,
+    ) -> Result<Self, StoreError> {
+        let store = Self::with_clock(
+            client,
+            Arc::new(SystemClock),
+            NodeLocalTelemetry::open(telemetry_path)?,
+        );
+        store.migrate_schema().await?;
+        store
+            .verify_compatibility(ClusterCompatibility::CURRENT)
+            .await?;
+        Ok(store)
+    }
+
+    async fn migrate_schema(&self) -> Result<(), StoreError> {
+        loop {
+            let sql = "SELECT schema_version, protocol_min, protocol_max \
+                       FROM cluster_meta WHERE singleton = 1";
+            let rows = self
+                .client()
+                .query_consistent_map::<CompatibilityRow, _>(sql, params!())
+                .await?;
+            match schema_migration_action(&rows, ClusterCompatibility::CURRENT)? {
+                SchemaMigrationAction::Current => return Ok(()),
+                SchemaMigrationAction::MigrateFrom(AUTH_SCHEMA_MIGRATION_SOURCE) => {
+                    let now = self.now()?;
+                    let results = self
+                        .client()
+                        .txn([
+                            (
+                                super::hiqlite_catalog::READING_STATE_TABLE_SCHEMA,
+                                params!(),
+                            ),
+                            (
+                                super::hiqlite_catalog::READING_STATE_INDEX_SCHEMA,
+                                params!(),
+                            ),
+                            (
+                                "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
+                                 WHERE singleton = 1 AND schema_version = $3",
+                                params!(READING_SCHEMA_VERSION, now, AUTH_SCHEMA_MIGRATION_SOURCE),
+                            ),
+                        ])
+                        .await?;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error)?;
+                }
+                SchemaMigrationAction::MigrateFrom(BOOK_SCHEMA_MIGRATION_SOURCE) => {
+                    let now = self.now()?;
+                    let results = self
+                        .client()
+                        .txn([
+                            (super::hiqlite_catalog::BOOK_AUTHOR_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_WORK_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_EDITION_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_SOURCE_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_WORK_INDEX_SCHEMA, params!()),
+                            (
+                                "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
+                                 WHERE singleton = 1 AND schema_version = $3",
+                                params!(AUTH_SCHEMA_VERSION, now, BOOK_SCHEMA_MIGRATION_SOURCE),
+                            ),
+                        ])
+                        .await?;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error)?;
+                }
+                SchemaMigrationAction::MigrateFrom(version) => {
+                    return Err(StoreError::Migration(format!(
+                        "cluster schema {version} has no migration implementation"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Run the compatibility guard through a remote client *before* starting
     /// this process's raft voter. A rejected process therefore cannot migrate
     /// state, vote, or become leader.
@@ -551,13 +647,13 @@ impl NetworkPriorStore for HiqliteAuthStore {
 
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError> {
         self.telemetry
             .prior(
-                user_id,
+                credential_generation.to_owned(),
                 client_class.to_owned(),
                 network_fingerprint.to_owned(),
             )
@@ -1041,6 +1137,40 @@ fn one_count(rows: Vec<CountRow>) -> Result<i64, StoreError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchemaMigrationAction {
+    Current,
+    MigrateFrom(i64),
+}
+
+fn schema_migration_action(
+    rows: &[CompatibilityRow],
+    supported: ClusterCompatibility,
+) -> Result<SchemaMigrationAction, StoreError> {
+    let [meta] = rows else {
+        return Err(StoreError::Migration(format!(
+            "cluster compatibility metadata returned {} rows",
+            rows.len()
+        )));
+    };
+    if !(meta.protocol_min..=meta.protocol_max).contains(&supported.protocol_version) {
+        return Err(StoreError::Migration(format!(
+            "cluster protocol range {}..={} excludes voter protocol {}",
+            meta.protocol_min, meta.protocol_max, supported.protocol_version
+        )));
+    }
+    match meta.schema_version {
+        version if version == supported.schema_version => Ok(SchemaMigrationAction::Current),
+        AUTH_SCHEMA_MIGRATION_SOURCE | BOOK_SCHEMA_MIGRATION_SOURCE => {
+            Ok(SchemaMigrationAction::MigrateFrom(meta.schema_version))
+        }
+        version => Err(StoreError::Migration(format!(
+            "cluster schema {version} cannot migrate to voter schema {}",
+            supported.schema_version
+        ))),
+    }
+}
+
 fn verify_compatibility_rows(
     rows: Vec<CompatibilityRow>,
     supported: ClusterCompatibility,
@@ -1375,7 +1505,7 @@ mod tests {
             protocol_max: AUTH_PROTOCOL_VERSION,
         };
         let error = verify_compatibility_rows(vec![existing_v4], ClusterCompatibility::CURRENT)
-            .expect_err("fresh-bootstrap v5 must not imply an in-place v4 upgrade");
+            .expect_err("the strict open path must never migrate");
         assert!(error.to_string().contains("schema 4 is incompatible"));
 
         let old_protocol = ClusterCompatibility {
@@ -1392,5 +1522,60 @@ mod tests {
         )
         .expect_err("old protocol must refuse");
         assert!(error.to_string().contains("excludes"));
+    }
+
+    #[test]
+    fn daemon_schema_gate_accepts_the_complete_supported_chain() {
+        assert_eq!(
+            AUTH_SCHEMA_MIGRATION_SOURCE + 2,
+            AUTH_SCHEMA_VERSION,
+            "this implementation contains the v5→v6 and v6→v7 steps"
+        );
+        let row = |schema_version| CompatibilityRow {
+            schema_version,
+            protocol_min: AUTH_PROTOCOL_VERSION,
+            protocol_max: AUTH_PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            schema_migration_action(&[row(AUTH_SCHEMA_VERSION)], ClusterCompatibility::CURRENT)
+                .expect("current schema"),
+            SchemaMigrationAction::Current
+        );
+        assert_eq!(
+            schema_migration_action(
+                &[row(AUTH_SCHEMA_MIGRATION_SOURCE)],
+                ClusterCompatibility::CURRENT,
+            )
+            .expect("oldest supported predecessor"),
+            SchemaMigrationAction::MigrateFrom(AUTH_SCHEMA_MIGRATION_SOURCE)
+        );
+        assert_eq!(
+            schema_migration_action(
+                &[row(BOOK_SCHEMA_MIGRATION_SOURCE)],
+                ClusterCompatibility::CURRENT,
+            )
+            .expect("immediate predecessor"),
+            SchemaMigrationAction::MigrateFrom(BOOK_SCHEMA_MIGRATION_SOURCE)
+        );
+
+        for rows in [Vec::new(), vec![row(4)], vec![row(6), row(6)]] {
+            let error = schema_migration_action(&rows, ClusterCompatibility::CURRENT)
+                .expect_err("ambiguous or unsupported state must fail before writes");
+            assert!(
+                error.to_string().contains("cannot migrate")
+                    || error.to_string().contains("metadata returned"),
+                "{error}"
+            );
+        }
+
+        let incompatible_protocol = CompatibilityRow {
+            schema_version: AUTH_SCHEMA_MIGRATION_SOURCE,
+            protocol_min: AUTH_PROTOCOL_VERSION + 1,
+            protocol_max: AUTH_PROTOCOL_VERSION + 1,
+        };
+        let error =
+            schema_migration_action(&[incompatible_protocol], ClusterCompatibility::CURRENT)
+                .expect_err("protocol drift must fail before migration");
+        assert!(error.to_string().contains("excludes"), "{error}");
     }
 }

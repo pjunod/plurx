@@ -976,8 +976,8 @@ mod tests {
     }
 
     /// Curator announces book imports through the same targeted-scan seam as
-    /// video. The hint carries no provider id: the resolved Books library and
-    /// the file extension decide whether this is a text book or audiobook.
+    /// video. The path identifies the local edition; explicit Curator keys are
+    /// the only evidence Cinema uses to relate text and audio editions.
     #[tokio::test]
     async fn a_curator_book_import_reaches_the_books_library() {
         let app = test_app();
@@ -1004,6 +1004,13 @@ mod tests {
             json!({
                 "path": book,
                 "hint": "book",
+                "book": {
+                    "title": "The Dispossessed",
+                    "author": "Ursula K. Le Guin",
+                    "medium": "ebook",
+                    "work_id": "curator:openlibrary:OL87320W",
+                    "edition_id": "curator:item:84:ebook"
+                },
                 "correlation_id": "t-84-books",
                 "source": "monarr"
             }),
@@ -1016,6 +1023,95 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert_eq!(detail["item"]["kind"], "book");
         assert_eq!(detail["item"]["title"], "The Dispossessed");
+        assert_eq!(detail["item"]["author"], "Ursula K. Le Guin");
+        assert_eq!(
+            detail["item"]["book_work_id"],
+            "curator:openlibrary:OL87320W"
+        );
+        assert_eq!(detail["item"]["book_edition_id"], "curator:item:84:ebook");
+        assert_eq!(detail["item"]["book_metadata_source"], "curator");
+    }
+
+    #[tokio::test]
+    async fn curator_book_metadata_is_bounded_and_books_only() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger"])).await;
+
+        let books = tempfile::tempdir().expect("books");
+        let book_path = books.path().join("Book");
+        std::fs::create_dir_all(&book_path).expect("book dir");
+        std::fs::write(book_path.join("Book.epub"), b"epub fixture").expect("book file");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Books", "kind": "books", "paths": [books.path()] }),
+            ),
+        )
+        .await;
+
+        let base = json!({
+            "path": book_path,
+            "hint": "book",
+            "book": {
+                "title": "Book",
+                "author": "Author",
+                "medium": "ebook",
+                "work_id": "curator:work:1",
+                "edition_id": "curator:edition:1"
+            }
+        });
+        let mut hostile_cover = base.clone();
+        hostile_cover["book"]["cover_url"] = json!("https://example.com/cover.jpg");
+        let (status, body) = call(&app, post("/api/v1/scan", Some(&key), hostile_cover)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Open Library"));
+
+        let mut wrong_medium = base;
+        wrong_medium["book"]["medium"] = json!("pdf");
+        let (status, body) = call(&app, post("/api/v1/scan", Some(&key), wrong_medium)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let movies = tempfile::tempdir().expect("movies");
+        std::fs::write(movies.path().join("Movie.mkv"), b"movie").expect("movie");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [movies.path()] }),
+            ),
+        )
+        .await;
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/scan",
+                Some(&key),
+                json!({
+                    "path": movies.path(),
+                    "hint": "book",
+                    "book": {
+                        "title": "Not a book",
+                        "author": "Author",
+                        "medium": "ebook",
+                        "work_id": "curator:work:2",
+                        "edition_id": "curator:edition:2"
+                    }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Books library"));
     }
 
     /// The rail is absent, not broken, when no monarr is paired — and a
@@ -2855,10 +2951,16 @@ mod tests {
                 );
                 request
             };
+        let credential_generation_str = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        )
+        .into_inner();
         let prior = || {
             state
                 .store
-                .network_prior(user.id, "safari", "198.51.100.0/24")
+                .network_prior(&credential_generation_str, "safari", "198.51.100.0/24")
         };
 
         let (status, _) = call(&app, report("ttff", 8_000, 1080, None)).await;
@@ -2899,6 +3001,115 @@ mod tests {
         let updated = updated.expect("second observation");
         assert_eq!(updated.sustained_kbps, Some(7_000));
         assert_eq!(updated.worst_rung_height, Some(720));
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_log_stays_bound_to_captured_credential_generation() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        state
+            .store
+            .put_setting(plurx_core::store::keys::PLAYBACK_NETWORK_PRIORS, "1")
+            .await
+            .expect("enable priors");
+        let original = state
+            .store
+            .get_user_by_username("paul")
+            .await
+            .expect("original lookup")
+            .expect("original user");
+        let original_generation = plurx_core::domain::CredentialGeneration::derive(
+            original.id,
+            original.created_at,
+            &original.password_hash,
+        );
+
+        const CAPTURE_MESSAGE: &str = "credential-generation-capture-race";
+        let (captured, release) = system::pause_next_client_log_after_capture(CAPTURE_MESSAGE);
+        let mut request = post(
+            "/api/v1/client-log",
+            Some(&token),
+            json!({
+                "event": "ttff",
+                "message": CAPTURE_MESSAGE,
+                "bandwidth": 9_000,
+                "height": 1080
+            }),
+        );
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("198.51.100.88"),
+        );
+        request.headers_mut().insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static(super::test_agents::SAFARI_MACOS_UA),
+        );
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move { call(&app, request).await }
+        });
+        captured
+            .await
+            .expect("request reached post-auth capture point");
+
+        assert!(state
+            .store
+            .delete_user(original.id)
+            .await
+            .expect("delete user"));
+        let replacement_hash =
+            plurx_core::auth::hash_password("replacement-password").expect("replacement hash");
+        let replacement = state
+            .store
+            .create_user("paul", &replacement_hash, true)
+            .await
+            .expect("replacement user");
+        assert_eq!(replacement.id, original.id, "numeric id must be reused");
+        assert_eq!(
+            replacement.created_at, original.created_at,
+            "the regression must cover same-second replacement"
+        );
+        let replacement_generation = plurx_core::domain::CredentialGeneration::derive(
+            replacement.id,
+            replacement.created_at,
+            &replacement.password_hash,
+        );
+        assert_ne!(replacement_generation, original_generation);
+
+        release.send(()).expect("release captured request");
+        let (status, _) = request.await.expect("request task");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for _ in 0..100 {
+            if state
+                .store
+                .network_prior(original_generation.as_str(), "safari", "198.51.100.0/24")
+                .await
+                .expect("old-generation lookup")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .store
+                .network_prior(original_generation.as_str(), "safari", "198.51.100.0/24",)
+                .await
+                .expect("old-generation lookup")
+                .is_some(),
+            "the in-flight event must remain under the authenticated generation"
+        );
+        assert!(
+            state
+                .store
+                .network_prior(replacement_generation.as_str(), "safari", "198.51.100.0/24",)
+                .await
+                .expect("replacement-generation lookup")
+                .is_none(),
+            "the in-flight event must not contaminate the replacement generation"
+        );
     }
 
     #[tokio::test]
@@ -3118,6 +3329,17 @@ mod tests {
             )
             .await
             .expect("book file");
+        let pdf = state
+            .store
+            .upsert_file(
+                book,
+                "/reading-api/contract.pdf",
+                8_192,
+                101,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("PDF file");
 
         let uri = format!("/api/v1/items/{book}/reading-state?file_id={file}");
         assert_eq!(
@@ -3184,6 +3406,19 @@ mod tests {
             call(&app, get(&format!("/api/v1/items/{book}"), Some(&admin))).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert_eq!(detail["reading"]["progression"], 0.6);
+        let pdf_dto = detail["files"]
+            .as_array()
+            .expect("book files")
+            .iter()
+            .find(|entry| entry["id"] == pdf)
+            .expect("PDF DTO");
+        assert_eq!(pdf_dto["reader"]["format"], "pdf");
+        assert_eq!(pdf_dto["reader"]["apple"]["online"], "read");
+        assert_eq!(pdf_dto["reader"]["apple"]["offline"], "unavailable");
+        assert_eq!(
+            pdf_dto["reader_revision"],
+            json!({ "size": 8192, "mtime": 101 })
+        );
 
         let (status, conflict) = call(
             &app,
@@ -5638,10 +5873,15 @@ mod tests {
             .await
             .expect("admin lookup")
             .expect("admin user");
+        let credential_generation = plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        );
         state
             .store
             .observe_network_prior(&NetworkPriorObservation {
-                user_id: user.id,
+                credential_generation: credential_generation.clone(),
                 client_class: "apple".to_owned(),
                 network_fingerprint: "192.0.2.0/24".to_owned(),
                 throughput_kbps: Some(20_000),
@@ -8025,7 +8265,7 @@ mod tests {
     /// that missing context as permission to turn a known HDR source into
     /// H.264 SDR. The refusal happens before playback accounting or ffmpeg.
     #[tokio::test]
-    async fn hls_create_refuses_hdr_subtitle_burns_at_the_server_boundary() {
+    async fn hls_create_refuses_hdr_downgrades_but_accepts_an_existing_sdr_plan() {
         crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
@@ -8072,6 +8312,57 @@ mod tests {
         assert_eq!(
             body["error"],
             "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
+        );
+
+        // TCL 9445X / Bad Boys for Life's route: the display advertises
+        // `hdr=0`, so the source is already tone-mapped before its forced PGS
+        // track is considered. `/decision` and session creation must agree
+        // that drawing into this already-SDR output is not an HDR downgrade.
+        let (status, sdr_preflight) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&subtitle=2"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sdr_preflight}");
+        assert_eq!(sdr_preflight["method"], "transcode", "{sdr_preflight}");
+        assert_eq!(
+            sdr_preflight["delivered_dynamic_range"], "sdr",
+            "{sdr_preflight}"
+        );
+        assert_eq!(
+            sdr_preflight["selection"]["subtitle_burn_in_blocked_by_hdr"], false,
+            "{sdr_preflight}"
+        );
+
+        let (status, accepted) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file}/hls/sessions"),
+                Some(&admin),
+                json!({
+                    "playback_id": "tcl-existing-sdr-burn",
+                    "height": 64,
+                    "subtitle_burn": 2,
+                    "subtitle_burn_sdr": true
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["delivered_dynamic_range"], "sdr", "{accepted}");
+        let session = accepted["session_id"].as_str().expect("session id");
+        assert_eq!(
+            status_of(
+                &app,
+                delete(&format!("/api/v1/hls/{session}"), Some(&admin))
+            )
+            .await,
+            StatusCode::NO_CONTENT
         );
     }
 
