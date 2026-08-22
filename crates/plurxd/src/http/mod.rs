@@ -2815,7 +2815,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_endpoint_is_admin_only() {
-        let app = test_app();
+        let (app, state) = test_app_with_state();
         let (status, _) = call(&app, get("/api/v1/system/logs", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -2827,6 +2827,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_array());
+
+        state.cluster_logs.push(crate::logbuf::LogEntry {
+            ts_ms: 1,
+            level: "INFO".to_owned(),
+            target: "plurx_core::cluster::membership".to_owned(),
+            message: "cluster-only proof".to_owned(),
+        });
+        let (status, body) = call(
+            &app,
+            get(
+                "/api/v1/system/logs?scope=cluster&level=info&limit=50",
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["message"], "cluster-only proof");
     }
 
     #[tokio::test]

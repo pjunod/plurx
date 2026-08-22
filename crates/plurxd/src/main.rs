@@ -281,9 +281,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // nothing saying which boots were replicated and which were not.
     match selected.backend {
         SelectedBackend::Replicated => {
-            tracing::info!("durable state: one-voter replicated store");
+            tracing::info!(target: "plurx::cluster", "durable state: replicated store");
         }
-        SelectedBackend::SqliteRecovery => tracing::warn!(
+        SelectedBackend::SqliteRecovery => tracing::warn!(target: "plurx::cluster",
             "durable state: unreplicated SQLite, recovering from an interrupted activation; \
              this boot is not replicated and the next restart retries the import"
         ),
@@ -350,7 +350,7 @@ struct Boot {
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
     system: SystemInfo,
-    logs: Arc<logbuf::LogBuffer>,
+    logs: logbuf::LogBuffers,
 }
 
 /// Everything from a measured node to a served, drained shutdown.
@@ -421,20 +421,37 @@ async fn boot(
 /// must not do to check that discovery is best-effort.
 type MdnsAdvertiser = fn(&str, &str, SocketAddr, &str) -> anyhow::Result<mdns_sd::ServiceDaemon>;
 
-/// Console logging plus a bounded in-memory ring the admin UI can read.
+/// Console logging plus separate bounded rings for general and cluster events.
 ///
-/// The EnvFilter is global, so both sinks see the same events. `try_init`
-/// rather than `init` because a second call is not a reason to abort a boot:
-/// the daemon installs exactly one subscriber, and losing that race could only
-/// ever mean logging is already going somewhere.
-fn init_logging() -> Arc<logbuf::LogBuffer> {
+/// Cluster INFO/DEBUG detail belongs on Settings → Cluster and is omitted from
+/// both the general ring and stdout. WARN/ERROR still reach stdout so a broken
+/// voter remains visible to service supervisors before an admin can sign in.
+/// The EnvFilter remains global, so `PLURX_LOG` governs every sink.
+fn init_logging() -> logbuf::LogBuffers {
+    use tracing::Level;
+    use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    let logs = Arc::new(logbuf::LogBuffer::default());
+    use tracing_subscriber::Layer;
+
+    let logs = logbuf::LogBuffers::default();
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_env("PLURX_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
-        .with(logbuf::BufferLayer(Arc::clone(&logs)))
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(filter_fn(|metadata| {
+                !logbuf::is_cluster_target(metadata.target()) || *metadata.level() <= Level::WARN
+            })),
+        )
+        .with(
+            logbuf::BufferLayer(Arc::clone(&logs.general)).with_filter(filter_fn(|metadata| {
+                !logbuf::is_cluster_target(metadata.target())
+            })),
+        )
+        .with(
+            logbuf::BufferLayer(Arc::clone(&logs.cluster)).with_filter(filter_fn(|metadata| {
+                logbuf::is_cluster_target(metadata.target())
+            })),
+        )
         .try_init()
         .ok();
     logs
@@ -711,7 +728,7 @@ fn build_state(
     dirs: crate::state::Dirs,
     encoder_caps: plurx_core::transcode::EncoderCaps,
     system: SystemInfo,
-    logs: Arc<logbuf::LogBuffer>,
+    logs: logbuf::LogBuffers,
 ) -> AppState {
     AppState::new_configured(
         crate::state::AppConfig {
@@ -2269,7 +2286,10 @@ mod startup_tests {
             create_dirs(dir).expect("dirs"),
             Default::default(),
             Default::default(),
-            Arc::new(logbuf::LogBuffer::new(64)),
+            logbuf::LogBuffers {
+                general: Arc::new(logbuf::LogBuffer::new(64)),
+                cluster: Arc::new(logbuf::LogBuffer::new(64)),
+            },
         )
     }
 
@@ -2420,12 +2440,13 @@ mod startup_tests {
         std::env::set_var("PLURX_LOG", "off");
         let logs = init_logging();
         assert!(
-            logs.tail("trace", 8).is_empty(),
-            "a fresh ring starts empty"
+            logs.general.tail("trace", 8).is_empty() && logs.cluster.tail("trace", 8).is_empty(),
+            "both fresh rings start empty"
         );
         // Second call, and the companion's own initialiser: neither may panic.
         let again = init_logging();
-        assert!(!Arc::ptr_eq(&logs, &again));
+        assert!(!Arc::ptr_eq(&logs.general, &again.general));
+        assert!(!Arc::ptr_eq(&logs.cluster, &again.cluster));
         init_companion_logging();
     }
 
@@ -2546,7 +2567,10 @@ mod startup_tests {
                 dirs: create_dirs(tmp.path()).expect("dirs"),
                 encoder_caps: Default::default(),
                 system: Default::default(),
-                logs: Arc::new(logbuf::LogBuffer::new(64)),
+                logs: logbuf::LogBuffers {
+                    general: Arc::new(logbuf::LogBuffer::new(64)),
+                    cluster: Arc::new(logbuf::LogBuffer::new(64)),
+                },
             },
             advertiser_that_fails,
             async move {
