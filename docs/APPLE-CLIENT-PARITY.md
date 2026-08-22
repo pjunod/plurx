@@ -9,10 +9,10 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-21): source is v0.2.7, Apple build 76. Native text
+> Status (2026-08-21): source is v0.2.7, Apple build 77. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 76 carries the explicit delivered-SDR acknowledgement required
+> landed. Build 77 carries the explicit delivered-SDR acknowledgement required
 > for a forced bitmap-subtitle session over an HDR source while refusing an
 > unplanned HDR downgrade. Build 75 adds online PDFKit reading on iPhone/iPad with
 > exact-revision temporary bytes, page resume, local search, and protected-

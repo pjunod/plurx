@@ -42,6 +42,12 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Apple TV playback diagnostics are readable from the couch.** Playback info
+  now opens as a large three-column Source, Playing, and Server dashboard with
+  the playback method, position, and stall health visible at a glance. A
+  focused Done action keeps the Siri Remote inside the modal until dismissal;
+  iPhone and iPad retain their compact inspector.
+
 - **Audiobook artwork refresh now uses the cover already embedded in the
   audio file.** Plurx's Books enricher inspected EPUBs only, so refreshing an
   MP3 or M4B returned success without doing any work even when ffprobe had
