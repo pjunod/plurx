@@ -12,6 +12,7 @@
 //! which needs no quorum and therefore no contended host.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::Write as _;
 use std::net::TcpListener;
@@ -27,8 +28,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig, Row};
 use plurx_core::cluster::membership::{
-    join_token_digest, ClusterAvailability, ClusterPeer, FinalizeJoinRequest, IssuedJoinToken,
-    JoinSecrets, MembershipManager, MembershipStatus, RedeemJoinRequest,
+    join_token_digest, ArtworkPeerAuth, ClusterAvailability, ClusterPeer, FinalizeJoinRequest,
+    IssuedJoinToken, JoinSecrets, MembershipManager, MembershipStatus, RedeemJoinRequest,
 };
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
@@ -389,11 +390,63 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     if public_status.contains(&redeemed_token) || public_status.contains("127.0.0.1") {
         bail!("public node records exposed token or address material");
     }
+    for node_id in 1..=3 {
+        let urls = match cluster.request(node_id, Request::ArtworkPeerUrls).await? {
+            Response::ArtworkPeerUrls { urls } => urls,
+            response => bail!("unexpected artwork peer roster: {response:?}"),
+        };
+        let expected = (1..=3)
+            .filter(|peer| *peer != node_id)
+            .map(|peer| format!("http://127.0.0.1:{}", 33_000 + peer))
+            .collect::<BTreeSet<_>>();
+        if urls.into_iter().collect::<BTreeSet<_>>() != expected {
+            bail!("node {node_id} did not learn every peer's public artwork URL");
+        }
+    }
 
     let leader = cluster.leader().await?;
-    let target = (2..=3)
-        .find(|node_id| *node_id != leader)
-        .context("choose a removable follower")?;
+    let target = leader;
+    let observer = (1..=3)
+        .find(|node_id| *node_id != target)
+        .context("choose a surviving membership observer")?;
+    let departing_artwork_proof = match cluster
+        .request(
+            target,
+            Request::ArtworkPeerAuth {
+                filename: "poster.jpg".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkPeerAuth { auth } => auth,
+        response => bail!("unexpected artwork proof response: {response:?}"),
+    };
+    match cluster
+        .request(
+            observer,
+            Request::VerifyArtworkPeer {
+                filename: "poster.jpg".to_owned(),
+                auth: departing_artwork_proof.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: true } => {}
+        response => bail!("a live voter's artwork proof was refused: {response:?}"),
+    }
+    match cluster
+        .request(
+            observer,
+            Request::VerifyArtworkPeer {
+                filename: "different.jpg".to_owned(),
+                auth: departing_artwork_proof.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("an artwork proof was not bound to its filename: {response:?}"),
+    }
     // M3c (`CLUSTERING-PLAN.md` §6.7): removal resolves the offline work the
     // departing node owns instead of refusing forever. Seeded on the target's
     // own process so the fixture's source files exist where its packages say
@@ -418,15 +471,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // resolve: a download that is in flight right now. Lifting the blanket
     // refusal must not turn removal into "always succeeds".
     let transfer_package = format!("{TRANSFER_PACKAGE}-{target_node}");
-    match cluster
-        .request(
-            1,
-            Request::RemoveVoter {
-                node_id: target_node.clone(),
-            },
-        )
-        .await?
-    {
+    match cluster.request(target, Request::LeaveVoter).await? {
         Response::MembershipError { code, message } if code == "node_owns_offline_work" => {
             if !message.contains("transferring") {
                 bail!("in-flight transfer refusal gave the operator no reason: {message}");
@@ -437,7 +482,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // The operator takes the action the refusal named.
     match cluster
         .request(
-            1,
+            observer,
             Request::DeleteOfflinePackage {
                 package_id: transfer_package,
                 user_id: offline_user,
@@ -469,20 +514,28 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         .require_ok()?;
 
     cluster
+        .request(target, Request::LeaveVoter)
+        .await?
+        .require_ok()?;
+    match cluster
         .request(
-            1,
-            Request::RemoveVoter {
-                node_id: target_node.clone(),
+            observer,
+            Request::VerifyArtworkPeer {
+                filename: "poster.jpg".to_owned(),
+                auth: departing_artwork_proof,
             },
         )
         .await?
-        .require_ok()?;
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("a removed voter retained artwork access: {response:?}"),
+    }
 
     // Either §6.7 outcome closes it — moved to a survivor, or failed with its
     // reservation released. The outcome this exists to catch is the third one:
     // still queued on a node that is now a tombstone, holding the traveller's
     // byte budget until the seven-day expiry.
-    match offline_summary(&mut cluster, &late_package, offline_user).await? {
+    match offline_summary(&mut cluster, observer, &late_package, offline_user).await? {
         Response::OfflinePackageSummary {
             state,
             node_id,
@@ -506,7 +559,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // A survivor proved it reads the source, so the work moved rather than
     // dying with the node.
     let movable_package = format!("{MOVABLE_PACKAGE}-{target_node}");
-    let movable = offline_summary(&mut cluster, &movable_package, offline_user).await?;
+    let movable = offline_summary(&mut cluster, observer, &movable_package, offline_user).await?;
     match &movable {
         Response::OfflinePackageSummary {
             state,
@@ -528,6 +581,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // byte budget until the seven-day expiry.
     match offline_summary(
         &mut cluster,
+        observer,
         &format!("{STRANDED_PACKAGE}-{target_node}"),
         offline_user,
     )
@@ -550,6 +604,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // downloader a different encoder's generation behind the same lease URL.
     match offline_summary(
         &mut cluster,
+        observer,
         &format!("{READY_PACKAGE}-{target_node}"),
         offline_user,
     )
@@ -605,7 +660,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     }
     match cluster
         .request(
-            1,
+            observer,
             Request::PublishOfflinePackage {
                 package_id: movable_package.clone(),
                 node_id: target_node.clone(),
@@ -631,7 +686,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     }
 
     cluster
-        .request(1, Request::ResetContractState)
+        .request(observer, Request::ResetContractState)
         .await?
         .require_ok()?;
     cluster
@@ -658,7 +713,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     cluster.wait_for_voters(&remaining).await?;
     cluster.kill(target).await?;
 
-    let status = match cluster.request(1, Request::MembershipStatus).await? {
+    let status = match cluster.request(observer, Request::MembershipStatus).await? {
         Response::MembershipStatus { status } => status,
         response => bail!("unexpected two-voter membership status: {response:?}"),
     };
@@ -678,7 +733,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     require_membership_error(
         cluster
             .request(
-                1,
+                observer,
                 Request::RemoveVoter {
                     node_id: format!("node-{quorum_target}"),
                 },
@@ -686,7 +741,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             .await?,
         "removal_would_lose_quorum",
     )?;
-    let final_dump = match cluster.request(1, Request::Dump).await? {
+    let final_dump = match cluster.request(observer, Request::Dump).await? {
         Response::Dump { dump, .. } => dump,
         response => bail!("unexpected final membership dump: {response:?}"),
     };
@@ -708,12 +763,13 @@ async fn run_membership_lifecycle_case() -> Result<()> {
 
 async fn offline_summary(
     cluster: &mut ClusterProcesses,
+    observer: u64,
     package_id: &str,
     user_id: i64,
 ) -> Result<Response> {
     cluster
         .request(
-            1,
+            observer,
             Request::OfflinePackageSummary {
                 package_id: package_id.to_owned(),
                 user_id,
@@ -1340,6 +1396,14 @@ pub enum Request {
         request: FinalizeJoinRequest,
     },
     MembershipStatus,
+    ArtworkPeerUrls,
+    ArtworkPeerAuth {
+        filename: String,
+    },
+    VerifyArtworkPeer {
+        filename: String,
+        auth: ArtworkPeerAuth,
+    },
     TombstoneOfflineFence {
         node_id: String,
     },
@@ -1349,6 +1413,7 @@ pub enum Request {
     RemoveVoter {
         node_id: String,
     },
+    LeaveVoter,
     SeedOfflineRemovalWork {
         node_id: String,
         media_dir: String,
@@ -1451,6 +1516,12 @@ pub enum Response {
     },
     MembershipStatus {
         status: MembershipStatus,
+    },
+    ArtworkPeerUrls {
+        urls: Vec<String>,
+    },
+    ArtworkPeerAuth {
+        auth: ArtworkPeerAuth,
     },
     MembershipError {
         code: String,
@@ -1817,11 +1888,19 @@ impl ClusterProcesses {
         }
     }
 
-    /// Wait until voter 1 reports exactly `expected` as the raft membership.
+    /// Wait until a surviving voter reports exactly `expected` as the raft
+    /// membership. The graceful-leave scenario deliberately removes the
+    /// original leader, which is commonly voter 1; a removed process is not
+    /// required to learn entries committed after its removal.
     pub async fn wait_for_voters(&mut self, expected: &[u64]) -> Result<()> {
+        let observer = *expected
+            .first()
+            .context("cannot observe an empty voter membership")?;
         let deadline = Instant::now() + self.convergence_timeout;
         loop {
-            if let Ok(Response::Metrics { voters, .. }) = self.request(1, Request::Metrics).await {
+            if let Ok(Response::Metrics { voters, .. }) =
+                self.request(observer, Request::Metrics).await
+            {
                 if voters == expected {
                     return Ok(());
                 }
@@ -2289,6 +2368,23 @@ async fn handle_request(
             .await
             .map(|status| Response::MembershipStatus { status })
             .or_else(|error| Ok(membership_error_response(error))),
+        Request::ArtworkPeerUrls => membership_ref(membership)?
+            .reachable_peer_http_urls()
+            .await
+            .map(|urls| Response::ArtworkPeerUrls { urls })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::ArtworkPeerAuth { ref filename } => membership_ref(membership)?
+            .artwork_peer_auth(filename)
+            .map(|auth| Response::ArtworkPeerAuth { auth })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::VerifyArtworkPeer {
+            ref filename,
+            ref auth,
+        } => membership_ref(membership)?
+            .verify_artwork_peer_auth(filename, auth)
+            .await
+            .map(|value| Response::Flag { value })
+            .or_else(|error| Ok(membership_error_response(error))),
         Request::TombstoneOfflineFence { ref node_id } => {
             let store = store_ref(store)?;
             let now = unix_now()?;
@@ -2343,6 +2439,11 @@ async fn handle_request(
             .remove_voter(&node_id)
             .await
             .map(|_| Response::Ok)
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::LeaveVoter => membership_ref(membership)?
+            .leave_voter()
+            .await
+            .map(|()| Response::Ok)
             .or_else(|error| Ok(membership_error_response(error))),
         Request::SeedOfflineRemovalWork { node_id, media_dir } => {
             let user_id =
@@ -2580,7 +2681,7 @@ async fn membership_manager(
             raft_address: local.raft.clone(),
             api_address: local.api.clone(),
         },
-        "https://127.0.0.1:1".to_owned(),
+        format!("http://127.0.0.1:{}", 33_000 + launch.node_id),
         JoinSecrets {
             raft: RAFT_SECRET.to_owned(),
             api: API_SECRET.to_owned(),

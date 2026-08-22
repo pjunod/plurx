@@ -850,6 +850,23 @@ impl MediaStore for HiqliteAuthStore {
         )
     }
 
+    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError> {
+        items(
+            self.client()
+                .query_consistent_map::<ItemRow, _>(
+                    format!(
+                        "SELECT {i} FROM items i \
+                         WHERE i.poster_path IS NOT NULL OR i.backdrop_path IS NOT NULL \
+                         ORDER BY i.id",
+                        i = item_cols("i")
+                    ),
+                    params!(),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
     async fn list_top_items_in_genre(
         &self,
         library_id: i64,

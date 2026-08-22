@@ -45,7 +45,7 @@ pub async fn serve(
         // Before local enrichment has run there is no thumbnail yet. Serving
         // the original beats a broken image in the grid.
         if let Some(name) = item.poster_path.clone() {
-            return super::images::serve_artwork(&state.artwork_dir, &name).await;
+            return super::images::serve_cluster_artwork(&state, &name).await;
         }
     }
 

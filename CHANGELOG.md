@@ -10,6 +10,14 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Cluster voters can now leave cleanly from their own Settings page or the
+  admin API.** A graceful leave applies the existing offline-work settlement
+  rules and, when the local voter is leader, elects and confirms a successor
+  before committing a membership that excludes itself. Only after that commit
+  does the daemon drain and stop. Remote removal still refuses the leader, and
+  both paths refuse a 2→1 reconfiguration. Routine updates remain in-place
+  rolling restarts, not leaves.
+
 - **Android phones and tablets can keep EPUBs inside Cinema for offline
   reading.** A durable profile-scoped catalogue records intent before I/O,
   downloads the authenticated original, reopens the server publication to
@@ -23,6 +31,18 @@ bump may break compatibility and a **patch** bump never does.
   deliberately excluded.
 
 ### Fixed
+
+- **Artwork now follows library rows across the cluster.** Item metadata is
+  replicated, but its poster and backdrop bytes live in each node's local
+  artwork cache, so a follower inherited a valid filename and returned 404.
+  Each voter now publishes its own public HTTP base inside private membership
+  state and continuously inventories every replicated artwork reference. A
+  missing file is pulled from a reachable peer under a one-minute,
+  filename-bound cluster proof, bounded to an image-sized response, and
+  atomically materialized; no reusable user bearer crosses between nodes. If
+  no peer retains the file, a paced source/provider repair recreates it.
+  Requests use the same peer path immediately while the background pass
+  converges, and image bytes still never enter Raft.
 
 - **Existing replicated installs now have a real v5 → v6 upgrade path.** The
   ebook reading-state release raised the Hiqlite compatibility marker to v6

@@ -125,6 +125,26 @@ pub async fn change_membership(
     }
 }
 
+/// Ask this voter to start an election immediately.
+///
+/// OpenRaft 0.9 has no dedicated leader-transfer API. Triggering an election
+/// on the intended successor is its supported pre-emptive handoff primitive:
+/// the winning higher term makes the old leader step down before membership
+/// removes it.
+pub async fn trigger_election(
+    state: &Arc<AppState>,
+    raft_type: &RaftType,
+) -> Result<(), Error> {
+    match raft_type {
+        #[cfg(feature = "sqlite")]
+        RaftType::Sqlite => state.raft_db.raft.trigger().elect().await?,
+        #[cfg(feature = "cache")]
+        RaftType::Cache => state.raft_cache.raft.trigger().elect().await?,
+        RaftType::Unknown => panic!("neither `sqlite` nor `cache` feature enabled"),
+    }
+    Ok(())
+}
+
 pub async fn remove_learner(
     state: &Arc<AppState>,
     raft_type: &RaftType,
