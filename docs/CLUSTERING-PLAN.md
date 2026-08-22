@@ -835,6 +835,15 @@ to the operator. The activity page aggregates
 direct-play and session rows from all healthy nodes instead of exposing only
 the process that answered the request.
 
+**M3e transport delivered.** Membership retains each node's explicitly
+configured plurxd URL in a cluster-internal table while the public status shape
+continues to omit every address. A narrow read-only activity snapshot route is
+authorized by a short-lived HMAC under the cluster API secret, never by a
+forwarded household bearer. The pre-wired client caps each peer at two seconds
+and returns answered, unhealthy, unreachable, or timed-out, so the aggregation
+above can degrade visibly without guessing ports or silently dropping nodes.
+SQLite and never-joined one-node paths construct no peer work.
+
 ### 6.8 M4 — transactional fences and materialization ownership
 
 Put scans, metadata refresh, genre backfill, scheduled cache production, and

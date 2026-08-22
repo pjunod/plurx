@@ -465,6 +465,7 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
             hostname: super::membership::system_short_hostname().unwrap_or_default(),
             raft_address: local.raft_address.clone(),
             api_address: local.api_address.clone(),
+            http_base: configured_join_url(config)?,
             schema_version: AUTH_SCHEMA_VERSION,
             protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
         },
@@ -3588,6 +3589,7 @@ mod tests {
                 hostname: "joining-test-node".to_owned(),
                 raft_address: staged_local.raft_address,
                 api_address: staged_local.api_address,
+                http_base: "http://127.0.0.1:32400".to_owned(),
                 schema_version: AUTH_SCHEMA_VERSION,
                 protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
             })

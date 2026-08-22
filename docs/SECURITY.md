@@ -409,6 +409,15 @@ node-status payload. The automatic certificates encrypt traffic but are
 self-signed and accepted without certificate verification; the shared secrets,
 not a certificate authority, authenticate membership requests.
 
+The read-only activity snapshot is the narrow application-level peer call. An
+explicit per-node `join_url` is retained behind membership (never projected in
+public status), and requests to `/_internal/v1/activity-snapshot` carry a
+30-second HMAC signature under cluster API authority. They never forward a
+login, admin, Plex, or scoped API-key bearer, and the shared cluster secret is
+not sent on the wire. Missing, stale, or invalid signatures receive 401. The
+snapshot contains only node identity and active session/delivery fields: no
+media paths, peer addresses, credentials, library rows, or settings.
+
 The consequence is explicit: **anything past a network you fully trust belongs
 behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik). Over plain
 HTTP the bearer token crosses the wire in the clear, so on an untrusted segment
