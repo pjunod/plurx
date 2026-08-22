@@ -375,6 +375,7 @@ pub async fn enrich_library_for_targets(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn enrich_library_for_targets_with_publication(
     store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
@@ -398,6 +399,7 @@ pub async fn enrich_library_for_targets_with_publication(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enrich_library_for_targets_inner(
     store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
@@ -903,6 +905,7 @@ async fn write_artwork(artwork_dir: &Path, item_id: i64, kind: &str, bytes: &[u8
 }
 
 /// Fetch each season once and patch this show's episodes by episode number.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_episodes(
     store: &PublicationStore<'_>,
     tmdb: &TmdbClient,

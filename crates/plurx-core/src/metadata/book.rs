@@ -160,17 +160,16 @@ pub async fn materialize_item_cover(
     if !matches!(item.kind, ItemKind::Book | ItemKind::Audiobook) {
         return Ok(Some(false));
     }
-    if item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str()) {
-        if has_curator_cover_origin(
+    if item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str())
+        && has_curator_cover_origin(
             store,
             item.id,
             item.book_edition_id.as_deref().unwrap_or_default(),
             expected,
         )
         .await?
-        {
-            return Ok(None);
-        }
+    {
+        return Ok(None);
     }
     let files = store.files_for_item(item.id).await?;
     let Some(worker) = workers.claim(item.id) else {
@@ -1106,7 +1105,7 @@ mod tests {
         BookMetadataPatch, BookMetadataSource, ItemKind, LibraryKind, NewItem, NewLibrary,
         ProbeResult,
     };
-    use crate::store::{LibraryStore, MediaStore, SqliteStore};
+    use crate::store::{LibraryStore, MediaStore, SettingsStore, SqliteStore};
 
     fn fixture(package: &str, cover: Option<&[u8]>) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().expect("temp EPUB");

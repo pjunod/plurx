@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["1f15ace7"]
+points = ["identity.access"]
+checks = ["rust-gate"]
+reason = "The retained credential-encryption HTTP regression binds its temporary server before spawning the request and sends the chosen address through the same channel as the listener, so an unrelated process cannot win the former reserve-then-rebind race. The Rust gate exercises that real authenticated route while preserving the at-rest sealing and redaction assertions; restoring the racy port handoff makes the test intermittently connect to the wrong listener or fail to bind."
