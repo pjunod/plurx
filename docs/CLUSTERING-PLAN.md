@@ -220,6 +220,7 @@ pub struct Lease {
     pub resource: String,
     pub owner_node_id: String,
     pub fence: u64,
+    pub revision: u64,
     pub expires_at_unix_ms: i64,
 }
 
@@ -245,12 +246,16 @@ pub trait ClusterCoordinator: Send + Sync + 'static {
 }
 ```
 
-`job_leases(resource PRIMARY KEY, owner_node, fence, expires_at)` is replicated.
-Every acquisition increments `fence`. Publishing methods such as scan-batch
-upsert, cursor advance, cache completion, and queue completion take `&Lease`.
-The same replicated transaction first validates `resource`, `owner_node`, and
-`fence`; zero matching rows aborts the entire write. A pre-write check is not a
-fence. Clock skew may delay takeover, but it cannot let an old owner commit.
+`job_leases(resource PRIMARY KEY, owner_node, fence, revision, expires_at)` is
+replicated. Every ownership takeover increments `fence`; every takeover,
+renewal, and release advances the dedicated monotone `revision`. Renew and
+release exact-CAS `resource`, `owner_node`, `fence`, `revision`, and the
+previous expiry, so delayed same-fence operations and recurring expiry values
+cannot resurrect old authority. Publishing methods such as scan-batch upsert,
+cursor advance, cache completion, and queue completion take `&Lease`. The same
+replicated transaction first validates `resource`, `owner_node`, and `fence`;
+zero matching rows aborts the entire write. A pre-write check is not a fence.
+Clock skew may delay takeover, but it cannot let an old owner commit.
 
 `claim_session` is compare-and-set. Two survivors reading epoch 5 cannot both
 write epoch 6: one commits the higher lease fence and the other receives

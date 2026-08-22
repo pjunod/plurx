@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["cc7909de"]
+points = ["metadata.enrichment"]
+checks = ["rust-gate"]
+reason = "The retained audiobook_refresh_adopts_its_embedded_cover integration test builds an MP3 with a real attached JPEG and requires a Books refresh to cache and persist that poster without changing book metadata precedence; restoring the pre-fix enricher leaves the audiobook uninspected and fails the test."

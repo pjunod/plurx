@@ -18,6 +18,16 @@ bump may break compatibility and a **patch** bump never does.
   both paths refuse a 2→1 reconfiguration. Routine updates remain in-place
   rolling restarts, not leaves.
 
+- **Cluster work now has one backend-neutral monotone lease primitive.**
+  SQLite and the replicated Hiqlite store agree on acquire, held-owner,
+  renewal, release, expiry takeover, and stale-token behavior. Releasing a
+  reusable resource retains its fence row, so a later owner can never make an
+  old token current again. A dedicated monotone token revision advances on
+  every takeover, renewal, and release, so delayed same-fence operations and
+  recurring expiry values cannot regress or resurrect newer state; the
+  replicated v7 → v8 migration creates the lease table atomically before the
+  daemon opens application work.
+
 - **Android phones and tablets can keep EPUBs inside Cinema for offline
   reading.** A durable profile-scoped catalogue records intent before I/O,
   downloads the authenticated original, reopens the server publication to
@@ -31,6 +41,14 @@ bump may break compatibility and a **patch** bump never does.
   deliberately excluded.
 
 ### Fixed
+
+- **Audiobook artwork refresh now uses the cover already embedded in the
+  audio file.** Plurx's Books enricher inspected EPUBs only, so refreshing an
+  MP3 or M4B returned success without doing any work even when ffprobe had
+  recorded an attached picture. Audiobooks with a missing poster now copy the
+  first attached picture through bounded, timed ffmpeg extraction into the
+  artwork cache; failures are recorded on the item, while the cover-only patch
+  leaves EPUB/Curator metadata precedence unchanged.
 
 - **Artwork now follows library rows across the cluster.** Item metadata is
   replicated, but its poster and backdrop bytes live in each node's local

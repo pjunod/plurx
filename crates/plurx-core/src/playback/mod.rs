@@ -307,7 +307,7 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
     let hdr_ok = file.hdr.is_none() || profile.supports_hdr || dolby_vision_claimed;
     if !hdr_ok {
         reasons.push(format!(
-            "HDR ({}) needs tone-mapping for this display",
+            "HDR ({}) presentation was not proven by this client; tone-mapping to SDR",
             file.hdr.as_deref().unwrap_or("hdr")
         ));
     }

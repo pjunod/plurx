@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["46005ee8"]
+points = ["cluster.membership"]
+checks = ["rust-gate"]
+reason = "The retained Rust regressions inject a reverse lookup for an IP-only membership row, require the returned FQDN to be reduced to its short hostname, and prove that a real reported hostname still wins without invoking DNS. The production path uses the same fallback after rejecting empty, placeholder, IP, and Docker-container identities, so a roster can recover nuc3/nuc4/m6 from their advertised LAN addresses without presenting an IP as the node name."
