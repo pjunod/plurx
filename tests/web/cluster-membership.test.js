@@ -119,7 +119,8 @@ const REPLICATION = {
 function node(id, raftId, role, extra = {}) {
   return {
     node_id: id,
-    hostname: `${id}.lan`,
+    hostname: id,
+    advertised_host: `${id}.lan`,
     raft_id: raftId,
     role,
     is_leader: false,
@@ -374,16 +375,17 @@ test("last_seen_at is read as milliseconds, not seconds", () => {
   assert.equal(/\d{2,}[yd] ago/.test(html), false, `stale-looking row: ${html}`);
 });
 
-test("a roster row shows only the privacy-safe fields the API exposes", () => {
+test("a roster row shows hostname and advertised host without listener ports", () => {
   const ui = sandbox();
   const row = ui.clusterNodeRow(node("node-a", 7, "voter"));
-  assert.match(row, /node-a\.lan/);
+  assert.match(row, /class="clhost">node-a/);
+  assert.match(row, /Advertised host node-a\.lan/);
   assert.match(row, /node-a/);
   assert.match(row, />7</);
   assert.match(row, /voter/);
   assert.match(row, /reachable/);
-  // Addresses and token material are not in the payload and must not be invented.
-  for (const leak of ["addr", "http://", "raft_address", "api_address"]) {
+  // Listener ports and internal field names remain private.
+  for (const leak of [":32401", ":32402", "http://", "raft_address", "api_address"]) {
     assert.equal(row.includes(leak), false, `roster row exposes ${leak}`);
   }
 });
@@ -392,16 +394,18 @@ test("hostname leads the identity while node id stays secondary", () => {
   const ui = sandbox();
   const row = ui.clusterNodeRow(
     node("550e8400-e29b-41d4-a716-446655440000", 7, "voter", {
-      hostname: "living-room-plurx.lan",
+      hostname: "living-room-plurx",
+      advertised_host: "192.168.1.20",
     }),
   );
-  assert.match(row, /class="clhost">living-room-plurx\.lan/);
+  assert.match(row, /class="clhost">living-room-plurx/);
+  assert.match(row, /Advertised host 192\.168\.1\.20/);
   assert.match(
     row,
     /class="clid">Node ID 550e8400-e29b-41d4-a716-446655440000/,
   );
   assert.ok(
-    row.indexOf("living-room-plurx.lan") < row.indexOf("550e8400-e29b"),
+    row.indexOf("living-room-plurx") < row.indexOf("550e8400-e29b"),
     `node id appeared before hostname: ${row}`,
   );
 });
@@ -412,7 +416,7 @@ test("the current leader is labeled beside its hostname", () => {
     node("node-b", 2, "voter", { is_leader: true }),
   );
   const follower = ui.clusterNodeRow(node("node-a", 1, "voter"));
-  assert.match(leader, /node-b\.lan[\s\S]*>Leader</);
+  assert.match(leader, /class="clhost">node-b[\s\S]*>Leader</);
   assert.equal(follower.includes(">Leader<"), false);
 });
 
@@ -420,6 +424,30 @@ test("an unreachable node says so rather than showing a blank", () => {
   const ui = sandbox();
   const row = ui.clusterNodeRow(node("node-c", 3, "voter", { reachable: false }));
   assert.match(row, /not reachable/);
+});
+
+test("loopback is shown as localhost beside the short hostname", () => {
+  const ui = sandbox();
+  const row = ui.clusterNodeRow(
+    node("node-local", 1, "voter", {
+      hostname: "media-1",
+      advertised_host: "localhost",
+    }),
+  );
+  assert.match(row, /class="clhost">media-1/);
+  assert.match(row, /Advertised host localhost/);
+  assert.equal(row.includes("127.0.0.1"), false);
+});
+
+test("cluster diagnostics have a separate log surface", () => {
+  const ui = sandbox();
+  const html = ui.clusterPanel({
+    cluster: status("single_node", [node("node-a", 1, "voter")]),
+    sys: { replication: REPLICATION },
+  });
+  assert.match(html, /Cluster log/);
+  assert.match(html, /id="cllogbox"/);
+  assert.match(html, /instead of the general System log/);
 });
 
 // ---- admin gating ---------------------------------------------------------
@@ -528,7 +556,7 @@ test("the Cluster tab is registered and dispatched", () => {
   assert.match(SHIPPED_UI, /if\(tab==="cluster"\)\s*return clusterPanel\(d\)/);
   // Fetched on first open, not with the rest of Settings: the common install
   // refuses this endpoint, and asking every visit would spend a failed request.
-  assert.match(SHIPPED_UI, /if\(tab==="cluster"\) loadCluster\(\)/);
+  assert.match(SHIPPED_UI, /if\(tab==="cluster"\)\s*\{\s*loadCluster\(\)/);
   assert.equal(
     /Promise\.all\(\[[^\]]*cluster\/nodes/.test(SHIPPED_UI),
     false,

@@ -3,9 +3,10 @@
 //! Membership is cluster infrastructure, not a second application store. The
 //! Hiqlite client remains the one replicated write path; this coordinator owns
 //! only the small amount of state needed to admit nodes, describe them without
-//! exposing addresses, and remove a voter safely.
+//! exposing listener ports or secrets, and remove a voter safely.
 
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -74,6 +75,12 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_node_http (\
          node_id TEXT PRIMARY KEY, \
          public_http_url TEXT NOT NULL) STRICT",
+    // Additive so a rolling upgrade can teach old membership rows their
+    // machine names without rewriting the cluster_nodes table underneath an
+    // older voter. Every new daemon creates this table before its heartbeat.
+    "CREATE TABLE IF NOT EXISTS cluster_node_hostnames (\
+         node_id TEXT PRIMARY KEY, \
+         hostname TEXT NOT NULL) STRICT",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -181,6 +188,11 @@ pub struct RedeemJoinRequest {
     pub token_digest: String,
     pub raft_id: u64,
     pub node_id: String,
+    /// The joining machine's OS hostname, reduced to its first DNS label.
+    /// Defaulting keeps an interrupted request from an older binary resumable;
+    /// its first current heartbeat fills the additive hostname table.
+    #[serde(default)]
+    pub hostname: String,
     pub raft_address: String,
     pub api_address: String,
     pub schema_version: i64,
@@ -194,6 +206,7 @@ impl std::fmt::Debug for RedeemJoinRequest {
             .field("token_digest", &"<redacted>")
             .field("raft_id", &self.raft_id)
             .field("node_id", &self.node_id)
+            .field("hostname", &self.hostname)
             .field("raft_address", &self.raft_address)
             .field("api_address", &self.api_address)
             .field("schema_version", &self.schema_version)
@@ -248,9 +261,11 @@ pub enum NodeRole {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterNodeRecord {
     pub node_id: String,
-    /// Host portion of the node's persisted cluster API address. The roster
-    /// needs a human-recognizable machine name, but not its listener port.
+    /// Actual short machine hostname reported by the node itself.
     pub hostname: String,
+    /// Host portion of the advertised cluster API address. Listener ports are
+    /// still private; loopback is rendered as `localhost`, not a raw IP.
+    pub advertised_host: String,
     pub raft_id: u64,
     pub role: NodeRole,
     pub is_leader: bool,
@@ -295,6 +310,7 @@ struct ReplicatedMembership {
     store: Arc<dyn Store>,
     identity: ClusterIdentity,
     local: ClusterPeer,
+    local_hostname: String,
     bootstrap_http: String,
     secrets: JoinSecrets,
     activation_marker: ActivationMarker,
@@ -362,12 +378,17 @@ impl MembershipManager {
         activation_marker: ActivationMarker,
     ) -> Result<Self, MembershipError> {
         let replication = ReplicationMonitor::replicated(client.clone());
+        let local_hostname = membership_hostname(
+            system_short_hostname().as_deref().unwrap_or_default(),
+            &local.api_address,
+        );
         let manager = Self {
             inner: Some(Arc::new(ReplicatedMembership {
                 client,
                 store,
                 identity,
                 local,
+                local_hostname,
                 bootstrap_http,
                 secrets,
                 activation_marker,
@@ -519,7 +540,14 @@ impl MembershipManager {
             // That same staged node may resume after the original TTL; expiry
             // still refuses an unused token below, and a different node id is
             // refused above, so this does not restore bearer authority.
-            "redeeming" => return Ok(()),
+            "redeeming" => {
+                self.upsert_hostname(
+                    &request.node_id,
+                    &membership_hostname(&request.hostname, &request.api_address),
+                )
+                .await?;
+                return Ok(());
+            }
             "issued" if record.expires_at <= now => return Err(MembershipError::ExpiredToken),
             "issued" => {}
             _ => return Err(MembershipError::InvalidToken),
@@ -560,6 +588,24 @@ impl MembershipManager {
                     request.api_address.as_str(),
                     now
                 ),
+            )
+            .await?;
+        self.upsert_hostname(
+            &request.node_id,
+            &membership_hostname(&request.hostname, &request.api_address),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_hostname(&self, node_id: &str, hostname: &str) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        inner
+            .client
+            .execute(
+                "INSERT INTO cluster_node_hostnames (node_id, hostname) VALUES ($1, $2) \
+                 ON CONFLICT(node_id) DO UPDATE SET hostname = excluded.hostname",
+                params!(node_id, hostname),
             )
             .await?;
         Ok(())
@@ -648,6 +694,8 @@ impl MembershipManager {
                     inner.bootstrap_http.as_str()
                 ),
             )
+            .await?;
+        self.upsert_hostname(&inner.identity.node_id, &inner.local_hostname)
             .await?;
         Ok(())
     }
@@ -756,8 +804,11 @@ impl MembershipManager {
         let rows = inner
             .client
             .query_map::<NodeRow, _>(
-                "SELECT node_id, raft_id, api_address, last_seen_at FROM cluster_nodes \
-                 WHERE removed_at IS NULL ORDER BY raft_id",
+                "SELECT n.node_id, n.raft_id, n.api_address, n.last_seen_at, \
+                        COALESCE(h.hostname, '') AS hostname \
+                 FROM cluster_nodes n \
+                 LEFT JOIN cluster_node_hostnames h ON h.node_id = n.node_id \
+                 WHERE n.removed_at IS NULL ORDER BY n.raft_id",
                 params!(),
             )
             .await?;
@@ -766,7 +817,8 @@ impl MembershipManager {
             .filter(|row| members.contains(&(row.raft_id as u64)))
             .map(|row| ClusterNodeRecord {
                 node_id: row.node_id,
-                hostname: advertised_hostname(&row.api_address),
+                hostname: membership_hostname(&row.hostname, &row.api_address),
+                advertised_host: advertised_host(&row.api_address),
                 raft_id: row.raft_id as u64,
                 role: if voters.contains(&(row.raft_id as u64)) {
                     NodeRole::Voter
@@ -1536,6 +1588,7 @@ struct NodeRow {
     node_id: String,
     raft_id: i64,
     api_address: String,
+    hostname: String,
     last_seen_at: i64,
 }
 
@@ -1574,6 +1627,7 @@ impl From<&mut Row<'_>> for NodeRow {
             node_id: row.get("node_id"),
             raft_id: row.get("raft_id"),
             api_address: row.get("api_address"),
+            hostname: row.get("hostname"),
             last_seen_at: row.get("last_seen_at"),
         }
     }
@@ -1584,18 +1638,78 @@ fn artwork_auth_message(node_id: &str, timestamp_ms: i64, filename: &str) -> Str
 }
 
 /// Strip the listener port while preserving DNS names, IPv4, and bracketed
-/// IPv6. Cluster addresses are validated and persisted as `host:port`, so the
-/// original address is the safest fallback for a legacy or malformed row.
-fn advertised_hostname(address: &str) -> String {
+/// IPv6. Loopback is a location, not a useful numeric identity, so every
+/// loopback literal has the one operator-facing spelling `localhost`.
+fn advertised_host(address: &str) -> String {
     let host = if let Some(bracketed) = address.strip_prefix('[') {
         bracketed.rsplit_once("]:")
     } else {
         address.rsplit_once(':')
     };
-    host.filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+    let host = host
+        .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
         .map(|(host, _)| host)
-        .unwrap_or(address)
-        .to_owned()
+        .unwrap_or(address);
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+    {
+        "localhost".to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
+/// Reduce a machine name or FQDN to the short hostname people use at a shell.
+/// An IP address is deliberately not accepted as a machine name.
+fn short_hostname(raw: &str) -> Option<String> {
+    let hostname = raw.trim().trim_end_matches('.');
+    if hostname.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let label = hostname.split('.').next().unwrap_or_default().trim();
+    if label.is_empty()
+        || label.eq_ignore_ascii_case("localhost")
+        || label.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(label.chars().take(63).collect())
+}
+
+fn membership_hostname(reported: &str, api_address: &str) -> String {
+    short_hostname(reported)
+        .or_else(|| short_hostname(&advertised_host(api_address)))
+        .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
+#[cfg(unix)]
+pub(crate) fn system_short_hostname() -> Option<String> {
+    if let Some(configured) = std::env::var("PLURX_NODE_HOSTNAME")
+        .ok()
+        .and_then(|hostname| short_hostname(&hostname))
+    {
+        return Some(configured);
+    }
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is writable for exactly the length passed to libc and
+    // stays alive until the returned bytes have been copied into a String.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    short_hostname(&String::from_utf8_lossy(&buffer[..end]))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn system_short_hostname() -> Option<String> {
+    std::env::var("PLURX_NODE_HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .and_then(|hostname| short_hostname(&hostname))
 }
 
 #[cfg(test)]
@@ -1677,12 +1791,26 @@ mod tests {
     }
 
     #[test]
-    fn advertised_hostname_hides_only_the_listener_port() {
-        assert_eq!(advertised_hostname("plurx-a.lan:32402"), "plurx-a.lan");
-        assert_eq!(advertised_hostname("192.0.2.40:32402"), "192.0.2.40");
-        assert_eq!(advertised_hostname("[2001:db8::40]:32402"), "2001:db8::40");
-        assert_eq!(advertised_hostname("legacy-host"), "legacy-host");
-        assert_eq!(advertised_hostname("legacy:host"), "legacy:host");
+    fn advertised_host_hides_the_port_and_names_loopback() {
+        assert_eq!(advertised_host("plurx-a.lan:32402"), "plurx-a.lan");
+        assert_eq!(advertised_host("192.0.2.40:32402"), "192.0.2.40");
+        assert_eq!(advertised_host("127.0.0.1:32402"), "localhost");
+        assert_eq!(advertised_host("[::1]:32402"), "localhost");
+        assert_eq!(advertised_host("[2001:db8::40]:32402"), "2001:db8::40");
+        assert_eq!(advertised_host("legacy-host"), "legacy-host");
+        assert_eq!(advertised_host("legacy:host"), "legacy:host");
+    }
+
+    #[test]
+    fn hostname_is_short_and_never_an_ip_address() {
+        assert_eq!(
+            short_hostname("living-room.example.net"),
+            Some("living-room".to_owned())
+        );
+        assert_eq!(short_hostname("nuc4.local."), Some("nuc4".to_owned()));
+        assert_eq!(short_hostname("192.0.2.40"), None);
+        assert_eq!(membership_hostname("", "plurx-a.lan:32402"), "plurx-a");
+        assert_eq!(membership_hostname("", "127.0.0.1:32402"), "unknown-host");
     }
 
     #[test]
@@ -1699,6 +1827,7 @@ mod tests {
             token_digest: digest.clone(),
             raft_id: payload.raft_id,
             node_id: "node-b".to_owned(),
+            hostname: "node-b.example.net".to_owned(),
             raft_address: "node-b:32401".to_owned(),
             api_address: "node-b:32402".to_owned(),
             schema_version: payload.schema_version,
