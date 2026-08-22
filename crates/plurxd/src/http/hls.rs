@@ -170,10 +170,10 @@ pub struct CreateSession {
     ///
     /// A request, never a verdict. The server refuses it for any source that
     /// does not prove a Dolby Vision RPU through the production renderer, for
-    /// any rung other than 1080p, and for any build whose boot probe did not
-    /// clear the passthrough graph — every refusal lands on today's SDR
-    /// ladder. Absent means no, which is what every client that predates it
-    /// sends.
+    /// any rung other than the measured 1080p software/QSV or 2160p QSV
+    /// points, and for any build whose boot probe did not clear the exact
+    /// graph — every refusal lands on today's SDR ladder. Absent means no,
+    /// which is what every client that predates it sends.
     pub hdr10: Option<bool>,
     /// Manual A/V correction for this playback attempt only. Positive delays
     /// audio. It is carried into every seek/reopen by the client and is never
@@ -289,9 +289,10 @@ pub async fn create(
         })));
     }
     let source_height = source.as_ref().and_then(|f| f.height);
+    let hdr10_requested = req.hdr10 == Some(true);
     let ladder_ceiling = state
         .transcode
-        .capability_height_ceiling(source.as_ref())
+        .capability_height_ceiling_for_request(source.as_ref(), hdr10_requested)
         .await;
     let mut identity = super::network::identity(&headers, remote);
     if let Some(ref mut id) = identity {
@@ -311,7 +312,7 @@ pub async fn create(
         None => {
             state
                 .transcode
-                .auto_height_for_file(source.as_ref(), network_prior.as_ref())
+                .auto_height_for_request(source.as_ref(), network_prior.as_ref(), hdr10_requested)
                 .await
         }
         // The source's own height is the Original/forced-burn promise
@@ -2553,8 +2554,9 @@ mod tests {
     #[test]
     fn the_hdr10_rungs_master_gets_pq_and_hevc_codecs_from_the_existing_rule() {
         let file = hls_file(vec![]);
-        // Exactly what `transcode::transcoded_hls_codecs(OutputGrade::Hdr10)`
-        // puts on the session.
+        // Exactly what the 1080p branch of
+        // `transcode::transcoded_hls_codecs(OutputGrade::Hdr10, height)` puts
+        // on the session.
         let context = hls_context("hvc1.2.4.H120.90,mp4a.40.2", None);
         let master = master_playlist(&file, None, &context);
         assert!(master.contains("VIDEO-RANGE=PQ"), "{master}");
