@@ -729,9 +729,10 @@ reconfiguration state, never supported HA.
 
 **M3a delivered 2026-08-15.** A running voter can issue a bounded, single-use
 join token; a fresh daemon consumes it to join as a real voter without changing
-the replicated `instance.id`. The admin-only membership API exposes a
-privacy-safe advertised hostname, stable node id, current-leader marker, Raft
-id, voter/learner role, reachability, and last-seen, then embeds the existing
+the replicated `instance.id`. The admin-only membership API exposes the actual
+short machine hostname, the advertised host without its listener port
+(`localhost` for loopback), stable node id, current-leader marker, Raft id,
+voter/learner role, reachability, and last-seen, then embeds the existing
 §6.6/#233 replication projection as its only lag answer. Both remote cluster
 listeners use automatic TLS, and the listener
 policy refuses a public cleartext bind. A never-joined installation remains on
