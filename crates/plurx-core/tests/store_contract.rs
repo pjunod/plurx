@@ -46,7 +46,7 @@ use plurx_core::secrets::CredentialKey;
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
+    ApiKeyStore, HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
     SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
     AUTH_SCHEMA_VERSION,
 };
@@ -317,6 +317,307 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
     HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID, &telemetry_path)
         .await
         .expect("bootstrap contract store")
+}
+
+#[cfg(feature = "hiqlite-store")]
+async fn contract_applied_index(client: &Client) -> u64 {
+    client
+        .metrics_db()
+        .await
+        .expect("read replicated-store metrics")
+        .last_applied
+        .expect("replicated store has an applied index")
+        .index
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_activity_refresh_has_a_fixed_clock_concurrent_write_budget() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect activity-budget client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("auth-activity-budget-telemetry.db");
+    let store = HiqliteAuthStore::validation_bootstrap_at(
+        client.clone(),
+        CONTRACT_INSTANCE_ID,
+        &telemetry,
+        1_000,
+    )
+    .await
+    .expect("bootstrap fixed-clock activity-budget store");
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated activity-budget state");
+    let user = store
+        .create_user("activity-budget", "hash", false)
+        .await
+        .expect("create activity-budget user");
+    store
+        .create_token("activity-budget-token", user.id, None)
+        .await
+        .expect("create activity-budget token");
+    client
+        .execute(
+            "UPDATE tokens SET last_seen_at = $1 WHERE token_hash = $2",
+            hiqlite::params!(1_i64, "activity-budget-token"),
+        )
+        .await
+        .expect("make token activity refresh due");
+
+    let before = contract_applied_index(&client).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(121));
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..120 {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        requests.spawn(async move {
+            barrier.wait().await;
+            store
+                .user_for_token("activity-budget-token")
+                .await
+                .expect("authenticate token")
+                .expect("resolve token user")
+                .id
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = requests.join_next().await {
+        assert_eq!(result.expect("join authentication request"), user.id);
+    }
+    let after_concurrent = contract_applied_index(&client).await;
+
+    assert_eq!(
+        after_concurrent.saturating_sub(before),
+        1,
+        "one process may append one token touch for 120 simultaneous requests"
+    );
+
+    for _ in 0..120 {
+        assert_eq!(
+            store
+                .user_for_token("activity-budget-token")
+                .await
+                .expect("authenticate warm token")
+                .expect("resolve warm token user")
+                .id,
+            user.id
+        );
+    }
+    assert_eq!(
+        contract_applied_index(&client).await,
+        after_concurrent,
+        "warm sequential authentication must append no activity entries"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_activity_refresh_burst_is_bounded_by_serving_process_count() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect multi-process activity-budget client");
+    let mut stores = Vec::new();
+    for ordinal in 0..3 {
+        let telemetry = cluster
+            ._root
+            .path()
+            .join(format!("auth-activity-budget-process-{ordinal}.db"));
+        stores.push(
+            HiqliteAuthStore::validation_bootstrap_at(
+                client.clone(),
+                CONTRACT_INSTANCE_ID,
+                &telemetry,
+                1_000,
+            )
+            .await
+            .expect("bootstrap independent activity-budget store"),
+        );
+    }
+    stores[0]
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated multi-process activity-budget state");
+    let user = stores[0]
+        .create_user("multi-process-activity-budget", "hash", false)
+        .await
+        .expect("create multi-process activity-budget user");
+    stores[0]
+        .create_token("multi-process-activity-budget-token", user.id, None)
+        .await
+        .expect("create multi-process activity-budget token");
+    client
+        .execute(
+            "UPDATE tokens SET last_seen_at = $1 WHERE token_hash = $2",
+            hiqlite::params!(1_i64, "multi-process-activity-budget-token"),
+        )
+        .await
+        .expect("make multi-process token activity refresh due");
+
+    let before = contract_applied_index(&client).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(121));
+    let mut requests = tokio::task::JoinSet::new();
+    for ordinal in 0..120 {
+        // Clones within each group share a gate. The three independently
+        // bootstrapped stores model serving processes with separate gates.
+        let store = stores[ordinal % stores.len()].clone();
+        let barrier = Arc::clone(&barrier);
+        requests.spawn(async move {
+            barrier.wait().await;
+            store
+                .user_for_token("multi-process-activity-budget-token")
+                .await
+                .expect("authenticate multi-process token")
+                .expect("resolve multi-process token user")
+                .id
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = requests.join_next().await {
+        assert_eq!(result.expect("join multi-process request"), user.id);
+    }
+    let delta = contract_applied_index(&client).await.saturating_sub(before);
+    assert!(
+        (1..=3).contains(&delta),
+        "120 simultaneous requests on three serving processes appended {delta} activity entries"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_activity_refresh_is_bounded_and_disabled_keys_do_not_touch() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect API-key activity-budget client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("api-key-activity-budget-telemetry.db");
+    let store = HiqliteAuthStore::validation_bootstrap_at(
+        client.clone(),
+        CONTRACT_INSTANCE_ID,
+        &telemetry,
+        1_000,
+    )
+    .await
+    .expect("bootstrap fixed-clock API-key activity-budget store");
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated API-key activity-budget state");
+    let key = store
+        .create_api_key(
+            "activity-budget",
+            "api-key-activity-budget-hash",
+            &[scopes::SCAN_TRIGGER.to_owned()],
+        )
+        .await
+        .expect("create activity-budget API key");
+
+    let before = contract_applied_index(&client).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(121));
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..120 {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        requests.spawn(async move {
+            barrier.wait().await;
+            let key = store
+                .api_key_for_hash("api-key-activity-budget-hash")
+                .await
+                .expect("look up API key")
+                .expect("resolve API key");
+            assert!(!key.disabled);
+            assert!(key.allows(scopes::SCAN_TRIGGER));
+            store.touch_api_key(key.id).await.expect("touch API key");
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = requests.join_next().await {
+        result.expect("join API-key request");
+    }
+    let after_concurrent = contract_applied_index(&client).await;
+    assert_eq!(
+        after_concurrent.saturating_sub(before),
+        1,
+        "one process may append one API-key touch for 120 simultaneous requests"
+    );
+    assert_eq!(
+        store
+            .api_key_for_hash("api-key-activity-budget-hash")
+            .await
+            .expect("look up touched API key")
+            .expect("resolve touched API key")
+            .last_used_at,
+        Some(1_000)
+    );
+
+    assert!(store
+        .set_api_key_disabled(key.id, true)
+        .await
+        .expect("disable API key"));
+    let after_disable = contract_applied_index(&client).await;
+    for _ in 0..120 {
+        let disabled = store
+            .api_key_for_hash("api-key-activity-budget-hash")
+            .await
+            .expect("look up disabled API key")
+            .expect("resolve disabled API key");
+        assert!(disabled.disabled);
+    }
+    assert_eq!(
+        contract_applied_index(&client).await,
+        after_disable,
+        "disabled-key checks must not append activity entries"
+    );
+
+    assert!(store
+        .delete_api_key(key.id)
+        .await
+        .expect("delete disabled API key"));
+    let after_delete = contract_applied_index(&client).await;
+    for _ in 0..120 {
+        assert!(store
+            .api_key_for_hash("api-key-activity-budget-hash")
+            .await
+            .expect("look up deleted API key")
+            .is_none());
+    }
+    assert_eq!(
+        contract_applied_index(&client).await,
+        after_delete,
+        "deleted-key checks must not append activity entries"
+    );
 }
 
 #[cfg(feature = "hiqlite-store")]
