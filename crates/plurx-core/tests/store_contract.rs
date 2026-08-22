@@ -43,7 +43,6 @@ use plurx_core::domain::{
 };
 use plurx_core::error::StoreError;
 use plurx_core::secrets::CredentialKey;
-use plurx_core::store::CoordinationStore;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::OfflinePackageStore;
 #[cfg(feature = "hiqlite-store")]

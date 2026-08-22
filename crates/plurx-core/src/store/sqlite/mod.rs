@@ -1505,7 +1505,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         assert!(conn
             .execute(
@@ -1573,7 +1573,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         let index: i64 = conn
             .query_row(
@@ -1651,7 +1651,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         assert!(conn
             .execute(
