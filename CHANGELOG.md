@@ -10,6 +10,23 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Cluster schedulers now spend shared work once, even when every voter ticks
+  together.** Scans and refreshes share a per-library lease across startup,
+  scheduled, manual, and targeted integration triggers; probe repair, artwork
+  providers, genre backfill, and pre-transcode candidate selection have their
+  own singleton resources. Ninety-second leases renew every thirty seconds and
+  self-fence on uncertainty, cancel the pass, and terminate an active
+  speculative encoder. Every scan/metadata publication validates the
+  exact owner, fence, renewal revision, expiry, and prior expiry inside its
+  SQLite or replicated transaction, so a paused predecessor cannot publish
+  after a successor takes over. Speculative cache claims use generation-scoped
+  paths and fence claim, heartbeat, completion, and failure cleanup in the
+  same way. Targeted requests queue behind remote owners,
+  while telemetry pruning, scratch cleanup, artwork files, and cache eviction
+  remain node-local work with node-scoped clocks. Same-path integration
+  waiters retain their own request status and metadata hints while queued;
+  same-path waiters share one bounded physical scan/enrichment pass.
+
 - **Cluster voters can now leave cleanly from their own Settings page or the
   admin API.** A graceful leave applies the existing offline-work settlement
   rules and, when the local voter is leader, elects and confirms a successor
