@@ -969,7 +969,7 @@ impl SqliteStore {
 
     /// Execute a durable job publication only while its exact lease token is
     /// current. The check and caller mutation share one SQLite transaction.
-    pub(crate) async fn with_fenced_conn<T, F>(
+    async fn with_fenced_conn<T, F>(
         &self,
         lease: &Lease,
         observed_at_unix_ms: i64,
