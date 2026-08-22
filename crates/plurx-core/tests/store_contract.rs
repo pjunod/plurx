@@ -333,7 +333,7 @@ async fn contract_applied_index(client: &Client) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_activity_refresh_has_a_fixed_clock_concurrent_write_budget() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
+    let cluster = ContractCluster::start();
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -426,7 +426,7 @@ async fn token_activity_refresh_has_a_fixed_clock_concurrent_write_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_activity_refresh_burst_is_bounded_by_serving_process_count() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
+    let cluster = ContractCluster::start();
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -507,7 +507,7 @@ async fn token_activity_refresh_burst_is_bounded_by_serving_process_count() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_key_activity_refresh_is_bounded_and_disabled_keys_do_not_touch() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
+    let cluster = ContractCluster::start();
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -623,7 +623,7 @@ async fn api_key_activity_refresh_is_bounded_and_disabled_keys_do_not_touch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
+    let cluster = ContractCluster::start();
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -746,7 +746,7 @@ async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
+    let cluster = ContractCluster::start();
     let client = Client::remote(
         cluster.addresses.clone(),
         true,
@@ -869,7 +869,7 @@ struct ContractNodeLaunch {
 #[cfg(feature = "hiqlite-store")]
 struct ContractNodeProcess {
     _child: Child,
-    _input: ChildStdin,
+    _input: Option<ChildStdin>,
     _output: ChildStdout,
 }
 
@@ -936,7 +936,7 @@ impl ContractCluster {
             output = reader.into_inner();
             nodes.push(ContractNodeProcess {
                 _child: child,
-                _input: input,
+                _input: Some(input),
                 _output: output,
             });
         }
@@ -944,6 +944,21 @@ impl ContractCluster {
             addresses: specs.into_iter().map(|node| node.api).collect(),
             _root: root,
             _nodes: nodes,
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+impl Drop for ContractCluster {
+    fn drop(&mut self) {
+        // Ask every voter to stop before removing their shared temporary data
+        // root, then reap them so a serial suite cannot accumulate old voters
+        // while its next isolated cluster is under load.
+        for node in &mut self._nodes {
+            drop(node._input.take());
+        }
+        for node in &mut self._nodes {
+            node._child.wait().expect("reap three-voter contract child");
         }
     }
 }
