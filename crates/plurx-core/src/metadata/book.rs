@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 use crate::domain::{
     ArtworkAttempt, BookMetadataPatch, BookMetadataSource, ItemKind, MediaFile, MetadataPatch,
 };
-use crate::store::Store;
+use crate::store::{PublicationStore, Store};
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
@@ -112,6 +112,23 @@ pub fn read_epub_facts(path: &Path) -> Result<EpubFacts, BookMetadataError> {
 /// change that source rank.
 pub async fn enrich_library(
     store: &dyn Store,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+) -> BookEnrichReport {
+    enrich_library_with_publication(
+        &PublicationStore::unfenced(store),
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_library_with_publication(
+    store: &PublicationStore<'_>,
     artwork_dir: &Path,
     library_id: i64,
     force: bool,
@@ -229,14 +246,14 @@ pub async fn enrich_library(
 /// second process, while MP3/M4B/FLAC cover formats stay ffmpeg's problem rather
 /// than becoming a pile of container-specific parsers here.
 async fn enrich_audiobook_cover(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     artwork_dir: &Path,
     item_id: i64,
     files: &[MediaFile],
     report: &mut BookEnrichReport,
 ) {
     for file in files {
-        let probe = match store.get_file_probe_json(file.id).await {
+        let probe = match store.raw().get_file_probe_json(file.id).await {
             Ok(Some(probe)) => probe,
             Ok(None) => continue,
             Err(error) => {

@@ -212,6 +212,19 @@ pub fn staging_dir(root: &Path, recipe_hash: &str) -> PathBuf {
     root.join(STAGING).join(recipe_hash)
 }
 
+/// P2's cluster-owned producer isolates an attempt by lease fence while the
+/// durable claim remains keyed by the canonical recipe. The orphan sweep must
+/// therefore protect `HASH-fN` staging whenever `HASH` is still claimed.
+fn staging_recipe(name: &str) -> &str {
+    name.rsplit_once("-f")
+        .filter(|(recipe, fence)| {
+            !recipe.is_empty()
+                && !fence.is_empty()
+                && fence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or(name, |(recipe, _)| recipe)
+}
+
 const GB: i64 = 1024 * 1024 * 1024;
 
 /// What one sweep did, for the log and for tests.
@@ -603,18 +616,19 @@ async fn sweep_orphan_dirs(
             let mut kept = 0usize;
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if claimed_recipes.contains(&name) {
+                let recipe = staging_recipe(&name);
+                if claimed_recipes.contains(recipe) {
                     kept += 1;
                     continue;
                 }
                 if !inventory_complete
-                    && !readers.knows_recipe(&name)
-                    && !removed_claims.contains(&name)
+                    && !readers.knows_recipe(recipe)
+                    && !removed_claims.contains(recipe)
                 {
                     kept += 1;
                     continue;
                 }
-                let _eviction = match readers.begin_eviction(&name) {
+                let _eviction = match readers.begin_eviction(recipe) {
                     Ok(guard) => guard,
                     Err(CacheBusy::Readers) => {
                         protected += 1;
@@ -670,6 +684,13 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn fenced_staging_names_retain_their_canonical_recipe_identity() {
+        assert_eq!(staging_recipe("abcdef-f42"), "abcdef");
+        assert_eq!(staging_recipe("abcdef-final"), "abcdef-final");
+        assert_eq!(staging_recipe("abcdef-f"), "abcdef-f");
     }
 
     const NODE: &str = "node-a";

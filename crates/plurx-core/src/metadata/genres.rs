@@ -35,7 +35,7 @@ use std::time::Duration;
 use super::{genre_patch, AniListClient, TmdbClient, MAX_PROBLEMS};
 use crate::domain::{Item, ItemKind, MetadataPatch};
 use crate::error::MetadataError;
-use crate::store::{keys, Store};
+use crate::store::{keys, PublicationStore, Store};
 
 /// Titles one pass will process before returning.
 ///
@@ -122,11 +122,20 @@ pub async fn backfill_pass(
     anilist: &AniListClient,
     pace: Duration,
 ) -> Option<GenreBackfillReport> {
-    if !is_armed(store).await {
+    backfill_pass_with_publication(&PublicationStore::unfenced(store), tmdb, anilist, pace).await
+}
+
+pub async fn backfill_pass_with_publication(
+    store: &PublicationStore<'_>,
+    tmdb: Option<&TmdbClient>,
+    anilist: &AniListClient,
+    pace: Duration,
+) -> Option<GenreBackfillReport> {
+    if !is_armed(store.raw()).await {
         return None;
     }
     let mut report = GenreBackfillReport {
-        resumed_from: read_cursor(store).await,
+        resumed_from: read_cursor(store.raw()).await,
         ..Default::default()
     };
     report.cursor = report.resumed_from;
@@ -311,7 +320,7 @@ async fn read_cursor(store: &dyn Store) -> i64 {
 /// Record progress durably, and only claim it in the report once the write
 /// landed. A cursor the report says was reached but the database never saw is
 /// the one lie that turns "resumable" back into "restarts".
-async fn stamp_cursor(store: &dyn Store, id: i64, report: &mut GenreBackfillReport) {
+async fn stamp_cursor(store: &PublicationStore<'_>, id: i64, report: &mut GenreBackfillReport) {
     match store
         .put_setting(keys::GENRE_BACKFILL_CURSOR, &id.to_string())
         .await

@@ -168,7 +168,7 @@ pub async fn reanalyze(
             "this item has no files to analyze".into(),
         ));
     }
-    let report = plurx_core::scan::reprobe_files(state.store.as_ref(), &files).await?;
+    let report = state.jobs.reanalyze_files(&files).await?;
     tracing::info!(
         item = id,
         repaired = report.repaired,
