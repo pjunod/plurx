@@ -87,9 +87,7 @@ class ClientTests(unittest.TestCase):
                 encoding="utf-8",
             )
             executable.chmod(0o755)
-            started = time.monotonic()
             measured = client(executable, HOLD_SECONDS).decode_for(stream(), 0.01)
-            elapsed = time.monotonic() - started
             self.assertIn("first_frame_monotonic", measured)
             # The decoder exits immediately, so its own exit is what the client
             # waits on; the grandchild keeps the inherited stdout write end open
@@ -105,7 +103,6 @@ class ClientTests(unittest.TestCase):
                 released_path.exists(),
                 "client waited for the inherited stdout write end to close",
             )
-            self.assertLess(elapsed, HOLD_SECONDS)
 
     def test_signal_resistant_decoder_is_killed_without_a_five_second_overrun(self):
         with tempfile.TemporaryDirectory() as directory:
