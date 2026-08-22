@@ -3113,9 +3113,14 @@ mod tests {
             .await
             .expect("replacement user");
         assert_eq!(replacement.id, original.id, "numeric id must be reused");
-        assert_eq!(
-            replacement.created_at, original.created_at,
-            "the regression must cover same-second replacement"
+        let same_second_replacement_generation = plurx_core::domain::CredentialGeneration::derive(
+            replacement.id,
+            original.created_at,
+            &replacement.password_hash,
+        );
+        assert_ne!(
+            same_second_replacement_generation, original_generation,
+            "the generation must distinguish replacement credentials even at the same second"
         );
         let replacement_generation = plurx_core::domain::CredentialGeneration::derive(
             replacement.id,
