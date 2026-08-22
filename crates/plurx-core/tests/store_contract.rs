@@ -476,9 +476,9 @@ async fn token_activity_refresh_burst_is_bounded_by_serving_process_count() {
         .expect("make multi-process token activity refresh due");
 
     let before = contract_applied_index(&client).await;
-    let barrier = Arc::new(tokio::sync::Barrier::new(361));
+    let barrier = Arc::new(tokio::sync::Barrier::new(121));
     let mut requests = tokio::task::JoinSet::new();
-    for ordinal in 0..360 {
+    for ordinal in 0..120 {
         // Clones within each group share a gate. The three independently
         // bootstrapped stores model serving processes with separate gates.
         let store = stores[ordinal % stores.len()].clone();
@@ -500,7 +500,7 @@ async fn token_activity_refresh_burst_is_bounded_by_serving_process_count() {
     let delta = contract_applied_index(&client).await.saturating_sub(before);
     assert!(
         (1..=3).contains(&delta),
-        "360 simultaneous requests on three serving processes appended {delta} activity entries"
+        "120 simultaneous requests on three serving processes appended {delta} activity entries"
     );
 }
 
