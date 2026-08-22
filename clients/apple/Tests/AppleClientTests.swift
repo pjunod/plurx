@@ -6093,6 +6093,36 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testTVPlaybackInfoUsesTenFootScaleAndPlainHealthLabels() {
+        XCTAssertGreaterThanOrEqual(
+            TVPlaybackInfoPresentation.panelMaxWidth,
+            1_440,
+            "playback diagnostics must use the television canvas, not a phone-sized panel"
+        )
+        XCTAssertGreaterThanOrEqual(TVPlaybackInfoPresentation.titleFontSize, 40)
+        XCTAssertGreaterThanOrEqual(TVPlaybackInfoPresentation.valueFontSize, 22)
+        XCTAssertGreaterThanOrEqual(
+            TVPlaybackInfoPresentation.cardMinimumHeight,
+            300
+        )
+        XCTAssertEqual(
+            TVPlaybackInfoPresentation.healthLabel(stalls: nil),
+            "Measuring"
+        )
+        XCTAssertEqual(
+            TVPlaybackInfoPresentation.healthLabel(stalls: 0),
+            "No stalls"
+        )
+        XCTAssertEqual(
+            TVPlaybackInfoPresentation.healthLabel(stalls: 1),
+            "1 stall"
+        )
+        XCTAssertEqual(
+            TVPlaybackInfoPresentation.healthLabel(stalls: 3),
+            "3 stalls"
+        )
+    }
+
     func testShelfMetadataUsesMediaFactsInsteadOfLibraryCategory() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
