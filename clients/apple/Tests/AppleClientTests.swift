@@ -5431,6 +5431,83 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerView.playbackDateLabel(airDate: nil, year: 2025), "2025")
     }
 
+    /// A chapterless file gets a duration-based end-credits estimate that the
+    /// server marks `chapter: false` precisely so the UI can hedge
+    /// (docs/ARCHITECTURE.md §6, docs/FEATURES.md). Rendering it exactly like a
+    /// chapter-derived marker makes a guess read as a fact, so flattening the
+    /// two presentations back together fails here — on both platforms.
+    func testEstimatedCreditsMarkerReadsAsAGuessAndChapterMarkersStayExact() {
+        let estimate = Marker(
+            kind: "credits",
+            label: "Skip Credits",
+            startMs: 80_000,
+            endMs: 90_000,
+            chapter: false
+        )
+        let chapterDerived = Marker(
+            kind: "credits",
+            label: "Skip Credits",
+            startMs: 80_000,
+            endMs: 90_000,
+            chapter: true
+        )
+        let olderServer = Marker(
+            kind: "credits",
+            label: "Skip Credits",
+            startMs: 80_000,
+            endMs: 90_000
+        )
+
+        XCTAssertTrue(PlayerMarkerButtonLabel.isEstimated(estimate))
+        XCTAssertFalse(PlayerMarkerButtonLabel.isEstimated(chapterDerived))
+        XCTAssertFalse(
+            PlayerMarkerButtonLabel.isEstimated(olderServer),
+            "a missing chapter flag is not evidence of an estimate"
+        )
+
+        let hedged = PlayerMarkerButtonLabel.displayTitle(
+            estimate.label,
+            estimated: PlayerMarkerButtonLabel.isEstimated(estimate)
+        )
+        let exact = PlayerMarkerButtonLabel.displayTitle(
+            chapterDerived.label,
+            estimated: PlayerMarkerButtonLabel.isEstimated(chapterDerived)
+        )
+
+        XCTAssertNotEqual(hedged, exact, "an estimate must not read as a chapter marker")
+        XCTAssertEqual(exact, "Skip Credits", "a chapter marker keeps today's label verbatim")
+        XCTAssertEqual(
+            PlayerMarkerButtonLabel.displayTitle(olderServer.label, estimated: false),
+            "Skip Credits"
+        )
+        XCTAssertTrue(
+            hedged.hasPrefix(PlayerMarkerButtonLabel.estimatedMark),
+            "the hedge leads so a truncating accessibility size cannot drop it"
+        )
+        XCTAssertTrue(hedged.hasSuffix("Skip Credits"), "the action stays legible")
+
+        XCTAssertEqual(
+            PlayerMarkerButtonLabel.symbol(estimated: false),
+            "forward.end.fill",
+            "the exact marker keeps its solid glyph"
+        )
+        XCTAssertNotEqual(
+            PlayerMarkerButtonLabel.symbol(estimated: true),
+            PlayerMarkerButtonLabel.symbol(estimated: false),
+            "the glyph is the second signal, for a viewer who reads the icon first"
+        )
+
+        XCTAssertEqual(
+            PlayerMarkerButtonLabel.accessibilityLabel("Skip Credits", estimated: true),
+            "Skip Credits, estimated",
+            "VoiceOver reads neither the glyph nor the mark"
+        )
+        XCTAssertEqual(
+            PlayerMarkerButtonLabel.accessibilityLabel("Skip Credits", estimated: false),
+            "Skip Credits"
+        )
+    }
+
     #if os(iOS)
     @MainActor
     func testIPadPlaybackWideRowExpandsTheTimelineAcrossThePlayer() {
@@ -5545,6 +5622,111 @@ final class AppleClientTests: XCTestCase {
                     }
                 }
                 window.isHidden = true
+            }
+        }
+    }
+
+    /// The hedged content has to survive the same row the exact content does:
+    /// pinned to the trailing edge, inside the viewport, and compact enough at
+    /// every touch width and text size that the estimate is not paid for with a
+    /// player control that no longer fits.
+    @MainActor
+    func testEstimatedSkipMarkerRowStaysCompactAtEveryTouchWidthAndTextSize() {
+        let horizontalPadding: CGFloat = 20
+        let sizeCategories: [ContentSizeCategory] = [
+            .large,
+            .accessibilityExtraExtraExtraLarge,
+        ]
+
+        func measure(
+            estimated: Bool,
+            sizeCategory: ContentSizeCategory,
+            viewportWidth: CGFloat
+        ) -> CGRect {
+            var buttonFrame: CGRect = .null
+            let controller = UIHostingController(rootView:
+                PlayerTrailingControlRow {
+                    Button {} label: {
+                        PlayerMarkerButtonLabel(
+                            title: "Skip Credits",
+                            estimated: estimated
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .reportLayoutFrame()
+                }
+                .environment(\.sizeCategory, sizeCategory)
+                .padding(.horizontal, horizontalPadding)
+                .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                    buttonFrame = $0
+                }
+            )
+
+            controller.view.frame = CGRect(
+                origin: .zero,
+                size: CGSize(width: viewportWidth, height: 160)
+            )
+            let window = UIWindow(frame: controller.view.frame)
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            controller.view.setNeedsLayout()
+            controller.view.layoutIfNeeded()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            window.isHidden = true
+            return buttonFrame
+        }
+
+        for sizeCategory in sizeCategories {
+            var referenceButtonWidth: CGFloat?
+
+            for viewportWidth: CGFloat in [320, 390, 430, 744, 1_024, 1_366] {
+                let context = "width: \(viewportWidth), size: \(sizeCategory)"
+                let hedged = measure(
+                    estimated: true,
+                    sizeCategory: sizeCategory,
+                    viewportWidth: viewportWidth
+                )
+
+                XCTAssertFalse(hedged.isNull, context)
+                XCTAssertEqual(
+                    hedged.maxX,
+                    viewportWidth - horizontalPadding,
+                    accuracy: 0.5,
+                    context
+                )
+                XCTAssertLessThanOrEqual(
+                    hedged.width,
+                    viewportWidth - (2 * horizontalPadding) + 0.5,
+                    context
+                )
+
+                guard sizeCategory == .large else { continue }
+
+                let exact = measure(
+                    estimated: false,
+                    sizeCategory: sizeCategory,
+                    viewportWidth: viewportWidth
+                )
+                XCTAssertGreaterThan(
+                    hedged.width,
+                    exact.width,
+                    "the estimate has to be visible in the row it renders in: \(context)"
+                )
+                XCTAssertLessThanOrEqual(
+                    hedged.width,
+                    exact.width + 24,
+                    "the hedge is a mark, not a second label: \(context)"
+                )
+                if let referenceButtonWidth {
+                    XCTAssertEqual(
+                        hedged.width,
+                        referenceButtonWidth,
+                        accuracy: 0.5,
+                        context
+                    )
+                } else {
+                    referenceButtonWidth = hedged.width
+                }
             }
         }
     }
