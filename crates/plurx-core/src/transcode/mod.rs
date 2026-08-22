@@ -959,7 +959,9 @@ pub fn hls_args(
     let subtitle_burn = opts.subtitle_burn.is_some();
     let vendor_gpu =
         matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) && !subtitle_burn;
-    let suffix = encoder.filter_suffix().filter(|_| !vendor_gpu);
+    let suffix = encoder
+        .filter_suffix_for(opts.pipeline.output_grade())
+        .filter(|_| !vendor_gpu);
     let mut vf = String::new();
     if let Some(prefix) = &hwdownload {
         vf.push_str(prefix);
@@ -1992,6 +1994,54 @@ mod tests {
         // …and the muxer/segment policy is untouched.
         assert!(joined.contains("-force_key_frames expr:gte(t,n_forced*2)"));
         assert!(joined.contains("-hls_segment_type mpegts"));
+
+        source.width = Some(3840);
+        source.height = Some(2160);
+        let qsv = hls_args(
+            &source,
+            Encoder::Qsv,
+            &TranscodeOptions {
+                tone_map: ToneMap::None,
+                pipeline: Pipeline::DoviPassthrough,
+                target_height: 2160,
+                video_bitrate_kbps: 20_000,
+                force_idr: true,
+                ..Default::default()
+            },
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(
+            qsv.starts_with(
+                "-hide_banner -loglevel error -init_hw_device qsv=hw -filter_hw_device hw"
+            ),
+            "{qsv}"
+        );
+        assert!(
+            qsv.contains(
+                "scale=3840:2160,format=yuv420p10le,format=p010le,\
+                 hwupload=extra_hw_frames=64,format=qsv"
+            ),
+            "{qsv}"
+        );
+        assert!(
+            qsv.contains("-c:v hevc_qsv -preset veryfast -profile:v main10"),
+            "{qsv}"
+        );
+        assert!(
+            qsv.contains("-color_primaries bt2020 -color_trc smpte2084"),
+            "{qsv}"
+        );
+        assert!(
+            qsv.contains("-colorspace bt2020nc -color_range tv"),
+            "{qsv}"
+        );
+        assert!(qsv.contains("-forced_idr 1"), "{qsv}");
+        assert!(
+            !qsv.contains("-hwaccel qsv"),
+            "Dolby RPU side data requires software decode: {qsv}"
+        );
     }
 
     /// PQ at 8 bits does not fail — it calls `abort()`. The guard therefore
