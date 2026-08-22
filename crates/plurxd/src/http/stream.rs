@@ -172,6 +172,10 @@ pub struct Caps {
     /// Max height to direct-play (omit = uncapped; a decodable 4K stream
     /// direct-plays and the browser downscales).
     pub maxheight: Option<i64>,
+    /// Per-codec direct-play height ceilings, e.g.
+    /// `h264:1080,hevc:2160,av1:1080`. A codec entry narrows `maxheight` for
+    /// that codec, while omission keeps older clients byte-for-byte stable.
+    pub vmaxheight: Option<String>,
     /// 1 when HDR may be shown directly (browser decodes it AND display is HDR).
     pub hdr: Option<u8>,
     /// `1` when this client decodes Dolby Vision (Safari does; Chrome does
@@ -226,6 +230,19 @@ fn csv(s: &Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn codec_max_heights(s: &Option<String>) -> std::collections::HashMap<String, i64> {
+    s.as_deref()
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|entry| {
+            let (codec, height) = entry.split_once(':')?;
+            let codec = codec.trim().to_ascii_lowercase();
+            let height = height.trim().parse::<i64>().ok()?;
+            (!codec.is_empty() && height > 0).then_some((codec, height))
+        })
+        .collect()
+}
+
 impl Caps {
     /// True when the client reported real capabilities (vs. only a named profile).
     fn has_caps(&self) -> bool {
@@ -268,6 +285,7 @@ impl Caps {
                 self.hdr == Some(1),
                 self.dvprofile.is_none() && self.dv == Some(1),
             );
+            profile.video_max_heights = codec_max_heights(&self.vmaxheight);
             profile.dolby_vision_profiles = csv(&self.dvprofile)
                 .into_iter()
                 .filter_map(|value| value.parse::<u8>().ok())
@@ -747,11 +765,12 @@ fn apply_selected_subtitle(
         .map(|track| track.codec.as_str())
         .unwrap_or("unknown");
 
-    // The established HDR guard refuses an SDR burn rather than silently
-    // replacing HDR/Dolby Vision video. Selection-aware preflight discloses
-    // that separately in `DecisionSelection`; do not add a reason for a failure
-    // that did not change the returned playback method.
-    if matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg")) {
+    // Refuse only when adding the subtitle would downgrade the picture the
+    // base decision actually delivers. An HDR source that is already being
+    // tone-mapped to SDR (for example because the display has `hdr=0`) loses
+    // no dynamic range by drawing its forced PGS subtitle into that SDR
+    // transcode. Looking at `file.hdr` here used to reject that valid plan.
+    if subtitle_burn_would_discard_hdr(decision, requires_burn_in) {
         return;
     }
 
@@ -762,6 +781,14 @@ fn apply_selected_subtitle(
     decision
         .reasons
         .push(format!("selected subtitle codec {codec} requires burn-in"));
+}
+
+fn subtitle_burn_would_discard_hdr(decision: &Decision, requires_burn_in: bool) -> bool {
+    requires_burn_in
+        && matches!(
+            decision.delivered_dynamic_range,
+            "dolby_vision" | "hdr10" | "hlg"
+        )
 }
 
 /// Classify a chapter title as an intro or end-credits marker. Case-insensitive
@@ -1015,8 +1042,8 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
     v.get("chapters")?.as_array().cloned()
 }
 
-/// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
-/// container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime browser
+/// GET /api/v1/files/:id/decision — players send `?vcodec=…&vmaxheight=…&
+/// acodec=…&container=…&hdr=…&force=…&audio=…&subtitle=…` (runtime
 /// capabilities + request-local track/quality choices); native clients still
 /// pass `?profile=`. `subtitle=-1` explicitly selects Off.
 pub async fn decision(
@@ -1027,9 +1054,17 @@ pub async fn decision(
     headers: HeaderMap,
     super::network::RemoteAddress(remote): super::network::RemoteAddress,
 ) -> Result<Json<DecisionResponse>, ApiError> {
-    let identity = super::network::identity(&headers, remote);
+    let mut identity = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = identity {
+        id.user_id = Some(user.id);
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
+    }
     let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+        super::network::stored_prior(state.store.as_ref(), identity.as_ref()).await?;
     let mut file = load_file(&state, id).await?;
     // Older builds stored this against the file. A fresh playback must never
     // inherit that historical value; its client starts at zero and carries
@@ -1064,11 +1099,11 @@ pub async fn decision(
     let selection_requested = q.audio.is_some() || q.subtitle.is_some();
     let selected_subtitle_requires_burn =
         subtitle_requires_burn_in(&file, selected_subtitle, state.pgs_overlay_enabled);
-    let subtitle_burn_in_blocked_by_hdr = selected_subtitle_requires_burn
-        && matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"));
     let container_default_audio = container_default_audio_index(&file.audio_streams);
     set_selected_audio_default(&mut file.audio_streams, selected_audio);
     let mut decision = q.decide(&file, dv_strippable(&state));
+    let subtitle_burn_in_blocked_by_hdr =
+        subtitle_burn_would_discard_hdr(&decision, selected_subtitle_requires_burn);
     // Only an explicit subtitle choice may change the delivery verdict. An
     // audio-only request still echoes the effective policy subtitle below,
     // but delivery does not burn that track unless the caller chose it.
@@ -1100,6 +1135,7 @@ pub async fn decision(
         client = q.client.as_deref().unwrap_or("unknown"),
         device = q.device.as_deref().unwrap_or("unknown"),
         vcodec = q.vcodec.as_deref().unwrap_or(""),
+        vmaxheight = q.vmaxheight.as_deref().unwrap_or(""),
         acodec = q.acodec.as_deref().unwrap_or(""),
         container = q.container.as_deref().unwrap_or(""),
         hdr = q.hdr.unwrap_or_default(),
@@ -1364,6 +1400,7 @@ pub struct StreamQuery {
     pub device: Option<String>,
     pub profile: Option<String>,
     pub vcodec: Option<String>,
+    pub vmaxheight: Option<String>,
     pub acodec: Option<String>,
     pub container: Option<String>,
     pub maxheight: Option<i64>,
@@ -1434,6 +1471,7 @@ impl StreamQuery {
             device: self.device.clone(),
             profile: self.profile.clone(),
             vcodec: self.vcodec.clone(),
+            vmaxheight: self.vmaxheight.clone(),
             acodec: self.acodec.clone(),
             container: self.container.clone(),
             maxheight: self.maxheight,
@@ -2166,6 +2204,25 @@ mod tests {
         assert!(profile.remux_dolby_vision);
     }
 
+    #[test]
+    fn runtime_caps_parse_per_codec_height_limits() {
+        let caps = Caps {
+            vcodec: Some("h264,hevc,av1".into()),
+            acodec: Some("aac".into()),
+            container: Some("mp4".into()),
+            maxheight: Some(2160),
+            vmaxheight: Some(" H264:1080,hevc:2160,av1:bad,empty:0,broken ".into()),
+            ..Default::default()
+        };
+
+        let profile = caps.profile();
+        assert_eq!(profile.max_height, Some(2160));
+        assert_eq!(profile.video_max_heights.get("h264"), Some(&1080));
+        assert_eq!(profile.video_max_heights.get("hevc"), Some(&2160));
+        assert!(!profile.video_max_heights.contains_key("av1"));
+        assert!(!profile.video_max_heights.contains_key("empty"));
+    }
+
     /// ffmpeg's `-progress` shares stderr with its diagnostics here, because
     /// stdout is the MP4. Telling them apart is the whole trick, and getting it
     /// wrong in either direction is silent: a misread error line vanishes from
@@ -2562,7 +2619,7 @@ mod tests {
                 ..Default::default()
             }
         }
-        let file = MediaFile {
+        let mut file = MediaFile {
             id: 1,
             item_id: 1,
             path: "/media/anime.mkv".into(),
@@ -2638,5 +2695,29 @@ mod tests {
                 plurx_core::tracks::is_native_text_subtitle(&source.codec)
             );
         }
+
+        // Bad Boys for Life's exact shape: HDR source, but `hdr=0` already
+        // made the base decision SDR before its forced PGS track was applied.
+        // Burning that track is not an HDR downgrade and must remain valid.
+        file.hdr = Some("hdr10".into());
+        let mut already_sdr = planned(playback::PlaybackMethod::Transcode);
+        already_sdr.delivered_dynamic_range = "sdr";
+        assert!(!subtitle_burn_would_discard_hdr(&already_sdr, true));
+        apply_selected_subtitle(&mut already_sdr, &file, Some(3), true);
+        assert_eq!(already_sdr.method, playback::PlaybackMethod::Transcode);
+        assert!(already_sdr
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("requires burn-in")));
+
+        let mut still_hdr = planned(playback::PlaybackMethod::Remux);
+        still_hdr.delivered_dynamic_range = "hdr10";
+        assert!(subtitle_burn_would_discard_hdr(&still_hdr, true));
+        apply_selected_subtitle(&mut still_hdr, &file, Some(3), true);
+        assert_eq!(still_hdr.method, playback::PlaybackMethod::Remux);
+        assert!(
+            still_hdr.reasons.is_empty(),
+            "a burn must not silently replace an HDR delivery with SDR"
+        );
     }
 }

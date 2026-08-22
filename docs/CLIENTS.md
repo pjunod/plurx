@@ -54,8 +54,12 @@ presenting the cost; text tracks still use the existing `native` flag because
 ASS/SSA and `mov_text` require a burn on native HLS even though the server can
 extract them as sidecars. A true
 `selection.subtitle_burn_in_blocked_by_hdr` means the existing HDR guard kept
-the current delivery instead of replacing it with SDR. The choice belongs to
-one playback only; no client writes Playback defaults as a side effect.
+the current HDR delivery instead of replacing it with SDR. The guard follows
+the delivered plan, so an HDR source already being tone-mapped for an SDR
+display may still carry its forced bitmap subtitle. Apple and Android state
+that context on session creation with `subtitle_burn_sdr: true`; absence
+remains a fail-closed old-client request. The choice belongs to one playback
+only; no client writes Playback defaults as a side effect.
 
 `selection.subtitle_requires_burn_in` describes the *server's plan*, and it is
 false when the PGS application overlay is enabled — a delivery only the native
@@ -176,20 +180,20 @@ image boundary.
 `previous_session_id` plus `reopen_reason: "stall"` and returns its normalized
 `height` under the attempt's `request_id`. That wire is additive and available
 to both native codebases. **Apple and Android have adopted it.** Android sends
-`quality_auto: true` when an Auto viewer's subtitle burn-in posts a promise
-height; an Auto session that posts no height omits the field. Android stops
-after three consecutive bound reopens
-that do not resolve to a strictly lower rung. A user-initiated seek, quality
-change, or track change resets that budget and invalidates the stall request.
+`quality_auto: true` when an Auto viewer's otherwise-copyable subtitle burn-in
+posts a source-height promise. A burn on a plan that already needed video
+transcoding posts no height and leaves the encoder-aware Auto rung to the
+server. Android stops after three consecutive bound reopens that do not
+resolve to a strictly lower rung. A user-initiated seek, quality change, or
+track change resets that budget and invalidates the stall request.
 
 Two obligations come with adopting it. A client that posts a *promise* height —
-the source height a subtitle burn or Quality = Original sends — while the
-viewer is on Auto must also send `quality_auto: true`, or the server reads that
-height as a sticky manual pick and never steps the session down; Android's
-`sessionHeight` answers the burn case before it consults quality, so this is
-its live case, not a hypothetical one. And the retry budget at the ladder floor
-belongs to the client: the server repeats the floor rung indefinitely and
-raises no terminal error of its own, by design.
+the source height an otherwise-copyable subtitle burn or Quality = Original
+sends — while the viewer is on Auto must also send `quality_auto: true`, or the
+server reads that height as a sticky manual pick and never steps the session
+down. The retry budget at the ladder floor belongs to the client: the server
+repeats the floor rung indefinitely and raises no terminal error of its own,
+by design.
 
 Apple's shape of both, in `PlayerController`, is the reference contract.
 `quality_auto` goes on *every* create as the viewer's own answer

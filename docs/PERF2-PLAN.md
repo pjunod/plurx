@@ -341,9 +341,10 @@ persist exactly `vbr` or `qvbr:<q>` when a package is created, existing rows
 backfill to `vbr`, and every resume uses that immutable value rather than the
 mutable global request. The replicated protocol remains v4 because no wire
 operation changes; schema v5 applies to fresh bootstrap/import, and an existing
-v4 cluster stays refused until the clustering upgrade protocol exists. N3's
-previously reserved SQLite v18 migration moves to v20: D9 assigns v19 to
-N4.2's node-local network priors.
+v4 cluster stays refused until the clustering upgrade protocol exists. D10
+preserves shipped reading state at SQLite v20, first-class book metadata at
+SQLite v21, and replicated v6, applies the N4.2 credential-generation
+correction at SQLite v22, and moves N3 to v23.
 Production encoding still uses the deployed
 server's Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is
 behavior-probed and scores captured bytes on the controller only after the
@@ -854,8 +855,8 @@ since adds:
 the conservative minimum of its client estimate and joined server delivery
 rate into a 25% EWMA. A supply/network stall records the lowest height known to
 starve, and when. Rows are node-local, retained for 30 days, and capped at 64
-networks per user/client class; a client routed to another cluster voter
-therefore starts cold, the tradeoff ratified in D9. The table stores only the
+networks per user/client class across credential generations; a client routed
+to another cluster voter therefore starts cold, the tradeoff ratified in D9. The table stores only the
 client class and IPv4 `/24`, never a full address. The class is derived from
 the request's own `User-Agent` on every path — the class is part of the primary
 key, so the reporting path and the consulting path must not derive it
@@ -1295,14 +1296,17 @@ All changes flow through the single `effective_recipe()` builder
   rows default/backfill to `vbr`). The replicated protocol remains v4.
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
-- N4.2: the node-local network-priors table is SQLite **v19**, matching N0's
-  node-local telemetry replication class. Replicated schema stays **v5** and
-  protocol stays **v4**; another voter deliberately starts cold.
+- N4.2: the original node-local network-priors table is SQLite **v19**. The
+  credential-generation correction is SQLite **v22**, after shipped reading
+  state at SQLite **v20** and first-class book metadata at SQLite **v21**.
+  Replicated schema stays **v6** and protocol stays **v4**; another voter
+  deliberately starts cold.
 - N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
-  manifest on location rows (schema **v20**; N0's telemetry table is
-  **v17**, N1's offline rate-control snapshot is **v18**, and N4.2's priors
-  table is **v19** — unique versions per slice, review R8); `prefix_secs` in
-  the recipe.
+  manifest on location rows (schema **v23**; N0's telemetry table is
+  **v17**, N1's offline rate-control snapshot is **v18**, N4.2's original
+  priors table is **v19**, reading state is **v20**, first-class book metadata
+  is **v21**, and credential-generation isolation is **v22** — unique versions
+  per slice, review R8); `prefix_secs` in the recipe.
 - N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
   HEVC changes the `muxer`/`segment_policy` fields — its own
   deliberate digest change, called out in its PR.
@@ -1444,6 +1448,12 @@ settings and may be amended without changing the contracts below.
    v5 and protocol stays v4. A client routed to another voter loses its prior
    and starts cold; that is the accepted cost of keeping coarse network
    observations off Raft.
+10. **D10 — append-only reconciliation.** Ratified 2026-08-21 after reading
+    state and first-class book metadata shipped: preserve reading state at
+    SQLite v20, book metadata at SQLite v21, and replicated schema v6; apply
+    the N4.2 credential-generation correction at SQLite v22; move N3 to SQLite
+    v23. The correction adds no replicated migration, protocol stays v4, and
+    old numeric-key prior rows are dropped rather than translated.
 
 ---
 

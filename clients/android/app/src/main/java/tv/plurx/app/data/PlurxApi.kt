@@ -80,7 +80,7 @@ interface PlurxApi {
     @POST("items/{id}/unscrobble")
     suspend fun markUnwatched(@Path("id") id: Long): MutationResult
 
-    /** The runtime caps map (vcodec/acodec/container/hdr/force) rides as query params. */
+    /** Runtime caps (vcodec/vmaxheight/acodec/container/HDR/force) ride as query params. */
     @GET("files/{id}/decision")
     suspend fun decision(
         @Path("id") id: Long,

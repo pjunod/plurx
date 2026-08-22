@@ -55,7 +55,7 @@ Replicated schema v6 added ebook reading state. Schema v7 adds nullable
 `author`, `book_work_id`, `book_edition_id`, and `book_metadata_source` item
 columns plus the partial work-id index. Stop application traffic and update
 every voter as one maintenance operation. The first v7 daemon that reaches
-quorum accepts an exact v5 or v6 activation marker and applies every missing
+quorum accepts any activation marker from v5 to the current v7 and applies every missing
 step in order. Each step commits its table/columns/index and compatibility row
 in one Raft transaction before the daemon starts producers or binds HTTP. A v5
 source therefore commits v5→v6 and then v6→v7; a v6 source commits only the
