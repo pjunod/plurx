@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["6b41197ed36cb39a5c901da1876972921ee0e379"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The replicated Store contract harness closes every voter control pipe and reaps every child before its temporary shared state is removed, so later serial and concurrent replicated contracts cannot inherit dying voters and lose quorum. The retained full serial Store contract and cluster-auth gate fail when the explicit ContractCluster cleanup is reverted."
