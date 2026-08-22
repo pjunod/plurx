@@ -9,7 +9,9 @@
 use std::time::Duration;
 
 use plurx_core::domain::MediaFile;
-use plurx_core::transcode::{output_size, Pacing, Pipeline};
+use plurx_core::transcode::{
+    output_size, EffectiveRateControl, Encoder, OutputGrade, Pacing, Pipeline,
+};
 
 /// An override wins only when it names something. An empty `PLURX_FFMPEG=` is
 /// what a Compose file produces for an unset variable, and treating that as a
@@ -28,6 +30,21 @@ pub fn ffmpeg_bin() -> String {
 /// ffprobe binary, overridable via `PLURX_FFPROBE` (jellyfin-ffmpeg / pinned).
 pub fn ffprobe_bin() -> String {
     resolve_bin(std::env::var("PLURX_FFPROBE").ok(), "ffprobe")
+}
+
+/// The executable and first line it reports from `-version`.
+pub async fn ffmpeg_build() -> String {
+    let bin = ffmpeg_bin();
+    let version = probe_ffmpeg(&["-version"])
+        .await
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "version unavailable".to_owned());
+    format!("{bin} ({version})")
 }
 
 /// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
@@ -49,6 +66,7 @@ static DOVI_RESHAPE_HW: std::sync::OnceLock<
     tokio::sync::Mutex<std::collections::HashMap<&'static str, bool>>,
 > = std::sync::OnceLock::new();
 static DOVI_PASSTHROUGH: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static DOVI_PASSTHROUGH_QSV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Does this build carry a given bitstream filter? Matched on a whole line of
 /// `ffmpeg -bsfs`, which lists exactly one filter per line — a substring
@@ -165,7 +183,7 @@ pub async fn has_dovi_reshape() -> bool {
                 );
                 return false;
             }
-            let passed = probe_dovi_reshape_graph(None, "libx264").await;
+            let passed = probe_dovi_reshape_graph(Encoder::Software).await;
             if passed {
                 tracing::info!("ffmpeg proved the Dolby Vision tonemapx renderer");
             } else {
@@ -181,35 +199,26 @@ pub async fn has_dovi_reshape() -> bool {
 /// Run one synthetic frame through the production Dolby Vision reshape graph,
 /// optionally uploading the filtered frames to a hardware encoder first.
 ///
-/// `upload` is the encoder's own `filter_suffix()` — `hwupload` for VA-API,
-/// `hwupload=extra_hw_frames=64,format=qsv` for QSV — appended after the
-/// software filter chain. The decode side is untouched: `lavfi` produces
-/// system-memory frames exactly as a software HEVC decode does.
-async fn probe_dovi_reshape_graph(upload: Option<&str>, codec: &str) -> bool {
+/// The encoder's device init, upload suffix and production argument builder
+/// are all used here. Omitting the init used to make every QSV probe fail with
+/// "A hardware device reference is required", even though the real session
+/// supplied that device and the node could run the graph.
+async fn probe_dovi_reshape_graph(encoder: Encoder) -> bool {
     let filter = format!(
         "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,scale=64:64,format=yuv420p{}",
-        upload.map(|s| format!(",{s}")).unwrap_or_default()
+        encoder
+            .filter_suffix_for(OutputGrade::Sdr)
+            .map(|s| format!(",{s}"))
+            .unwrap_or_default()
     );
     let mut command = tokio::process::Command::new(ffmpeg_bin());
     command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=64x64:rate=1:color=black",
-            "-frames:v",
-            "1",
-            "-vf",
-            &filter,
-            "-c:v",
-            codec,
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(encoder.init_args())
+        .args(["-f", "lavfi", "-i", "color=size=64x64:rate=1:color=black"])
+        .args(["-frames:v", "1", "-vf", &filter])
+        .args(encoder.encode_args(1_000, EffectiveRateControl::Vbr, false, None))
+        .args(["-f", "null", "-"])
         .kill_on_drop(true);
     tokio::time::timeout(Duration::from_secs(20), command.status())
         .await
@@ -232,7 +241,6 @@ async fn probe_dovi_reshape_graph(upload: Option<&str>, codec: &str) -> bool {
 /// route, and an unproved pairing falls back to software rather than failing a
 /// session in front of a viewer.
 pub async fn has_dovi_reshape_with(encoder: plurx_core::transcode::Encoder) -> bool {
-    use plurx_core::transcode::Encoder;
     if encoder == Encoder::Software {
         return has_dovi_reshape().await;
     }
@@ -248,7 +256,7 @@ pub async fn has_dovi_reshape_with(encoder: plurx_core::transcode::Encoder) -> b
     if let Some(known) = memo.get(key) {
         return *known;
     }
-    let passed = probe_dovi_reshape_graph(encoder.filter_suffix(), encoder.video_codec()).await;
+    let passed = probe_dovi_reshape_graph(encoder).await;
     if passed {
         tracing::info!(
             encoder = key,
@@ -350,6 +358,61 @@ pub async fn has_dovi_passthrough() -> bool {
                 stderr.trim()
             );
             false
+        })
+        .await
+}
+
+/// Can this node accept the software Dolby renderer's 10-bit frames and run
+/// the measured QSV Main10 encode graph?
+///
+/// The synthetic frame cannot carry a Dolby RPU, so the passthrough filter's
+/// documented refusal is proved separately by [`has_dovi_passthrough`]. This
+/// probe establishes the other half that refusal cannot reach: QSV device
+/// init, P010 conversion/upload, Main10 encode, bounded VBR and PQ/BT.2020
+/// output flags. A real source's RPU mutation is still proved per file.
+pub async fn has_dovi_passthrough_with(encoder: Encoder) -> bool {
+    if encoder == Encoder::Software {
+        return has_dovi_passthrough().await;
+    }
+    if encoder != Encoder::Qsv || !has_dovi_passthrough().await {
+        return false;
+    }
+    *DOVI_PASSTHROUGH_QSV
+        .get_or_init(|| async {
+            let Some(upload) = encoder.filter_suffix_for(OutputGrade::Hdr10) else {
+                return false;
+            };
+            let filter = upload.to_owned();
+            let mut command = tokio::process::Command::new(ffmpeg_bin());
+            command
+                .kill_on_drop(true)
+                .args(["-hide_banner", "-loglevel", "error"])
+                .args(encoder.init_args())
+                .args(["-f", "lavfi", "-i", "color=size=64x64:rate=1:color=black"])
+                .args(["-frames:v", "1", "-vf", &filter])
+                .args(encoder.encode_args_for(
+                    OutputGrade::Hdr10,
+                    20_000,
+                    EffectiveRateControl::Vbr,
+                    false,
+                    None,
+                ))
+                .args(["-f", "null", "-"]);
+            let passed = tokio::time::timeout(Duration::from_secs(20), command.status())
+                .await
+                .is_ok_and(|result| result.is_ok_and(|status| status.success()));
+            if passed {
+                tracing::info!(
+                    encoder = encoder.label(),
+                    "ffmpeg proved the Dolby Vision HDR10 renderer's hardware encode half"
+                );
+            } else {
+                tracing::warn!(
+                    encoder = encoder.label(),
+                    "ffmpeg could not run the Dolby Vision HDR10 hardware encode graph; using the measured software rung"
+                );
+            }
+            passed
         })
         .await
 }
@@ -472,7 +535,25 @@ fn pacing_from_probe(probe: Result<String, String>) -> PacingCaps {
 pub async fn pacing_caps() -> PacingCaps {
     *PACING
         .get_or_init(|| async {
-            pacing_from_probe(probe_ffmpeg(&["-hide_banner", "-h", "full"]).await)
+            let help = probe_ffmpeg(&["-hide_banner", "-h", "full"]).await;
+            let mut caps = pacing_from_probe(help);
+            // Some builds (notably ffmpeg 8.0.1) declare the option but
+            // silently ignore it. Check behaviourally when the declaration
+            // looks promising.
+            if caps.initial_burst {
+                let measured = classify_burst(caps, probe_burst().await);
+                if caps.initial_burst && !measured.initial_burst {
+                    let ffmpeg_build = ffmpeg_build().await;
+                    tracing::warn!(
+                        "this ffmpeg build ({ffmpeg_build}) declares -readrate_initial_burst but does not honour it: \
+                         sessions are paced flat from the first byte, so the copy path's publish gate \
+                         fills at the paced rate instead of at I/O speed and every play starts seconds \
+                         slower than it needs to"
+                    );
+                }
+                caps = measured;
+            }
+            caps
         })
         .await
 }
@@ -502,6 +583,54 @@ impl PacingCaps {
             initial_burst: self.initial_burst.then_some(burst).filter(|b| *b > 0.0),
             legacy_re: false,
         }
+    }
+}
+
+/// Check whether this ffmpeg build actually honours `-readrate_initial_burst`.
+///
+/// Some builds (notably ffmpeg 8.0.1-3ubuntu2) declare the option in their
+/// help text but silently ignore it at runtime, so a purely textual probe of
+/// the declaration is insufficient. This runs a short behavioural test.
+///
+/// The test creates a 2-second `testsrc` fixture and runs ffmpeg with a 300 s
+/// burst at 2x readrate. An honoured burst consumes the fixture at I/O speed
+/// (sub-200 ms). An inert burst paces at the readrate and takes ~1 second of
+/// wall time. A 600 ms threshold cleanly separates the two cases.
+fn classify_burst(mut caps: PacingCaps, probe: Result<Duration, String>) -> PacingCaps {
+    caps.initial_burst &= probe.is_ok_and(|elapsed| elapsed < Duration::from_millis(600));
+    caps
+}
+
+fn burst_probe_args() -> [&'static str; 14] {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-readrate_initial_burst",
+        "300",
+        "-readrate",
+        "2",
+        "-i",
+        "testsrc=duration=2:size=2x2:rate=1",
+        "-f",
+        "null",
+        "-",
+    ]
+}
+
+async fn probe_burst() -> Result<Duration, String> {
+    let args = burst_probe_args();
+    let start = std::time::Instant::now();
+    match tokio::process::Command::new(ffmpeg_bin())
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => Ok(start.elapsed()),
+        Ok(out) => Err(format!("exited with {}", out.status)),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -636,6 +765,51 @@ mod tests {
         );
         assert!(!caps.readrate);
         assert!(!caps.initial_burst);
+    }
+
+    #[test]
+    fn burst_probe_classifies_honoured_inert_and_failed_measurements() {
+        let declared = PacingCaps {
+            readrate: true,
+            initial_burst: true,
+        };
+        let honoured = classify_burst(declared, Ok(Duration::from_millis(599)));
+        assert!(honoured.initial_burst);
+        assert_eq!(
+            honoured.resolve(2.0, 90.0, true).args(),
+            vec!["-readrate_initial_burst", "90.0", "-readrate", "2.00"]
+        );
+        for probe in [
+            Ok(Duration::from_millis(600)),
+            Ok(Duration::from_secs(1)),
+            Err("probe failed".to_owned()),
+        ] {
+            let corrected = classify_burst(declared, probe);
+            assert!(!corrected.initial_burst);
+            assert_eq!(
+                corrected.resolve(2.0, 90.0, true).args(),
+                vec!["-readrate", "2.00"]
+            );
+        }
+    }
+
+    #[test]
+    fn burst_probe_applies_pacing_to_the_input() {
+        let args = burst_probe_args();
+        let input = args
+            .iter()
+            .position(|arg| *arg == "-i")
+            .expect("the probe must declare its synthetic input");
+        for option in ["-readrate_initial_burst", "-readrate"] {
+            let option_index = args
+                .iter()
+                .position(|arg| *arg == option)
+                .unwrap_or_else(|| panic!("the probe must pass {option}"));
+            assert!(
+                option_index < input,
+                "{option} is an input option and must precede -i: {args:?}"
+            );
+        }
     }
 
     #[test]

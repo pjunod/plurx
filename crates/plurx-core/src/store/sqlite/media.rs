@@ -312,6 +312,22 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {i} FROM items i \
+                 WHERE i.poster_path IS NOT NULL OR i.backdrop_path IS NOT NULL \
+                 ORDER BY i.id",
+                i = item_cols("i")
+            ))?;
+            let items = stmt
+                .query_map([], |row| item_from_row(row, 0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
     async fn list_top_items_in_genre(
         &self,
         library_id: i64,

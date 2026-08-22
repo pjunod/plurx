@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["596baafa", "947a3398"]
+points = ["playback.pipeline", "web.experience"]
+checks = ["rust-gate", "web-static"]
+reason = "The retained Rust regressions prove that Dolby Vision Profile 5 reaches only boot-proved SDR or HDR10 encoder pairs and advertises the produced Main10 stream, while the web policy regressions prove that HDR10 intent and grade-aware Auto selection survive every HLS reopen."

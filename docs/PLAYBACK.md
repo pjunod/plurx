@@ -579,10 +579,12 @@ Three details, each load-bearing:
   whatever it fetched before playback began and never grows, so every hiccup
   after that is a stall. Worse on an Apple TV, which wants ~3 segments before
   it starts at all. Now the session delivers a configurable head start
-  flat-out (`-readrate_initial_burst`, default 90 s) and then settles to a
-  small multiple of real time (`-readrate`, default 2×), while the disk is
-  bounded by the ahead-window suspend below instead of by starving the viewer.
-  An ffmpeg older than 5.1 has neither flag and falls back to `-re`.
+  flat-out (`-readrate_initial_burst`, default 90 s, when the ffmpeg build honours
+  it — some builds declare the option but ignore it at runtime, detected by a
+  behavioural probe in `ffmpeg.rs`) and then settles to a small multiple of
+  real time (`-readrate`, default 2×), while the disk is bounded by the
+  ahead-window suspend below instead of by starving the viewer. An ffmpeg older
+  than 5.1 has neither flag and falls back to `-re`.
 - **The ahead-window suspend.** Once a session is more than
   `playback.hls_ahead_max_secs` (default 180 s) of content ahead of the last
   segment the client fetched, the request-side flow controller SIGSTOPs its

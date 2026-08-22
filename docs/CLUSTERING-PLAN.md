@@ -220,6 +220,7 @@ pub struct Lease {
     pub resource: String,
     pub owner_node_id: String,
     pub fence: u64,
+    pub revision: u64,
     pub expires_at_unix_ms: i64,
 }
 
@@ -245,12 +246,16 @@ pub trait ClusterCoordinator: Send + Sync + 'static {
 }
 ```
 
-`job_leases(resource PRIMARY KEY, owner_node, fence, expires_at)` is replicated.
-Every acquisition increments `fence`. Publishing methods such as scan-batch
-upsert, cursor advance, cache completion, and queue completion take `&Lease`.
-The same replicated transaction first validates `resource`, `owner_node`, and
-`fence`; zero matching rows aborts the entire write. A pre-write check is not a
-fence. Clock skew may delay takeover, but it cannot let an old owner commit.
+`job_leases(resource PRIMARY KEY, owner_node, fence, revision, expires_at)` is
+replicated. Every ownership takeover increments `fence`; every takeover,
+renewal, and release advances the dedicated monotone `revision`. Renew and
+release exact-CAS `resource`, `owner_node`, `fence`, `revision`, and the
+previous expiry, so delayed same-fence operations and recurring expiry values
+cannot resurrect old authority. Publishing methods such as scan-batch upsert,
+cursor advance, cache completion, and queue completion take `&Lease`. The same
+replicated transaction first validates `resource`, `owner_node`, and `fence`;
+zero matching rows aborts the entire write. A pre-write check is not a fence.
+Clock skew may delay takeover, but it cannot let an old owner commit.
 
 `claim_session` is compare-and-set. Two survivors reading epoch 5 cannot both
 write epoch 6: one commits the higher lease fence and the other receives
@@ -729,10 +734,12 @@ reconfiguration state, never supported HA.
 
 **M3a delivered 2026-08-15.** A running voter can issue a bounded, single-use
 join token; a fresh daemon consumes it to join as a real voter without changing
-the replicated `instance.id`. The admin-only membership API exposes
-privacy-safe node id, Raft id, voter/learner role, reachability, and last-seen,
-then embeds the existing §6.6/#233 replication projection as its only lag
-answer. Both remote cluster listeners use automatic TLS, and the listener
+the replicated `instance.id`. The admin-only membership API exposes the actual
+short machine hostname, the advertised host without its listener port
+(`localhost` for loopback), stable node id, current-leader marker, Raft id,
+voter/learner role, reachability, and last-seen, then embeds the existing
+§6.6/#233 replication projection as its only lag answer. Both remote cluster
+listeners use automatic TLS, and the listener
 policy refuses a public cleartext bind. A never-joined installation remains on
 loopback until the operator sets `advertise_host`; a sole voter then rebuilds
 only its one-node Raft metadata from a verified Hiqlite snapshot so the

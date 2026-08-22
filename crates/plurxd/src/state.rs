@@ -24,7 +24,7 @@ use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::logbuf::LogBuffer;
+use crate::logbuf::{LogBuffer, LogBuffers};
 use crate::offline::OfflineManager;
 use crate::schedule::{due_jobs, DueJob, GlobalSchedule};
 use crate::trakt::TraktManager;
@@ -75,6 +75,10 @@ pub struct SystemInfo {
     /// probe of a separate graph — the SDR one proves nothing about a PQ
     /// output, where an 8-bit format aborts the process outright.
     pub dovi_passthrough: bool,
+    /// Whether this node proved the P010 upload → QSV Main10 half of the
+    /// Dolby Vision HDR10 route. Kept separate so a working software rung
+    /// never implies a working GPU driver.
+    pub dovi_passthrough_qsv: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -127,6 +131,8 @@ pub struct AppState {
     pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
+    /// Replication/membership detail kept out of the general diagnostics ring.
+    pub cluster_logs: Arc<LogBuffer>,
     /// The coming-soon rail's cached answer from monarr (plan §11.2).
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
     /// Pushes watch state to monarr when enabled (plan §11.1).
@@ -156,6 +162,10 @@ pub struct AppState {
     /// lifetimes, so this holds only what would otherwise be invisible; see
     /// [`crate::delivery`].
     pub direct_plays: Arc<crate::delivery::DirectPlays>,
+    /// Application-initiated graceful drain. Signals still use the process
+    /// watcher in `main`; the cluster leave endpoint cancels this only after
+    /// its own voter removal has committed.
+    pub shutdown: tokio_util::sync::CancellationToken,
     pub started_at: Instant,
 }
 
@@ -189,7 +199,10 @@ impl AppState {
             dirs,
             encoder_caps,
             system,
-            logs,
+            LogBuffers {
+                general: logs,
+                cluster: Arc::new(LogBuffer::default()),
+            },
         )
     }
 
@@ -199,7 +212,7 @@ impl AppState {
         dirs: Dirs,
         encoder_caps: EncoderCaps,
         system: SystemInfo,
-        logs: Arc<LogBuffer>,
+        logs: LogBuffers,
     ) -> Self {
         let AppConfig {
             server_name,
@@ -233,6 +246,7 @@ impl AppState {
             .with_dv_strippable(system.dovi_rpu)
             .with_dovi_reshape(system.dovi_reshape)
             .with_dovi_passthrough(system.dovi_passthrough)
+            .with_dovi_passthrough_qsv(system.dovi_passthrough_qsv)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
@@ -272,7 +286,8 @@ impl AppState {
             publications: crate::http::publication::PublicationSessions::new(),
             trakt,
             system: Arc::new(system),
-            logs,
+            logs: logs.general,
+            cluster_logs: logs.cluster,
             coming_soon,
             watched,
             progress,
@@ -281,6 +296,7 @@ impl AppState {
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),
             direct_plays: crate::delivery::DirectPlays::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             started_at: Instant::now(),
         }
     }

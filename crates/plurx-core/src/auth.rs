@@ -47,6 +47,18 @@ pub fn generate_token() -> Result<String, AuthError> {
 /// either being tried against the other's table.
 pub const API_KEY_PREFIX: &str = "plx_";
 
+/// Minimum age of an authentication activity timestamp before it is refreshed.
+///
+/// Authentication still performs an authority-consistent credential lookup on
+/// every request. This window only coalesces the best-effort activity write so
+/// repeated requests do not each append a Raft log entry.
+pub const ACTIVITY_REFRESH_SECS: i64 = 60;
+
+/// Whether an authentication activity timestamp is old enough to refresh.
+pub fn activity_refresh_due(last_activity_at: Option<i64>, now: i64) -> bool {
+    last_activity_at.is_none_or(|last| last < now.saturating_sub(ACTIVITY_REFRESH_SECS))
+}
+
 /// Generate a fresh API key secret: `plx_` + 32 hex (16 random bytes).
 ///
 /// Shorter than a login token by design — it is pasted between machines by a
@@ -106,5 +118,14 @@ mod tests {
             hash_token(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn activity_refresh_is_due_only_after_the_window() {
+        assert!(activity_refresh_due(None, 1_000));
+        assert!(!activity_refresh_due(Some(941), 1_000));
+        assert!(!activity_refresh_due(Some(940), 1_000));
+        assert!(activity_refresh_due(Some(939), 1_000));
+        assert!(!activity_refresh_due(Some(1_001), 1_000));
     }
 }

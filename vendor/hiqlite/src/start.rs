@@ -181,7 +181,8 @@ where
                         .post(management::post_membership)
                         .delete(management::leave_cluster),
                 )
-                .route("/metrics/{raft_type}", get(management::metrics)),
+                .route("/metrics/{raft_type}", get(management::metrics))
+                .route("/elect/{raft_type}", post(management::elect)),
         )
         .route("/listen", get(api::listen))
         .route("/stream/{raft_type}", get(api::stream))

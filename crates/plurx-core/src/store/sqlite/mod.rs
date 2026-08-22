@@ -10,6 +10,7 @@
 
 mod apikeys;
 mod cache;
+mod coordination;
 mod library;
 mod media;
 mod offline;
@@ -608,6 +609,17 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX network_priors_by_updated
         ON network_priors(updated_at_ms, user_id, client_class);",
+    // v23: monotone cluster-work leases. Release retains the row so an old
+    // fence can never become current again after the logical resource is
+    // reacquired.
+    "CREATE TABLE job_leases (
+        resource       TEXT PRIMARY KEY,
+        owner_node_id  TEXT NOT NULL,
+        fence          INTEGER NOT NULL CHECK (fence > 0),
+        revision       INTEGER NOT NULL CHECK (revision > 0),
+        expires_at_ms  INTEGER NOT NULL,
+        updated_at_ms  INTEGER NOT NULL
+    ) STRICT;",
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -1292,7 +1304,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 22,
+            version, 23,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1438,7 +1450,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 22);
+        assert_eq!(version, SQLITE_SCHEMA_VERSION);
         for index in ["playback_events_by_event", "playback_events_by_file"] {
             let present: i64 = conn
                 .query_row(
@@ -1493,7 +1505,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         assert!(conn
             .execute(
@@ -1561,7 +1573,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         let index: i64 = conn
             .query_row(
@@ -1639,7 +1651,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         assert!(conn
             .execute(
@@ -1680,7 +1692,7 @@ mod tests {
             .expect("seed v20 rows");
         }
 
-        let store = SqliteStore::open(&db).expect("migrate v20 to v21");
+        let store = SqliteStore::open(&db).expect("migrate v20 to current");
         let item = store
             .get_item(10)
             .await
@@ -1700,7 +1712,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         let index: i64 = conn
             .query_row(
@@ -1738,7 +1750,7 @@ mod tests {
                 .expect("version");
         }
 
-        let store = SqliteStore::open(&db).expect("migrate v21 to v22");
+        let store = SqliteStore::open(&db).expect("migrate v21 to current");
         assert_eq!(
             store
                 .get_setting("migration.proof")
@@ -1765,12 +1777,66 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            22
+            SQLITE_SCHEMA_VERSION
         );
         let old_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM network_priors", [], |row| row.get(0))
             .expect("count new-format rows");
         assert_eq!(old_rows, 1, "legacy numeric-key rows must be dropped");
+    }
+
+    #[tokio::test]
+    async fn v23_adds_monotone_job_leases_without_losing_v22_state() {
+        use crate::cluster::coordination::LeaseClaim;
+        use crate::store::{CoordinationStore, SettingsStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(22) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|error| panic!("v{}: {error}", index + 1));
+            }
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('migration.proof', 'survives-v22')",
+                [],
+            )
+            .expect("seed v22 row");
+            conn.pragma_update(None, "user_version", 22)
+                .expect("version");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v22 to v23");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read v22 proof")
+                .as_deref(),
+            Some("survives-v22")
+        );
+        let lease = store
+            .acquire_lease("migration-proof", "node-a", 100, 200)
+            .await
+            .expect("acquire migrated lease");
+        assert!(matches!(lease, LeaseClaim::Acquired(lease) if lease.fence == 1));
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            SQLITE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('job_leases')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("job lease columns"),
+            6
+        );
     }
     /// v13 adds a column to `items`, which is the migration shape with a
     /// silent failure mode: `ITEM_COLS` and `ITEM_COL_COUNT` are positional,

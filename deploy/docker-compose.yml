@@ -76,6 +76,11 @@ services:
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       PLURX_SERVER_NAME: "plurx"
+      # Containers see a generated container hostname by default. Give the
+      # membership roster the physical machine's short name. `make docker-up`
+      # always supplies it; the HOSTNAME fallback also covers shells that
+      # export the host name when Compose is run directly.
+      PLURX_NODE_HOSTNAME: "${PLURX_NODE_HOSTNAME:-${HOSTNAME:-}}"
       PLURX_BIND: "0.0.0.0:32400"
       PLURX_DATA_DIR: "/var/lib/plurx"
       # Multicast cannot escape a Docker bridge. The host-network discovery

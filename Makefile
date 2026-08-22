@@ -250,6 +250,7 @@ web-check: ## Test playback policy, embedded JS, and every shipped theme
 # crates/plurxd/build.rs — see docs/RELEASING.md.
 VERSION := $(shell sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
 BUILD_REF := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+HOST_SHORTNAME := $(shell hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown-host)
 
 .PHONY: version
 version: ## Print the version and git build stamp a build would report
@@ -297,7 +298,7 @@ container-smoke: docker ## Build, start, probe, restart, and re-probe the contai
 # one sprang on the first real deploy.
 .PHONY: docker-up
 docker-up: ## Build + (re)start the Compose stack, stamping this commit into the image
-	cd deploy && PLURX_BUILD_REF="$(BUILD_REF)" docker compose up -d --build
+	cd deploy && PLURX_BUILD_REF="$(BUILD_REF)" PLURX_NODE_HOSTNAME="$(HOST_SHORTNAME)" docker compose up -d --build
 	@echo "up: $(VERSION) ($(BUILD_REF))"
 
 .PHONY: release-check
