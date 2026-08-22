@@ -171,6 +171,7 @@ pub struct Lease {
     pub resource: String,
     pub owner_node_id: String,
     pub fence: u64,
+    pub revision: u64,
     pub expires_at_unix_ms: i64,
 }
 
@@ -213,7 +214,9 @@ the clock, clamps TTLs, and exposes `acquire(resource, ttl)`. Store methods
 stay explicit about the owner so backend contract tests can create competing
 nodes without constructing a daemon. It is the concrete implementation of the
 `ClusterCoordinator` seam named in CLUSTERING-PLAN; the repository must not
-grow two independent lease abstractions.
+grow two independent lease abstractions. A successful renewal returns a new
+`Lease`; the caller replaces its old token because the dedicated monotone
+revision is part of the same-fence compare-and-swap identity.
 
 Media sessions deliberately do not call generic `acquire_lease` and then edit
 a second row. `claim_session`, `renew_session`, `publish_session_frontier`,
@@ -233,6 +236,7 @@ CREATE TABLE job_leases (
     resource       TEXT PRIMARY KEY,
     owner_node_id  TEXT NOT NULL,
     fence           INTEGER NOT NULL CHECK (fence > 0),
+    revision        INTEGER NOT NULL CHECK (revision > 0),
     expires_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
 ) STRICT;
@@ -240,9 +244,15 @@ CREATE TABLE job_leases (
 
 Acquiring an absent row writes fence `1`. Acquiring an expired or explicitly
 released row increments the existing fence. Renew succeeds only for the exact
-resource · owner · fence while the old lease is still live. Release sets
-`expires_at_ms = now`; it does not delete the row, because deleting would let a
-later owner reuse fence `1` and make an old token current again.
+resource · owner · fence · revision · previous expiry while that token is still
+live, advances both the revision and expiry, and returns the replacement token.
+Release compares the same identity, advances the revision, and sets
+`expires_at_ms = min(current_expiry, now)`. Consequently a delayed same-fence
+renewal cannot resurrect a release, an expiry value recurring after release
+cannot create an ABA match, reordered renewals cannot shorten newer state, and
+a caller clock ahead of expiry cannot make an expired lease live again. Release
+does not delete the row, because deleting would let a later owner reuse fence
+`1` and make an old token current again.
 
 The only bounded-lifecycle exception is a random server-minted session
 incarnation that the session APIs permanently mark ended and will never claim
@@ -946,7 +956,7 @@ node A, cache hit on node C” is useful; “cluster optimized” is not.
 1. **Schema-only lease support first.** The first schema step adds coordination
    tables without changing peer HTTP. Re-verify the then-current replicated
    schema number and add an explicit previous-version migration; do not assume
-   `v7` remains current after the M3 dependencies merge.
+   `v8` remains current after the lease primitive lands.
 2. **Protocol bumps follow wire changes.** Media snapshots/offers/session RPCs
    bump the cluster protocol. A node advertises compatibility before it may
    receive work.

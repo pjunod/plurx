@@ -19,6 +19,7 @@ use crate::error::StoreError;
 use crate::secrets::{self, CredentialKey};
 use crate::store::{SettingsStore, SqliteStore, Store};
 
+pub mod coordination;
 #[cfg(feature = "hiqlite-store")]
 pub mod membership;
 pub mod migration;

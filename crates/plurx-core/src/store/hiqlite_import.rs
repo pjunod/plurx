@@ -698,6 +698,22 @@ const TABLES: &[TablePlan] = &[
         sealed_columns: &[],
         parent_first: false,
     },
+    TablePlan {
+        name: "job_leases",
+        columns: &[
+            "resource",
+            "owner_node_id",
+            "fence",
+            "revision",
+            "expires_at_ms",
+            "updated_at_ms",
+        ],
+        order_by: "resource",
+        minimum_schema: 23,
+        import_filter: None,
+        sealed_columns: &[],
+        parent_first: false,
+    },
 ];
 
 /// Groups import rows into transactions bounded by serialized bytes.
@@ -1807,7 +1823,7 @@ mod tests {
         assert!(!names.contains(&"playback_events"));
         assert!(!names.contains(&"items_fts"));
         assert!(!names.contains(&"offline_lease_guards"));
-        assert_eq!(names.len(), 18, "review every imported durable table");
+        assert_eq!(names.len(), 19, "review every imported durable table");
     }
 
     #[test]
