@@ -346,6 +346,7 @@ mod tests {
     const SQLITE_MODULES: &[(&str, &str)] = &[
         ("apikeys.rs", include_str!("sqlite/apikeys.rs")),
         ("cache.rs", include_str!("sqlite/cache.rs")),
+        ("coordination.rs", include_str!("sqlite/coordination.rs")),
         ("library.rs", include_str!("sqlite/library.rs")),
         ("media.rs", include_str!("sqlite/media.rs")),
         ("mod.rs", include_str!("sqlite/mod.rs")),

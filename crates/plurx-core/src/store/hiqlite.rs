@@ -27,16 +27,18 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 
-// v6 adds revision-bound ebook reading state; v7 adds first-class book facts.
-// Both additive steps are applied through Raft before the daemon opens the
+// v6 adds revision-bound ebook reading state; v7 adds first-class book facts;
+// v8 adds monotone cluster-work leases. Every additive step is applied through
+// Raft before the daemon opens the
 // store. v5 remains a supported direct-upgrade source so an offline node is
 // not forced to install every intermediate Cinema release; older or future
 // schemas still fail closed.
-pub const AUTH_SCHEMA_VERSION: i64 = 7;
+pub const AUTH_SCHEMA_VERSION: i64 = 8;
 /// Oldest schema this binary can advance through the complete migration chain.
 pub const AUTH_SCHEMA_MIGRATION_SOURCE: i64 = 5;
 const READING_SCHEMA_VERSION: i64 = 6;
 const BOOK_SCHEMA_MIGRATION_SOURCE: i64 = READING_SCHEMA_VERSION;
+const LEASE_SCHEMA_MIGRATION_SOURCE: i64 = 7;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -80,6 +82,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER,
     disabled     INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS job_leases (
+    resource       TEXT PRIMARY KEY,
+    owner_node_id  TEXT NOT NULL,
+    fence          INTEGER NOT NULL CHECK (fence > 0),
+    revision       INTEGER NOT NULL CHECK (revision > 0),
+    expires_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL
 ) STRICT;
 "#;
 
@@ -463,7 +474,29 @@ impl HiqliteAuthStore {
                             (
                                 "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
                                  WHERE singleton = 1 AND schema_version = $3",
-                                params!(AUTH_SCHEMA_VERSION, now, BOOK_SCHEMA_MIGRATION_SOURCE),
+                                params!(
+                                    LEASE_SCHEMA_MIGRATION_SOURCE,
+                                    now,
+                                    BOOK_SCHEMA_MIGRATION_SOURCE
+                                ),
+                            ),
+                        ])
+                        .await?;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error)?;
+                }
+                SchemaMigrationAction::MigrateFrom(LEASE_SCHEMA_MIGRATION_SOURCE) => {
+                    let now = self.now()?;
+                    let results = self
+                        .client()
+                        .txn([
+                            (super::hiqlite_coordination::JOB_LEASES_SCHEMA, params!()),
+                            (
+                                "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
+                                 WHERE singleton = 1 AND schema_version = $3",
+                                params!(AUTH_SCHEMA_VERSION, now, LEASE_SCHEMA_MIGRATION_SOURCE),
                             ),
                         ])
                         .await?;
@@ -537,6 +570,7 @@ impl HiqliteAuthStore {
     pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
         self.telemetry.clear().await?;
         let statements = [
+            "DELETE FROM job_leases",
             "DELETE FROM offline_source_probes",
             "DELETE FROM offline_lease_guards",
             "DELETE FROM offline_package_leases",
@@ -581,7 +615,8 @@ impl HiqliteAuthStore {
             (statements[16].to_owned(), params!()),
             (statements[17].to_owned(), params!()),
             (statements[18].to_owned(), params!()),
-            (statements[19].to_owned(), params!(keys::INSTANCE_ID)),
+            (statements[19].to_owned(), params!()),
+            (statements[20].to_owned(), params!(keys::INSTANCE_ID)),
         ]))
         .await?
         .into_iter()
@@ -608,6 +643,7 @@ impl HiqliteAuthStore {
             "SELECT id, username, password_hash, is_admin, created_at FROM users ORDER BY id",
             "SELECT token_hash, user_id, device, created_at, last_seen_at FROM tokens ORDER BY token_hash",
             "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled FROM api_keys ORDER BY id",
+            "SELECT resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms FROM job_leases ORDER BY resource",
         ] {
             validate_sql(sql)?;
         }
@@ -654,6 +690,12 @@ impl HiqliteAuthStore {
             api_keys: timeout_store(self.client().query_map(
                 "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
                      FROM api_keys ORDER BY id",
+                params!(),
+            ))
+            .await?,
+            job_leases: timeout_store(self.client().query_map(
+                "SELECT resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms \
+                     FROM job_leases ORDER BY resource",
                 params!(),
             ))
             .await?,
@@ -1343,7 +1385,9 @@ fn schema_migration_action(
     }
     match meta.schema_version {
         version if version == supported.schema_version => Ok(SchemaMigrationAction::Current),
-        AUTH_SCHEMA_MIGRATION_SOURCE | BOOK_SCHEMA_MIGRATION_SOURCE => {
+        AUTH_SCHEMA_MIGRATION_SOURCE
+        | BOOK_SCHEMA_MIGRATION_SOURCE
+        | LEASE_SCHEMA_MIGRATION_SOURCE => {
             Ok(SchemaMigrationAction::MigrateFrom(meta.schema_version))
         }
         version => Err(StoreError::Migration(format!(
@@ -1387,6 +1431,7 @@ struct AuthStoreDump {
     users: Vec<UserDumpRow>,
     tokens: Vec<TokenDumpRow>,
     api_keys: Vec<ApiKeyDumpRow>,
+    job_leases: Vec<JobLeaseDumpRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1608,6 +1653,14 @@ dump_row!(ApiKeyDumpRow {
     last_used_at: Option<i64>,
     disabled: i64,
 });
+dump_row!(JobLeaseDumpRow {
+    resource: String,
+    owner_node_id: String,
+    fence: i64,
+    revision: i64,
+    expires_at_ms: i64,
+    updated_at_ms: i64,
+});
 
 #[cfg(test)]
 mod tests {
@@ -1636,6 +1689,7 @@ mod tests {
     fn replicated_store_modules_cannot_bypass_the_timed_client_accessor() {
         for (name, source) in [
             ("catalog", include_str!("hiqlite_catalog.rs")),
+            ("coordination", include_str!("hiqlite_coordination.rs")),
             ("media", include_str!("hiqlite_media.rs")),
             ("durable", include_str!("hiqlite_durable.rs")),
         ] {
@@ -1761,9 +1815,9 @@ mod tests {
     #[test]
     fn daemon_schema_gate_accepts_the_complete_supported_chain() {
         assert_eq!(
-            AUTH_SCHEMA_MIGRATION_SOURCE + 2,
+            AUTH_SCHEMA_MIGRATION_SOURCE + 3,
             AUTH_SCHEMA_VERSION,
-            "this implementation contains the v5→v6 and v6→v7 steps"
+            "this implementation contains the v5→v6, v6→v7, and v7→v8 steps"
         );
         let row = |schema_version| CompatibilityRow {
             schema_version,
@@ -1788,11 +1842,19 @@ mod tests {
                 &[row(BOOK_SCHEMA_MIGRATION_SOURCE)],
                 ClusterCompatibility::CURRENT,
             )
-            .expect("immediate predecessor"),
+            .expect("book-schema predecessor"),
             SchemaMigrationAction::MigrateFrom(BOOK_SCHEMA_MIGRATION_SOURCE)
         );
+        assert_eq!(
+            schema_migration_action(
+                &[row(LEASE_SCHEMA_MIGRATION_SOURCE)],
+                ClusterCompatibility::CURRENT,
+            )
+            .expect("immediate predecessor"),
+            SchemaMigrationAction::MigrateFrom(LEASE_SCHEMA_MIGRATION_SOURCE)
+        );
 
-        for rows in [Vec::new(), vec![row(4)], vec![row(6), row(6)]] {
+        for rows in [Vec::new(), vec![row(4)], vec![row(7), row(7)]] {
             let error = schema_migration_action(&rows, ClusterCompatibility::CURRENT)
                 .expect_err("ambiguous or unsupported state must fail before writes");
             assert!(
