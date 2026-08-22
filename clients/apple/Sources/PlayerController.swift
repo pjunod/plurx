@@ -1535,6 +1535,16 @@ final class PlayerController: ObservableObject {
         player.currentItem?.accessLog()?.events.last?.numberOfStalls
     }
 
+    /// A live snapshot for the on-device Debug stats view. This is the same
+    /// evidence attached to a stall report, but reading it here has no
+    /// telemetry side effect and makes the browser's diagnostic categories
+    /// available without connecting a separate debugger.
+    var currentDiagnosticSnapshot: ApplePlaybackDiagnosticSnapshot {
+        playbackDiagnosticSnapshot(at: currentMs)
+    }
+
+    var currentSessionId: String? { sessionId }
+
     /// Runway of the item currently attached, or `nil` when there is no item
     /// or no usable clock. `nil` means "unknown", which the delivery watchdog
     /// must not read as "healthy".

@@ -666,6 +666,7 @@ struct PlayerView: View {
     @StateObject private var pictureInPicture = PictureInPictureController()
     @StateObject private var lifecycle = PlayerLifecycleCoordinator()
     @State private var showStats = false
+    @State private var statsMode = PlaybackStatsMode.standard
     @State private var findingNext = false
     @State private var nextEpisodeTask: Task<Void, Never>?
     @State private var isScrubbing = false
@@ -754,7 +755,7 @@ struct PlayerView: View {
                                 // Keep the remote inside its visible Done action
                                 // instead of letting focus escape to dimmed
                                 // transport controls behind the panel.
-                                .disabled(showStats)
+                                .disabled(showStats && statsMode != .mini)
                                 #endif
                         }
                         .padding(20)
@@ -765,12 +766,14 @@ struct PlayerView: View {
                         #if os(tvOS)
                         PlaybackStatsView(
                             controller: controller,
+                            mode: $statsMode,
                             onDismiss: dismissPlaybackInfo
                         )
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                         #else
                         PlaybackStatsView(
                             controller: controller,
+                            mode: $statsMode,
                             onDismiss: dismissPlaybackInfo
                         )
                         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -2159,11 +2162,28 @@ struct PlayerView: View {
     }
 }
 
-/// Apple equivalent of the web player's playback-info panel. iOS keeps the
-/// compact inspector; tvOS promotes the same live facts into a ten-foot,
-/// glanceable dashboard instead of stretching phone-sized diagnostics.
+enum PlaybackStatsMode: String, CaseIterable, Identifiable {
+    case mini
+    case standard
+    case debug
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .mini: return "Mini"
+        case .standard: return "Standard"
+        case .debug: return "Debug"
+        }
+    }
+}
+
+/// The same three playback-info levels used by the web and Android players.
+/// Each client renders them natively, but Mini, Standard, and Debug keep the
+/// same job and information hierarchy on every screen size.
 private struct PlaybackStatsView: View {
     @ObservedObject var controller: PlayerController
+    @Binding var mode: PlaybackStatsMode
     let onDismiss: () -> Void
 
     #if os(tvOS)
@@ -2177,11 +2197,260 @@ private struct PlaybackStatsView: View {
     private let labelColor = Color.white.opacity(0.82)
 
     var body: some View {
+        Group {
+            if mode == .mini {
+                miniBody
+            } else if mode == .debug {
+                debugBody
+            } else {
+                #if os(tvOS)
+                televisionBody
+                #else
+                compactBody
+                #endif
+            }
+        }
+    }
+
+    private var modeSelector: some View {
+        HStack(spacing: 6) {
+            ForEach(PlaybackStatsMode.allCases) { candidate in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) { mode = candidate }
+                } label: {
+                    Text(candidate.label)
+                        .font(.system(size: modeFontSize, weight: .semibold, design: .rounded))
+                        .padding(.horizontal, modeHorizontalPadding)
+                        .padding(.vertical, modeVerticalPadding)
+                        .foregroundStyle(mode == candidate ? .white : .white.opacity(0.62))
+                        .background(
+                            mode == candidate ? Palette.accent : Color.white.opacity(0.07),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(candidate.label) playback info")
+                .accessibilityAddTraits(mode == candidate ? .isSelected : [])
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Playback info size")
+    }
+
+    private var modeFontSize: CGFloat {
         #if os(tvOS)
-        televisionBody
+        18
         #else
-        compactBody
+        12
         #endif
+    }
+
+    private var modeHorizontalPadding: CGFloat {
+        #if os(tvOS)
+        17
+        #else
+        11
+        #endif
+    }
+
+    private var modeVerticalPadding: CGFloat {
+        #if os(tvOS)
+        10
+        #else
+        7
+        #endif
+    }
+
+    private var miniBody: some View {
+        VStack(alignment: .leading, spacing: miniSpacing) {
+            HStack(spacing: miniSpacing) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(controller.methodLabel)
+                        .font(.system(size: miniTitleSize, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text("\(formatTime(controller.currentMs)) / \(formatTime(controller.knownDurationMs))")
+                        .font(.system(size: miniDetailSize, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.62))
+                }
+
+                Spacer(minLength: miniSpacing)
+                miniHealth
+                modeSelector
+                closeButton
+            }
+
+            HStack(spacing: miniSpacing) {
+                miniFact("Playing", miniPlayingSummary)
+                miniFact("Buffer", miniBufferSummary)
+                miniFact("Network", miniNetworkSummary)
+            }
+        }
+        .padding(.horizontal, miniHorizontalPadding)
+        .padding(.vertical, miniVerticalPadding)
+        .frame(maxWidth: miniMaxWidth)
+        .background(panelSurface, in: RoundedRectangle(cornerRadius: miniCornerRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: miniCornerRadius)
+                .stroke(.white.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .padding(miniOuterPadding)
+    }
+
+    private var miniHealth: some View {
+        let stalls = controller.stalls ?? 0
+        return HStack(spacing: 7) {
+            Circle()
+                .fill(stalls > 0 ? Color.orange : Color.green)
+                .frame(width: miniHealthDotSize, height: miniHealthDotSize)
+            Text(stalls > 0 ? "\(stalls) stall\(stalls == 1 ? "" : "s")" : "Healthy")
+                .font(.system(size: miniDetailSize, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.82))
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func miniFact(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.system(size: miniLabelSize, weight: .bold, design: .rounded))
+                .tracking(0.8)
+                .foregroundStyle(.white.opacity(0.42))
+            Text(value)
+                .font(.system(size: miniDetailSize, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var miniPlayingSummary: String {
+        let size = controller.presentationSize
+        let resolution = size.width > 0 && size.height > 0
+            ? "\(Int(size.width))×\(Int(size.height))"
+            : "Waiting"
+        let range = PlayerView.dynamicRangeSummary(
+            source: controller.decision?.source,
+            delivered: controller.deliveredRange,
+            displayHDR: Caps.displayIsHDR,
+            reasons: []
+        )
+        return [resolution, range?.components(separatedBy: " — ").first]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private var miniBufferSummary: String {
+        if let runway = controller.bufferedRunwaySeconds() {
+            return String(format: "%.1f s ahead", runway)
+        }
+        return "Measuring"
+    }
+
+    private var miniNetworkSummary: String {
+        if let delivered = controller.sessionStatus?.deliveredBps, delivered > 0 {
+            return bitRate(delivered)
+        }
+        if let observed = controller.observedBitrate, observed > 0 {
+            return bitRate(Int(observed))
+        }
+        return "Measuring"
+    }
+
+    private var miniSpacing: CGFloat {
+        #if os(tvOS)
+        20
+        #else
+        10
+        #endif
+    }
+
+    private var miniTitleSize: CGFloat {
+        #if os(tvOS)
+        25
+        #else
+        15
+        #endif
+    }
+
+    private var miniDetailSize: CGFloat {
+        #if os(tvOS)
+        17
+        #else
+        11
+        #endif
+    }
+
+    private var miniLabelSize: CGFloat {
+        #if os(tvOS)
+        13
+        #else
+        9
+        #endif
+    }
+
+    private var miniHealthDotSize: CGFloat {
+        #if os(tvOS)
+        10
+        #else
+        7
+        #endif
+    }
+
+    private var miniHorizontalPadding: CGFloat {
+        #if os(tvOS)
+        26
+        #else
+        14
+        #endif
+    }
+
+    private var miniVerticalPadding: CGFloat {
+        #if os(tvOS)
+        20
+        #else
+        12
+        #endif
+    }
+
+    private var miniMaxWidth: CGFloat {
+        #if os(tvOS)
+        1_380
+        #else
+        620
+        #endif
+    }
+
+    private var miniCornerRadius: CGFloat {
+        #if os(tvOS)
+        22
+        #else
+        12
+        #endif
+    }
+
+    private var miniOuterPadding: CGFloat {
+        #if os(tvOS)
+        54
+        #else
+        16
+        #endif
+    }
+
+    private var closeButton: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: modeFontSize, weight: .bold))
+                .padding(modeVerticalPadding)
+                .foregroundStyle(.white.opacity(0.72))
+                .background(.white.opacity(0.07), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Close playback info")
     }
 
     #if os(tvOS)
@@ -2261,6 +2530,8 @@ private struct PlaybackStatsView: View {
             }
 
             Spacer(minLength: 24)
+
+            modeSelector
 
             playbackHealth
 
@@ -2450,14 +2721,8 @@ private struct PlaybackStatsView: View {
                         .font(.system(.headline, design: .monospaced))
                         .foregroundColor(.white)
                     Spacer()
-                    #if os(iOS)
-                    Button(action: onDismiss) {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.white.opacity(0.72))
-                    .accessibilityLabel("Close playback info")
-                    #endif
+                    modeSelector
+                    closeButton
                 }
                 Divider().overlay(Palette.outline)
                 row("Method", controller.methodLabel)
@@ -2475,6 +2740,391 @@ private struct PlaybackStatsView: View {
         .background(panelSurface, in: RoundedRectangle(cornerRadius: 12))
     }
     #endif
+
+    private var debugBody: some View {
+        ZStack {
+            Color.black.opacity(0.52)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: debugSpacing) {
+                HStack(spacing: debugSpacing) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Playback debug")
+                            .font(.system(size: debugTitleSize, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("Live player, network, and server diagnostics")
+                            .font(.system(size: debugDetailSize, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.56))
+                    }
+                    Spacer(minLength: debugSpacing)
+                    modeSelector
+                    closeButton
+                }
+
+                Divider().overlay(.white.opacity(0.12))
+
+                ScrollView {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: debugColumnWidth), spacing: debugSpacing)],
+                        alignment: .leading,
+                        spacing: debugSpacing
+                    ) {
+                        debugPlaybackSection
+                        debugSourceSection
+                        debugDecodingSection
+                        debugNetworkSection
+                        debugServerSection
+                    }
+                    .padding(.bottom, 2)
+                }
+            }
+            .padding(debugPanelPadding)
+            .frame(maxWidth: debugMaxWidth, maxHeight: debugMaxHeight)
+            .background(
+                panelSurface,
+                in: RoundedRectangle(cornerRadius: debugCornerRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: debugCornerRadius, style: .continuous)
+                    .stroke(.white.opacity(0.13), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.58), radius: 36, y: 18)
+            .padding(debugOuterPadding)
+        }
+    }
+
+    private var debugPlaybackSection: some View {
+        debugSection("Playback") {
+            debugRow("Build", buildLabel)
+            debugRow("Method", controller.methodLabel)
+            debugRow(
+                "Transport",
+                controller.currentSessionId == nil
+                    ? "Continuous file · range requests · Apple AVPlayer"
+                    : "Segmented HLS · Apple AVPlayer"
+            )
+            debugRow(
+                "Position",
+                "\(formatTime(controller.currentMs)) / \(formatTime(controller.knownDurationMs))"
+            )
+            debugRow("File ID", controller.decision.map { "#\($0.fileId)" } ?? "—")
+            if let session = controller.currentSessionId {
+                debugRow("Session", session)
+            }
+            if let reasons = controller.decision?.reasons, !reasons.isEmpty {
+                debugRow("Reason", reasons.joined(separator: "; "))
+            }
+        }
+    }
+
+    private var debugSourceSection: some View {
+        debugSection("Source") {
+            if let source = controller.decision?.source {
+                let video = [
+                    source.videoCodec?.uppercased(),
+                    source.videoProfile,
+                    source.bitDepth.map { "\($0)-bit" },
+                    source.hdrFormat ?? source.hdr?.uppercased(),
+                ].compactMap { $0 }.joined(separator: " · ")
+                debugRow("Video", video.isEmpty ? "—" : video)
+                debugRow(
+                    "Resolution",
+                    source.width.flatMap { width in source.height.map { "\(width)×\($0)" } } ?? "—"
+                )
+                debugRow("Bitrate", source.bitrate.map(bitRate) ?? "—")
+                debugRow("Container", source.container?.uppercased() ?? "—")
+            }
+            if let audio = selectedAudioDescription {
+                debugRow("Audio", audio)
+            }
+            debugRow("AV offset", "\(controller.decision?.audioOffsetMs ?? 0) ms")
+        }
+    }
+
+    private var debugDecodingSection: some View {
+        let snapshot = controller.currentDiagnosticSnapshot
+        return debugSection("Now decoding") {
+            let size = controller.presentationSize
+            debugRow(
+                "Resolution",
+                size.width > 0 && size.height > 0
+                    ? "\(Int(size.width))×\(Int(size.height))"
+                    : "—"
+            )
+            if let range = PlayerView.dynamicRangeSummary(
+                source: controller.decision?.source,
+                delivered: controller.deliveredRange,
+                displayHDR: Caps.displayIsHDR,
+                reasons: controller.decision?.reasons
+            ) {
+                debugRow("Dynamic range", range)
+            }
+            debugRow("Buffer", snapshot.runway.map { String(format: "%.1f s", $0) } ?? "—")
+            debugRow("Player state", snapshot.timeControlStatus ?? "unknown")
+            if let waiting = snapshot.waitingReason { debugRow("Waiting reason", waiting) }
+            debugRow("Buffer empty", yesNo(snapshot.playbackBufferEmpty))
+            debugRow("Likely to keep up", yesNo(snapshot.playbackLikelyToKeepUp))
+            debugRow("Buffer full", yesNo(snapshot.playbackBufferFull))
+            debugRow("Stalls", snapshot.accessStalls.map(String.init) ?? "—")
+            debugRow("Subtitles", selectedSubtitleDescription)
+        }
+    }
+
+    private var debugNetworkSection: some View {
+        let snapshot = controller.currentDiagnosticSnapshot
+        return debugSection("Network") {
+            debugRow("Delivery rate", controller.sessionStatus?.deliveredBps.map(bitRate) ?? "—")
+            debugRow("Observed rate", snapshot.observedBitrateBps.map { bitRate(Int($0)) } ?? "—")
+            debugRow("Stream rate", snapshot.indicatedBitrateBps.map { bitRate(Int($0)) } ?? "—")
+            debugRow("Requests", snapshot.mediaRequests.map(String.init) ?? "—")
+            debugRow(
+                "Downloaded media",
+                snapshot.downloadedDuration.map { String(format: "%.1f s", $0) } ?? "—"
+            )
+            debugRow("Transferred", snapshot.bytesTransferred.map(byteCount) ?? "—")
+            debugRow(
+                "Transfer time",
+                snapshot.transferDuration.map { String(format: "%.2f s", $0) } ?? "—"
+            )
+        }
+    }
+
+    private var debugServerSection: some View {
+        debugSection("Server") {
+            if controller.isVOD {
+                debugRow("Stream", "Already transcoded · served from cache")
+            } else if let status = controller.sessionStatus {
+                debugRow("Encoder", status.encoder ?? controller.encoder ?? "—")
+                debugRow(
+                    "Encode speed",
+                    (status.recentSpeed ?? status.speed).map { String(format: "%.2f×", $0) } ?? "—"
+                )
+                debugRow("Server ahead", status.aheadSeconds.map { "\(max(0, $0)) s" } ?? "—")
+                debugRow("Ahead bytes", status.aheadBytes.map(byteCount) ?? "—")
+                debugRow("Produced", status.outTimeMs.map { formatTime($0) } ?? "—")
+                debugRow("Pacing", status.readrate.map { String(format: "%.2f×", $0) } ?? "—")
+                debugRow("Held", yesNo(status.suspended))
+                if let reason = status.holdReason { debugRow("Hold reason", reason) }
+                debugRow("Suspend count", status.suspendCount.map(String.init) ?? "0")
+                debugRow("Delivered", status.deliveredBytes.map(byteCount) ?? "—")
+                debugRow("Delivery idle", status.deliveredIdleMs.map { "\($0) ms" } ?? "—")
+                if let request = status.lastRequest { debugRow("Last request", request) }
+                debugRow("Request idle", status.idleSeconds.map { "\($0) s" } ?? "—")
+                if let shape = status.playlistShape { debugRow("Playlist", shape) }
+                debugRow("Published end", status.publishedEndMs.map { "\($0) ms" } ?? "—")
+                debugRow("Fetched end", status.fetchedEndMs.map { "\($0) ms" } ?? "—")
+            } else {
+                debugRow("Status", "No server-side session")
+            }
+        }
+    }
+
+    private func debugSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: debugRowSpacing) {
+            Text(title.uppercased())
+                .font(.system(size: debugSectionSize, weight: .bold, design: .rounded))
+                .tracking(1)
+                .foregroundStyle(Palette.accent)
+            content()
+        }
+        .padding(debugSectionPadding)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(
+            .white.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: debugSectionCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: debugSectionCornerRadius, style: .continuous)
+                .stroke(.white.opacity(0.07), lineWidth: 1)
+        }
+    }
+
+    private func debugRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: debugLabelSize, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.45))
+            #if os(iOS)
+            Text(value)
+                .font(.system(size: debugValueSize, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.92))
+                .textSelection(.enabled)
+            #else
+            Text(value)
+                .font(.system(size: debugValueSize, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.92))
+            #endif
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var selectedAudioDescription: String? {
+        let track = controller.audioTracks.first(where: { $0.index == controller.selectedAudio })
+            ?? controller.audioTracks.first(where: { $0.default })
+        guard let track else { return nil }
+        return [
+            track.codec.uppercased(),
+            track.channels.map(channelDescription),
+            track.language?.uppercased(),
+            track.title,
+        ].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private var selectedSubtitleDescription: String {
+        guard let index = controller.selectedSubtitle,
+              let track = controller.subtitles.first(where: { $0.index == index })
+        else { return "Off" }
+        return subtitleDescription(track, index: index)
+    }
+
+    private func channelDescription(_ channels: Int) -> String {
+        switch channels {
+        case 1: return "Mono"
+        case 2: return "Stereo"
+        case 6: return "5.1"
+        case 8: return "7.1"
+        default: return "\(channels)ch"
+        }
+    }
+
+    private func yesNo(_ value: Bool?) -> String {
+        value.map { $0 ? "Yes" : "No" } ?? "—"
+    }
+
+    private var buildLabel: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (version, build) {
+        case let (version?, build?) where version != build: return "\(version) (\(build))"
+        case let (version?, _): return version
+        case let (_, build?): return build
+        default: return "development"
+        }
+    }
+
+    private var debugSpacing: CGFloat {
+        #if os(tvOS)
+        22
+        #else
+        12
+        #endif
+    }
+
+    private var debugRowSpacing: CGFloat {
+        #if os(tvOS)
+        13
+        #else
+        8
+        #endif
+    }
+
+    private var debugTitleSize: CGFloat {
+        #if os(tvOS)
+        34
+        #else
+        20
+        #endif
+    }
+
+    private var debugDetailSize: CGFloat {
+        #if os(tvOS)
+        18
+        #else
+        12
+        #endif
+    }
+
+    private var debugSectionSize: CGFloat {
+        #if os(tvOS)
+        17
+        #else
+        11
+        #endif
+    }
+
+    private var debugLabelSize: CGFloat {
+        #if os(tvOS)
+        15
+        #else
+        10
+        #endif
+    }
+
+    private var debugValueSize: CGFloat {
+        #if os(tvOS)
+        17
+        #else
+        11
+        #endif
+    }
+
+    private var debugColumnWidth: CGFloat {
+        #if os(tvOS)
+        360
+        #else
+        260
+        #endif
+    }
+
+    private var debugPanelPadding: CGFloat {
+        #if os(tvOS)
+        32
+        #else
+        16
+        #endif
+    }
+
+    private var debugSectionPadding: CGFloat {
+        #if os(tvOS)
+        20
+        #else
+        12
+        #endif
+    }
+
+    private var debugMaxWidth: CGFloat {
+        #if os(tvOS)
+        1_700
+        #else
+        820
+        #endif
+    }
+
+    private var debugMaxHeight: CGFloat {
+        #if os(tvOS)
+        900
+        #else
+        720
+        #endif
+    }
+
+    private var debugCornerRadius: CGFloat {
+        #if os(tvOS)
+        28
+        #else
+        14
+        #endif
+    }
+
+    private var debugSectionCornerRadius: CGFloat {
+        #if os(tvOS)
+        18
+        #else
+        10
+        #endif
+    }
+
+    private var debugOuterPadding: CGFloat {
+        #if os(tvOS)
+        54
+        #else
+        12
+        #endif
+    }
 
     @ViewBuilder
     private var sourceRows: some View {
