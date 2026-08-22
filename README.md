@@ -63,7 +63,14 @@ Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md), with
 [docs/CLUSTERING-PLAN.md](docs/CLUSTERING-PLAN.md) turning Phase 4 into ordered
-milestones and acceptance checks; client strategy in
+milestones and acceptance checks, with
+[docs/CLUSTER-PERFORMANCE-PLAN.md](docs/CLUSTER-PERFORMANCE-PLAN.md) defining
+the post-membership topology, consistency classes, observability, and ordered
+work that turns additional nodes into measured read and application capacity,
+and
+[docs/CLUSTER-MEDIA-POOL-PLAN.md](docs/CLUSTER-MEDIA-POOL-PLAN.md) defining how
+those voters become one capability-aware transcode, cache, and failover pool;
+client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md), with
 [docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md](docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md)
 recording what the Apple native-subtitle work shipped, why each choice was

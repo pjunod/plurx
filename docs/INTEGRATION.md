@@ -286,7 +286,8 @@ key too. The other tell is the first-run setup screen reappearing.
 **How to read it.** `last_used_at` on the listing is the cheapest proof that
 monarr is really using the key you think it is. A key that has never been used
 and a monarr that reports successful deliveries means monarr is holding a
-*different* key.
+*different* key. The timestamp refreshes no more than once per minute, so it
+is an activity signal rather than an exact request counter.
 
 Note what the listing does **not** return: `key_hash`. Listing keys is a
 routine, frequently-open screen; the stored hash has no business on it, and

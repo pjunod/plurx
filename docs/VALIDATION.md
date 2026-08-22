@@ -170,6 +170,36 @@ jobs. Impact optimization therefore fails open: a bad diff base costs time;
 it never suppresses tests. The scheduled workflow still runs the `nightly`
 profile.
 
+### Which ffmpeg the profiles assume
+
+Every CI profile runs **ffmpeg 6**, from the pinned `ubuntu-24.04` runner image.
+`.github/actions/ffmpeg` is the single place that installs it; it prints the
+build that actually resolved into the job log and step summary, and fails the
+job when the major is not the one that lane named. So `runs-on` and the expected
+major move together in a reviewable diff, and neither can move on its own.
+
+This is a deliberate choice rather than an inherited default, because the two do
+not agree. **ffmpeg 8 declares `-readrate_initial_burst` and then ignores it**,
+which costs the copy path its startup burst — the burst-then-hold behaviour
+[PLAYBACK.md](PLAYBACK.md) promises — with no warning, because the capability
+probe sees the option advertised. That is [#380](https://github.com/pjunod/plurx/issues/380),
+and the plurxd side of it is #386. Before this pin, no CI job had ever run
+ffmpeg 8; the gate was green by accident of whichever image `ubuntu-latest`
+resolved to that week, and a promotion past 24.04 would have turned `main` red
+in one silent step with no diff to blame.
+
+So "green in CI" and "green on a worker" currently mean different things, and
+this is the difference: a worker host on Ubuntu 26.04 runs ffmpeg 8.0.1, where
+`make validate` fails on the pacing assumptions in
+`crates/plurxd/src/transcode.rs` until #386 lands. The nightly `ffmpeg8-pacing`
+job is where that gap is watched — it runs the same capability contract as the
+`playback-recovery` point against a real ffmpeg 8, pinned by the `ubuntu:26.04`
+container tag. It is nightly rather than required on purpose: making the gate a
+matrix over both majors before #386 exists would leave a required check red by
+design. `tests/operations/test_contracts.py` enforces the whole arrangement —
+no job may install ffmpeg outside the action, name a major without pinning the
+image or container that supplies it, or drop either major's coverage.
+
 ### Base syncs — the gate revalidates, the reviewer does not
 
 `main` is protected with `required_status_checks.strict: true`, so a pull

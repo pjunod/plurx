@@ -24,7 +24,7 @@ use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::logbuf::LogBuffer;
+use crate::logbuf::{LogBuffer, LogBuffers};
 use crate::offline::OfflineManager;
 use crate::schedule::{due_jobs, DueJob, GlobalSchedule};
 use crate::trakt::TraktManager;
@@ -127,6 +127,8 @@ pub struct AppState {
     pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
+    /// Replication/membership detail kept out of the general diagnostics ring.
+    pub cluster_logs: Arc<LogBuffer>,
     /// The coming-soon rail's cached answer from monarr (plan §11.2).
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
     /// Pushes watch state to monarr when enabled (plan §11.1).
@@ -156,6 +158,10 @@ pub struct AppState {
     /// lifetimes, so this holds only what would otherwise be invisible; see
     /// [`crate::delivery`].
     pub direct_plays: Arc<crate::delivery::DirectPlays>,
+    /// Application-initiated graceful drain. Signals still use the process
+    /// watcher in `main`; the cluster leave endpoint cancels this only after
+    /// its own voter removal has committed.
+    pub shutdown: tokio_util::sync::CancellationToken,
     pub started_at: Instant,
 }
 
@@ -189,7 +195,10 @@ impl AppState {
             dirs,
             encoder_caps,
             system,
-            logs,
+            LogBuffers {
+                general: logs,
+                cluster: Arc::new(LogBuffer::default()),
+            },
         )
     }
 
@@ -199,7 +208,7 @@ impl AppState {
         dirs: Dirs,
         encoder_caps: EncoderCaps,
         system: SystemInfo,
-        logs: Arc<LogBuffer>,
+        logs: LogBuffers,
     ) -> Self {
         let AppConfig {
             server_name,
@@ -272,7 +281,8 @@ impl AppState {
             publications: crate::http::publication::PublicationSessions::new(),
             trakt,
             system: Arc::new(system),
-            logs,
+            logs: logs.general,
+            cluster_logs: logs.cluster,
             coming_soon,
             watched,
             progress,
@@ -281,6 +291,7 @@ impl AppState {
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),
             direct_plays: crate::delivery::DirectPlays::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             started_at: Instant::now(),
         }
     }

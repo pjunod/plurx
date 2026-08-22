@@ -274,7 +274,7 @@ pub async fn image(
         _ => item.poster_path,
     };
     let filename = filename.ok_or(ApiError::NotFound("image"))?;
-    super::images::serve_artwork(&state.artwork_dir, &filename).await
+    super::images::serve_cluster_artwork(&state, &filename).await
 }
 
 /// GET /photo/:/transcode — Plex image resizer. We proxy the underlying image
@@ -308,7 +308,7 @@ pub async fn photo_transcode(
         item.poster_path
     };
     let filename = filename.ok_or(ApiError::NotFound("image"))?;
-    super::images::serve_artwork(&state.artwork_dir, &filename).await
+    super::images::serve_cluster_artwork(&state, &filename).await
 }
 
 #[derive(serde::Deserialize)]

@@ -242,6 +242,23 @@ pub(crate) async fn post_membership(
     fmt_ok(headers, ())
 }
 
+/// Pre-emptively elect this voter. Authenticated on the private cluster API;
+/// callers use it to hand leadership away before a graceful self-removal.
+pub(crate) async fn elect(
+    state: AppStateExt,
+    headers: HeaderMap,
+    Path(raft_type): Path<RaftType>,
+) -> Result<Response, Error> {
+    validate_secret(&state, &headers)?;
+    if helpers::is_raft_stopped(&state, &raft_type)
+        || !helpers::is_raft_initialized(&state, &raft_type).await?
+    {
+        return Err(Error::Config("Raft node has not been initialized".into()));
+    }
+    helpers::trigger_election(&state, &raft_type).await?;
+    fmt_ok(headers, ())
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn leave_cluster(
     state: AppStateExt,

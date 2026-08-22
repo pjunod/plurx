@@ -14,7 +14,7 @@ mod dto;
 mod error;
 mod extract;
 mod hls;
-mod images;
+pub(crate) mod images;
 mod items;
 mod keys;
 mod libraries;
@@ -98,9 +98,14 @@ pub fn router(state: AppState) -> Router {
         // exception: their single-use token is its own narrow credential.
         .route("/cluster/join-tokens", post(cluster::issue_join_token))
         .route("/cluster/nodes", get(cluster::nodes))
+        .route("/cluster/leave", post(cluster::leave))
         .route("/cluster/nodes/{node_id}", delete(cluster::remove_node))
         .route("/cluster/join/redeem", post(cluster::redeem_join))
         .route("/cluster/join/finalize", post(cluster::finalize_join))
+        // Node-to-node artwork materialization. The handler verifies a
+        // filename-bound cluster HMAC and current live membership; it does
+        // not accept an account bearer and never proxies another hop.
+        .route("/cluster/artwork/{filename}", get(images::serve_peer))
         // What the libraries hold, in transcoder terms — the census PERF-PLAN
         // §5 needs to say whether the GPU tone-map reaches a real library.
         .route("/system/library-shape", get(system::library_shape))
@@ -2594,6 +2599,16 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "membership_unavailable");
 
+        let (status, _) = call(&app, post("/api/v1/cluster/leave", None, Value::Null)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = call(
+            &app,
+            post("/api/v1/cluster/leave", Some(&admin), Value::Null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "membership_unavailable");
+
         let (status, body) = call(
             &app,
             post(
@@ -2800,7 +2815,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_endpoint_is_admin_only() {
-        let app = test_app();
+        let (app, state) = test_app_with_state();
         let (status, _) = call(&app, get("/api/v1/system/logs", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -2812,6 +2827,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_array());
+
+        state.cluster_logs.push(crate::logbuf::LogEntry {
+            ts_ms: 1,
+            level: "INFO".to_owned(),
+            target: "plurx_core::cluster::membership".to_owned(),
+            message: "cluster-only proof".to_owned(),
+        });
+        let (status, body) = call(
+            &app,
+            get(
+                "/api/v1/system/logs?scope=cluster&level=info&limit=50",
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["message"], "cluster-only proof");
     }
 
     #[tokio::test]

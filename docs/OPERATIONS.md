@@ -278,9 +278,20 @@ read when you open the tab, not on every Settings visit.
 | `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
 | `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
 
-The node table carries only what `GET /api/v1/cluster/nodes` exposes: node id,
-Raft id, voter/learner role, reachability, and last-seen. Addresses, media
-paths, and token material are not in that payload and are not shown.
+The node table leads with each machine's short OS hostname, labels the current
+leader beside it, then shows the advertised host and stable node id underneath.
+The advertised host may be a DNS name or IP; loopback is written `localhost`
+instead of `127.0.0.1`, and listener ports stay private. A native daemon reads
+the hostname from the OS. A container should set `PLURX_NODE_HOSTNAME` to the
+Docker host's `hostname -s`, because its own OS hostname is normally a generated
+container id. `GET /api/v1/cluster/nodes` also exposes the Raft id,
+voter/learner role, reachability, and last-seen. Media paths and token material
+are not in that payload and are not shown.
+
+The **Cluster log** under the roster holds membership, Hiqlite, and Raft events
+in its own 2,000-line process-local ring. Those events do not consume the
+general Settings → System log ring; cluster warnings and errors still reach
+stdout/journald so a startup failure remains visible without the web UI.
 
 **Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
 displays it exactly once, with a lifetime you pick between 10 minutes and 1
@@ -398,6 +409,58 @@ curl -fsS "$PLURX/api/v1/cluster/nodes" \
   -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
 ```
 
+**Update voters one at a time.** A three-voter cluster has a majority of two,
+so an update may stop exactly one voter. Never batch two Cinema restarts and
+never call the leave endpoint as an update hook: leave is permanent membership
+removal, while an update must reopen the same voter and the same data
+directory. Wait for `GET /readyz` to return 200 before advancing to the next
+machine. `/healthz` is insufficient here; it proves that HTTP is alive, not
+that the voter can use replicated storage or sees a leader. The private Ansible
+deployment uses `serial: 1`, fails the whole play on the first node error, and
+now gates each Cinema host on `/readyz`.
+
+**Let artwork converge before relying on a voter for failover.** Item rows name
+poster and backdrop files through Raft, while the image bytes remain in each
+node's local artwork directory. Every voter reconciles those names in the
+background: it pulls a missing file from a reachable peer under a short-lived
+cluster proof and atomically installs it. If no peer retains the file, a
+bounded repair recreates it from the original local/provider source. Requests
+also use the peer path immediately, so a newly joined voter does not show
+broken cards while the first inventory pass is still running. The configured
+`cluster.join_url` (or its default derived from `advertise_host`) must therefore
+be the public HTTP base other voters can reach for that node.
+
+**Recover a temporary quorum loss by restoring the original voters.** With one
+of three voters available, Plurx deliberately commits no writes or membership
+changes. Bring back any second original voter with its existing data directory,
+node identity, and cluster secrets; Raft elects a leader and service recovers
+without an operator reconfiguration. Do not delete Raft state or mint a
+replacement node while the old majority may still exist.
+
+A permanently lost majority has no supported force-reconfigure or
+backup-to-fresh-cluster procedure in this release. A minority cannot safely
+declare itself the new cluster without proving the old majority is dead; doing
+so would create split brain if those machines returned. Preserve every
+surviving data directory and secret, keep the nodes stopped, and recover the
+original majority from host/storage backups. Quorum-aware backup/restore and a
+deterministic one-node disaster-recovery drill remain the explicit M6 work in
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md).
+
+**Gracefully remove the node you are connected to.** Settings → Cluster →
+**Leave this cluster** calls the same admin-only operation. It resolves the
+node's offline work and, if this voter is the leader, elects and confirms a
+successor before committing its own removal. It then drains HTTP and exits.
+The command-line equivalent is:
+
+```bash
+curl -fsS -X POST "$PLURX/api/v1/cluster/leave" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
+```
+
+This is permanent and refuses a 2→1 change. To reuse the machine, discard the
+old Plurx data directory and join it again with a fresh token. Do not use this
+operation for a rolling update or ordinary restart.
+
 **Remove a follower from three or more voters.** Use the node id from the
 roster, not its Raft id. The request refuses the current leader and any change
 that would leave fewer than two voters.
@@ -495,6 +558,7 @@ membership addresses and token-file paths are intentionally file-only:
 |---|---|---|---|
 | `PLURX_BIND` | `server.bind` | `0.0.0.0:32400` | Address the HTTP API binds to |
 | `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
+| `PLURX_NODE_HOSTNAME` | — | OS hostname | Short physical-machine name shown in Settings → Cluster. Native installs normally leave this unset; containers set it explicitly so a generated container id is not mistaken for the host |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
@@ -1442,13 +1506,21 @@ means enrichment has no TMDB key configured — the scan itself succeeded.
 
 ## Logs
 
-Structured `tracing` logs go to stdout/journald, and the same buffer is exposed
-in Settings → Logs with a level filter (`info` / `warn` / `error` / `debug`) and
-auto-refresh. Each line is `time  level  target — message`. The targets that
-matter most: `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
-`plurxd::transcode` (encoder selection + why a hardware path was rejected),
+Structured `tracing` logs are split by job. Settings → System shows the general
+2,000-line process-local ring with a level filter (`info` / `warn` / `error` /
+`debug`) and auto-refresh. Settings → Cluster has a separate ring for
+membership, Hiqlite, and Raft detail, so replication traffic cannot evict the
+playback or library line you are looking for. General events and cluster
+warnings/errors go to stdout/journald; lower-severity cluster detail stays in
+the Cluster tab. Both rings obey `PLURX_LOG` and disappear at restart.
+
+Each line is `time  level  target — message`. The general targets that matter
+most are `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
+`plurxd::transcode` (encoder selection + why a hardware path was rejected), and
 `plurxd::stream` (session lifecycle). Raise verbosity for one subsystem with
-`PLURX_LOG=plurxd::transcode=debug`.
+`PLURX_LOG=plurxd::transcode=debug`; use
+`PLURX_LOG=info,openraft=debug,hiqlite=debug` when the Cluster log needs Raft
+detail.
 
 ## Health & metrics
 

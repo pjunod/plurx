@@ -410,6 +410,14 @@ pub trait MediaStore: Send + Sync + 'static {
     // --- browse ---
     async fn get_item(&self, id: i64) -> Result<Option<Item>, StoreError>;
     async fn get_item_children(&self, parent_id: i64) -> Result<Vec<Item>, StoreError>;
+    /// Every item that names at least one materialized artwork file.
+    ///
+    /// Cluster voters use this as a reconciliation inventory: item rows are
+    /// replicated, while the bytes named by `poster_path` and `backdrop_path`
+    /// remain node-local. Returning complete items keeps the owning item id
+    /// available for a provider/local-source repair when no peer still holds
+    /// the named file.
+    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError>;
     /// One page of a library's grid, optionally narrowed to a single genre.
     ///
     /// The genre is matched against the item's stored list (migration v13),

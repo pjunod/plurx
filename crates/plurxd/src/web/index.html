@@ -603,7 +603,18 @@
   .clstate.good{border-left-color:var(--good)}
   .clstate.warn{border-left-color:var(--warn,#fbbf24)}
   .clstate.calm{border-left-color:var(--line)}
-  .clnode{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+  /* A UUID is stable but useless for recognizing a machine. Lead with the
+     short OS hostname, keep the advertised host and node id as copyable
+     details, and put leadership beside the host it belongs to instead of
+     making the operator infer it from a removal refusal. */
+  .clidentity{min-width:190px}
+  .clhostline{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .clhost{font-size:15px;font-weight:700;line-height:1.3;overflow-wrap:anywhere}
+  .claddr{margin-top:4px;color:var(--text);font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:11.5px;font-weight:500;line-height:1.35;overflow-wrap:anywhere}
+  .clid{margin-top:3px;color:var(--muted);font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:10.5px;font-weight:400;line-height:1.35;word-break:break-all}
+  .clleader{color:var(--accent);border-color:var(--accent)}
   /* A join token is a complete cluster credential shown exactly once. It gets
      its own loud box so nobody mistakes it for an id they can leave on screen,
      and `user-select:all` makes copying it one gesture on a machine with no
@@ -8908,7 +8919,10 @@ function renderSettings(){
   const bar=SET_TABS.map(([id,label])=>`<button class="settab${tab===id?' active':''}" onclick="setSettingsTab('${id}')">${label}</button>`).join("");
   document.getElementById("main").innerHTML=`<div class="settabs">${bar}</div><div class="adminwrap" id="setbody">${settingsPanel(tab,d)}</div>`;
   if(tab==="system") refreshLogs();     // the log box only exists on the System tab
-  if(tab==="cluster") loadCluster();    // the roster is fetched on first open, not with Settings
+  if(tab==="cluster"){
+    loadCluster();                       // the roster is fetched on first open, not with Settings
+    refreshClusterLogs();                // replication detail has its own ring on this tab
+  }
 }
 function settingsPanel(tab,d){
   if(tab==="metadata") return metadataPanel(d.settings,d.trakt);
@@ -9389,6 +9403,7 @@ let CLUSTER_LOADED=false;
 // The last removal refusal, held so its sentence stays readable. A toast is
 // 2.2 seconds and these answers are paragraphs.
 let CLUSTER_REFUSAL=null;
+let CLUSTER_LEAVING=false;
 // A minted join token lives here and nowhere else — never localStorage, never
 // the URL, never a log. Until it is redeemed or expires it is the complete
 // authority to join a node to this cluster (docs/SECURITY.md), so it is held
@@ -9470,9 +9485,9 @@ function membershipRefusalText(code,message){
       "downloads here, then retry the removal. plurx will move work only when a surviving node proves "+
       "it can read the source; otherwise it fails the package cleanly so the client can request it again.",
     cluster_leader_removal_refused:
-      "This node is the cluster's current leader, and a leader cannot remove itself. Leadership moves to "+
-      "another voter on its own when this node restarts or stops being reachable; wait for that, then "+
-      "try the removal again.",
+      "That node is the cluster's current leader, so another voter cannot remove it remotely. Open Cinema "+
+      "on the leader itself and use Leave this cluster; it elects and confirms a successor before committing "+
+      "its own removal, and then shuts down.",
     cluster_node_not_found:
       "This node is not in the cluster's current membership — it may already have been removed from "+
       "another browser or another server. The current roster is being refreshed now.",
@@ -9494,7 +9509,12 @@ function clusterNodeRow(n){
     ? `<span style="color:var(--good)">reachable</span>`
     : `<span style="color:var(--bad)">not reachable</span>`;
   const seen=n.last_seen_at?esc(fmtAgo(Math.floor(n.last_seen_at/1000))):`<span class="muted">never</span>`;
-  return `<tr><td class="libname clnode">${esc(n.node_id)}</td>
+  const leader=n.is_leader?`<span class="pill clleader">Leader</span>`:"";
+  const hostname=n.hostname||n.node_id;
+  const advertised=n.advertised_host
+    ? `<div class="claddr">Advertised host ${esc(n.advertised_host)}</div>`:"";
+  return `<tr><td class="libname clidentity"><div class="clhostline"><span class="clhost">${esc(hostname)}</span>${leader}</div>
+      ${advertised}<div class="clid">Node ID ${esc(n.node_id)}</div></td>
     <td data-label="Raft id" class="muted">${esc(String(n.raft_id))}</td>
     <td data-label="Role">${role}</td>
     <td data-label="Reachable">${reach}</td>
@@ -9517,7 +9537,7 @@ function clusterPanel(d){
   // the same renderer as Settings → System.
   const replication=(clustered&&cluster.replication)||(d.sys&&d.sys.replication);
   const roster=nodes.length
-    ? `<table><thead><tr><th>Node</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
+    ? `<table><thead><tr><th>Host</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
        <tbody>${nodes.map(clusterNodeRow).join("")}</tbody></table>`
     : clustered?`<div class="empty">No node records yet.</div>`:"";
   return `<div class="card"><h2 class="section" style="margin-top:0">Cluster</h2>
@@ -9527,7 +9547,15 @@ function clusterPanel(d){
       — the same reading as the Server card on the System tab.</div>
     ${statusFailure?`<div class="row" style="margin-top:10px"><button class="ghost sm" onclick="retryCluster()">Retry roster</button></div>`:""}
     ${clusterRefusalHtml()}
-    ${clustered?joinPanel():""}</div>`;
+    ${clustered?joinPanel()+leavePanel():""}</div>
+    <div class="card"><h2 class="section" style="margin-top:0">Cluster log</h2>
+      <div class="row"><select id="clloglvl" style="max-width:120px" onchange="refreshClusterLogs()">
+          <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
+          <option value="error">Errors</option><option value="debug">Debug+</option></select>
+        <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="cllogauto" checked style="width:auto"> auto-refresh</label>
+        <button class="ghost sm" onclick="refreshClusterLogs()">Refresh</button></div>
+      <div class="hint">Membership, Hiqlite, and Raft events are kept here instead of the general System log.</div>
+      <div class="logbox" id="cllogbox">Loading…</div></div>`;
 }
 function retryCluster(){
   CLUSTER_LOADED=false;
@@ -9553,6 +9581,17 @@ function joinPanel(){
       <button onclick="mintJoinToken(this)">Create a join token</button></div>
     <div class="hint">A join token is single-use and short-lived, and it is shown once. Create it when the
       other machine is ready to start, not before.</div>`;
+}
+function leavePanel(){
+  if(CLUSTER_LEAVING) return `<h2 class="section">Remove this node</h2>
+    <div class="clstate calm"><h3>Leaving the cluster</h3><p>The membership change committed. This
+      Cinema node is draining connections and will shut down.</p></div>`;
+  return `<h2 class="section">Remove this node</h2>
+    <button class="ghost sm" onclick="leaveCluster(this)">Leave this cluster</button>
+    <div class="hint">A graceful leave is permanent, not an update or restart action. This node resolves
+      its owned offline work and, if it is the leader, elects and confirms a successor before committing its
+      own removal. It then drains and shuts down. Rejoining this machine requires a fresh data directory and
+      a new join token.</div>`;
 }
 // Deliberately loud. Anyone holding the complete token can join a node to this
 // cluster until it is redeemed or expires, so this says that plainly rather
@@ -9619,6 +9658,21 @@ async function removeNode(nodeId){
   }
   renderSettings();
 }
+async function leaveCluster(btn){
+  if(!confirm(`Permanently remove this Cinema node from the cluster and shut it down?\n\n`+
+    `Do not use this for an update or restart. Rejoining requires discarding this node's old Cinema `+
+    `data directory and using a new join token. Media files are not touched.`)) return;
+  CLUSTER_REFUSAL=null;
+  const was=btn.textContent; btn.disabled=true; btn.textContent="Leaving…";
+  try{
+    await api("/cluster/leave",{method:"POST"});
+    CLUSTER_LEAVING=true;
+  }catch(e){
+    btn.disabled=false; btn.textContent=was;
+    CLUSTER_REFUSAL={node_id:"This node",code:e.code,message:e.message};
+  }
+  renderSettings();
+}
 // Inline library editor: the row becomes an editable form (name · kind · paths).
 function editLib(id){
   const l=SETTINGS_DATA&&SETTINGS_DATA.libs.find(x=>x.id===id); if(!l) return;
@@ -9670,6 +9724,8 @@ async function settingsTick(){
     }
     const auto=document.getElementById("logauto");
     if(auto&&auto.checked) refreshLogs();
+    const clusterAuto=document.getElementById("cllogauto");
+    if(clusterAuto&&clusterAuto.checked) refreshClusterLogs();
     // Live Trakt card: the device-link poll and sync state resolve server-side.
     if(!TRAKT_EDIT){
       const t=await api("/trakt/status");
@@ -9687,6 +9743,17 @@ async function refreshLogs(){
       ||'<span class="muted">Nothing at this level yet.</span>';
     if(stick) box.scrollTop=box.scrollHeight;
   }catch(e){ box.textContent="Failed to load logs: "+e.message; }
+}
+async function refreshClusterLogs(){
+  const box=document.getElementById("cllogbox"); if(!box) return;
+  const sel=document.getElementById("clloglvl");
+  try{
+    const lines=await api(`/system/logs?scope=cluster&level=${sel?sel.value:"info"}&limit=300`);
+    const stick = box.scrollHeight-box.scrollTop-box.clientHeight < 40;
+    box.innerHTML=lines.map(l=>`<div class="log-${esc(l.level)}">${fmtTs(l.ts_ms)} <b>${esc(l.level)}</b> ${esc(l.target)} — ${esc(l.message)}</div>`).join("")
+      ||'<span class="muted">Nothing at this level yet.</span>';
+    if(stick) box.scrollTop=box.scrollHeight;
+  }catch(e){ box.textContent="Failed to load cluster logs: "+e.message; }
 }
 async function addLib(){
   const name=ln.value.trim(), sel=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
