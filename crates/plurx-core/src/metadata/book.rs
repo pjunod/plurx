@@ -16,7 +16,7 @@ use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Reader;
 
 use crate::domain::{BookMetadataPatch, BookMetadataSource, ItemKind};
-use crate::store::Store;
+use crate::store::{PublicationStore, Store};
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
@@ -102,6 +102,23 @@ pub fn read_epub_facts(path: &Path) -> Result<EpubFacts, BookMetadataError> {
 /// true across later scheduled scans as well as at initial import time.
 pub async fn enrich_library(
     store: &dyn Store,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+) -> BookEnrichReport {
+    enrich_library_with_publication(
+        &PublicationStore::unfenced(store),
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_library_with_publication(
+    store: &PublicationStore<'_>,
     artwork_dir: &Path,
     library_id: i64,
     force: bool,

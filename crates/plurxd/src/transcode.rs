@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plurx_core::domain::PlaybackEvent;
-use plurx_core::store::{keys, Store};
+use plurx_core::store::{keys, PublicationFence, PublicationStore, Store};
 use plurx_core::transcode::{
     self, EffectiveRateControl, Encoder, EncoderCaps, OutputGrade, Pacing, Pipeline,
     PipelineDigest, QualityRateControlValidation, QualityRc, RateMode, Recipe, ToneMap,
@@ -2930,7 +2930,7 @@ pub enum OfflineProduceOutcome {
 /// The policy and source shared by the cache-claim and encoder stages of one
 /// portable production attempt. Keeping these together makes it much harder
 /// for a resume path to accidentally change one input between the two stages.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PortableProduction<'a> {
     file: &'a plurx_core::domain::MediaFile,
     opts: &'a TranscodeOptions,
@@ -2939,6 +2939,7 @@ struct PortableProduction<'a> {
     yield_to_offline: bool,
     cancelled: Option<&'a tokio_util::sync::CancellationToken>,
     offline_package_id: Option<&'a str>,
+    publication_fence: Option<PublicationFence>,
 }
 
 /// Everything an earlier pass already encoded, in order.
@@ -4009,12 +4010,51 @@ impl TranscodeManager {
     /// Returns the recipe hash on success, `None` when there was nothing to do
     /// (already cached, already claimed by another producer, no cache
     /// configured) — neither of which is a failure.
+    #[cfg(test)]
     pub async fn produce(
         &self,
         file: &plurx_core::domain::MediaFile,
         target_height: i64,
         deadline: Instant,
     ) -> Result<Option<Produced>, String> {
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        self.produce_attempt(file, target_height, deadline, &cancelled, None)
+            .await
+    }
+
+    /// Speculative production with an ownership token. Losing the cluster
+    /// candidate-pass lease cancels the active ffmpeg child at the same
+    /// checkpoint used for live/offline preemption, so a stale node cannot
+    /// keep consuming an encoder or finish a cache publication.
+    pub async fn produce_cancelled(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        deadline: Instant,
+        cancelled: &tokio_util::sync::CancellationToken,
+        publication_fence: PublicationFence,
+    ) -> Result<Option<Produced>, String> {
+        self.produce_attempt(
+            file,
+            target_height,
+            deadline,
+            cancelled,
+            Some(publication_fence),
+        )
+        .await
+    }
+
+    async fn produce_attempt(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        deadline: Instant,
+        cancelled: &tokio_util::sync::CancellationToken,
+        publication_fence: Option<PublicationFence>,
+    ) -> Result<Option<Produced>, String> {
+        if cancelled.is_cancelled() {
+            return Ok(None);
+        }
         if self.cache.is_none() {
             return Ok(None);
         }
@@ -4055,6 +4095,9 @@ impl TranscodeManager {
         let hash = self
             .effective_recipe(&mut digest, file, &opts, encoder, false)
             .hash();
+        if cancelled.is_cancelled() {
+            return Ok(None);
+        }
 
         Ok(
             match self
@@ -4065,8 +4108,9 @@ impl TranscodeManager {
                         encoder,
                         deadline,
                         yield_to_offline: true,
-                        cancelled: None,
+                        cancelled: Some(cancelled),
                         offline_package_id: None,
+                        publication_fence,
                     },
                     hash,
                 )
@@ -4160,6 +4204,7 @@ impl TranscodeManager {
                     yield_to_offline: false,
                     cancelled: Some(cancelled),
                     offline_package_id: Some(package_id),
+                    publication_fence: None,
                 },
                 hash,
             )
@@ -4198,16 +4243,25 @@ impl TranscodeManager {
             encoder: _,
             deadline: _,
             yield_to_offline: _,
-            cancelled: _,
+            cancelled,
             offline_package_id,
-        } = request;
+            publication_fence,
+        } = &request;
+        let cancelled = *cancelled;
+        let offline_package_id = *offline_package_id;
         let cache = self.cache.as_ref().ok_or("no cache configured")?;
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         if let Some(cached) = self
             .store
             .cache_hit(&hash, &cache.node_id)
             .await
             .map_err(|error| error.to_string())?
         {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Ok(OfflineProduceOutcome::Yielded);
+            }
             let playlist =
                 tokio::fs::read_to_string(cache.dir.join(&cached.relative_dir).join("index.m3u8"))
                     .await
@@ -4231,21 +4285,55 @@ impl TranscodeManager {
             }));
         }
 
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         self.ensure_text_subtitle(file, opts.subtitle_burn.as_ref())
             .await?;
-        let relative = format!("{}/{hash}", &hash[..2]);
-        let taken = self
-            .store
-            .claim_cache_entry(
-                &hash,
-                file.id,
-                CACHE_RECIPE_VERSION,
-                &cache.node_id,
-                &relative,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let temp = crate::cachekeep::staging_dir(&cache.dir, &hash);
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
+        let generation = if let Some(fence) = publication_fence {
+            let Some(lease) = fence.snapshot().await else {
+                return Ok(OfflineProduceOutcome::Yielded);
+            };
+            Some(lease.fence)
+        } else {
+            None
+        };
+        let relative = generation.map_or_else(
+            || format!("{}/{hash}", &hash[..2]),
+            |fence| format!("{}/{hash}-f{fence}", &hash[..2]),
+        );
+        let taken = if let Some(fence) = publication_fence {
+            PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                .claim_cache_entry(
+                    &hash,
+                    file.id,
+                    CACHE_RECIPE_VERSION,
+                    &cache.node_id,
+                    &relative,
+                )
+                .await
+        } else {
+            self.store
+                .claim_cache_entry(
+                    &hash,
+                    file.id,
+                    CACHE_RECIPE_VERSION,
+                    &cache.node_id,
+                    &relative,
+                )
+                .await
+        }
+        .map_err(|error| error.to_string())?;
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
+        let temp = generation.map_or_else(
+            || crate::cachekeep::staging_dir(&cache.dir, &hash),
+            |fence| cache.dir.join("tmp").join(format!("{hash}-f{fence}")),
+        );
         if !taken {
             if tokio::fs::metadata(&temp).await.is_err() {
                 tracing::debug!(
@@ -4265,32 +4353,64 @@ impl TranscodeManager {
         let published = match self.produce_into(&temp, &hash, &request).await {
             Ok(Some(published)) => published,
             Ok(None) => {
-                self.touch_claim(&hash, &cache.node_id).await;
+                if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    return Ok(OfflineProduceOutcome::Yielded);
+                }
+                if let Some(fence) = publication_fence {
+                    if let Err(error) = PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                        .touch_cache_claim(&hash, &cache.node_id)
+                        .await
+                    {
+                        tracing::warn!(recipe = %hash, error = %error, "could not mark a fenced pre-transcode as still in progress");
+                    }
+                } else {
+                    self.touch_claim(&hash, &cache.node_id).await;
+                }
                 return Ok(OfflineProduceOutcome::Yielded);
             }
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temp).await;
-                let _ = self
-                    .store
-                    .forget_cache_entry(&hash, &cache.node_id, "local")
-                    .await;
+                if !cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    if let Some(fence) = publication_fence {
+                        let _ = PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                            .forget_cache_entry(&hash, &cache.node_id, "local")
+                            .await;
+                    } else {
+                        let _ = self
+                            .store
+                            .forget_cache_entry(&hash, &cache.node_id, "local")
+                            .await;
+                    }
+                }
                 return Err(error);
             }
         };
 
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         let final_dir = cache.dir.join(&relative);
         if let Some(parent) = final_dir.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|error| format!("creating {}: {error}", parent.display()))?;
         }
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         tokio::fs::rename(&temp, &final_dir)
             .await
             .map_err(|error| format!("publishing {}: {error}", final_dir.display()))?;
-        self.store
-            .complete_cache_entry(&hash, &cache.node_id, published.bytes)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Some(fence) = publication_fence {
+            PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                .complete_cache_entry(&hash, &cache.node_id, &relative, published.bytes)
+                .await
+        } else {
+            self.store
+                .complete_cache_entry(&hash, &cache.node_id, published.bytes)
+                .await
+        }
+        .map_err(|error| error.to_string())?;
         tracing::info!(
             recipe = %hash,
             file = file.id,
@@ -4338,7 +4458,8 @@ impl TranscodeManager {
             yield_to_offline,
             cancelled,
             offline_package_id,
-        } = *request;
+            publication_fence: _,
+        } = request.clone();
         tokio::fs::create_dir_all(temp)
             .await
             .map_err(|e| format!("creating {}: {e}", temp.display()))?;
@@ -4483,7 +4604,12 @@ impl TranscodeManager {
             }
 
             match ended {
-                PartEnd::Finished => return publish_from(temp, &parts).await,
+                PartEnd::Finished => {
+                    if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        return Ok(None);
+                    }
+                    return publish_from(temp, &parts).await;
+                }
                 PartEnd::Preempted | PartEnd::Deadline => {
                     tracing::info!(
                         recipe = %hash, spawned,
@@ -4541,6 +4667,10 @@ impl TranscodeManager {
         cancelled: Option<&tokio_util::sync::CancellationToken>,
     ) -> PartEnd {
         loop {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                let _ = child.kill().await;
+                return PartEnd::Preempted;
+            }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return PartEnd::Finished,
                 Ok(Some(status)) => {
@@ -4558,10 +4688,6 @@ impl TranscodeManager {
                         .offline_waiting
                         .load(std::sync::atomic::Ordering::Acquire))
             {
-                let _ = child.kill().await;
-                return PartEnd::Preempted;
-            }
-            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 let _ = child.kill().await;
                 return PartEnd::Preempted;
             }
