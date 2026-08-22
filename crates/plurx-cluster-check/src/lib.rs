@@ -294,6 +294,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             token_digest: token_digest.clone(),
             raft_id: issued.raft_id,
             node_id: format!("node-{node_id}"),
+            hostname: format!("cluster-node-{node_id}"),
             raft_address: spec.raft,
             api_address: spec.api,
             schema_version: AUTH_SCHEMA_VERSION,
@@ -365,6 +366,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                         token_digest: join_token_digest(&expired.token),
                         raft_id: expired.raft_id,
                         node_id: "expired-candidate".to_owned(),
+                        hostname: "expired-host".to_owned(),
                         raft_address: "127.0.0.1:1".to_owned(),
                         api_address: "127.0.0.1:2".to_owned(),
                         schema_version: AUTH_SCHEMA_VERSION,
@@ -384,6 +386,11 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         || status.nodes.len() != 3
         || status.nodes.iter().any(|node| !node.reachable)
         || status.nodes.iter().any(|node| node.hostname.is_empty())
+        || status.nodes.iter().any(|node| node.hostname.contains('.'))
+        || status
+            .nodes
+            .iter()
+            .any(|node| node.advertised_host != "localhost")
         || status.nodes.iter().filter(|node| node.is_leader).count() != 1
         || !status
             .nodes
@@ -397,8 +404,9 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     if public_status.contains(&redeemed_token)
         || public_status.contains("api_address")
         || public_status.contains("raft_address")
+        || public_status.contains(":3240")
     {
-        bail!("public node records exposed token or listener-address material");
+        bail!("public node records exposed token or listener-port material");
     }
     for node_id in 1..=3 {
         let urls = match cluster.request(node_id, Request::ArtworkPeerUrls).await? {

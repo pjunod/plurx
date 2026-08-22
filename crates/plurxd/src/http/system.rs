@@ -305,6 +305,10 @@ pub struct LogsQuery {
     pub level: String,
     #[serde(default = "default_log_limit")]
     pub limit: usize,
+    /// `general` is Settings → System; `cluster` is the isolated membership
+    /// and Raft ring on Settings → Cluster.
+    #[serde(default)]
+    pub scope: String,
 }
 
 fn default_log_level() -> String {
@@ -320,7 +324,12 @@ pub async fn logs(
     State(state): State<AppState>,
     Query(q): Query<LogsQuery>,
 ) -> Json<Vec<crate::logbuf::LogEntry>> {
-    Json(state.logs.tail(&q.level, q.limit.min(2000)))
+    let buffer = if q.scope == "cluster" {
+        &state.cluster_logs
+    } else {
+        &state.logs
+    };
+    Json(buffer.tail(&q.level, q.limit.min(2000)))
 }
 
 #[derive(Deserialize)]

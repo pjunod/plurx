@@ -278,11 +278,20 @@ read when you open the tab, not on every Settings visit.
 | `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
 | `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
 
-The node table leads with each advertised hostname so you can recognize the
-machine, labels the current leader beside that hostname, and keeps the stable
-node id underneath for copy/paste. `GET /api/v1/cluster/nodes` also exposes the
-Raft id, voter/learner role, reachability, and last-seen. Listener ports, media
-paths, and token material are not in that payload and are not shown.
+The node table leads with each machine's short OS hostname, labels the current
+leader beside it, then shows the advertised host and stable node id underneath.
+The advertised host may be a DNS name or IP; loopback is written `localhost`
+instead of `127.0.0.1`, and listener ports stay private. A native daemon reads
+the hostname from the OS. A container should set `PLURX_NODE_HOSTNAME` to the
+Docker host's `hostname -s`, because its own OS hostname is normally a generated
+container id. `GET /api/v1/cluster/nodes` also exposes the Raft id,
+voter/learner role, reachability, and last-seen. Media paths and token material
+are not in that payload and are not shown.
+
+The **Cluster log** under the roster holds membership, Hiqlite, and Raft events
+in its own 2,000-line process-local ring. Those events do not consume the
+general Settings → System log ring; cluster warnings and errors still reach
+stdout/journald so a startup failure remains visible without the web UI.
 
 **Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
 displays it exactly once, with a lifetime you pick between 10 minutes and 1
@@ -549,6 +558,7 @@ membership addresses and token-file paths are intentionally file-only:
 |---|---|---|---|
 | `PLURX_BIND` | `server.bind` | `0.0.0.0:32400` | Address the HTTP API binds to |
 | `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
+| `PLURX_NODE_HOSTNAME` | — | OS hostname | Short physical-machine name shown in Settings → Cluster. Native installs normally leave this unset; containers set it explicitly so a generated container id is not mistaken for the host |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_SCAN_PRUNE_PERCENT` | `storage.scan_prune_percent` | `10` | Maximum percentage of known files one complete scan may remove; `0` disables automatic removal |
 | `PLURX_CREDENTIAL_KEY_FILE` | `cluster.credential_key_file` | `<data_dir>/credentials.key` | Node-local key that encrypts the stored Trakt bearer credential. Minted mode-`0600` on first boot, and required to stay owner-only. **Back it up with the database** — plurx refuses to start if the sealed rows outlive it, or if the key present is not the one that sealed them ([SECURITY.md](SECURITY.md)) |
@@ -1496,13 +1506,21 @@ means enrichment has no TMDB key configured — the scan itself succeeded.
 
 ## Logs
 
-Structured `tracing` logs go to stdout/journald, and the same buffer is exposed
-in Settings → Logs with a level filter (`info` / `warn` / `error` / `debug`) and
-auto-refresh. Each line is `time  level  target — message`. The targets that
-matter most: `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
-`plurxd::transcode` (encoder selection + why a hardware path was rejected),
+Structured `tracing` logs are split by job. Settings → System shows the general
+2,000-line process-local ring with a level filter (`info` / `warn` / `error` /
+`debug`) and auto-refresh. Settings → Cluster has a separate ring for
+membership, Hiqlite, and Raft detail, so replication traffic cannot evict the
+playback or library line you are looking for. General events and cluster
+warnings/errors go to stdout/journald; lower-severity cluster detail stays in
+the Cluster tab. Both rings obey `PLURX_LOG` and disappear at restart.
+
+Each line is `time  level  target — message`. The general targets that matter
+most are `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
+`plurxd::transcode` (encoder selection + why a hardware path was rejected), and
 `plurxd::stream` (session lifecycle). Raise verbosity for one subsystem with
-`PLURX_LOG=plurxd::transcode=debug`.
+`PLURX_LOG=plurxd::transcode=debug`; use
+`PLURX_LOG=info,openraft=debug,hiqlite=debug` when the Cluster log needs Raft
+detail.
 
 ## Health & metrics
 
