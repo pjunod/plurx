@@ -7184,7 +7184,7 @@ async function rescueAutoSupply(){
 }
 async function autoControllerTick(){
   const p=PLAYER, v=document.getElementById("video");
-  if(!p||!v||!p.abr||qualityForce()!=='auto'||!p.started||v.paused||p.abr.switching) return;
+  if(!(SERVER&&SERVER.playback_auto_abr)||!p||!v||!p.abr||qualityForce()!=='auto'||!p.started||v.paused||p.abr.switching) return;
   if(p.autoFallbackInFlight) return;
   await pollSessionHealth(true);
   // Re-checked after the poll for the same reason it is checked before it: the
@@ -9193,6 +9193,9 @@ function playbackPanel(settings){
           <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
       </div>
       <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="autonext" ${autoNextOn()?'checked':''} onchange="setAutoNext(this.checked)" style="width:auto;margin-right:9px"> Auto-play the next episode when one finishes <span class="muted" style="font-size:12px;margin-left:6px">· saved on this browser</span></label>
+      <h2 class="section">Automatic quality</h2>
+      <label class="row" style="margin:0;font-size:14px;color:var(--text)"><input type="checkbox" id="pabr" ${settings.playback_auto_abr?'checked':''} style="width:auto;margin-right:9px"> Adjust Auto quality while playing</label>
+      <p class="muted" style="margin-top:8px">Off keeps the server's initial Auto choice and the full manual quality menu, but makes no client-side rung changes or supply-stall restart. Off is the default until the Auto acceptance week is complete.</p>
       <h2 class="section">Measured playback limits</h2>
       <p class="muted" style="margin-top:0">When an original stream loses visible frames, this browser remembers that
         exact media load — codec/profile, resolution, bit depth, dynamic range, and a 10 Mb/s bitrate band — and lets
@@ -9819,10 +9822,12 @@ async function savePlayback(){
       default_sub_lang:document.getElementById("psl").value,
       sub_mode:document.getElementById("psm").value,
       stream_readrate:document.getElementById("prr").value,
+      playback_auto_abr:document.getElementById("pabr").checked,
       hls_readrate:document.getElementById("phr").value,
       hls_burst_secs:document.getElementById("phb").value,
       hls_ahead_max_secs:document.getElementById("pha").value,
       hls_typeless_sliding:document.getElementById("phs").checked}});
+    if(SERVER) SERVER.playback_auto_abr=SETTINGS.playback_auto_abr;
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }
