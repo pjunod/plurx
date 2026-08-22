@@ -444,3 +444,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackTelemetr
 source_anchor = "internal fun redactedFailureDetail("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackTelemetryTest.kt"
 test_anchor = "preMediaFailureNamesItsStageWithoutLeakingExceptionText"
+
+[[fixes]]
+id = "android.saved-session-unreachable-resume"
+commits = ["1014af35"]
+source = "clients/android/app/src/main/java/tv/plurx/app/ui/AppViewModel.kt"
+source_anchor = "A persisted bearer is enough to restore the app shell."
+test = "clients/android/app/src/androidTest/java/tv/plurx/app/ui/SavedSessionResumeTest.kt"
+test_anchor = "savedSessionPaintsHomeBeforeAnUnreachableServerFinishesValidation"
