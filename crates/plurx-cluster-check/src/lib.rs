@@ -269,6 +269,10 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         }
     })
     .await?;
+    cluster
+        .request(1, Request::SeedLegacyArtworkUrls)
+        .await?
+        .require_ok()?;
     cluster.request(1, Request::Bootstrap).await?.require_ok()?;
 
     let initial_dump = match cluster.request(1, Request::Dump).await? {
@@ -412,6 +416,18 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     {
         bail!("public node records exposed token or listener-port material");
     }
+    require_membership_error_message(
+        cluster
+            .request(
+                2,
+                Request::RejectDuplicateArtworkUrl {
+                    public_http_url: "http://127.0.0.1:33001".to_owned(),
+                },
+            )
+            .await?,
+        "membership_internal",
+        "already published by another cluster node",
+    )?;
     for node_id in 1..=3 {
         let urls = match cluster.request(node_id, Request::ArtworkPeerUrls).await? {
             Response::ArtworkPeerUrls { urls } => urls,
@@ -1092,6 +1108,23 @@ fn require_membership_error(response: Response, expected: &str) -> Result<()> {
     }
 }
 
+fn require_membership_error_message(
+    response: Response,
+    expected_code: &str,
+    expected_message: &str,
+) -> Result<()> {
+    match response {
+        Response::MembershipError { code, message }
+            if code == expected_code && message.contains(expected_message) =>
+        {
+            Ok(())
+        }
+        response => bail!(
+            "expected membership error {expected_code} containing {expected_message:?}, got {response:?}"
+        ),
+    }
+}
+
 async fn compacted_growth_gate(root: Option<PathBuf>) -> Result<()> {
     println!("cluster-check: post-coalescer compacted growth");
     install_crypto_provider();
@@ -1690,6 +1723,10 @@ pub struct Preflight {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
+    /// Recreate the origin/main M3 table shape and its former shared join-URL
+    /// rows before MembershipManager starts, proving the rolling upgrade path
+    /// rather than only the schema a fresh binary would create.
+    SeedLegacyArtworkUrls,
     Bootstrap,
     RejectIdentityDrift,
     Open,
@@ -1704,6 +1741,9 @@ pub enum Request {
     },
     MembershipStatus,
     ArtworkPeerUrls,
+    RejectDuplicateArtworkUrl {
+        public_http_url: String,
+    },
     ArtworkPeerAuth {
         filename: String,
     },
@@ -2643,6 +2683,29 @@ async fn handle_request(
     membership: &mut Option<MembershipManager>,
 ) -> Result<Response> {
     match request {
+        Request::SeedLegacyArtworkUrls => {
+            client
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS cluster_node_http (\
+                       node_id TEXT PRIMARY KEY, \
+                       public_http_url TEXT NOT NULL) STRICT",
+                    hiqlite::macros::params!(),
+                )
+                .await?;
+            for node_id in 1..=3 {
+                client
+                    .execute(
+                        "INSERT INTO cluster_node_http (node_id, public_http_url) \
+                         VALUES ($1, $2)",
+                        hiqlite::macros::params!(
+                            format!("node-{node_id}"),
+                            "https://shared-join-lb.invalid"
+                        ),
+                    )
+                    .await?;
+            }
+            Ok(Response::Ok)
+        }
         Request::Bootstrap => {
             let opened = Arc::new(
                 HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID, telemetry_path).await?,
@@ -2695,6 +2758,20 @@ async fn handle_request(
             .await
             .map(|urls| Response::ArtworkPeerUrls { urls })
             .or_else(|error| Ok(membership_error_response(error))),
+        Request::RejectDuplicateArtworkUrl { public_http_url } => {
+            membership_manager_with_artwork_url(
+                client,
+                store
+                    .as_ref()
+                    .cloned()
+                    .context("auth store has not been opened")?,
+                launch,
+                public_http_url,
+            )
+            .await
+            .map(|_| Response::Ok)
+            .or_else(|error| Ok(membership_error_response(error)))
+        }
         Request::ArtworkPeerAuth { ref filename } => membership_ref(membership)?
             .artwork_peer_auth(filename)
             .map(|auth| Response::ArtworkPeerAuth { auth })
@@ -3003,11 +3080,32 @@ async fn membership_manager(
     store: Arc<HiqliteAuthStore>,
     launch: &NodeLaunch,
 ) -> Result<MembershipManager> {
+    membership_manager_with_artwork_url(
+        client,
+        store,
+        launch,
+        format!("http://127.0.0.1:{}", 33_000 + launch.node_id),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn membership_manager_with_artwork_url(
+    client: &Client,
+    store: Arc<HiqliteAuthStore>,
+    launch: &NodeLaunch,
+    artwork_http: String,
+) -> std::result::Result<MembershipManager, plurx_core::cluster::membership::MembershipError> {
     let local = launch
         .nodes
         .iter()
         .find(|node| node.id == launch.node_id)
-        .with_context(|| format!("voter {} has no local node spec", launch.node_id))?;
+        .ok_or_else(|| {
+            plurx_core::cluster::membership::MembershipError::Internal(format!(
+                "voter {} has no local node spec",
+                launch.node_id
+            ))
+        })?;
     MembershipManager::replicated(
         client.clone(),
         store,
@@ -3022,7 +3120,7 @@ async fn membership_manager(
             api_address: local.api.clone(),
         },
         "https://shared-join-lb.invalid".to_owned(),
-        format!("http://127.0.0.1:{}", 33_000 + launch.node_id),
+        artwork_http,
         JoinSecrets {
             raft: RAFT_SECRET.to_owned(),
             api: API_SECRET.to_owned(),
@@ -3039,7 +3137,6 @@ async fn membership_manager(
         },
     )
     .await
-    .map_err(Into::into)
 }
 
 /// Package ids the removal scenario asserts on. Each names the §6.7 outcome

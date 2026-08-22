@@ -81,7 +81,7 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
     // is where another voter can retrieve node-local materialized bytes.
     "CREATE TABLE IF NOT EXISTS cluster_node_http (\
          node_id TEXT PRIMARY KEY, \
-         public_http_url TEXT NOT NULL UNIQUE) STRICT",
+         public_http_url TEXT NOT NULL) STRICT",
     // Additive so a rolling upgrade can teach old membership rows their
     // machine names without rewriting the cluster_nodes table underneath an
     // older voter. Every new daemon creates this table before its heartbeat.
@@ -722,15 +722,30 @@ impl MembershipManager {
     /// carrying no new information.
     async fn publish_http_url(&self) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
-        inner
+        // The ownership check belongs in the serialized Raft statement rather
+        // than a UNIQUE table constraint. Existing M3 clusters already have
+        // this table without that constraint, and may temporarily contain the
+        // former shared join URL in every row while voters roll forward. A
+        // node may replace its own legacy value, but may never claim a URL
+        // currently published by another node.
+        let changed = inner
             .client
             .execute(
-                "INSERT INTO cluster_node_http (node_id, public_http_url) VALUES ($1, $2) \
+                "INSERT INTO cluster_node_http (node_id, public_http_url) \
+                 SELECT $1, $2 WHERE NOT EXISTS (\
+                   SELECT 1 FROM cluster_node_http \
+                   WHERE public_http_url = $2 AND node_id != $1) \
                  ON CONFLICT(node_id) DO UPDATE SET \
                    public_http_url = excluded.public_http_url",
                 params!(inner.identity.node_id.as_str(), inner.artwork_http.as_str()),
             )
             .await?;
+        if changed != 1 {
+            return Err(MembershipError::Internal(format!(
+                "artwork URL {} is already published by another cluster node",
+                inner.artwork_http
+            )));
+        }
         self.upsert_hostname(&inner.identity.node_id, &inner.local_hostname)
             .await
     }
@@ -1810,17 +1825,20 @@ async fn reconcile_membership_change(
                 let client = client.clone();
                 let raft_id = *raft_id;
                 async move {
-                    let voters = client
+                    let response = client
                         .get(format!("https://{api}/cluster/metrics/sqlite"))
                         .header("X-API-SECRET", api_secret)
                         .header(reqwest::header::ACCEPT, "application/json")
                         .send()
-                        .await
-                        .ok()?
-                        .json::<RemoteMembershipMetrics>()
-                        .await
-                        .ok()
-                        .and_then(RemoteMembershipMetrics::uniform_voters);
+                        .await;
+                    let voters = match response {
+                        Ok(response) => response
+                            .json::<RemoteMembershipMetrics>()
+                            .await
+                            .ok()
+                            .and_then(RemoteMembershipMetrics::uniform_voters),
+                        Err(_) => None,
+                    };
                     (raft_id, voters)
                 }
             }))
