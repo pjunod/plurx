@@ -1,7 +1,7 @@
 version = 1
 
 [[coverage]]
-commits = ["0d6b1701"]
+commits = ["0d6b1701", "0ba4bb42"]
 points = ["cluster.auth", "metadata.enrichment"]
 checks = ["rust-gate", "cluster-auth"]
 reason = "The Rust gate compiles the legacy-client removal-fence commands against the actual Hiqlite parameter macro and membership error type, and applies current Clippy policy to the local artwork rematerialization regressions. The three-voter contract then executes the raw preceding-release lease SQL, exhausted-token delayed publication, and tombstone-backfill cases; restoring the missing imports prevents those proofs from compiling, while restoring cloned one-element slices violates the workspace lint gate before the metadata behavior checks can run."
