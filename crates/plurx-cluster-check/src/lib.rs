@@ -236,6 +236,8 @@ async fn run_growth_subprocess() -> Result<()> {
 async fn controller() -> Result<()> {
     println!("cluster-check: membership lifecycle 1 -> 3 -> 2");
     run_membership_lifecycle_case().await?;
+    println!("cluster-check: current-leader self-leave");
+    run_leader_self_leave_case().await?;
     println!("cluster-check: follower loss and incompatible-voter guard");
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
@@ -488,7 +490,15 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // resolve: a download that is in flight right now. Lifting the blanket
     // refusal must not turn removal into "always succeeds".
     let transfer_package = format!("{TRANSFER_PACKAGE}-{target_node}");
-    match cluster.request(target, Request::LeaveVoter).await? {
+    match cluster
+        .request(
+            observer,
+            Request::RemoveVoter {
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
         Response::MembershipError { code, message } if code == "node_owns_offline_work" => {
             if !message.contains("transferring") {
                 bail!("in-flight transfer refusal gave the operator no reason: {message}");
@@ -531,7 +541,12 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         .require_ok()?;
 
     cluster
-        .request(target, Request::LeaveVoter)
+        .request(
+            observer,
+            Request::RemoveVoter {
+                node_id: target_node.clone(),
+            },
+        )
         .await?
         .require_ok()?;
     match cluster
@@ -774,6 +789,60 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     {
         bail!("quorum-loss roster did not explain the outage: {no_quorum_status:?}");
     }
+    cluster.shutdown_all().await?;
+    Ok(())
+}
+
+/// Prove the self-leave path that a remote removal deliberately refuses: the
+/// current leader hands leadership to a survivor before it excludes itself.
+/// This is a separate cluster because the membership lifecycle above must keep
+/// exercising ordinary remote follower removal and its offline-work policy.
+async fn run_leader_self_leave_case() -> Result<()> {
+    let executable = harness_executable()?;
+    let root = tempfile::tempdir().context("leader self-leave data root")?;
+    let (mut cluster, _) = start_cluster_with_port_retry(&executable, root.path(), 3).await?;
+
+    cluster.request(1, Request::Bootstrap).await?.require_ok()?;
+    for node_id in 2..=3 {
+        cluster
+            .request(node_id, Request::Open)
+            .await?
+            .require_ok()?;
+    }
+    cluster.wait_for_voters(&[1, 2, 3]).await?;
+
+    let departed = cluster.leader().await?;
+    cluster
+        .request(departed, Request::LeaveVoter)
+        .await?
+        .require_ok()?;
+    let remaining = (1..=3)
+        .filter(|node_id| *node_id != departed)
+        .collect::<Vec<_>>();
+    cluster.wait_for_voters(&remaining).await?;
+
+    let successor = cluster.leader().await?;
+    if successor == departed || !remaining.contains(&successor) {
+        bail!(
+            "leader self-leave did not converge on a surviving successor: departed={departed}, successor={successor}, remaining={remaining:?}"
+        );
+    }
+    let observer = remaining[0];
+    let status = match cluster.request(observer, Request::MembershipStatus).await? {
+        Response::MembershipStatus { status } => status,
+        response => bail!("unexpected post-leave membership status: {response:?}"),
+    };
+    if status.nodes.len() != 2
+        || status.nodes.iter().any(|node| node.raft_id == departed)
+        || status.nodes.iter().filter(|node| node.is_leader).count() != 1
+        || !status
+            .nodes
+            .iter()
+            .any(|node| node.raft_id == successor && node.is_leader)
+    {
+        bail!("leader self-leave did not publish the converged survivor roster: {status:?}");
+    }
+
     cluster.shutdown_all().await?;
     Ok(())
 }
