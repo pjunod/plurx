@@ -426,6 +426,7 @@ title = "Metadata matching and enrichment"
 contract = "Local and remote metadata improve catalog records deterministically, retry safely, and never overwrite stronger user-owned facts."
 paths = [
   "crates/plurx-core/src/metadata/**",
+  "crates/plurx-core/tests/audiobook_artwork.rs",
   "crates/plurxd/src/http/items.rs",
   "docs/METADATA*.md",
 ]

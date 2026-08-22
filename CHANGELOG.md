@@ -42,6 +42,14 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Audiobook artwork refresh now uses the cover already embedded in the
+  audio file.** Plurx's Books enricher inspected EPUBs only, so refreshing an
+  MP3 or M4B returned success without doing any work even when ffprobe had
+  recorded an attached picture. Audiobooks with a missing poster now copy the
+  first attached picture through bounded, timed ffmpeg extraction into the
+  artwork cache; failures are recorded on the item, while the cover-only patch
+  leaves EPUB/Curator metadata precedence unchanged.
+
 - **Artwork now follows library rows across the cluster.** Item metadata is
   replicated, but its poster and backdrop bytes live in each node's local
   artwork cache, so a follower inherited a valid filename and returned 404.
