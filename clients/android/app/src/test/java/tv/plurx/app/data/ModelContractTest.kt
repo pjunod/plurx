@@ -395,6 +395,26 @@ class ModelContractTest {
     }
 
     @Test
+    fun playbackSessionStatusDecodesTheSharedDiagnosticsContract() {
+        val status = json.decodeFromString<PlaybackSessionStatus>(
+            """{
+              "id": "session-7", "target_height": 1080, "encoder": "videotoolbox",
+              "recent_speed": 1.18, "ahead_seconds": 14, "ahead_bytes": 7340032,
+              "delivered_bps": 12400000, "suspended": false, "suspend_count": 2,
+              "playlist_shape": "sliding", "last_request": "segment-41.ts"
+            }""".trimIndent(),
+        )
+
+        assertEquals("session-7", status.id)
+        assertEquals(1080L, status.target_height)
+        assertEquals("videotoolbox", status.encoder)
+        assertEquals(1.18, status.recent_speed!!, 0.001)
+        assertEquals(12_400_000L, status.delivered_bps)
+        assertEquals("sliding", status.playlist_shape)
+        assertFalse(status.suspended!!)
+    }
+
+    @Test
     fun aTextSubtitleAsksForARenditionAndNeverAnEncoder() {
         val wire = Json { explicitNulls = false }
         // Absolute subtitle-stream index, not an ordinal among the text ones.

@@ -19,8 +19,10 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.7**, build `39` — native viewer parity across phone, foldable,
-> and TV. Build 39 restores a saved session's Home shell before checking server
+> Status: **v0.2.7**, build `40` — native viewer parity across phone, foldable,
+> and TV. Build 40 adds Mini, Standard, and Debug playback-info modes shared
+> with web and Apple, including live server-session diagnostics. Build 39
+> restores a saved session's Home shell before checking server
 > reachability, so an Android process recreation cannot strand resume on an
 > empty loading surface while its server is unavailable. Build 38 stops
 > software-only decoder claims above 1080p from selecting direct play while

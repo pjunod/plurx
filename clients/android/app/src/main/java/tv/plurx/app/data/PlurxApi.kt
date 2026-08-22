@@ -118,6 +118,9 @@ interface PlurxApi {
     @POST("files/{id}/hls/sessions")
     suspend fun createHlsSession(@Path("id") id: Long, @Body body: CreateSessionReq): HlsStart
 
+    @GET("hls/{session}/status")
+    suspend fun hlsSessionStatus(@Path("session") session: String): PlaybackSessionStatus
+
     /**
      * Release a session the moment playback ends, instead of leaving its
      * encoder to the server's idle reaper (over a minute of a hardware slot

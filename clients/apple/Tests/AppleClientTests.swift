@@ -6123,6 +6123,13 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testPlaybackInfoUsesTheSharedThreeModeContract() {
+        XCTAssertEqual(
+            PlaybackStatsMode.allCases.map(\.label),
+            ["Mini", "Standard", "Debug"]
+        )
+    }
+
     func testShelfMetadataUsesMediaFactsInsteadOfLibraryCategory() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

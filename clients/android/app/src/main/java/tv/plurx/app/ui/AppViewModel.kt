@@ -715,6 +715,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun createHlsSession(fileId: Long, body: CreateSessionReq): HlsStart =
         api().createHlsSession(fileId, body)
 
+    suspend fun hlsSessionStatus(sessionId: String) = api().hlsSessionStatus(sessionId)
+
     /**
      * Fire-and-forget session release, on [viewModelScope] for the same reason
      * as [postProgress]: teardown can't await, and the scope outlives the

@@ -61,6 +61,7 @@ import tv.plurx.app.data.ReopenReason
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.SubTrack
 import tv.plurx.app.data.Net
+import tv.plurx.app.data.PlaybackSessionStatus
 import tv.plurx.app.data.Session
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.theme.Accent
@@ -261,6 +262,12 @@ class Controller(
     var encoder: String? = null
         private set
 
+    var sessionStatus: PlaybackSessionStatus? by mutableStateOf(null)
+        private set
+
+    val currentSessionId: String? get() = sessionId
+    val currentSessionIsVod: Boolean get() = sessionIsVod
+
     private val mediaSession = MediaSession.Builder(context, player).build()
 
     /** The HLS session this player owns, if the plan opened one. */
@@ -292,6 +299,7 @@ class Controller(
         emit = { event -> postPlaybackClientLog(scope, event) },
     )
     private val stallWatchdogJob: Job
+    private var statusPollingJob: Job? = null
 
     /** Stable for this player instance — the server's supersession key. */
     private val playbackId = UUID.randomUUID().toString()
@@ -521,6 +529,7 @@ class Controller(
 
     fun release() {
         stallWatchdogJob.cancel()
+        clearStatusPolling()
         pgsOverlay.release()
         stallGuard.invalidateForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
@@ -645,6 +654,7 @@ class Controller(
         val requestVersion = stallGuard.beginRequest()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        clearStatusPolling()
         encoder = null
         sessionIsVod = false
         scope.launch {
@@ -686,6 +696,7 @@ class Controller(
                 return@launch
             }
             sessionId = hls.session_id
+            startStatusPolling(hls.session_id)
             // Save this session's resolved height so the stall-reopen budget
             // can compare each stall response against the predecessor rung.
             stallReopenBudget.seed(hls.height)
@@ -740,6 +751,7 @@ class Controller(
         // map.  Session creation supersedes and kills the predecessor
         // atomically.
         sessionId = null
+        clearStatusPolling()
         encoder = null
         sessionIsVod = false
         scope.launch {
@@ -799,6 +811,7 @@ class Controller(
             // the client can compare.
             stallReopenBudget.record(hls.height)
             sessionId = hls.session_id
+            startStatusPolling(hls.session_id)
             encoder = hls.encoder
             sessionIsVod = hls.vod
             hls.delivered_dynamic_range?.let { deliveredRange = it }
@@ -950,11 +963,40 @@ class Controller(
         stallGuard.invalidateForUserAction()
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        clearStatusPolling()
         encoder = null
         sessionIsVod = false
         // Back on the plan's own delivery, so back to the plan's own grade —
         // otherwise a chip would keep reporting the session that just ended.
         deliveredRange = plan.deliveredDynamicRange
+    }
+
+    /**
+     * Poll only while this controller owns an HLS session. The endpoint does
+     * not count as playback activity, so showing Standard or Debug cannot keep
+     * an abandoned encoder alive; keeping the last successful sample mirrors
+     * the browser and avoids a useful panel vanishing during teardown.
+     */
+    private fun startStatusPolling(polledSessionId: String) {
+        statusPollingJob?.cancel()
+        sessionStatus = null
+        statusPollingJob = scope.launch {
+            while (isActive && sessionId == polledSessionId) {
+                try {
+                    sessionStatus = vm.hlsSessionStatus(polledSessionId)
+                } catch (_: Exception) {
+                    // Keep the last real sample. A completed session may
+                    // disappear before the player finishes its buffered tail.
+                }
+                delay(2_000)
+            }
+        }
+    }
+
+    private fun clearStatusPolling() {
+        statusPollingJob?.cancel()
+        statusPollingJob = null
+        sessionStatus = null
     }
 
     private fun remuxUri(ms: Long): String = progressiveRemuxUri(
