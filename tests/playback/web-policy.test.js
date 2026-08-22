@@ -2349,6 +2349,48 @@ test("a session that lands on a different range repaints the badge", () => {
   assert.equal(repaints, settled, "a stale generation never paints the live player");
 });
 
+test("every web transcode reopen preserves the decision's HDR10 request", () => {
+  const build = new Function(
+    "PLAYER",
+    "transcodeHeight",
+    "qualityForce",
+    "sessionHeight",
+    [shippedSource("transcodeOpts"), "return {transcodeOpts};"].join("\n"),
+  );
+  const player = {
+    requestHdr10: true,
+    deliveredRange: "hdr10",
+    autoHeight: 2160,
+    burnedSub: null,
+    aoffset: 0,
+  };
+  const { transcodeOpts } = build(player, () => null, () => "auto", () => null);
+
+  assert.deepEqual(transcodeOpts(12, 3), {
+    height: 2160,
+    start: 12,
+    audio: 3,
+    hdr10: true,
+  });
+
+  // attachSession replaces deliveredRange with what the session actually
+  // produced. That mutable display truth must never erase the immutable
+  // decision request when a seek/audio switch opens the next session.
+  player.deliveredRange = "sdr";
+  assert.equal(transcodeOpts(30, 3).hdr10, true);
+
+  player.requestHdr10 = false;
+  assert.equal("hdr10" in transcodeOpts(30, 3), false);
+});
+
+test("HDR10 Auto leaves the cold-start height to the grade-aware server", () => {
+  assert.match(
+    SHIPPED_UI,
+    /const autoStartHeight=[\s\S]{0,520}decision\.delivered_dynamic_range!==['"]hdr10['"]/,
+    "a persisted 720p SDR rung must not override the server's proved HDR10 ceiling",
+  );
+});
+
 test("an upgrade needs encode headroom, not just a bandwidth estimate", () => {
   const ladder = [
     { height: 1080, total_kbps: 8160, peak_kbps: 12160 },
