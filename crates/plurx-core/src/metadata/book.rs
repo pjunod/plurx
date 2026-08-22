@@ -5,18 +5,20 @@
 //! Artwork always lands in Cinema's cache. Neither path writes beside, renames,
 //! or otherwise mutates the library file it inspected.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Reader;
+use sha2::{Digest, Sha256};
 
 use crate::domain::{BookMetadataPatch, BookMetadataSource, ItemKind};
-use crate::store::Store;
+use crate::store::{ArtworkRepairFence, Store};
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
@@ -65,6 +67,44 @@ struct ManifestItem {
     properties: String,
 }
 
+/// Process-local singleflight for blocking EPUB reads. A timed-out async
+/// caller cannot cancel `spawn_blocking`, so ownership lives inside the
+/// blocking closure and is released only after that read actually exits.
+#[derive(Clone, Default)]
+pub struct CoverMaterializationWorkers(Arc<Mutex<HashSet<i64>>>);
+
+impl CoverMaterializationWorkers {
+    fn claim(&self, item_id: i64) -> Option<CoverMaterializationWorker> {
+        let mut active = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        active.insert(item_id).then(|| CoverMaterializationWorker {
+            active: Arc::clone(&self.0),
+            item_id,
+        })
+    }
+
+    #[cfg(test)]
+    fn contains(&self, item_id: i64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&item_id)
+    }
+}
+
+struct CoverMaterializationWorker {
+    active: Arc<Mutex<HashSet<i64>>>,
+    item_id: i64,
+}
+
+impl Drop for CoverMaterializationWorker {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.item_id);
+    }
+}
+
 /// Extract only catalogue facts and an optional cover. The publication reader
 /// performs its own complete manifest/spine validation; this deliberately
 /// does not inflate arbitrary resources just to paint a library card.
@@ -95,6 +135,263 @@ pub fn read_epub_facts(path: &Path) -> Result<EpubFacts, BookMetadataError> {
         facts.cover = Some(read_entry(&mut archive, &path, MAX_COVER_BYTES)?);
     }
     Ok(facts)
+}
+
+/// Recreate an already-published embedded EPUB cover on this node without
+/// mutating replicated book facts or poster paths.
+pub async fn materialize_item_cover(
+    store: &dyn Store,
+    artwork_dir: &Path,
+    item_id: i64,
+    expected: &[String],
+    workers: &CoverMaterializationWorkers,
+) -> Result<Option<bool>, crate::error::StoreError> {
+    let Some(item) = store.get_item(item_id).await? else {
+        return Ok(Some(false));
+    };
+    if item.kind != ItemKind::Book {
+        return Ok(Some(false));
+    }
+    if item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str()) {
+        if has_curator_cover_origin(
+            store,
+            item.id,
+            item.book_edition_id.as_deref().unwrap_or_default(),
+            expected,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+    }
+    let files = store.files_for_item(item.id).await?;
+    let Some(path) = files.into_iter().map(|file| file.path).find(|path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("epub"))
+    }) else {
+        return Ok(Some(false));
+    };
+    let Some(worker) = workers.claim(item.id) else {
+        return Ok(Some(false));
+    };
+    let Ok(Ok(facts)) = tokio::task::spawn_blocking(move || {
+        let _worker = worker;
+        read_epub_facts(&path)
+    })
+    .await
+    else {
+        return Ok(Some(false));
+    };
+    let Some(cover) = facts.cover.as_deref() else {
+        return Ok(Some(false));
+    };
+    let Ok(filename) = write_cached_cover(artwork_dir, item.id, cover).await else {
+        return Ok(Some(false));
+    };
+    if !expected.contains(&filename) {
+        // The caller's replicated snapshot went stale while the bytes were
+        // being rebuilt. Never unlink the final name here: another writer may
+        // already have acquired the publication slot and made this generation
+        // current. The grace-aged orphan sweep owns safe deletion.
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
+}
+
+/// Re-fetch a Curator cover from the item's persisted Open Library edition
+/// identity. The caller holds the cluster-wide provider fence. If the mutable
+/// upstream URL now yields different validated bytes, publish that new
+/// content-addressed generation first and then advance the replicated path.
+pub async fn materialize_curator_cover(
+    store: &dyn Store,
+    artwork_dir: &Path,
+    item_id: i64,
+    expected: &[String],
+    repair_fence: Option<&ArtworkRepairFence>,
+) -> bool {
+    let Ok(Some(item)) = store.get_item(item_id).await else {
+        return false;
+    };
+    if !matches!(item.kind, ItemKind::Book | ItemKind::Audiobook)
+        || item.book_metadata_source.as_deref() != Some(BookMetadataSource::Curator.as_str())
+    {
+        return false;
+    }
+    let Ok(Some((current_filename, url))) =
+        current_curator_cover_origin(store, &item, expected).await
+    else {
+        return false;
+    };
+    let edition_id = item.book_edition_id.as_deref().unwrap_or_default();
+    let Ok(cover) = fetch_curator_cover(item.id, &url).await else {
+        return false;
+    };
+    let filename = cover.filename().to_owned();
+    let Ok(reservation) = super::reserve_artwork_publication(artwork_dir.join(&filename)) else {
+        return false;
+    };
+    if publish_curator_cover(artwork_dir, cover, reservation)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if filename == current_filename {
+        return true;
+    }
+
+    // Open Library cover URLs are allowed to change bytes. Publish the new
+    // content-addressed file first; only then advance replicated state. A
+    // crash before either write leaves the old catalogue/file pair intact and
+    // at worst a harmless unreferenced generation for the grace sweep.
+    let Some(updated_origin) = curator_cover_origin_value(edition_id, Some(&url), Some(&filename))
+    else {
+        return false;
+    };
+    let origin_key = curator_cover_origin_key(item.id, edition_id, &filename);
+    let origin_result = if let Some(fence) = repair_fence {
+        store
+            .put_setting_if_absent_if_artwork_repair_current(
+                &origin_key,
+                &updated_origin,
+                item.id,
+                fence,
+            )
+            .await
+    } else {
+        store
+            .put_setting_if_absent(&origin_key, &updated_origin)
+            .await
+    };
+    if origin_result.is_err() {
+        return false;
+    }
+    match store
+        .apply_book_metadata_if_current(
+            &item,
+            &BookMetadataPatch {
+                title: None,
+                author: None,
+                work_id: None,
+                edition_id: Some(edition_id.to_owned()),
+                poster_path: Some(filename),
+                source: BookMetadataSource::Curator,
+            },
+            repair_fence,
+        )
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) | Err(_) => false,
+    }
+}
+
+async fn current_curator_cover_origin(
+    store: &dyn Store,
+    item: &crate::domain::Item,
+    expected: &[String],
+) -> Result<Option<(String, String)>, crate::error::StoreError> {
+    let Some(filename) = item.poster_path.as_deref() else {
+        return Ok(None);
+    };
+    if !expected.iter().any(|candidate| candidate == filename) {
+        return Ok(None);
+    }
+    let edition_id = item.book_edition_id.as_deref().unwrap_or_default();
+    let origin = store
+        .get_setting(&curator_cover_origin_key(item.id, edition_id, filename))
+        .await?;
+    Ok(origin
+        .and_then(|origin| curator_cover_origin_url(&origin, edition_id, &[filename.to_owned()]))
+        .map(|url| (filename.to_owned(), url)))
+}
+
+#[must_use]
+pub fn curator_cover_origin_key(item_id: i64, edition_id: &str, filename: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(edition_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(filename.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("internal.book_cover_origin.{item_id}.{digest}")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CuratorCoverOrigin {
+    edition_id: String,
+    url: String,
+    filename: String,
+}
+
+/// Bind a validated cover origin to Curator's opaque edition key. The URL is
+/// independent authority; no Open Library identifier is inferred from the
+/// opaque key.
+pub fn curator_cover_origin_value(
+    edition_id: &str,
+    url: Option<&str>,
+    published_filename: Option<&str>,
+) -> Option<String> {
+    let url = url?;
+    let filename = published_filename?.trim();
+    if filename.is_empty()
+        || Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(filename)
+    {
+        return None;
+    }
+    allowed_curator_cover_url(url)?;
+    serde_json::to_string(&CuratorCoverOrigin {
+        edition_id: edition_id.to_owned(),
+        url: url.to_owned(),
+        filename: filename.to_owned(),
+    })
+    .ok()
+}
+
+fn curator_cover_origin_url(value: &str, edition_id: &str, expected: &[String]) -> Option<String> {
+    let origin = serde_json::from_str::<CuratorCoverOrigin>(value).ok()?;
+    (origin.edition_id == edition_id
+        && expected.contains(&origin.filename)
+        && allowed_curator_cover_url(&origin.url).is_some())
+    .then_some(origin.url)
+}
+
+fn valid_curator_cover_origin(
+    stored: Result<Option<String>, crate::error::StoreError>,
+    edition_id: &str,
+    expected: &[String],
+) -> Result<Option<String>, crate::error::StoreError> {
+    stored.map(|stored| {
+        stored.and_then(|value| curator_cover_origin_url(&value, edition_id, expected))
+    })
+}
+
+/// Whether this exact edition and published filename have a recoverable
+/// provider origin. Store errors propagate so a quorum failure cannot select
+/// embedded EPUB bytes by accident.
+pub async fn has_curator_cover_origin(
+    store: &dyn Store,
+    item_id: i64,
+    edition_id: &str,
+    expected: &[String],
+) -> Result<bool, crate::error::StoreError> {
+    for filename in expected {
+        if valid_curator_cover_origin(
+            store
+                .get_setting(&curator_cover_origin_key(item_id, edition_id, filename))
+                .await,
+            edition_id,
+            std::slice::from_ref(filename),
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Enrich standalone EPUBs in one Books library. Explicit Curator facts are
@@ -203,11 +500,10 @@ pub async fn enrich_library(
 
 /// Fetch one Curator-provided Open Library cover with no redirects, no bearer,
 /// a strict host allowlist, and a streaming byte bound.
-pub async fn cache_curator_cover(
-    artwork_dir: &Path,
+pub async fn fetch_curator_cover(
     item_id: i64,
     url: &str,
-) -> Result<String, BookMetadataError> {
+) -> Result<CuratorCover, BookMetadataError> {
     let parsed = allowed_curator_cover_url(url).ok_or(BookMetadataError::CoverUrl)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -241,8 +537,59 @@ pub async fn cache_curator_cover(
         }
         bytes.extend_from_slice(&chunk);
     }
+    curator_cover_from_bytes(item_id, bytes)
+}
+
+fn curator_cover_from_bytes(
+    item_id: i64,
+    bytes: Vec<u8>,
+) -> Result<CuratorCover, BookMetadataError> {
+    if bytes.is_empty() || bytes.len() > MAX_COVER_BYTES as usize {
+        return Err(BookMetadataError::Limit);
+    }
+    let extension = raster_cover_extension(&bytes).ok_or(BookMetadataError::Invalid(
+        "cover is not a supported raster image",
+    ))?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    Ok(CuratorCover {
+        filename: format!("{item_id}-poster-{digest}.{extension}"),
+        bytes,
+    })
+}
+
+/// A validated Curator cover held in memory until its origin and catalogue
+/// row are durably published.
+pub struct CuratorCover {
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+impl CuratorCover {
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+}
+
+pub async fn publish_curator_cover(
+    artwork_dir: &Path,
+    cover: CuratorCover,
+    reservation: super::ArtworkPublicationReservation,
+) -> Result<String, BookMetadataError> {
     tokio::fs::create_dir_all(artwork_dir).await?;
-    write_cached_cover(artwork_dir, item_id, &bytes).await
+    super::write_artwork_atomically_reserved(reservation, &cover.bytes).await?;
+    Ok(cover.filename)
+}
+
+pub async fn cache_curator_cover(
+    artwork_dir: &Path,
+    item_id: i64,
+    url: &str,
+) -> Result<String, BookMetadataError> {
+    let cover = fetch_curator_cover(item_id, url).await?;
+    let target = artwork_dir.join(cover.filename());
+    let reservation = super::reserve_artwork_publication(target)?;
+    publish_curator_cover(artwork_dir, cover, reservation).await
 }
 
 /// Parse the sole provider URL Curator currently hands across the pairing.
@@ -271,12 +618,7 @@ async fn write_cached_cover(
     ))?;
     let filename = format!("{item_id}-poster.{extension}");
     let target = artwork_dir.join(&filename);
-    let temporary = artwork_dir.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&temporary, bytes).await?;
-    if let Err(error) = tokio::fs::rename(&temporary, &target).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(BookMetadataError::Io(error));
-    }
+    super::write_artwork_atomically(&target, bytes).await?;
     Ok(filename)
 }
 
@@ -561,6 +903,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::domain::{
+        BookMetadataPatch, BookMetadataSource, ItemKind, LibraryKind, NewItem, NewLibrary,
+        ProbeResult,
+    };
+    use crate::store::{LibraryStore, MediaStore, SqliteStore};
 
     fn fixture(package: &str, cover: Option<&[u8]>) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().expect("temp EPUB");
@@ -641,6 +988,44 @@ mod tests {
     }
 
     #[test]
+    fn curator_cover_filename_changes_when_same_format_bytes_change() {
+        let first = curator_cover_from_bytes(84, vec![0xff, 0xd8, 0xff, 0x01]).expect("first");
+        let second = curator_cover_from_bytes(84, vec![0xff, 0xd8, 0xff, 0x02]).expect("second");
+        assert_ne!(first.filename(), second.filename());
+        assert!(first.filename().ends_with(".jpg"));
+        assert!(second.filename().ends_with(".jpg"));
+    }
+
+    #[test]
+    fn each_cover_generation_keeps_its_own_recovery_url() {
+        let edition = "curator:item:84:ebook";
+        let first_url = "https://covers.openlibrary.org/b/olid/OL123M-L.jpg";
+        let second_url = "https://covers.openlibrary.org/b/olid/OL456M-L.jpg";
+        let first = curator_cover_from_bytes(84, vec![0xff, 0xd8, 0xff, 0x01]).expect("first");
+        let second = curator_cover_from_bytes(84, vec![0xff, 0xd8, 0xff, 0x02]).expect("second");
+        let first_origin =
+            curator_cover_origin_value(edition, Some(first_url), Some(first.filename()))
+                .expect("first origin");
+        let second_origin =
+            curator_cover_origin_value(edition, Some(second_url), Some(second.filename()))
+                .expect("second origin");
+        assert_eq!(
+            curator_cover_origin_url(&first_origin, edition, &[first.filename().to_owned()])
+                .as_deref(),
+            Some(first_url)
+        );
+        assert_eq!(
+            curator_cover_origin_url(&second_origin, edition, &[second.filename().to_owned()])
+                .as_deref(),
+            Some(second_url)
+        );
+        assert_ne!(
+            curator_cover_origin_key(84, edition, first.filename()),
+            curator_cover_origin_key(84, edition, second.filename())
+        );
+    }
+
+    #[test]
     fn curator_cover_allowlist_is_exact_https_without_credentials_or_ports() {
         assert!(
             allowed_curator_cover_url("https://covers.openlibrary.org/b/olid/OL1M-L.jpg").is_some()
@@ -653,5 +1038,333 @@ mod tests {
         ] {
             assert!(allowed_curator_cover_url(url).is_none(), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn curator_cover_recovery_binds_an_independent_url_to_an_opaque_edition() {
+        let edition = "curator:item:84:ebook";
+        let url = "https://covers.openlibrary.org/b/olid/OL123M-L.jpg";
+        let filename = "84-poster.jpg";
+        let expected = vec![filename.to_owned()];
+        let value = curator_cover_origin_value(edition, Some(url), Some(filename)).expect("origin");
+        assert_eq!(
+            curator_cover_origin_url(&value, edition, &expected).as_deref(),
+            Some(url)
+        );
+        assert!(curator_cover_origin_url(&value, "another-edition", &expected).is_none());
+        assert!(curator_cover_origin_url(&value, edition, &["different.jpg".to_owned()]).is_none());
+        assert!(
+            curator_cover_origin_value(edition, Some("https://example.com/x"), Some(filename))
+                .is_none()
+        );
+        assert_ne!(
+            curator_cover_origin_key(84, edition, filename),
+            curator_cover_origin_key(84, "curator:item:85:ebook", filename),
+            "re-pairing must not destroy the prior edition's recovery origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_expected_generation_cannot_select_an_obsolete_origin() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Books".to_owned(),
+                kind: LibraryKind::Books,
+                paths: vec![Path::new("/books").to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item_id = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "Proof".to_owned(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        let edition = "curator:item:84:ebook";
+        let stale_filename = format!("84-poster-{}.jpg", "a".repeat(64));
+        let current_filename = format!("84-poster-{}.jpg", "b".repeat(64));
+        let stale_url = "https://covers.openlibrary.org/b/olid/OL123M-L.jpg";
+        let current_url = "https://covers.openlibrary.org/b/olid/OL456M-L.jpg";
+        store
+            .apply_book_metadata(
+                item_id,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: Some("curator:work:84".to_owned()),
+                    edition_id: Some(edition.to_owned()),
+                    poster_path: Some(current_filename.clone()),
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("current pairing");
+        for (filename, url) in [
+            (stale_filename.as_str(), stale_url),
+            (current_filename.as_str(), current_url),
+        ] {
+            store
+                .put_setting_if_absent(
+                    &curator_cover_origin_key(item_id, edition, filename),
+                    &curator_cover_origin_value(edition, Some(url), Some(filename))
+                        .expect("origin"),
+                )
+                .await
+                .expect("store origin");
+        }
+        let item = store
+            .get_item(item_id)
+            .await
+            .expect("read current item")
+            .expect("current item");
+
+        assert_eq!(
+            current_curator_cover_origin(&store, &item, std::slice::from_ref(&stale_filename))
+                .await
+                .expect("select stale recovery origin"),
+            None,
+            "a stale caller may not bind its old origin to the current poster"
+        );
+        assert_eq!(
+            current_curator_cover_origin(
+                &store,
+                &item,
+                &[stale_filename.clone(), current_filename.clone()],
+            )
+            .await
+            .expect("select current recovery origin"),
+            Some((current_filename.clone(), current_url.to_owned())),
+            "recovery must select the URL bound to the reread poster generation"
+        );
+        assert!(
+            !store
+                .put_setting_if_absent(
+                    &curator_cover_origin_key(item_id, edition, &current_filename),
+                    &curator_cover_origin_value(edition, Some(stale_url), Some(&current_filename),)
+                        .expect("replacement origin"),
+                )
+                .await
+                .expect("attempt same-generation origin replacement"),
+            "a same-fields/same-digest re-pair cannot replace generation authority"
+        );
+        assert_eq!(
+            current_curator_cover_origin(&store, &item, std::slice::from_ref(&current_filename))
+                .await
+                .expect("reread immutable origin"),
+            Some((current_filename.clone(), current_url.to_owned()))
+        );
+        assert_eq!(item.poster_path.as_deref(), Some(current_filename.as_str()));
+    }
+
+    #[test]
+    fn omitted_or_failed_curator_cover_does_not_claim_the_published_epub_poster() {
+        let edition = "curator:item:84:ebook";
+        let url = "https://covers.openlibrary.org/b/olid/OL123M-L.jpg";
+        assert!(curator_cover_origin_value(edition, None, None).is_none());
+        assert!(curator_cover_origin_value(edition, Some(url), None).is_none());
+    }
+
+    #[test]
+    fn curator_origin_read_error_fails_closed_instead_of_selecting_epub() {
+        let result = valid_curator_cover_origin(
+            Err(crate::error::StoreError::Database(
+                "quorum unavailable".to_owned(),
+            )),
+            "curator:item:84:ebook",
+            &["84-poster.jpg".to_owned()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn curator_identity_without_provider_origin_rebuilds_the_embedded_epub_cover() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let epub = fixture(
+            r#"<package><metadata><title>Proof</title></metadata><manifest><item id="cover" href="Images/cover.jpg" media-type="image/jpeg" properties="cover-image"/></manifest></package>"#,
+            Some(&[0xff, 0xd8, 0xff, 0x00]),
+        );
+        let epub_path = media.path().join("proof.epub");
+        std::fs::copy(epub.path(), &epub_path).expect("copy EPUB");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Books".to_owned(),
+                kind: LibraryKind::Books,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let item_id = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Book,
+                parent_id: None,
+                title: "Proof".to_owned(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("book");
+        store
+            .upsert_file(
+                item_id,
+                epub_path.to_str().expect("UTF-8 path"),
+                1,
+                1,
+                &ProbeResult::default(),
+            )
+            .await
+            .expect("file");
+        let filename = format!("{item_id}-poster.jpg");
+        store
+            .apply_book_metadata(
+                item_id,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: None,
+                    edition_id: None,
+                    poster_path: Some(filename.clone()),
+                    source: BookMetadataSource::Epub,
+                },
+            )
+            .await
+            .expect("EPUB facts");
+        store
+            .apply_book_metadata(
+                item_id,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: Some("work:84".to_owned()),
+                    edition_id: Some("curator:item:84:ebook".to_owned()),
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("Curator facts without cover");
+
+        let stale_result = materialize_item_cover(
+            &store,
+            artwork.path(),
+            item_id,
+            &["stale-generation.jpg".to_owned()],
+            &CoverMaterializationWorkers::default(),
+        )
+        .await
+        .expect("stale materialization store reads");
+        assert_eq!(stale_result, Some(false));
+        assert!(
+            artwork.path().join(&filename).is_file(),
+            "a stale caller must leave the published final generation for the fenced grace sweep"
+        );
+        let competing_writer =
+            super::super::reserve_artwork_publication(artwork.path().join(&filename))
+                .expect("the next writer acquires the same final-name slot");
+        assert!(artwork.path().join(&filename).is_file());
+        drop(competing_writer);
+
+        let result = materialize_item_cover(
+            &store,
+            artwork.path(),
+            item_id,
+            std::slice::from_ref(&filename),
+            &CoverMaterializationWorkers::default(),
+        )
+        .await
+        .expect("materialization store reads");
+        assert_eq!(result, Some(true));
+        assert!(artwork.path().join(filename).is_file());
+        let item = store
+            .get_item(item_id)
+            .await
+            .expect("read book")
+            .expect("book remains");
+        assert_eq!(
+            item.book_metadata_source.as_deref(),
+            Some(BookMetadataSource::Curator.as_str()),
+            "byte recovery must not alter Curator catalogue facts"
+        );
+
+        let stale = item;
+        store
+            .apply_book_metadata(
+                item_id,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: Some("work:new".to_owned()),
+                    edition_id: Some("curator:item:new:ebook".to_owned()),
+                    poster_path: Some("new-generation.jpg".to_owned()),
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("concurrent re-pair");
+        let changed = store
+            .apply_book_metadata_if_current(
+                &stale,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: None,
+                    edition_id: stale.book_edition_id.clone(),
+                    poster_path: stale.poster_path.clone(),
+                    source: BookMetadataSource::Curator,
+                },
+                None,
+            )
+            .await
+            .expect("stale conditional update");
+        assert!(!changed, "slow old recovery must lose the CAS");
+        assert_eq!(
+            store
+                .get_item(item_id)
+                .await
+                .expect("read latest")
+                .expect("book")
+                .book_edition_id
+                .as_deref(),
+            Some("curator:item:new:ebook")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_blocking_cover_read_remains_single_flight_until_it_exits() {
+        let workers = CoverMaterializationWorkers::default();
+        let worker = workers.claim(84).expect("first claim");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task = tokio::task::spawn_blocking(move || {
+            let _worker = worker;
+            task_entered.wait();
+            task_release.wait();
+        });
+        entered.wait();
+
+        assert!(workers.contains(84));
+        assert!(
+            workers.claim(84).is_none(),
+            "a timed-out caller must not start another blocking read"
+        );
+
+        release.wait();
+        task.await.expect("blocking reader exits");
+        assert!(!workers.contains(84));
+        assert!(workers.claim(84).is_some(), "a later pass may retry");
     }
 }

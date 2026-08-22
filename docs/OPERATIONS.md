@@ -428,9 +428,36 @@ poster and backdrop files through Raft, while the image bytes remain in each
 node's local artwork directory. Every voter reconciles those names in the
 background: it pulls a missing file from a reachable peer under a short-lived
 cluster proof and atomically installs it. If no peer retains the file, a
-bounded repair recreates it from the original local/provider source. Requests
-also use the peer path immediately, so a newly joined voter does not show
-broken cards while the first inventory pass is still running. The configured
+bounded, leader-arbitrated repair recreates provider-backed artwork. Home and
+Books voters instead recreate already-published bytes only when their own
+node can read the local media, without republishing the catalogue row. A
+successor waits a full monotonic lease before fencing an abandoned older Raft
+term, so host clock skew cannot create overlapping provider work. Every
+provider-origin and catalogue mutation also requires that replicated
+owner/term/generation row inside the same database statement; a timed-out old
+Raft command therefore commits as a no-op after leadership changes or a later
+same-term repair attempt. Completion and timeout both retire the exact
+generation with a later conditional Raft command.
+For a Curator book, the provider owns recovery only after its validated cover
+was successfully cached and bound to the published filename. If Curator sent
+no cover, or its fetch failed, an embedded EPUB cover remains eligible for
+node-local byte recovery while Curator's title/work facts remain authoritative.
+Re-pairing an edition that already owns provider art is stricter: the edition
+and cover advance together only after the replacement bytes are fetched and
+their publication slot is reserved; otherwise the previous coherent pair is
+retained for a later retry. Curator filenames include a content version, so a
+replicated edition change is observed as a missing new name on every voter;
+no voter can mistake nonempty bytes from the prior edition for the new cover.
+If the allowed upstream URL later returns different validated bytes, the
+fenced repair publishes that new content-addressed generation before advancing
+the replicated filename, so the old pair survives any interruption. Voters
+scan for orphan generations every six hours and remove only exact
+Plurx-managed filenames that have been unreferenced for at least 24 hours.
+Each candidate is checked consistently against replicated catalogue state
+again while holding the same per-file reservation used by fetch/publication;
+ordinary user files in the artwork directory are never sweep targets.
+Requests also use the peer path immediately, so a newly joined voter does not
+show broken cards while the first inventory pass is still running. The configured
 `cluster.artwork_url` (or its default derived from `advertise_host`) must be a
 node-specific public HTTP base other voters can reach. It deliberately does not
 inherit `cluster.join_url`: the join URL may name a shared load balancer, while

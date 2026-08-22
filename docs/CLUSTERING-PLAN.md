@@ -360,8 +360,21 @@ collision.
 Replicated state never implies local bytes exist. Segment and artwork requests
 proxy to a known holder when local bytes are absent. Artwork repair is per-node
 materialization from replicated facts, not a singleton. If no holder exists,
-the request queues local repair and returns the existing bounded error. This
-keeps provider-fetched art offline-safe while avoiding raft byte storage.
+the current leader arbitrates one provider repair under a term fence; an
+elected successor waits a full local monotonic lease before replacing an older
+term. Provider-origin and catalogue writes compare that replicated
+owner/term/generation inside the mutation, so a timed-out command submitted by
+an old owner or attempt becomes a no-op even if Raft applies it later. Finishing
+or timing out conditionally advances that generation before the scheduler
+continues. Home and Books nodes recreate already-published bytes only from
+media they can read locally and never republish catalogue fields from that path. The
+request queues local repair and returns the existing bounded error. This keeps
+provider-fetched art offline-safe while avoiding raft byte storage or
+cross-host wall-clock arbitration.
+Each voter scans its local artwork cache for orphan generations every six
+hours. It deletes only exact Plurx-managed names older than 24 hours, after a
+consistent per-filename catalogue recheck under the publication reservation;
+user-managed files are outside that cleanup contract.
 
 ## 4. Data migration — quiesced, staged, verified, and reversible
 

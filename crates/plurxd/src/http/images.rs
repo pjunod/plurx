@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
 use plurx_core::cluster::membership::{ArtworkPeerAuth, MembershipManager};
 use plurx_core::error::StoreError;
-use plurx_core::store::ArtworkInventoryItem;
+use plurx_core::store::{ArtworkInventoryItem, Store};
 
 use super::error::ApiError;
 use super::extract::AuthUser;
@@ -35,6 +35,8 @@ const MATERIALIZE_INTERVAL: Duration = Duration::from_secs(60);
 const SOURCE_REPAIR_GRACE: Duration = Duration::from_secs(2 * 60);
 const ARTWORK_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
 const PEER_RACE_CONCURRENCY: usize = 3;
+const ORPHAN_ARTWORK_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Shared process-wide bounds for on-demand and background peer fetches.
 ///
@@ -359,21 +361,7 @@ async fn install_artwork(
 ) -> Result<(), std::io::Error> {
     tokio::fs::create_dir_all(artwork_dir).await?;
     let destination = artwork_dir.join(filename);
-    let temporary = artwork_dir.join(format!(
-        ".{filename}.{}.part",
-        uuid::Uuid::new_v4().simple()
-    ));
-    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
-    }
-    match tokio::fs::rename(&temporary, &destination).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            Err(error)
-        }
-    }
+    plurx_core::metadata::write_artwork_atomically(&destination, bytes).await
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +392,116 @@ pub(crate) struct MaterializeReport {
     pub copied: usize,
     pub source_repairs: usize,
     pub unresolved: usize,
+    pub orphans_removed: usize,
+}
+
+fn managed_artwork_filename(filename: &str) -> bool {
+    let path = FsPath::new(filename);
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    if !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp"
+    ) {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some((item_id, kind)) = stem.split_once('-') else {
+        return false;
+    };
+    let Ok(item_id) = item_id.parse::<i64>() else {
+        return false;
+    };
+    if item_id <= 0 {
+        return false;
+    }
+    if matches!(kind, "poster" | "backdrop") {
+        return true;
+    }
+    kind.strip_prefix("poster-").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+async fn orphan_candidate_old_enough(path: &FsPath, grace: Duration) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= grace)
+}
+
+async fn remove_orphan_candidate(
+    store: &dyn Store,
+    filename: &str,
+    path: &FsPath,
+    grace: Duration,
+) -> bool {
+    let Ok(reservation) = plurx_core::metadata::reserve_artwork_publication(path.to_path_buf())
+    else {
+        return false;
+    };
+    // Candidate discovery happens before this reservation. Re-stat while
+    // holding it: a publisher that replaced the path and released its slot
+    // after discovery has reset the age, so its fresh bytes cannot be deleted
+    // before the following catalogue mutation commits.
+    if !orphan_candidate_old_enough(path, grace).await {
+        return false;
+    }
+    // Recheck this exact filename consistently after taking the reservation
+    // so a concurrent replicated catalogue update cannot turn a candidate
+    // into live artwork between discovery and deletion.
+    match store.artwork_filename_is_referenced(filename).await {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return false,
+    }
+    match plurx_core::metadata::remove_artwork_reserved(reservation).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(filename, %error, "removing orphaned artwork");
+            false
+        }
+    }
+}
+
+async fn sweep_orphan_artwork(store: &dyn Store, artwork_dir: &FsPath, grace: Duration) -> usize {
+    let Ok(referenced) = store.items_with_artwork().await else {
+        return 0;
+    };
+    let referenced = artwork_references(referenced)
+        .into_iter()
+        .map(|reference| reference.filename)
+        .collect::<BTreeSet<_>>();
+    let Ok(mut entries) = tokio::fs::read_dir(artwork_dir).await else {
+        return 0;
+    };
+    let mut candidates = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if referenced.contains(&filename) || !managed_artwork_filename(&filename) {
+            continue;
+        }
+        if orphan_candidate_old_enough(&entry.path(), grace).await {
+            candidates.push((filename, entry.path()));
+        }
+    }
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let mut removed = 0;
+    for (filename, path) in candidates {
+        if remove_orphan_candidate(store, &filename, &path, grace).await {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Reconcile every filename named by replicated item rows onto this voter.
@@ -503,13 +601,92 @@ async fn materialize_once(
     }
 
     for (item_id, filenames) in repair_items.into_iter().take(SOURCE_REPAIRS_PER_PASS) {
+        let local_deadline = tokio::time::Instant::now() + SOURCE_REPAIR_LEASE;
+        match tokio::time::timeout_at(
+            local_deadline,
+            state
+                .jobs
+                .materialize_local_item_artwork(item_id, &filenames),
+        )
+        .await
+        {
+            Ok(Ok(Some(true))) => {
+                report.source_repairs += 1;
+                repair_after.insert(item_id, now + SOURCE_REPAIR_BACKOFF);
+                continue;
+            }
+            Ok(Ok(Some(false))) => {
+                repair_after.insert(item_id, now + SOURCE_REPAIR_LEASE);
+                continue;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(item_id, %error, "local artwork materialization failed");
+                repair_after.insert(item_id, now + SOURCE_REPAIR_LEASE);
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(item_id, "local artwork materialization exceeded its lease");
+                repair_after.insert(item_id, now + SOURCE_REPAIR_LEASE);
+                continue;
+            }
+        }
         match state
             .membership
             .claim_artwork_source_repair(item_id, SOURCE_REPAIR_LEASE)
             .await
         {
-            Ok(true) => {
-                let outcome = state.jobs.refresh_item_artwork(item_id).await;
+            Ok(Some(claim)) => {
+                // The successor for a newer Raft term waits this same lease
+                // from its first observation of our fence. The timeout bounds
+                // new local work; every replicated mutation also compares the
+                // owner/term/generation row atomically because dropping a
+                // submitted Raft future cannot prove that its command will
+                // never commit.
+                let deadline = tokio::time::Instant::from_std(claim.deadline());
+                let repair_fence = claim.fence().clone();
+                if deadline <= tokio::time::Instant::now() {
+                    tracing::warn!(
+                        item_id,
+                        "artwork source repair fence expired before work began"
+                    );
+                    if let Err(error) = state
+                        .membership
+                        .retire_artwork_source_repair(&repair_fence)
+                        .await
+                    {
+                        tracing::warn!(
+                            item_id,
+                            code = error.code(),
+                            "cannot retire expired artwork source repair generation"
+                        );
+                    }
+                    repair_after.insert(item_id, now + SOURCE_REPAIR_LEASE);
+                    continue;
+                }
+                let outcome = tokio::time::timeout_at(
+                    deadline,
+                    state
+                        .jobs
+                        .refresh_item_artwork_fenced(item_id, &repair_fence),
+                )
+                .await;
+                match state
+                    .membership
+                    .retire_artwork_source_repair(&repair_fence)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        item_id,
+                        "artwork source repair generation was already retired"
+                    ),
+                    Err(error) => tracing::warn!(
+                        item_id,
+                        code = error.code(),
+                        "cannot retire artwork source repair generation"
+                    ),
+                }
                 let materialized =
                     futures_util::future::join_all(filenames.into_iter().map(|filename| {
                         let path = state.artwork_dir.join(&filename);
@@ -522,23 +699,28 @@ async fn materialize_once(
                     .await
                     .into_iter()
                     .all(|present| present);
-                if outcome.is_ok() && materialized {
+                if matches!(outcome, Ok(Ok(_))) && materialized {
                     report.source_repairs += 1;
                     repair_after.insert(item_id, now + SOURCE_REPAIR_BACKOFF);
                 } else {
-                    if let Err(error) = outcome {
-                        tracing::warn!(item_id, %error, "artwork source repair failed");
-                    } else {
-                        tracing::warn!(item_id, "artwork source repair produced no requested file");
+                    match outcome {
+                        Ok(Err(error)) => {
+                            tracing::warn!(item_id, %error, "artwork source repair failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!(item_id, "artwork source repair exceeded its lease");
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::warn!(
+                                item_id,
+                                "artwork source repair produced no requested file"
+                            );
+                        }
                     }
-                    // Keep the failed claimant's lease until its bucket ends.
-                    // Releasing early would let the same deterministic voter
-                    // reclaim every minute, multiplying writes and starving a
-                    // capable peer until rotation.
                     repair_after.insert(item_id, now + SOURCE_REPAIR_LEASE);
                 }
             }
-            Ok(false) => {
+            Ok(None) => {
                 repair_after.insert(item_id, now + MATERIALIZE_INTERVAL);
             }
             Err(error) => {
@@ -556,6 +738,7 @@ pub(crate) async fn materialize_loop(state: AppState) {
     }
     let mut repair_after = HashMap::new();
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut next_orphan_sweep = Instant::now() + ORPHAN_SWEEP_INTERVAL;
     loop {
         match state.membership.local_node_is_active_voter().await {
             Ok(false) => match state.membership.local_node_is_committed_voter().await {
@@ -589,13 +772,27 @@ pub(crate) async fn materialize_loop(state: AppState) {
                 continue;
             }
         }
-        match materialize_once(&state, &mut repair_after).await {
-            Ok(report) if report.missing > 0 => tracing::info!(
+        let mut outcome = materialize_once(&state, &mut repair_after).await;
+        if Instant::now() >= next_orphan_sweep {
+            let removed = sweep_orphan_artwork(
+                state.store.as_ref(),
+                &state.artwork_dir,
+                ORPHAN_ARTWORK_GRACE,
+            )
+            .await;
+            next_orphan_sweep = Instant::now() + ORPHAN_SWEEP_INTERVAL;
+            if let Ok(report) = &mut outcome {
+                report.orphans_removed = removed;
+            }
+        }
+        match outcome {
+            Ok(report) if report.missing > 0 || report.orphans_removed > 0 => tracing::info!(
                 references = report.references,
                 missing = report.missing,
                 copied = report.copied,
                 source_repairs = report.source_repairs,
                 unresolved = report.unresolved,
+                orphans_removed = report.orphans_removed,
                 "reconciled node-local artwork"
             ),
             Ok(_) => {}
@@ -614,6 +811,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::get;
     use axum::Router;
+    use plurx_core::store::SqliteStore;
 
     use super::*;
 
@@ -636,6 +834,109 @@ mod tests {
         assert_eq!(references[0].item_id, 20);
         assert_eq!(references[1].filename, "shared.jpg");
         assert_eq!(references[1].item_id, 10);
+    }
+
+    #[test]
+    fn orphan_sweep_only_matches_exact_plurx_artwork_names() {
+        let digest = "a".repeat(64);
+        assert!(managed_artwork_filename("84-poster.jpg"));
+        assert!(managed_artwork_filename("84-backdrop.png"));
+        assert!(managed_artwork_filename(&format!(
+            "84-poster-{digest}.webp"
+        )));
+        assert!(!managed_artwork_filename("2024-family.jpg"));
+        assert!(!managed_artwork_filename(".84-poster.jpg"));
+        assert!(!managed_artwork_filename("84-poster-short.jpg"));
+        assert!(!managed_artwork_filename("0-poster.jpg"));
+        assert!(!managed_artwork_filename("-84-poster.jpg"));
+    }
+
+    #[tokio::test]
+    async fn versioned_repair_name_invalidates_old_bytes_on_every_voter() {
+        let old = "84-poster-aaaaaaaaaaaaaaaa.jpg";
+        let new = "84-poster-bbbbbbbbbbbbbbbb.jpg";
+        let voters = [
+            tempfile::tempdir().expect("voter one"),
+            tempfile::tempdir().expect("voter two"),
+        ];
+        for voter in &voters {
+            tokio::fs::write(voter.path().join(old), b"old edition")
+                .await
+                .expect("old cover");
+        }
+        let references = artwork_references(vec![ArtworkInventoryItem {
+            id: 84,
+            poster_path: Some(new.to_owned()),
+            backdrop_path: None,
+        }]);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].filename, new);
+        for voter in &voters {
+            assert!(voter.path().join(old).is_file(), "stale bytes still exist");
+            assert!(
+                tokio::fs::metadata(voter.path().join(&references[0].filename))
+                    .await
+                    .is_err(),
+                "the replicated content-versioned name must be missing on every stale voter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_honors_publication_reservations_and_removes_old_generations() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let directory = tempfile::tempdir().expect("artwork");
+        let orphan = directory
+            .path()
+            .join(format!("84-poster-{}.jpg", "a".repeat(64)));
+        tokio::fs::write(&orphan, b"superseded")
+            .await
+            .expect("orphan");
+        tokio::fs::write(directory.path().join("README.txt"), b"not managed")
+            .await
+            .expect("sentinel");
+        let reservation =
+            plurx_core::metadata::reserve_artwork_publication(orphan.clone()).expect("reserve");
+        assert_eq!(
+            sweep_orphan_artwork(&store, directory.path(), Duration::ZERO).await,
+            0,
+            "an active publisher owns the path"
+        );
+        assert!(orphan.is_file());
+        drop(reservation);
+
+        assert_eq!(
+            sweep_orphan_artwork(&store, directory.path(), Duration::ZERO).await,
+            1
+        );
+        assert!(!orphan.exists());
+        assert!(directory.path().join("README.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn orphan_candidate_rechecks_age_after_a_competing_publication() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let directory = tempfile::tempdir().expect("artwork");
+        let filename = format!("84-poster-{}.jpg", "b".repeat(64));
+        let path = directory.path().join(&filename);
+        let grace = Duration::from_secs(1);
+        tokio::fs::write(&path, b"old generation")
+            .await
+            .expect("old candidate");
+        tokio::time::sleep(grace + Duration::from_millis(100)).await;
+        assert!(orphan_candidate_old_enough(&path, grace).await);
+
+        plurx_core::metadata::write_artwork_atomically(&path, b"fresh generation")
+            .await
+            .expect("competing publication");
+        assert!(
+            !remove_orphan_candidate(&store, &filename, &path, grace).await,
+            "the discovery-time age must not authorize deletion after replacement"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("fresh file survives"),
+            b"fresh generation"
+        );
     }
 
     #[tokio::test]

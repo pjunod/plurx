@@ -72,6 +72,21 @@ pub struct ArtworkInventoryItem {
     pub backdrop_path: Option<String>,
 }
 
+/// Replicated owner/term/generation proof attached to every provider artwork
+/// mutation.
+/// A timeout may drop a submitted client future without cancelling its Raft
+/// command, so the database mutation itself must reject an obsolete claim.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtworkRepairFence {
+    pub item_id: i64,
+    pub owner_node_id: String,
+    pub leader_term: i64,
+    /// Monotonic per-item attempt generation. This distinguishes sequential
+    /// repairs by the same leader, so a timed-out command from an earlier
+    /// attempt cannot become valid during a later retry in the same term.
+    pub generation: i64,
+}
+
 /// The text a backend may write into a durable Trakt bearer column.
 ///
 /// Every store implementation funnels its bearer writes through here, so the
@@ -289,6 +304,18 @@ pub trait SettingsStore: Send + Sync + 'static {
         second: &str,
     ) -> Result<(Option<String>, Option<String>), StoreError>;
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), StoreError>;
+    /// Insert an immutable setting value. Returns false when the key already
+    /// exists and leaves the first committed value unchanged.
+    async fn put_setting_if_absent(&self, key: &str, value: &str) -> Result<bool, StoreError>;
+    /// Insert an immutable setting only while the named provider-repair claim
+    /// is still current in the same replicated transaction.
+    async fn put_setting_if_absent_if_artwork_repair_current(
+        &self,
+        key: &str,
+        value: &str,
+        expected_item_id: i64,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError>;
     /// Atomically publish a related group of settings.
     ///
     /// Callers use this when one key activates the meaning of another. A
@@ -431,6 +458,9 @@ pub trait MediaStore: Send + Sync + 'static {
     /// so a periodic node-local pass does not rendezvous at the leader or move
     /// complete catalogue rows.
     async fn items_with_artwork(&self) -> Result<Vec<ArtworkInventoryItem>, StoreError>;
+    /// Authority check used immediately before deleting a grace-aged local
+    /// artwork generation. Replicated stores must answer consistently.
+    async fn artwork_filename_is_referenced(&self, filename: &str) -> Result<bool, StoreError>;
     /// One page of a library's grid, optionally narrowed to a single genre.
     ///
     /// The genre is matched against the item's stored list (migration v13),
@@ -469,6 +499,15 @@ pub trait MediaStore: Send + Sync + 'static {
 
     // --- metadata enrichment ---
     async fn apply_metadata(&self, item_id: i64, patch: &MetadataPatch) -> Result<(), StoreError>;
+    /// Apply provider metadata only while the replicated
+    /// owner/term/generation fence is still current. A stale submitted command
+    /// succeeds as a no-op.
+    async fn apply_metadata_if_artwork_repair_current(
+        &self,
+        item_id: i64,
+        patch: &MetadataPatch,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError>;
     /// Apply first-class facts for one book with source precedence enforced by
     /// the backend. A Curator handoff outranks EPUB package metadata; title +
     /// author alone never creates a work relation.
@@ -477,6 +516,16 @@ pub trait MediaStore: Send + Sync + 'static {
         item_id: i64,
         patch: &BookMetadataPatch,
     ) -> Result<(), StoreError>;
+    /// Apply Curator facts only while every book field this operation may
+    /// overwrite is still the item snapshot the caller acted on. This is the
+    /// store-level fence between slow provider work and a concurrent re-pair
+    /// or edit on another voter.
+    async fn apply_book_metadata_if_current(
+        &self,
+        expected: &Item,
+        patch: &BookMetadataPatch,
+        repair_fence: Option<&ArtworkRepairFence>,
+    ) -> Result<bool, StoreError>;
     /// Book rows in one library, optionally narrowed to the exact ids a
     /// targeted scan placed. `Some(&[])` means no rows.
     async fn book_items(

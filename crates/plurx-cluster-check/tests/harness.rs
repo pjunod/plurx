@@ -697,9 +697,10 @@ fn the_request_and_response_encoding_is_stable() {
             leader: Some(1),
             voters: vec![1, 2, 3],
             applied_index: None,
+            quorum_acknowledged: true,
         })
         .expect("encode"),
-        r#"{"Metrics":{"leader":1,"voters":[1,2,3],"applied_index":null}}"#
+        r#"{"Metrics":{"leader":1,"voters":[1,2,3],"applied_index":null,"quorum_acknowledged":true}}"#
     );
 
     let decoded: Request =

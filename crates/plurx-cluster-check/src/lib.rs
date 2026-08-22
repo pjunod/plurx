@@ -43,10 +43,10 @@ use plurx_core::domain::{
 };
 use plurx_core::secrets::CredentialKey;
 use plurx_core::store::{
-    ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
-    OfflinePackageStore, PlaybackTelemetryStore, ReconcileOutcome, RootFingerprintStatus,
-    SettingsStore, TraktStore, TranscodeCacheStore, UserStore, WatchStore, WatchedOutboxStore,
-    AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ApiKeyStore, ArtworkRepairFence, ClusterCompatibility, HiqliteAuthStore, LibraryStore,
+    MediaStore, OfflinePackageStore, PlaybackTelemetryStore, ReconcileOutcome,
+    RootFingerprintStatus, SettingsStore, TraktStore, TranscodeCacheStore, UserStore, WatchStore,
+    WatchedOutboxStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -470,47 +470,70 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     }
 
     // Four reconciliation loops must not turn one persistent miss into one
-    // Raft write per node. Only the deterministic voter submits the lease CAS;
-    // after that claimant releases and the time bucket advances, a different
-    // voter must be able to take over.
-    let repair_item = 9_001_i64;
-    let repair_lease_ms = 5_000_u64;
+    // Raft write per node. Only the current leader submits the claim; after a
+    // live election, its successor waits a receiver-local monotonic lease and
+    // then fences the old term without consulting either host's wall clock.
+    let repair_lease_ms = 250_u64;
+    let repair_item = match cluster
+        .request(leader, Request::SeedArtworkRepairFenceItem { ordinal: 1 })
+        .await?
+    {
+        Response::ItemId { item_id } => item_id,
+        response => bail!("unexpected artwork fence fixture response: {response:?}"),
+    };
+    let wrong_target_item = match cluster
+        .request(leader, Request::SeedArtworkRepairFenceItem { ordinal: 2 })
+        .await?
+    {
+        Response::ItemId { item_id } => item_id,
+        response => bail!("unexpected cross-item fence fixture response: {response:?}"),
+    };
     let before_repair = match cluster.request(leader, Request::Metrics).await? {
         Response::Metrics { applied_index, .. } => {
             applied_index.context("repair budget missing initial applied index")?
         }
         response => bail!("unexpected pre-repair metrics: {response:?}"),
     };
-    // Begin early in one shared rotation epoch. The requests cross process
-    // boundaries sequentially, so a tiny lease can straddle two epochs and
-    // correctly yield no selected caller in that one sweep. Production uses a
-    // five-minute lease; this shorter aligned epoch keeps the proof fast while
-    // ensuring every contender computes the same deterministic selection.
-    let bucket_offset = u64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() % u128::from(repair_lease_ms),
-    )?;
-    if bucket_offset > 500 {
-        tokio::time::sleep(Duration::from_millis(repair_lease_ms - bucket_offset + 50)).await;
-    }
     let mut first_winners = Vec::new();
+    let mut initial_fence = None;
     for node_id in 1..=3 {
-        match cluster
-            .request(
-                node_id,
-                Request::ClaimArtworkRepair {
-                    item_id: repair_item,
-                    lease_ms: repair_lease_ms,
-                },
-            )
-            .await?
-        {
-            Response::Flag { value: true } => first_winners.push(node_id),
-            Response::Flag { value: false } => {}
-            response => bail!("unexpected artwork repair claim response: {response:?}"),
+        if node_id == leader {
+            match cluster
+                .request(
+                    node_id,
+                    Request::ClaimArtworkRepairFence {
+                        item_id: repair_item,
+                        lease_ms: repair_lease_ms,
+                    },
+                )
+                .await?
+            {
+                Response::ArtworkRepairFence { fence: Some(fence) } => {
+                    first_winners.push(node_id);
+                    initial_fence = Some(fence);
+                }
+                Response::ArtworkRepairFence { fence: None } => {}
+                response => bail!("unexpected initial artwork fence response: {response:?}"),
+            }
+        } else {
+            match cluster
+                .request(
+                    node_id,
+                    Request::ClaimArtworkRepair {
+                        item_id: repair_item,
+                        lease_ms: repair_lease_ms,
+                    },
+                )
+                .await?
+            {
+                Response::Flag { value: true } => first_winners.push(node_id),
+                Response::Flag { value: false } => {}
+                response => bail!("unexpected artwork repair claim response: {response:?}"),
+            }
         }
     }
-    if first_winners.len() != 1 {
-        bail!("artwork repair lease had {} winners", first_winners.len());
+    if first_winners != [leader] {
+        bail!("artwork repair authority was not exactly leader {leader}: {first_winners:?}");
     }
     let after_repair = match cluster.request(leader, Request::Metrics).await? {
         Response::Metrics { applied_index, .. } => {
@@ -549,11 +572,132 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     if held_after != held_index {
         bail!("failed repair retries wrote inside the active lease");
     }
-    let mut handoff = None;
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_millis(repair_lease_ms + 30)).await;
-        for node_id in 1..=3 {
-            if let Response::Flag { value: true } = cluster
+    tokio::time::sleep(Duration::from_millis(repair_lease_ms + 30)).await;
+    let old_fence = match cluster
+        .request(
+            leader,
+            Request::ClaimArtworkRepairFence {
+                item_id: repair_item,
+                lease_ms: repair_lease_ms,
+            },
+        )
+        .await?
+    {
+        Response::ArtworkRepairFence { fence: Some(fence) } => fence,
+        response => bail!("stable-term artwork re-repair stayed fenced: {response:?}"),
+    };
+    let same_term_after = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("stable-term repair reuse missing applied index")?
+        }
+        response => bail!("unexpected stable-term repair metrics: {response:?}"),
+    };
+    if same_term_after.saturating_sub(held_index) != 1 {
+        bail!(
+            "stable-term artwork re-repair consumed {} Raft entries instead of one fenced generation",
+            same_term_after.saturating_sub(held_index)
+        );
+    }
+    match cluster
+        .request(
+            leader,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: initial_fence.context("initial leader did not return its repair fence")?,
+                title: "stale same-term write".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: false,
+            metadata: false,
+        } => {}
+        response => bail!("an old same-term artwork generation remained valid: {response:?}"),
+    }
+    match cluster
+        .request(
+            leader,
+            Request::ClaimArtworkRepairAfterPause {
+                item_id: repair_item + 1,
+                lease_ms: 100,
+                pause_ms: 150,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("expired post-CAS artwork claim could begin work: {response:?}"),
+    }
+    let election_target = (1..=3)
+        .find(|node_id| *node_id != leader)
+        .context("choose artwork leadership successor")?;
+    cluster
+        .request(election_target, Request::TriggerElection)
+        .await?
+        .require_ok()?;
+    let handoff_deadline = Instant::now() + Duration::from_secs(10);
+    let handoff = loop {
+        let current = cluster.leader().await?;
+        if current != leader {
+            break current;
+        }
+        if Instant::now() >= handoff_deadline {
+            bail!("artwork repair leadership did not move from voter {leader}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    loop {
+        match cluster.request(handoff, Request::Metrics).await? {
+            Response::Metrics {
+                quorum_acknowledged: true,
+                ..
+            } => break,
+            Response::Metrics { .. } => {}
+            response => bail!("unexpected successor metrics response: {response:?}"),
+        }
+        if Instant::now() >= handoff_deadline {
+            bail!("artwork repair successor never established a quorum lease");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    match cluster
+        .request(
+            handoff,
+            Request::ClaimArtworkRepair {
+                item_id: repair_item,
+                lease_ms: repair_lease_ms,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("successor ignored the monotonic repair fence: {response:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(repair_lease_ms + 30)).await;
+    let mut handoff_winners = Vec::new();
+    let mut new_fence = None;
+    for node_id in 1..=3 {
+        if node_id == handoff {
+            match cluster
+                .request(
+                    node_id,
+                    Request::ClaimArtworkRepairFence {
+                        item_id: repair_item,
+                        lease_ms: repair_lease_ms,
+                    },
+                )
+                .await?
+            {
+                Response::ArtworkRepairFence { fence: Some(fence) } => {
+                    handoff_winners.push(node_id);
+                    new_fence = Some(fence);
+                }
+                Response::ArtworkRepairFence { fence: None } => {}
+                response => bail!("unexpected handoff repair fence response: {response:?}"),
+            }
+        } else {
+            match cluster
                 .request(
                     node_id,
                     Request::ClaimArtworkRepair {
@@ -563,29 +707,97 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 )
                 .await?
             {
-                cluster
-                    .request(
-                        node_id,
-                        Request::ReleaseArtworkRepair {
-                            item_id: repair_item,
-                        },
-                    )
-                    .await?
-                    .require_ok()?;
-                if node_id != first_winners[0] {
-                    handoff = Some(node_id);
-                    break;
-                }
+                Response::Flag { value: true } => handoff_winners.push(node_id),
+                Response::Flag { value: false } => {}
+                response => bail!("unexpected handoff repair claim response: {response:?}"),
             }
         }
-        if handoff.is_some() {
-            break;
-        }
     }
-    handoff.context("artwork repair lease did not rotate to another capable voter")?;
+    if handoff_winners != [handoff] {
+        bail!("new leader did not exclusively fence artwork repair: {handoff_winners:?}");
+    }
+    let new_fence = new_fence.context("new leader did not return its artwork repair fence")?;
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: wrong_target_item,
+                fence: new_fence.clone(),
+                title: "wrong-item write".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: false,
+            metadata: false,
+        } => {}
+        response => bail!("an artwork fence authorized a different item: {response:?}"),
+    }
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: old_fence,
+                title: "stale old-term write".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: false,
+            metadata: false,
+        } => {}
+        response => bail!("an old-term artwork mutation was not fenced: {response:?}"),
+    }
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: new_fence.clone(),
+                title: "current-term write".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: true,
+            metadata: true,
+        } => {}
+        response => bail!("the current artwork repair fence was refused: {response:?}"),
+    }
+    cluster
+        .request(
+            handoff,
+            Request::ReleaseArtworkRepair {
+                fence: new_fence.clone(),
+            },
+        )
+        .await?
+        .require_ok()?;
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: new_fence,
+                title: "retired-generation write".to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: false,
+            metadata: false,
+        } => {}
+        response => bail!("a retired artwork generation remained valid: {response:?}"),
+    }
 
+    let post_handoff_leader = cluster.leader().await?;
     let target = (2..=3)
-        .find(|node_id| *node_id != leader)
+        .find(|node_id| *node_id != post_handoff_leader)
         .context("choose a removable follower")?;
     let observer = (1..=3)
         .find(|node_id| *node_id != target)
@@ -1787,9 +1999,27 @@ pub enum Request {
         item_id: i64,
         lease_ms: u64,
     },
-    ReleaseArtworkRepair {
+    ClaimArtworkRepairAfterPause {
         item_id: i64,
+        lease_ms: u64,
+        pause_ms: u64,
     },
+    SeedArtworkRepairFenceItem {
+        ordinal: u64,
+    },
+    ClaimArtworkRepairFence {
+        item_id: i64,
+        lease_ms: u64,
+    },
+    ApplyArtworkRepairFence {
+        target_item_id: i64,
+        fence: ArtworkRepairFence,
+        title: String,
+    },
+    ReleaseArtworkRepair {
+        fence: ArtworkRepairFence,
+    },
+    TriggerElection,
     RemoveVoter {
         node_id: String,
     },
@@ -1888,6 +2118,7 @@ pub enum Response {
         leader: Option<u64>,
         voters: Vec<u64>,
         applied_index: Option<u64>,
+        quorum_acknowledged: bool,
     },
     ReplicationStatus {
         status: ReplicationStatus,
@@ -1903,6 +2134,16 @@ pub enum Response {
     },
     ArtworkPeerAuth {
         auth: ArtworkPeerAuth,
+    },
+    ItemId {
+        item_id: i64,
+    },
+    ArtworkRepairFence {
+        fence: Option<ArtworkRepairFence>,
+    },
+    ArtworkFenceApply {
+        setting: bool,
+        metadata: bool,
     },
     MembershipError {
         code: String,
@@ -2911,12 +3152,92 @@ async fn handle_request(
         Request::ClaimArtworkRepair { item_id, lease_ms } => membership_ref(membership)?
             .claim_artwork_source_repair(item_id, Duration::from_millis(lease_ms))
             .await
-            .map(|value| Response::Flag { value })
+            .map(|claim| Response::Flag {
+                value: claim.is_some(),
+            })
             .or_else(|error| Ok(membership_error_response(error))),
-        Request::ReleaseArtworkRepair { item_id } => {
-            membership_ref(membership)?
-                .release_artwork_source_repair(item_id)
+        Request::ClaimArtworkRepairAfterPause {
+            item_id,
+            lease_ms,
+            pause_ms,
+        } => {
+            let claim = membership_ref(membership)?
+                .claim_artwork_source_repair(item_id, Duration::from_millis(lease_ms))
                 .await?;
+            tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            Ok(Response::Flag {
+                value: claim.is_some_and(|claim| claim.deadline() > Instant::now()),
+            })
+        }
+        Request::SeedArtworkRepairFenceItem { ordinal } => {
+            let store = store_ref(store)?;
+            let library = store
+                .create_library(&NewLibrary {
+                    name: format!("Artwork fence {}-{ordinal}", unix_now()?),
+                    kind: LibraryKind::Movies,
+                    paths: vec![PathBuf::from("/cluster-artwork-fence")],
+                    anime: false,
+                })
+                .await?;
+            let item_id = store
+                .insert_item(&NewItem {
+                    library_id: library.id,
+                    kind: ItemKind::Movie,
+                    parent_id: None,
+                    title: "Original artwork fence title".to_owned(),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await?;
+            Ok(Response::ItemId { item_id })
+        }
+        Request::ClaimArtworkRepairFence { item_id, lease_ms } => membership_ref(membership)?
+            .claim_artwork_source_repair(item_id, Duration::from_millis(lease_ms))
+            .await
+            .map(|claim| Response::ArtworkRepairFence {
+                fence: claim.map(|claim| claim.fence().clone()),
+            })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::ApplyArtworkRepairFence {
+            target_item_id,
+            ref fence,
+            ref title,
+        } => {
+            let store = store_ref(store)?;
+            let setting = store
+                .put_setting_if_absent_if_artwork_repair_current(
+                    &format!("cluster-check.artwork-fence.{target_item_id}.{title}"),
+                    title,
+                    target_item_id,
+                    fence,
+                )
+                .await?;
+            let metadata = store
+                .apply_metadata_if_artwork_repair_current(
+                    target_item_id,
+                    &MetadataPatch {
+                        title: Some(title.clone()),
+                        ..Default::default()
+                    },
+                    fence,
+                )
+                .await?;
+            Ok(Response::ArtworkFenceApply { setting, metadata })
+        }
+        Request::ReleaseArtworkRepair { ref fence } => membership_ref(membership)?
+            .retire_artwork_source_repair(fence)
+            .await
+            .and_then(|retired| {
+                retired.then_some(Response::Ok).ok_or_else(|| {
+                    MembershipError::Internal(
+                        "current artwork repair generation was not retired".to_owned(),
+                    )
+                })
+            })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::TriggerElection => {
+            membership_ref(membership)?.trigger_local_election().await?;
             Ok(Response::Ok)
         }
         Request::RemoveVoter { node_id } => membership_ref(membership)?
@@ -3092,6 +3413,9 @@ async fn handle_request(
                 leader: metrics.current_leader,
                 voters,
                 applied_index: metrics.last_applied.as_ref().map(|log| log.index),
+                quorum_acknowledged: metrics
+                    .millis_since_quorum_ack
+                    .is_some_and(|age| age <= 1_000),
             })
         }
         Request::ReplicationStatus => Ok(Response::ReplicationStatus {

@@ -84,6 +84,8 @@ const SETTINGS_METHODS: &[&str] = &[
     "get_setting",
     "get_setting_pair",
     "put_setting",
+    "put_setting_if_absent",
+    "put_setting_if_absent_if_artwork_repair_current",
     "put_settings",
     "instance_id",
 ];
@@ -127,7 +129,9 @@ const MEDIA_METHODS: &[&str] = &[
     "recently_added",
     "search_items",
     "apply_metadata",
+    "apply_metadata_if_artwork_repair_current",
     "apply_book_metadata",
+    "apply_book_metadata_if_current",
     "book_items",
     "related_book_editions",
     "items_needing_metadata",
@@ -135,6 +139,7 @@ const MEDIA_METHODS: &[&str] = &[
     "items_needing_artwork",
     "items_missing_artwork",
     "items_with_artwork",
+    "artwork_filename_is_referenced",
     "items_missing_genres",
     "update_item_fields",
     "set_nfo_seeded",
@@ -3209,7 +3214,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 148, "review the Store method count");
+    assert_eq!(declared.len(), 153, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -3357,6 +3362,28 @@ async fn settings_contract_runs_through_dyn_store() {
         assert_eq!(
             store.get_setting("contract.key").await.expect("get"),
             Some("second".to_owned()),
+            "backend {backend}"
+        );
+        assert!(
+            store
+                .put_setting_if_absent("contract.immutable", "first")
+                .await
+                .expect("insert immutable setting"),
+            "backend {backend}"
+        );
+        assert!(
+            !store
+                .put_setting_if_absent("contract.immutable", "second")
+                .await
+                .expect("retain immutable setting"),
+            "backend {backend}"
+        );
+        assert_eq!(
+            store
+                .get_setting("contract.immutable")
+                .await
+                .expect("get immutable setting"),
+            Some("first".to_owned()),
             "backend {backend}"
         );
         store
@@ -3852,6 +3879,68 @@ async fn media_contract_runs_through_dyn_store() {
         );
         assert_eq!(enriched.poster_path.as_deref(), Some("curator-cover.jpg"));
         assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Newer Pairing Title".into()),
+                    author: Some("Newer Pairing Author".into()),
+                    work_id: Some("curator:work:newer".into()),
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("same-edition concurrent pairing");
+        assert!(
+            !store
+                .apply_book_metadata_if_current(
+                    &enriched,
+                    &BookMetadataPatch {
+                        title: Some("Stale Pairing Title".into()),
+                        author: Some("Stale Pairing Author".into()),
+                        work_id: Some("curator:work:stale".into()),
+                        edition_id: enriched.book_edition_id.clone(),
+                        poster_path: enriched.poster_path.clone(),
+                        source: BookMetadataSource::Curator,
+                    },
+                    None,
+                )
+                .await
+                .expect("stale same-edition conditional pairing"),
+            "same-edition/same-poster stale pairing must lose the full-field CAS on {backend}"
+        );
+        let newest_pairing = store
+            .get_item(ebook)
+            .await
+            .expect("read newest pairing")
+            .expect("newest pairing");
+        assert_eq!(newest_pairing.title, "Newer Pairing Title", "{backend}");
+        assert_eq!(
+            newest_pairing.author.as_deref(),
+            Some("Newer Pairing Author"),
+            "{backend}"
+        );
+        assert_eq!(
+            newest_pairing.book_work_id.as_deref(),
+            Some("curator:work:newer"),
+            "{backend}"
+        );
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("restore media contract pairing");
         let artwork_items = store
             .items_with_artwork()
             .await

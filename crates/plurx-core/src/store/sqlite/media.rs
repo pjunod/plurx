@@ -15,7 +15,9 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 use crate::mediafacts::{FactsRow, MediaFacts};
-use crate::store::{ArtworkInventoryItem, MediaStore, ReconcileOutcome, RootFingerprintStatus};
+use crate::store::{
+    ArtworkInventoryItem, ArtworkRepairFence, MediaStore, ReconcileOutcome, RootFingerprintStatus,
+};
 
 /// Build an FTS5 MATCH expression from free text: quoted tokens, prefix
 /// matching on the last one. Returns `None` for queries with no tokens.
@@ -333,6 +335,20 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn artwork_filename_is_referenced(&self, filename: &str) -> Result<bool, StoreError> {
+        let filename = filename.to_owned();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM items \
+                 WHERE poster_path = ?1 OR backdrop_path = ?1)",
+                params![filename],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     async fn list_top_items_in_genre(
         &self,
         library_id: i64,
@@ -562,6 +578,84 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn apply_metadata_if_artwork_repair_current(
+        &self,
+        item_id: i64,
+        patch: &MetadataPatch,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        let patch = patch.clone();
+        let fence = fence.clone();
+        self.with_conn(move |conn| {
+            let sort_title = patch.title.as_deref().map(sort_title_for);
+            let tags = patch
+                .tags
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let genres = patch
+                .genres
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let changed = conn.execute(
+                "UPDATE items SET
+                     title = COALESCE(?2, title),
+                     sort_title = COALESCE(?3, sort_title),
+                     year = COALESCE(?4, year),
+                     overview = COALESCE(?5, overview),
+                     tmdb_id = COALESCE(?6, tmdb_id),
+                     imdb_id = COALESCE(?7, imdb_id),
+                     air_date = COALESCE(?8, air_date),
+                     runtime_ms = COALESCE(?9, runtime_ms),
+                     poster_path = COALESCE(?10, poster_path),
+                     backdrop_path = COALESCE(?11, backdrop_path),
+                     recorded_at = COALESCE(?12, recorded_at),
+                     tags = COALESCE(?13, tags),
+                     genres = COALESCE(?17, genres),
+                     metadata_at = CASE WHEN ?14 = 1 THEN unixepoch() ELSE metadata_at END,
+                     artwork_attempted_at =
+                         CASE WHEN ?15 = 1 THEN unixepoch() ELSE artwork_attempted_at END,
+                     artwork_error = CASE WHEN ?15 = 1 THEN ?16 ELSE artwork_error END,
+                     updated_at = unixepoch()
+                 WHERE id = ?1 AND ?18 = ?1 AND EXISTS (
+                   SELECT 1 FROM cluster_artwork_repairs
+                   WHERE item_id = ?18 AND owner_node_id = ?19 AND leader_term = ?20
+                     AND generation = ?21)",
+                params![
+                    item_id,
+                    patch.title,
+                    sort_title,
+                    patch.year,
+                    patch.overview,
+                    patch.tmdb_id,
+                    patch.imdb_id,
+                    patch.air_date,
+                    patch.runtime_ms,
+                    patch.poster_path,
+                    patch.backdrop_path,
+                    patch.recorded_at,
+                    tags,
+                    patch.enriched as i64,
+                    patch.artwork.is_some() as i64,
+                    match &patch.artwork {
+                        Some(ArtworkAttempt::Failed(reason)) => Some(reason.as_str()),
+                        _ => None,
+                    },
+                    genres,
+                    fence.item_id,
+                    fence.owner_node_id,
+                    fence.leader_term,
+                    fence.generation,
+                ],
+            )?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
     async fn apply_book_metadata(
         &self,
         item_id: i64,
@@ -612,6 +706,89 @@ impl MediaStore for SqliteStore {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn apply_book_metadata_if_current(
+        &self,
+        expected: &Item,
+        patch: &BookMetadataPatch,
+        repair_fence: Option<&ArtworkRepairFence>,
+    ) -> Result<bool, StoreError> {
+        let patch = patch.clone();
+        let expected = expected.clone();
+        let repair_fence = repair_fence.cloned();
+        self.with_conn(move |conn| {
+            let sort_title = patch.title.as_deref().map(sort_title_for);
+            let source = patch.source.as_str();
+            let base_sql = "UPDATE items SET
+                     title = COALESCE(?2, title),
+                     sort_title = COALESCE(?3, sort_title),
+                     author = COALESCE(?4, author),
+                     book_work_id = COALESCE(?5, book_work_id),
+                     book_edition_id = COALESCE(?6, book_edition_id),
+                     poster_path = COALESCE(?7, poster_path),
+                     book_metadata_source = ?8,
+                     updated_at = unixepoch()
+                 WHERE id = ?1 AND kind IN ('book', 'audiobook')
+                   AND title = ?9
+                   AND author IS ?10
+                   AND book_work_id IS ?11
+                   AND book_metadata_source IS ?12
+                   AND book_edition_id IS ?13
+                   AND poster_path IS ?14";
+            let changed = if let Some(fence) = repair_fence.as_ref() {
+                conn.execute(
+                    &format!(
+                        "{base_sql} AND ?15 = ?1 AND EXISTS (
+                           SELECT 1 FROM cluster_artwork_repairs
+                           WHERE item_id = ?15 AND owner_node_id = ?16 AND leader_term = ?17
+                             AND generation = ?18)"
+                    ),
+                    params![
+                        expected.id,
+                        patch.title,
+                        sort_title,
+                        patch.author,
+                        patch.work_id,
+                        patch.edition_id,
+                        patch.poster_path,
+                        source,
+                        expected.title,
+                        expected.author,
+                        expected.book_work_id,
+                        expected.book_metadata_source,
+                        expected.book_edition_id,
+                        expected.poster_path,
+                        fence.item_id,
+                        fence.owner_node_id,
+                        fence.leader_term,
+                        fence.generation,
+                    ],
+                )?
+            } else {
+                conn.execute(
+                    base_sql,
+                    params![
+                        expected.id,
+                        patch.title,
+                        sort_title,
+                        patch.author,
+                        patch.work_id,
+                        patch.edition_id,
+                        patch.poster_path,
+                        source,
+                        expected.title,
+                        expected.author,
+                        expected.book_work_id,
+                        expected.book_metadata_source,
+                        expected.book_edition_id,
+                        expected.poster_path,
+                    ],
+                )?
+            };
+            Ok(changed == 1)
         })
         .await
     }

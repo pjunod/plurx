@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::{OfflinePackage, OfflineRemovalPlanEntry, OfflineRemovalReport};
-use crate::store::{Store, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
+use crate::store::{ArtworkRepairFence, Store, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 
 use super::migration::status::{ReplicationMonitor, ReplicationStatus};
 use super::migration::ActivationMarker;
@@ -31,6 +31,10 @@ const JOIN_TOKEN_VERSION: u32 = 1;
 const MEMBERSHIP_SCHEMA_VERSION: i64 = 1;
 const NODE_REACHABLE_WINDOW_MS: i64 = 30_000;
 const ARTWORK_AUTH_WINDOW_MS: i64 = 60_000;
+/// The vendored Raft configuration sends heartbeats every 500 ms and cannot
+/// elect a successor before 1,500 ms. Requiring an acknowledgement inside two
+/// heartbeats makes the old leader ineligible before a new term can exist.
+const ARTWORK_LEADER_QUORUM_FRESH_MS: u64 = 1_000;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a removal waits for survivors to answer a source probe before
 /// treating silence as "cannot prove it". Long enough for a healthy node's
@@ -88,13 +92,14 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_node_hostnames (\
          node_id TEXT PRIMARY KEY, \
          hostname TEXT NOT NULL) STRICT",
-    // Provider/source repair is a replicated side effect. A durable per-item
-    // lease and deterministic voter rotation prevent restarts, elections, or
-    // four independent reconciliation loops from multiplying external work.
+    // Provider/source repair is a replicated side effect. The current Raft
+    // leader arbitrates one durable claim per item and term; a successor waits
+    // a full local monotonic lease before fencing an abandoned older term.
     "CREATE TABLE IF NOT EXISTS cluster_artwork_repairs (\
          item_id INTEGER PRIMARY KEY, \
          owner_node_id TEXT NOT NULL, \
-         lease_expires_at INTEGER NOT NULL) STRICT",
+         leader_term INTEGER NOT NULL, \
+         generation INTEGER NOT NULL) STRICT",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -332,6 +337,28 @@ pub struct ArtworkPeerAuth {
     pub signature: String,
 }
 
+/// Fencing proof for one leader-arbitrated source repair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtworkRepairClaim {
+    deadline: Instant,
+    fence: ArtworkRepairFence,
+}
+
+impl ArtworkRepairClaim {
+    /// Receiver-local deadline for the side effect. Time spent obtaining the
+    /// replicated fence consumes the lease.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Replicated proof every provider mutation must compare atomically.
+    #[must_use]
+    pub fn fence(&self) -> &ArtworkRepairFence {
+        &self.fence
+    }
+}
+
 struct ReplicatedMembership {
     client: Client,
     store: Arc<dyn Store>,
@@ -343,6 +370,10 @@ struct ReplicatedMembership {
     secrets: JoinSecrets,
     activation_marker: ActivationMarker,
     replication: ReplicationMonitor,
+    /// First local observation of an older-term claim. `Instant` deliberately
+    /// never crosses a process boundary: a successor waits the entire lease
+    /// regardless of either host's wall clock.
+    artwork_claim_observed_at: Mutex<BTreeMap<i64, (i64, i64, Instant)>>,
 }
 
 #[derive(Clone)]
@@ -423,6 +454,7 @@ impl MembershipManager {
                 secrets,
                 activation_marker,
                 replication,
+                artwork_claim_observed_at: Mutex::new(BTreeMap::new()),
             })),
         };
         manager.initialize().await?;
@@ -760,54 +792,103 @@ impl MembershipManager {
 
     /// Claim the one cluster-wide provider/source repair for an item.
     ///
-    /// The conditional Raft write is the authority proof: only one voter can
-    /// own the item at a time. Any voter may contend because local sidecars and
-    /// library mounts are not guaranteed to exist on the leader; a failed
-    /// claimant retains its short lease so the next time bucket rotates to a
-    /// different machine without a write storm.
+    /// Only the current Raft leader may submit the conditional write. This
+    /// makes one clock and one process the arbitration point instead of asking
+    /// replicas with different clocks and apply positions to pick a caller.
+    /// After an election, the successor observes the older term and waits one
+    /// complete local monotonic lease before fencing it. A restarted successor
+    /// waits again, which is conservative but cannot overlap an old repair.
     pub async fn claim_artwork_source_repair(
         &self,
         item_id: i64,
         lease: Duration,
-    ) -> Result<bool, MembershipError> {
+    ) -> Result<Option<ArtworkRepairClaim>, MembershipError> {
         let inner = self.replicated_inner()?;
+        let claim_started = Instant::now();
+        let claim_deadline = claim_started + lease;
         if !self.local_node_is_active_voter().await? {
             return Err(MembershipError::LocalNodeNotActive);
         }
-        let now = unix_ms()?;
-        let lease_ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX).max(1);
-        let active = inner
+        let metrics = inner.client.metrics_db().await?;
+        if metrics.current_leader != Some(inner.identity.raft_id)
+            || !metrics
+                .millis_since_quorum_ack
+                .is_some_and(|age| age <= ARTWORK_LEADER_QUORUM_FRESH_MS)
+        {
+            return Ok(None);
+        }
+        let leader_term = i64::try_from(metrics.current_term)
+            .map_err(|_| MembershipError::Internal("Raft term overflow".to_owned()))?;
+        let existing = inner
             .client
-            .query_map::<ArtworkRepairLeaseRow, _>(
-                "SELECT owner_node_id, lease_expires_at FROM cluster_artwork_repairs \
+            .query_consistent_map::<ArtworkRepairLeaseRow, _>(
+                "SELECT owner_node_id, leader_term, generation FROM cluster_artwork_repairs \
                  WHERE item_id = $1",
                 params!(item_id),
             )
             .await?;
-        if active.first().is_some_and(|row| row.lease_expires_at > now) {
-            return Ok(false);
+        let previous = existing.first();
+        if let Some(previous) = previous {
+            if previous.leader_term > leader_term {
+                return Ok(None);
+            }
+            let mut observations = inner.artwork_claim_observed_at.lock().map_err(|_| {
+                MembershipError::Internal("artwork claim observation lock was poisoned".to_owned())
+            })?;
+            if previous.leader_term == leader_term {
+                if previous.owner_node_id != inner.identity.node_id {
+                    return Ok(None);
+                }
+                match observations.get(&item_id) {
+                    Some((term, generation, observed_at))
+                        if *term == leader_term
+                            && *generation == previous.generation
+                            && observed_at.elapsed() >= lease => {}
+                    Some((term, generation, _))
+                        if *term == leader_term && *generation == previous.generation =>
+                    {
+                        return Ok(None);
+                    }
+                    _ => {
+                        observations
+                            .insert(item_id, (leader_term, previous.generation, Instant::now()));
+                        return Ok(None);
+                    }
+                }
+            }
+            match observations.get(&item_id) {
+                Some((term, generation, observed_at))
+                    if *term == previous.leader_term
+                        && *generation == previous.generation
+                        && observed_at.elapsed() >= lease => {}
+                Some((term, generation, _))
+                    if *term == previous.leader_term && *generation == previous.generation =>
+                {
+                    return Ok(None);
+                }
+                _ => {
+                    observations.insert(
+                        item_id,
+                        (previous.leader_term, previous.generation, Instant::now()),
+                    );
+                    return Ok(None);
+                }
+            }
         }
-
-        // Every voter observes the same committed voter order and time bucket,
-        // so just one contender submits the CAS write. The CAS remains the
-        // final authority across clock skew and a bucket boundary.
-        let metrics = inner.client.metrics_db().await?;
-        let voters = metrics.membership_config.voter_ids().collect::<Vec<_>>();
-        if voters.is_empty() {
-            return Err(MembershipError::LocalNodeNotActive);
-        }
-        let bucket = now.div_euclid(lease_ms) as u64;
-        let selected =
-            voters[(item_id.unsigned_abs().wrapping_add(bucket) % voters.len() as u64) as usize];
-        if selected != inner.identity.raft_id {
-            return Ok(false);
-        }
+        let previous_owner = previous
+            .map(|row| row.owner_node_id.as_str())
+            .unwrap_or_default();
+        let previous_term = previous.map_or(-1, |row| row.leader_term);
+        let previous_generation = previous.map_or(0, |row| row.generation);
+        let generation = previous_generation.checked_add(1).ok_or_else(|| {
+            MembershipError::Internal("artwork repair generation overflow".to_owned())
+        })?;
         let changed = inner
             .client
             .execute(
                 "INSERT INTO cluster_artwork_repairs \
-                 (item_id, owner_node_id, lease_expires_at) \
-                 SELECT $1, $2, $3 WHERE EXISTS (\
+                 (item_id, owner_node_id, leader_term, generation) \
+                 SELECT $1, $2, $3, $4 WHERE EXISTS (\
                    SELECT 1 FROM cluster_nodes \
                    WHERE node_id = $2 AND removed_at IS NULL \
                      AND NOT EXISTS (SELECT 1 FROM cluster_node_removals \
@@ -815,17 +896,47 @@ impl MembershipManager {
                  ) \
                  ON CONFLICT(item_id) DO UPDATE SET \
                    owner_node_id = excluded.owner_node_id, \
-                   lease_expires_at = excluded.lease_expires_at \
-                 WHERE cluster_artwork_repairs.lease_expires_at <= $4",
+                   leader_term = excluded.leader_term, \
+                   generation = excluded.generation \
+                 WHERE cluster_artwork_repairs.owner_node_id = $5 \
+                   AND cluster_artwork_repairs.leader_term = $6 \
+                   AND cluster_artwork_repairs.generation = $7 \
+                   AND (cluster_artwork_repairs.leader_term < excluded.leader_term \
+                     OR (cluster_artwork_repairs.leader_term = excluded.leader_term \
+                       AND cluster_artwork_repairs.owner_node_id = excluded.owner_node_id))",
                 params!(
                     item_id,
                     inner.identity.node_id.as_str(),
-                    now.saturating_add(lease_ms),
-                    now
+                    leader_term,
+                    generation,
+                    previous_owner,
+                    previous_term,
+                    previous_generation
                 ),
             )
             .await?;
-        Ok(changed == 1)
+        if changed == 1 {
+            inner
+                .artwork_claim_observed_at
+                .lock()
+                .map_err(|_| {
+                    MembershipError::Internal(
+                        "artwork claim observation lock was poisoned".to_owned(),
+                    )
+                })?
+                .insert(item_id, (leader_term, generation, claim_started));
+            Ok(Some(ArtworkRepairClaim {
+                deadline: claim_deadline,
+                fence: ArtworkRepairFence {
+                    item_id,
+                    owner_node_id: inner.identity.node_id.clone(),
+                    leader_term,
+                    generation,
+                },
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Whether this process is both present in the committed Raft voter set
@@ -857,20 +968,38 @@ impl MembershipManager {
             .any(|raft_id| raft_id == inner.identity.raft_id))
     }
 
-    /// Release a lease owned by this node without disturbing a successor.
-    /// Production failures deliberately retain their lease; the cluster
-    /// acceptance harness uses this only to keep its short-lived fixture tidy.
-    pub async fn release_artwork_source_repair(&self, item_id: i64) -> Result<(), MembershipError> {
+    /// Retire one completed or timed-out provider repair generation. The
+    /// conditional increment is itself a Raft command submitted after the
+    /// repair work, so an earlier command either lands before retirement or
+    /// observes an obsolete generation and becomes a no-op afterwards.
+    pub async fn retire_artwork_source_repair(
+        &self,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, MembershipError> {
         let inner = self.replicated_inner()?;
-        inner
+        let changed = inner
             .client
             .execute(
-                "DELETE FROM cluster_artwork_repairs \
-                 WHERE item_id = $1 AND owner_node_id = $2",
-                params!(item_id, inner.identity.node_id.as_str()),
+                "UPDATE cluster_artwork_repairs SET generation = generation + 1 \
+                 WHERE item_id = $1 AND owner_node_id = $2 AND leader_term = $3 \
+                   AND generation = $4 AND generation < 9223372036854775807",
+                params!(
+                    fence.item_id,
+                    fence.owner_node_id.as_str(),
+                    fence.leader_term,
+                    fence.generation
+                ),
             )
             .await?;
-        Ok(())
+        Ok(changed == 1)
+    }
+
+    /// Ask this node's Raft endpoint to stand for election. Production uses
+    /// the same bounded operation during graceful leader leave; the cluster
+    /// harness uses it to prove artwork fencing across a live handoff.
+    pub async fn trigger_local_election(&self) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        trigger_election(&inner.local.api_address, &inner.secrets.api).await
     }
 
     /// Public HTTP bases for currently reachable peers, used only to recover
@@ -1459,15 +1588,10 @@ impl MembershipManager {
     /// gets the same `node_removed` failure an unverifiable package gets, which
     /// releases its reservation and lets the client ask again.
     ///
-    /// This is the removal's last act, not a permanent fence. Leaving the raft
-    /// roster does not stop the node's writes: hiqlite forwards a non-leader
-    /// client's write to the leader on the shared API secret, which removal does
-    /// not rotate, and [`crate::store::OfflinePackageStore::create_offline_package`]
-    /// consults no tombstone. A removed node still running and still answering
-    /// download requests can therefore create packages owned by a tombstone,
-    /// after every refusal and failure path this removal has run. Those are
-    /// outside the removal's guarantee until the operator stops that process or
-    /// repoints its clients, which `docs/OPERATIONS.md` tells them to do.
+    /// This is the removal's last cleanup act for a package that committed
+    /// before the membership tombstone. The store's package-creation statement
+    /// checks both the durable removal intent and the tombstone atomically, so
+    /// later requests forwarded by a removed process are permanently refused.
     async fn fail_offline_work_left_behind(&self, node_id: &str) -> Result<u64, MembershipError> {
         let inner = self.replicated_inner()?;
         let plan = inner
@@ -2001,9 +2125,9 @@ struct HttpUrlRow {
 }
 
 struct ArtworkRepairLeaseRow {
-    #[allow(dead_code)]
     owner_node_id: String,
-    lease_expires_at: i64,
+    leader_term: i64,
+    generation: i64,
 }
 
 struct CountRow {
@@ -2057,7 +2181,8 @@ impl From<&mut Row<'_>> for ArtworkRepairLeaseRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
             owner_node_id: row.get("owner_node_id"),
-            lease_expires_at: row.get("lease_expires_at"),
+            leader_term: row.get("leader_term"),
+            generation: row.get("generation"),
         }
     }
 }

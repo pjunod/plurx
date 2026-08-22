@@ -11,6 +11,7 @@
 //! than referenced in place: the image server still touches only one
 //! directory.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{ItemKind, MetadataPatch};
@@ -20,6 +21,25 @@ use crate::store::Store;
 /// home and movie cards without a visible quality step.
 const THUMB_WIDTH: i64 = 500;
 
+/// Cancellation cleanup for bytes that have not been atomically published.
+struct TemporaryArtwork(PathBuf);
+
+impl TemporaryArtwork {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryArtwork {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The ffmpeg binary; overridable via `PLURX_FFMPEG` for jellyfin-ffmpeg or a
 /// pinned path — same convention as the transcoder and prober.
 fn ffmpeg_bin() -> String {
@@ -27,6 +47,86 @@ fn ffmpeg_bin() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "ffmpeg".to_owned())
+}
+
+/// Recreate already-published Home artwork on this node without changing the
+/// replicated catalogue row. This is the cluster materializer path: only a
+/// voter that can read the local media can succeed, and its work remains
+/// node-local.
+pub async fn materialize_item_artwork(
+    store: &dyn Store,
+    artwork_dir: &Path,
+    item_id: i64,
+    expected: &[String],
+) -> bool {
+    let Ok(Some(mut item)) = store.get_item(item_id).await else {
+        return false;
+    };
+    if item.kind == ItemKind::Folder {
+        let Ok(children) = store.get_item_children(item.id).await else {
+            return false;
+        };
+        for child in &children {
+            let Some(path) = first_file_path(store, child.id).await else {
+                continue;
+            };
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            if let Some(name) = adopt_folder_art(artwork_dir, item.id, directory).await {
+                if expected.contains(&name) {
+                    return cached_file_is_complete(artwork_dir, &name).await;
+                }
+                // A stale caller cannot safely remove a final name after its
+                // publication slot has been released. Leave mismatches to the
+                // grace-aged sweep, which rechecks replicated ownership while
+                // holding that same slot.
+            }
+            break;
+        }
+        let Some(source) = children.into_iter().find(|child| {
+            child
+                .poster_path
+                .as_ref()
+                .is_some_and(|poster| expected.contains(poster))
+                && matches!(child.kind, ItemKind::Video | ItemKind::Photo)
+        }) else {
+            return false;
+        };
+        item = source;
+    }
+    if !matches!(item.kind, ItemKind::Video | ItemKind::Photo) {
+        return false;
+    }
+    let Some(path) = first_file_path(store, item.id).await else {
+        return false;
+    };
+    if let Some(name) = adopt_local_art(artwork_dir, item.id, &path).await {
+        if expected.contains(&name) {
+            return cached_file_is_complete(artwork_dir, &name).await;
+        }
+        // See the folder path above: eager cleanup can race a newer writer.
+    }
+    let generated = format!("{}-poster.jpg", item.id);
+    if !expected.contains(&generated) {
+        return false;
+    }
+    generate_thumb(
+        artwork_dir,
+        item.id,
+        &path,
+        item.kind,
+        duration(store, item.id).await,
+    )
+    .await
+    .is_some_and(|name| expected.contains(&name))
+        && cached_file_is_complete(artwork_dir, &generated).await
+}
+
+async fn cached_file_is_complete(artwork_dir: &Path, filename: &str) -> bool {
+    tokio::fs::metadata(artwork_dir.join(filename))
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -197,10 +297,10 @@ async fn copy_into_cache(artwork_dir: &Path, item_id: i64, source: &Path) -> Opt
         .to_lowercase();
     let filename = format!("{item_id}-poster.{ext}");
     let dest = artwork_dir.join(&filename);
-    match tokio::fs::copy(source, &dest).await {
-        Ok(_) => Some(filename),
-        Err(e) => {
-            tracing::warn!(source = %source.display(), error = %e, "copying local artwork");
+    match super::copy_artwork_atomically(source, &dest).await {
+        Ok(()) => Some(filename),
+        Err(error) => {
+            tracing::warn!(source = %source.display(), %error, "copying local artwork");
             None
         }
     }
@@ -221,11 +321,37 @@ async fn generate_thumb(
     kind: ItemKind,
     duration_ms: Option<i64>,
 ) -> Option<String> {
+    let ffmpeg = ffmpeg_bin();
+    generate_thumb_with(
+        OsStr::new(&ffmpeg),
+        artwork_dir,
+        item_id,
+        media,
+        kind,
+        duration_ms,
+    )
+    .await
+}
+
+async fn generate_thumb_with(
+    ffmpeg: &OsStr,
+    artwork_dir: &Path,
+    item_id: i64,
+    media: &Path,
+    kind: ItemKind,
+    duration_ms: Option<i64>,
+) -> Option<String> {
     let filename = format!("{item_id}-poster.jpg");
     let dest = artwork_dir.join(&filename);
+    let temporary = TemporaryArtwork::new(artwork_dir.join(format!(
+        ".{filename}.{}.tmp.jpg",
+        uuid::Uuid::new_v4().simple()
+    )));
 
-    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
-    cmd.arg("-nostdin").args(["-v", "error", "-y"]);
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.kill_on_drop(true)
+        .arg("-nostdin")
+        .args(["-v", "error", "-y"]);
     if kind == ItemKind::Video {
         cmd.arg("-ss")
             .arg(format!("{:.3}", seek_seconds(duration_ms)));
@@ -235,10 +361,18 @@ async fn generate_thumb(
         .args(["-frames:v", "1"])
         .args(["-vf", &format!("scale=w={THUMB_WIDTH}:h=-2")])
         .args(["-q:v", "4"])
-        .arg(&dest);
+        .arg(temporary.path());
 
     match cmd.output().await {
-        Ok(out) if out.status.success() && dest.is_file() => Some(filename),
+        Ok(out) if out.status.success() && temporary.path().is_file() => {
+            match tokio::fs::rename(temporary.path(), &dest).await {
+                Ok(()) => Some(filename),
+                Err(error) => {
+                    tracing::warn!(path = %media.display(), %error, "installing generated thumbnail");
+                    None
+                }
+            }
+        }
         Ok(out) => {
             tracing::warn!(
                 path = %media.display(),
@@ -380,6 +514,29 @@ mod tests {
             std::fs::read(&sidecar_art).expect("read source"),
             "the owner's own art wins over a frame grab"
         );
+        std::fs::remove_file(artwork.join(&adopted)).expect("delete adopted poster");
+        let adopted_item = children
+            .iter()
+            .find(|child| child.title == "Sandcastle")
+            .expect("adopted item");
+        assert!(
+            !materialize_item_artwork(
+                &store,
+                &artwork,
+                adopted_item.id,
+                &["stale-generation.jpg".to_owned()],
+            )
+            .await,
+            "a stale snapshot must not claim the rebuilt generation"
+        );
+        assert!(
+            artwork.join(&adopted).is_file(),
+            "a stale caller must leave the final generation for the fenced grace sweep"
+        );
+        let competing_writer = super::super::reserve_artwork_publication(artwork.join(&adopted))
+            .expect("the next writer acquires the same final-name slot");
+        assert!(artwork.join(&adopted).is_file());
+        drop(competing_writer);
         // The folder inherited its first child's poster.
         assert!(folder
             .poster_path
@@ -391,6 +548,58 @@ mod tests {
             .expect("get")
             .expect("present");
         assert!(folder_after.poster_path.is_some());
+
+        std::fs::write(media.join("folder.jpg"), b"folder-owned-art").expect("folder art");
+        let folder_refresh =
+            enrich_home_library(&store, &artwork, lib.id, true, Some(&[folder.id])).await;
+        assert_eq!(folder_refresh.inherited, 1);
+        let folder_owned = store
+            .get_item(folder.id)
+            .await
+            .expect("get")
+            .expect("present")
+            .poster_path
+            .expect("folder-owned poster");
+        std::fs::remove_file(artwork.join(&folder_owned)).expect("delete folder poster");
+        assert!(
+            materialize_item_artwork(&store, &artwork, folder.id, &[folder_owned.clone()]).await,
+            "folder sidecar art must rematerialize without a catalogue write"
+        );
+        assert_eq!(
+            store
+                .get_item(folder.id)
+                .await
+                .expect("get")
+                .expect("present")
+                .poster_path,
+            Some(folder_owned.clone())
+        );
+        assert_eq!(
+            std::fs::read(artwork.join(folder_owned)).expect("folder bytes"),
+            b"folder-owned-art"
+        );
+
+        let beach = children
+            .iter()
+            .find(|child| child.title == "Beach")
+            .expect("generated child");
+        let beach_poster = beach.poster_path.clone().expect("generated poster");
+        std::fs::remove_file(artwork.join(&beach_poster)).expect("delete cached poster");
+        assert!(
+            materialize_item_artwork(&store, &artwork, beach.id, &[beach_poster.clone()]).await,
+            "a capable voter must recreate deleted local bytes"
+        );
+        assert!(artwork.join(&beach_poster).is_file());
+        assert_eq!(
+            store
+                .get_item(beach.id)
+                .await
+                .expect("get")
+                .expect("present")
+                .poster_path,
+            Some(beach_poster),
+            "node-local repair must not republish the replicated path"
+        );
 
         // Nothing is left needing artwork, so a second pass is a no-op.
         let again = enrich_home_library(&store, &artwork, lib.id, false, None).await;
@@ -419,5 +628,91 @@ mod tests {
         // Unknown duration → 5 s.
         assert!((seek_seconds(None) - 5.0).abs() < f64::EPSILON);
         assert!((seek_seconds(Some(0)) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_thumbnail_reaps_the_encoder() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let script = dir.path().join("hung-ffmpeg");
+        let pid_file = dir.path().join("encoder.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor output in \"$@\"; do :; done\nprintf partial > \"$output\"\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+
+        let task_script = script.clone();
+        let task_artwork = dir.path().to_path_buf();
+        let task_media = dir.path().join("video.mp4");
+        let task = tokio::spawn(async move {
+            generate_thumb_with(
+                task_script.as_os_str(),
+                &task_artwork,
+                7,
+                &task_media,
+                ItemKind::Video,
+                Some(10_000),
+            )
+            .await
+        });
+        let pid_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_file) {
+                break value.trim().to_owned();
+            }
+            assert!(
+                tokio::time::Instant::now() < pid_deadline,
+                "fixture encoder never recorded its pid"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            !dir.path().join("7-poster.jpg").exists(),
+            "a partial encoder output became visible at the published name"
+        );
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("aborted encoder completed")
+            .is_cancelled());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("artwork entries")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.jpg")),
+            "cancelled thumbnail left temporary artwork"
+        );
+        let reap_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let running = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !running {
+                break;
+            }
+            if tokio::time::Instant::now() >= reap_deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid])
+                    .status();
+                panic!("cancelled thumbnail encoder {pid} remained alive");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

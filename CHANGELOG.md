@@ -54,7 +54,8 @@ bump may break compatibility and a **patch** bump never does.
   no peer retains the file, a paced source/provider repair recreates it.
   Requests use the same peer path immediately while the background pass
   converges. Peer pulls are singleflight and globally bounded, source repair
-  uses a rotating durable lease, and image bytes still never enter Raft.
+  uses a leader-arbitrated owner/term/generation fence with conditional
+  mutation and retirement, and image bytes still never enter Raft.
 
 - **Repeated authentication no longer appends one Raft entry per request.**
   Login-token and scoped API-key authorization still use authority-consistent
