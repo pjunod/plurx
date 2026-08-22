@@ -8,7 +8,10 @@ use hiqlite::macros::params;
 use hiqlite::Row;
 
 use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore, TimedClient};
-use super::{MediaStore, ReconcileOutcome, RootFingerprintStatus, WatchStore};
+use super::{
+    ArtworkInventoryItem, ArtworkRepairFence, MediaStore, ReconcileOutcome, RootFingerprintStatus,
+    WatchStore,
+};
 use crate::domain::{
     sort_title_for, ArtworkAttempt, BookMetadataPatch, InProgressItem, Item, ItemEdit, ItemKind,
     ItemPage, ItemSort, MediaFile, MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
@@ -61,6 +64,16 @@ struct ItemRow {
     book_work_id: Option<String>,
     book_edition_id: Option<String>,
     book_metadata_source: Option<String>,
+}
+
+impl From<&mut Row<'_>> for ArtworkInventoryItem {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            id: row.get("id"),
+            poster_path: row.get("poster_path"),
+            backdrop_path: row.get("backdrop_path"),
+        }
+    }
 }
 
 impl From<&mut Row<'_>> for ItemRow {
@@ -850,21 +863,29 @@ impl MediaStore for HiqliteAuthStore {
         )
     }
 
-    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError> {
-        items(
-            self.client()
-                .query_consistent_map::<ItemRow, _>(
-                    format!(
-                        "SELECT {i} FROM items i \
-                         WHERE i.poster_path IS NOT NULL OR i.backdrop_path IS NOT NULL \
-                         ORDER BY i.id",
-                        i = item_cols("i")
-                    ),
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-        )
+    async fn items_with_artwork(&self) -> Result<Vec<ArtworkInventoryItem>, StoreError> {
+        self.client()
+            .query_map::<ArtworkInventoryItem, _>(
+                "SELECT id, poster_path, backdrop_path FROM items \
+                 WHERE poster_path IS NOT NULL OR backdrop_path IS NOT NULL \
+                 ORDER BY id",
+                params!(),
+            )
+            .await
+            .map_err(database_error)
+    }
+
+    async fn artwork_filename_is_referenced(&self, filename: &str) -> Result<bool, StoreError> {
+        let rows = self
+            .client()
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM items \
+                 WHERE poster_path = $1 OR backdrop_path = $1",
+                params!(filename),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(rows.first().is_some_and(|row| row.count > 0))
     }
 
     async fn list_top_items_in_genre(
@@ -1043,6 +1064,83 @@ impl MediaStore for HiqliteAuthStore {
         Ok(())
     }
 
+    async fn apply_metadata_if_artwork_repair_current(
+        &self,
+        item_id: i64,
+        patch: &MetadataPatch,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        let sort_title = patch.title.as_deref().map(sort_title_for);
+        let tags = patch
+            .tags
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(database_error)?;
+        let genres = patch
+            .genres
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(database_error)?;
+        let artwork_error = match &patch.artwork {
+            Some(ArtworkAttempt::Failed(reason)) => Some(reason.as_str()),
+            _ => None,
+        };
+        let now = self.now()?;
+        let changed = self
+            .execute(
+                "UPDATE items SET \
+                     title = COALESCE($1, title), \
+                     sort_title = COALESCE($2, sort_title), \
+                     year = COALESCE($3, year), \
+                     overview = COALESCE($4, overview), \
+                     tmdb_id = COALESCE($5, tmdb_id), \
+                     imdb_id = COALESCE($6, imdb_id), \
+                     air_date = COALESCE($7, air_date), \
+                     runtime_ms = COALESCE($8, runtime_ms), \
+                     poster_path = COALESCE($9, poster_path), \
+                     backdrop_path = COALESCE($10, backdrop_path), \
+                     recorded_at = COALESCE($11, recorded_at), \
+                     tags = COALESCE($12, tags), \
+                     genres = COALESCE($13, genres), \
+                     artwork_error = CASE WHEN $14 = 1 THEN $15 ELSE artwork_error END, \
+                     metadata_at = CASE WHEN $16 = 1 THEN $17 ELSE metadata_at END, \
+                     artwork_attempted_at = CASE WHEN $14 = 1 THEN $17 ELSE artwork_attempted_at END, \
+                     updated_at = $17 \
+                 WHERE id = $18 AND $19 = $18 AND EXISTS (\
+                   SELECT 1 FROM cluster_artwork_repairs \
+                   WHERE item_id = $19 AND owner_node_id = $20 AND leader_term = $21 \
+                     AND generation = $22)",
+                params!(
+                    patch.title.as_deref(),
+                    sort_title,
+                    patch.year,
+                    patch.overview.as_deref(),
+                    patch.tmdb_id,
+                    patch.imdb_id.as_deref(),
+                    patch.air_date.as_deref(),
+                    patch.runtime_ms,
+                    patch.poster_path.as_deref(),
+                    patch.backdrop_path.as_deref(),
+                    patch.recorded_at.as_deref(),
+                    tags,
+                    genres,
+                    patch.artwork.is_some(),
+                    artwork_error,
+                    patch.enriched,
+                    now,
+                    item_id,
+                    fence.item_id,
+                    fence.owner_node_id.as_str(),
+                    fence.leader_term,
+                    fence.generation
+                ),
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
     async fn apply_book_metadata(
         &self,
         item_id: i64,
@@ -1094,6 +1192,101 @@ impl MediaStore for HiqliteAuthStore {
         )
         .await?;
         Ok(())
+    }
+
+    async fn apply_book_metadata_if_current(
+        &self,
+        expected: &Item,
+        patch: &BookMetadataPatch,
+        repair_fence: Option<&ArtworkRepairFence>,
+    ) -> Result<bool, StoreError> {
+        let sort_title = patch.title.as_deref().map(sort_title_for);
+        let source = patch.source.as_str();
+        let now = self.now()?;
+        let base_sql = "UPDATE items SET \
+                     title = COALESCE($1, title), \
+                     sort_title = COALESCE($2, sort_title), \
+                     author = COALESCE($3, author), \
+                     book_work_id = COALESCE($4, book_work_id), \
+                     book_edition_id = COALESCE($5, book_edition_id), \
+                     poster_path = COALESCE($6, poster_path), \
+                     book_metadata_source = $7, \
+                     updated_at = $8 \
+                 WHERE id = $9 AND kind IN ('book', 'audiobook') \
+                   AND title = $10 \
+                   AND author IS $11 \
+                   AND book_work_id IS $12 \
+                   AND book_metadata_source IS $13 \
+                   AND book_edition_id IS $14 \
+                   AND poster_path IS $15";
+        let changed = if let Some(fence) = repair_fence {
+            self.execute(
+                "UPDATE items SET \
+                     title = COALESCE($1, title), \
+                     sort_title = COALESCE($2, sort_title), \
+                     author = COALESCE($3, author), \
+                     book_work_id = COALESCE($4, book_work_id), \
+                     book_edition_id = COALESCE($5, book_edition_id), \
+                     poster_path = COALESCE($6, poster_path), \
+                     book_metadata_source = $7, \
+                     updated_at = $8 \
+                 WHERE id = $9 AND kind IN ('book', 'audiobook') \
+                   AND title = $10 \
+                   AND author IS $11 \
+                   AND book_work_id IS $12 \
+                   AND book_metadata_source IS $13 \
+                   AND book_edition_id IS $14 \
+                   AND poster_path IS $15 AND $16 = $9 \
+                   AND EXISTS (SELECT 1 FROM cluster_artwork_repairs \
+                     WHERE item_id = $16 AND owner_node_id = $17 AND leader_term = $18 \
+                       AND generation = $19)",
+                params!(
+                    patch.title.as_deref(),
+                    sort_title,
+                    patch.author.as_deref(),
+                    patch.work_id.as_deref(),
+                    patch.edition_id.as_deref(),
+                    patch.poster_path.as_deref(),
+                    source,
+                    now,
+                    expected.id,
+                    expected.title.as_str(),
+                    expected.author.as_deref(),
+                    expected.book_work_id.as_deref(),
+                    expected.book_metadata_source.as_deref(),
+                    expected.book_edition_id.as_deref(),
+                    expected.poster_path.as_deref(),
+                    fence.item_id,
+                    fence.owner_node_id.as_str(),
+                    fence.leader_term,
+                    fence.generation
+                ),
+            )
+            .await?
+        } else {
+            self.execute(
+                base_sql,
+                params!(
+                    patch.title.as_deref(),
+                    sort_title,
+                    patch.author.as_deref(),
+                    patch.work_id.as_deref(),
+                    patch.edition_id.as_deref(),
+                    patch.poster_path.as_deref(),
+                    source,
+                    now,
+                    expected.id,
+                    expected.title.as_str(),
+                    expected.author.as_deref(),
+                    expected.book_work_id.as_deref(),
+                    expected.book_metadata_source.as_deref(),
+                    expected.book_edition_id.as_deref(),
+                    expected.poster_path.as_deref()
+                ),
+            )
+            .await?
+        };
+        Ok(changed == 1)
     }
 
     async fn book_items(

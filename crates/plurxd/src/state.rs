@@ -20,7 +20,7 @@ use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
 use plurx_core::secrets::CredentialKey;
-use plurx_core::store::{keys, PublicationFence, PublicationStore, Store};
+use plurx_core::store::{keys, ArtworkRepairFence, PublicationFence, PublicationStore, Store};
 use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -113,6 +113,9 @@ pub struct AppState {
     /// Stable identity of the node that owns local transcode/offline bytes.
     pub node_id: String,
     pub artwork_dir: PathBuf,
+    /// Shared peer-artwork HTTP client, per-filename singleflight, and global
+    /// response-buffer bound for request and background reconciliation paths.
+    pub(crate) artwork_fetch: Arc<crate::http::images::ArtworkCoordinator>,
     /// Finished content-addressed transcodes. Offline routes never join a
     /// request-controlled path directly to this root.
     pub cache_dir: PathBuf,
@@ -274,6 +277,7 @@ impl AppState {
             server_name,
             node_id,
             artwork_dir,
+            artwork_fetch: crate::http::images::ArtworkCoordinator::new(),
             cache_dir,
             subs_dir,
             pgs_overlay_enabled: std::env::var("PLURX_PGS_OVERLAY").is_ok_and(|value| {
@@ -510,6 +514,10 @@ pub struct JobManager {
     /// cannot block scans or disk cleanup; this flag is the corresponding
     /// single-flight guarantee when a slow provider outlives its interval.
     retrying_artwork: std::sync::atomic::AtomicBool,
+    /// EPUB parsing uses `spawn_blocking`, which cannot be cancelled by the
+    /// artwork lease. Keep timed-out reads single-flight until the blocking
+    /// worker itself exits so a slow mount cannot accumulate detached reads.
+    book_cover_workers: metadata::book::CoverMaterializationWorkers,
     /// What the last genre-backfill pass did. Server-wide rather than per
     /// library because the backfill is: it walks item ids, not libraries.
     /// Surfaced on the settings page, which is where an operator armed it.
@@ -627,6 +635,15 @@ pub struct BookHints {
     pub work_id: String,
     pub edition_id: String,
     pub cover_url: Option<String>,
+}
+
+fn curator_pairing_can_advance(
+    current_edition: Option<&str>,
+    current_provider_cover: bool,
+    requested_edition: &str,
+    replacement_cover_ready: bool,
+) -> bool {
+    !current_provider_cover || current_edition == Some(requested_edition) || replacement_cover_ready
 }
 
 impl IdHints {
@@ -889,6 +906,7 @@ impl JobManager {
             stop_producing: std::sync::atomic::AtomicBool::new(false),
             backfilling_genres: std::sync::atomic::AtomicBool::new(false),
             retrying_artwork: std::sync::atomic::AtomicBool::new(false),
+            book_cover_workers: metadata::book::CoverMaterializationWorkers::default(),
             last_genre_backfill: Mutex::new(None),
         }
     }
@@ -1192,6 +1210,7 @@ impl JobManager {
                 refresh_existing_show,
                 Some(&targets),
                 Some(&repairs),
+                None,
             )
             .await;
         for request in requests {
@@ -1275,6 +1294,7 @@ impl JobManager {
         force: bool,
         routes: Option<&[i64]>,
         repairs: Option<&[i64]>,
+        repair_fence: Option<&ArtworkRepairFence>,
     ) -> EnrichOutcome {
         let mut outcome = EnrichOutcome::default();
         // Home libraries have no provider: their enrichment is local artwork.
@@ -1317,6 +1337,7 @@ impl JobManager {
                     library.id,
                     force,
                     routes,
+                    repair_fence,
                 )
                 .await,
             );
@@ -1333,6 +1354,7 @@ impl JobManager {
                             force,
                             routes,
                             repairs.or(routes),
+                            repair_fence,
                         )
                         .await,
                     );
@@ -1356,17 +1378,36 @@ impl JobManager {
     /// already did this" marker. The per-item counterpart to a library
     /// refresh, for when a poster is wrong or missing on exactly one thing.
     pub async fn refresh_item_artwork(&self, item_id: i64) -> Result<EnrichOutcome, StoreError> {
+        self.refresh_item_artwork_inner(item_id, None).await
+    }
+
+    /// Leader-arbitrated repair path. Every replicated provider mutation is
+    /// conditioned on this owner/term proof inside its database statement.
+    pub async fn refresh_item_artwork_fenced(
+        &self,
+        item_id: i64,
+        repair_fence: &ArtworkRepairFence,
+    ) -> Result<EnrichOutcome, StoreError> {
+        self.refresh_item_artwork_inner(item_id, Some(repair_fence))
+            .await
+    }
+
+    async fn refresh_item_artwork_inner(
+        &self,
+        item_id: i64,
+        repair_fence: Option<&ArtworkRepairFence>,
+    ) -> Result<EnrichOutcome, StoreError> {
+        if repair_fence.is_some_and(|fence| fence.item_id != item_id) {
+            return Err(StoreError::Task(
+                "artwork repair fence does not name the requested item".to_owned(),
+            ));
+        }
         let Some(item) = self.store.get_item(item_id).await? else {
             return Ok(EnrichOutcome::default());
         };
         let Some(library) = self.store.get_library(item.library_id).await? else {
             return Ok(EnrichOutcome::default());
         };
-        // Ancestors for the same reason a targeted scan needs them: an
-        // episode's artwork is fetched through its show's season, so asking
-        // for the episode alone would ask for nothing.
-        let targets = self.enrich_targets(&[item_id]).await;
-        let repairs = [item_id];
         let Some(lease) = self.acquire_job("provider:artwork".to_owned()).await? else {
             return Err(StoreError::Task(
                 "artwork provider pass is active on another cluster node".to_owned(),
@@ -1375,16 +1416,45 @@ impl JobManager {
         let lost = lease.loss_token();
         let publisher = lease.publisher(self.store.as_ref());
         let outcome = tokio::select! {
-            outcome = self.enrich(&publisher, &library, true, Some(&targets), Some(&repairs)) => outcome,
-            () = lost.cancelled() => {
-                drop(publisher);
-                lease.release().await;
-                return Err(StoreError::Task("cluster artwork lease was lost".to_owned()));
-            }
+            outcome = async {
+                if library.kind == LibraryKind::Books
+                    && item.book_metadata_source.as_deref()
+                        == Some(BookMetadataSource::Curator.as_str())
+                {
+                    let expected = item.poster_path.iter().cloned().collect::<Vec<_>>();
+                    let _ = metadata::book::materialize_curator_cover(
+                        &publisher,
+                        &self.artwork_dir,
+                        item_id,
+                        &expected,
+                        repair_fence,
+                    )
+                    .await;
+                    Ok(EnrichOutcome::default())
+                } else {
+                    // Episodes route through their show, but only the requested
+                    // item may publish under its repair fence.
+                    let targets = self.enrich_targets(&[item_id]).await;
+                    let repairs = [item_id];
+                    Ok(self
+                        .enrich(
+                            &publisher,
+                            &library,
+                            true,
+                            Some(&targets),
+                            Some(&repairs),
+                            repair_fence,
+                        )
+                        .await)
+                }
+            } => outcome,
+            () = lost.cancelled() => Err(StoreError::Task(
+                "cluster artwork lease was lost".to_owned()
+            )),
         };
         drop(publisher);
         lease.release().await;
-        Ok(outcome)
+        outcome
     }
 
     pub async fn reanalyze_files(
@@ -1407,6 +1477,46 @@ impl JobManager {
         drop(publisher);
         lease.release().await;
         result
+    }
+
+    /// Recreate Home/Books bytes from media mounted on this voter without
+    /// publishing catalogue fields. Books includes EPUB and audiobook covers;
+    /// `None` means the library is provider-backed and therefore requires the
+    /// cluster-wide source fence.
+    pub async fn materialize_local_item_artwork(
+        &self,
+        item_id: i64,
+        expected: &[String],
+    ) -> Result<Option<bool>, StoreError> {
+        let Some(item) = self.store.get_item(item_id).await? else {
+            return Ok(Some(false));
+        };
+        let Some(library) = self.store.get_library(item.library_id).await? else {
+            return Ok(Some(false));
+        };
+        match library.kind {
+            LibraryKind::Home => Ok(Some(
+                metadata::local::materialize_item_artwork(
+                    self.store.as_ref(),
+                    &self.artwork_dir,
+                    item_id,
+                    expected,
+                )
+                .await,
+            )),
+            LibraryKind::Books if matches!(item.kind, ItemKind::Book | ItemKind::Audiobook) => {
+                metadata::book::materialize_item_cover(
+                    self.store.as_ref(),
+                    &self.artwork_dir,
+                    item_id,
+                    expected,
+                    &self.book_cover_workers,
+                )
+                .await
+            }
+            LibraryKind::Books => Ok(None),
+            LibraryKind::Movies | LibraryKind::Shows => Ok(None),
+        }
     }
 
     /// Apply caller-supplied ids to what the scan placed.
@@ -1485,14 +1595,87 @@ impl JobManager {
                     continue;
                 }
             };
-            let poster_path = if let Some(url) = hints.cover_url.as_deref() {
-                match metadata::book::cache_curator_cover(&self.artwork_dir, item.id, url).await {
-                    Ok(path) => Some(path),
+            let expected = item.poster_path.iter().cloned().collect::<Vec<_>>();
+            let current_provider_cover = if item.book_metadata_source.as_deref()
+                == Some(BookMetadataSource::Curator.as_str())
+            {
+                match metadata::book::has_curator_cover_origin(
+                    self.store.as_ref(),
+                    item.id,
+                    item.book_edition_id.as_deref().unwrap_or_default(),
+                    &expected,
+                )
+                .await
+                {
+                    Ok(value) => value,
                     Err(error) => {
-                        tracing::warn!(item = item.id, error = %error, "caching Curator book cover");
-                        None
+                        tracing::warn!(item = item.id, %error, "reading current Curator cover origin");
+                        continue;
                     }
                 }
+            } else {
+                false
+            };
+            let mut prepared_cover = None;
+            if let Some(url) = hints.cover_url.as_deref() {
+                match metadata::book::fetch_curator_cover(item.id, url).await {
+                    Ok(cover) => {
+                        let target = self.artwork_dir.join(cover.filename());
+                        match metadata::reserve_artwork_publication(target) {
+                            Ok(reservation) => prepared_cover = Some((cover, reservation, url)),
+                            Err(error) => tracing::warn!(
+                                item = item.id,
+                                %error,
+                                "reserving Curator cover publication"
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(item = item.id, error = %error, "fetching Curator book cover");
+                    }
+                }
+            }
+            if !curator_pairing_can_advance(
+                item.book_edition_id.as_deref(),
+                current_provider_cover,
+                &hints.edition_id,
+                prepared_cover.is_some(),
+            ) {
+                tracing::warn!(
+                    item = item.id,
+                    current_edition = item.book_edition_id.as_deref().unwrap_or("-"),
+                    requested_edition = %hints.edition_id,
+                    "retaining Curator edition because its replacement cover is unavailable"
+                );
+                continue;
+            }
+            let poster_path = if let Some((cover, reservation, url)) = prepared_cover.take() {
+                let filename = cover.filename().to_owned();
+                if let Err(error) =
+                    metadata::book::publish_curator_cover(&self.artwork_dir, cover, reservation)
+                        .await
+                {
+                    tracing::warn!(item = item.id, %error, "publishing Curator book cover");
+                    continue;
+                }
+                let key =
+                    metadata::book::curator_cover_origin_key(item.id, &hints.edition_id, &filename);
+                let Some(origin) = metadata::book::curator_cover_origin_value(
+                    &hints.edition_id,
+                    Some(url),
+                    Some(&filename),
+                ) else {
+                    tracing::warn!(
+                        item = item.id,
+                        "validated Curator cover origin became invalid"
+                    );
+                    continue;
+                };
+                if let Err(error) = publisher.put_setting_if_absent(&key, &origin).await {
+                    tracing::warn!(item = item.id, %error, "persisting Curator cover origin");
+                    continue;
+                }
+                Some(filename)
             } else {
                 None
             };
@@ -1504,14 +1687,25 @@ impl JobManager {
                 poster_path,
                 source: BookMetadataSource::Curator,
             };
-            match publisher.apply_book_metadata(item.id, &patch).await {
-                Ok(()) => tracing::info!(
+            match publisher
+                .apply_book_metadata_if_current(&item, &patch, None)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        target: "plurxd::integrate",
+                        item = item.id,
+                        work = %hints.work_id,
+                        edition = %hints.edition_id,
+                        correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+                        "applied Curator book metadata"
+                    );
+                }
+                Ok(false) => tracing::info!(
                     target: "plurxd::integrate",
                     item = item.id,
-                    work = %hints.work_id,
-                    edition = %hints.edition_id,
                     correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
-                    "applied Curator book metadata"
+                    "Curator pairing lost a concurrent update; retaining the newer item"
                 ),
                 Err(error) => tracing::warn!(
                     target: "plurxd::integrate",
@@ -1768,7 +1962,7 @@ impl JobManager {
         // provider-choosing lives in `enrich` so the targeted path cannot
         // have a different idea of it.
         let outcome = self
-            .enrich(&publisher, &library, force_metadata, None, None)
+            .enrich(&publisher, &library, force_metadata, None, None, None)
             .await;
         status.last_enrich = outcome.enrich;
         status.last_local_art = outcome.local_art;
@@ -2472,7 +2666,7 @@ impl JobManager {
             let ids: Vec<i64> = candidates.iter().map(|item| item.id).collect();
             let targets = self.enrich_targets(&ids).await;
             let outcome = self
-                .enrich(publisher, &library, true, Some(&targets), Some(&ids))
+                .enrich(publisher, &library, true, Some(&targets), Some(&ids), None)
                 .await;
             provider_errors += outcome.enrich.as_ref().map_or(0, |r| r.errors);
 
@@ -2601,6 +2795,32 @@ mod tests {
     use plurx_core::transcode::Pipeline;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn re_pairing_provider_art_waits_for_its_replacement_cover() {
+        assert!(
+            curator_pairing_can_advance(None, false, "edition:new", false),
+            "an initial optional or failed cover may retain embedded EPUB art"
+        );
+        assert!(
+            curator_pairing_can_advance(Some("edition:old"), false, "edition:new", false),
+            "EPUB-backed Curator facts may advance without provider art"
+        );
+        assert!(
+            !curator_pairing_can_advance(Some("edition:old"), true, "edition:new", false),
+            "fetch failure or publication-slot contention must retain the coherent old pair"
+        );
+        assert!(curator_pairing_can_advance(
+            Some("edition:old"),
+            true,
+            "edition:new",
+            true
+        ));
+        assert!(
+            curator_pairing_can_advance(Some("edition:same"), true, "edition:same", false),
+            "refreshing facts for the same edition may retain its provider cover"
+        );
+    }
 
     fn manager(store: Arc<dyn Store>, artwork: &std::path::Path) -> Arc<JobManager> {
         Arc::new(JobManager::new(store, artwork.to_path_buf()))

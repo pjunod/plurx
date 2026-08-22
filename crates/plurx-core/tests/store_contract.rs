@@ -50,7 +50,10 @@ use plurx_core::store::{
     TraktStore, TranscodeCacheStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
     AUTH_SCHEMA_VERSION,
 };
-use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
+use plurx_core::store::{
+    ArtworkRepairFence, OutboxEntry, PublicationStore, ReconcileOutcome, RootFingerprintStatus,
+    SqliteStore, Store,
+};
 #[cfg(feature = "hiqlite-store")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "hiqlite-store")]
@@ -85,6 +88,8 @@ const SETTINGS_METHODS: &[&str] = &[
     "get_setting",
     "get_setting_pair",
     "put_setting",
+    "put_setting_if_absent",
+    "put_setting_if_absent_if_artwork_repair_current",
     "put_settings",
     "instance_id",
 ];
@@ -128,7 +133,9 @@ const MEDIA_METHODS: &[&str] = &[
     "recently_added",
     "search_items",
     "apply_metadata",
+    "apply_metadata_if_artwork_repair_current",
     "apply_book_metadata",
+    "apply_book_metadata_if_current",
     "book_items",
     "related_book_editions",
     "items_needing_metadata",
@@ -136,6 +143,7 @@ const MEDIA_METHODS: &[&str] = &[
     "items_needing_artwork",
     "items_missing_artwork",
     "items_with_artwork",
+    "artwork_filename_is_referenced",
     "items_missing_genres",
     "update_item_fields",
     "set_nfo_seeded",
@@ -258,10 +266,14 @@ const NETWORK_PRIOR_METHODS: &[&str] = &[
 const COORDINATION_METHODS: &[&str] = &["acquire_lease", "renew_lease", "release_lease"];
 const FENCED_PUBLICATION_METHODS: &[&str] = &[
     "put_setting_fenced",
+    "put_setting_if_absent_fenced",
+    "put_setting_if_absent_if_artwork_repair_current_fenced",
     "mark_library_scanned_fenced",
     "insert_item_fenced",
     "apply_metadata_fenced",
+    "apply_metadata_if_artwork_repair_current_fenced",
     "apply_book_metadata_fenced",
+    "apply_book_metadata_if_current_fenced",
     "set_nfo_seeded_fenced",
     "upsert_file_fenced",
     "ensure_library_root_fingerprint_fenced",
@@ -545,6 +557,27 @@ async fn fenced_publication_contract_runs_through_dyn_store() {
             .put_setting_fenced("contract.fenced", "first", &first, 150)
             .await
             .unwrap_or_else(|error| panic!("{backend}: valid publication: {error}"));
+        assert!(
+            store
+                .put_setting_if_absent_fenced("contract.fenced.immutable", "first", &first, 150,)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: immutable publication: {error}")),
+            "{backend}: first immutable publication must win"
+        );
+        assert!(
+            !store
+                .put_setting_if_absent_fenced(
+                    "contract.fenced.immutable",
+                    "replacement",
+                    &first,
+                    150,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{backend}: duplicate immutable publication: {error}")
+                }),
+            "{backend}: immutable publication must retain its first value"
+        );
         let baseline_book = store
             .insert_item_fenced(
                 &NewItem {
@@ -561,6 +594,38 @@ async fn fenced_publication_contract_runs_through_dyn_store() {
             )
             .await
             .unwrap_or_else(|error| panic!("{backend}: baseline fenced insert: {error}"));
+        let baseline_before_conditional = store
+            .get_item(baseline_book)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read conditional baseline: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: conditional baseline disappeared"));
+        assert!(
+            store
+                .apply_book_metadata_if_current_fenced(
+                    &baseline_before_conditional,
+                    &BookMetadataPatch {
+                        title: None,
+                        author: None,
+                        work_id: None,
+                        edition_id: None,
+                        poster_path: None,
+                        source: BookMetadataSource::Epub,
+                    },
+                    None,
+                    &first,
+                    151,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{backend}: conditional book publication: {error}")
+                }),
+            "{backend}: current snapshot and lease must publish"
+        );
+        let baseline_after_conditional = store
+            .get_item(baseline_book)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: reread conditional baseline: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: conditional baseline disappeared"));
         let baseline_file = store
             .upsert_file_fenced(
                 baseline_book,
@@ -622,6 +687,15 @@ async fn fenced_publication_contract_runs_through_dyn_store() {
             "setting"
         );
         assert_stale!(
+            store.put_setting_if_absent_fenced(
+                "contract.fenced.stale-immutable",
+                "stale-revision",
+                &first,
+                170,
+            ),
+            "immutable setting"
+        );
+        assert_stale!(
             store.mark_library_scanned_fenced(library.id, true, &first, 170),
             "scan stamp"
         );
@@ -668,6 +742,23 @@ async fn fenced_publication_contract_runs_through_dyn_store() {
                 170,
             ),
             "book metadata"
+        );
+        assert_stale!(
+            store.apply_book_metadata_if_current_fenced(
+                &baseline_after_conditional,
+                &BookMetadataPatch {
+                    title: None,
+                    author: Some("Stale Conditional Author".to_owned()),
+                    work_id: None,
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+                None,
+                &first,
+                170,
+            ),
+            "conditional book metadata"
         );
         assert_stale!(
             store.set_nfo_seeded_fenced(baseline_book, &first, 170),
@@ -1002,6 +1093,81 @@ async fn fenced_publication_contract_runs_through_dyn_store() {
         );
     })
     .await;
+}
+
+#[tokio::test]
+async fn artwork_repair_publication_fails_closed_without_a_job_lease() {
+    let store = SqliteStore::open_in_memory().expect("store");
+    let library = store
+        .create_library(&NewLibrary {
+            name: "Repair Fence Library".to_owned(),
+            kind: LibraryKind::Books,
+            paths: vec![],
+            anime: false,
+        })
+        .await
+        .expect("library");
+    let item_id = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Book,
+            parent_id: None,
+            title: "Repair Fence Book".to_owned(),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await
+        .expect("book");
+    let item = store
+        .get_item(item_id)
+        .await
+        .expect("read book")
+        .expect("book exists");
+    let repair_fence = ArtworkRepairFence {
+        item_id,
+        owner_node_id: "node-a".to_owned(),
+        leader_term: 1,
+        generation: 1,
+    };
+    let publisher = PublicationStore::unfenced(&store);
+
+    for result in [
+        publisher
+            .put_setting_if_absent_if_artwork_repair_current(
+                "repair.origin",
+                "value",
+                item_id,
+                &repair_fence,
+            )
+            .await,
+        publisher
+            .apply_metadata_if_artwork_repair_current(
+                item_id,
+                &MetadataPatch::default(),
+                &repair_fence,
+            )
+            .await,
+        publisher
+            .apply_book_metadata_if_current(
+                &item,
+                &BookMetadataPatch {
+                    title: None,
+                    author: None,
+                    work_id: None,
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+                Some(&repair_fence),
+            )
+            .await,
+    ] {
+        assert!(
+            matches!(result, Err(StoreError::Task(message)) if message.contains("singleton job lease")),
+            "an artwork repair mutation must not accept a per-item fence alone"
+        );
+    }
 }
 
 fn acquired(outcome: LeaseClaim, backend: &str) -> Lease {
@@ -3901,7 +4067,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 161, "review the Store method count");
+    assert_eq!(declared.len(), 170, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -4049,6 +4215,28 @@ async fn settings_contract_runs_through_dyn_store() {
         assert_eq!(
             store.get_setting("contract.key").await.expect("get"),
             Some("second".to_owned()),
+            "backend {backend}"
+        );
+        assert!(
+            store
+                .put_setting_if_absent("contract.immutable", "first")
+                .await
+                .expect("insert immutable setting"),
+            "backend {backend}"
+        );
+        assert!(
+            !store
+                .put_setting_if_absent("contract.immutable", "second")
+                .await
+                .expect("retain immutable setting"),
+            "backend {backend}"
+        );
+        assert_eq!(
+            store
+                .get_setting("contract.immutable")
+                .await
+                .expect("get immutable setting"),
+            Some("first".to_owned()),
             "backend {backend}"
         );
         store
@@ -4492,7 +4680,7 @@ async fn media_contract_runs_through_dyn_store() {
                     author: Some("Curator Author".into()),
                     work_id: Some("curator:work:shared".into()),
                     edition_id: Some("curator:edition:ebook".into()),
-                    poster_path: Some("books/curator-cover.jpg".into()),
+                    poster_path: Some("curator-cover.jpg".into()),
                     source: BookMetadataSource::Curator,
                 },
             )
@@ -4542,11 +4730,70 @@ async fn media_contract_runs_through_dyn_store() {
             enriched.book_edition_id.as_deref(),
             Some("curator:edition:ebook")
         );
-        assert_eq!(
-            enriched.poster_path.as_deref(),
-            Some("books/curator-cover.jpg")
-        );
+        assert_eq!(enriched.poster_path.as_deref(), Some("curator-cover.jpg"));
         assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Newer Pairing Title".into()),
+                    author: Some("Newer Pairing Author".into()),
+                    work_id: Some("curator:work:newer".into()),
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("same-edition concurrent pairing");
+        assert!(
+            !store
+                .apply_book_metadata_if_current(
+                    &enriched,
+                    &BookMetadataPatch {
+                        title: Some("Stale Pairing Title".into()),
+                        author: Some("Stale Pairing Author".into()),
+                        work_id: Some("curator:work:stale".into()),
+                        edition_id: enriched.book_edition_id.clone(),
+                        poster_path: enriched.poster_path.clone(),
+                        source: BookMetadataSource::Curator,
+                    },
+                    None,
+                )
+                .await
+                .expect("stale same-edition conditional pairing"),
+            "same-edition/same-poster stale pairing must lose the full-field CAS on {backend}"
+        );
+        let newest_pairing = store
+            .get_item(ebook)
+            .await
+            .expect("read newest pairing")
+            .expect("newest pairing");
+        assert_eq!(newest_pairing.title, "Newer Pairing Title", "{backend}");
+        assert_eq!(
+            newest_pairing.author.as_deref(),
+            Some("Newer Pairing Author"),
+            "{backend}"
+        );
+        assert_eq!(
+            newest_pairing.book_work_id.as_deref(),
+            Some("curator:work:newer"),
+            "{backend}"
+        );
+        store
+            .apply_book_metadata(
+                ebook,
+                &BookMetadataPatch {
+                    title: Some("Curator Title".into()),
+                    author: Some("Curator Author".into()),
+                    work_id: Some("curator:work:shared".into()),
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+            )
+            .await
+            .expect("restore media contract pairing");
         let artwork_items = store
             .items_with_artwork()
             .await
@@ -4555,7 +4802,7 @@ async fn media_contract_runs_through_dyn_store() {
         assert_eq!(artwork_items[0].id, ebook, "backend {backend}");
         assert_eq!(
             artwork_items[0].poster_path.as_deref(),
-            Some("books/curator-cover.jpg"),
+            Some("curator-cover.jpg"),
             "backend {backend}"
         );
         assert_eq!(

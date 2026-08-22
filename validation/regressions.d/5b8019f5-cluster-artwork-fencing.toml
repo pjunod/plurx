@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["5b8019f5"]
+points = ["cluster.auth", "metadata.enrichment"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained store contracts and separate-process cluster lifecycle require artwork settings, generic metadata, and full-field book metadata to publish only when both the singleton-job token and per-item repair generation are current. They reject stale terms, generations, job renewals, snapshot CAS inputs, removed-owner tokens including exhausted counters, and the preceding release's raw acquire SQL; they also prove current fenced publication, immutable content-addressed origins, bounded peer recovery, and local audiobook cover recreation. Restoring the unfenced repair path lets at least one stale-owner assertion publish after takeover or removal."

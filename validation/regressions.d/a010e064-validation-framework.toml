@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["a010e064", "275d424e"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "The history audit requires every fragment filename to begin with its first mapped corrective commit and every mapped commit to intersect the fragment's declared functionality point. These metadata corrections preserve the merged evidence identities and then separate runtime membership coverage from validation-framework-only rename coverage."

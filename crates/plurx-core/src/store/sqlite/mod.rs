@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use super::{keys, SettingsStore};
+use super::{keys, ArtworkRepairFence, SettingsStore};
 use crate::cluster::coordination::Lease;
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
@@ -1106,6 +1106,55 @@ impl SettingsStore for SqliteStore {
                 params![key, value],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn put_setting_if_absent(&self, key: &str, value: &str) -> Result<bool, StoreError> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.with_conn(move |conn| {
+            let changed = conn.execute(
+                "INSERT INTO settings (key, value, updated_at)
+                 VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(key) DO NOTHING",
+                params![key, value],
+            )?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    async fn put_setting_if_absent_if_artwork_repair_current(
+        &self,
+        key: &str,
+        value: &str,
+        expected_item_id: i64,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        let fence = fence.clone();
+        self.with_conn(move |conn| {
+            let changed = conn.execute(
+                "INSERT INTO settings (key, value, updated_at)
+                 SELECT ?1, ?2, unixepoch()
+                 WHERE ?3 = ?4 AND EXISTS (
+                   SELECT 1 FROM cluster_artwork_repairs
+                   WHERE item_id = ?4 AND owner_node_id = ?5 AND leader_term = ?6
+                     AND generation = ?7)
+                 ON CONFLICT(key) DO NOTHING",
+                params![
+                    key,
+                    value,
+                    expected_item_id,
+                    fence.item_id,
+                    fence.owner_node_id,
+                    fence.leader_term,
+                    fence.generation,
+                ],
+            )?;
+            Ok(changed == 1)
         })
         .await
     }

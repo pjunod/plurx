@@ -2599,11 +2599,27 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "membership_unavailable");
 
-        let (status, _) = call(&app, post("/api/v1/cluster/leave", None, Value::Null)).await;
+        let leave_body = json!({ "node_id": "test-node" });
+        let (status, _) = call(
+            &app,
+            post("/api/v1/cluster/leave", None, leave_body.clone()),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, body) = call(
             &app,
-            post("/api/v1/cluster/leave", Some(&admin), Value::Null),
+            post(
+                "/api/v1/cluster/leave",
+                Some(&admin),
+                json!({ "node_id": "another-node" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "leave_node_mismatch");
+        let (status, body) = call(
+            &app,
+            post("/api/v1/cluster/leave", Some(&admin), leave_body),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3097,9 +3113,14 @@ mod tests {
             .await
             .expect("replacement user");
         assert_eq!(replacement.id, original.id, "numeric id must be reused");
-        assert_eq!(
-            replacement.created_at, original.created_at,
-            "the regression must cover same-second replacement"
+        let same_second_replacement_generation = plurx_core::domain::CredentialGeneration::derive(
+            replacement.id,
+            original.created_at,
+            &replacement.password_hash,
+        );
+        assert_ne!(
+            same_second_replacement_generation, original_generation,
+            "the generation must distinguish replacement credentials even at the same second"
         );
         let replacement_generation = plurx_core::domain::CredentialGeneration::derive(
             replacement.id,

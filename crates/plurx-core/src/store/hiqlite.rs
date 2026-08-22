@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 use super::replicated::ReplicatedSql;
 use super::telemetry::NodeLocalTelemetry;
 use super::{
-    keys, ApiKeyStore, NetworkPriorStore, PlaybackTelemetryStore, SettingsStore, UserStore,
+    keys, ApiKeyStore, ArtworkRepairFence, NetworkPriorStore, PlaybackTelemetryStore,
+    SettingsStore, UserStore,
 };
 use crate::domain::{
     ApiKey, NetworkPrior, NetworkPriorObservation, PlaybackEvent, PlaybackEventQuery, User,
@@ -590,7 +591,8 @@ impl HiqliteAuthStore {
             "DELETE FROM tokens",
             "DELETE FROM api_keys",
             "DELETE FROM users",
-            "DELETE FROM settings WHERE key <> $1",
+            "DELETE FROM settings WHERE key <> $1 \
+               AND key NOT GLOB 'internal.cluster_job_owner_removed.*'",
         ];
         for sql in statements {
             validate_sql(sql)?;
@@ -952,6 +954,49 @@ impl SettingsStore for HiqliteAuthStore {
         )
         .await?;
         Ok(())
+    }
+
+    async fn put_setting_if_absent(&self, key: &str, value: &str) -> Result<bool, StoreError> {
+        let now = self.now()?;
+        Ok(self
+            .execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT(key) DO NOTHING",
+                params!(key, value, now),
+            )
+            .await?
+            == 1)
+    }
+
+    async fn put_setting_if_absent_if_artwork_repair_current(
+        &self,
+        key: &str,
+        value: &str,
+        expected_item_id: i64,
+        fence: &ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        let now = self.now()?;
+        Ok(self
+            .execute(
+                "INSERT INTO settings (key, value, updated_at) \
+                 SELECT $1, $2, $3 WHERE $4 = $5 AND EXISTS (\
+                   SELECT 1 FROM cluster_artwork_repairs \
+                   WHERE item_id = $5 AND owner_node_id = $6 AND leader_term = $7 \
+                     AND generation = $8) \
+                 ON CONFLICT(key) DO NOTHING",
+                params!(
+                    key,
+                    value,
+                    now,
+                    expected_item_id,
+                    fence.item_id,
+                    fence.owner_node_id.as_str(),
+                    fence.leader_term,
+                    fence.generation
+                ),
+            )
+            .await?
+            == 1)
     }
 
     async fn put_settings(&self, values: &[(&str, &str)]) -> Result<(), StoreError> {

@@ -139,6 +139,43 @@ impl<'a> PublicationStore<'a> {
             .await
     }
 
+    pub async fn put_setting_if_absent(&self, key: &str, value: &str) -> Result<bool, StoreError> {
+        if self.fence.is_none() {
+            return self.store.put_setting_if_absent(key, value).await;
+        }
+        let token = self.token().await?;
+        let lease = token.as_ref().ok_or_else(|| self.invalidated())?;
+        self.store
+            .put_setting_if_absent_fenced(key, value, lease, unix_ms()?)
+            .await
+    }
+
+    pub async fn put_setting_if_absent_if_artwork_repair_current(
+        &self,
+        key: &str,
+        value: &str,
+        expected_item_id: i64,
+        repair_fence: &super::ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        if self.fence.is_none() {
+            return Err(StoreError::Task(
+                "artwork repair publication requires a singleton job lease".to_owned(),
+            ));
+        }
+        let token = self.token().await?;
+        let lease = token.as_ref().ok_or_else(|| self.invalidated())?;
+        self.store
+            .put_setting_if_absent_if_artwork_repair_current_fenced(
+                key,
+                value,
+                expected_item_id,
+                repair_fence,
+                lease,
+                unix_ms()?,
+            )
+            .await
+    }
+
     pub async fn mark_library_scanned(&self, id: i64, refreshed: bool) -> Result<(), StoreError> {
         if self.fence.is_none() {
             return self.store.mark_library_scanned(id, refreshed).await;
@@ -174,6 +211,30 @@ impl<'a> PublicationStore<'a> {
             .await
     }
 
+    pub async fn apply_metadata_if_artwork_repair_current(
+        &self,
+        item_id: i64,
+        patch: &MetadataPatch,
+        repair_fence: &super::ArtworkRepairFence,
+    ) -> Result<bool, StoreError> {
+        if self.fence.is_none() {
+            return Err(StoreError::Task(
+                "artwork repair publication requires a singleton job lease".to_owned(),
+            ));
+        }
+        let token = self.token().await?;
+        let lease = token.as_ref().ok_or_else(|| self.invalidated())?;
+        self.store
+            .apply_metadata_if_artwork_repair_current_fenced(
+                item_id,
+                patch,
+                repair_fence,
+                lease,
+                unix_ms()?,
+            )
+            .await
+    }
+
     pub async fn apply_book_metadata(
         &self,
         item_id: i64,
@@ -186,6 +247,30 @@ impl<'a> PublicationStore<'a> {
         let lease = token.as_ref().ok_or_else(|| self.invalidated())?;
         self.store
             .apply_book_metadata_fenced(item_id, patch, lease, unix_ms()?)
+            .await
+    }
+
+    pub async fn apply_book_metadata_if_current(
+        &self,
+        expected: &crate::domain::Item,
+        patch: &BookMetadataPatch,
+        repair_fence: Option<&super::ArtworkRepairFence>,
+    ) -> Result<bool, StoreError> {
+        if self.fence.is_none() {
+            if repair_fence.is_some() {
+                return Err(StoreError::Task(
+                    "artwork repair publication requires a singleton job lease".to_owned(),
+                ));
+            }
+            return self
+                .store
+                .apply_book_metadata_if_current(expected, patch, repair_fence)
+                .await;
+        }
+        let token = self.token().await?;
+        let lease = token.as_ref().ok_or_else(|| self.invalidated())?;
+        self.store
+            .apply_book_metadata_if_current_fenced(expected, patch, repair_fence, lease, unix_ms()?)
             .await
     }
 

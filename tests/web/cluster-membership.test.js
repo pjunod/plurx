@@ -131,7 +131,12 @@ function node(id, raftId, role, extra = {}) {
 }
 
 function status(availability, nodes) {
-  return { availability, nodes, replication: REPLICATION };
+  return {
+    local_node_id: nodes[0] && nodes[0].node_id,
+    availability,
+    nodes,
+    replication: REPLICATION,
+  };
 }
 
 // ---- the two-voter state is the point -------------------------------------
@@ -296,6 +301,8 @@ const REFUSAL_CODES = [
   "node_owns_offline_work",
   "cluster_leader_removal_refused",
   "cluster_node_not_found",
+  "self_removal_requires_leave",
+  "leave_node_mismatch",
 ];
 
 test("each removal refusal renders as an actionable sentence, not a code", () => {
@@ -448,6 +455,24 @@ test("cluster diagnostics have a separate log surface", () => {
   assert.match(html, /Cluster log/);
   assert.match(html, /id="cllogbox"/);
   assert.match(html, /instead of the general System log/);
+});
+
+test("the local row cannot use generic removal", () => {
+  const ui = sandbox();
+  const local = ui.clusterNodeRow(node("node-a", 1, "voter"), "node-a");
+  const peer = ui.clusterNodeRow(node("node-b", 2, "voter"), "node-a");
+  assert.match(local, /This node/);
+  assert.match(local, /Use graceful leave below/);
+  assert.equal(local.includes(">Remove<"), false);
+  assert.match(peer, />Remove</);
+});
+
+test("graceful leave binds the POST to the roster's local node", () => {
+  const panel = sandbox().leavePanel("node-a");
+  assert.match(panel, /leaveCluster\(this,&quot;node-a&quot;\)/);
+  const handler = shippedSource("leaveCluster");
+  assert.match(handler, /body:\{node_id:nodeId\}/);
+  assert.match(sandbox().leavePanel(), /identity unavailable/i);
 });
 
 // ---- admin gating ---------------------------------------------------------

@@ -1,7 +1,9 @@
 use std::process::{Command, Stdio};
 
 use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary};
-use plurx_core::metadata::book::enrich_library;
+use plurx_core::metadata::book::{
+    enrich_library, materialize_item_cover, CoverMaterializationWorkers,
+};
 use plurx_core::scan::probe::probe;
 use plurx_core::store::{LibraryStore, MediaStore, SqliteStore};
 
@@ -119,4 +121,27 @@ async fn audiobook_refresh_adopts_its_embedded_cover() {
     assert_eq!(item.book_metadata_source, None);
     assert!(item.artwork_attempted_at.is_some());
     assert_eq!(item.artwork_error, None);
+
+    std::fs::remove_file(artwork.path().join(&poster)).expect("remove local materialization");
+    assert_eq!(
+        materialize_item_cover(
+            &store,
+            artwork.path(),
+            item_id,
+            std::slice::from_ref(&poster),
+            &CoverMaterializationWorkers::default(),
+        )
+        .await
+        .expect("rebuild embedded audiobook cover"),
+        Some(true)
+    );
+    assert!(artwork.path().join(&poster).is_file());
+    let after = store
+        .get_item(item_id)
+        .await
+        .expect("item after materialization")
+        .expect("audiobook disappeared after materialization");
+    assert_eq!(after.poster_path.as_deref(), Some(poster.as_str()));
+    assert_eq!(after.book_metadata_source, item.book_metadata_source);
+    assert_eq!(after.artwork_attempted_at, item.artwork_attempted_at);
 }

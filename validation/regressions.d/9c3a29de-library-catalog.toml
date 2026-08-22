@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["9c3a29de"]
+points = ["library.catalog", "cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The workspace lint gate compiles every Axum handler and the spawned artwork reconciler, proving peer requests own the values they carry across await boundaries. The isolated cluster harness wire fixture also pins the optional applied-index field. Restoring the borrowed peer iterator makes the route and reconciliation futures fail their Send and higher-ranked lifetime bounds, while restoring the stale fixture prevents the harness test target from compiling."

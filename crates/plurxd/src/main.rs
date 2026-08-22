@@ -194,6 +194,7 @@ async fn refresh_metadata_with_store(
                             library.id,
                             true,
                             None,
+                            None,
                         )
                         .await;
                         println!("{}: {}", library.name, serde_json::to_string(&report)?);
