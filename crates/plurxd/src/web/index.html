@@ -603,7 +603,16 @@
   .clstate.good{border-left-color:var(--good)}
   .clstate.warn{border-left-color:var(--warn,#fbbf24)}
   .clstate.calm{border-left-color:var(--line)}
-  .clnode{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+  /* A UUID is stable but useless for recognizing a machine. Lead with the
+     advertised hostname, keep the node id as quiet copyable detail, and put
+     leadership beside the host it belongs to instead of making the operator
+     infer it from a removal refusal. */
+  .clidentity{min-width:190px}
+  .clhostline{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .clhost{font-size:15px;font-weight:700;line-height:1.3;overflow-wrap:anywhere}
+  .clid{margin-top:3px;color:var(--muted);font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:10.5px;font-weight:400;line-height:1.35;word-break:break-all}
+  .clleader{color:var(--accent);border-color:var(--accent)}
   /* A join token is a complete cluster credential shown exactly once. It gets
      its own loud box so nobody mistakes it for an id they can leave on screen,
      and `user-select:all` makes copying it one gesture on a machine with no
@@ -9494,7 +9503,10 @@ function clusterNodeRow(n){
     ? `<span style="color:var(--good)">reachable</span>`
     : `<span style="color:var(--bad)">not reachable</span>`;
   const seen=n.last_seen_at?esc(fmtAgo(Math.floor(n.last_seen_at/1000))):`<span class="muted">never</span>`;
-  return `<tr><td class="libname clnode">${esc(n.node_id)}</td>
+  const leader=n.is_leader?`<span class="pill clleader">Leader</span>`:"";
+  const hostname=n.hostname||n.node_id;
+  return `<tr><td class="libname clidentity"><div class="clhostline"><span class="clhost">${esc(hostname)}</span>${leader}</div>
+      <div class="clid">Node ID ${esc(n.node_id)}</div></td>
     <td data-label="Raft id" class="muted">${esc(String(n.raft_id))}</td>
     <td data-label="Role">${role}</td>
     <td data-label="Reachable">${reach}</td>
@@ -9517,7 +9529,7 @@ function clusterPanel(d){
   // the same renderer as Settings → System.
   const replication=(clustered&&cluster.replication)||(d.sys&&d.sys.replication);
   const roster=nodes.length
-    ? `<table><thead><tr><th>Node</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
+    ? `<table><thead><tr><th>Host</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
        <tbody>${nodes.map(clusterNodeRow).join("")}</tbody></table>`
     : clustered?`<div class="empty">No node records yet.</div>`:"";
   return `<div class="card"><h2 class="section" style="margin-top:0">Cluster</h2>

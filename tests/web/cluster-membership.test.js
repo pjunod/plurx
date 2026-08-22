@@ -117,8 +117,10 @@ const REPLICATION = {
 function node(id, raftId, role, extra = {}) {
   return {
     node_id: id,
+    hostname: `${id}.lan`,
     raft_id: raftId,
     role,
+    is_leader: false,
     reachable: true,
     last_seen_at: Date.now(),
     ...extra,
@@ -373,6 +375,7 @@ test("last_seen_at is read as milliseconds, not seconds", () => {
 test("a roster row shows only the privacy-safe fields the API exposes", () => {
   const ui = sandbox();
   const row = ui.clusterNodeRow(node("node-a", 7, "voter"));
+  assert.match(row, /node-a\.lan/);
   assert.match(row, /node-a/);
   assert.match(row, />7</);
   assert.match(row, /voter/);
@@ -381,6 +384,34 @@ test("a roster row shows only the privacy-safe fields the API exposes", () => {
   for (const leak of ["addr", "http://", "raft_address", "api_address"]) {
     assert.equal(row.includes(leak), false, `roster row exposes ${leak}`);
   }
+});
+
+test("hostname leads the identity while node id stays secondary", () => {
+  const ui = sandbox();
+  const row = ui.clusterNodeRow(
+    node("550e8400-e29b-41d4-a716-446655440000", 7, "voter", {
+      hostname: "living-room-plurx.lan",
+    }),
+  );
+  assert.match(row, /class="clhost">living-room-plurx\.lan/);
+  assert.match(
+    row,
+    /class="clid">Node ID 550e8400-e29b-41d4-a716-446655440000/,
+  );
+  assert.ok(
+    row.indexOf("living-room-plurx.lan") < row.indexOf("550e8400-e29b"),
+    `node id appeared before hostname: ${row}`,
+  );
+});
+
+test("the current leader is labeled beside its hostname", () => {
+  const ui = sandbox();
+  const leader = ui.clusterNodeRow(
+    node("node-b", 2, "voter", { is_leader: true }),
+  );
+  const follower = ui.clusterNodeRow(node("node-a", 1, "voter"));
+  assert.match(leader, /node-b\.lan[\s\S]*>Leader</);
+  assert.equal(follower.includes(">Leader<"), false);
 });
 
 test("an unreachable node says so rather than showing a blank", () => {
