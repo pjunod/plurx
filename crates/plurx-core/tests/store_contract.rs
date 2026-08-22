@@ -44,12 +44,10 @@ use plurx_core::domain::{
 use plurx_core::error::StoreError;
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
-use plurx_core::store::OfflinePackageStore;
-#[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    ApiKeyStore, HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
-    SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
-    AUTH_SCHEMA_VERSION,
+    ApiKeyStore, CoordinationStore, HiqliteAuthStore, LibraryStore, MediaStore,
+    OfflinePackageStore, PlaybackTelemetryStore, ReadingStore, SettingsStore, TraktStore,
+    UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
