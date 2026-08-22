@@ -9,7 +9,9 @@
 use std::time::Duration;
 
 use plurx_core::domain::MediaFile;
-use plurx_core::transcode::{output_size, Pacing, Pipeline};
+use plurx_core::transcode::{
+    output_size, EffectiveRateControl, Encoder, OutputGrade, Pacing, Pipeline,
+};
 
 /// An override wins only when it names something. An empty `PLURX_FFMPEG=` is
 /// what a Compose file produces for an unset variable, and treating that as a
@@ -64,6 +66,7 @@ static DOVI_RESHAPE_HW: std::sync::OnceLock<
     tokio::sync::Mutex<std::collections::HashMap<&'static str, bool>>,
 > = std::sync::OnceLock::new();
 static DOVI_PASSTHROUGH: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static DOVI_PASSTHROUGH_QSV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Does this build carry a given bitstream filter? Matched on a whole line of
 /// `ffmpeg -bsfs`, which lists exactly one filter per line — a substring
@@ -180,7 +183,7 @@ pub async fn has_dovi_reshape() -> bool {
                 );
                 return false;
             }
-            let passed = probe_dovi_reshape_graph(None, "libx264").await;
+            let passed = probe_dovi_reshape_graph(Encoder::Software).await;
             if passed {
                 tracing::info!("ffmpeg proved the Dolby Vision tonemapx renderer");
             } else {
@@ -196,35 +199,26 @@ pub async fn has_dovi_reshape() -> bool {
 /// Run one synthetic frame through the production Dolby Vision reshape graph,
 /// optionally uploading the filtered frames to a hardware encoder first.
 ///
-/// `upload` is the encoder's own `filter_suffix()` — `hwupload` for VA-API,
-/// `hwupload=extra_hw_frames=64,format=qsv` for QSV — appended after the
-/// software filter chain. The decode side is untouched: `lavfi` produces
-/// system-memory frames exactly as a software HEVC decode does.
-async fn probe_dovi_reshape_graph(upload: Option<&str>, codec: &str) -> bool {
+/// The encoder's device init, upload suffix and production argument builder
+/// are all used here. Omitting the init used to make every QSV probe fail with
+/// "A hardware device reference is required", even though the real session
+/// supplied that device and the node could run the graph.
+async fn probe_dovi_reshape_graph(encoder: Encoder) -> bool {
     let filter = format!(
         "tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv:format=yuv420p:apply_dovi=1,scale=64:64,format=yuv420p{}",
-        upload.map(|s| format!(",{s}")).unwrap_or_default()
+        encoder
+            .filter_suffix_for(OutputGrade::Sdr)
+            .map(|s| format!(",{s}"))
+            .unwrap_or_default()
     );
     let mut command = tokio::process::Command::new(ffmpeg_bin());
     command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=64x64:rate=1:color=black",
-            "-frames:v",
-            "1",
-            "-vf",
-            &filter,
-            "-c:v",
-            codec,
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(encoder.init_args())
+        .args(["-f", "lavfi", "-i", "color=size=64x64:rate=1:color=black"])
+        .args(["-frames:v", "1", "-vf", &filter])
+        .args(encoder.encode_args(1_000, EffectiveRateControl::Vbr, false, None))
+        .args(["-f", "null", "-"])
         .kill_on_drop(true);
     tokio::time::timeout(Duration::from_secs(20), command.status())
         .await
@@ -247,7 +241,6 @@ async fn probe_dovi_reshape_graph(upload: Option<&str>, codec: &str) -> bool {
 /// route, and an unproved pairing falls back to software rather than failing a
 /// session in front of a viewer.
 pub async fn has_dovi_reshape_with(encoder: plurx_core::transcode::Encoder) -> bool {
-    use plurx_core::transcode::Encoder;
     if encoder == Encoder::Software {
         return has_dovi_reshape().await;
     }
@@ -263,7 +256,7 @@ pub async fn has_dovi_reshape_with(encoder: plurx_core::transcode::Encoder) -> b
     if let Some(known) = memo.get(key) {
         return *known;
     }
-    let passed = probe_dovi_reshape_graph(encoder.filter_suffix(), encoder.video_codec()).await;
+    let passed = probe_dovi_reshape_graph(encoder).await;
     if passed {
         tracing::info!(
             encoder = key,
@@ -365,6 +358,61 @@ pub async fn has_dovi_passthrough() -> bool {
                 stderr.trim()
             );
             false
+        })
+        .await
+}
+
+/// Can this node accept the software Dolby renderer's 10-bit frames and run
+/// the measured QSV Main10 encode graph?
+///
+/// The synthetic frame cannot carry a Dolby RPU, so the passthrough filter's
+/// documented refusal is proved separately by [`has_dovi_passthrough`]. This
+/// probe establishes the other half that refusal cannot reach: QSV device
+/// init, P010 conversion/upload, Main10 encode, bounded VBR and PQ/BT.2020
+/// output flags. A real source's RPU mutation is still proved per file.
+pub async fn has_dovi_passthrough_with(encoder: Encoder) -> bool {
+    if encoder == Encoder::Software {
+        return has_dovi_passthrough().await;
+    }
+    if encoder != Encoder::Qsv || !has_dovi_passthrough().await {
+        return false;
+    }
+    *DOVI_PASSTHROUGH_QSV
+        .get_or_init(|| async {
+            let Some(upload) = encoder.filter_suffix_for(OutputGrade::Hdr10) else {
+                return false;
+            };
+            let filter = upload.to_owned();
+            let mut command = tokio::process::Command::new(ffmpeg_bin());
+            command
+                .kill_on_drop(true)
+                .args(["-hide_banner", "-loglevel", "error"])
+                .args(encoder.init_args())
+                .args(["-f", "lavfi", "-i", "color=size=64x64:rate=1:color=black"])
+                .args(["-frames:v", "1", "-vf", &filter])
+                .args(encoder.encode_args_for(
+                    OutputGrade::Hdr10,
+                    20_000,
+                    EffectiveRateControl::Vbr,
+                    false,
+                    None,
+                ))
+                .args(["-f", "null", "-"]);
+            let passed = tokio::time::timeout(Duration::from_secs(20), command.status())
+                .await
+                .is_ok_and(|result| result.is_ok_and(|status| status.success()));
+            if passed {
+                tracing::info!(
+                    encoder = encoder.label(),
+                    "ffmpeg proved the Dolby Vision HDR10 renderer's hardware encode half"
+                );
+            } else {
+                tracing::warn!(
+                    encoder = encoder.label(),
+                    "ffmpeg could not run the Dolby Vision HDR10 hardware encode graph; using the measured software rung"
+                );
+            }
+            passed
         })
         .await
 }

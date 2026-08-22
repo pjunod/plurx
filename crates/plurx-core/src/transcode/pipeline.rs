@@ -160,10 +160,12 @@ impl Pipeline {
             // the pairing is probed at boot (`has_dovi_reshape_with`) before it
             // is ever attempted — unproved pairings fall back to software.
             Pipeline::DoviTonemapx => true,
-            // Same reasoning, plus one more: the HDR10 grade's only measured
-            // encoder is libx265 (see `Encoder::video_codec_for`), which is
-            // the software family by definition.
-            Pipeline::DoviPassthrough => encoder == Encoder::Software,
+            // The same software-decode constraint applies to HDR passthrough.
+            // Its encode half has two measured routes: libx265 and QSV
+            // Main10. Other families remain refused until measured.
+            Pipeline::DoviPassthrough => {
+                matches!(encoder, Encoder::Software | Encoder::Qsv)
+            }
             Pipeline::Cpu => true,
         }
     }
@@ -544,12 +546,8 @@ mod tests {
         assert!(p.init_args().is_empty());
 
         assert!(p.pairs_with(Encoder::Software));
-        for encoder in [
-            Encoder::Nvenc,
-            Encoder::Qsv,
-            Encoder::Vaapi,
-            Encoder::VideoToolbox,
-        ] {
+        assert!(p.pairs_with(Encoder::Qsv));
+        for encoder in [Encoder::Nvenc, Encoder::Vaapi, Encoder::VideoToolbox] {
             assert!(
                 !p.pairs_with(encoder),
                 "{encoder:?} has no measured HEVC Main10 encoder"

@@ -75,6 +75,10 @@ pub struct SystemInfo {
     /// probe of a separate graph — the SDR one proves nothing about a PQ
     /// output, where an 8-bit format aborts the process outright.
     pub dovi_passthrough: bool,
+    /// Whether this node proved the P010 upload → QSV Main10 half of the
+    /// Dolby Vision HDR10 route. Kept separate so a working software rung
+    /// never implies a working GPU driver.
+    pub dovi_passthrough_qsv: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -242,6 +246,7 @@ impl AppState {
             .with_dv_strippable(system.dovi_rpu)
             .with_dovi_reshape(system.dovi_reshape)
             .with_dovi_passthrough(system.dovi_passthrough)
+            .with_dovi_passthrough_qsv(system.dovi_passthrough_qsv)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
