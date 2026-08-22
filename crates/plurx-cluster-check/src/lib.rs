@@ -374,6 +374,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             .await?,
         "join_token_expired",
     )?;
+    let leader = cluster.leader().await?;
     let status = match cluster.request(1, Request::MembershipStatus).await? {
         Response::MembershipStatus { status } => status,
         response => bail!("unexpected three-voter membership status: {response:?}"),
@@ -381,16 +382,24 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     if status.availability != ClusterAvailability::HighAvailability
         || status.nodes.len() != 3
         || status.nodes.iter().any(|node| !node.reachable)
+        || status.nodes.iter().any(|node| node.hostname.is_empty())
+        || status.nodes.iter().filter(|node| node.is_leader).count() != 1
+        || !status
+            .nodes
+            .iter()
+            .any(|node| node.raft_id == leader && node.is_leader)
         || status.replication.health != ReplicationHealth::InSync
     {
         bail!("three-voter membership status was not healthy: {status:?}");
     }
     let public_status = serde_json::to_string(&status)?;
-    if public_status.contains(&redeemed_token) || public_status.contains("127.0.0.1") {
-        bail!("public node records exposed token or address material");
+    if public_status.contains(&redeemed_token)
+        || public_status.contains("api_address")
+        || public_status.contains("raft_address")
+    {
+        bail!("public node records exposed token or listener-address material");
     }
 
-    let leader = cluster.leader().await?;
     let target = (2..=3)
         .find(|node_id| *node_id != leader)
         .context("choose a removable follower")?;
