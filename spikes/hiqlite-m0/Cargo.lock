@@ -2207,6 +2207,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
  "kamadak-exif",
  "quick-xml 0.41.0",
  "regex",
