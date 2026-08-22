@@ -5,9 +5,11 @@
 //! only the small amount of state needed to admit nodes, describe them without
 //! exposing listener ports or secrets, and remove a voter safely.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::CStr;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -1670,6 +1672,7 @@ fn short_hostname(raw: &str) -> Option<String> {
     let label = hostname.split('.').next().unwrap_or_default().trim();
     if label.is_empty()
         || label.eq_ignore_ascii_case("localhost")
+        || label.eq_ignore_ascii_case("unknown-host")
         || looks_like_container_id(label)
         || label.chars().any(char::is_control)
     {
@@ -1686,9 +1689,133 @@ fn looks_like_container_id(label: &str) -> bool {
 }
 
 fn membership_hostname(reported: &str, api_address: &str) -> String {
+    membership_hostname_with_lookup(reported, api_address, cached_reverse_hostname)
+}
+
+fn membership_hostname_with_lookup(
+    reported: &str,
+    api_address: &str,
+    reverse_lookup: impl FnOnce(IpAddr) -> Option<String>,
+) -> String {
+    let advertised = advertised_host(api_address);
     short_hostname(reported)
-        .or_else(|| short_hostname(&advertised_host(api_address)))
+        .or_else(|| short_hostname(&advertised))
+        .or_else(|| {
+            advertised
+                .parse::<IpAddr>()
+                .ok()
+                .and_then(reverse_lookup)
+                .and_then(|hostname| short_hostname(&hostname))
+        })
         .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
+fn cached_reverse_hostname(address: IpAddr) -> Option<String> {
+    static CACHE: OnceLock<Mutex<BTreeMap<IpAddr, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(hostname) = cache.get(&address) {
+            return Some(hostname.clone());
+        }
+    }
+
+    let hostname = reverse_hostname(address)?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(address, hostname.clone());
+    }
+    Some(hostname)
+}
+
+#[cfg(unix)]
+fn reverse_hostname(address: IpAddr) -> Option<String> {
+    match address {
+        IpAddr::V4(address) => {
+            // SAFETY: an all-zero sockaddr is a valid base value. The family
+            // and address fields below are initialized before libc reads it.
+            let mut socket: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            socket.sin_family = libc::AF_INET as libc::sa_family_t;
+            socket.sin_addr.s_addr = u32::from_ne_bytes(address.octets());
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))]
+            {
+                socket.sin_len = std::mem::size_of_val(&socket) as u8;
+            }
+            reverse_sockaddr(
+                (&raw const socket).cast(),
+                std::mem::size_of_val(&socket) as libc::socklen_t,
+            )
+        }
+        IpAddr::V6(address) => {
+            // SAFETY: an all-zero sockaddr is a valid base value. The family
+            // and address fields below are initialized before libc reads it.
+            let mut socket: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            socket.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            socket.sin6_addr.s6_addr = address.octets();
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))]
+            {
+                socket.sin6_len = std::mem::size_of_val(&socket) as u8;
+            }
+            reverse_sockaddr(
+                (&raw const socket).cast(),
+                std::mem::size_of_val(&socket) as libc::socklen_t,
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reverse_sockaddr(
+    address: *const libc::sockaddr,
+    address_len: libc::socklen_t,
+) -> Option<String> {
+    let mut hostname = [0 as libc::c_char; 1025];
+    // SAFETY: `address` points to a fully initialized sockaddr whose concrete
+    // length is supplied alongside it. `hostname` is writable for its full
+    // declared size and remains alive until the C string is copied below.
+    let result = unsafe {
+        libc::getnameinfo(
+            address,
+            address_len,
+            hostname.as_mut_ptr(),
+            hostname.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: successful getnameinfo writes a NUL-terminated hostname into
+    // the provided buffer.
+    unsafe { CStr::from_ptr(hostname.as_ptr()) }
+        .to_str()
+        .ok()
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(not(unix))]
+fn reverse_hostname(_address: IpAddr) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -1825,6 +1952,27 @@ mod tests {
     fn docker_container_ids_are_not_machine_hostnames() {
         assert_eq!(short_hostname("1cb4bdb624dc"), None);
         assert_eq!(short_hostname(&"a".repeat(64)), None);
+    }
+
+    #[test]
+    fn reverse_dns_supplies_a_short_name_for_an_ip_only_node() {
+        let hostname =
+            membership_hostname_with_lookup("unknown-host", "192.168.4.7:32402", |address| {
+                assert_eq!(address, "192.168.4.7".parse::<IpAddr>().expect("ip"));
+                Some("nuc3.home.arpa".to_owned())
+            });
+
+        assert_eq!(hostname, "nuc3");
+    }
+
+    #[test]
+    fn reported_hostname_wins_without_a_reverse_lookup() {
+        let hostname =
+            membership_hostname_with_lookup("nuc4.example.net", "192.168.4.8:32402", |_| {
+                panic!("reported hostnames must not trigger reverse DNS")
+            });
+
+        assert_eq!(hostname, "nuc4");
     }
 
     #[test]
