@@ -1200,8 +1200,8 @@ async fn separate_clients_racing_an_expired_lease_choose_one_fenced_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_clients_cannot_interleave_cache_takeover_with_stale_cleanup() {
     let _case = HIQLITE_CASE.lock().await;
-    let cluster = contract_cluster();
-    let bootstrap = open_contract_hiqlite_store().await;
+    let cluster = ContractCluster::start();
+    let bootstrap = open_contract_hiqlite_store(&cluster).await;
     bootstrap
         .validation_reset_contract_state()
         .await
