@@ -579,7 +579,13 @@ mod tests {
             .expect("folder-owned poster");
         std::fs::remove_file(artwork.join(&folder_owned)).expect("delete folder poster");
         assert!(
-            materialize_item_artwork(&store, &artwork, folder.id, &[folder_owned.clone()]).await,
+            materialize_item_artwork(
+                &store,
+                &artwork,
+                folder.id,
+                std::slice::from_ref(&folder_owned)
+            )
+            .await,
             "folder sidecar art must rematerialize without a catalogue write"
         );
         assert_eq!(
@@ -603,7 +609,13 @@ mod tests {
         let beach_poster = beach.poster_path.clone().expect("generated poster");
         std::fs::remove_file(artwork.join(&beach_poster)).expect("delete cached poster");
         assert!(
-            materialize_item_artwork(&store, &artwork, beach.id, &[beach_poster.clone()]).await,
+            materialize_item_artwork(
+                &store,
+                &artwork,
+                beach.id,
+                std::slice::from_ref(&beach_poster)
+            )
+            .await,
             "a capable voter must recreate deleted local bytes"
         );
         assert!(artwork.join(&beach_poster).is_file());

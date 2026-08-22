@@ -25,12 +25,14 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use hiqlite::macros::params;
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig, Row};
 use plurx_core::cluster::coordination::{Lease, LeaseClaim};
 use plurx_core::cluster::membership::{
     join_token_digest, ArtworkPeerAuth, ClusterAvailability, ClusterPeer, FinalizeJoinRequest,
-    IssuedJoinToken, JoinSecrets, MembershipManager, MembershipStatus, RedeemJoinRequest,
+    IssuedJoinToken, JoinSecrets, MembershipError, MembershipManager, MembershipStatus,
+    RedeemJoinRequest,
 };
 use plurx_core::cluster::migration::status::{
     ReplicationHealth, ReplicationMonitor, ReplicationStatus,
