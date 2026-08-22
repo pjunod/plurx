@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4a700cc"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained server manifest regression proves a same-millisecond last-state replacement is re-coalesced against the preceding effective composition, preventing adjacent duplicate cues after A@0, B@1000, A@1000."

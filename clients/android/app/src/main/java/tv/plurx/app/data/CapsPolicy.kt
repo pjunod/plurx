@@ -48,6 +48,55 @@ internal object AudioSinkEncoding {
     const val E_AC3_JOC = 18
 }
 
+/** One codec decoder's highest movie-sized frame proven by MediaCodec. */
+internal data class VideoDecoderLimit(
+    val codec: String,
+    val maxHeight: Int,
+    /** False for platform/software components such as `c2.android.av1-dav1d.decoder`. */
+    val hardwareAccelerated: Boolean = true,
+)
+
+/**
+ * A registered software decoder is useful capability evidence, but its
+ * advertised size range is not a realtime performance guarantee. Android's
+ * dav1d component can report 3840x2160 on a mid-grade CPU while dropping a
+ * material share of the frames. Keep the software fallback for ordinary HD;
+ * require hardware evidence above it.
+ */
+internal const val SOFTWARE_VIDEO_MAX_HEIGHT = 1080
+
+internal data class VideoCodecCaps(
+    val codecs: List<String>,
+    val maxHeights: Map<String, Int>,
+) {
+    fun queryParams(): Map<String, String> = mapOf(
+        "vcodec" to codecs.joinToString(","),
+        "vmaxheight" to codecs.joinToString(",") { "$it:${maxHeights.getValue(it)}" },
+    )
+}
+
+/**
+ * Normalize MediaCodec evidence into the two server capability fields.
+ * Duplicate decoders are intentional — the best decoder for a codec wins —
+ * while unknown codecs and non-positive limits are not capability evidence.
+ */
+internal fun videoCodecCaps(limits: Iterable<VideoDecoderLimit>): VideoCodecCaps {
+    val supported = setOf("h264", "hevc", "av1", "vp9")
+    val maxima = mutableMapOf<String, Int>()
+    for (limit in limits) {
+        val codec = limit.codec.lowercase()
+        if (codec !in supported || limit.maxHeight <= 0) continue
+        val effectiveHeight = if (limit.hardwareAccelerated) {
+            limit.maxHeight
+        } else {
+            minOf(limit.maxHeight, SOFTWARE_VIDEO_MAX_HEIGHT)
+        }
+        maxima[codec] = maxOf(maxima[codec] ?: 0, effectiveHeight)
+    }
+    val ordered = listOf("h264", "hevc", "av1", "vp9").filter(maxima::containsKey)
+    return VideoCodecCaps(ordered, ordered.associateWith(maxima::getValue))
+}
+
 /**
  * Dolby Vision profile numbers this client is willing to claim, from the raw
  * profile constants a `video/dolby-vision` decoder advertises.

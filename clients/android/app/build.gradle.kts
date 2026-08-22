@@ -1,7 +1,39 @@
+import javax.inject.Inject
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.FileSystemOperations
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.TaskAction
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+}
+
+abstract class GenerateReaderAssets @Inject constructor(
+    private val fileSystem: FileSystemOperations,
+) : DefaultTask() {
+    @get:InputDirectory
+    abstract val sourceDirectory: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        fileSystem.sync {
+            from(sourceDirectory)
+            include("reader.js", "offline-reader.js", "offline-reader.html")
+            into(outputDirectory)
+        }
+    }
+}
+
+val generateReaderAssets = tasks.register<GenerateReaderAssets>("generateReaderAssets") {
+    sourceDirectory.set(layout.projectDirectory.dir("../../../crates/plurxd/src/web"))
+    outputDirectory.set(layout.buildDirectory.dir("generated/reader-assets"))
 }
 
 android {
@@ -13,7 +45,7 @@ android {
         // 23 covers phones and the vast majority of Android TV / Google TV boxes.
         minSdk = 23
         targetSdk = 37
-        versionCode = 29
+        versionCode = 39
         versionName = "0.2.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -46,7 +78,16 @@ android {
         compose = true
     }
     sourceSets {
-        getByName("test").resources.srcDir("../../../tests/contracts")
+        getByName("test").resources.directories.add("../../../tests/contracts")
+    }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(
+            generateReaderAssets,
+            GenerateReaderAssets::outputDirectory,
+        )
     }
 }
 

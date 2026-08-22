@@ -7,7 +7,12 @@ members = [
     "crates/plurx-pgs",
     "crates/plurxd",
 ]
-exclude = ["vendor/rust_decimal", "vendor/s3-simple"]
+exclude = [
+    "vendor/hiqlite",
+    "vendor/hiqlite-wal",
+    "vendor/rust_decimal",
+    "vendor/s3-simple",
+]
 
 [workspace.package]
 # One version for the whole workspace: the crates are not published separately,
@@ -44,6 +49,10 @@ walkdir = "2"
 # XML: NFO sidecar parsing (home libraries). plurx-compat-plex hand-rolls a
 # *writer*; this is the reader, and real-world NFOs are too filthy to hand-roll.
 quick-xml = "0.41"
+# EPUB is an OCF ZIP container. Only the two formats EPUB requires in
+# practice (stored and deflate) are enabled; archive parsing is bounded again
+# in plurxd before any entry is allocated or served.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 # EXIF: capture dates for photos in home libraries (pure Rust, JPEG/TIFF).
 kamadak-exif = "0.6"
 notify = "6"
@@ -93,13 +102,23 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
+# Test executables are replicated in every isolated swarm worker cache. Rust
+# debug info made each plurxd test binary hundreds of megabytes even though the
+# harness never attaches a debugger to them. Keep normal development builds
+# debuggable, but omit debug info from the disposable test artifacts.
+[profile.test]
+debug = 0
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
 
-# Patch hiqlite's unused optional dependency edges without advisory ignores.
-# Path packages are skipped by cargo-audit, so rust-audit.yml also scans a
-# synthesized registry-provenance lockfile built by scripts/vendor-audit-lock.
+# Patch Hiqlite's sparse-membership and WAL-recovery compatibility plus unused
+# optional dependency edges without advisory ignores. Path packages are
+# skipped by cargo-audit, so rust-audit.yml also scans a synthesized
+# registry-provenance lockfile built by scripts/vendor-audit-lock.
 [patch.crates-io]
+hiqlite = { path = "vendor/hiqlite" }
+hiqlite-wal = { path = "vendor/hiqlite-wal" }
 s3-simple = { path = "vendor/s3-simple" }
 rust_decimal = { path = "vendor/rust_decimal" }

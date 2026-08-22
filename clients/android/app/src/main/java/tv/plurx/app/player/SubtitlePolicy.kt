@@ -2,6 +2,7 @@ package tv.plurx.app.player
 
 import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.ReopenReason
 import tv.plurx.app.data.SubTrack
 import java.util.Locale
 
@@ -139,8 +140,9 @@ internal fun nativeSubtitleOrdinal(index: Long, tracks: List<SubTrack>): Int? =
  * One veto survives, and it is about cost rather than choice: an automatic
  * selection must never start a burn, because a burn re-encodes a stream the
  * viewer never asked to have re-encoded. A *forced* track is the carve-out —
- * a handful of signage cues the film is unwatchable without — and it may burn,
- * at source height (docs/CLIENTS-REMEDIATION-PLAN.md §3.1, owner policy).
+ * a handful of signage cues the film is unwatchable without — and when that
+ * burn alone replaces copyable video, it preserves source height
+ * (docs/CLIENTS-REMEDIATION-PLAN.md §3.1, owner policy).
  */
 internal fun autoSubtitleSelection(tracks: List<SubTrack>): Long? {
     val pick = tracks.firstOrNull { it.default } ?: return null
@@ -192,21 +194,36 @@ private fun negatedBefore(prefix: String): Boolean {
 /**
  * The `height` a session create should carry.
  *
- * §3.2: a height that is a *promise* rather than a rung — a burn, or Quality =
- * Original — sends the source's own height, which `hls.rs` recognises and
- * passes through unsnapped. A genuine Auto sends nothing, because the rung
- * depends on which encoder wins and only the create response knows that. An
- * explicit rung sends the rung and lets the server snap it onto the ladder.
+ * §3.2: a height that is a *promise* rather than a rung — a burn that is the
+ * only reason copyable video must be encoded, or Quality = Original — sends
+ * the source's own height, which `hls.rs` recognises and passes through
+ * unsnapped. A plan that already needed video transcoding keeps genuine Auto:
+ * the subtitle must not promote that session from the server's 720/1080 rung
+ * back to a 4K encode. An explicit rung retains the established burn promise.
  */
 internal fun sessionHeight(
     quality: PlaybackQuality,
     delivery: SubtitleDelivery,
     sourceHeight: Int?,
+    copyableVideo: Boolean,
 ): Int? = when {
-    delivery == SubtitleDelivery.Burn -> sourceHeight
+    delivery == SubtitleDelivery.Burn &&
+        (copyableVideo || quality != PlaybackQuality.Auto) -> sourceHeight
     quality == PlaybackQuality.Original -> sourceHeight
     else -> quality.storageValue.toIntOrNull()
 }
+
+/**
+ * Whether the session's height is a promise from an Auto viewer rather than a
+ * manual quality pick. An Auto viewer that sends a promise-height — a burn, or
+ * Quality = Original — must carry this flag, or the server reads the posted
+ * height as a sticky manual pick and can never step that session down.
+ * See docs/ADAPTIVE-QUALITY.md §"Native stall-reopen server boundary".
+ */
+internal fun qualityAuto(
+    quality: PlaybackQuality,
+    delivery: SubtitleDelivery,
+): Boolean = quality == PlaybackQuality.Auto && delivery == SubtitleDelivery.Burn
 
 /**
  * The exact body each routing arm posts to `/files/{id}/hls/sessions`.
@@ -230,6 +247,9 @@ internal fun subtitleSessionBody(
     audioOffsetMs: Long,
     quality: PlaybackQuality,
     sourceHeight: Int?,
+    deliveredDynamicRange: String? = null,
+    previousSessionId: String? = null,
+    reopenReason: ReopenReason? = null,
 ): CreateSessionReq {
     val copy = copyableVideo && delivery != SubtitleDelivery.Burn
     val native = delivery == SubtitleDelivery.NativeSession
@@ -238,16 +258,26 @@ internal fun subtitleSessionBody(
         request_id = requestId,
         // `height` is ignored under `copy`; sending it anyway would suggest a
         // rung this session is not going to honour.
-        height = if (copy) null else sessionHeight(quality, delivery, sourceHeight),
+        height = if (copy) {
+            null
+        } else {
+            sessionHeight(quality, delivery, sourceHeight, copyableVideo)
+        },
         start = startSeconds,
         audio = audioIndex?.toInt(),
         subtitle_burn = subtitleIndex?.toInt().takeIf { delivery == SubtitleDelivery.Burn },
+        subtitle_burn_sdr = true.takeIf {
+            delivery == SubtitleDelivery.Burn && deliveredDynamicRange == "sdr"
+        },
         native_subtitles = true.takeIf { native },
         subtitle = subtitleIndex?.toInt().takeIf { native },
         audio_offset_ms = audioOffsetMs.takeIf { it != 0L },
         copy = true.takeIf { copy },
         aac = aac.takeIf { copy },
         preserve_dolby_vision = true.takeIf { copy && preserveDolbyVision },
+        previous_session_id = previousSessionId,
+        reopen_reason = reopenReason,
+        quality_auto = true.takeIf { qualityAuto(quality, delivery) },
     )
 }
 

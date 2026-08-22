@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["415db12"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained watchdog and production-fallback regressions pin that a routine kill ends without a false stall while a deliberately killed predecessor cannot poison its replacement; reverting only the production correction restores the false teardown verdict."

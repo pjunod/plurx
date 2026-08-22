@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["404c8d55"]
+points = ["apple.client", "operations.packaging"]
+checks = ["apple-simulators", "operations-contract", "container-runtime"]
+reason = "Concrete simulators, writable state, and ephemeral ports are checked statically and then exercised by both platform and container jobs."

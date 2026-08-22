@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0fda21eb"]
+points = ["core.media"]
+checks = ["rust-gate"]
+reason = "The retained sidecar test seeds the exact interrupted-migration state — network_priors committed, user_version still 1 — and requires NodeLocalTelemetry::open to reopen it, keep the recorded event and prior, and finish the version stamp; restoring only the pre-fix initialize reproduces the permanent `table network_priors already exists` startup failure."

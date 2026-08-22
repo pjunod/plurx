@@ -186,4 +186,22 @@ class PlaybackTelemetryTest {
         assertFalse(body.contains("Bearer "))
         assertNull(request.header("Authorization"))
     }
+
+    @Test
+    fun preMediaFailureNamesItsStageWithoutLeakingExceptionText() {
+        val event = planLoadFailureEvent(
+            fileId = 5209,
+            reason = "cold-start",
+            stage = "decision",
+            error = IllegalStateException(
+                "request https://plurx.test/file?token=do-not-send failed",
+            ),
+        )
+
+        assertEquals("playback_error", event.event)
+        assertEquals("Android preflight", event.ua)
+        assertEquals("cold-start", event.reason)
+        assertEquals("stage=decision type=IllegalStateException", event.detail)
+        assertFalse(event.detail.orEmpty().contains("do-not-send"))
+    }
 }

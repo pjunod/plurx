@@ -8,8 +8,12 @@ use std::time::Instant;
 
 #[cfg(test)]
 use plurx_core::domain::ArtworkAttempt;
-use plurx_core::domain::{Item, Library, LibraryKind, MetadataPatch, PlaybackEvent};
+use plurx_core::domain::{
+    BookMetadataPatch, BookMetadataSource, Item, ItemKind, Library, LibraryKind, MetadataPatch,
+    PlaybackEvent,
+};
 use plurx_core::error::StoreError;
+use plurx_core::metadata::book::BookEnrichReport;
 use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
@@ -117,6 +121,9 @@ pub struct AppState {
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
     pub offline: Arc<OfflineManager>,
+    /// Short-lived, revision-bound EPUB resource capabilities. Publication
+    /// markup receives one of these, never the user's reusable API token.
+    pub publications: Arc<crate::http::publication::PublicationSessions>,
     pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
@@ -262,6 +269,7 @@ impl AppState {
             jobs,
             transcode,
             offline,
+            publications: crate::http::publication::PublicationSessions::new(),
             trakt,
             system: Arc::new(system),
             logs,
@@ -320,6 +328,8 @@ pub struct EnrichOutcome {
     pub enrich: Option<EnrichReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_art: Option<LocalArtReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub books: Option<BookEnrichReport>,
 }
 
 /// Point-in-time view of a running scan's counters.
@@ -585,6 +595,17 @@ pub struct IdHints {
     pub episodeish: bool,
 }
 
+/// Validated Curator facts carried by one targeted book scan.
+#[derive(Clone, Debug)]
+pub struct BookHints {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub medium: ItemKind,
+    pub work_id: String,
+    pub edition_id: String,
+    pub cover_url: Option<String>,
+}
+
 impl IdHints {
     fn is_empty(&self) -> bool {
         self.tmdb.is_none() && self.imdb.is_none() && self.series_tmdb.is_none()
@@ -602,6 +623,7 @@ pub struct ScanRequest {
     /// them itself would silently drop them for every request that arrived
     /// while a scan was running. Which is most of them.
     pub ids: Option<IdHints>,
+    pub book: Option<BookHints>,
     pub correlation_id: Option<String>,
     pub source: Option<String>,
 }
@@ -908,6 +930,7 @@ impl JobManager {
                 Some(&repairs),
             )
             .await;
+        self.apply_book_hints(req, &out.items).await;
         tracing::info!(
             target: "plurxd::integrate",
             library = req.library_id,
@@ -1003,9 +1026,20 @@ impl JobManager {
                 .await,
             );
         } else if library.kind == LibraryKind::Books {
-            // Deliberately empty. Treating Books as the generic TMDB arm would
-            // spend provider calls on titles TMDB cannot identify and could
-            // attach an unrelated film's artwork to a book with the same name.
+            // File-derived EPUB facts are the standalone fallback. A paired
+            // Curator handoff is applied after this pass and is source-ranked
+            // above it by the store, so later scheduled scans cannot regress
+            // explicit author/work/edition identity.
+            outcome.books = Some(
+                metadata::book::enrich_library(
+                    self.store.as_ref(),
+                    &self.artwork_dir,
+                    library.id,
+                    force,
+                    routes,
+                )
+                .await,
+            );
         } else if library.anime {
             let client = AniListClient::new();
             outcome.enrich = Some(
@@ -1111,6 +1145,66 @@ impl JobManager {
                     item = target, error = %e,
                     correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
                     "could not apply caller-supplied ids; falling back to title matching"
+                ),
+            }
+        }
+    }
+
+    /// Apply Curator's exact work/edition relation after local EPUB
+    /// enrichment. Source precedence is also enforced in the store, so this
+    /// ordering is defense in depth rather than a convention later scans can
+    /// accidentally reverse.
+    async fn apply_book_hints(&self, req: &ScanRequest, placed: &[PlacedFile]) {
+        let Some(hints) = req.book.as_ref() else {
+            return;
+        };
+        let mut seen = HashSet::new();
+        for file in placed {
+            if !seen.insert(file.item_id) {
+                continue;
+            }
+            let item = match self.store.get_item(file.item_id).await {
+                Ok(Some(item)) if item.kind == hints.medium => item,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(item = file.item_id, error = %error, "reading Curator book target");
+                    continue;
+                }
+            };
+            let poster_path = if let Some(url) = hints.cover_url.as_deref() {
+                match metadata::book::cache_curator_cover(&self.artwork_dir, item.id, url).await {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!(item = item.id, error = %error, "caching Curator book cover");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let patch = BookMetadataPatch {
+                title: hints.title.clone(),
+                author: hints.author.clone(),
+                work_id: Some(hints.work_id.clone()),
+                edition_id: Some(hints.edition_id.clone()),
+                poster_path,
+                source: BookMetadataSource::Curator,
+            };
+            match self.store.apply_book_metadata(item.id, &patch).await {
+                Ok(()) => tracing::info!(
+                    target: "plurxd::integrate",
+                    item = item.id,
+                    work = %hints.work_id,
+                    edition = %hints.edition_id,
+                    correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+                    "applied Curator book metadata"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "plurxd::integrate",
+                    item = item.id,
+                    error = %error,
+                    correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+                    "could not apply Curator book metadata"
                 ),
             }
         }
@@ -2176,6 +2270,7 @@ mod tests {
             library_id,
             path: PathBuf::from("/missing/target"),
             ids: None,
+            book: None,
             correlation_id: Some("correlation".into()),
             source: Some("test".into()),
         }
@@ -2634,6 +2729,7 @@ mod tests {
                 library_id: lib.id,
                 path: media.path().join("Holiday"),
                 ids: None,
+                book: None,
                 correlation_id: None,
                 source: Some("monarr".into()),
             })
@@ -2714,6 +2810,7 @@ mod tests {
                 library_id: lib.id,
                 path: season_one,
                 ids: ids.clone(),
+                book: None,
                 correlation_id: None,
                 source: Some("monarr".into()),
             })
@@ -2750,6 +2847,7 @@ mod tests {
                 library_id: lib.id,
                 path: season_two,
                 ids,
+                book: None,
                 correlation_id: None,
                 source: Some("monarr".into()),
             })

@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["b7e8185a"]
+points = ["android.client"]
+checks = ["android-jvm"]
+reason = "The corrected client policy is exercised by the Android JVM policy and model suites."

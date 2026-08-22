@@ -139,6 +139,31 @@ requires = ["node"]
 missing = "fail"
 timeout_seconds = 300
 
+# The membership panel's promise is the sentences an operator reads, not the API
+# fields behind them: two voters are a reconfiguration waypoint and never
+# redundancy (CLUSTERING-PLAN §7.2), and a removal refusal has to name a next
+# step. Neither is visible to the Rust gate or to a structural DOM golden, and
+# both are pure Node against the shipped index.html, so this runs on every
+# commit rather than only in a browser profile.
+[[checks]]
+id = "web-membership"
+title = "Cluster membership panel wording and join-token handling"
+command = "node tests/web/cluster-membership.test.js"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["node"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
+id = "reader-browser"
+title = "EPUB reader restore, navigation, search, and hostile-content boundary"
+command = "scripts/reader-browser"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["python3", "cargo"]
+preflight = "python3 -c 'import playwright'"
+missing = "skip"
+timeout_seconds = 1800
+
 [[checks]]
 id = "apple-simulators"
 title = "Shared iOS and tvOS XCTest suite"
@@ -264,7 +289,7 @@ timeout_seconds = 1800
 [[checks]]
 id = "resource-bounds"
 title = "Session registries, hardware slots, and memory work stay bounded"
-command = "cargo test -p plurxd cannot_grow_the_registry_without_bound -- --nocapture && cargo test -p plurxd transcode::tests::concurrent_starts_cannot_exceed_the_hardware_slot_cap -- --exact --nocapture"
+command = "cargo test -p plurxd cannot_grow_the_registry_without_bound -- --nocapture && cargo test -p plurxd transcode::tests::concurrent_starts_cannot_exceed_the_hardware_slot_cap -- --exact --nocapture && cargo test -p plurxd http::publication::tests::epub_manifest_does_not_expand_large_resource -- --exact --ignored --nocapture"
 profiles = ["nightly"]
 requires = ["cargo"]
 missing = "fail"
@@ -292,6 +317,7 @@ paths = [
   "crates/plurx-core/src/store/mod.rs",
   "crates/plurx-core/src/store/replicated.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
+  "crates/plurx-core/src/store/sqlite/reading.rs",
   "crates/plurx-core/src/store/sqlite/telemetry.rs",
   "crates/plurx-core/src/store/telemetry.rs",
   "crates/plurx-core/tests/store_contract.rs",
@@ -324,8 +350,11 @@ paths = [
   "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
+  "vendor/hiqlite/**",
+  "vendor/hiqlite-wal/**",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
 ]
@@ -350,10 +379,11 @@ contract = "The single server binary exposes stable native endpoints and coordin
 paths = [
   "crates/plurxd/Cargo.toml",
   "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe,telemetry}.rs",
-  "crates/plurxd/src/http/{dto,error,extract,mod,network,system}.rs",
+  "crates/plurxd/src/reader_formats.rs",
+  "crates/plurxd/src/http/{dto,error,extract,mod,network,publication,reading,system}.rs",
   "plurx.example.toml",
 ]
-checks = ["rust-gate", "api-wire", "user-journey"]
+checks = ["rust-gate", "api-wire", "user-journey", "resource-bounds"]
 depends_on = ["core.media", "persistence.upgrades"]
 
 [[points]]
@@ -511,7 +541,7 @@ depends_on = ["server.api", "api.contract", "playback.pipeline"]
 [[points]]
 id = "web.experience"
 title = "Embedded web player and administration UI"
-contract = "The shipped one-file web app remains syntactically valid, readable in every theme, and structurally stable across layouts."
+contract = "The shipped one-file web app remains syntactically valid, readable in every theme, and structurally stable across layouts. Its admin cluster panel reads the membership API without widening it, presents two voters as a reconfiguration waypoint rather than redundancy, renders every removal refusal as an actionable sentence, stays absent for a non-admin, and holds a minted join token in memory only — never in browser storage, a URL, or a log."
 paths = [
   "brand/tokens.css",
   "crates/plurxd/src/http/web.rs",
@@ -519,11 +549,13 @@ paths = [
   "docs/UI-*.md",
   "scripts/contrast-*",
   "scripts/js-check",
+  "scripts/reader-browser",
   "scripts/themes-proposed.json",
   "scripts/ui-baseline",
   "tests/ui-structure.golden",
+  "tests/web/**",
 ]
-checks = ["rust-gate", "web-static", "web-layout", "playback-smoke", "playback-exhaustive"]
+checks = ["rust-gate", "web-static", "web-membership", "reader-browser", "web-layout", "playback-smoke", "playback-exhaustive"]
 depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
@@ -591,6 +623,7 @@ paths = [
   "scripts/ci-flake-report",
   "scripts/history-audit",
   "scripts/prove-fix",
+  "scripts/prove-tombstone-offline-fence",
   "scripts/validate",
   "tests/client-fixes.toml",
   "tests/validation/**",

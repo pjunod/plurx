@@ -49,6 +49,29 @@ runbook. Until that work lands, a post-activation rollback means roll forward
 with an M2-capable binary against the retained active target. The commands
 below are only for the pre-activation SQLite case.
 
+### Upgrading an activated v5 or v6 cluster to v7
+
+Replicated schema v6 added ebook reading state. Schema v7 adds nullable
+`author`, `book_work_id`, `book_edition_id`, and `book_metadata_source` item
+columns plus the partial work-id index. Stop application traffic and update
+every voter as one maintenance operation. The first v7 daemon that reaches
+quorum accepts any activation marker from v5 to the current v7 and applies every missing
+step in order. Each step commits its table/columns/index and compatibility row
+in one Raft transaction before the daemon starts producers or binds HTTP. A v5
+source therefore commits v5→v6 and then v6→v7; a v6 source commits only the
+second transaction. Each voter atomically rewrites its local `activation.json`
+to v7 only after the replicated transactions are visible.
+
+A death before a step leaves the preceding schema authoritative. A death after
+the replicated write but before the local marker rewrite replays only the
+marker write on the next boot. Do not restart a v5 or v6 binary after v7
+commits: its strict compatibility check correctly refuses the newer schema. If
+a node fails during the maintenance window, leave the v7 quorum authoritative
+and roll that node forward with the same v7-or-newer binary. `reset-password`,
+`refresh-metadata`, and other maintenance clients do not own migration and
+will refuse until the running daemon has completed it. Replicated v4 has no
+supported direct path to v7 and remains refused.
+
 Every Ansible redeploy stops the Plurx Compose stack long enough to copy the
 closed SQLite database. The three newest copies stay on each node under
 `<PLURX_DATA>/backups/`, named
@@ -216,9 +239,9 @@ Raft progress facts, never users, titles, media paths, tokens, or library data.
 | Surface | What it means | What to do |
 |---|---|---|
 | `SQLite single-node` | This boot is using unreplicated SQLite. A pause or watched flag is stored only on this server; calling it "synced" would be false because there is no peer. | If this is the recovery boot after an interrupted activation, restart once the cause is fixed so activation can retry. |
-| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. M3 owns adding or removing nodes. |
+| `Replicated one node` | Hiqlite is authoritative and this node has applied every known entry, but no second voter exists yet. The backend is ready for M3 membership; it is not HA by itself. | Nothing for replication. Add or remove nodes from **Settings → Cluster**. |
 | `Replicated in sync` | This node has applied its latest known entry. On the leader, every reporting peer has matched that point; on a follower, only this node's catch-up is confirmed and the explanation points you to the leader for peer status. | No action. Read the plain-language explanation before treating a follower's local catch-up as a cluster-wide all-clear. |
-| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter. Do not stop either voter until three are present and in sync. |
+| `Replicated DEGRADED` with two voters | Both voters are required for every quorum, so one failure stops writes and membership changes. This is a reconfiguration waypoint, never HA. | Add a third voter from **Settings → Cluster**, which reports the same state as a reconfiguration in progress. Do not stop either voter until three are present and in sync. |
 | `Replicated DEGRADED` | This node has unapplied entries, a leader cannot be confirmed, or a reporting peer is behind or missing. Watch state is durable once quorum-acknowledged, but it may not be visible from every node yet. | Keep the available nodes online and check the last observed in-sync time. If the gap does not fall, inspect the logs before restarting anything. |
 
 **How to read the numbers:** `applied term T, index I` is this node's latest
@@ -236,11 +259,50 @@ endpoint observes an in-sync sample. The Settings page samples this when you
 open it; the timestamp does not claim that an unseen convergence happened
 between visits.
 
-This row is status, not membership control. The admin-only cluster endpoints
-below list, join, and remove voters. Their `replication` member is this exact
-projection rather than a second answer for lag.
+This row is status, not membership control. **Settings → Cluster** is the
+membership surface, and the admin-only cluster endpoints below are the same
+operations from a terminal. Their `replication` member is this exact projection
+rather than a second answer for lag.
+
+### The Cluster tab
+
+**Settings → Cluster** does everything the endpoints below do, and it is the
+easier path when you have a browser open. It is admin-only, matching the
+endpoints' own gating; a non-admin never sees the tab or its data. The roster is
+read when you open the tab, not on every Settings visit.
+
+| What you see | What it means |
+|---|---|
+| `Not clustered` | This server is on unreplicated SQLite and has no membership. Normal and complete for a single machine; there is nothing to fix and no join control to press. |
+| `One node` | Replicated, one voter. A supported configuration, not a half-built cluster. |
+| `Reconfiguration in progress — not redundant` | Two voters. Both machines are required for every write and every membership change, so this survives no failure — read the same warning in the table above. Add a third node. |
+| `Redundant — N voters` | Three or more voters. The panel names the majority required and how many nodes may be down. |
+
+The node table carries only what `GET /api/v1/cluster/nodes` exposes: node id,
+Raft id, voter/learner role, reachability, and last-seen. Addresses, media
+paths, and token material are not in that payload and are not shown.
+
+**Add a node** mints one token through `POST /api/v1/cluster/join-tokens` and
+displays it exactly once, with a lifetime you pick between 10 minutes and 1
+hour. plurx keeps only its digest, so the browser is the only copy: the panel
+never writes it to browser storage, a URL, or a log, and it is dropped when you
+leave the tab. Everything after that — the owner-only file, `join_token_file`,
+the fresh data directory — is the terminal procedure below, unchanged. Treat the
+displayed token exactly as the runbook treats the `curl` response: anyone
+holding it can join a node to this cluster until it is redeemed or expires.
+
+**Remove** calls the removal endpoint and renders its refusal as a sentence with
+a next step rather than a code. `node_owns_offline_work` tells you to let active
+transfers finish (or delete those packages), stop clients from creating new
+downloads on that node, and retry; ordinary queued work is resolved by the
+server as described below. The confirmation states what the terminal path
+states below — the removed machine's data directory is tombstoned, and
+rejoining means discarding it.
 
 ### Joining and removing voters
+
+The rest of this section is the terminal path. It is the same three endpoints
+the Cluster tab drives, and is the right path for a scripted or headless setup.
 
 Use one, three, or more voters. Two voters are useful only while adding or
 removing a node: they require both processes for every write and survive no
@@ -356,13 +418,15 @@ before committing rather than acting on the list it started with.
 
 **Stop the removed node once the removal returns**, or repoint its clients at a
 surviving server. Removal takes the machine out of the cluster roster; it does
-not switch the machine off, and a removed plurxd that is still running and still
-reachable can still accept a download request and record the package against
-itself. Nothing resolves those: the removal that would have failed or moved them
-has already finished. They hold their reservation against the requesting user's
-byte budget until the seven-day expiry, and a package that reaches `ready` on a
-node you later switch off will not download. This is the only offline case
-removal does not clean up for you.
+not switch the machine off. A removed-but-still-running node that keeps
+receiving download requests is refused at the write path with a legible
+`node_removed` response — the durable insert checks the `cluster_nodes.removed_at`
+tombstone and returns `NodeIsTombstone` before any admission or quota step.
+Nothing ever reaches the encoder or holds a reservation against a tombstone.
+
+This is a fence on the offline package write path only. A removed-but-running
+node keeps its other write paths open, and the operator advice below still
+applies — but the offline case removal could not clean up for you is now closed.
 
 Before it commits, the cluster asks every other node whether it can actually
 read each package's source file — not whether the path looks the same, but

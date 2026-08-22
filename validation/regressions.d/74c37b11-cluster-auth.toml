@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["74c37b11"]
+points = ["persistence.upgrades", "cluster.auth"]
+checks = ["rust-gate"]
+reason = "The `hiqlite_accepts_a_unique_sparse_node_roster` regression passes the real production roster builder voters 1 and 3, requires exactly those two connection targets, and then requires Hiqlite to accept local voter 3 by durable Raft id. Restoring positional selection fails validation; restoring duplicate padding fails the target assertion."

@@ -109,12 +109,39 @@ XCTest, regardless of strictness.
 CI fetches full Git history and selects from the pull-request base. The
 fast policy preflight runs mobile release hygiene first when applicable, then
 the history audit, catalog and validation unit tests, and operations contracts.
+
+Mobile release hygiene reads two different refs, and the distinction is
+load-bearing. `PLURX_VALIDATION_BASE` is the recorded pull-request base sha and
+scopes *which* release inputs the branch touched; it is the branch point.
+`PLURX_VALIDATION_MERGE_TARGET` is `origin/<base ref>` re-fetched when the job
+runs, and supplies the counters the branch has to clear, because that is what
+the branch actually merges into. They name the same commit only until the base
+moves. Scope is the whole of scope: both the changed paths and the
+workspace-version comparison that marks a release are read against the recorded
+base, and only the two counters are read against the target. That split is
+load-bearing in both directions. Reading the workspace comparison off the target
+would conflate "this branch shipped a release" with "a release landed on the
+target", so every branch open across a release — including an ordinary
+dependency-only `Cargo.toml` edit, which is in this point's paths — would go red
+and be told to bump two store counters it never touched. Reading the counters
+off the branch point is the original defect. Two branches that bump a build
+counter to the same value auto-merge with
+no conflict marker and produce no `BEHIND` signal in this job, so a branch
+measured only against its branch point stays green forever once an unrelated
+release bump lands that same counter on the base. Re-baselining means a pull
+request can go red without its own head moving; that is correct, and the
+failure names the base ref and both counters so the fix is unambiguous without
+reading the workflow. An unreadable merge target fails the check rather than
+falling back to the branch point: scope selection fails open because a bad diff
+base only costs time, but a missing counter baseline would report green on a
+tree that cannot ship. A local `--changed-from` run passes one ref and uses it
+for both roles, which is right for a branch measured against a fixed point.
 Every expensive fan-out job in the main CI workflow waits for that preflight.
 A documentation-only pull request stops after those executable documentation
 contracts; it does not compile the Rust workspace or provision browsers and
 native-client environments. A documentation change may include
-`validation/regressions.toml` and keep this lane because the file is consumed
-only by the history audit that preflight already runs; selector code and
+`validation/regressions.d/**` and keep this lane because those entries are
+consumed only by the history audit that preflight already runs; selector code and
 `validation/points.toml` still take the executable-change lane.
 
 For executable changes, the portable Rust and focused Linux contracts remain
@@ -166,11 +193,48 @@ refusals live in the merge gate itself; see SwarmDeck `docs/OPERATIONS.md`.
 ## Load-sensitive cluster checks — a timeout is not a verdict
 
 One check drives real replicated infrastructure rather than a library, so the
-host it runs on is part of the experiment. `cluster-auth` (`make
-cluster-check`, points `cluster.auth` and `persistence.upgrades`) starts voters
-as separate processes; the Rust gate's `plurx-cluster-check` harness tests do
-the same. Under a full `make validate` those voters compete with every other
-check for the same cores **and for the same ephemeral ports**.
+host it runs on is part of the experiment:
+
+| Check | Point | What the host can change |
+|---|---|---|
+| `cluster-auth` (`make cluster-check`) | `cluster.auth` · `persistence.upgrades` | Three voters run as separate processes and every call carries a three-second per-operation deadline (`STORE_TIMEOUT` in `crates/plurx-core/src/store/hiqlite.rs`). Under a full `make validate` those voters compete with every other check for the same cores, and that deadline is reachable by scheduling pressure alone |
+
+**What a timeout there means.** `Database("replicated store operation timed out")`
+is the host reporting that it could not finish an operation in three seconds.
+It is not durable-state evidence in either direction: nothing was proved and
+nothing was found broken. The production deadline stays at three seconds
+because it is a server safety bound, so the suite absorbs load by re-attempting
+a deadlined step from a reset target instead of by relaxing it.
+
+**Why this check reaches that deadline before the others do.** The import
+contract and the production bound push against each other by design. The
+byte-budget transaction builder (#282) sizes every transaction as close to the
+WAL payload capacity as it can, because a transaction that stays comfortably
+small would not prove the bound it exists to prove. Maximising the payload also
+maximises how long one replicated operation takes, so this check spends most of
+its time on operations deliberately sized to sit near the three-second ceiling.
+That is not only a test-harness concern: a real library import on a busy server
+runs the same builder against the same fixed bound, so an operator seeing this
+timeout in production is seeing the same interaction, not a different bug.
+
+**How to tell it from a real regression.** The failures look different at the
+client, and the check now says which of these three it saw:
+
+- A **replicated deadline** names itself, states that the bound was neither
+  proved nor violated, and points back at this section. Rerun `make
+  cluster-check` alone on an idle machine; it takes about ten seconds.
+- A **durable-state or size violation** carries the contract's own verdict.
+  An oversized Raft transaction, for example, is refused by `hiqlite-wal` in
+  the leader (`` `data` length must not exceed `wal_size` ``) and reaches the
+  client as `ClientWriteError: panicked` — a byte comparison that reports
+  identically on an idle and a saturated host.
+- A deadline whose voter then **fails a consistent readiness read** is treated
+  as the violation, not as load: a busy voter still answers that probe, while
+  a leader killed by an oversized transaction does not.
+
+Never re-diagnose a red `cluster-auth` from elapsed time. Read which of those
+three the failure text claims, and reproduce it in isolation before treating it
+as a durable-state regression.
 
 ### A busy port is not an un-migrated store
 
@@ -301,7 +365,11 @@ across every registered layout, route, and desktop/mobile viewport. A check
 rebuilds `plurxd` first so it cannot accidentally serve an old embedded web
 app, then runs a real browser sweep. It needs Python Playwright with Chromium,
 `ffmpeg`, and a buildable `plurxd`; expect it to take minutes rather than
-seconds.
+seconds. The generated player media includes a synthetic audio track so the
+browser exercises a real media timeline, but validation browsers always launch
+with host output muted and operating-system media-key integration disabled.
+Audio is still decoded and selectable; the gate neither sounds the workstation
+speakers nor claims macOS Now Playing.
 
 ```bash
 make ui-golden          # capture the current reviewed UI as the answer key
@@ -414,8 +482,9 @@ evidence:
   the production-to-test relationship;
 - for other runtime corrections after that baseline, an explicit regression
   mapping or anchor names the current evidence; or
-- [`validation/regressions.toml`](../validation/regressions.toml) explicitly
-  maps the commit to a current functionality point and runnable check.
+- a fragment in [`validation/regressions.d/`](../validation/regressions.d/)
+  explicitly maps the commit to a current functionality point and runnable
+  check.
 
 The explicit mapping is for checks whose evidence lives outside the fixing
 patch: both Apple platforms compiling, a real container completing its
@@ -423,6 +492,38 @@ non-root lifecycle, the browser playback matrix, or the UI structural sweep.
 It is not an exemption. Unknown commits, checks, and points fail; duplicate
 claims fail; and a new corrective commit with neither a test nor a mapping
 fails the baseline.
+
+### One mapping, one file
+
+The mapping ledger is a directory, not a file. Each entry lives in its own
+`validation/regressions.d/<first-commit-prefix>-<slug>.toml`, holds exactly one
+`[[coverage]]` table, and repeats `version = 1`. The audit loads every `*.toml`
+there in file-name order and treats them as one ledger; entry order carries no
+meaning.
+
+```toml
+# validation/regressions.d/a1b2c3d4-playback-pipeline.toml
+version = 1
+
+[[coverage]]
+commits = ["a1b2c3d4"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "One sentence naming the current check that exercises the defect."
+```
+
+The file name is not cosmetic. The audit rejects a fragment whose name does not
+begin with its own first mapped commit, so two corrective changes can never
+choose the same path. That is the whole point of the directory: a single
+append-only `validation/regressions.toml` put every new entry at the same
+offset, so each merge to `main` conflicted every other open pull request
+carrying a mapping — and clearing that conflict with a rebase rewrote the SHAs a
+reviewer had pinned an approval to, spending a review cycle on nothing. Adding a
+file collides with nothing. The loader refuses to run while a shared
+`validation/regressions.toml` exists, so the hotspot cannot come back.
+
+[`validation/regressions.d/README.md`](../validation/regressions.d/README.md)
+carries the field-by-field format next to the entries themselves.
 
 ```bash
 make history-check

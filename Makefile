@@ -70,7 +70,7 @@ check: validation-lint history-check operations-check benchmark-check rust-check
 
 .PHONY: hiqlite-spike
 hiqlite-spike: ## Run the isolated M0 raft/SQLite semantic proof
-	$(CARGO) test --manifest-path spikes/hiqlite-m0/Cargo.toml \
+	$(CARGO) test --locked --manifest-path spikes/hiqlite-m0/Cargo.toml \
 	  --test hiqlite_m0 -- --nocapture
 
 .PHONY: hiqlite-baseline
@@ -80,7 +80,13 @@ hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
 	  single_voter_cost_stays_inside_the_m0_budget -- --ignored --exact --nocapture
 
 .PHONY: cluster-check
-cluster-check: ## Run compacted growth plus M1b-M2 durable-state, import, and failure contracts
+cluster-check: ## Run WAL recovery plus M1b-M2 durable-state, import, growth, and failure contracts
+	$(CARGO) test --locked --manifest-path vendor/hiqlite-wal/Cargo.toml \
+	  metadata::tests::interrupted_metadata_replacement_keeps_the_previous_record_readable \
+	  -- --exact
+	$(CARGO) test --locked --manifest-path vendor/hiqlite-wal/Cargo.toml \
+	  writer::tests::single_file_snapshot_tail_restores_its_missing_purge_boundary \
+	  -- --exact
 	$(CARGO) test --locked -p plurx-core --features hiqlite-store \
 	  --test store_contract -- --test-threads=1
 	$(CARGO) test --locked -p plurx-cluster-check \
@@ -232,6 +238,7 @@ ui-golden: ## Rewrite tests/ui-structure.golden after an intended UI change
 .PHONY: web-check
 web-check: ## Test playback policy, embedded JS, and every shipped theme
 	@node tests/playback/web-policy.test.js
+	@node tests/web/reader.test.js
 	@scripts/js-check
 	@scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
 		--foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad' \

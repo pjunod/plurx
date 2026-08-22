@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["e8f8acac", "6e98c2fb"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained HLS tests read the Dolby Vision configuration record from the published init and require a preserved Profile 5 master to advertise its dvh1 identifier; the core routing tests separately require a claimed Dolby Vision profile to survive a missing generic HDR bit while an unclaimed profile still tone-maps."
