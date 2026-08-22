@@ -383,10 +383,22 @@ mod tests {
     fn method_source(site: &SqliteTransactionSite) -> &'static str {
         let source = source_for(site.module);
         let keyword = if site.is_async { "async fn" } else { "fn" };
-        let declaration = format!("    {keyword} {}(", site.method);
+        let declaration = format!("    {keyword} {}", site.method);
         let start = source
-            .find(&declaration)
-            .unwrap_or_else(|| panic!("missing {declaration} in {}", site.module));
+            .match_indices(&declaration)
+            .find_map(|(start, _)| {
+                matches!(
+                    source.as_bytes().get(start + declaration.len()),
+                    Some(b'(' | b'<')
+                )
+                .then_some(start)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {declaration}( or {declaration}< in {}",
+                    site.module
+                )
+            });
         let tail = &source[start + declaration.len()..];
         let next_async = tail.find("\n    async fn ");
         let next_sync = tail.find("\n    fn ");
