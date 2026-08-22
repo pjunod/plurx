@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0d3868a4", "19c6a1d4"]
+points = ["server.api", "api.contract"]
+checks = ["rust-gate", "api-wire"]
+reason = "The Rust gate retains direct assertions that an artwork URL changes when its replicated item revision changes and that the authenticated response is private and immutable, so restoring a week-long unversioned public cache reproduces the stale pre-cluster image. The shared native fixture carries the revision query through the live Rust wire contract and the production Swift/Kotlin decoders, proving that cache busting remains consumable by every native client."

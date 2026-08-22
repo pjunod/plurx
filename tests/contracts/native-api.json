@@ -27,8 +27,8 @@
       "genres": ["Drama"],
       "tmdb_id": 1234,
       "imdb_id": "tt0001234",
-      "poster": "/api/v1/images/contract-poster.jpg",
-      "backdrop": "/api/v1/images/contract-backdrop.jpg",
+      "poster": "/api/v1/images/contract-poster.jpg?v=1785733260",
+      "backdrop": "/api/v1/images/contract-backdrop.jpg?v=1785733260",
       "resolution": 2160,
       "show_title": "Contract Show",
       "watch": {

@@ -126,7 +126,10 @@ fn artwork_response(path: &FsPath, bytes: Vec<u8>) -> Response {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "public, max-age=604800".to_owned()),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=604800, immutable".to_owned(),
+            ),
         ],
         bytes,
     )
@@ -411,6 +414,20 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn versioned_artwork_is_private_and_immutable() {
+        let response = artwork_response(
+            FsPath::new("287-poster.jpg"),
+            b"\xff\xd8\xff artwork".to_vec(),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, max-age=604800, immutable"
+        );
+    }
 
     #[test]
     fn peer_url_keeps_a_reverse_proxy_prefix_and_escapes_the_filename() {
