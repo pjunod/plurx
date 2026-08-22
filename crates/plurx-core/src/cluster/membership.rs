@@ -248,8 +248,12 @@ pub enum NodeRole {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterNodeRecord {
     pub node_id: String,
+    /// Host portion of the node's persisted cluster API address. The roster
+    /// needs a human-recognizable machine name, but not its listener port.
+    pub hostname: String,
     pub raft_id: u64,
     pub role: NodeRole,
+    pub is_leader: bool,
     pub reachable: bool,
     pub last_seen_at: i64,
 }
@@ -752,7 +756,7 @@ impl MembershipManager {
         let rows = inner
             .client
             .query_map::<NodeRow, _>(
-                "SELECT node_id, raft_id, last_seen_at FROM cluster_nodes \
+                "SELECT node_id, raft_id, api_address, last_seen_at FROM cluster_nodes \
                  WHERE removed_at IS NULL ORDER BY raft_id",
                 params!(),
             )
@@ -762,12 +766,14 @@ impl MembershipManager {
             .filter(|row| members.contains(&(row.raft_id as u64)))
             .map(|row| ClusterNodeRecord {
                 node_id: row.node_id,
+                hostname: advertised_hostname(&row.api_address),
                 raft_id: row.raft_id as u64,
                 role: if voters.contains(&(row.raft_id as u64)) {
                     NodeRole::Voter
                 } else {
                     NodeRole::Learner
                 },
+                is_leader: metrics.current_leader == Some(row.raft_id as u64),
                 reachable: now.saturating_sub(row.last_seen_at) <= NODE_REACHABLE_WINDOW_MS,
                 last_seen_at: row.last_seen_at,
             })
@@ -1529,6 +1535,7 @@ impl From<&mut Row<'_>> for JoinTokenRow {
 struct NodeRow {
     node_id: String,
     raft_id: i64,
+    api_address: String,
     last_seen_at: i64,
 }
 
@@ -1566,6 +1573,7 @@ impl From<&mut Row<'_>> for NodeRow {
         Self {
             node_id: row.get("node_id"),
             raft_id: row.get("raft_id"),
+            api_address: row.get("api_address"),
             last_seen_at: row.get("last_seen_at"),
         }
     }
@@ -1573,6 +1581,21 @@ impl From<&mut Row<'_>> for NodeRow {
 
 fn artwork_auth_message(node_id: &str, timestamp_ms: i64, filename: &str) -> String {
     format!("plurx-artwork-v1\n{node_id}\n{timestamp_ms}\n{filename}")
+}
+
+/// Strip the listener port while preserving DNS names, IPv4, and bracketed
+/// IPv6. Cluster addresses are validated and persisted as `host:port`, so the
+/// original address is the safest fallback for a legacy or malformed row.
+fn advertised_hostname(address: &str) -> String {
+    let host = if let Some(bracketed) = address.strip_prefix('[') {
+        bracketed.rsplit_once("]:")
+    } else {
+        address.rsplit_once(':')
+    };
+    host.filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+        .map(|(host, _)| host)
+        .unwrap_or(address)
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -1651,6 +1674,15 @@ mod tests {
             MembershipError::QuorumLoss.code(),
             "removal_would_lose_quorum"
         );
+    }
+
+    #[test]
+    fn advertised_hostname_hides_only_the_listener_port() {
+        assert_eq!(advertised_hostname("plurx-a.lan:32402"), "plurx-a.lan");
+        assert_eq!(advertised_hostname("192.0.2.40:32402"), "192.0.2.40");
+        assert_eq!(advertised_hostname("[2001:db8::40]:32402"), "2001:db8::40");
+        assert_eq!(advertised_hostname("legacy-host"), "legacy-host");
+        assert_eq!(advertised_hostname("legacy:host"), "legacy:host");
     }
 
     #[test]
