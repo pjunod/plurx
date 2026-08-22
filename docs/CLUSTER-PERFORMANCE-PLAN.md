@@ -349,8 +349,8 @@ processes may submit at most `N`, independent of request count.
 **Acceptance:** the `cluster.auth` CI point and HTTP auth matrix pass; revocation
 remains immediate; 120 sequential requests inside one window produce no more
 than one physical activity entry after the initial due read. A synchronized
-120-request burst on each of three HTTP nodes produces no more than three
-entries and exactly one durable timestamp change.
+120-request burst distributed across three HTTP nodes produces no more than
+three entries and exactly one durable timestamp change.
 
 ### 6.3 P2 — instrument Store and Raft cost
 

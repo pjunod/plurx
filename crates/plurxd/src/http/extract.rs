@@ -8,7 +8,9 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use plurx_core::auth;
+use plurx_core::domain::ApiKey;
 use plurx_core::domain::User;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::error::ApiError;
 use crate::state::AppState;
@@ -46,10 +48,9 @@ pub struct ScopedKey(pub plurx_core::domain::ApiKey);
 impl ScopedKey {
     /// Extract a key from the request and require `scope`.
     ///
-    /// `last_used_at` is bumped on every successful check. It is the only
-    /// way an operator can tell a key that is working from one that was
-    /// issued and forgotten — and the forgotten ones are what should be
-    /// revoked.
+    /// `last_used_at` is refreshed at most once per minute on successful
+    /// checks. It remains a useful activity signal without turning every
+    /// request into a replicated write.
     pub async fn require(
         parts: &mut Parts,
         state: &AppState,
@@ -76,10 +77,24 @@ impl ScopedKey {
             // credential is valid and the answer is about permission.
             return Err(ApiError::Forbidden);
         }
-        let _ = state.store.touch_api_key(key.id).await;
+        if key_activity_refresh_due(&key, unix_seconds()) {
+            let _ = state.store.touch_api_key(key.id).await;
+        }
         Ok(ScopedKey(key))
     }
 }
+
+fn unix_seconds() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+}
+
+fn key_activity_refresh_due(key: &ApiKey, now: Option<i64>) -> bool {
+    now.is_some_and(|now| auth::activity_refresh_due(key.last_used_at, now))
+}
+
 /// The raw bearer token, for endpoints that operate on the token itself
 /// (e.g. logout). Does not validate the token against the store.
 pub struct RawToken(pub String);
@@ -206,7 +221,7 @@ impl FromRequestParts<AppState> for AdminUser {
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::{key_activity_refresh_due, percent_decode};
     use plurx_core::auth;
     use plurx_core::domain::{scopes, ApiKey};
 
@@ -248,6 +263,19 @@ mod tests {
         for s in scopes::ALL {
             assert!(!revoked.allows(s), "a revoked key still allows {s}");
         }
+    }
+
+    #[test]
+    fn key_activity_refresh_is_coalesced_without_affecting_authorization() {
+        let mut k = key(&[scopes::SCAN_TRIGGER], false);
+        assert!(key_activity_refresh_due(&k, Some(1_000)));
+
+        k.last_used_at = Some(940);
+        assert!(!key_activity_refresh_due(&k, Some(1_000)));
+
+        k.last_used_at = Some(939);
+        assert!(key_activity_refresh_due(&k, Some(1_000)));
+        assert!(!key_activity_refresh_due(&k, None));
     }
 
     #[test]
