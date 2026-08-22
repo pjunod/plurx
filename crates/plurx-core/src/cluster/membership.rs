@@ -6,8 +6,10 @@
 //! exposing listener ports or secrets, and remove a voter safely.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::CStr;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -18,6 +20,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cluster::coordination::removed_job_owner_key;
 use crate::domain::{OfflinePackage, OfflineRemovalPlanEntry, OfflineRemovalReport};
 use crate::store::{ArtworkRepairFence, Store, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION};
 
@@ -100,6 +103,20 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
          owner_node_id TEXT NOT NULL, \
          leader_term INTEGER NOT NULL, \
          generation INTEGER NOT NULL) STRICT",
+    // These triggers make the removed-owner fence authoritative for every
+    // client version. A still-running older binary uses lease SQL that does
+    // not know about the settings marker, but SQLite evaluates these guards
+    // on the replicated state machine before accepting its insert or update.
+    "CREATE TRIGGER IF NOT EXISTS job_leases_removed_owner_insert \
+         BEFORE INSERT ON job_leases \
+         WHEN EXISTS (SELECT 1 FROM settings \
+                      WHERE key = 'internal.cluster_job_owner_removed.' || NEW.owner_node_id) \
+         BEGIN SELECT RAISE(ABORT, 'cluster job lease owner has been removed'); END",
+    "CREATE TRIGGER IF NOT EXISTS job_leases_removed_owner_update \
+         BEFORE UPDATE OF owner_node_id, expires_at_ms, revision ON job_leases \
+         WHEN EXISTS (SELECT 1 FROM settings \
+                      WHERE key = 'internal.cluster_job_owner_removed.' || NEW.owner_node_id) \
+         BEGIN SELECT RAISE(ABORT, 'cluster job lease owner has been removed'); END",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -491,6 +508,7 @@ impl MembershipManager {
                 return Err(MembershipError::Incompatible);
             }
         }
+        self.backfill_removed_job_owner_fences().await?;
         self.heartbeat().await?;
         self.publish_http_url().await
     }
@@ -1173,6 +1191,7 @@ impl MembershipManager {
         let target_raft_id = target.raft_id as u64;
         if !voters.contains(&target_raft_id) {
             if self.node_is_tombstoned(node_id).await? {
+                self.fence_removed_job_owner(node_id).await?;
                 self.finalize_node_removal(node_id).await;
                 return self.status().await;
             }
@@ -1269,6 +1288,7 @@ impl MembershipManager {
             .collect::<BTreeSet<_>>();
         if !voters.contains(&inner.identity.raft_id) {
             if self.node_is_tombstoned(&node_id).await? {
+                self.fence_removed_job_owner(&node_id).await?;
                 self.finalize_node_removal(&node_id).await;
                 return Ok(());
             }
@@ -1396,14 +1416,38 @@ impl MembershipManager {
 
     async fn begin_node_removal(&self, node_id: &str) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
+        let now = unix_ms()?;
+        let owner_fence_key = removed_job_owner_key(node_id);
         inner
             .client
-            .execute(
-                "INSERT INTO cluster_node_removals (node_id, started_at) VALUES ($1, $2) \
-                 ON CONFLICT(node_id) DO NOTHING",
-                params!(node_id, unix_ms()?),
-            )
-            .await?;
+            .txn(vec![
+                (
+                    "INSERT INTO cluster_node_removals (node_id, started_at) VALUES ($1, $2) \
+                     ON CONFLICT(node_id) DO NOTHING"
+                        .to_owned(),
+                    params!(node_id, now),
+                ),
+                (
+                    "INSERT INTO settings (key, value, updated_at) VALUES ($1, '1', $2) \
+                     ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at"
+                        .to_owned(),
+                    params!(owner_fence_key.as_str(), now / 1_000),
+                ),
+                (
+                    "UPDATE job_leases SET \
+                       owner_node_id = 'internal.removed-job-owner:' || owner_node_id, \
+                       expires_at_ms = CASE WHEN expires_at_ms < $1 THEN expires_at_ms ELSE $1 END, \
+                       revision = CASE WHEN revision < 9223372036854775807 \
+                         THEN revision + 1 ELSE revision END, \
+                       updated_at_ms = $1 \
+                     WHERE owner_node_id = $2"
+                        .to_owned(),
+                    params!(now, node_id),
+                ),
+            ])
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         if !self.node_is_tombstoned(node_id).await? {
             return Err(MembershipError::Internal(
                 "node removal fence did not become authoritative".to_owned(),
@@ -1412,15 +1456,96 @@ impl MembershipManager {
         Ok(())
     }
 
-    async fn rollback_node_removal(&self, node_id: &str) -> Result<(), MembershipError> {
+    /// Restore the durable job-owner fence for state created before that
+    /// invariant existed, and invalidate tokens by changing their row identity
+    /// even when their revision counter is already exhausted.
+    async fn backfill_removed_job_owner_fences(&self) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
+        let now = unix_ms()?;
         inner
             .client
-            .execute(
-                "DELETE FROM cluster_node_removals WHERE node_id = $1",
-                params!(node_id),
-            )
-            .await?;
+            .txn(vec![
+                (
+                    "INSERT INTO settings (key, value, updated_at) \
+                     SELECT 'internal.cluster_job_owner_removed.' || removed.node_id, '1', $1 \
+                     FROM (SELECT node_id FROM cluster_nodes WHERE removed_at IS NOT NULL \
+                           UNION SELECT node_id FROM cluster_node_removals) AS removed \
+                     WHERE 1 \
+                     ON CONFLICT(key) DO UPDATE SET value = '1'"
+                        .to_owned(),
+                    params!(now / 1_000),
+                ),
+                (
+                    "UPDATE job_leases SET \
+                       owner_node_id = 'internal.removed-job-owner:' || owner_node_id, \
+                       expires_at_ms = CASE WHEN expires_at_ms < $1 THEN expires_at_ms ELSE $1 END, \
+                       revision = CASE WHEN revision < 9223372036854775807 \
+                         THEN revision + 1 ELSE revision END, \
+                       updated_at_ms = $1 \
+                     WHERE EXISTS (SELECT 1 FROM settings \
+                       WHERE key = 'internal.cluster_job_owner_removed.' || job_leases.owner_node_id)"
+                        .to_owned(),
+                    params!(now),
+                ),
+            ])
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    /// Re-establish a single known removed identity without creating a new
+    /// pending-removal record. This is used by idempotent removal calls for
+    /// clusters whose tombstones predate the job-owner fence.
+    async fn fence_removed_job_owner(&self, node_id: &str) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        let now = unix_ms()?;
+        let owner_fence_key = removed_job_owner_key(node_id);
+        inner
+            .client
+            .txn(vec![
+                (
+                    "INSERT INTO settings (key, value, updated_at) VALUES ($1, '1', $2) \
+                     ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at"
+                        .to_owned(),
+                    params!(owner_fence_key, now / 1_000),
+                ),
+                (
+                    "UPDATE job_leases SET \
+                       owner_node_id = 'internal.removed-job-owner:' || owner_node_id, \
+                       expires_at_ms = CASE WHEN expires_at_ms < $1 THEN expires_at_ms ELSE $1 END, \
+                       revision = CASE WHEN revision < 9223372036854775807 \
+                         THEN revision + 1 ELSE revision END, \
+                       updated_at_ms = $1 \
+                     WHERE owner_node_id = $2"
+                        .to_owned(),
+                    params!(now, node_id),
+                ),
+            ])
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    async fn rollback_node_removal(&self, node_id: &str) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        let owner_fence_key = removed_job_owner_key(node_id);
+        inner
+            .client
+            .txn(vec![
+                (
+                    "DELETE FROM cluster_node_removals WHERE node_id = $1".to_owned(),
+                    params!(node_id),
+                ),
+                (
+                    "DELETE FROM settings WHERE key = $1".to_owned(),
+                    params!(owner_fence_key),
+                ),
+            ])
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         if self.node_is_tombstoned(node_id).await? {
             return Err(MembershipError::Internal(
                 "node removal fence rollback could not be verified".to_owned(),
@@ -2236,6 +2361,7 @@ fn short_hostname(raw: &str) -> Option<String> {
     let label = hostname.split('.').next().unwrap_or_default().trim();
     if label.is_empty()
         || label.eq_ignore_ascii_case("localhost")
+        || label.eq_ignore_ascii_case("unknown-host")
         || looks_like_container_id(label)
         || label.chars().any(char::is_control)
     {
@@ -2252,9 +2378,133 @@ fn looks_like_container_id(label: &str) -> bool {
 }
 
 fn membership_hostname(reported: &str, api_address: &str) -> String {
+    membership_hostname_with_lookup(reported, api_address, cached_reverse_hostname)
+}
+
+fn membership_hostname_with_lookup(
+    reported: &str,
+    api_address: &str,
+    reverse_lookup: impl FnOnce(IpAddr) -> Option<String>,
+) -> String {
+    let advertised = advertised_host(api_address);
     short_hostname(reported)
-        .or_else(|| short_hostname(&advertised_host(api_address)))
+        .or_else(|| short_hostname(&advertised))
+        .or_else(|| {
+            advertised
+                .parse::<IpAddr>()
+                .ok()
+                .and_then(reverse_lookup)
+                .and_then(|hostname| short_hostname(&hostname))
+        })
         .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
+fn cached_reverse_hostname(address: IpAddr) -> Option<String> {
+    static CACHE: OnceLock<Mutex<BTreeMap<IpAddr, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(hostname) = cache.get(&address) {
+            return Some(hostname.clone());
+        }
+    }
+
+    let hostname = reverse_hostname(address)?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(address, hostname.clone());
+    }
+    Some(hostname)
+}
+
+#[cfg(unix)]
+fn reverse_hostname(address: IpAddr) -> Option<String> {
+    match address {
+        IpAddr::V4(address) => {
+            // SAFETY: an all-zero sockaddr is a valid base value. The family
+            // and address fields below are initialized before libc reads it.
+            let mut socket: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            socket.sin_family = libc::AF_INET as libc::sa_family_t;
+            socket.sin_addr.s_addr = u32::from_ne_bytes(address.octets());
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))]
+            {
+                socket.sin_len = std::mem::size_of_val(&socket) as u8;
+            }
+            reverse_sockaddr(
+                (&raw const socket).cast(),
+                std::mem::size_of_val(&socket) as libc::socklen_t,
+            )
+        }
+        IpAddr::V6(address) => {
+            // SAFETY: an all-zero sockaddr is a valid base value. The family
+            // and address fields below are initialized before libc reads it.
+            let mut socket: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            socket.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            socket.sin6_addr.s6_addr = address.octets();
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))]
+            {
+                socket.sin6_len = std::mem::size_of_val(&socket) as u8;
+            }
+            reverse_sockaddr(
+                (&raw const socket).cast(),
+                std::mem::size_of_val(&socket) as libc::socklen_t,
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reverse_sockaddr(
+    address: *const libc::sockaddr,
+    address_len: libc::socklen_t,
+) -> Option<String> {
+    let mut hostname = [0 as libc::c_char; 1025];
+    // SAFETY: `address` points to a fully initialized sockaddr whose concrete
+    // length is supplied alongside it. `hostname` is writable for its full
+    // declared size and remains alive until the C string is copied below.
+    let result = unsafe {
+        libc::getnameinfo(
+            address,
+            address_len,
+            hostname.as_mut_ptr(),
+            hostname.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: successful getnameinfo writes a NUL-terminated hostname into
+    // the provided buffer.
+    unsafe { CStr::from_ptr(hostname.as_ptr()) }
+        .to_str()
+        .ok()
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(not(unix))]
+fn reverse_hostname(_address: IpAddr) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -2405,6 +2655,27 @@ mod tests {
     fn docker_container_ids_are_not_machine_hostnames() {
         assert_eq!(short_hostname("1cb4bdb624dc"), None);
         assert_eq!(short_hostname(&"a".repeat(64)), None);
+    }
+
+    #[test]
+    fn reverse_dns_supplies_a_short_name_for_an_ip_only_node() {
+        let hostname =
+            membership_hostname_with_lookup("unknown-host", "192.168.4.7:32402", |address| {
+                assert_eq!(address, "192.168.4.7".parse::<IpAddr>().expect("ip"));
+                Some("nuc3.home.arpa".to_owned())
+            });
+
+        assert_eq!(hostname, "nuc3");
+    }
+
+    #[test]
+    fn reported_hostname_wins_without_a_reverse_lookup() {
+        let hostname =
+            membership_hostname_with_lookup("nuc4.example.net", "192.168.4.8:32402", |_| {
+                panic!("reported hostnames must not trigger reverse DNS")
+            });
+
+        assert_eq!(hostname, "nuc4");
     }
 
     #[test]

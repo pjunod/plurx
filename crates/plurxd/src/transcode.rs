@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plurx_core::domain::PlaybackEvent;
-use plurx_core::store::{keys, Store};
+use plurx_core::store::{keys, PublicationFence, PublicationStore, Store};
 use plurx_core::transcode::{
     self, EffectiveRateControl, Encoder, EncoderCaps, OutputGrade, Pacing, Pipeline,
     PipelineDigest, QualityRateControlValidation, QualityRc, RateMode, Recipe, ToneMap,
@@ -2930,7 +2930,7 @@ pub enum OfflineProduceOutcome {
 /// The policy and source shared by the cache-claim and encoder stages of one
 /// portable production attempt. Keeping these together makes it much harder
 /// for a resume path to accidentally change one input between the two stages.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PortableProduction<'a> {
     file: &'a plurx_core::domain::MediaFile,
     opts: &'a TranscodeOptions,
@@ -2939,6 +2939,7 @@ struct PortableProduction<'a> {
     yield_to_offline: bool,
     cancelled: Option<&'a tokio_util::sync::CancellationToken>,
     offline_package_id: Option<&'a str>,
+    publication_fence: Option<PublicationFence>,
 }
 
 /// Everything an earlier pass already encoded, in order.
@@ -3182,6 +3183,9 @@ pub struct TranscodeManager {
     /// boot ([`crate::ffmpeg::has_dovi_passthrough`]). Its own field, and its
     /// own probe: the SDR reshape graph proves nothing about a PQ output.
     dovi_passthrough: bool,
+    /// Whether boot also proved the P010 upload → QSV Main10 encode half.
+    /// This is the measured route that makes the 2160p HDR10 rung realtime.
+    dovi_passthrough_qsv: bool,
     dovi_proofs: std::sync::Mutex<HashMap<String, bool>>,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
@@ -3243,6 +3247,7 @@ impl TranscodeManager {
             dv_strippable: false,
             dovi_reshape: false,
             dovi_passthrough: false,
+            dovi_passthrough_qsv: false,
             dovi_proofs: std::sync::Mutex::new(HashMap::new()),
             cached_limits: std::sync::RwLock::new(None),
             #[cfg(test)]
@@ -3267,6 +3272,11 @@ impl TranscodeManager {
 
     pub fn with_dovi_passthrough(mut self, dovi_passthrough: bool) -> Self {
         self.dovi_passthrough = dovi_passthrough;
+        self
+    }
+
+    pub fn with_dovi_passthrough_qsv(mut self, proved: bool) -> Self {
+        self.dovi_passthrough_qsv = proved;
         self
     }
 
@@ -3530,7 +3540,8 @@ impl TranscodeManager {
     ///   profiles the RPU renderer is actually built for
     ///   ([`plurx_core::playback::dolby_vision_needs_rpu_render`], which is
     ///   `needs_dovi_reshape` without the refusal messages).
-    /// - **Not the 1080p rung.** See [`HDR10_HEIGHT`].
+    /// - **Not a measured encoder/geometry pair.** See [`HDR10_HEIGHT`] and
+    ///   [`HDR10_4K_HEIGHT`].
     /// - **Not proved by this build**, or **not proved by this source**: the
     ///   boot probe says the graph runs, and `require_dovi_renderer` says
     ///   this file's RPU actually changes pixels through it. The second is the
@@ -3545,10 +3556,11 @@ impl TranscodeManager {
         file: &plurx_core::domain::MediaFile,
         requested: bool,
         target_height: i64,
+        encoder: Encoder,
     ) -> Result<OutputGrade, String> {
         if !requested
             || !plurx_core::playback::dolby_vision_needs_rpu_render(file)
-            || !hdr10_rung_fits(file, target_height)
+            || !hdr10_rung_fits(file, target_height, encoder)
         {
             return Ok(OutputGrade::Sdr);
         }
@@ -3560,6 +3572,13 @@ impl TranscodeManager {
             );
             return Ok(OutputGrade::Sdr);
         }
+        if encoder == Encoder::Qsv && !self.dovi_passthrough_qsv {
+            tracing::info!(
+                file = file.id,
+                "this node did not prove the Dolby Vision HDR10 QSV encode graph; using the measured software/SDR route"
+            );
+            return Ok(OutputGrade::Sdr);
+        }
         // The same per-source proof the SDR reshape rung demands: that the
         // decoder really exports RPU side data for THIS file and that
         // applying it really changes pixels. A `hdr=dolby_vision` column is a
@@ -3568,6 +3587,39 @@ impl TranscodeManager {
             return Ok(OutputGrade::Sdr);
         }
         Ok(OutputGrade::Hdr10)
+    }
+
+    /// Resolve grade and encoder together. The HDR filter and encoder are one
+    /// measured route: choosing QSV through the ordinary SDR selector first
+    /// could pair a PQ graph with H.264, while pinning every HDR request to
+    /// software would throw away the node's proved 4K route.
+    async fn encoder_and_grade_for(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        requested: bool,
+        target_height: i64,
+    ) -> Result<(Encoder, OutputGrade), String> {
+        let hdr_candidate = if requested
+            && plurx_core::playback::dolby_vision_needs_rpu_render(file)
+            && matches!(target_height, HDR10_HEIGHT | HDR10_4K_HEIGHT)
+        {
+            let preferred = self.encoder().await;
+            if preferred == Encoder::Qsv && self.dovi_passthrough_qsv {
+                Encoder::Qsv
+            } else {
+                Encoder::Software
+            }
+        } else {
+            self.encoder_for_file(file).await?
+        };
+        let grade = self
+            .hdr10_grade_for(file, requested, target_height, hdr_candidate)
+            .await?;
+        if grade == OutputGrade::Hdr10 {
+            Ok((hdr_candidate, grade))
+        } else {
+            Ok((self.encoder_for_file(file).await?, grade))
+        }
     }
 
     async fn encoder_for_file(
@@ -3922,7 +3974,7 @@ impl TranscodeManager {
             // A cache hit is the whole stream from the beginning.
             media_origin_seconds: 0.0,
             grade: opts.pipeline.output_grade(),
-            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade()),
+            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade(), opts.target_height),
             hls_supplemental_codecs: None,
             target_height: opts.target_height,
             encoder_label: Mutex::new("cached"),
@@ -4009,12 +4061,51 @@ impl TranscodeManager {
     /// Returns the recipe hash on success, `None` when there was nothing to do
     /// (already cached, already claimed by another producer, no cache
     /// configured) — neither of which is a failure.
+    #[cfg(test)]
     pub async fn produce(
         &self,
         file: &plurx_core::domain::MediaFile,
         target_height: i64,
         deadline: Instant,
     ) -> Result<Option<Produced>, String> {
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        self.produce_attempt(file, target_height, deadline, &cancelled, None)
+            .await
+    }
+
+    /// Speculative production with an ownership token. Losing the cluster
+    /// candidate-pass lease cancels the active ffmpeg child at the same
+    /// checkpoint used for live/offline preemption, so a stale node cannot
+    /// keep consuming an encoder or finish a cache publication.
+    pub async fn produce_cancelled(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        deadline: Instant,
+        cancelled: &tokio_util::sync::CancellationToken,
+        publication_fence: PublicationFence,
+    ) -> Result<Option<Produced>, String> {
+        self.produce_attempt(
+            file,
+            target_height,
+            deadline,
+            cancelled,
+            Some(publication_fence),
+        )
+        .await
+    }
+
+    async fn produce_attempt(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        deadline: Instant,
+        cancelled: &tokio_util::sync::CancellationToken,
+        publication_fence: Option<PublicationFence>,
+    ) -> Result<Option<Produced>, String> {
+        if cancelled.is_cancelled() {
+            return Ok(None);
+        }
         if self.cache.is_none() {
             return Ok(None);
         }
@@ -4055,6 +4146,9 @@ impl TranscodeManager {
         let hash = self
             .effective_recipe(&mut digest, file, &opts, encoder, false)
             .hash();
+        if cancelled.is_cancelled() {
+            return Ok(None);
+        }
 
         Ok(
             match self
@@ -4065,8 +4159,9 @@ impl TranscodeManager {
                         encoder,
                         deadline,
                         yield_to_offline: true,
-                        cancelled: None,
+                        cancelled: Some(cancelled),
                         offline_package_id: None,
+                        publication_fence,
                     },
                     hash,
                 )
@@ -4160,6 +4255,7 @@ impl TranscodeManager {
                     yield_to_offline: false,
                     cancelled: Some(cancelled),
                     offline_package_id: Some(package_id),
+                    publication_fence: None,
                 },
                 hash,
             )
@@ -4198,16 +4294,25 @@ impl TranscodeManager {
             encoder: _,
             deadline: _,
             yield_to_offline: _,
-            cancelled: _,
+            cancelled,
             offline_package_id,
-        } = request;
+            publication_fence,
+        } = &request;
+        let cancelled = *cancelled;
+        let offline_package_id = *offline_package_id;
         let cache = self.cache.as_ref().ok_or("no cache configured")?;
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         if let Some(cached) = self
             .store
             .cache_hit(&hash, &cache.node_id)
             .await
             .map_err(|error| error.to_string())?
         {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Ok(OfflineProduceOutcome::Yielded);
+            }
             let playlist =
                 tokio::fs::read_to_string(cache.dir.join(&cached.relative_dir).join("index.m3u8"))
                     .await
@@ -4231,21 +4336,55 @@ impl TranscodeManager {
             }));
         }
 
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         self.ensure_text_subtitle(file, opts.subtitle_burn.as_ref())
             .await?;
-        let relative = format!("{}/{hash}", &hash[..2]);
-        let taken = self
-            .store
-            .claim_cache_entry(
-                &hash,
-                file.id,
-                CACHE_RECIPE_VERSION,
-                &cache.node_id,
-                &relative,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let temp = crate::cachekeep::staging_dir(&cache.dir, &hash);
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
+        let generation = if let Some(fence) = publication_fence {
+            let Some(lease) = fence.snapshot().await else {
+                return Ok(OfflineProduceOutcome::Yielded);
+            };
+            Some(lease.fence)
+        } else {
+            None
+        };
+        let relative = generation.map_or_else(
+            || format!("{}/{hash}", &hash[..2]),
+            |fence| format!("{}/{hash}-f{fence}", &hash[..2]),
+        );
+        let taken = if let Some(fence) = publication_fence {
+            PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                .claim_cache_entry(
+                    &hash,
+                    file.id,
+                    CACHE_RECIPE_VERSION,
+                    &cache.node_id,
+                    &relative,
+                )
+                .await
+        } else {
+            self.store
+                .claim_cache_entry(
+                    &hash,
+                    file.id,
+                    CACHE_RECIPE_VERSION,
+                    &cache.node_id,
+                    &relative,
+                )
+                .await
+        }
+        .map_err(|error| error.to_string())?;
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
+        let temp = generation.map_or_else(
+            || crate::cachekeep::staging_dir(&cache.dir, &hash),
+            |fence| cache.dir.join("tmp").join(format!("{hash}-f{fence}")),
+        );
         if !taken {
             if tokio::fs::metadata(&temp).await.is_err() {
                 tracing::debug!(
@@ -4265,32 +4404,64 @@ impl TranscodeManager {
         let published = match self.produce_into(&temp, &hash, &request).await {
             Ok(Some(published)) => published,
             Ok(None) => {
-                self.touch_claim(&hash, &cache.node_id).await;
+                if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    return Ok(OfflineProduceOutcome::Yielded);
+                }
+                if let Some(fence) = publication_fence {
+                    if let Err(error) = PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                        .touch_cache_claim(&hash, &cache.node_id)
+                        .await
+                    {
+                        tracing::warn!(recipe = %hash, error = %error, "could not mark a fenced pre-transcode as still in progress");
+                    }
+                } else {
+                    self.touch_claim(&hash, &cache.node_id).await;
+                }
                 return Ok(OfflineProduceOutcome::Yielded);
             }
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temp).await;
-                let _ = self
-                    .store
-                    .forget_cache_entry(&hash, &cache.node_id, "local")
-                    .await;
+                if !cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    if let Some(fence) = publication_fence {
+                        let _ = PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                            .forget_cache_entry(&hash, &cache.node_id, "local")
+                            .await;
+                    } else {
+                        let _ = self
+                            .store
+                            .forget_cache_entry(&hash, &cache.node_id, "local")
+                            .await;
+                    }
+                }
                 return Err(error);
             }
         };
 
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         let final_dir = cache.dir.join(&relative);
         if let Some(parent) = final_dir.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|error| format!("creating {}: {error}", parent.display()))?;
         }
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
         tokio::fs::rename(&temp, &final_dir)
             .await
             .map_err(|error| format!("publishing {}: {error}", final_dir.display()))?;
-        self.store
-            .complete_cache_entry(&hash, &cache.node_id, published.bytes)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Some(fence) = publication_fence {
+            PublicationStore::fenced(self.store.as_ref(), fence.clone())
+                .complete_cache_entry(&hash, &cache.node_id, &relative, published.bytes)
+                .await
+        } else {
+            self.store
+                .complete_cache_entry(&hash, &cache.node_id, published.bytes)
+                .await
+        }
+        .map_err(|error| error.to_string())?;
         tracing::info!(
             recipe = %hash,
             file = file.id,
@@ -4338,7 +4509,8 @@ impl TranscodeManager {
             yield_to_offline,
             cancelled,
             offline_package_id,
-        } = *request;
+            publication_fence: _,
+        } = request.clone();
         tokio::fs::create_dir_all(temp)
             .await
             .map_err(|e| format!("creating {}: {e}", temp.display()))?;
@@ -4483,7 +4655,12 @@ impl TranscodeManager {
             }
 
             match ended {
-                PartEnd::Finished => return publish_from(temp, &parts).await,
+                PartEnd::Finished => {
+                    if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        return Ok(None);
+                    }
+                    return publish_from(temp, &parts).await;
+                }
                 PartEnd::Preempted | PartEnd::Deadline => {
                     tracing::info!(
                         recipe = %hash, spawned,
@@ -4541,6 +4718,10 @@ impl TranscodeManager {
         cancelled: Option<&tokio_util::sync::CancellationToken>,
     ) -> PartEnd {
         loop {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                let _ = child.kill().await;
+                return PartEnd::Preempted;
+            }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return PartEnd::Finished,
                 Ok(Some(status)) => {
@@ -4558,10 +4739,6 @@ impl TranscodeManager {
                         .offline_waiting
                         .load(std::sync::atomic::Ordering::Acquire))
             {
-                let _ = child.kill().await;
-                return PartEnd::Preempted;
-            }
-            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 let _ = child.kill().await;
                 return PartEnd::Preempted;
             }
@@ -5328,6 +5505,18 @@ impl TranscodeManager {
         file: Option<&plurx_core::domain::MediaFile>,
         prior: Option<&plurx_core::domain::NetworkPrior>,
     ) -> i64 {
+        self.auto_height_for_request(file, prior, false).await
+    }
+
+    /// Grade-aware Auto. A web client that asked for HDR10 leaves its first
+    /// height unset so this node, which alone knows the boot-proved encoder,
+    /// can start at the highest measured rung.
+    pub async fn auto_height_for_request(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+        prior: Option<&plurx_core::domain::NetworkPrior>,
+        hdr10_requested: bool,
+    ) -> i64 {
         let Some(file) = file else {
             return self.auto_height(None, prior).await;
         };
@@ -5335,7 +5524,9 @@ impl TranscodeManager {
         // Follow the encoder and filter graph this exact file can reach. This
         // used to apply only to Dolby Vision reshapes, leaving every ordinary
         // 4K SDR hardware transcode under a global 1080p policy cap.
-        let max = self.capability_height_ceiling(Some(file)).await;
+        let max = self
+            .capability_height_ceiling_for_request(Some(file), hdr10_requested)
+            .await;
         let current = source_height
             .filter(|height| *height > 0)
             .unwrap_or(max.min(AUTO_HARDWARE_PROBED_HEIGHT))
@@ -5360,10 +5551,38 @@ impl TranscodeManager {
     /// judgement about one link at one moment, and hiding rungs on that basis
     /// would keep a recovered link from ever being offered them again. This
     /// is the capability ceiling only.
+    #[cfg(test)]
     pub async fn capability_height_ceiling(
         &self,
         file: Option<&plurx_core::domain::MediaFile>,
     ) -> i64 {
+        self.capability_height_ceiling_for_request(file, false)
+            .await
+    }
+
+    pub async fn capability_height_ceiling_for_request(
+        &self,
+        file: Option<&plurx_core::domain::MediaFile>,
+        hdr10_requested: bool,
+    ) -> i64 {
+        // The exact Profile-5 → HDR10 → QSV chain was measured above realtime
+        // at both 1080p and 2160p. This branch is intentionally narrower than
+        // generic "hardware HDR": it requires the selected QSV family and the
+        // boot proof of its Main10 upload/encode graph.
+        if hdr10_requested
+            && self.dovi_passthrough
+            && self.dovi_passthrough_qsv
+            && self.encoder().await == Encoder::Qsv
+        {
+            if let Some(file) = file {
+                if hdr10_rung_fits(file, HDR10_4K_HEIGHT, Encoder::Qsv) {
+                    return HDR10_4K_HEIGHT;
+                }
+                if hdr10_rung_fits(file, HDR10_HEIGHT, Encoder::Qsv) {
+                    return HDR10_HEIGHT;
+                }
+            }
+        }
         // A Dolby Vision reshape is capped by whichever encoder it can
         // actually reach — hardware when the pairing is proved, software
         // otherwise — not unconditionally by the software rung.
@@ -5374,20 +5593,7 @@ impl TranscodeManager {
                 .unwrap_or(Encoder::Software),
             _ => self.encoder().await,
         };
-        if encoder == Encoder::Software {
-            return AUTO_SOFTWARE_HEIGHT;
-        }
-        match file {
-            // The boot probe exercises a 4K HDR decode and tone-map into a
-            // 1080p hardware encode. Do not turn that proof into a claim about
-            // an unmeasured 4K HDR output.
-            Some(file) if file.hdr.is_some() => AUTO_HARDWARE_PROBED_HEIGHT,
-            // A known SDR source needs no tone-map graph. Validated hardware
-            // H.264 can retain its geometry; network evidence is applied by
-            // `auto_height_from_prior`, not guessed here.
-            Some(_) => MAX_HEIGHT,
-            None => AUTO_HARDWARE_PROBED_HEIGHT,
-        }
+        capability_height_for_encoder(file, encoder)
     }
 
     /// The admin's playback language preferences (Settings → Playback
@@ -5655,10 +5861,11 @@ impl TranscodeManager {
         // hardware slot and no place in the queue — the work is already done,
         // and making a viewer wait behind a busy GPU for bytes that exist is
         // the one thing this cache exists to prevent.
-        let mut encoder = self.encoder_for_file(&file).await?;
-        // Resolved once, before the cache lookup: the grade changes the bytes,
-        // so it has to be part of the recipe a hit is looked up by.
-        let grade = self.hdr10_grade_for(&file, hdr10, target_height).await?;
+        // Resolved together, once, before the cache lookup: the grade and
+        // encoder both change the bytes and therefore the recipe identity.
+        let (mut encoder, grade) = self
+            .encoder_and_grade_for(&file, hdr10, target_height)
+            .await?;
         let opts = self.live_lookup_options(
             rate_control,
             encoder,
@@ -5719,6 +5926,14 @@ impl TranscodeManager {
         let work = Workload::of(&file, target_height);
         let admission = self.admit_live(encoder, work, QUEUE_WAIT).await?;
         encoder = admission.encoder;
+        if grade == OutputGrade::Hdr10
+            && target_height == HDR10_4K_HEIGHT
+            && encoder != Encoder::Qsv
+        {
+            return Err(capacity_error(
+                "the proved 4K HDR10 QuickSync slot is busy; retry at 1080p",
+            ));
+        }
         let hw_slot = admission.hw_slot;
         let sw_permit = admission.sw_permit;
 
@@ -5818,7 +6033,7 @@ impl TranscodeManager {
             // it was asked to: no probe, no discrepancy to resolve.
             media_origin_seconds: start_seconds,
             grade: opts.pipeline.output_grade(),
-            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade()),
+            hls_codecs: transcoded_hls_codecs(opts.pipeline.output_grade(), opts.target_height),
             hls_supplemental_codecs: None,
             target_height,
             encoder_label: Mutex::new(encoder.label()),
@@ -7599,36 +7814,45 @@ fn bitrate_for_height(height: i64) -> u32 {
     }
 }
 
-/// The one rung the Dolby-Vision → HDR10 re-encode runs at.
+/// The measured Dolby-Vision → HDR10 rungs.
 ///
-/// **1080p, exactly — not "at least" and not "at most".** Three reasons, and
-/// they point the same way:
-///
-/// - *Above it is unmeasured and probably a loss.* The full chain (Profile 5
-///   decode → `tonemapx` passthrough → libx265 Main10 veryfast) measured 10.4
-///   fps at 1080p on two cores, about 1.8x the cost of the SDR chain's 20.3.
-///   A real node has more cores, but no 4K10 rate has been measured on one,
-///   and a 4K encode running below realtime is worse for a viewer than a
-///   1080p one running above it. **Open item:** measure `libx265` and
-///   `hevc_qsv` Main10 at 2160p on a node before considering a 4K HDR rung.
-/// - *Below it, the point is gone.* The rung exists so a client that can
-///   decode Main10 PQ is not laddered down to 720p SDR. A client that cannot
-///   sustain 1080p is better served by the SDR ladder, which already handles
-///   step-down, than by a smaller HDR picture nobody measured.
-/// - *One rung is one measurement.* The HLS codec declaration
-///   ([`HDR10_HLS_CODEC`]) is a level and a tier x265 chooses from the frame
-///   size and the rate. Pinning the rung pins both to the point that was
-///   actually observed instead of a table of guesses.
-///
-/// **Open item — Auto does not reach this rung.** The HDR10 grade runs on
-/// software (see `Encoder::video_codec_for`), and `auto_height_for_file` caps
-/// a software Auto session at [`AUTO_SOFTWARE_HEIGHT`] (720). So a viewer on
-/// Auto still gets the tone-mapped SDR ladder; only a client that names the
-/// 1080p rung — which the quality menu does — gets HDR10. Raising the
-/// software Auto ceiling for this grade would be a *performance* claim, and
-/// the only rate that exists is 10.4 fps at 1080p on two cores, which is
-/// sub-realtime. A node measurement has to come first.
+/// Software retains the original 1080p point. QuickSync additionally admits
+/// 2160p after the exact Profile 5 software-decode → tonemapx passthrough →
+/// P010 upload → HEVC Main10 graph measured 1.52× realtime at 1080p and 1.26×
+/// at 2160p on nynuc (2026-08-22). Boot re-proves the device graph before the
+/// larger rung is advertised; machines that cannot reproduce it stay at the
+/// conservative route.
 pub const HDR10_HEIGHT: i64 = 1080;
+pub const HDR10_4K_HEIGHT: i64 = 2160;
+
+/// The output-geometry proof attached to an already-resolved encoder route.
+fn capability_height_for_encoder(
+    file: Option<&plurx_core::domain::MediaFile>,
+    encoder: Encoder,
+) -> i64 {
+    if encoder == Encoder::Software {
+        return AUTO_SOFTWARE_HEIGHT;
+    }
+    match file {
+        // Profile 5 software decode → tonemapx SDR reshape → QSV H.264
+        // measured 1.37× realtime at 2160p on nynuc (2026-08-22). The pairing
+        // probe proves the node's device init/upload graph before its caller
+        // may resolve QSV, so SDR-only displays keep the source geometry too.
+        Some(file)
+            if encoder == Encoder::Qsv
+                && TranscodeManager::needs_dovi_reshape(file) == Ok(true) =>
+        {
+            MAX_HEIGHT
+        }
+        // Other hardware HDR graphs retain the older 1080p proof. Do not turn
+        // one QSV/Profile-5 measurement into a claim about them.
+        Some(file) if file.hdr.is_some() => AUTO_HARDWARE_PROBED_HEIGHT,
+        // A known SDR source needs no tone-map graph. Validated hardware H.264
+        // can retain its geometry; network evidence is applied separately.
+        Some(_) => MAX_HEIGHT,
+        None => AUTO_HARDWARE_PROBED_HEIGHT,
+    }
+}
 
 /// HEVC level 4.0's maximum luma picture size, in samples.
 ///
@@ -7638,6 +7862,8 @@ pub const HDR10_HEIGHT: i64 = 1080;
 /// about the stream. Those sessions take the SDR ladder, which is what they
 /// get today.
 const HDR10_MAX_LUMA_SAMPLES: i64 = 2_228_224;
+/// HEVC level 5.0's maximum luma picture size, in samples.
+const HDR10_4K_MAX_LUMA_SAMPLES: i64 = 8_912_896;
 
 /// The RFC 6381 identifier for the HDR10 rung's video, **measured** rather
 /// than derived.
@@ -7657,6 +7883,9 @@ const HDR10_MAX_LUMA_SAMPLES: i64 = 2_228_224;
 /// collapses a High-tier HDR master to its media rendition for AVPlayer, and
 /// this rung inherits that unchanged.
 const HDR10_HLS_CODEC: &str = "hvc1.2.4.H120.90";
+/// Measured from the 2160p QSV output's hvcC: Main10, compatibility 4, High
+/// tier, level 150, constraint byte 0x90.
+const HDR10_4K_HLS_CODEC: &str = "hvc1.2.4.H150.90";
 
 /// The RFC 6381 `CODECS` value for a *re-encoded* HLS session.
 ///
@@ -7665,23 +7894,32 @@ const HDR10_HLS_CODEC: &str = "hvc1.2.4.H120.90";
 /// read, and unlike an fMP4 session there is no `init.mp4` for
 /// `http::hls::exact_hls_context` to open (this muxer writes MPEG-TS). So the
 /// string is the grade's, and the grade is the pipeline's.
-fn transcoded_hls_codecs(grade: OutputGrade) -> String {
+fn transcoded_hls_codecs(grade: OutputGrade, target_height: i64) -> String {
     match grade {
         OutputGrade::Sdr => "avc1.640034,mp4a.40.2".to_owned(),
+        OutputGrade::Hdr10 if target_height > HDR10_HEIGHT => {
+            format!("{HDR10_4K_HLS_CODEC},mp4a.40.2")
+        }
         OutputGrade::Hdr10 => format!("{HDR10_HLS_CODEC},mp4a.40.2"),
     }
 }
 
-/// Does this source at this rung fit the HDR10 grade's one measured point?
-fn hdr10_rung_fits(file: &plurx_core::domain::MediaFile, target_height: i64) -> bool {
-    if target_height != HDR10_HEIGHT {
-        return false;
-    }
+/// Does this source/encoder pair fit one of the measured HDR10 points?
+fn hdr10_rung_fits(
+    file: &plurx_core::domain::MediaFile,
+    target_height: i64,
+    encoder: Encoder,
+) -> bool {
+    let max_samples = match (target_height, encoder) {
+        (HDR10_HEIGHT, Encoder::Software | Encoder::Qsv) => HDR10_MAX_LUMA_SAMPLES,
+        (HDR10_4K_HEIGHT, Encoder::Qsv) => HDR10_4K_MAX_LUMA_SAMPLES,
+        _ => return false,
+    };
     match plurx_core::transcode::output_size(file, target_height) {
         // Never upscale into HDR: `output_size` clamps to the source, so a
         // 720p source at the 1080 rung produces a 720p frame, which is not
         // the geometry the codec declaration was measured at.
-        Some((w, h)) => h == HDR10_HEIGHT && w * h <= HDR10_MAX_LUMA_SAMPLES,
+        Some((w, h)) => h == target_height && w * h <= max_samples,
         None => false,
     }
 }
@@ -8208,19 +8446,19 @@ mod tests {
         }
     }
 
-    /// The HDR10 rung runs at exactly one measured point, and everything
-    /// else falls back to the SDR ladder rather than to a guess.
+    /// The HDR10 rung runs only at measured encoder/geometry points, and
+    /// everything else falls back to the SDR ladder rather than to a guess.
     #[test]
-    fn the_hdr10_rung_only_admits_the_geometry_it_was_measured_at() {
+    fn the_hdr10_rungs_only_admit_the_geometries_they_were_measured_at() {
         let mut file = profile5_file();
         file.width = Some(3840);
         file.height = Some(2160);
-        assert!(hdr10_rung_fits(&file, HDR10_HEIGHT));
-        // No 2160p HDR rung: a 4K10 encode rate has not been measured on a
-        // node, and a 4K encode below realtime is worse than 1080p above it.
-        assert!(!hdr10_rung_fits(&file, 2160));
+        assert!(hdr10_rung_fits(&file, HDR10_HEIGHT, Encoder::Software));
+        assert!(hdr10_rung_fits(&file, HDR10_HEIGHT, Encoder::Qsv));
+        assert!(hdr10_rung_fits(&file, HDR10_4K_HEIGHT, Encoder::Qsv));
+        assert!(!hdr10_rung_fits(&file, HDR10_4K_HEIGHT, Encoder::Software));
         for lower in [360, 480, 720, 900] {
-            assert!(!hdr10_rung_fits(&file, lower), "{lower}");
+            assert!(!hdr10_rung_fits(&file, lower, Encoder::Qsv), "{lower}");
         }
 
         // Never upscaled into: a 720p source at the 1080 rung produces a 720p
@@ -8228,7 +8466,7 @@ mod tests {
         let mut small = file.clone();
         small.width = Some(1280);
         small.height = Some(720);
-        assert!(!hdr10_rung_fits(&small, HDR10_HEIGHT));
+        assert!(!hdr10_rung_fits(&small, HDR10_HEIGHT, Encoder::Software));
 
         // A 2.39:1 frame at 1080 high is past HEVC level 4.0's luma bound, so
         // x265 would encode it at level 5 and `HDR10_HLS_CODEC` would be
@@ -8238,12 +8476,30 @@ mod tests {
         scope.height = Some(2400);
         let (w, h) = plurx_core::transcode::output_size(&scope, HDR10_HEIGHT).expect("size");
         assert!(w * h > HDR10_MAX_LUMA_SAMPLES, "{w}x{h}");
-        assert!(!hdr10_rung_fits(&scope, HDR10_HEIGHT));
+        assert!(!hdr10_rung_fits(&scope, HDR10_HEIGHT, Encoder::Software));
 
         // An unprobed source has no geometry to check.
         let mut unprobed = file;
         unprobed.width = None;
-        assert!(!hdr10_rung_fits(&unprobed, HDR10_HEIGHT));
+        assert!(!hdr10_rung_fits(&unprobed, HDR10_HEIGHT, Encoder::Software));
+    }
+
+    #[test]
+    fn the_measured_qsv_sdr_reshape_keeps_profile5_at_four_k() {
+        let file = profile5_file();
+        assert_eq!(
+            capability_height_for_encoder(Some(&file), Encoder::Qsv),
+            MAX_HEIGHT
+        );
+        assert_eq!(
+            capability_height_for_encoder(Some(&file), Encoder::Nvenc),
+            AUTO_HARDWARE_PROBED_HEIGHT,
+            "the QSV measurement must not widen an unmeasured family"
+        );
+        assert_eq!(
+            capability_height_for_encoder(Some(&file), Encoder::Software),
+            AUTO_SOFTWARE_HEIGHT
+        );
     }
 
     /// The session's `CODECS` follows the grade, and its shape is what makes
@@ -8252,14 +8508,18 @@ mod tests {
     #[test]
     fn a_transcode_advertises_the_codec_its_grade_produces() {
         assert_eq!(
-            transcoded_hls_codecs(OutputGrade::Sdr),
+            transcoded_hls_codecs(OutputGrade::Sdr, 2160),
             "avc1.640034,mp4a.40.2"
         );
-        let hdr10 = transcoded_hls_codecs(OutputGrade::Hdr10);
+        let hdr10 = transcoded_hls_codecs(OutputGrade::Hdr10, HDR10_HEIGHT);
         assert_eq!(hdr10, "hvc1.2.4.H120.90,mp4a.40.2");
         assert!(
             hdr10.starts_with("hvc1"),
             "the HDR attribute logic keys on this prefix: {hdr10}"
+        );
+        assert_eq!(
+            transcoded_hls_codecs(OutputGrade::Hdr10, HDR10_4K_HEIGHT),
+            "hvc1.2.4.H150.90,mp4a.40.2"
         );
     }
 
@@ -8290,7 +8550,7 @@ mod tests {
         // Everything proved, and asked for.
         assert_eq!(
             manager
-                .hdr10_grade_for(&file, true, HDR10_HEIGHT)
+                .hdr10_grade_for(&file, true, HDR10_HEIGHT, Encoder::Software)
                 .await
                 .expect("proved"),
             OutputGrade::Hdr10
@@ -8298,7 +8558,7 @@ mod tests {
         // Not asked for: absent means not proven, and not proven tone-maps.
         assert_eq!(
             manager
-                .hdr10_grade_for(&file, false, HDR10_HEIGHT)
+                .hdr10_grade_for(&file, false, HDR10_HEIGHT, Encoder::Software)
                 .await
                 .expect("no request"),
             OutputGrade::Sdr
@@ -8306,7 +8566,7 @@ mod tests {
         // Not the measured rung.
         assert_eq!(
             manager
-                .hdr10_grade_for(&file, true, 2160)
+                .hdr10_grade_for(&file, true, 2160, Encoder::Software)
                 .await
                 .expect("wrong rung"),
             OutputGrade::Sdr
@@ -8318,7 +8578,7 @@ mod tests {
         hdr10_source.hdr_format = None;
         assert_eq!(
             manager
-                .hdr10_grade_for(&hdr10_source, true, HDR10_HEIGHT)
+                .hdr10_grade_for(&hdr10_source, true, HDR10_HEIGHT, Encoder::Software,)
                 .await
                 .expect("non-dv source"),
             OutputGrade::Sdr
@@ -8334,7 +8594,7 @@ mod tests {
         .with_dovi_reshape(true);
         assert_eq!(
             unproved
-                .hdr10_grade_for(&file, true, HDR10_HEIGHT)
+                .hdr10_grade_for(&file, true, HDR10_HEIGHT, Encoder::Software)
                 .await
                 .expect("unproved build"),
             OutputGrade::Sdr
@@ -9260,6 +9520,45 @@ mod tests {
             hardware.auto_height(Some(0), None).await,
             AUTO_HARDWARE_PROBED_HEIGHT,
             "0 is not a height"
+        );
+    }
+
+    #[tokio::test]
+    async fn hdr10_auto_starts_at_the_highest_qsv_rung_proved_at_boot() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let manager = TranscodeManager::new(
+            store,
+            work.path().to_path_buf(),
+            EncoderCaps {
+                qsv: true,
+                ..Default::default()
+            },
+            Pipeline::VppQsv,
+        )
+        .with_dovi_passthrough(true)
+        .with_dovi_passthrough_qsv(true);
+        let file = profile5_file();
+
+        assert_eq!(
+            manager
+                .capability_height_ceiling_for_request(Some(&file), true)
+                .await,
+            HDR10_4K_HEIGHT
+        );
+        assert_eq!(
+            manager
+                .auto_height_for_request(Some(&file), None, true)
+                .await,
+            HDR10_4K_HEIGHT
+        );
+        assert_eq!(
+            manager
+                .capability_height_ceiling_for_request(Some(&file), false)
+                .await,
+            AUTO_SOFTWARE_HEIGHT,
+            "without an HDR10 request the unproved SDR reshape remains conservative"
         );
     }
 

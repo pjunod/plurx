@@ -258,6 +258,17 @@ replicated transaction first validates `resource`, `owner_node`, and `fence`;
 zero matching rows aborts the entire write. A pre-write check is not a fence.
 Clock skew may delay takeover, but it cannot let an old owner commit.
 
+Membership removal composes with this lease contract. The transaction that
+publishes a pending-removal fence also invalidates every current job token for
+that node and stores a permanent owner tombstone. Invalidation rewrites the
+lease-row owner, so it remains effective even if the revision counter is
+exhausted or a delayed command carries an observation from before expiry.
+Replicated insert/update triggers enforce the tombstone for rolling-upgrade
+clients whose lease SQL predates this check; current acquire and renew calls
+also fail explicitly. Startup and idempotent removal backfill tombstones made
+by earlier binaries. Rolling back a definitively rejected membership change
+removes the owner tombstone but leaves the old tokens stale.
+
 `claim_session` is compare-and-set. Two survivors reading epoch 5 cannot both
 write epoch 6: one commits the higher lease fence and the other receives
 `SessionConflict { current }`. Session publication carries that same fence,
@@ -363,12 +374,13 @@ materialization from replicated facts, not a singleton. If no holder exists,
 the current leader arbitrates one provider repair under a term fence; an
 elected successor waits a full local monotonic lease before replacing an older
 term. Provider-origin and catalogue writes compare that replicated
-owner/term/generation inside the mutation, so a timed-out command submitted by
-an old owner or attempt becomes a no-op even if Raft applies it later. Finishing
-or timing out conditionally advances that generation before the scheduler
-continues. Home and Books nodes recreate already-published bytes only from
-media they can read locally and never republish catalogue fields from that path. The
-request queues local repair and returns the existing bounded error. This keeps
+owner/term/generation and the exact `provider:artwork` singleton lease inside
+the mutation, so a timed-out command submitted by an old owner, job lease, or
+attempt becomes a no-op even if Raft applies it later. Finishing or timing out
+conditionally advances that generation before the scheduler continues. Home
+and Books nodes recreate already-published bytes only from media they can read
+locally and never republish catalogue fields from that path. The request queues
+local repair and returns the existing bounded error. This keeps
 provider-fetched art offline-safe while avoiding raft byte storage or
 cross-host wall-clock arbitration.
 Each voter scans its local artwork cache for orphan generations every six

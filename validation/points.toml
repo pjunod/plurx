@@ -343,19 +343,26 @@ depends_on = ["core.media"]
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "The shared Store suite passes on SQLite and three voters; backend-neutral cluster leases have one fenced winner, monotone revisions, exact stale-token rejection, and expiry takeover across both stores; populated v14 and current SQLite backups reach exact imported-table parity; replicated path metadata retains its named owner while bytes and playback telemetry stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused; the production progress coalescer's deterministic five-second/ten-second load stays within 64 physical commits per stream and 512 compacted bytes per incoming beat after production-threshold compaction, while an uncoalesced control violates both budgets."
+contract = "The shared Store suite passes on SQLite and three voters; backend-neutral cluster leases have one fenced winner, monotone revisions, exact stale-token rejection, and expiry takeover across both stores; singleton scan, repair, provider, genre, and candidate passes admit one owner across simultaneous scheduler ticks, renew or self-fence, and validate every durable scan/metadata publication in the mutation transaction; membership removal atomically invalidates the departing node's job tokens and permanently refuses that identity new leases; populated v14 and current SQLite backups reach exact imported-table parity; replicated path metadata retains its named owner while bytes and playback telemetry stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused; the production progress coalescer's deterministic five-second/ten-second load stays within 64 physical commits per stream and 512 compacted bytes per incoming beat after production-threshold compaction, while an uncoalesced control violates both budgets."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/cluster/coordination.rs",
+  "crates/plurx-core/src/metadata/**",
+  "crates/plurx-core/src/scan/**",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurx-core/src/store/hiqlite_catalog.rs",
   "crates/plurx-core/src/store/hiqlite_coordination.rs",
   "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "crates/plurx-core/src/store/hiqlite_publication.rs",
   "crates/plurx-core/src/store/hiqlite_reading.rs",
   "crates/plurx-core/src/store/sqlite/coordination.rs",
+  "crates/plurx-core/src/store/sqlite/publication.rs",
+  "crates/plurx-core/src/store/publication.rs",
   "crates/plurx-core/tests/store_contract.rs",
+  "crates/plurxd/src/{cachekeep,main,state,transcode}.rs",
+  "crates/plurxd/src/http/items.rs",
   "scripts/vendor-audit-lock",
   "spikes/hiqlite-m0/{Cargo.toml,Cargo.lock,src/lib.rs,tests/hiqlite_m0.rs}",
   "vendor/hiqlite/**",
@@ -426,6 +433,7 @@ title = "Metadata matching and enrichment"
 contract = "Local and remote metadata improve catalog records deterministically, retry safely, and never overwrite stronger user-owned facts."
 paths = [
   "crates/plurx-core/src/metadata/**",
+  "crates/plurx-core/tests/audiobook_artwork.rs",
   "crates/plurxd/src/http/items.rs",
   "docs/METADATA*.md",
 ]

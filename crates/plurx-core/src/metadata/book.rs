@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,9 +17,12 @@ use futures_util::StreamExt;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Reader;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
-use crate::domain::{BookMetadataPatch, BookMetadataSource, ItemKind};
-use crate::store::{ArtworkRepairFence, Store};
+use crate::domain::{
+    ArtworkAttempt, BookMetadataPatch, BookMetadataSource, ItemKind, MediaFile, MetadataPatch,
+};
+use crate::store::{ArtworkRepairFence, PublicationStore, Store};
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
@@ -28,6 +32,7 @@ const MAX_TITLE_BYTES: usize = 512;
 const MAX_AUTHOR_BYTES: usize = 512;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const COVER_HOST: &str = "covers.openlibrary.org";
+const COVER_EXTRACT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BookMetadataError {
@@ -43,6 +48,8 @@ pub enum BookMetadataError {
     CoverUrl,
     #[error("cover request failed: {0}")]
     Http(String),
+    #[error("cannot extract embedded cover: {0}")]
+    EmbeddedCover(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,9 +74,10 @@ struct ManifestItem {
     properties: String,
 }
 
-/// Process-local singleflight for blocking EPUB reads. A timed-out async
-/// caller cannot cancel `spawn_blocking`, so ownership lives inside the
-/// blocking closure and is released only after that read actually exits.
+/// Process-local singleflight for embedded book-cover extraction. A timed-out
+/// async caller cannot cancel `spawn_blocking`, so EPUB ownership lives inside
+/// the blocking closure and is released only after that read actually exits;
+/// audiobook extraction retains the same guard until ffmpeg exits.
 #[derive(Clone, Default)]
 pub struct CoverMaterializationWorkers(Arc<Mutex<HashSet<i64>>>);
 
@@ -137,8 +145,8 @@ pub fn read_epub_facts(path: &Path) -> Result<EpubFacts, BookMetadataError> {
     Ok(facts)
 }
 
-/// Recreate an already-published embedded EPUB cover on this node without
-/// mutating replicated book facts or poster paths.
+/// Recreate an already-published embedded EPUB or audiobook cover on this node
+/// without mutating replicated book facts or poster paths.
 pub async fn materialize_item_cover(
     store: &dyn Store,
     artwork_dir: &Path,
@@ -149,7 +157,7 @@ pub async fn materialize_item_cover(
     let Some(item) = store.get_item(item_id).await? else {
         return Ok(Some(false));
     };
-    if item.kind != ItemKind::Book {
+    if !matches!(item.kind, ItemKind::Book | ItemKind::Audiobook) {
         return Ok(Some(false));
     }
     if item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str()) {
@@ -165,14 +173,32 @@ pub async fn materialize_item_cover(
         }
     }
     let files = store.files_for_item(item.id).await?;
+    let Some(worker) = workers.claim(item.id) else {
+        return Ok(Some(false));
+    };
+    if item.kind == ItemKind::Audiobook {
+        let _worker = worker;
+        for file in &files {
+            let Some(probe) = store.get_file_probe_json(file.id).await? else {
+                continue;
+            };
+            let Some(stream_index) = attached_picture_stream(&probe) else {
+                continue;
+            };
+            let Ok(filename) =
+                extract_attached_picture(artwork_dir, item.id, &file.path, stream_index).await
+            else {
+                continue;
+            };
+            return Ok(Some(expected.contains(&filename)));
+        }
+        return Ok(Some(false));
+    }
     let Some(path) = files.into_iter().map(|file| file.path).find(|path| {
         path.extension()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("epub"))
     }) else {
-        return Ok(Some(false));
-    };
-    let Some(worker) = workers.claim(item.id) else {
         return Ok(Some(false));
     };
     let Ok(Ok(facts)) = tokio::task::spawn_blocking(move || {
@@ -204,7 +230,7 @@ pub async fn materialize_item_cover(
 /// upstream URL now yields different validated bytes, publish that new
 /// content-addressed generation first and then advance the replicated path.
 pub async fn materialize_curator_cover(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     artwork_dir: &Path,
     item_id: i64,
     expected: &[String],
@@ -219,7 +245,7 @@ pub async fn materialize_curator_cover(
         return false;
     }
     let Ok(Some((current_filename, url))) =
-        current_curator_cover_origin(store, &item, expected).await
+        current_curator_cover_origin(store.raw(), &item, expected).await
     else {
         return false;
     };
@@ -394,11 +420,31 @@ pub async fn has_curator_cover_origin(
     Ok(false)
 }
 
-/// Enrich standalone EPUBs in one Books library. Explicit Curator facts are
-/// never even parsed as candidates for replacement, which keeps precedence
-/// true across later scheduled scans as well as at initial import time.
+/// Enrich standalone editions in one Books library: catalogue facts and covers
+/// from EPUB packages, and attached cover pictures from audiobook containers.
+/// Explicit Curator facts are never parsed as candidates for replacement,
+/// which keeps precedence true across later scheduled scans as well as at
+/// initial import time; an audiobook cover is an artwork-only patch and cannot
+/// change that source rank.
 pub async fn enrich_library(
     store: &dyn Store,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+) -> BookEnrichReport {
+    enrich_library_with_publication(
+        &PublicationStore::unfenced(store),
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_library_with_publication(
+    store: &PublicationStore<'_>,
     artwork_dir: &Path,
     library_id: i64,
     force: bool,
@@ -419,19 +465,32 @@ pub async fn enrich_library(
         return report;
     }
     for item in items {
-        if item.kind != ItemKind::Book
-            || item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str())
+        if item.kind != ItemKind::Book && item.kind != ItemKind::Audiobook {
+            continue;
+        }
+        if item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str())
+            && (item.kind == ItemKind::Book || item.poster_path.is_some())
         {
+            // Curator catalogue facts always outrank package metadata. Its
+            // published cover does too; an audiobook may fall back to its
+            // embedded picture only when Curator never published one.
+            continue;
+        }
+        if item.kind == ItemKind::Audiobook && !force && item.poster_path.is_some() {
             continue;
         }
         let files = match store.files_for_item(item.id).await {
             Ok(files) => files,
             Err(error) => {
                 report.errors += 1;
-                tracing::warn!(item = item.id, error = %error, "listing EPUB editions");
+                tracing::warn!(item = item.id, error = %error, "listing book edition files");
                 continue;
             }
         };
+        if item.kind == ItemKind::Audiobook {
+            enrich_audiobook_cover(store, artwork_dir, item.id, &files, &mut report).await;
+            continue;
+        }
         let Some(path) = files.into_iter().map(|file| file.path).find(|path| {
             path.extension()
                 .and_then(|value| value.to_str())
@@ -496,6 +555,146 @@ pub async fn enrich_library(
         }
     }
     report
+}
+
+/// Adopt the first attached picture already carried by an audiobook part.
+///
+/// The scanner deliberately ignores attached pictures as video streams, but
+/// keeps ffprobe's raw document. That makes the document a cheap guard before
+/// asking ffmpeg to copy the exact image bytes: ordinary audio never spawns a
+/// second process, while MP3/M4B/FLAC cover formats stay ffmpeg's problem rather
+/// than becoming a pile of container-specific parsers here.
+async fn enrich_audiobook_cover(
+    store: &PublicationStore<'_>,
+    artwork_dir: &Path,
+    item_id: i64,
+    files: &[MediaFile],
+    report: &mut BookEnrichReport,
+) {
+    for file in files {
+        let probe = match store.raw().get_file_probe_json(file.id).await {
+            Ok(Some(probe)) => probe,
+            Ok(None) => continue,
+            Err(error) => {
+                report.errors += 1;
+                tracing::warn!(item = item_id, file = file.id, error = %error, "reading audiobook probe for cover art");
+                continue;
+            }
+        };
+        let Some(stream_index) = attached_picture_stream(&probe) else {
+            continue;
+        };
+        report.inspected += 1;
+        match extract_attached_picture(artwork_dir, item_id, &file.path, stream_index).await {
+            Ok(poster_path) => {
+                let patch = MetadataPatch {
+                    poster_path: Some(poster_path),
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                };
+                match store.apply_metadata(item_id, &patch).await {
+                    Ok(()) => report.updated += 1,
+                    Err(error) => {
+                        report.errors += 1;
+                        tracing::warn!(item = item_id, error = %error, "storing embedded audiobook cover");
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                report.errors += 1;
+                tracing::warn!(item = item_id, path = %file.path.display(), error = %error, "extracting embedded audiobook cover");
+                let patch = MetadataPatch {
+                    artwork: Some(ArtworkAttempt::Failed(error.to_string())),
+                    ..Default::default()
+                };
+                if let Err(store_error) = store.apply_metadata(item_id, &patch).await {
+                    tracing::warn!(item = item_id, error = %store_error, "recording audiobook cover failure");
+                }
+            }
+        }
+    }
+}
+
+fn attached_picture_stream(probe: &str) -> Option<i64> {
+    let probe: serde_json::Value = serde_json::from_str(probe).ok()?;
+    probe
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|stream| {
+            stream.get("codec_type").and_then(|value| value.as_str()) == Some("video")
+                && stream
+                    .get("disposition")
+                    .and_then(|value| value.get("attached_pic"))
+                    .and_then(|value| value.as_i64())
+                    .is_some_and(|value| value != 0)
+        })?
+        .get("index")?
+        .as_i64()
+        .filter(|index| *index >= 0)
+}
+
+fn ffmpeg_bin() -> String {
+    std::env::var("PLURX_FFMPEG")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_owned())
+}
+
+async fn extract_attached_picture(
+    artwork_dir: &Path,
+    item_id: i64,
+    media: &Path,
+    stream_index: i64,
+) -> Result<String, BookMetadataError> {
+    tokio::fs::create_dir_all(artwork_dir).await?;
+    let mut command = tokio::process::Command::new(ffmpeg_bin());
+    command
+        .kill_on_drop(true)
+        .arg("-nostdin")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(media)
+        .args(["-map", &format!("0:{stream_index}"), "-frames:v", "1"])
+        .args(["-c:v", "copy", "-f", "image2pipe", "pipe:1"])
+        .stdout(Stdio::piped())
+        // The bounded stdout is the diagnostic that matters. Discarding
+        // stderr also prevents a malformed input from filling a second pipe
+        // while the byte-bound reader is waiting on the first one.
+        .stderr(Stdio::null());
+    let extract = async move {
+        let mut child = command
+            .spawn()
+            .map_err(|error| BookMetadataError::EmbeddedCover(error.to_string()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            BookMetadataError::EmbeddedCover("ffmpeg stdout was unavailable".to_owned())
+        })?;
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_COVER_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| BookMetadataError::EmbeddedCover(error.to_string()))?;
+        if bytes.len() > MAX_COVER_BYTES as usize {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(BookMetadataError::Limit);
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| BookMetadataError::EmbeddedCover(error.to_string()))?;
+        if !status.success() {
+            return Err(BookMetadataError::EmbeddedCover(format!(
+                "ffmpeg exited with {status}"
+            )));
+        }
+        Ok(bytes)
+    };
+    let bytes = tokio::time::timeout(COVER_EXTRACT_TIMEOUT, extract)
+        .await
+        .map_err(|_| BookMetadataError::EmbeddedCover("ffmpeg timed out".to_owned()))??;
+    write_cached_cover(artwork_dir, item_id, &bytes).await
 }
 
 /// Fetch one Curator-provided Open Library cover with no redirects, no bearer,
@@ -1366,5 +1565,25 @@ mod tests {
         task.await.expect("blocking reader exits");
         assert!(!workers.contains(84));
         assert!(workers.claim(84).is_some(), "a later pass may retry");
+    }
+
+    #[test]
+    fn finds_only_a_real_attached_picture_stream() {
+        assert_eq!(
+            attached_picture_stream(
+                r#"{"streams":[
+                    {"index":0,"codec_type":"audio"},
+                    {"index":1,"codec_type":"video","disposition":{"attached_pic":1}}
+                ]}"#
+            ),
+            Some(1)
+        );
+        for probe in [
+            r#"{"streams":[{"index":1,"codec_type":"video","disposition":{"attached_pic":0}}]}"#,
+            r#"{"streams":[{"index":1,"codec_type":"audio","disposition":{"attached_pic":1}}]}"#,
+            "not json",
+        ] {
+            assert_eq!(attached_picture_stream(probe), None, "accepted {probe}");
+        }
     }
 }

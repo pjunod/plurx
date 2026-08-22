@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use plurx_core::cluster::coordination::StoreCoordinator;
 use plurx_core::cluster::migration::{
     connect_activated_store, select_daemon_store, SelectedBackend,
 };
@@ -44,7 +45,7 @@ use plurx_core::store::{keys, Store};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use crate::state::{AppState, SystemInfo};
+use crate::state::{acquire_cluster_job, AppState, SystemInfo};
 
 #[derive(Parser)]
 // `--version` carries the build stamp too: "0.1.0 (v0.1.0-14-gc0ffee)". The
@@ -145,15 +146,18 @@ async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::R
              running because maintenance commands share its voter rather than \
              opening a second store",
     )?;
+    let cluster_id = store.instance_id().await?;
+    let identity = plurx_core::cluster::initialize_identity(&config.storage.data_dir, &cluster_id)?;
     let artwork_dir = config.storage.data_dir.join("artwork");
     std::fs::create_dir_all(&artwork_dir)?;
-    refresh_metadata_with_store(store, &artwork_dir, library_id).await
+    refresh_metadata_with_store(store, &artwork_dir, library_id, &identity.node_id).await
 }
 
 async fn refresh_metadata_with_store(
     store: Arc<dyn Store>,
     artwork_dir: &std::path::Path,
     library_id: Option<i64>,
+    node_id: &str,
 ) -> anyhow::Result<()> {
     let libraries = store.list_libraries().await?;
 
@@ -165,45 +169,63 @@ async fn refresh_metadata_with_store(
     }
 
     let tmdb_key = store.get_setting(keys::TMDB_API_KEY).await?;
-    for library in libraries
-        .into_iter()
-        .filter(|library| library_id.is_none_or(|id| library.id == id))
-    {
-        match library.kind {
-            LibraryKind::Books | LibraryKind::Home => {
-                println!("{}: skipped provider artwork", library.name);
+    let coordinator = StoreCoordinator::new(Arc::clone(&store), node_id.to_owned())?;
+    let Some(lease) = acquire_cluster_job(&coordinator, "provider:artwork".to_owned()).await?
+    else {
+        anyhow::bail!("artwork provider pass is active on another cluster node");
+    };
+    let lost = lease.loss_token();
+    let publisher = lease.publisher(store.as_ref());
+    let result: anyhow::Result<()> = tokio::select! {
+        result = async {
+            for library in libraries
+                .into_iter()
+                .filter(|library| library_id.is_none_or(|id| library.id == id))
+            {
+                match library.kind {
+                    LibraryKind::Books | LibraryKind::Home => {
+                        println!("{}: skipped provider artwork", library.name);
+                    }
+                    LibraryKind::Shows if library.anime => {
+                        let report = metadata::enrich_anime_library_with_publication(
+                            &publisher,
+                            &AniListClient::new(),
+                            artwork_dir,
+                            library.id,
+                            true,
+                            None,
+                            None,
+                        )
+                        .await;
+                        println!("{}: {}", library.name, serde_json::to_string(&report)?);
+                    }
+                    LibraryKind::Movies | LibraryKind::Shows => {
+                        let key = tmdb_key
+                            .as_deref()
+                            .filter(|key| !key.is_empty())
+                            .context("TMDB API key is not configured")?;
+                        let report = metadata::enrich_library_with_publication(
+                            &publisher,
+                            &TmdbClient::new(key),
+                            artwork_dir,
+                            Some(library.id),
+                            true,
+                            None,
+                        )
+                        .await;
+                        println!("{}: {}", library.name, serde_json::to_string(&report)?);
+                    }
+                }
             }
-            LibraryKind::Shows if library.anime => {
-                let report = metadata::enrich_anime_library(
-                    store.as_ref(),
-                    &AniListClient::new(),
-                    artwork_dir,
-                    library.id,
-                    true,
-                    None,
-                )
-                .await;
-                println!("{}: {}", library.name, serde_json::to_string(&report)?);
-            }
-            LibraryKind::Movies | LibraryKind::Shows => {
-                let key = tmdb_key
-                    .as_deref()
-                    .filter(|key| !key.is_empty())
-                    .context("TMDB API key is not configured")?;
-                let report = metadata::enrich_library(
-                    store.as_ref(),
-                    &TmdbClient::new(key),
-                    artwork_dir,
-                    Some(library.id),
-                    true,
-                    None,
-                )
-                .await;
-                println!("{}: {}", library.name, serde_json::to_string(&report)?);
-            }
-        }
-    }
-    Ok(())
+            Ok(())
+        } => result,
+        () = lost.cancelled() => Err(anyhow::anyhow!(
+            "artwork provider pass stopped after losing its cluster lease"
+        )),
+    };
+    drop(publisher);
+    lease.release().await;
+    result
 }
 
 /// Console recovery path: rewrite one user's password hash and revoke their
@@ -632,6 +654,11 @@ async fn probe_system(
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
         dovi_reshape: crate::ffmpeg::has_dovi_reshape().await,
         dovi_passthrough: crate::ffmpeg::has_dovi_passthrough().await,
+        dovi_passthrough_qsv: if encoder_caps.qsv {
+            crate::ffmpeg::has_dovi_passthrough_with(plurx_core::transcode::Encoder::Qsv).await
+        } else {
+            false
+        },
         encoder_selected,
         tone_map,
     };
@@ -646,6 +673,7 @@ struct Measured {
     dovi_rpu: bool,
     dovi_reshape: bool,
     dovi_passthrough: bool,
+    dovi_passthrough_qsv: bool,
     encoder_selected: String,
     tone_map: pipeprobe::PipelineReport,
 }
@@ -676,6 +704,7 @@ fn system_info(
         dovi_rpu: measured.dovi_rpu,
         dovi_reshape: measured.dovi_reshape,
         dovi_passthrough: measured.dovi_passthrough,
+        dovi_passthrough_qsv: measured.dovi_passthrough_qsv,
     }
 }
 
@@ -2208,7 +2237,7 @@ mod startup_tests {
         add_library(&store, "Books", LibraryKind::Books, false).await;
         add_library(&store, "Home", LibraryKind::Home, false).await;
         let artwork = tmp.path().join("artwork");
-        refresh_metadata_with_store(store, &artwork, None)
+        refresh_metadata_with_store(store, &artwork, None, "test-refresh")
             .await
             .expect("a provider-less refresh must succeed");
     }
@@ -2224,7 +2253,7 @@ mod startup_tests {
 
         let error = format!(
             "{:#}",
-            refresh_metadata_with_store(store, &artwork, Some(4242))
+            refresh_metadata_with_store(store, &artwork, Some(4242), "test-refresh")
                 .await
                 .expect_err("no such library")
         );
@@ -2242,7 +2271,7 @@ mod startup_tests {
 
         let error = format!(
             "{:#}",
-            refresh_metadata_with_store(store, &artwork, None)
+            refresh_metadata_with_store(store, &artwork, None, "test-refresh")
                 .await
                 .expect_err("no TMDB key")
         );
@@ -2265,10 +2294,15 @@ mod startup_tests {
         assert!(anime.anime, "the anime flag must be stored");
         let artwork = tmp.path().join("artwork");
 
-        refresh_metadata_with_store(Arc::clone(&store), &artwork, Some(movies.id))
-            .await
-            .expect("empty TMDB refresh");
-        refresh_metadata_with_store(store, &artwork, Some(anime.id))
+        refresh_metadata_with_store(
+            Arc::clone(&store),
+            &artwork,
+            Some(movies.id),
+            "test-refresh",
+        )
+        .await
+        .expect("empty TMDB refresh");
+        refresh_metadata_with_store(store, &artwork, Some(anime.id), "test-refresh")
             .await
             .expect("empty AniList refresh");
     }
@@ -2614,6 +2648,7 @@ mod startup_tests {
                 dovi_rpu: true,
                 dovi_reshape: true,
                 dovi_passthrough: true,
+                dovi_passthrough_qsv: true,
                 encoder_selected: selected.clone(),
                 tone_map: pipeprobe::PipelineReport::cpu_only("not probed"),
             },

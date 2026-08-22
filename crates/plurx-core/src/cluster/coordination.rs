@@ -14,8 +14,13 @@ pub const MIN_LEASE_TTL: Duration = Duration::from_secs(1);
 pub const MAX_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const MAX_LEASE_RESOURCE_BYTES: usize = 256;
 pub(crate) const MAX_LEASE_OWNER_BYTES: usize = 128;
+const REMOVED_JOB_OWNER_PREFIX: &str = "internal.cluster_job_owner_removed.";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) fn removed_job_owner_key(node_id: &str) -> String {
+    format!("{REMOVED_JOB_OWNER_PREFIX}{node_id}")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Lease {
     pub resource: String,
     pub owner_node_id: String,
@@ -140,7 +145,7 @@ fn expiry_from(now_unix_ms: i64, ttl: Duration) -> Result<i64, StoreError> {
         .ok_or_else(|| StoreError::Task("lease expiry overflowed i64".to_owned()))
 }
 
-fn unix_ms() -> Result<i64, StoreError> {
+pub(crate) fn unix_ms() -> Result<i64, StoreError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StoreError::Task(format!("system clock precedes unix epoch: {error}")))?

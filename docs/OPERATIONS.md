@@ -429,13 +429,15 @@ node's local artwork directory. Every voter reconciles those names in the
 background: it pulls a missing file from a reachable peer under a short-lived
 cluster proof and atomically installs it. If no peer retains the file, a
 bounded, leader-arbitrated repair recreates provider-backed artwork. Home and
-Books voters instead recreate already-published bytes only when their own
-node can read the local media, without republishing the catalogue row. A
+Books voters instead recreate already-published bytes—including EPUB and
+audiobook embedded covers—only when their own node can read the local media,
+without republishing the catalogue row. A
 successor waits a full monotonic lease before fencing an abandoned older Raft
 term, so host clock skew cannot create overlapping provider work. Every
 provider-origin and catalogue mutation also requires that replicated
-owner/term/generation row inside the same database statement; a timed-out old
-Raft command therefore commits as a no-op after leadership changes or a later
+owner/term/generation row and the exact `provider:artwork` singleton-job lease
+inside the same database statement; a timed-out old Raft command therefore
+commits as a no-op after leadership changes, lease takeover, or a later
 same-term repair attempt. Completion and timeout both retire the exact
 generation with a later conditional Raft command.
 For a Curator book, the provider owns recovery only after its validated cover
@@ -501,6 +503,16 @@ curl -fsS -X POST "$PLURX_NODE/api/v1/cluster/leave" \
 This is permanent and refuses a 2→1 change. To reuse the machine, discard the
 old Plurx data directory and join it again with a fresh token. Do not use this
 operation for a rolling update or ordinary restart.
+
+As soon as removal enters its durable pending state, Plurx invalidates every
+singleton-job lease owned by that node in the same replicated transaction.
+The removed node identity is permanently refused new scheduler leases by
+replicated database triggers, so a still-running or resumed process—including
+one on the preceding rolling-upgrade version—cannot publish background work
+after the membership change. Startup and an idempotent removal retry restore
+missing owner fences for older tombstones. A definitively rejected removal
+clears that owner fence, but the invalidated tokens remain stale and the node
+must acquire fresh ones.
 
 **Remove a follower from three or more voters.** Use the node id from the
 roster, not its Raft id. The request refuses the current leader and any change

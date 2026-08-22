@@ -19,7 +19,7 @@ pub use anilist::AniListClient;
 pub use tmdb::TmdbClient;
 
 use crate::domain::{ArtworkAttempt, ItemKind, MetadataPatch};
-use crate::store::{ArtworkRepairFence, Store};
+use crate::store::{ArtworkRepairFence, PublicationStore, Store};
 
 /// Poster width bucket — small enough to be snappy in a grid, sharp on TV.
 const POSTER_SIZE: &str = "w500";
@@ -313,7 +313,36 @@ pub async fn enrich_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> EnrichReport {
-    enrich_library_for_targets(store, tmdb, artwork_dir, library_id, force, only, only).await
+    enrich_library_with_publication(
+        &PublicationStore::unfenced(store),
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_library_with_publication(
+    store: &PublicationStore<'_>,
+    tmdb: &TmdbClient,
+    artwork_dir: &Path,
+    library_id: Option<i64>,
+    force: bool,
+    only: Option<&[i64]>,
+) -> EnrichReport {
+    enrich_library_for_targets_with_publication(
+        store,
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+        only,
+        None,
+    )
+    .await
 }
 
 /// Enrich a targeted TMDB tree while keeping provider-routing ancestors
@@ -333,8 +362,8 @@ pub async fn enrich_library_for_targets(
     routes: Option<&[i64]>,
     repairs: Option<&[i64]>,
 ) -> EnrichReport {
-    enrich_library_for_targets_with_fence(
-        store,
+    enrich_library_for_targets_with_publication(
+        &PublicationStore::unfenced(store),
         tmdb,
         artwork_dir,
         library_id,
@@ -346,9 +375,31 @@ pub async fn enrich_library_for_targets(
     .await
 }
 
-/// Fenced form used only by leader-arbitrated provider artwork repair.
-pub async fn enrich_library_for_targets_with_fence(
-    store: &dyn Store,
+pub async fn enrich_library_for_targets_with_publication(
+    store: &PublicationStore<'_>,
+    tmdb: &TmdbClient,
+    artwork_dir: &Path,
+    library_id: Option<i64>,
+    force: bool,
+    routes: Option<&[i64]>,
+    repairs: Option<&[i64]>,
+    repair_fence: Option<&ArtworkRepairFence>,
+) -> EnrichReport {
+    enrich_library_for_targets_inner(
+        store,
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        routes,
+        repairs,
+        repair_fence,
+    )
+    .await
+}
+
+async fn enrich_library_for_targets_inner(
+    store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     library_id: Option<i64>,
@@ -651,12 +702,41 @@ pub async fn enrich_anime_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> EnrichReport {
-    enrich_anime_library_with_fence(store, client, artwork_dir, library_id, force, only, None).await
+    enrich_anime_library_with_publication(
+        &PublicationStore::unfenced(store),
+        client,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+        None,
+    )
+    .await
 }
 
-/// Fenced form used only by leader-arbitrated provider artwork repair.
-pub async fn enrich_anime_library_with_fence(
-    store: &dyn Store,
+pub async fn enrich_anime_library_with_publication(
+    store: &PublicationStore<'_>,
+    client: &AniListClient,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+    repair_fence: Option<&ArtworkRepairFence>,
+) -> EnrichReport {
+    enrich_anime_library_inner(
+        store,
+        client,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+        repair_fence,
+    )
+    .await
+}
+
+async fn enrich_anime_library_inner(
+    store: &PublicationStore<'_>,
     client: &AniListClient,
     artwork_dir: &Path,
     library_id: i64,
@@ -824,7 +904,7 @@ async fn write_artwork(artwork_dir: &Path, item_id: i64, kind: &str, bytes: &[u8
 
 /// Fetch each season once and patch this show's episodes by episode number.
 async fn enrich_episodes(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     show_id: i64,
@@ -987,7 +1067,7 @@ async fn enrich_episodes(
 }
 
 async fn apply(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     item_id: i64,
     patch: MetadataPatch,
     report: &mut EnrichReport,

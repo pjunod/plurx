@@ -1,6 +1,6 @@
 # Cluster media pool — make every node improve playback
 
-**Status:** ready to build after the M3 transport dependencies in §2.2 ·
+**Status:** P0–P2 delivered; P3 is next ·
 **Executes:** M4–M5 from [CLUSTERING-PLAN.md](CLUSTERING-PLAN.md) and M4 from
 [PERF-PLAN.md](PERF-PLAN.md) · **Written:** 2026-08-21 against `main`
 `a543dcaa`
@@ -802,6 +802,9 @@ avoids their files.
 release · expiry takeover · monotone fence · stale renewal; the real-process
 cluster harness proves two voters racing after expiry produce one winner.
 
+**Delivered:** `CoordinationStore`, exact revision-bound tokens, and matching
+SQLite/Hiqlite contracts landed before scheduler behavior changed.
+
 ### 8.3 P2 — fence singleton scheduler work
 
 Acquire named leases at the common scan/refresh/probe/provider/genre/candidate
@@ -814,6 +817,32 @@ rules are present.
 **Acceptance:** pause an owner past TTL, let a successor acquire, resume the
 old process, and prove its next publication is rejected; three simultaneous
 scheduler ticks produce one scan/provider pass.
+
+**Delivered:** the common daemon boundaries use these resource names and the
+90 s / 30 s policy from §4.4:
+
+| Work | Resource | Publication rule |
+|---|---|---|
+| Full, refresh, startup, manual, and targeted scans | `scan:library:<id>` | Item, file, metadata, root reconciliation, and completion stamps are fenced |
+| Scheduled and manual probe repair | `repair:probe` | Every repaired file upsert is fenced |
+| Artwork retry and manual artwork refresh | `provider:artwork` | Provider metadata is fenced; downloaded/generated image bytes stay local |
+| Genre backfill | `provider:genres` | Item patches, cursor, and disarm stamp are fenced |
+| Pre-transcode candidate pass | `candidate:pretranscode` | Candidate claim/touch/complete/forget and generation paths are fenced now; P3 replaces the singleton executor with per-worker queue fences |
+
+The daemon HTTP paths and the `refresh-metadata` maintenance command use the
+same boundaries. Renewal loss cancels the running pass; speculative production
+passes that signal through the producer's existing checkpoint-and-terminate
+path so an expired owner does not keep an encoder busy.
+
+Telemetry retention, transcode scratch cleanup, and local cache eviction keep
+running per node. Their last-run keys include the stable node id so one voter's
+local cleanup cannot suppress another's. A targeted request that encounters a
+remote scan owner remains queued and retries acquisition. Every waiter retains
+its own terminal request record and caller-supplied metadata hints; none is
+treated as a successful no-op or discarded because another waiter names the
+same path. The per-library waiter queue is bounded, and same-path waiters share
+one canonicalized physical scan/enrichment pass before their individual hints
+and statuses are published.
 
 ### 8.4 P3 — turn pre-transcode candidates into a distributed queue
 

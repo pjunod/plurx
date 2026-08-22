@@ -21,7 +21,7 @@ use walkdir::WalkDir;
 
 use crate::domain::{Item, ItemKind, Library, LibraryKind, MetadataPatch, NewItem, ProbeResult};
 use crate::error::StoreError;
-use crate::store::{ReconcileOutcome, RootFingerprintStatus, Store};
+use crate::store::{PublicationStore, ReconcileOutcome, RootFingerprintStatus, Store};
 
 /// Container extensions we treat as playable video.
 const VIDEO_EXTS: &[&str] = &[
@@ -206,6 +206,13 @@ pub async fn reprobe_files(
     store: &dyn Store,
     files: &[crate::domain::MediaFile],
 ) -> Result<ReprobeReport, StoreError> {
+    reprobe_files_with_publication(&PublicationStore::unfenced(store), files).await
+}
+
+pub async fn reprobe_files_with_publication(
+    store: &PublicationStore<'_>,
+    files: &[crate::domain::MediaFile],
+) -> Result<ReprobeReport, StoreError> {
     let mut report = ReprobeReport::default();
     for file in files {
         report.attempted += 1;
@@ -385,7 +392,30 @@ pub async fn scan_library_with_progress_and_prune_percent(
     } else {
         (known.saturating_mul(percent) / 100).max(1)
     };
-    scan_library_with_progress_and_prune_limit(store, library, progress, prune_limit).await
+    scan_library_with_publication_and_prune_limit(
+        &PublicationStore::unfenced(store),
+        library,
+        progress,
+        prune_limit,
+    )
+    .await
+}
+
+/// Fenced counterpart used by cluster-wide scan owners.
+pub async fn scan_library_with_publication_and_prune_percent(
+    store: &PublicationStore<'_>,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+    prune_percent: u8,
+) -> Result<ScanReport, StoreError> {
+    let known = store.library_file_paths(library.id).await?.len() as u64;
+    let percent = u64::from(prune_percent.min(100));
+    let prune_limit = if percent == 0 || known == 0 {
+        0
+    } else {
+        (known.saturating_mul(percent) / 100).max(1)
+    };
+    scan_library_with_publication_and_prune_limit(store, library, progress, prune_limit).await
 }
 
 /// Cluster-ready scan entry point. `prune_limit` is the maximum number of
@@ -394,6 +424,21 @@ pub async fn scan_library_with_progress_and_prune_percent(
 /// cluster-wide delete.
 pub async fn scan_library_with_progress_and_prune_limit(
     store: &dyn Store,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+    prune_limit: u64,
+) -> Result<ScanReport, StoreError> {
+    scan_library_with_publication_and_prune_limit(
+        &PublicationStore::unfenced(store),
+        library,
+        progress,
+        prune_limit,
+    )
+    .await
+}
+
+pub async fn scan_library_with_publication_and_prune_limit(
+    store: &PublicationStore<'_>,
     library: &Library,
     progress: Option<&ScanProgress>,
     prune_limit: u64,
@@ -724,6 +769,14 @@ pub async fn scan_path(
     library: &Library,
     target: &Path,
 ) -> Result<TargetedScan, TargetError> {
+    scan_path_with_publication(&PublicationStore::unfenced(store), library, target).await
+}
+
+pub async fn scan_path_with_publication(
+    store: &PublicationStore<'_>,
+    library: &Library,
+    target: &Path,
+) -> Result<TargetedScan, TargetError> {
     let roots: Vec<String> = library
         .paths
         .iter()
@@ -857,7 +910,7 @@ fn wanted_file(library: &Library, path: &Path) -> bool {
 /// reconcile. Deliberately does NOT reconcile: only the caller knows whether
 /// it saw the whole library.
 async fn record_candidates(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     candidates: Vec<std::path::PathBuf>,
     progress: Option<&ScanProgress>,
@@ -1051,7 +1104,7 @@ async fn record_candidates(
 }
 
 async fn refresh_audiobook_runtimes(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     placed: &[PlacedFile],
 ) -> Result<(), StoreError> {
@@ -1109,7 +1162,7 @@ enum Placement {
 
 /// Find-or-create the item a file belongs to.
 async fn place_item(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     path: &Path,
 ) -> Result<Placement, StoreError> {
@@ -1243,7 +1296,7 @@ async fn place_item(
 }
 
 async fn find_or_create_show(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     parsed: &parse::ParsedEpisode,
 ) -> Result<Item, StoreError> {
@@ -1271,7 +1324,7 @@ async fn find_or_create_show(
 }
 
 async fn find_or_create_season(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     show_id: i64,
     season_number: i32,
@@ -1494,7 +1547,7 @@ mod tests {
             path: "/contract/books/01.m4b".into(),
         }];
 
-        refresh_audiobook_runtimes(&store, &library, &placed)
+        refresh_audiobook_runtimes(&PublicationStore::unfenced(&store), &library, &placed)
             .await
             .expect("aggregate runtime");
         assert_eq!(
@@ -1508,7 +1561,7 @@ mod tests {
         );
 
         store.delete_files(&[second]).await.expect("delete part");
-        refresh_audiobook_runtimes(&store, &library, &placed)
+        refresh_audiobook_runtimes(&PublicationStore::unfenced(&store), &library, &placed)
             .await
             .expect("reconcile runtime");
         assert_eq!(
@@ -1558,7 +1611,7 @@ mod tests {
             .expect("untimed part");
 
         refresh_audiobook_runtimes(
-            &store,
+            &PublicationStore::unfenced(&store),
             &library,
             &[PlacedFile {
                 item_id,

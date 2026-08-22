@@ -5,7 +5,8 @@ use hiqlite::Row;
 use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore};
 use super::CoordinationStore;
 use crate::cluster::coordination::{
-    validate_lease_identity, validate_lease_input, validate_lease_renewal, Lease, LeaseClaim,
+    removed_job_owner_key, validate_lease_identity, validate_lease_input, validate_lease_renewal,
+    Lease, LeaseClaim,
 };
 use crate::error::StoreError;
 
@@ -20,7 +21,8 @@ pub(super) const JOB_LEASES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS job_lease
 
 const ACQUIRE_SQL: &str = "INSERT INTO job_leases
     (resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms)
-    VALUES ($1, $2, 1, 1, $3, $4)
+    SELECT $1, $2, 1, 1, $3, $4
+    WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = $5)
     ON CONFLICT(resource) DO UPDATE SET
         owner_node_id = excluded.owner_node_id,
         fence = job_leases.fence + 1,
@@ -43,11 +45,18 @@ impl CoordinationStore for HiqliteAuthStore {
     ) -> Result<LeaseClaim, StoreError> {
         validate_lease_input(resource, owner_node_id, now_unix_ms, expires_at_unix_ms)?;
         validate_sql(ACQUIRE_SQL)?;
+        let owner_fence_key = removed_job_owner_key(owner_node_id);
         let acquired = self
             .client()
             .execute_returning_map::<_, LeaseRow>(
                 ACQUIRE_SQL,
-                params!(resource, owner_node_id, expires_at_unix_ms, now_unix_ms),
+                params!(
+                    resource,
+                    owner_node_id,
+                    expires_at_unix_ms,
+                    now_unix_ms,
+                    owner_fence_key.as_str()
+                ),
             )
             .await?
             .into_iter()
@@ -55,6 +64,19 @@ impl CoordinationStore for HiqliteAuthStore {
             .map_err(database_error)?;
         if let Some(row) = acquired.into_iter().next() {
             return Ok(LeaseClaim::Acquired(row.try_into()?));
+        }
+
+        let removed = self
+            .client()
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM settings WHERE key = $1",
+                params!(owner_fence_key),
+            )
+            .await?;
+        if removed.first().is_some_and(|row| row.count == 1) {
+            return Err(StoreError::Task(format!(
+                "cluster job lease owner {owner_node_id} has been removed"
+            )));
         }
 
         let rows = self
@@ -96,6 +118,7 @@ impl CoordinationStore for HiqliteAuthStore {
         validate_lease_renewal(lease, now_unix_ms, expires_at_unix_ms)?;
         let fence = sql_fence(lease.fence)?;
         let revision = sql_revision(lease.revision)?;
+        let owner_fence_key = removed_job_owner_key(&lease.owner_node_id);
         let sql = "UPDATE job_leases
                    SET expires_at_ms = $1, revision = revision + 1, updated_at_ms = $2
                    WHERE resource = $3 AND owner_node_id = $4 AND fence = $5
@@ -103,6 +126,7 @@ impl CoordinationStore for HiqliteAuthStore {
                      AND revision = $6
                      AND expires_at_ms = $7
                      AND revision < 9223372036854775807
+                     AND NOT EXISTS (SELECT 1 FROM settings WHERE key = $8)
                    RETURNING resource, owner_node_id, fence, revision, expires_at_ms";
         validate_sql(sql)?;
         let rows = self
@@ -116,7 +140,8 @@ impl CoordinationStore for HiqliteAuthStore {
                     &lease.owner_node_id,
                     fence,
                     revision,
-                    lease.expires_at_unix_ms
+                    lease.expires_at_unix_ms,
+                    owner_fence_key
                 ),
             )
             .await?
@@ -162,6 +187,18 @@ struct LeaseRow {
     fence: i64,
     revision: i64,
     expires_at_unix_ms: i64,
+}
+
+struct CountRow {
+    count: i64,
+}
+
+impl From<&mut Row<'_>> for CountRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            count: row.get("count"),
+        }
+    }
 }
 
 impl From<&mut Row<'_>> for LeaseRow {

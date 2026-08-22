@@ -591,7 +591,8 @@ impl HiqliteAuthStore {
             "DELETE FROM tokens",
             "DELETE FROM api_keys",
             "DELETE FROM users",
-            "DELETE FROM settings WHERE key <> $1",
+            "DELETE FROM settings WHERE key <> $1 \
+               AND key NOT GLOB 'internal.cluster_job_owner_removed.*'",
         ];
         for sql in statements {
             validate_sql(sql)?;

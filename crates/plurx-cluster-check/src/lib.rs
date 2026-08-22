@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig, Row};
+use plurx_core::cluster::coordination::{Lease, LeaseClaim};
 use plurx_core::cluster::membership::{
     join_token_digest, ArtworkPeerAuth, ClusterAvailability, ClusterPeer, FinalizeJoinRequest,
     IssuedJoinToken, JoinSecrets, MembershipManager, MembershipStatus, RedeemJoinRequest,
@@ -37,16 +38,17 @@ use plurx_core::cluster::migration::status::{
 use plurx_core::cluster::migration::{ActivationMarker, HIQLITE_WAL_SIZE_BYTES};
 use plurx_core::cluster::ClusterIdentity;
 use plurx_core::domain::{
-    ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
-    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
-    TraktAuth,
+    BookMetadataPatch, BookMetadataSource, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
+    NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
+    PlaybackEventQuery, ProbeResult, TraktAuth,
 };
 use plurx_core::secrets::CredentialKey;
 use plurx_core::store::{
-    ApiKeyStore, ArtworkRepairFence, ClusterCompatibility, HiqliteAuthStore, LibraryStore,
-    MediaStore, OfflinePackageStore, PlaybackTelemetryStore, ReconcileOutcome,
-    RootFingerprintStatus, SettingsStore, TraktStore, TranscodeCacheStore, UserStore, WatchStore,
-    WatchedOutboxStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ApiKeyStore, ArtworkRepairFence, ClusterCompatibility, CoordinationStore,
+    FencedPublicationStore, HiqliteAuthStore, LibraryStore, MediaStore, OfflinePackageStore,
+    PlaybackTelemetryStore, ReconcileOutcome, RootFingerprintStatus, SettingsStore, TraktStore,
+    TranscodeCacheStore, UserStore, WatchStore, WatchedOutboxStore, AUTH_PROTOCOL_VERSION,
+    AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -473,7 +475,10 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // Raft write per node. Only the current leader submits the claim; after a
     // live election, its successor waits a receiver-local monotonic lease and
     // then fences the old term without consulting either host's wall clock.
-    let repair_lease_ms = 250_u64;
+    // Process scheduling plus consistent reads can exceed hundreds of
+    // milliseconds on a loaded CI host. Keep the active-lease proof far from
+    // its deadline; the explicit sleeps below are the only expiry trigger.
+    let repair_lease_ms = 5_000_u64;
     let repair_item = match cluster
         .request(leader, Request::SeedArtworkRepairFenceItem { ordinal: 1 })
         .await?
@@ -605,6 +610,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 target_item_id: repair_item,
                 fence: initial_fence.context("initial leader did not return its repair fence")?,
                 title: "stale same-term write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: false,
             },
         )
         .await?
@@ -612,6 +619,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::ArtworkFenceApply {
             setting: false,
             metadata: false,
+            book: false,
         } => {}
         response => bail!("an old same-term artwork generation remained valid: {response:?}"),
     }
@@ -724,6 +732,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 target_item_id: wrong_target_item,
                 fence: new_fence.clone(),
                 title: "wrong-item write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: false,
             },
         )
         .await?
@@ -731,6 +741,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::ArtworkFenceApply {
             setting: false,
             metadata: false,
+            book: false,
         } => {}
         response => bail!("an artwork fence authorized a different item: {response:?}"),
     }
@@ -741,6 +752,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 target_item_id: repair_item,
                 fence: old_fence,
                 title: "stale old-term write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: false,
             },
         )
         .await?
@@ -748,6 +761,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::ArtworkFenceApply {
             setting: false,
             metadata: false,
+            book: false,
         } => {}
         response => bail!("an old-term artwork mutation was not fenced: {response:?}"),
     }
@@ -757,7 +771,29 @@ async fn run_membership_lifecycle_case() -> Result<()> {
             Request::ApplyArtworkRepairFence {
                 target_item_id: repair_item,
                 fence: new_fence.clone(),
-                title: "current-term write".to_owned(),
+                title: "stale-job-lease write".to_owned(),
+                stale_job_lease: true,
+                stale_book_snapshot: false,
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: false,
+            metadata: false,
+            book: false,
+        } => {}
+        response => bail!("a stale singleton-job lease authorized artwork writes: {response:?}"),
+    }
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: new_fence.clone(),
+                title: "stale-book-snapshot write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: true,
             },
         )
         .await?
@@ -765,6 +801,27 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::ArtworkFenceApply {
             setting: true,
             metadata: true,
+            book: false,
+        } => {}
+        response => bail!("a stale book snapshot overwrote newer fields: {response:?}"),
+    }
+    match cluster
+        .request(
+            handoff,
+            Request::ApplyArtworkRepairFence {
+                target_item_id: repair_item,
+                fence: new_fence.clone(),
+                title: "current-term write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: false,
+            },
+        )
+        .await?
+    {
+        Response::ArtworkFenceApply {
+            setting: true,
+            metadata: true,
+            book: true,
         } => {}
         response => bail!("the current artwork repair fence was refused: {response:?}"),
     }
@@ -784,6 +841,8 @@ async fn run_membership_lifecycle_case() -> Result<()> {
                 target_item_id: repair_item,
                 fence: new_fence,
                 title: "retired-generation write".to_owned(),
+                stale_job_lease: false,
+                stale_book_snapshot: false,
             },
         )
         .await?
@@ -791,6 +850,7 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::ArtworkFenceApply {
             setting: false,
             metadata: false,
+            book: false,
         } => {}
         response => bail!("a retired artwork generation remained valid: {response:?}"),
     }
@@ -845,6 +905,33 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // own process so the fixture's source files exist where its packages say
     // they do.
     let target_node = format!("node-{target}");
+    let departing_job_resource = format!("cluster-check:departing-job:{target_node}");
+    let departing_job_lease = match cluster
+        .request(
+            observer,
+            Request::AcquireJobLease {
+                resource: departing_job_resource.clone(),
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::JobLease { lease: Some(lease) } => lease,
+        response => bail!("could not seed the departing node's job lease: {response:?}"),
+    };
+    let exhausted_job_lease = match cluster
+        .request(
+            observer,
+            Request::SeedExhaustedJobLease {
+                resource: format!("{departing_job_resource}:exhausted"),
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::JobLease { lease: Some(lease) } => lease,
+        response => bail!("could not seed the exhausted departing-node lease: {response:?}"),
+    };
     let media_dir = root.path().join(format!("media-{target_node}"));
     let offline_user = match cluster
         .request(
@@ -935,6 +1022,93 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     {
         Response::Flag { value: false } => {}
         response => bail!("a removed voter retained artwork access: {response:?}"),
+    }
+    match cluster
+        .request(
+            observer,
+            Request::ApplyJobLease {
+                key: format!("cluster-check.removed-job.{target_node}"),
+                lease: departing_job_lease,
+                observed_at_ms: None,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("a removed voter's existing job lease still published: {response:?}"),
+    }
+    match cluster
+        .request(
+            observer,
+            Request::ApplyJobLease {
+                key: format!("cluster-check.removed-exhausted-job.{target_node}"),
+                observed_at_ms: Some(exhausted_job_lease.expires_at_unix_ms - 1),
+                lease: exhausted_job_lease,
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!(
+            "a removed voter's exhausted, already-expired token published from a delayed command: {response:?}"
+        ),
+    }
+    match cluster
+        .request(
+            observer,
+            Request::AcquireJobLease {
+                resource: departing_job_resource,
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::JobLease { lease: None } => {}
+        response => bail!("a removed voter reacquired singleton work: {response:?}"),
+    }
+    match cluster
+        .request(
+            observer,
+            Request::AcquireJobLeaseLegacy {
+                resource: format!("cluster-check:legacy-reacquire:{target_node}"),
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("legacy lease SQL bypassed a removed-owner fence: {response:?}"),
+    }
+    cluster
+        .request(
+            observer,
+            Request::ClearJobOwnerFence {
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+        .require_ok()?;
+    cluster
+        .request(
+            observer,
+            Request::RemoveVoter {
+                node_id: target_node.clone(),
+            },
+        )
+        .await?
+        .require_ok()?;
+    match cluster
+        .request(
+            observer,
+            Request::AcquireJobLeaseLegacy {
+                resource: format!("cluster-check:legacy-backfill:{target_node}"),
+                owner_node_id: target_node.clone(),
+            },
+        )
+        .await?
+    {
+        Response::Flag { value: false } => {}
+        response => bail!("idempotent removal did not backfill its job-owner fence: {response:?}"),
     }
     cluster
         .request(
@@ -2015,6 +2189,28 @@ pub enum Request {
         target_item_id: i64,
         fence: ArtworkRepairFence,
         title: String,
+        stale_job_lease: bool,
+        stale_book_snapshot: bool,
+    },
+    AcquireJobLease {
+        resource: String,
+        owner_node_id: String,
+    },
+    SeedExhaustedJobLease {
+        resource: String,
+        owner_node_id: String,
+    },
+    AcquireJobLeaseLegacy {
+        resource: String,
+        owner_node_id: String,
+    },
+    ClearJobOwnerFence {
+        owner_node_id: String,
+    },
+    ApplyJobLease {
+        key: String,
+        lease: Lease,
+        observed_at_ms: Option<i64>,
     },
     ReleaseArtworkRepair {
         fence: ArtworkRepairFence,
@@ -2141,9 +2337,13 @@ pub enum Response {
     ArtworkRepairFence {
         fence: Option<ArtworkRepairFence>,
     },
+    JobLease {
+        lease: Option<Lease>,
+    },
     ArtworkFenceApply {
         setting: bool,
         metadata: bool,
+        book: bool,
     },
     MembershipError {
         code: String,
@@ -3174,7 +3374,7 @@ async fn handle_request(
             let library = store
                 .create_library(&NewLibrary {
                     name: format!("Artwork fence {}-{ordinal}", unix_now()?),
-                    kind: LibraryKind::Movies,
+                    kind: LibraryKind::Books,
                     paths: vec![PathBuf::from("/cluster-artwork-fence")],
                     anime: false,
                 })
@@ -3182,7 +3382,7 @@ async fn handle_request(
             let item_id = store
                 .insert_item(&NewItem {
                     library_id: library.id,
-                    kind: ItemKind::Movie,
+                    kind: ItemKind::Book,
                     parent_id: None,
                     title: "Original artwork fence title".to_owned(),
                     year: None,
@@ -3203,27 +3403,238 @@ async fn handle_request(
             target_item_id,
             ref fence,
             ref title,
+            stale_job_lease,
+            stale_book_snapshot,
         } => {
             let store = store_ref(store)?;
-            let setting = store
-                .put_setting_if_absent_if_artwork_repair_current(
+            let now_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("cluster-check clock precedes unix epoch")?
+                    .as_millis(),
+            )
+            .context("cluster-check unix millisecond clock overflowed")?;
+            let resource = format!("cluster-check:artwork-fence:{target_item_id}:{title}");
+            let lease = match store
+                .acquire_lease(&resource, "cluster-check-artwork", now_ms, now_ms + 10_000)
+                .await?
+            {
+                LeaseClaim::Acquired(lease) => lease,
+                held => bail!("cluster-check artwork publication lease was held: {held:?}"),
+            };
+            if stale_job_lease {
+                store
+                    .renew_lease(&lease, now_ms + 1, now_ms + 20_000)
+                    .await?
+                    .context("cluster-check artwork publication lease was not renewable")?;
+            }
+            let setting = match store
+                .put_setting_if_absent_if_artwork_repair_current_fenced(
                     &format!("cluster-check.artwork-fence.{target_item_id}.{title}"),
                     title,
                     target_item_id,
                     fence,
+                    &lease,
+                    now_ms + 2,
                 )
-                .await?;
-            let metadata = store
-                .apply_metadata_if_artwork_repair_current(
+                .await
+            {
+                Ok(setting) => setting,
+                Err(plurx_core::error::StoreError::FenceRejected { .. }) => false,
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = match store
+                .apply_metadata_if_artwork_repair_current_fenced(
                     target_item_id,
                     &MetadataPatch {
                         title: Some(title.clone()),
                         ..Default::default()
                     },
                     fence,
+                    &lease,
+                    now_ms + 2,
+                )
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(plurx_core::error::StoreError::FenceRejected { .. }) => false,
+                Err(error) => return Err(error.into()),
+            };
+            let expected = store
+                .get_item(target_item_id)
+                .await?
+                .context("cluster-check artwork fence target disappeared")?;
+            if stale_book_snapshot {
+                store
+                    .apply_metadata_fenced(
+                        target_item_id,
+                        &MetadataPatch {
+                            title: Some(format!("{title} successor")),
+                            ..Default::default()
+                        },
+                        &lease,
+                        now_ms + 3,
+                    )
+                    .await?;
+            }
+            let book = match store
+                .apply_book_metadata_if_current_fenced(
+                    &expected,
+                    &BookMetadataPatch {
+                        title: None,
+                        author: Some(format!("{title} author")),
+                        work_id: Some(format!("{title} work")),
+                        edition_id: Some(format!("{title} edition")),
+                        poster_path: None,
+                        source: BookMetadataSource::Curator,
+                    },
+                    Some(fence),
+                    &lease,
+                    now_ms + 4,
+                )
+                .await
+            {
+                Ok(book) => book,
+                Err(plurx_core::error::StoreError::FenceRejected { .. }) => false,
+                Err(error) => return Err(error.into()),
+            };
+            Ok(Response::ArtworkFenceApply {
+                setting,
+                metadata,
+                book,
+            })
+        }
+        Request::AcquireJobLease {
+            ref resource,
+            ref owner_node_id,
+        } => {
+            let now_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("cluster-check clock precedes unix epoch")?
+                    .as_millis(),
+            )
+            .context("cluster-check unix millisecond clock overflowed")?;
+            match store_ref(store)?
+                .acquire_lease(resource, owner_node_id, now_ms, now_ms + 600_000)
+                .await
+            {
+                Ok(LeaseClaim::Acquired(lease)) => Ok(Response::JobLease { lease: Some(lease) }),
+                Ok(LeaseClaim::Held { .. }) => Ok(Response::JobLease { lease: None }),
+                Err(plurx_core::error::StoreError::Task(message))
+                    if message.contains("has been removed") =>
+                {
+                    Ok(Response::JobLease { lease: None })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Request::SeedExhaustedJobLease {
+            ref resource,
+            ref owner_node_id,
+        } => {
+            let now_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("cluster-check clock precedes unix epoch")?
+                    .as_millis(),
+            )
+            .context("cluster-check unix millisecond clock overflowed")?;
+            let expires_at_unix_ms = now_ms - 100;
+            client
+                .execute(
+                    "INSERT INTO job_leases \
+                       (resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms) \
+                     VALUES ($1, $2, 1, 9223372036854775807, $3, $4)",
+                    params!(resource, owner_node_id, expires_at_unix_ms, now_ms),
                 )
                 .await?;
-            Ok(Response::ArtworkFenceApply { setting, metadata })
+            Ok(Response::JobLease {
+                lease: Some(Lease {
+                    resource: resource.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    fence: 1,
+                    revision: i64::MAX as u64,
+                    expires_at_unix_ms,
+                }),
+            })
+        }
+        Request::AcquireJobLeaseLegacy {
+            ref resource,
+            ref owner_node_id,
+        } => {
+            let now_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("cluster-check clock precedes unix epoch")?
+                    .as_millis(),
+            )
+            .context("cluster-check unix millisecond clock overflowed")?;
+            let legacy_sql = "INSERT INTO job_leases \
+                (resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms) \
+                VALUES ($1, $2, 1, 1, $3, $4) \
+                ON CONFLICT(resource) DO UPDATE SET \
+                    owner_node_id = excluded.owner_node_id, \
+                    fence = job_leases.fence + 1, \
+                    revision = job_leases.revision + 1, \
+                    expires_at_ms = excluded.expires_at_ms, \
+                    updated_at_ms = excluded.updated_at_ms \
+                WHERE job_leases.expires_at_ms <= $4 \
+                  AND job_leases.fence < 9223372036854775807 \
+                  AND job_leases.revision < 9223372036854775807";
+            match client
+                .execute(
+                    legacy_sql,
+                    params!(resource, owner_node_id, now_ms + 600_000, now_ms),
+                )
+                .await
+            {
+                Ok(changed) => Ok(Response::Flag {
+                    value: changed == 1,
+                }),
+                Err(error) if error.to_string().contains("owner has been removed") => {
+                    Ok(Response::Flag { value: false })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Request::ClearJobOwnerFence { ref owner_node_id } => {
+            client
+                .execute(
+                    "DELETE FROM settings \
+                     WHERE key = 'internal.cluster_job_owner_removed.' || $1",
+                    params!(owner_node_id),
+                )
+                .await?;
+            Ok(Response::Ok)
+        }
+        Request::ApplyJobLease {
+            ref key,
+            ref lease,
+            observed_at_ms,
+        } => {
+            let now_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("cluster-check clock precedes unix epoch")?
+                    .as_millis(),
+            )
+            .context("cluster-check unix millisecond clock overflowed")?;
+            match store_ref(store)?
+                .put_setting_fenced(
+                    key,
+                    "removed-owner-write",
+                    lease,
+                    observed_at_ms.unwrap_or(now_ms),
+                )
+                .await
+            {
+                Ok(()) => Ok(Response::Flag { value: true }),
+                Err(plurx_core::error::StoreError::FenceRejected { .. }) => {
+                    Ok(Response::Flag { value: false })
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         Request::ReleaseArtworkRepair { ref fence } => membership_ref(membership)?
             .retire_artwork_source_repair(fence)

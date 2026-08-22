@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use plurx_core::cluster::coordination::{LeaseClaim, StoreCoordinator};
 #[cfg(test)]
 use plurx_core::domain::ArtworkAttempt;
 use plurx_core::domain::{
@@ -19,7 +20,7 @@ use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
 use plurx_core::secrets::CredentialKey;
-use plurx_core::store::{keys, ArtworkRepairFence, Store};
+use plurx_core::store::{keys, ArtworkRepairFence, PublicationFence, PublicationStore, Store};
 use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -75,6 +76,10 @@ pub struct SystemInfo {
     /// probe of a separate graph — the SDR one proves nothing about a PQ
     /// output, where an 8-bit format aborts the process outright.
     pub dovi_passthrough: bool,
+    /// Whether this node proved the P010 upload → QSV Main10 half of the
+    /// Dolby Vision HDR10 route. Kept separate so a working software rung
+    /// never implies a working GPU driver.
+    pub dovi_passthrough_qsv: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -231,6 +236,7 @@ impl AppState {
             Arc::clone(&store),
             artwork_dir.clone(),
             scan_prune_percent,
+            node_id.clone(),
         ));
         let coming_soon = crate::http::ComingSoonCache::new();
         let watched = crate::watched::WatchedNotifier::new(Arc::clone(&store));
@@ -245,6 +251,7 @@ impl AppState {
             .with_dv_strippable(system.dovi_rpu)
             .with_dovi_reshape(system.dovi_reshape)
             .with_dovi_passthrough(system.dovi_passthrough)
+            .with_dovi_passthrough_qsv(system.dovi_passthrough_qsv)
             .with_cache(
                 cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
@@ -462,6 +469,7 @@ impl IntegrationMetrics {
 
 pub struct JobManager {
     store: Arc<dyn Store>,
+    coordinator: StoreCoordinator,
     artwork_dir: PathBuf,
     scan_prune_percent: u8,
     /// Test-only provider override so the targeted-scan seam can be exercised
@@ -474,6 +482,10 @@ pub struct JobManager {
     /// Targeted scans waiting for a library's running scan to finish,
     /// per library. See [`JobManager::request_scan`].
     pending: Mutex<HashMap<i64, Vec<ScanRequest>>>,
+    /// At most one delayed remote-lease retry per library. Without this,
+    /// several integration requests arriving during the same remote scan
+    /// would each perpetuate its own two-second retry task.
+    pending_retries: Mutex<HashSet<i64>>,
     /// Recent targeted-scan requests and their outcomes, newest last.
     requests: Mutex<VecDeque<ScanRequestRecord>>,
     metrics: IntegrationMetrics,
@@ -683,6 +695,179 @@ pub struct ScanRequestRecord {
 /// would mean a schema, a retention policy and a growth problem, for data
 /// whose value expires in hours.
 const MAX_REQUESTS: usize = 256;
+/// One library can attract a burst of integration callbacks while another
+/// node owns its scan. Bound retained waiter state independently of the
+/// request-history ring; overflow is terminal and visible to the caller.
+const MAX_PENDING_PER_LIBRARY: usize = 256;
+
+const JOB_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+const JOB_LEASE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) struct ActiveJobLease {
+    coordinator: StoreCoordinator,
+    fence: PublicationFence,
+    cancel: tokio_util::sync::CancellationToken,
+    lost: tokio_util::sync::CancellationToken,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ActiveJobLease {
+    fn start(
+        coordinator: StoreCoordinator,
+        lease: plurx_core::cluster::coordination::Lease,
+    ) -> Self {
+        Self::start_with_policy(coordinator, lease, JOB_LEASE_TTL, JOB_LEASE_HEARTBEAT)
+    }
+
+    fn start_with_policy(
+        coordinator: StoreCoordinator,
+        lease: plurx_core::cluster::coordination::Lease,
+        ttl: std::time::Duration,
+        heartbeat_every: std::time::Duration,
+    ) -> Self {
+        let fence = PublicationFence::new(lease);
+        let heartbeat_fence = fence.clone();
+        let heartbeat_coordinator = coordinator.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_cancel = cancel.clone();
+        let lost = tokio_util::sync::CancellationToken::new();
+        let heartbeat_lost = lost.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(heartbeat_every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                let Some(current) = heartbeat_fence.snapshot().await else {
+                    break;
+                };
+                let renewal = heartbeat_fence.renew(&heartbeat_coordinator, ttl);
+                tokio::pin!(renewal);
+                let expiry = tokio::time::sleep(lease_time_remaining(current.expires_at_unix_ms));
+                tokio::pin!(expiry);
+                let renewed = tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => break,
+                    _ = &mut expiry => {
+                        let _ = heartbeat_fence.invalidate(&current).await;
+                        heartbeat_lost.cancel();
+                        tracing::warn!(
+                            resource = current.resource,
+                            fence = current.fence,
+                            "cluster job renewal exceeded its lease deadline and self-fenced"
+                        );
+                        break;
+                    }
+                    result = &mut renewal => result,
+                };
+                match renewed {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        heartbeat_lost.cancel();
+                        tracing::warn!(
+                            resource = current.resource,
+                            fence = current.fence,
+                            "cluster job lost its lease and self-fenced"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        heartbeat_lost.cancel();
+                        tracing::warn!(
+                            resource = current.resource,
+                            fence = current.fence,
+                            error = %error,
+                            "cluster job lease renewal failed and self-fenced"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            coordinator,
+            fence,
+            cancel,
+            lost,
+            heartbeat: Some(heartbeat),
+        }
+    }
+
+    pub(crate) fn publisher<'a>(&self, store: &'a dyn Store) -> PublicationStore<'a> {
+        PublicationStore::fenced(store, self.fence.clone())
+    }
+
+    pub(crate) fn loss_token(&self) -> tokio_util::sync::CancellationToken {
+        self.lost.clone()
+    }
+
+    fn publication_fence(&self) -> PublicationFence {
+        self.fence.clone()
+    }
+
+    pub(crate) async fn release(mut self) {
+        self.cancel.cancel();
+        if let Some(heartbeat) = self.heartbeat.take() {
+            if let Err(error) = heartbeat.await {
+                tracing::warn!(error = %error, "cluster job heartbeat task failed during release");
+            }
+        }
+        let token = self.fence.snapshot().await;
+        if let Some(token) = token {
+            if let Err(error) = self.coordinator.release(&token).await {
+                tracing::warn!(
+                    resource = token.resource,
+                    fence = token.fence,
+                    error = %error,
+                    "cluster job lease release failed; TTL will recover it"
+                );
+            }
+        }
+    }
+}
+
+fn lease_time_remaining(expires_at_unix_ms: i64) -> std::time::Duration {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(i64::MAX);
+    std::time::Duration::from_millis(expires_at_unix_ms.saturating_sub(now_unix_ms).max(0) as u64)
+}
+
+impl Drop for ActiveJobLease {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.lost.cancel();
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
+}
+
+pub(crate) async fn acquire_cluster_job(
+    coordinator: &StoreCoordinator,
+    resource: String,
+) -> Result<Option<ActiveJobLease>, StoreError> {
+    match coordinator.acquire(&resource, JOB_LEASE_TTL).await? {
+        LeaseClaim::Acquired(lease) => Ok(Some(ActiveJobLease::start(coordinator.clone(), lease))),
+        LeaseClaim::Held {
+            owner_node_id,
+            fence,
+            expires_at_unix_ms,
+        } => {
+            tracing::debug!(
+                resource,
+                owner = owner_node_id,
+                fence,
+                expires_at_unix_ms,
+                "cluster job lease is held; skipping local duplicate"
+            );
+            Ok(None)
+        }
+    }
+}
 
 impl JobManager {
     #[cfg(test)]
@@ -691,6 +876,7 @@ impl JobManager {
             store,
             artwork_dir,
             plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+            "test-node".to_owned(),
         )
     }
 
@@ -698,9 +884,13 @@ impl JobManager {
         store: Arc<dyn Store>,
         artwork_dir: PathBuf,
         scan_prune_percent: u8,
+        node_id: String,
     ) -> Self {
+        let coordinator = StoreCoordinator::new(Arc::clone(&store), node_id)
+            .expect("configured node id is a valid lease owner");
         JobManager {
             store,
+            coordinator,
             artwork_dir,
             scan_prune_percent,
             #[cfg(test)]
@@ -708,6 +898,7 @@ impl JobManager {
             statuses: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            pending_retries: Mutex::new(HashSet::new()),
             requests: Mutex::new(VecDeque::new()),
             metrics: IntegrationMetrics::default(),
             producing: std::sync::atomic::AtomicBool::new(false),
@@ -718,6 +909,10 @@ impl JobManager {
             book_cover_workers: metadata::book::CoverMaterializationWorkers::default(),
             last_genre_backfill: Mutex::new(None),
         }
+    }
+
+    async fn acquire_job(&self, resource: String) -> Result<Option<ActiveJobLease>, StoreError> {
+        acquire_cluster_job(&self.coordinator, resource).await
     }
 
     /// What the last genre-backfill pass did, if one has run since boot.
@@ -797,10 +992,21 @@ impl JobManager {
         force_metadata: bool,
         why: ScanTrigger,
     ) -> bool {
+        let resource = format!("scan:library:{library_id}");
+        let lease = match self.acquire_job(resource).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(library = library_id, error = %error, "acquiring scan lease failed");
+                return false;
+            }
+        };
         {
             let mut statuses = self.statuses.lock().await;
             let entry = statuses.entry(library_id).or_default();
             if entry.running {
+                drop(statuses);
+                lease.release().await;
                 return false;
             }
             self.metrics.count_scan(why);
@@ -819,7 +1025,22 @@ impl JobManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.run_scan(library_id, progress, force_metadata).await;
+            let lost = lease.loss_token();
+            tokio::select! {
+                () = manager.run_scan(library_id, progress, force_metadata, &lease) => {}
+                () = lost.cancelled() => {
+                    let mut status = manager
+                        .statuses
+                        .lock()
+                        .await
+                        .get(&library_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    status.error = Some("cluster scan lease was lost".to_owned());
+                    manager.finish(library_id, status).await;
+                }
+            }
+            lease.release().await;
             // Whatever queued up while this ran is work someone was
             // promised. A full scan covers the same files a targeted one
             // would have, but the CALLER is still owed its answer — the
@@ -836,7 +1057,7 @@ impl JobManager {
     /// library was already scanning and the request was queued — the caller
     /// polls `scan_request` for the outcome.
     ///
-    /// **Requests are coalesced, never dropped.** `trigger` returns false
+    /// **Requests are queued, never dropped.** `trigger` returns false
     /// while a scan runs, which is right for "the user pressed Scan twice"
     /// and wrong here: importing a season fires one request per episode
     /// within seconds, and dropping N−1 of them would leave most of the
@@ -854,22 +1075,41 @@ impl JobManager {
             statuses.get(&req.library_id).is_some_and(|s| s.running)
         };
         if busy {
-            let mut pending = self.pending.lock().await;
-            let queue = pending.entry(req.library_id).or_default();
-            if queue.iter().any(|q| q.path == req.path) {
-                // The same folder is already waiting. Scanning it twice
-                // would produce the same rows and the same answer.
-                tracing::debug!(target: "plurxd::integrate",
-                    path = %req.path.display(), "targeted scan already pending; coalesced");
-            } else {
-                queue.push(req.clone());
+            if let Err(error) = self.queue_targeted(req.clone()).await {
+                self.record_request(&req, "failed", None, Some(error.to_string()))
+                    .await;
+                return Err(error);
             }
-            drop(pending);
             self.set_request_status(&req.id, "queued").await;
             return Ok(None);
         }
 
-        let out = self.run_targeted(&req).await;
+        let lease = match self
+            .acquire_job(format!("scan:library:{}", req.library_id))
+            .await
+            .map_err(TargetError::Store)?
+        {
+            Some(lease) => lease,
+            None => {
+                if let Err(error) = self.queue_targeted(req.clone()).await {
+                    self.record_request(&req, "failed", None, Some(error.to_string()))
+                        .await;
+                    return Err(error);
+                }
+                self.set_request_status(&req.id, "queued").await;
+                self.schedule_pending_retry(req.library_id).await;
+                return Ok(None);
+            }
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
+        let out = tokio::select! {
+            out = self.run_targeted(std::slice::from_ref(&req), &publisher) => out,
+            () = lost.cancelled() => Err(TargetError::Store(StoreError::Task(
+                "cluster scan lease was lost".to_owned(),
+            ))),
+        };
+        lease.release().await;
         match &out {
             Ok(scan) => {
                 self.record_request(&req, "done", Some(scan), None).await;
@@ -882,7 +1122,16 @@ impl JobManager {
         out.map(Some)
     }
 
-    async fn run_targeted(&self, req: &ScanRequest) -> Result<TargetedScan, TargetError> {
+    async fn run_targeted(
+        &self,
+        requests: &[ScanRequest],
+        publisher: &PublicationStore<'_>,
+    ) -> Result<TargetedScan, TargetError> {
+        let req = requests.first().ok_or_else(|| {
+            TargetError::Store(StoreError::Task(
+                "targeted scan group contained no waiters".to_owned(),
+            ))
+        })?;
         self.metrics.count_scan(ScanTrigger::Targeted);
         let library = self
             .store
@@ -900,10 +1149,13 @@ impl JobManager {
             correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
             source = req.source.as_deref().unwrap_or("-"),
             request = %req.id,
+            waiters = requests.len(),
             "targeted scan requested"
         );
-        let out = scan::scan_path(self.store.as_ref(), &library, &req.path).await?;
-        self.apply_ids(req, &out.items).await;
+        let out = scan::scan_path_with_publication(publisher, &library, &req.path).await?;
+        for request in requests {
+            self.apply_ids(request, &out.items, publisher).await;
+        }
 
         // The rows exist; without this they would have no artwork until
         // somebody pressed Scan. Bounded to what this request placed (and the
@@ -953,6 +1205,7 @@ impl JobManager {
         };
         let outcome = self
             .enrich(
+                publisher,
                 &library,
                 refresh_existing_show,
                 Some(&targets),
@@ -960,7 +1213,9 @@ impl JobManager {
                 None,
             )
             .await;
-        self.apply_book_hints(req, &out.items).await;
+        for request in requests {
+            self.apply_book_hints(request, &out.items, publisher).await;
+        }
         tracing::info!(
             target: "plurxd::integrate",
             library = req.library_id,
@@ -1034,6 +1289,7 @@ impl JobManager {
     /// route into TMDB. `None` remains the whole-library behavior.
     async fn enrich(
         &self,
+        publisher: &PublicationStore<'_>,
         library: &Library,
         force: bool,
         routes: Option<&[i64]>,
@@ -1047,8 +1303,8 @@ impl JobManager {
         // libraries use TMDB when a key is configured.
         if library.kind == LibraryKind::Home {
             outcome.local_art = Some(
-                metadata::local::enrich_home_library(
-                    self.store.as_ref(),
+                metadata::local::enrich_home_library_with_publication(
+                    publisher,
                     &self.artwork_dir,
                     library.id,
                     force,
@@ -1062,8 +1318,8 @@ impl JobManager {
             // above it by the store, so later scheduled scans cannot regress
             // explicit author/work/edition identity.
             outcome.books = Some(
-                metadata::book::enrich_library(
-                    self.store.as_ref(),
+                metadata::book::enrich_library_with_publication(
+                    publisher,
                     &self.artwork_dir,
                     library.id,
                     force,
@@ -1074,8 +1330,8 @@ impl JobManager {
         } else if library.anime {
             let client = AniListClient::new();
             outcome.enrich = Some(
-                metadata::enrich_anime_library_with_fence(
-                    self.store.as_ref(),
+                metadata::enrich_anime_library_with_publication(
+                    publisher,
                     &client,
                     &self.artwork_dir,
                     library.id,
@@ -1090,8 +1346,8 @@ impl JobManager {
                 Ok(Some(key)) if !key.is_empty() => {
                     let tmdb = self.tmdb_client(key);
                     outcome.enrich = Some(
-                        metadata::enrich_library_for_targets_with_fence(
-                            self.store.as_ref(),
+                        metadata::enrich_library_for_targets_with_publication(
+                            publisher,
                             &tmdb,
                             &self.artwork_dir,
                             Some(library.id),
@@ -1152,33 +1408,81 @@ impl JobManager {
         let Some(library) = self.store.get_library(item.library_id).await? else {
             return Ok(EnrichOutcome::default());
         };
-        if library.kind == LibraryKind::Books
-            && item.book_metadata_source.as_deref() == Some(BookMetadataSource::Curator.as_str())
-        {
-            let expected = item.poster_path.iter().cloned().collect::<Vec<_>>();
-            let _ = metadata::book::materialize_curator_cover(
-                self.store.as_ref(),
-                &self.artwork_dir,
-                item_id,
-                &expected,
-                repair_fence,
-            )
-            .await;
-            return Ok(EnrichOutcome::default());
-        }
-        // Ancestors for the same reason a targeted scan needs them: an
-        // episode's artwork is fetched through its show's season, so asking
-        // for the episode alone would ask for nothing.
-        let targets = self.enrich_targets(&[item_id]).await;
-        let repairs = [item_id];
-        Ok(self
-            .enrich(&library, true, Some(&targets), Some(&repairs), repair_fence)
-            .await)
+        let Some(lease) = self.acquire_job("provider:artwork".to_owned()).await? else {
+            return Err(StoreError::Task(
+                "artwork provider pass is active on another cluster node".to_owned(),
+            ));
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
+        let outcome = tokio::select! {
+            outcome = async {
+                if library.kind == LibraryKind::Books
+                    && item.book_metadata_source.as_deref()
+                        == Some(BookMetadataSource::Curator.as_str())
+                {
+                    let expected = item.poster_path.iter().cloned().collect::<Vec<_>>();
+                    let _ = metadata::book::materialize_curator_cover(
+                        &publisher,
+                        &self.artwork_dir,
+                        item_id,
+                        &expected,
+                        repair_fence,
+                    )
+                    .await;
+                    Ok(EnrichOutcome::default())
+                } else {
+                    // Episodes route through their show, but only the requested
+                    // item may publish under its repair fence.
+                    let targets = self.enrich_targets(&[item_id]).await;
+                    let repairs = [item_id];
+                    Ok(self
+                        .enrich(
+                            &publisher,
+                            &library,
+                            true,
+                            Some(&targets),
+                            Some(&repairs),
+                            repair_fence,
+                        )
+                        .await)
+                }
+            } => outcome,
+            () = lost.cancelled() => Err(StoreError::Task(
+                "cluster artwork lease was lost".to_owned()
+            )),
+        };
+        drop(publisher);
+        lease.release().await;
+        outcome
+    }
+
+    pub async fn reanalyze_files(
+        &self,
+        files: &[plurx_core::domain::MediaFile],
+    ) -> Result<plurx_core::scan::ReprobeReport, StoreError> {
+        let Some(lease) = self.acquire_job("repair:probe".to_owned()).await? else {
+            return Err(StoreError::Task(
+                "probe repair pass is active on another cluster node".to_owned(),
+            ));
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
+        let result = tokio::select! {
+            result = scan::reprobe_files_with_publication(&publisher, files) => result,
+            () = lost.cancelled() => Err(StoreError::Task(
+                "cluster probe-repair lease was lost".to_owned(),
+            )),
+        };
+        drop(publisher);
+        lease.release().await;
+        result
     }
 
     /// Recreate Home/Books bytes from media mounted on this voter without
-    /// publishing catalogue fields. `None` means the library is provider-
-    /// backed and therefore requires the cluster-wide source fence.
+    /// publishing catalogue fields. Books includes EPUB and audiobook covers;
+    /// `None` means the library is provider-backed and therefore requires the
+    /// cluster-wide source fence.
     pub async fn materialize_local_item_artwork(
         &self,
         item_id: i64,
@@ -1200,7 +1504,7 @@ impl JobManager {
                 )
                 .await,
             )),
-            LibraryKind::Books if item.kind == ItemKind::Book => {
+            LibraryKind::Books if matches!(item.kind, ItemKind::Book | ItemKind::Audiobook) => {
                 metadata::book::materialize_item_cover(
                     self.store.as_ref(),
                     &self.artwork_dir,
@@ -1220,7 +1524,12 @@ impl JobManager {
     /// Best-effort by design: a failure here must not fail the scan. The
     /// files are indexed and playable either way, and a missing id degrades
     /// to the fuzzy title match plurx would have done anyway.
-    async fn apply_ids(&self, req: &ScanRequest, items: &[PlacedFile]) {
+    async fn apply_ids(
+        &self,
+        req: &ScanRequest,
+        items: &[PlacedFile],
+        publisher: &PublicationStore<'_>,
+    ) {
         let Some(ids) = req.ids.as_ref().filter(|i| !i.is_empty()) else {
             return;
         };
@@ -1242,7 +1551,7 @@ impl JobManager {
                 },
                 ..Default::default()
             };
-            match self.store.apply_metadata(target, &patch).await {
+            match publisher.apply_metadata(target, &patch).await {
                 Ok(_) => tracing::info!(
                     target: "plurxd::integrate",
                     item = target,
@@ -1264,7 +1573,12 @@ impl JobManager {
     /// enrichment. Source precedence is also enforced in the store, so this
     /// ordering is defense in depth rather than a convention later scans can
     /// accidentally reverse.
-    async fn apply_book_hints(&self, req: &ScanRequest, placed: &[PlacedFile]) {
+    async fn apply_book_hints(
+        &self,
+        req: &ScanRequest,
+        placed: &[PlacedFile],
+        publisher: &PublicationStore<'_>,
+    ) {
         let Some(hints) = req.book.as_ref() else {
             return;
         };
@@ -1357,7 +1671,7 @@ impl JobManager {
                     );
                     continue;
                 };
-                if let Err(error) = self.store.put_setting_if_absent(&key, &origin).await {
+                if let Err(error) = publisher.put_setting_if_absent(&key, &origin).await {
                     tracing::warn!(item = item.id, %error, "persisting Curator cover origin");
                     continue;
                 }
@@ -1373,8 +1687,7 @@ impl JobManager {
                 poster_path,
                 source: BookMetadataSource::Curator,
             };
-            match self
-                .store
+            match publisher
                 .apply_book_metadata_if_current(&item, &patch, None)
                 .await
             {
@@ -1418,24 +1731,121 @@ impl JobManager {
         Some(current.id)
     }
 
+    async fn queue_targeted(&self, req: ScanRequest) -> Result<(), TargetError> {
+        let mut pending = self.pending.lock().await;
+        // The path is only the physical scan target. Request ids, caller ids,
+        // curator book hints, correlation ids, and terminal status are all
+        // per waiter; discarding a same-path request would strand its record
+        // in `queued` forever and silently lose its metadata payload.
+        let queue = pending.entry(req.library_id).or_default();
+        if queue.len() >= MAX_PENDING_PER_LIBRARY {
+            return Err(TargetError::Store(StoreError::Task(format!(
+                "targeted scan queue for library {} is full ({MAX_PENDING_PER_LIBRARY} waiters)",
+                req.library_id
+            ))));
+        }
+        queue.push(req);
+        Ok(())
+    }
+
+    async fn schedule_pending_retry(self: &Arc<Self>, library_id: i64) {
+        if !self.pending_retries.lock().await.insert(library_id) {
+            return;
+        }
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if manager.drain_pending_once(library_id).await {
+                    continue;
+                }
+                // Close the empty-observation/removal race with request_scan:
+                // it queues while holding `pending`, then tries
+                // `pending_retries`. Holding the first lock while removing
+                // from the second makes an enqueue land wholly before this
+                // check (and loop again) or wholly after removal (and install
+                // a new retry task).
+                let pending = manager.pending.lock().await;
+                if pending
+                    .get(&library_id)
+                    .is_some_and(|queue| !queue.is_empty())
+                {
+                    continue;
+                }
+                manager.pending_retries.lock().await.remove(&library_id);
+                break;
+            }
+        });
+    }
+
     /// Run whatever queued up while a library was scanning. Called once a
     /// scan finishes; the work a caller was promised must not be forgotten
     /// just because it arrived at a busy moment.
     async fn drain_pending(self: &Arc<Self>, library_id: i64) {
+        if self.drain_pending_once(library_id).await {
+            self.schedule_pending_retry(library_id).await;
+        }
+    }
+
+    /// Attempt one drain. `true` asks the caller's single-flight retry loop to
+    /// try again after the remote owner has had time to make progress.
+    async fn drain_pending_once(self: &Arc<Self>, library_id: i64) -> bool {
         let queued = {
             let mut pending = self.pending.lock().await;
             pending.remove(&library_id).unwrap_or_default()
         };
+        if queued.is_empty() {
+            return false;
+        }
+        let lease = match self.acquire_job(format!("scan:library:{library_id}")).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                for req in queued {
+                    if let Err(error) = self.queue_targeted(req.clone()).await {
+                        self.record_request(&req, "failed", None, Some(error.to_string()))
+                            .await;
+                    }
+                }
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(library = library_id, error = %error, "targeted scan lease retry failed");
+                for req in queued {
+                    if let Err(error) = self.queue_targeted(req.clone()).await {
+                        self.record_request(&req, "failed", None, Some(error.to_string()))
+                            .await;
+                    }
+                }
+                return true;
+            }
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
+        let mut groups: BTreeMap<PathBuf, Vec<ScanRequest>> = BTreeMap::new();
         for req in queued {
-            let out = self.run_targeted(&req).await;
-            match &out {
-                Ok(scan) => self.record_request(&req, "done", Some(scan), None).await,
-                Err(e) => {
-                    self.record_request(&req, "failed", None, Some(e.to_string()))
-                        .await
+            let normalized = req.path.canonicalize().unwrap_or_else(|_| req.path.clone());
+            groups.entry(normalized).or_default().push(req);
+        }
+        for requests in groups.into_values() {
+            let out = tokio::select! {
+                out = self.run_targeted(&requests, &publisher) => out,
+                () = lost.cancelled() => Err(TargetError::Store(StoreError::Task(
+                    "cluster scan lease was lost".to_owned(),
+                ))),
+            };
+            for req in requests {
+                match &out {
+                    Ok(scan) => self.record_request(&req, "done", Some(scan), None).await,
+                    Err(e) => {
+                        self.record_request(&req, "failed", None, Some(e.to_string()))
+                            .await
+                    }
                 }
             }
         }
+        drop(publisher);
+        lease.release().await;
+        false
     }
 
     /// The recent request ring, newest last.
@@ -1496,7 +1906,13 @@ impl JobManager {
         }
     }
 
-    async fn run_scan(&self, library_id: i64, progress: Arc<ScanProgress>, force_metadata: bool) {
+    async fn run_scan(
+        &self,
+        library_id: i64,
+        progress: Arc<ScanProgress>,
+        force_metadata: bool,
+        lease: &ActiveJobLease,
+    ) {
         let mut status = ScanStatus {
             running: true,
             started_at: Some(now()),
@@ -1516,8 +1932,9 @@ impl JobManager {
             }
         };
 
-        match scan::scan_library_with_progress_and_prune_percent(
-            self.store.as_ref(),
+        let publisher = lease.publisher(self.store.as_ref());
+        match scan::scan_library_with_publication_and_prune_percent(
+            &publisher,
             &library,
             Some(&progress),
             self.scan_prune_percent,
@@ -1545,7 +1962,7 @@ impl JobManager {
         // provider-choosing lives in `enrich` so the targeted path cannot
         // have a different idea of it.
         let outcome = self
-            .enrich(&library, force_metadata, None, None, None)
+            .enrich(&publisher, &library, force_metadata, None, None, None)
             .await;
         status.last_enrich = outcome.enrich;
         status.last_local_art = outcome.local_art;
@@ -1556,8 +1973,7 @@ impl JobManager {
         // that takes 40 minutes on a 1-hour interval would otherwise be due
         // again 20 minutes later, and a library slower than its own interval
         // would scan without pause.
-        if let Err(e) = self
-            .store
+        if let Err(e) = publisher
             .mark_library_scanned(library_id, force_metadata)
             .await
         {
@@ -1637,7 +2053,9 @@ impl JobManager {
                 .await,
             last_artwork_retry: self.job_stamp(keys::JOB_LAST_ARTWORK_RETRY).await,
             transcode_cleanup_mins: self.job_interval(keys::JOB_TRANSCODE_CLEANUP_MINS).await,
-            last_transcode_cleanup: self.job_stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await,
+            last_transcode_cleanup: self
+                .job_stamp(&self.local_job_key(keys::JOB_LAST_TRANSCODE_CLEANUP))
+                .await,
             telemetry_retain_days: self
                 .job_interval_or(
                     keys::TELEMETRY_RETAIN_DAYS,
@@ -1649,7 +2067,9 @@ impl JobManager {
                 .get_setting(keys::PLAYBACK_NETWORK_PRIORS)
                 .await?
                 .is_some_and(|value| value.trim() == "1"),
-            last_telemetry_prune: self.job_stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await,
+            last_telemetry_prune: self
+                .job_stamp(&self.local_job_key(keys::JOB_LAST_TELEMETRY_PRUNE))
+                .await,
             cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
             last_cache_produce: self.job_stamp(keys::JOB_LAST_CACHE_PRODUCE).await,
         };
@@ -1668,20 +2088,36 @@ impl JobManager {
                 // Server-wide jobs are stamped before dispatch so one failure
                 // cannot retry every minute forever.
                 DueJob::RetryProbes => {
-                    self.stamp(keys::JOB_LAST_PROBE_RETRY).await;
-                    let files = self.store.files_missing_probe(None).await?;
-                    if !files.is_empty() {
-                        let report = scan::reprobe_files(self.store.as_ref(), &files).await?;
-                        tracing::info!(
-                            attempted = report.attempted,
-                            repaired = report.repaired,
-                            still_failing = report.still_failing,
-                            "scheduled re-probe finished"
-                        );
+                    if let Some(lease) = self.acquire_job("repair:probe".to_owned()).await? {
+                        let lost = lease.loss_token();
+                        let publisher = lease.publisher(self.store.as_ref());
+                        self.stamp(keys::JOB_LAST_PROBE_RETRY, &publisher).await;
+                        let result: Result<(), StoreError> = tokio::select! {
+                            result = async {
+                                let files = self.store.files_missing_probe(None).await?;
+                                if !files.is_empty() {
+                                    let report =
+                                        scan::reprobe_files_with_publication(&publisher, &files)
+                                            .await?;
+                                    tracing::info!(
+                                        attempted = report.attempted,
+                                        repaired = report.repaired,
+                                        still_failing = report.still_failing,
+                                        "scheduled re-probe finished"
+                                    );
+                                }
+                                Ok(())
+                            } => result,
+                            () = lost.cancelled() => Err(StoreError::Task(
+                                "cluster probe-repair lease was lost".to_owned(),
+                            )),
+                        };
+                        drop(publisher);
+                        lease.release().await;
+                        result?;
                     }
                 }
                 DueJob::RetryArtwork => {
-                    self.stamp(keys::JOB_LAST_ARTWORK_RETRY).await;
                     // Unlike probe retry, this can perform hundreds of paced
                     // provider calls. Keep it off the scheduler task so scans
                     // and disk cleanup remain dispatchable while it runs.
@@ -1689,7 +2125,7 @@ impl JobManager {
                     tokio::spawn(async move { state.artwork_retry_pass().await });
                 }
                 DueJob::CleanupTranscode => {
-                    self.stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await;
+                    self.stamp_local(keys::JOB_LAST_TRANSCODE_CLEANUP).await;
                     let removed = transcode.sweep_orphan_dirs().await;
                     if removed > 0 {
                         tracing::info!(removed, "swept orphaned transcode directories");
@@ -1712,13 +2148,12 @@ impl JobManager {
                 }
                 DueJob::PruneTelemetry => {
                     let removed = self.prune_telemetry(now()).await?;
-                    self.stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await;
+                    self.stamp_local(keys::JOB_LAST_TELEMETRY_PRUNE).await;
                     if removed > 0 {
                         tracing::info!(removed, "pruned aged playback telemetry");
                     }
                 }
                 DueJob::ProduceCache => {
-                    self.stamp(keys::JOB_LAST_CACHE_PRODUCE).await;
                     // Spawned rather than run inline: this one takes hours, and
                     // the scheduler tick it is on is also what starts scans and
                     // sweeps. `run_due_jobs` is stamped-before-run, so a
@@ -1751,8 +2186,34 @@ impl JobManager {
             return;
         }
         let _guard = ArtworkRetryGuard(Arc::clone(&self));
-        if let Err(e) = self.sweep_artwork().await {
-            tracing::warn!(error = %e, "artwork retry sweep failed");
+        match self.acquire_job("provider:artwork".to_owned()).await {
+            Ok(Some(lease)) => {
+                let lost = lease.loss_token();
+                let publisher = lease.publisher(self.store.as_ref());
+                self.stamp(keys::JOB_LAST_ARTWORK_RETRY, &publisher).await;
+                let result = tokio::select! {
+                    result = self.sweep_artwork_with_publication(
+                        keys::ARTWORK_RETRY_BACKOFF_SECS,
+                        &publisher,
+                    ) => result,
+                    () = lost.cancelled() => Err(StoreError::Task(
+                        "cluster artwork lease was lost".to_owned(),
+                    )),
+                };
+                match result {
+                    Ok(report) => tracing::debug!(
+                        repaired = report.repaired,
+                        "cluster artwork retry publication complete"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "artwork retry sweep failed");
+                    }
+                }
+                drop(publisher);
+                lease.release().await;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(error = %error, "artwork retry lease failed"),
         }
     }
 
@@ -1812,6 +2273,16 @@ impl JobManager {
             return;
         }
         let _guard = GenreBackfillGuard(Arc::clone(&self));
+        let lease = match self.acquire_job("provider:genres".to_owned()).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error = %error, "genre backfill lease failed");
+                return;
+            }
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
 
         // No key configured is not a reason to skip the pass: anime libraries
         // enrich from AniList, which needs none, and those titles are exactly
@@ -1825,19 +2296,26 @@ impl JobManager {
             }
         };
         let anilist = AniListClient::new();
-        let report = metadata::genres::backfill_pass(
-            self.store.as_ref(),
-            tmdb.as_ref(),
-            &anilist,
-            metadata::genres::PACE,
-        )
-        .await;
+        let report = tokio::select! {
+            report = metadata::genres::backfill_pass_with_publication(
+                &publisher,
+                tmdb.as_ref(),
+                &anilist,
+                metadata::genres::PACE,
+            ) => report,
+            () = lost.cancelled() => {
+                tracing::warn!("genre backfill stopped after losing its cluster lease");
+                None
+            },
+        };
         if let Some(report) = report {
             for problem in &report.problems {
                 tracing::error!(problem = %problem, "genre backfill problem");
             }
             *self.last_genre_backfill.lock().await = Some(report);
         }
+        drop(publisher);
+        lease.release().await;
     }
 
     /// One producer pass: sweep the cache back under budget, work out what
@@ -1848,7 +2326,33 @@ impl JobManager {
     /// is logged and skipped rather than ending the pass: the list is a
     /// prediction, and one bad prediction is not a reason to stop making them.
     async fn produce_pass(self: Arc<Self>, transcode: Arc<TranscodeManager>) {
+        let lease = match self.acquire_job("candidate:pretranscode".to_owned()).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error = %error, "pre-transcode candidate lease failed");
+                return;
+            }
+        };
+        let publisher = lease.publisher(self.store.as_ref());
+        self.stamp(keys::JOB_LAST_CACHE_PRODUCE, &publisher).await;
+        drop(publisher);
+        let lost = lease.loss_token();
+        self.produce_pass_owned(transcode, &lost, lease.publication_fence())
+            .await;
+        lease.release().await;
+    }
+
+    async fn produce_pass_owned(
+        self: &Arc<Self>,
+        transcode: Arc<TranscodeManager>,
+        lease_lost: &tokio_util::sync::CancellationToken,
+        publication_fence: PublicationFence,
+    ) {
         use crate::produce;
+        if lease_lost.is_cancelled() {
+            return;
+        }
         let Some((root, node)) = transcode.cache_location() else {
             self.emit_producer_pass(0, 0, serde_json::json!({"unavailable": 1}));
             return;
@@ -1861,7 +2365,7 @@ impl JobManager {
             self.emit_producer_pass(0, 1, serde_json::json!({"already_running": 1}));
             return;
         }
-        let _running = ProducingGuard(Arc::clone(&self));
+        let _running = ProducingGuard(Arc::clone(self));
 
         // Under budget BEFORE producing, not after. Producing first would push
         // the cache over its ceiling and then evict — and the eviction is LRU,
@@ -1951,6 +2455,12 @@ impl JobManager {
         let mut skipped = 0_u64;
         let mut reasons = std::collections::BTreeMap::<&'static str, u64>::new();
         for (i, c) in candidates.into_iter().enumerate() {
+            if lease_lost.is_cancelled() {
+                tracing::warn!("pre-transcode pass stopped after losing its cluster lease");
+                skipped += (total - i) as u64;
+                reasons.insert("lease_lost", (total - i) as u64);
+                break;
+            }
             if std::time::Instant::now() >= deadline {
                 tracing::info!("pre-transcode pass out of time");
                 skipped += (total - i) as u64;
@@ -1993,7 +2503,16 @@ impl JobManager {
             // what a real playback looks up. Asking the manager rather than
             // assuming is what keeps the two in step when Auto's policy moves.
             let height = transcode.auto_height_for_file(Some(&file), None).await;
-            match transcode.produce(&file, height, deadline).await {
+            match transcode
+                .produce_cancelled(
+                    &file,
+                    height,
+                    deadline,
+                    lease_lost,
+                    publication_fence.clone(),
+                )
+                .await
+            {
                 Ok(Some(made)) => {
                     produced += 1;
                     tracing::info!(
@@ -2050,6 +2569,7 @@ impl JobManager {
     /// Grouped by library because that is the unit that knows which provider
     /// to ask. The per-item backoff, not this interval, is what stops a
     /// permanently art-less item from being re-fetched every half hour.
+    #[cfg(test)]
     pub async fn sweep_artwork(&self) -> Result<usize, plurx_core::error::StoreError> {
         Ok(self
             .sweep_artwork_with_backoff(keys::ARTWORK_RETRY_BACKOFF_SECS)
@@ -2058,9 +2578,31 @@ impl JobManager {
     }
 
     /// The retry pass with an injectable backoff for fairness tests.
+    #[cfg(test)]
     async fn sweep_artwork_with_backoff(
         &self,
         retry_after_secs: i64,
+    ) -> Result<ArtworkSweepResult, plurx_core::error::StoreError> {
+        let Some(lease) = self.acquire_job("provider:artwork".to_owned()).await? else {
+            return Ok(ArtworkSweepResult::default());
+        };
+        let lost = lease.loss_token();
+        let publisher = lease.publisher(self.store.as_ref());
+        let result = tokio::select! {
+            result = self.sweep_artwork_with_publication(retry_after_secs, &publisher) => result,
+            () = lost.cancelled() => Err(StoreError::Task(
+                "cluster artwork lease was lost".to_owned(),
+            )),
+        };
+        drop(publisher);
+        lease.release().await;
+        result
+    }
+
+    async fn sweep_artwork_with_publication(
+        &self,
+        retry_after_secs: i64,
+        publisher: &PublicationStore<'_>,
     ) -> Result<ArtworkSweepResult, plurx_core::error::StoreError> {
         let mut items = self
             .store
@@ -2124,7 +2666,7 @@ impl JobManager {
             let ids: Vec<i64> = candidates.iter().map(|item| item.id).collect();
             let targets = self.enrich_targets(&ids).await;
             let outcome = self
-                .enrich(&library, true, Some(&targets), Some(&ids), None)
+                .enrich(publisher, &library, true, Some(&targets), Some(&ids), None)
                 .await;
             provider_errors += outcome.enrich.as_ref().map_or(0, |r| r.errors);
 
@@ -2205,9 +2747,20 @@ impl JobManager {
             .and_then(|v| v.trim().parse::<i64>().ok())
     }
 
-    async fn stamp(&self, key: &str) {
-        if let Err(e) = self.store.put_setting(key, &now().to_string()).await {
+    async fn stamp(&self, key: &str, publisher: &PublicationStore<'_>) {
+        if let Err(e) = publisher.put_setting(key, &now().to_string()).await {
             tracing::warn!(error = %e, key, "recording a job run time failed");
+        }
+    }
+
+    fn local_job_key(&self, key: &str) -> String {
+        format!("{key}.node.{}", self.coordinator.node_id())
+    }
+
+    async fn stamp_local(&self, key: &str) {
+        let key = self.local_job_key(key);
+        if let Err(e) = self.store.put_setting(&key, &now().to_string()).await {
+            tracing::warn!(error = %e, key, "recording a node-local job run time failed");
         }
     }
 
@@ -2292,6 +2845,116 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn three_cluster_ticks_run_one_provider_pass() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("cluster tick store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let transcode_dir = tempfile::tempdir().expect("transcode");
+        seeded_episode_backlog(&store, 1).await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let base = serve(blocking_season_tmdb(
+            Arc::clone(&hits),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ))
+        .await;
+        let manager = |node: &str| {
+            let store: Arc<dyn Store> = store.clone();
+            let mut manager = JobManager::new_with_scan_prune_percent(
+                store,
+                artwork.path().to_path_buf(),
+                plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+                node.to_owned(),
+            );
+            manager.tmdb_base = Some((base.clone(), base.clone()));
+            Arc::new(manager)
+        };
+        let a = manager("tick-a");
+        let b = manager("tick-b");
+        let c = manager("tick-c");
+        let transcode_store: Arc<dyn Store> = store.clone();
+        let transcode = Arc::new(TranscodeManager::new(
+            transcode_store,
+            transcode_dir.path().join("work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+        let (a_tick, b_tick, c_tick) = tokio::join!(
+            a.run_due_jobs(&transcode),
+            b.run_due_jobs(&transcode),
+            c.run_due_jobs(&transcode),
+        );
+        a_tick.expect("tick a");
+        b_tick.expect("tick b");
+        c_tick.expect("tick c");
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("winning provider pass started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "three real scheduler ticks must dispatch one provider pass"
+        );
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while a.retrying_artwork.load(Ordering::Relaxed)
+                || b.retrying_artwork.load(Ordering::Relaxed)
+                || c.retrying_artwork.load(Ordering::Relaxed)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider owner released its lease");
+    }
+
+    #[tokio::test]
+    async fn aborted_job_owner_stops_heartbeat_and_allows_ttl_takeover() {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::open_in_memory().expect("aborted owner store"));
+        let first =
+            StoreCoordinator::new(Arc::clone(&store), "aborted-owner").expect("first coordinator");
+        let successor =
+            StoreCoordinator::new(Arc::clone(&store), "successor").expect("successor coordinator");
+        let lease = match first
+            .acquire("test:aborted-owner", std::time::Duration::from_secs(1))
+            .await
+            .expect("first acquire")
+        {
+            LeaseClaim::Acquired(lease) => lease,
+            held => panic!("first owner must acquire, got {held:?}"),
+        };
+        let active = ActiveJobLease::start_with_policy(
+            first,
+            lease,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(50),
+        );
+        let owner = tokio::spawn(async move {
+            let active = active;
+            std::future::pending::<()>().await;
+            drop(active);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        owner.abort();
+        assert!(owner
+            .await
+            .expect_err("owner task was aborted")
+            .is_cancelled());
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_150)).await;
+        assert!(matches!(
+            successor
+                .acquire("test:aborted-owner", std::time::Duration::from_secs(1))
+                .await
+                .expect("takeover acquire"),
+            LeaseClaim::Acquired(_)
+        ));
     }
 
     fn targeted_show_tmdb(
@@ -2589,13 +3252,21 @@ mod tests {
             .expect("invalid");
         assert_eq!(jobs.job_stamp("job.test").await, None);
 
-        jobs.stamp("job.stamped").await;
+        let lease = jobs
+            .acquire_job("test:stamp".to_owned())
+            .await
+            .expect("stamp lease")
+            .expect("stamp owner");
+        let publisher = lease.publisher(store.as_ref());
+        jobs.stamp("job.stamped", &publisher).await;
+        drop(publisher);
+        lease.release().await;
         let stamped = jobs.job_stamp("job.stamped").await.expect("stamp");
         assert!((now() - stamped).abs() <= 1);
     }
 
     #[tokio::test]
-    async fn targeted_request_failures_queue_coalesce_and_stay_bounded() {
+    async fn targeted_request_failures_queue_every_waiter_and_stay_bounded() {
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let artwork = tempfile::tempdir().expect("artwork");
         let jobs = manager(Arc::clone(&store), artwork.path());
@@ -2624,11 +3295,11 @@ mod tests {
         assert!(jobs
             .request_scan(scan_request_fixture("queued-2", 405))
             .await
-            .expect("coalesce duplicate")
+            .expect("queue duplicate path waiter")
             .is_none());
         assert_eq!(
             jobs.pending.lock().await.get(&405).expect("pending").len(),
-            1
+            2
         );
         assert_eq!(
             jobs.scan_request("queued-1")
@@ -2652,6 +3323,13 @@ mod tests {
                 .status,
             "failed"
         );
+        assert_eq!(
+            jobs.scan_request("queued-2")
+                .await
+                .expect("second drained record")
+                .status,
+            "failed"
+        );
 
         for index in 0..=MAX_REQUESTS {
             let request = scan_request_fixture(format!("ring-{index}"), 1);
@@ -2671,6 +3349,148 @@ mod tests {
                 .expect("updated newest")
                 .status,
             "done"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_path_waiters_all_finish_and_apply_their_own_ids() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let folder = media.path().join("Queued");
+        std::fs::create_dir_all(&folder).expect("queued folder");
+        std::fs::write(folder.join("clip.mp4"), b"not really video").expect("queued clip");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Queued Home".to_owned(),
+                kind: LibraryKind::Home,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let jobs = manager(store.clone(), artwork.path());
+        jobs.statuses.lock().await.insert(
+            library.id,
+            ScanStatus {
+                running: true,
+                ..Default::default()
+            },
+        );
+
+        let first = ScanRequest {
+            id: "same-path-first".to_owned(),
+            library_id: library.id,
+            path: folder.clone(),
+            ids: None,
+            book: None,
+            correlation_id: None,
+            source: Some("first".to_owned()),
+        };
+        let second = ScanRequest {
+            id: "same-path-second".to_owned(),
+            ids: Some(IdHints {
+                tmdb: Some(4242),
+                ..Default::default()
+            }),
+            source: Some("second".to_owned()),
+            ..first.clone()
+        };
+        assert!(jobs
+            .request_scan(first)
+            .await
+            .expect("queue first")
+            .is_none());
+        assert!(jobs
+            .request_scan(second)
+            .await
+            .expect("queue second")
+            .is_none());
+        jobs.statuses.lock().await.remove(&library.id);
+        jobs.drain_pending(library.id).await;
+
+        for request_id in ["same-path-first", "same-path-second"] {
+            assert_eq!(
+                jobs.scan_request(request_id)
+                    .await
+                    .expect("terminal waiter")
+                    .status,
+                "done",
+                "every same-path waiter must reach a terminal state"
+            );
+        }
+        let (counts, _) = jobs.metrics().snapshot();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(trigger, _)| *trigger == "targeted")
+                .map(|(_, count)| count),
+            Some(1),
+            "same-path waiters share one physical scan/enrichment pass"
+        );
+        let second = jobs
+            .scan_request("same-path-second")
+            .await
+            .expect("second waiter record");
+        let item_id = second
+            .items
+            .expect("second waiter placed items")
+            .first()
+            .expect("placed item")
+            .item_id;
+        assert_eq!(
+            store
+                .get_item(item_id)
+                .await
+                .expect("item lookup")
+                .expect("placed item")
+                .tmdb_id,
+            Some(4242),
+            "the later waiter's caller-specific ids must not be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_waiter_queue_is_bounded_and_overflow_is_terminal() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(store, artwork.path());
+        let library_id = 406;
+        jobs.statuses.lock().await.insert(
+            library_id,
+            ScanStatus {
+                running: true,
+                ..Default::default()
+            },
+        );
+        for index in 0..MAX_PENDING_PER_LIBRARY {
+            assert!(jobs
+                .request_scan(scan_request_fixture(format!("bounded-{index}"), library_id))
+                .await
+                .expect("waiter within bound")
+                .is_none());
+        }
+        let overflow = scan_request_fixture("bounded-overflow", library_id);
+        let error = jobs
+            .request_scan(overflow)
+            .await
+            .expect_err("overflow is explicit");
+        assert!(error.to_string().contains("queue for library 406 is full"));
+        assert_eq!(
+            jobs.pending
+                .lock()
+                .await
+                .get(&library_id)
+                .expect("bounded queue")
+                .len(),
+            MAX_PENDING_PER_LIBRARY
+        );
+        assert_eq!(
+            jobs.scan_request("bounded-overflow")
+                .await
+                .expect("overflow record")
+                .status,
+            "failed"
         );
     }
 
@@ -3385,14 +4205,36 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
             .await
             .expect("artwork reached provider");
+        let cleanup_key = jobs.local_job_key(keys::JOB_LAST_TRANSCODE_CLEANUP);
         assert!(
             store
-                .get_setting(keys::JOB_LAST_TRANSCODE_CLEANUP)
+                .get_setting(&cleanup_key)
                 .await
                 .expect("cleanup stamp")
                 .is_some(),
             "a job ordered after artwork completed in the same tick"
         );
+        assert!(
+            store
+                .get_setting(keys::JOB_LAST_TRANSCODE_CLEANUP)
+                .await
+                .expect("legacy global cleanup stamp")
+                .is_none(),
+            "node-local cleanup must not recreate the cluster-wide clock"
+        );
+        let other_store: Arc<dyn Store> = store.clone();
+        let other = JobManager::new_with_scan_prune_percent(
+            other_store,
+            artwork.path().to_path_buf(),
+            plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+            "other-cleanup-node".to_owned(),
+        );
+        let other_key = other.local_job_key(keys::JOB_LAST_TRANSCODE_CLEANUP);
+        assert_ne!(cleanup_key, other_key);
+        assert_eq!(other.job_stamp(&other_key).await, None);
+        other.stamp_local(keys::JOB_LAST_TRANSCODE_CLEANUP).await;
+        assert!(jobs.job_stamp(&cleanup_key).await.is_some());
+        assert!(other.job_stamp(&other_key).await.is_some());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         release.notify_waiters();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3443,7 +4285,7 @@ mod tests {
         assert_eq!(events[0].event, "kept");
         assert!(
             store
-                .get_setting(keys::JOB_LAST_TELEMETRY_PRUNE)
+                .get_setting(&jobs.local_job_key(keys::JOB_LAST_TELEMETRY_PRUNE))
                 .await
                 .expect("prune stamp")
                 .is_some(),

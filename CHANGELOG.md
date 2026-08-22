@@ -10,6 +10,26 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Cluster schedulers now spend shared work once, even when every voter ticks
+  together.** Scans and refreshes share a per-library lease across startup,
+  scheduled, manual, and targeted integration triggers; probe repair, artwork
+  providers, genre backfill, and pre-transcode candidate selection have their
+  own singleton resources. Ninety-second leases renew every thirty seconds and
+  self-fence on uncertainty, cancel the pass, and terminate an active
+  speculative encoder. Every scan/metadata publication validates the
+  exact owner, fence, renewal revision, expiry, and prior expiry inside its
+  SQLite or replicated transaction, so a paused predecessor cannot publish
+  after a successor takes over. Starting voter removal atomically invalidates
+  every job token owned by that node, and replicated triggers make a durable
+  owner tombstone authoritative even for the preceding rolling-upgrade binary.
+  Older tombstones are backfilled on startup and idempotent retry. Speculative cache claims
+  use generation-scoped paths and fence claim, heartbeat, completion, and
+  failure cleanup in the same way. Targeted requests queue behind remote owners,
+  while telemetry pruning, scratch cleanup, artwork files, and cache eviction
+  remain node-local work with node-scoped clocks. Same-path integration
+  waiters retain their own request status and metadata hints while queued;
+  same-path waiters share one bounded physical scan/enrichment pass.
+
 - **Cluster voters can now leave cleanly from their own Settings page or the
   admin API.** A graceful leave applies the existing offline-work settlement
   rules and, when the local voter is leader, elects and confirms a successor
@@ -42,6 +62,20 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Apple TV playback diagnostics are readable from the couch.** Playback info
+  now opens as a large three-column Source, Playing, and Server dashboard with
+  the playback method, position, and stall health visible at a glance. A
+  focused Done action keeps the Siri Remote inside the modal until dismissal;
+  iPhone and iPad retain their compact inspector.
+
+- **Audiobook artwork refresh now uses the cover already embedded in the
+  audio file.** Plurx's Books enricher inspected EPUBs only, so refreshing an
+  MP3 or M4B returned success without doing any work even when ffprobe had
+  recorded an attached picture. Audiobooks with a missing poster now copy the
+  first attached picture through bounded, timed ffmpeg extraction into the
+  artwork cache; failures are recorded on the item, while the cover-only patch
+  leaves EPUB/Curator metadata precedence unchanged.
+
 - **Artwork now follows library rows across the cluster.** Item metadata is
   replicated, but its poster and backdrop bytes live in each node's local
   artwork cache, so a follower inherited a valid filename and returned 404.
@@ -54,8 +88,10 @@ bump may break compatibility and a **patch** bump never does.
   no peer retains the file, a paced source/provider repair recreates it.
   Requests use the same peer path immediately while the background pass
   converges. Peer pulls are singleflight and globally bounded, source repair
-  uses a leader-arbitrated owner/term/generation fence with conditional
-  mutation and retirement, and image bytes still never enter Raft.
+  uses both the shared `provider:artwork` job lease and a leader-arbitrated
+  per-item owner/term/generation fence. Provider-origin and catalogue writes
+  validate both exact tokens atomically before mutation; image bytes still
+  never enter Raft.
 
 - **Repeated authentication no longer appends one Raft entry per request.**
   Login-token and scoped API-key authorization still use authority-consistent
