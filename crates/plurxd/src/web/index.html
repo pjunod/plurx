@@ -4139,7 +4139,7 @@ function dynamicRangeBadge(f, delivered, displayHdr){
   const displayLoss = delivered!=='sdr' && !displayHdr;
   const rendered = displayLoss ? 'sdr' : delivered;
   if(rendered===source) return {...lit, rendered, panel:`${RANGE_LONG[source]} (rendering)`};
-  const note = displayLoss ? "this display is not HDR"
+  const note = displayLoss ? "this browser did not expose HDR presentation"
     : (dynamicRangeReason()
       || (rendered==='sdr' ? `tone-mapped from ${RANGE_LONG[source]||'the source grade'}`
         : source==='dolby_vision' ? "Dolby Vision removed for this browser"
@@ -5345,6 +5345,11 @@ function transcodeOpts(startSec, audioIndex, autoHeightOverride){
   // disagree about it mid-session.
   if(o.height==null) o.height=sessionHeight();
   if(audioIndex!=null) o.audio=audioIndex;
+  // `/decision` already proved the browser can decode Main10 PQ and selected
+  // the HDR10 grade. Preserve that immutable request across every session
+  // open; `deliveredRange` is display truth and mutates when a session lands,
+  // so using it here would turn one SDR fallback into permanent SDR on seek.
+  if(PLAYER && PLAYER.requestHdr10) o.hdr10=true;
   if(PLAYER && PLAYER.burnedSub!=null) o.subtitle_burn=PLAYER.burnedSub;
   if(PLAYER && PLAYER.aoffset) o.audio_offset_ms=PLAYER.aoffset;
   return o;
@@ -5821,6 +5826,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   const ladder=decision.ladder||[];
   const priorKbps=decision.prior_kbps||null;
   const autoStartHeight=qualityForce()==='auto' && decision.method==='transcode'
+    // The decision ladder does not know this node's grade-specific hardware
+    // ceiling. Let the session endpoint choose its highest proved HDR10 rung
+    // instead of allowing an old 720p SDR last-good value to cap it.
+    && decision.delivered_dynamic_range!=='hdr10'
     ? PlaybackPolicy.initialAutoRung({ladder,persistedHeight:autoLastGoodHeight(),
         priorKbps,playerHeight:playerPixelHeight(video)})
     : null;
@@ -5873,6 +5882,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     bookParts:book?(meta.book_parts||[]):null,
     transcodeAudio:!!decision.transcode_audio,
     preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
+    // What `/decision` asked the session builder to preserve. Unlike
+    // deliveredRange this never changes when a session response reports what
+    // it actually produced, so seek/audio/quality reopens retain the grade.
+    requestHdr10:decision.method==='transcode'&&decision.delivered_dynamic_range==='hdr10',
     // What grade the DECISION plans to put on the wire. A session overrides it
     // the moment one attaches (a burn or a forced rung transcodes something the
     // decision never promised); direct play has no session, so this stands for

@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["f3ff11c2"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The retained transcode regressions prove that Dolby Vision Profile 5 reaches only boot-proved SDR or HDR10 encoder pairs, that HDR10 Auto selects the highest measured QSV rung, and that the advertised HLS codec matches the produced Main10 stream."
