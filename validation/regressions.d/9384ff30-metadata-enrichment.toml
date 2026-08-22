@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["9384ff30"]
+points = ["metadata.enrichment"]
+checks = ["rust-gate"]
+reason = "The Rust gate compiles the embedded-cover recovery tests with the SettingsStore contract in scope and applies workspace Clippy policy to the fenced enrichment entry points. The retained regressions then exercise Curator-origin detection and the publication-aware enrichment flow; restoring this corrective integration either fails all-target compilation or reintroduces lint-rejected control flow that prevents the gate from reaching those behavior checks."
