@@ -151,17 +151,24 @@ boundary in code and documentation.
 |---|---|---|---|
 | `Authority` | leader/quorum-consistent | token and key validation · settings that gate work · membership · leases · offline ownership · migration/version guards | catalogue cards solely because the existing code used a consistent helper |
 | `ReadYourWrite` | return the write result, revision-fenced local read, or consistent fallback | a settings save response · watch/unwatch response · membership mutation result | an unfenced follower query immediately after mutation |
-| `BoundedReplica` | local query only while leader is known and applied lag is within the declared budget | catalogue browse · item/file metadata · genre/filter facts · dashboard aggregates | auth · locks · admission · ownership · schema state |
+| `BoundedReplica` | local query only with a fresh quorum-confirmed leader watermark and applied lag within the declared budget | catalogue browse · item/file metadata · genre/filter facts · dashboard aggregates | auth · locks · admission · ownership · schema state |
 | `NodeLocal` | process or node-local storage | playback telemetry · transcode scratch · regenerable indexes and caches | any acknowledged user or library fact |
 
 The code should name the class at the call site. A generic helper named only
 `query` or `query_map` is insufficient once two correctness contracts exist.
 
-`BoundedReplica` initially uses an entry-lag gate, not a wall-clock promise:
-the local applied index must be known, the current leader must be known, and
-the gap from the leader's committed index must be no more than the configured
-budget. A node that cannot prove those facts falls back to an authority read or
-fails readiness according to the caller's contract.
+`BoundedReplica` requires two bounds. First, the node must hold a leader-issued
+watermark containing `(term, leader_id, committed_index, issued_at)` that was
+renewed by a successful quorum `ReadIndex` or equivalent heartbeat proof. The
+term and leader identity must match, and the proof may be at most one second
+old initially. An isolated former leader cannot renew it. Second, the local
+applied index must be known and no farther behind that committed index than the
+configured entry budget. The time lease bounds commits made after the sampled
+index; the entry gate bounds apply backlog at the sample. A node that cannot
+prove every fact falls back to an `Authority` read or fails readiness according
+to the caller's contract. Local `metrics_db()` state and
+`last_log_index - last_applied` alone are explicitly insufficient: they can
+look current on a partitioned follower while a new majority keeps committing.
 
 ### 3.3 Authorization remains immediately revocable
 
@@ -171,9 +178,12 @@ auth optimization only suppresses no-op activity writes:
 
 - include the durable activity timestamp in the consistent lookup;
 - submit a touch only when that timestamp is outside the 60-second window;
+- reserve that credential in a process-local keyed singleflight before the
+  mutation and release the reservation if the write fails;
 - retain the SQL predicate as the race-safe final guard; and
-- accept that concurrent requests from several nodes may produce a small
-  bounded burst at the window boundary, never one write per request.
+- bound a concurrent window-edge burst to at most one submitted mutation per
+  serving process. Across `N` HTTP nodes, at most `N` entries may race; the
+  SQL predicate permits only one timestamp change.
 
 A future successful-auth cache requires explicit revoke notifications, a
 bounded fallback TTL, loss/reconnect tests, and fail-closed behavior. It is not
@@ -247,16 +257,19 @@ leadership preference is not a substitute for making all voters safe leaders.
 
 Add these families with fixed label vocabularies:
 
-| Metric | Type | Labels | Meaning |
+| Metric | Type | Labels | Source and meaning |
 |---|---|---|---|
-| `plurx_store_operation_seconds` | histogram | `class`, `outcome` | local read · authority read · write latency |
-| `plurx_store_operations_total` | counter | `class`, `outcome` | volume and error rate by consistency cost |
-| `plurx_auth_activity_writes_total` | counter | `kind`, `result` | token/key touch submitted · suppressed · failed |
-| `plurx_raft_commit_index` | gauge | none | latest known committed durable entry |
-| `plurx_raft_applied_index` | gauge | none | latest entry applied on this node |
-| `plurx_raft_apply_lag_entries` | gauge | none | conservative commit minus applied gap |
-| `plurx_raft_leader_changes_total` | counter | none | process-observed leader changes |
-| `plurx_raft_snapshot_seconds` | histogram | `outcome` | snapshot duration without snapshot-id cardinality |
+| `plurx_store_operation_seconds` | histogram | `class`, `outcome` | `TimedClient`: local read · authority read · write latency |
+| `plurx_store_operations_total` | counter | `class`, `outcome` | `TimedClient`: volume and error rate by consistency cost |
+| `plurx_auth_activity_writes_total` | counter | `kind`, `result` | auth coalescer: token/key touch submitted · suppressed · failed |
+| `plurx_raft_commit_index` | gauge | none | most recent quorum-confirmed leader watermark; meaningful only while its validity gauge is `1` |
+| `plurx_raft_applied_index` | gauge | none | OpenRaft local metrics watch: latest entry applied on this node |
+| `plurx_raft_apply_lag_entries` | gauge | none | saturating watermark commit minus local applied; meaningful only while both sources are valid |
+| `plurx_raft_leader_changes_total` | counter | none | OpenRaft metrics watch: process-observed leader identity changes |
+| `plurx_raft_snapshot_seconds` | histogram | `outcome` | explicit snapshot build/install start-to-finish hooks, not monitor polling |
+| `plurx_raft_metric_sample_errors_total` | counter | `source` | failed samples from the fixed `watermark` · `local` · `snapshot` vocabulary |
+| `plurx_raft_metric_sample_age_seconds` | gauge | `source` | age of the last successful sample from each fixed source |
+| `plurx_raft_metric_sample_valid` | gauge | `source` | `1` only while the source is present and inside its freshness contract |
 
 Do not label by SQL, route, token, user, node UUID, item, session, or dynamic
 error text. Those values either leak data or create unbounded series.
@@ -277,17 +290,33 @@ result. At minimum:
 | leader loss | kill the reported leader under load | failed requests · election time · time until readiness |
 | snapshot | cross two 10,000-entry snapshot cycles | write tail latency · snapshot duration · retained bytes |
 
-The first accepted run establishes targets. Until then, a PR must not claim an
-absolute latency improvement from a synthetic microbenchmark alone.
+P0 runs each scenario three times on the named cluster-performance runner and
+commits the median baseline plus raw artifacts under a versioned schema. It
+also records concrete go/no-go limits before later behavior PRs begin. The
+initial limits are: zero additional request errors; no more than a 10% p99
+regression in unaffected Store classes; less than 2% CPU and wall-time overhead
+from metrics-only P2; at least a 95% reduction in sequential auth activity
+entries for P1; and at least a 70% reduction in authority catalogue reads for
+the P3 slice without a greater than 10% browse p99 regression. P0 replaces
+these provisional percentages only with reviewed numbers justified by runner
+variance.
+
+Deterministic CI contracts enforce correctness and physical-entry bounds.
+Hardware results enforce the recorded comparative budgets; noisy benchmark
+percentiles do not become unit-test assertions. Until that baseline exists, a
+PR must not claim an absolute latency improvement from a synthetic
+microbenchmark alone.
 
 ## 6. Milestones — one correctness boundary per pull request
 
 ### 6.1 P0 — document and measure the three-versus-four-voter choice
 
-**Change:** Add the odd-voter guidance, reverse-proxy readiness contract, sticky
-stream recommendation, and durable-versus-scratch storage layout to
-`OPERATIONS.md`. Extend the cluster benchmark harness to run the same write mix
-with three and four voters and emit the §5.2 record.
+**Change:** After membership PRs #490 and #491 land, rebase before touching
+their shared cluster harness and `OPERATIONS.md` surfaces. Add the odd-voter
+guidance, reverse-proxy readiness contract, sticky stream recommendation, and
+durable-versus-scratch storage layout to the authoritative operations text.
+Extend the cluster benchmark harness to run the same write mix with three and
+four voters and emit the §5.2 record.
 
 Do not remove a live voter from automation. The operator selects the follower
 after confirming it owns no in-flight transfer and the existing removal API
@@ -295,40 +324,56 @@ accepts the change.
 
 **Acceptance:** CI's replicated-storage contract passes; the benchmark artifact
 contains both voter counts and reports quorum, commit percentiles, lag, and
-resource use with the same dataset and load.
+resource use with the same dataset and load. The named runner, raw three-run
+results, median baseline, variance, and reviewed comparative budgets are
+committed before P1-P3 performance claims are accepted.
 
 ### 6.2 P1 — suppress no-op auth activity writes
 
 **Change:** In `HiqliteAuthStore::user_for_token`, return the durable
 `last_seen_at` beside the user and skip `execute` inside the 60-second window.
 Apply the same due check to API-key `last_used_at` before the extractor calls
-`touch_api_key`. Keep both authority lookups and the SQL race predicates.
+`touch_api_key`. Add a process-local per-credential singleflight reservation
+before either mutation so concurrent requests on one process submit only one
+entry; clear the reservation on write failure. Keep both authority lookups and
+the SQL race predicates.
 
-Add boundary tests for never-used · 59 seconds · exactly 60 seconds · clock
-rollback · disabled/deleted credential. Add a real replicated-store budget test
-that compares the Raft log delta for repeated requests: one activity window may
-produce at most one successful touch per credential plus bounded concurrent
-window-edge races; it may not scale with request count.
+Pin the predicate as `last_activity < now - 60`: never-used is due, 59 seconds
+and exactly 60 seconds are suppressed, 61 seconds is due, and a clock rollback
+suppresses the best-effort touch. Disabled, deleted, or otherwise unauthorized
+credentials never reserve or touch. Add real replicated-store budget tests that
+compare the Raft log delta for sequential and simultaneous requests. One
+process may submit at most one touch per credential per window; `N` serving
+processes may submit at most `N`, independent of request count.
 
 **Acceptance:** the `cluster.auth` CI point and HTTP auth matrix pass; revocation
 remains immediate; 120 sequential requests inside one window produce no more
-than one physical activity update after the initial due touch.
+than one physical activity entry after the initial due read. A synchronized
+120-request burst on each of three HTTP nodes produces no more than three
+entries and exactly one durable timestamp change.
 
 ### 6.3 P2 — instrument Store and Raft cost
 
 **Change:** Instrument `TimedClient` once so every replicated Store module uses
 the same bounded local-read · authority-read · write histograms and counters.
-Extend `ReplicationMonitor` with Prometheus-safe commit, applied, lag, and
-leader-change observations. Expose them through the existing `/metrics` body.
+Extend the OpenRaft/Hiqlite metrics boundary with the explicit §5.1 sources:
+local applied/leader observations from the metrics watch, quorum-confirmed
+commit watermarks from a bounded background sampler, and snapshot duration
+from build/install start-and-finish hooks. `ReplicationMonitor` projects those
+samples but does not invent unavailable values. Expose them through the
+existing `/metrics` body.
 
 Metrics collection must be non-blocking and must not execute a Store operation
-to describe a Store operation. A failed metrics sample preserves the last
-known gauge and increments a bounded error counter rather than delaying the
+to describe a Store operation. A failed sample preserves the last known value,
+sets its validity gauge to `0` after the freshness limit, publishes sample age,
+and increments the bounded source error counter rather than delaying the
 request path.
 
 **Acceptance:** exact exposition tests prove HELP/TYPE lines, fixed labels,
-monotonic counters, and absence of SQL or identifiers. Cluster CI proves a
-write, consistent read, and local read each increment only their class.
+monotonic counters, age/validity transitions, and absence of SQL or identifiers.
+Cluster CI proves a write, consistent read, and local read each increment only
+their class. The named performance runner rejects instrumentation above the P0
+overhead budget.
 
 ### 6.4 P3 — add lag-gated bounded-replica reads
 
@@ -338,19 +383,23 @@ and technical aggregates. Keep search local as it is today. Do not move watch
 state, authentication, settings, leases, membership, jobs, cache ownership, or
 offline state.
 
-Before a bounded-replica query, require a known leader and applied lag within
-the initial entry budget. If the proof is absent, use an authority read. Extend
-readiness so a persistently lagged node leaves load-balancer rotation before it
-serves stale browse traffic.
+Before a bounded-replica query, require the fresh quorum-confirmed term/leader/
+commit watermark and local applied-index proof from §3.2. If either proof is
+absent, mismatched, expired, or outside the entry budget, use an authority read.
+Extend readiness so a persistently unproved or lagged node leaves load-balancer
+rotation before it serves stale browse traffic.
 
 Write-followed-by-read handlers return the write result or use authority until
 a revision fence exists. They do not rely on timing.
 
 **Acceptance:** three-voter tests pause one follower's apply path, prove that it
 falls back or becomes unready, resume it, and prove local reads return only
-after the lag gate recovers. Existing store parity remains byte-identical after
-follower and leader loss. Metrics show browse load distributed across request
-targets instead of converging entirely on the leader.
+after the lag gate recovers. A separate test partitions one follower from the
+leader while the remaining majority continues committing; the isolated node
+must stop local reads before the one-second watermark lease expires even when
+its local log/apply gap is zero. Existing store parity remains byte-identical
+after follower and leader loss. Metrics meet the P0 authority-read reduction
+and browse p99 budgets instead of merely reporting them.
 
 ### 6.5 P4 — coalesce remaining replaceable write traffic
 
@@ -411,11 +460,17 @@ operations text distinguish compute/read capacity from voting redundancy.
 
 ### 6.8 P7 — close the loop with load-balancer and failure drills
 
+P2 and P7 fulfill and extend the metrics, mixed-version, proxy, and failure
+proofs already owned by `CLUSTERING-PLAN.md` M5/M6; they do not create a second
+operations contract. Update both plans in the behavior PR, and treat the older
+milestone as satisfied only when its original acceptance plus the performance
+budget here are both met.
+
 **Change:** Ship Caddy/nginx/Traefik-neutral guidance: probe `/readyz`, keep HLS
 and segment requests sticky, cap connection/drain times, and fail over without
-retrying unsafe mutations automatically. Add an executable local proxy fixture
-to the cluster validation harness rather than blessing one vendor's syntax as
-the application contract.
+retrying unsafe mutations automatically. Extend the M5/M6 cluster validation
+harness with an executable local proxy fixture rather than blessing one
+vendor's syntax as the application contract.
 
 Record three-voter, three-voter-plus-learner, follower-loss, leader-loss, and
 lagged-worker runs. Lock absolute SLOs only from those artifacts.
@@ -427,6 +482,8 @@ documented discontinuity behavior.
 
 ## 7. Pull-request sequence — small diffs, explicit dependencies
 
+### 7.1 Sequence
+
 | PR | Scope | Depends on | May proceed in parallel with |
 |---|---|---|---|
 | 0 | this plan | functional membership | none |
@@ -437,6 +494,39 @@ documented discontinuity behavior.
 | 5 | storage roots + measured read pool | PR 2; P3 measurements for pool | PR 4 |
 | 6 | non-voting learner/read worker | PR 3 | PR 5 |
 | 7 | proxy fixture + final failure/SLO record | PRs 3, 5, and 6 | none |
+
+### 7.2 Existing work and shared-file ownership
+
+Membership PRs #490 and #491 own overlapping changes in
+`crates/plurx-cluster-check/src/lib.rs`, `crates/plurx-core/tests/store_contract.rs`,
+`docs/CLUSTERING-PLAN.md`, and `docs/OPERATIONS.md`. P0 waits for both and
+rebases before extending the harness or operations contract. P1 may develop in
+parallel, but it rebases after #490 before merge because its physical-entry
+test shares `store_contract.rs`. Later milestones extend the merged M5/M6
+contracts rather than copying them into a second harness or document.
+
+Before opening each PR, compare its path list with every open cluster PR. One
+branch owns a shared contract at a time; another either waits, moves an
+independent test to a non-overlapping surface, or declares the dependency in
+its PR body. A green head from before the dependency merged is not sufficient.
+
+### 7.3 Mixed-version and downgrade matrix
+
+Every behavior PR records supported old/new combinations and exercises them in
+the `CLUSTERING-PLAN.md` M6 mixed-version fixture:
+
+| Milestone | Feature gate and old-node behavior | Upgrade order | Downgrade gate |
+|---|---|---|---|
+| P1-P2 | no schema/wire change; old nodes remain correct but do not coalesce or export new metrics | non-leader nodes, then current leader | unrestricted after disabling dashboards that require the new series |
+| P3 | bounded reads stay off unless the serving node and quorum-confirmed watermark source advertise the same protocol feature; old nodes use `Authority` | upgrade all voters, verify feature advertisements, then enable per-node traffic | force the authority-read kill switch cluster-wide before installing an old binary |
+| P5 | new paths are node-local config; an omitted field preserves the old root exactly | move one non-leader only after its reverse path is proven | move bytes back and restore old config before downgrade |
+| P6 | learner membership mutation is refused until every voter advertises the learner protocol; old binaries must reject rather than reinterpret that membership | upgrade all voters first, then add a learner, then enable learner traffic | remove every learner and verify voter-only membership before downgrade; if the chosen compatibility marker is irreversible, old-binary downgrade is unsupported and rollback is a forward fix |
+| P7 | proxy behavior keys only on stable readiness/HTTP contracts | upgrade backends before enabling new routing policy | restore the prior routing policy before backend downgrade |
+
+Each PR pins `protocol_min`/`protocol_max` expectations, old-binary startup or
+refusal, feature negotiation, upgrade order, and rollback outcome. An older
+node may never promote a learner or opt another node into bounded reads by
+accident.
 
 Each behavior PR contains its tests and updates the authoritative operations or
 architecture text in the same commit. A branch is cut from current `main` in a
@@ -471,8 +561,8 @@ new PR head to pass.
 For each behavior PR:
 
 1. capture the before artifact on the same topology and workload;
-2. deploy to one non-leader only when the cluster's compatibility contract
-   permits the mixed version;
+2. prove the §7.3 mixed-version row, then deploy to one non-leader only when
+   its feature gate permits the combination;
 3. confirm readiness, apply lag, and auth/write counters before adding traffic;
 4. expand traffic while watching p95/p99, leader changes, lag, and errors;
 5. exercise follower loss, then leader loss, before declaring the slice done;
