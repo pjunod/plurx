@@ -474,13 +474,24 @@ async fn run_membership_lifecycle_case() -> Result<()> {
     // after that claimant releases and the time bucket advances, a different
     // voter must be able to take over.
     let repair_item = 9_001_i64;
-    let repair_lease_ms = 250_u64;
+    let repair_lease_ms = 5_000_u64;
     let before_repair = match cluster.request(leader, Request::Metrics).await? {
         Response::Metrics { applied_index, .. } => {
             applied_index.context("repair budget missing initial applied index")?
         }
         response => bail!("unexpected pre-repair metrics: {response:?}"),
     };
+    // Begin early in one shared rotation epoch. The requests cross process
+    // boundaries sequentially, so a tiny lease can straddle two epochs and
+    // correctly yield no selected caller in that one sweep. Production uses a
+    // five-minute lease; this shorter aligned epoch keeps the proof fast while
+    // ensuring every contender computes the same deterministic selection.
+    let bucket_offset = u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() % u128::from(repair_lease_ms),
+    )?;
+    if bucket_offset > 500 {
+        tokio::time::sleep(Duration::from_millis(repair_lease_ms - bucket_offset + 50)).await;
+    }
     let mut first_winners = Vec::new();
     for node_id in 1..=3 {
         match cluster
