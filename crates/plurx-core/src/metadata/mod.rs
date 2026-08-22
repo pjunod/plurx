@@ -18,7 +18,7 @@ pub use anilist::AniListClient;
 pub use tmdb::TmdbClient;
 
 use crate::domain::{ArtworkAttempt, ItemKind, MetadataPatch};
-use crate::store::Store;
+use crate::store::{PublicationStore, Store};
 
 /// Poster width bucket — small enough to be snappy in a grid, sharp on TV.
 const POSTER_SIZE: &str = "w500";
@@ -92,7 +92,35 @@ pub async fn enrich_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> EnrichReport {
-    enrich_library_for_targets(store, tmdb, artwork_dir, library_id, force, only, only).await
+    enrich_library_with_publication(
+        &PublicationStore::unfenced(store),
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_library_with_publication(
+    store: &PublicationStore<'_>,
+    tmdb: &TmdbClient,
+    artwork_dir: &Path,
+    library_id: Option<i64>,
+    force: bool,
+    only: Option<&[i64]>,
+) -> EnrichReport {
+    enrich_library_for_targets_with_publication(
+        store,
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+        only,
+    )
+    .await
 }
 
 /// Enrich a targeted TMDB tree while keeping provider-routing ancestors
@@ -105,6 +133,27 @@ pub async fn enrich_library(
 /// title or download its poster and backdrop again.
 pub async fn enrich_library_for_targets(
     store: &dyn Store,
+    tmdb: &TmdbClient,
+    artwork_dir: &Path,
+    library_id: Option<i64>,
+    force: bool,
+    routes: Option<&[i64]>,
+    repairs: Option<&[i64]>,
+) -> EnrichReport {
+    enrich_library_for_targets_with_publication(
+        &PublicationStore::unfenced(store),
+        tmdb,
+        artwork_dir,
+        library_id,
+        force,
+        routes,
+        repairs,
+    )
+    .await
+}
+
+pub async fn enrich_library_for_targets_with_publication(
+    store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     library_id: Option<i64>,
@@ -401,6 +450,25 @@ pub async fn enrich_anime_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> EnrichReport {
+    enrich_anime_library_with_publication(
+        &PublicationStore::unfenced(store),
+        client,
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_anime_library_with_publication(
+    store: &PublicationStore<'_>,
+    client: &AniListClient,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
         tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
@@ -561,7 +629,7 @@ async fn write_artwork(artwork_dir: &Path, item_id: i64, kind: &str, bytes: &[u8
 
 /// Fetch each season once and patch this show's episodes by episode number.
 async fn enrich_episodes(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     show_id: i64,
@@ -719,7 +787,7 @@ async fn enrich_episodes(
 }
 
 async fn apply(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     item_id: i64,
     patch: MetadataPatch,
     report: &mut EnrichReport,

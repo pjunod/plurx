@@ -18,6 +18,8 @@
 mod sqlite;
 mod telemetry;
 
+mod publication;
+
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite;
 #[cfg(feature = "hiqlite-store")]
@@ -30,6 +32,8 @@ mod hiqlite_durable;
 mod hiqlite_import;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_publication;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_reading;
 
@@ -44,6 +48,7 @@ pub use self::hiqlite::{
 };
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};
+pub use publication::{PublicationFence, PublicationStore};
 pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 
 use async_trait::async_trait;
@@ -1332,6 +1337,119 @@ pub trait CoordinationStore: Send + Sync + 'static {
     async fn release_lease(&self, lease: &Lease, now_unix_ms: i64) -> Result<bool, StoreError>;
 }
 
+/// Durable mutations performed by singleton cluster jobs. Implementations
+/// must validate the exact lease token and its expiry in the same atomic
+/// transaction as the mutation.
+#[async_trait]
+pub trait FencedPublicationStore: Send + Sync + 'static {
+    async fn put_setting_fenced(
+        &self,
+        key: &str,
+        value: &str,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    async fn mark_library_scanned_fenced(
+        &self,
+        id: i64,
+        refreshed: bool,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    async fn insert_item_fenced(
+        &self,
+        item: &NewItem,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<i64, StoreError>;
+    async fn apply_metadata_fenced(
+        &self,
+        item_id: i64,
+        patch: &MetadataPatch,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    async fn apply_book_metadata_fenced(
+        &self,
+        item_id: i64,
+        patch: &BookMetadataPatch,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    async fn set_nfo_seeded_fenced(
+        &self,
+        item_id: i64,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_file_fenced(
+        &self,
+        item_id: i64,
+        path: &str,
+        size: i64,
+        mtime: i64,
+        probe: &ProbeResult,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<i64, StoreError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_library_root_fingerprint_fenced(
+        &self,
+        library_id: i64,
+        fingerprint: &str,
+        allow_establish: bool,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<RootFingerprintStatus, StoreError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_library_fenced(
+        &self,
+        library_id: i64,
+        root_fingerprint: &str,
+        gone_file_ids: &[i64],
+        prune_limit: u64,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<ReconcileOutcome, StoreError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn claim_cache_entry_fenced(
+        &self,
+        recipe_hash: &str,
+        file_id: i64,
+        recipe_version: i64,
+        node_id: &str,
+        relative_dir: &str,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<bool, StoreError>;
+    async fn touch_cache_claim_fenced(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_cache_entry_fenced(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        relative_dir: &str,
+        bytes: i64,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+    async fn forget_cache_entry_fenced(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        storage_class: &str,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -1348,6 +1466,7 @@ pub trait Store:
     + PlaybackTelemetryStore
     + NetworkPriorStore
     + CoordinationStore
+    + FencedPublicationStore
     + Send
     + Sync
     + 'static
@@ -1369,6 +1488,7 @@ impl<T> Store for T where
         + PlaybackTelemetryStore
         + NetworkPriorStore
         + CoordinationStore
+        + FencedPublicationStore
         + Send
         + Sync
         + 'static

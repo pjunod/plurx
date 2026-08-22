@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::{ItemKind, MetadataPatch};
-use crate::store::Store;
+use crate::store::{PublicationStore, Store};
 
 /// Thumbnail width. Matches the TMDB poster bucket (`w500`) so the grid mixes
 /// home and movie cards without a visible quality step.
@@ -54,6 +54,23 @@ pub async fn enrich_home_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> LocalArtReport {
+    enrich_home_library_with_publication(
+        &PublicationStore::unfenced(store),
+        artwork_dir,
+        library_id,
+        force,
+        only,
+    )
+    .await
+}
+
+pub async fn enrich_home_library_with_publication(
+    store: &PublicationStore<'_>,
+    artwork_dir: &Path,
+    library_id: i64,
+    force: bool,
+    only: Option<&[i64]>,
+) -> LocalArtReport {
     let mut report = LocalArtReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
         tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
@@ -73,7 +90,7 @@ pub async fn enrich_home_library(
     // its children already have the poster it inherits.
     for item in items {
         let poster = match item.kind {
-            ItemKind::Folder => match folder_poster(store, artwork_dir, item.id).await {
+            ItemKind::Folder => match folder_poster(store.raw(), artwork_dir, item.id).await {
                 Some(name) => {
                     report.inherited += 1;
                     Some(name)
@@ -81,7 +98,7 @@ pub async fn enrich_home_library(
                 None => None,
             },
             ItemKind::Video | ItemKind::Photo => {
-                let Some(path) = first_file_path(store, item.id).await else {
+                let Some(path) = first_file_path(store.raw(), item.id).await else {
                     continue;
                 };
                 match adopt_local_art(artwork_dir, item.id, &path).await {
@@ -95,7 +112,7 @@ pub async fn enrich_home_library(
                             item.id,
                             &path,
                             item.kind,
-                            duration(store, item.id).await,
+                            duration(store.raw(), item.id).await,
                         )
                         .await
                         {

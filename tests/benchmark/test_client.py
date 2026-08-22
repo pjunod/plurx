@@ -9,6 +9,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# How long a grandchild holds an inherited stdout write end open. It only has to
+# outlast the client's own teardown by enough that no amount of machine load can
+# reorder the two, so this is a margin, not a measured budget.
+HOLD_SECONDS = 30
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from cinema_plex_bench.client import ClientError, FfmpegClient  # noqa: E402
@@ -61,19 +66,43 @@ class ClientTests(unittest.TestCase):
 
     def test_parent_exit_does_not_wait_for_inherited_stdout_eof(self):
         with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "held-stdout-decoder"
+            root = Path(directory)
+            holder_pid_path = root / "holder-pid"
+            released_path = root / "released"
+            holder = root / "stdout-holder.py"
+            holder.write_text(
+                "import time\n"
+                f"time.sleep({HOLD_SECONDS})\n"
+                f"open({str(released_path)!r}, 'w', encoding='utf-8').write('released')\n",
+                encoding="utf-8",
+            )
+            executable = root / "held-stdout-decoder"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
                 "import subprocess, sys\n"
                 "print('out_time_us=1000', flush=True)\n"
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.5)'])\n",
+                f"holder = subprocess.Popen([sys.executable, {str(holder)!r}])\n"
+                f"open({str(holder_pid_path)!r}, 'w', encoding='utf-8')"
+                ".write(str(holder.pid))\n",
                 encoding="utf-8",
             )
             executable.chmod(0o755)
-            started = time.monotonic()
-            measured = client(executable, 1).decode_for(stream(), 0.01)
-            self.assertLess(time.monotonic() - started, 0.45)
+            measured = client(executable, HOLD_SECONDS).decode_for(stream(), 0.01)
             self.assertIn("first_frame_monotonic", measured)
+            # The decoder exits immediately, so its own exit is what the client
+            # waits on; the grandchild keeps the inherited stdout write end open
+            # for HOLD_SECONDS. Both facts below are ordering, not timing: the
+            # grandchild writes `released` only after that hold elapses, and the
+            # pipe reaches EOF only after the grandchild is gone. A client that
+            # waited for EOF could not return before `released` exists.
+            self.assertTrue(
+                holder_pid_path.exists(),
+                "decoder never spawned the stdout-holding grandchild",
+            )
+            self.assertFalse(
+                released_path.exists(),
+                "client waited for the inherited stdout write end to close",
+            )
 
     def test_signal_resistant_decoder_is_killed_without_a_five_second_overrun(self):
         with tempfile.TemporaryDirectory() as directory:

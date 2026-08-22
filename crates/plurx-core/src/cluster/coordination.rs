@@ -140,7 +140,7 @@ fn expiry_from(now_unix_ms: i64, ttl: Duration) -> Result<i64, StoreError> {
         .ok_or_else(|| StoreError::Task("lease expiry overflowed i64".to_owned()))
 }
 
-fn unix_ms() -> Result<i64, StoreError> {
+pub(crate) fn unix_ms() -> Result<i64, StoreError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StoreError::Task(format!("system clock precedes unix epoch: {error}")))?
