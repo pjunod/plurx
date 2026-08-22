@@ -291,7 +291,7 @@ else, and it cannot widen itself.
 | At rest | SHA-256 of the secret, same discipline as login tokens (`api_keys.key_hash`); the plaintext is shown **once**, in the create response, and is unrecoverable afterwards |
 | Scopes | `scan:trigger` · `status:read`. A key holds exactly the scopes it was created with. Unknown scopes are rejected at creation rather than stored, so a typo cannot produce a key that looks right and authorizes nothing |
 | Revocation | `disabled` (or delete) takes away every scope at once, checked in one place — a revocation that depends on each call site remembering to check is not a revocation |
-| Audit | `last_used_at` is bumped on every successful check; a key nobody can tell is unused is a key nobody revokes |
+| Audit | Successful checks refresh `last_used_at` when it is more than 60 seconds old; the activity signal remains useful without a Raft write per request |
 | Management | admin only — `POST/GET/DELETE /api/v1/keys`. A key cannot mint another key, or the narrow credential would be one request away from a wide one |
 
 **Two credential kinds, two doors**, and the wall runs in both directions. A

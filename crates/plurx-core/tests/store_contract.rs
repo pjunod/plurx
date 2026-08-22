@@ -321,6 +321,81 @@ async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
 
 #[cfg(feature = "hiqlite-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_token_authentication_commits_one_activity_refresh_per_window() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect activity-budget client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("auth-activity-budget-telemetry.db");
+    let store = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap activity-budget store");
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated activity-budget state");
+    let user = store
+        .create_user("activity-budget", "hash", false)
+        .await
+        .expect("create activity-budget user");
+    store
+        .create_token("activity-budget-token", user.id, None)
+        .await
+        .expect("create activity-budget token");
+    client
+        .execute(
+            "UPDATE tokens SET last_seen_at = $1 WHERE token_hash = $2",
+            hiqlite::params!(1_i64, "activity-budget-token"),
+        )
+        .await
+        .expect("make token activity refresh due");
+
+    let before = client
+        .metrics_db()
+        .await
+        .expect("read metrics before authentication burst")
+        .last_applied
+        .expect("replicated store has an applied index")
+        .index;
+    for _ in 0..120 {
+        assert_eq!(
+            store
+                .user_for_token("activity-budget-token")
+                .await
+                .expect("authenticate token")
+                .expect("resolve token user")
+                .id,
+            user.id
+        );
+    }
+    let after = client
+        .metrics_db()
+        .await
+        .expect("read metrics after authentication burst")
+        .last_applied
+        .expect("replicated store has an applied index")
+        .index;
+
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "120 authentications inside one refresh window must append one activity write"
+    );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
     let cluster = contract_cluster();

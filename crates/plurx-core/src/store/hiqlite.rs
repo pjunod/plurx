@@ -889,24 +889,33 @@ impl UserStore for HiqliteAuthStore {
     }
 
     async fn user_for_token(&self, token_hash: &str) -> Result<Option<User>, StoreError> {
-        let user = self
-            .user_optional(
-                "SELECT u.id, u.username, u.password_hash, u.is_admin, u.created_at \
+        let sql = "SELECT u.id, u.username, u.password_hash, u.is_admin, u.created_at, \
+                          t.last_seen_at \
                  FROM users u JOIN tokens t ON t.user_id = u.id \
-                 WHERE t.token_hash = $1",
-                params!(token_hash),
-            )
-            .await?;
-        if user.is_some() {
+                 WHERE t.token_hash = $1";
+        validate_sql(sql)?;
+        let mut rows = timeout_store(
+            self.client()
+                .query_consistent_map::<TokenUserRow, _>(sql, params!(token_hash)),
+        )
+        .await?;
+        let row = rows.pop();
+        if let Some(row) = row.as_ref() {
             let now = self.now()?;
-            self.execute(
-                "UPDATE tokens SET last_seen_at = $1 \
-                 WHERE token_hash = $2 AND last_seen_at < $3",
-                params!(now, token_hash, now.saturating_sub(60)),
-            )
-            .await?;
+            if crate::auth::activity_refresh_due(Some(row.last_seen_at), now) {
+                self.execute(
+                    "UPDATE tokens SET last_seen_at = $1 \
+                     WHERE token_hash = $2 AND last_seen_at < $3",
+                    params!(
+                        now,
+                        token_hash,
+                        now.saturating_sub(crate::auth::ACTIVITY_REFRESH_SECS)
+                    ),
+                )
+                .await?;
+            }
         }
-        Ok(user)
+        Ok(row.map(Into::into))
     }
 
     async fn delete_token(&self, token_hash: &str) -> Result<bool, StoreError> {
@@ -1280,6 +1289,26 @@ struct UserRow {
     password_hash: String,
     is_admin: bool,
     created_at: i64,
+}
+
+struct TokenUserRow {
+    user: UserRow,
+    last_seen_at: i64,
+}
+
+impl From<&mut Row<'_>> for TokenUserRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            user: UserRow::from(row),
+            last_seen_at: row.get("last_seen_at"),
+        }
+    }
+}
+
+impl From<TokenUserRow> for User {
+    fn from(row: TokenUserRow) -> Self {
+        row.user.into()
+    }
 }
 
 impl From<&mut Row<'_>> for UserRow {
