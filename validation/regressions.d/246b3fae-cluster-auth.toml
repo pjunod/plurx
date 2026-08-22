@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["246b3fae"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained replicated-storage job lints the isolated three-voter semantic harness with its committed lockfile under `--locked` before running that harness, so omitting any dependency inherited from `plurx-core` fails the current cluster-auth evidence before compilation can silently refresh build metadata."

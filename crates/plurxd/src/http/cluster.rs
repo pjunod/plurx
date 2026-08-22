@@ -57,6 +57,21 @@ pub async fn remove_node(
         .map_err(api_error)
 }
 
+/// Permanently remove this voter, then ask the daemon to drain and exit.
+/// Membership removal is synchronous; shutdown is signalled only after the
+/// Raft change has committed, so a refused leave keeps serving normally.
+pub async fn leave(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.membership.leave_voter().await.map_err(api_error)?;
+    state.shutdown.cancel();
+    Ok(Json(serde_json::json!({
+        "leaving": true,
+        "node_id": state.node_id,
+    })))
+}
+
 /// The join token's SHA-256 digest is the credential for this route. The fresh
 /// node decodes the full bearer locally and sends only proof of possession, so
 /// the cluster secrets inside it never cross the public HTTP listener.

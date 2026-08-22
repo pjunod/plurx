@@ -14,7 +14,7 @@ mod dto;
 mod error;
 mod extract;
 mod hls;
-mod images;
+pub(crate) mod images;
 mod items;
 mod keys;
 mod libraries;
@@ -98,9 +98,14 @@ pub fn router(state: AppState) -> Router {
         // exception: their single-use token is its own narrow credential.
         .route("/cluster/join-tokens", post(cluster::issue_join_token))
         .route("/cluster/nodes", get(cluster::nodes))
+        .route("/cluster/leave", post(cluster::leave))
         .route("/cluster/nodes/{node_id}", delete(cluster::remove_node))
         .route("/cluster/join/redeem", post(cluster::redeem_join))
         .route("/cluster/join/finalize", post(cluster::finalize_join))
+        // Node-to-node artwork materialization. The handler verifies a
+        // filename-bound cluster HMAC and current live membership; it does
+        // not accept an account bearer and never proxies another hop.
+        .route("/cluster/artwork/{filename}", get(images::serve_peer))
         // What the libraries hold, in transcoder terms — the census PERF-PLAN
         // §5 needs to say whether the GPU tone-map reaches a real library.
         .route("/system/library-shape", get(system::library_shape))
@@ -2591,6 +2596,16 @@ mod tests {
 
         let admin = setup_admin(&app).await;
         let (status, body) = call(&app, get("/api/v1/cluster/nodes", Some(&admin))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "membership_unavailable");
+
+        let (status, _) = call(&app, post("/api/v1/cluster/leave", None, Value::Null)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = call(
+            &app,
+            post("/api/v1/cluster/leave", Some(&admin), Value::Null),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "membership_unavailable");
 

@@ -399,12 +399,21 @@ async fn boot(
     spawn_background_loops(&state);
 
     let progress = Arc::clone(&state.progress);
+    let leave_shutdown = state.shutdown.clone();
     let app = http::router(state);
     let listener = bind_listener(config.server.bind).await?;
     trigger_shutdown_registration_failpoint("after-listener-bind");
     let mdns = start_discovery(&config, &instance_id, advertiser);
 
-    serve(listener, app, progress, mdns, shutdown).await
+    serve(listener, app, progress, mdns, async move {
+        tokio::select! {
+            () = shutdown => {}
+            () = leave_shutdown.cancelled() => {
+                tracing::info!("cluster leave committed, draining");
+            }
+        }
+    })
+    .await
 }
 
 /// How a Bonjour record gets published. A parameter rather than a direct call
@@ -732,6 +741,10 @@ fn spawn_background_loops(state: &AppState) {
     // removed. Every node has to be listening for its own removal to be
     // possible, so this runs whether or not a removal is in progress.
     tokio::spawn(state.membership.clone().offline_source_probe_loop());
+    // Artwork filenames are replicated facts, but their bytes are node-local.
+    // Reconcile them independently of traffic so every voter is ready to
+    // become the public leader before a failover actually happens.
+    tokio::spawn(crate::http::images::materialize_loop(state.clone()));
     tokio::spawn(std::sync::Arc::clone(&state.transcode).rate_control_refresh_loop());
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());

@@ -13,6 +13,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hiqlite::macros::params;
 use hiqlite::{Client, Node, Row};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +29,7 @@ const JOIN_TOKEN_AAD: &[u8] = b"plurx-cluster-join-v1";
 const JOIN_TOKEN_VERSION: u32 = 1;
 const MEMBERSHIP_SCHEMA_VERSION: i64 = 1;
 const NODE_REACHABLE_WINDOW_MS: i64 = 30_000;
+const ARTWORK_AUTH_WINDOW_MS: i64 = 60_000;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a removal waits for survivors to answer a source probe before
 /// treating silence as "cannot prove it". Long enough for a healthy node's
@@ -65,6 +67,13 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
          api_address TEXT NOT NULL, \
          last_seen_at INTEGER NOT NULL, \
          removed_at INTEGER) STRICT",
+    // Kept separate from `cluster_nodes` so this patch is rolling-compatible
+    // with M3 binaries that still write the original six-column row. Public
+    // HTTP addressing belongs to the node rather than the logical server: it
+    // is where another voter can retrieve node-local materialized bytes.
+    "CREATE TABLE IF NOT EXISTS cluster_node_http (\
+         node_id TEXT PRIMARY KEY, \
+         public_http_url TEXT NOT NULL) STRICT",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -270,6 +279,17 @@ pub struct MembershipManager {
     inner: Option<Arc<ReplicatedMembership>>,
 }
 
+/// Short-lived proof that one admitted voter requested a node-local artwork
+/// file. The shared API secret signs this shape but never crosses the public
+/// HTTP listener; a captured proof expires after one minute and names exactly
+/// one filename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtworkPeerAuth {
+    pub node_id: String,
+    pub timestamp_ms: i64,
+    pub signature: String,
+}
+
 struct ReplicatedMembership {
     client: Client,
     store: Arc<dyn Store>,
@@ -324,6 +344,11 @@ impl MembershipManager {
     #[must_use]
     pub fn unavailable() -> Self {
         Self { inner: None }
+    }
+
+    #[must_use]
+    pub fn is_replicated(&self) -> bool {
+        self.inner.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -612,7 +637,95 @@ impl MembershipManager {
                 ),
             )
             .await?;
+        inner
+            .client
+            .execute(
+                "INSERT INTO cluster_node_http (node_id, public_http_url) VALUES ($1, $2) \
+                 ON CONFLICT(node_id) DO UPDATE SET \
+                   public_http_url = excluded.public_http_url",
+                params!(
+                    inner.identity.node_id.as_str(),
+                    inner.bootstrap_http.as_str()
+                ),
+            )
+            .await?;
         Ok(())
+    }
+
+    /// Public HTTP bases for currently reachable peers, used only to recover
+    /// node-local materialized bytes such as artwork. The ordinary membership
+    /// status deliberately continues to omit addresses.
+    pub async fn reachable_peer_http_urls(&self) -> Result<Vec<String>, MembershipError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let reachable_after = unix_ms()?.saturating_sub(NODE_REACHABLE_WINDOW_MS);
+        let rows = inner
+            .client
+            .query_map::<HttpUrlRow, _>(
+                "SELECT http.public_http_url \
+                 FROM cluster_node_http http \
+                 JOIN cluster_nodes node ON node.node_id = http.node_id \
+                 WHERE node.removed_at IS NULL AND node.node_id != $1 \
+                   AND node.last_seen_at >= $2 \
+                 ORDER BY node.last_seen_at DESC, node.raft_id",
+                params!(inner.identity.node_id.as_str(), reachable_after),
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.public_http_url).collect())
+    }
+
+    /// Sign a one-file materialization request without exposing the shared
+    /// cluster API secret to the HTTP transport.
+    pub fn artwork_peer_auth(&self, filename: &str) -> Result<ArtworkPeerAuth, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let timestamp_ms = unix_ms()?;
+        let message = artwork_auth_message(&inner.identity.node_id, timestamp_ms, filename);
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(inner.secrets.api.as_bytes())
+            .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        mac.update(message.as_bytes());
+        Ok(ArtworkPeerAuth {
+            node_id: inner.identity.node_id.clone(),
+            timestamp_ms,
+            signature: hex::encode(mac.finalize().into_bytes()),
+        })
+    }
+
+    /// Verify the proof and the sender's live membership. A removed node still
+    /// knows the old cluster secret, so signature validity alone is not enough
+    /// authority to read bytes from the surviving voters.
+    pub async fn verify_artwork_peer_auth(
+        &self,
+        filename: &str,
+        auth: &ArtworkPeerAuth,
+    ) -> Result<bool, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let now = unix_ms()?;
+        if now.abs_diff(auth.timestamp_ms) > ARTWORK_AUTH_WINDOW_MS as u64 {
+            return Ok(false);
+        }
+        let signature = match hex::decode(&auth.signature) {
+            Ok(signature) => signature,
+            Err(_) => return Ok(false),
+        };
+        let message = artwork_auth_message(&auth.node_id, auth.timestamp_ms, filename);
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(inner.secrets.api.as_bytes())
+            .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        mac.update(message.as_bytes());
+        if mac.verify_slice(&signature).is_err() {
+            return Ok(false);
+        }
+
+        let reachable_after = now.saturating_sub(NODE_REACHABLE_WINDOW_MS);
+        let rows = inner
+            .client
+            .query_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM cluster_nodes \
+                 WHERE node_id = $1 AND removed_at IS NULL AND last_seen_at >= $2",
+                params!(auth.node_id.as_str(), reachable_after),
+            )
+            .await?;
+        Ok(rows.first().is_some_and(|row| row.count == 1))
     }
 
     pub async fn heartbeat_loop(self) {
@@ -744,6 +857,188 @@ impl MembershipManager {
             );
         }
         self.status().await
+    }
+
+    /// Remove this process's own voter, including when it is the leader.
+    ///
+    /// Arbitrary leader removal remains refused by [`Self::remove_voter`]. A
+    /// self-leave is different: the departing process is still alive to settle
+    /// its owned work, commit a membership that excludes itself, observe a
+    /// surviving leader, and then let the HTTP layer drain the daemon.
+    pub async fn leave_voter(&self) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        let node_id = inner.identity.node_id.clone();
+        let status = self.status().await?;
+        let target = status
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or(MembershipError::NodeNotFound)?;
+        let metrics = inner.client.metrics_db().await?;
+        let voters = metrics
+            .membership_config
+            .voter_ids()
+            .collect::<BTreeSet<_>>();
+        if !voters.contains(&target.raft_id) {
+            return Err(MembershipError::NodeNotFound);
+        }
+        if voters.len() < 3 {
+            return Err(MembershipError::QuorumLoss);
+        }
+
+        let mut resolved = self.settle_offline_work(&node_id).await?;
+        let remaining = voters
+            .into_iter()
+            .filter(|id| *id != target.raft_id)
+            .collect::<BTreeSet<_>>();
+        let leader_id = metrics
+            .current_leader
+            .ok_or_else(|| MembershipError::Internal("cluster has no current leader".to_owned()))?;
+        let leader = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader_id)
+            .ok_or_else(|| MembershipError::Internal("leader has no node record".to_owned()))?;
+        let survivor_nodes = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(raft_id, _)| remaining.contains(raft_id))
+            .map(|(raft_id, node)| (*raft_id, node.addr_api.clone()))
+            .collect::<Vec<_>>();
+        let mut commit_leader_api = leader.addr_api.clone();
+
+        // OpenRaft 0.9 has no dedicated transfer-leader call. Triggering an
+        // election on one survivor advances the term and makes this leader
+        // step down before its membership entry is removed. Waiting until
+        // every survivor reports that same leader turns the trigger into a
+        // verified handoff rather than a hopeful delay.
+        if leader_id == target.raft_id {
+            let candidate = survivor_nodes.first().ok_or_else(|| {
+                MembershipError::Internal("cluster has no leadership successor".to_owned())
+            })?;
+            trigger_election(&candidate.1, &inner.secrets.api).await?;
+            let new_leader = self
+                .await_survivor_leader(
+                    target.raft_id,
+                    &remaining,
+                    &survivor_nodes,
+                    &inner.secrets.api,
+                )
+                .await?;
+            commit_leader_api = survivor_nodes
+                .iter()
+                .find(|(raft_id, _)| *raft_id == new_leader)
+                .map(|(_, api)| api.clone())
+                .ok_or_else(|| {
+                    MembershipError::Internal("new leader has no node record".to_owned())
+                })?;
+        }
+        change_membership(&commit_leader_api, &inner.secrets.api, &remaining).await?;
+
+        // Membership is already committed, so cleanup failures must not keep
+        // this now-nonmember process serving. The HTTP layer will drain after
+        // this method returns; report cleanup failures loudly and preserve the
+        // one success answer that makes shutdown inevitable.
+        if let Err(error) = inner
+            .client
+            .execute(
+                "UPDATE cluster_nodes SET removed_at = $1 WHERE node_id = $2",
+                params!(unix_ms()?, node_id.as_str()),
+            )
+            .await
+        {
+            tracing::error!(%error, %node_id, "self-removal committed but node tombstone write failed");
+        }
+        match self.fail_offline_work_left_behind(&node_id).await {
+            Ok(failed) => resolved.failed += failed,
+            Err(error) => tracing::error!(
+                %error,
+                %node_id,
+                "self-removal committed but late offline work could not be failed"
+            ),
+        }
+        tracing::info!(
+            %node_id,
+            requeued = resolved.requeued,
+            failed = resolved.failed,
+            "local voter left the cluster"
+        );
+        Ok(())
+    }
+
+    /// Wait long enough to distinguish a committed self-removal from a
+    /// cluster still electing. This is deliberately best-effort: once the
+    /// membership entry committed, keeping the removed daemon online because
+    /// an observation timed out is strictly less safe than draining it.
+    async fn await_survivor_leader(
+        &self,
+        departed: u64,
+        remaining: &BTreeSet<u64>,
+        survivor_nodes: &[(u64, String)],
+        api_secret: &str,
+    ) -> Result<u64, MembershipError> {
+        let Ok(client) = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(1))
+            .build()
+        else {
+            return Err(MembershipError::Internal(
+                "building leader handoff client".to_owned(),
+            ));
+        };
+        let mut stable_rounds = 0_u8;
+        let mut stable_leader = None;
+        for _ in 0..40 {
+            let mut elected = None;
+            let mut all_confirmed = !survivor_nodes.is_empty();
+            for (_, api) in survivor_nodes {
+                let response = client
+                    .get(format!("https://{api}/cluster/metrics/sqlite"))
+                    .header("X-API-SECRET", api_secret)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .send()
+                    .await;
+                let leader = match response {
+                    Ok(response) => response
+                        .json::<LeaderMetrics>()
+                        .await
+                        .ok()
+                        .and_then(|metrics| metrics.current_leader),
+                    Err(_) => None,
+                };
+                if !leader.is_some_and(|leader| {
+                    leader != departed
+                        && remaining.contains(&leader)
+                        && elected.is_none_or(|expected| expected == leader)
+                }) {
+                    all_confirmed = false;
+                    break;
+                }
+                elected = leader;
+            }
+            if all_confirmed {
+                if elected == stable_leader {
+                    stable_rounds += 1;
+                } else {
+                    stable_leader = elected;
+                    stable_rounds = 1;
+                }
+                if stable_rounds >= 3 {
+                    return stable_leader.ok_or_else(|| {
+                        MembershipError::Internal("leader handoff lost its winner".to_owned())
+                    });
+                }
+            } else {
+                stable_rounds = 0;
+                stable_leader = None;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(MembershipError::Internal(format!(
+            "leadership did not move away from Raft voter {departed}"
+        )))
     }
 
     /// Resolve the node's offline work, then keep going until a fresh read
@@ -1159,6 +1454,26 @@ async fn change_membership(
     Ok(())
 }
 
+async fn trigger_election(candidate_api: &str, api_secret: &str) -> Result<(), MembershipError> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|error| MembershipError::Internal(error.to_string()))?;
+    let response = client
+        .post(format!("https://{candidate_api}/cluster/elect/sqlite"))
+        .header("X-API-SECRET", api_secret)
+        .send()
+        .await
+        .map_err(|error| MembershipError::Internal(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(MembershipError::Internal(format!(
+            "Hiqlite refused leader handoff with HTTP {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
 fn unix_ms() -> Result<i64, MembershipError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1224,6 +1539,35 @@ struct NodeRow {
     last_seen_at: i64,
 }
 
+struct HttpUrlRow {
+    public_http_url: String,
+}
+
+struct CountRow {
+    count: i64,
+}
+
+#[derive(Deserialize)]
+struct LeaderMetrics {
+    current_leader: Option<u64>,
+}
+
+impl From<&mut Row<'_>> for CountRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            count: row.get("count"),
+        }
+    }
+}
+
+impl From<&mut Row<'_>> for HttpUrlRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            public_http_url: row.get("public_http_url"),
+        }
+    }
+}
+
 impl From<&mut Row<'_>> for NodeRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -1233,6 +1577,10 @@ impl From<&mut Row<'_>> for NodeRow {
             last_seen_at: row.get("last_seen_at"),
         }
     }
+}
+
+fn artwork_auth_message(node_id: &str, timestamp_ms: i64, filename: &str) -> String {
+    format!("plurx-artwork-v1\n{node_id}\n{timestamp_ms}\n{filename}")
 }
 
 /// Strip the listener port while preserving DNS names, IPv4, and bracketed

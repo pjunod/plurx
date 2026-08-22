@@ -156,6 +156,10 @@ pub struct AppState {
     /// lifetimes, so this holds only what would otherwise be invisible; see
     /// [`crate::delivery`].
     pub direct_plays: Arc<crate::delivery::DirectPlays>,
+    /// Application-initiated graceful drain. Signals still use the process
+    /// watcher in `main`; the cluster leave endpoint cancels this only after
+    /// its own voter removal has committed.
+    pub shutdown: tokio_util::sync::CancellationToken,
     pub started_at: Instant,
 }
 
@@ -281,6 +285,7 @@ impl AppState {
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),
             direct_plays: crate::delivery::DirectPlays::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             started_at: Instant::now(),
         }
     }

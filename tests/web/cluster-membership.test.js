@@ -51,6 +51,7 @@ const BORROWED = [
   "clusterNodeRow",
   "clusterRefusalHtml",
   "joinPanel",
+  "leavePanel",
   "joinTokenHtml",
   "clusterPanel",
 ];
@@ -62,6 +63,7 @@ function sandbox({ isAdmin = true, refusal = null, token = null } = {}) {
     let ME = ${JSON.stringify({ is_admin: isAdmin })};
     let CLUSTER_REFUSAL = ${JSON.stringify(refusal)};
     let CLUSTER_TOKEN = ${JSON.stringify(token)};
+    let CLUSTER_LEAVING = false;
     ${BORROWED.map(shippedSource).join("\n")}
     return { ${BORROWED.join(", ")} };
   `;
@@ -553,7 +555,7 @@ test("late cluster work can repaint only a live Settings route", () => {
   }
 });
 
-test("this panel adds no endpoint beyond the three the node API already ships", () => {
+test("this panel calls only the four cluster endpoints the node API ships", () => {
   const called = new Set();
   const CALL = /api\(\s*([`"'])(\/cluster[^`"']*)\1/g;
   for (const [, , route] of SHIPPED_UI.matchAll(CALL)) {
@@ -563,7 +565,12 @@ test("this panel adds no endpoint beyond the three the node API already ships", 
   }
   assert.deepEqual(
     [...called].sort(),
-    ["/cluster/join-tokens", "/cluster/nodes", "/cluster/nodes/<id>"],
+    [
+      "/cluster/join-tokens",
+      "/cluster/leave",
+      "/cluster/nodes",
+      "/cluster/nodes/<id>",
+    ],
   );
 });
 
