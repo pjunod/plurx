@@ -589,6 +589,24 @@ mod audiobook_tests {
     use super::*;
 
     #[test]
+    fn artwork_urls_change_with_the_replicated_item_revision() {
+        let filename = Some("287-poster.jpg".to_owned());
+        let before = image_url(&filename, 1_785_733_260);
+        let after = image_url(&filename, 1_785_733_261);
+
+        assert_eq!(
+            before.as_deref(),
+            Some("/api/v1/images/287-poster.jpg?v=1785733260")
+        );
+        assert_eq!(
+            after.as_deref(),
+            Some("/api/v1/images/287-poster.jpg?v=1785733261")
+        );
+        assert_ne!(before, after, "changed artwork must get a fresh cache key");
+        assert_eq!(image_url(&None, 1_785_733_260), None);
+    }
+
+    #[test]
     fn chapter_table_is_named_sorted_and_converted_to_milliseconds() {
         let raw = r#"{"chapters":[
             {"id":8,"start_time":"12.500","end_time":"20.000","tags":{"title":"Second"}},
