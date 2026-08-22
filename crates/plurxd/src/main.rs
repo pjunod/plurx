@@ -632,6 +632,11 @@ async fn probe_system(
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
         dovi_reshape: crate::ffmpeg::has_dovi_reshape().await,
         dovi_passthrough: crate::ffmpeg::has_dovi_passthrough().await,
+        dovi_passthrough_qsv: if encoder_caps.qsv {
+            crate::ffmpeg::has_dovi_passthrough_with(plurx_core::transcode::Encoder::Qsv).await
+        } else {
+            false
+        },
         encoder_selected,
         tone_map,
     };
@@ -646,6 +651,7 @@ struct Measured {
     dovi_rpu: bool,
     dovi_reshape: bool,
     dovi_passthrough: bool,
+    dovi_passthrough_qsv: bool,
     encoder_selected: String,
     tone_map: pipeprobe::PipelineReport,
 }
@@ -676,6 +682,7 @@ fn system_info(
         dovi_rpu: measured.dovi_rpu,
         dovi_reshape: measured.dovi_reshape,
         dovi_passthrough: measured.dovi_passthrough,
+        dovi_passthrough_qsv: measured.dovi_passthrough_qsv,
     }
 }
 
@@ -2614,6 +2621,7 @@ mod startup_tests {
                 dovi_rpu: true,
                 dovi_reshape: true,
                 dovi_passthrough: true,
+                dovi_passthrough_qsv: true,
                 encoder_selected: selected.clone(),
                 tone_map: pipeprobe::PipelineReport::cpu_only("not probed"),
             },
