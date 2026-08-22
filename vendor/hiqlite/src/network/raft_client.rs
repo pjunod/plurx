@@ -228,32 +228,39 @@ impl NetworkStreaming {
                             time::sleep(Duration::from_millis(heartbeat_interval)).await;
 
                             // make sure channel is always free
-                            if let Ok(req) = rx.try_recv() {
-                                let ack = match req {
-                                    #[cfg(feature = "sqlite")]
-                                    RaftRequest::AppendDB((ack, _)) => Some(ack),
-                                    #[cfg(feature = "sqlite")]
-                                    RaftRequest::VoteDB((ack, _)) => Some(ack),
-                                    #[cfg(feature = "sqlite")]
-                                    RaftRequest::SnapshotDB((ack, _)) => Some(ack),
-                                    #[cfg(feature = "cache")]
-                                    RaftRequest::AppendCache((ack, _)) => Some(ack),
-                                    #[cfg(feature = "cache")]
-                                    RaftRequest::VoteCache((ack, _)) => Some(ack),
-                                    #[cfg(feature = "cache")]
-                                    RaftRequest::SnapshotCache((ack, _)) => Some(ack),
-                                    RaftRequest::StreamResponse(_) => None,
-                                    RaftRequest::ReaderExit => {
-                                        continue;
-                                    }
-                                    RaftRequest::Shutdown => {
-                                        break 'outer;
-                                    }
-                                };
+                            match rx.try_recv() {
+                                Ok(req) => {
+                                    let ack = match req {
+                                        #[cfg(feature = "sqlite")]
+                                        RaftRequest::AppendDB((ack, _)) => Some(ack),
+                                        #[cfg(feature = "sqlite")]
+                                        RaftRequest::VoteDB((ack, _)) => Some(ack),
+                                        #[cfg(feature = "sqlite")]
+                                        RaftRequest::SnapshotDB((ack, _)) => Some(ack),
+                                        #[cfg(feature = "cache")]
+                                        RaftRequest::AppendCache((ack, _)) => Some(ack),
+                                        #[cfg(feature = "cache")]
+                                        RaftRequest::VoteCache((ack, _)) => Some(ack),
+                                        #[cfg(feature = "cache")]
+                                        RaftRequest::SnapshotCache((ack, _)) => Some(ack),
+                                        RaftRequest::StreamResponse(_) => None,
+                                        RaftRequest::ReaderExit => {
+                                            continue;
+                                        }
+                                        RaftRequest::Shutdown => {
+                                            break 'outer;
+                                        }
+                                    };
 
-                                if let Some(ack) = ack {
-                                    let _ = ack.send(Err(Error::Connect(err.to_string())));
+                                    if let Some(ack) = ack {
+                                        let _ = ack.send(Err(Error::Connect(err.to_string())));
+                                    }
                                 }
+                                // `Drop` normally queues `Shutdown`, but a request may already
+                                // occupy the bounded channel. Once the last sender disappears,
+                                // disconnection is the equally authoritative shutdown signal.
+                                Err(flume::TryRecvError::Disconnected) => break 'outer,
+                                Err(flume::TryRecvError::Empty) => {}
                             }
                         }
 
@@ -466,9 +473,12 @@ pub struct NetworkConnectionStreaming {
 impl Drop for NetworkConnectionStreaming {
     fn drop(&mut self) {
         let _ = self.sender.try_send(RaftRequest::Shutdown);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // Dropping a Tokio JoinHandle detaches its task. That is intentional:
+        // `ws_handler` must receive the shutdown request, close the WebSocket,
+        // and abort its split reader and writer. Aborting the handler here
+        // instead detached those child tasks while the reader still owned its
+        // socket, leaking one accepted Raft connection per OpenRaft RPC.
+        drop(self.task.take());
     }
 }
 
@@ -605,5 +615,46 @@ impl RaftNetwork<TypeConfigKV> for NetworkConnectionStreaming {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn dropping_connection_allows_handler_to_process_shutdown() {
+        let (sender, receiver) = flume::bounded(1);
+        let release = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let release = Arc::clone(&release);
+            let stopped = Arc::clone(&stopped);
+            async move {
+                release.notified().await;
+                assert!(matches!(
+                    receiver.recv_async().await,
+                    Ok(RaftRequest::Shutdown)
+                ));
+                stopped.notify_one();
+            }
+        });
+        let connection = NetworkConnectionStreaming {
+            node: Node {
+                id: 2,
+                addr_raft: "127.0.0.1:32401".to_owned(),
+                addr_api: "127.0.0.1:32402".to_owned(),
+            },
+            sender,
+            task: Some(task),
+        };
+
+        drop(connection);
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("the detached handler must consume shutdown and exit cleanly");
     }
 }
