@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use super::{exif, nfo, parse};
 use crate::domain::{Item, ItemKind, Library, MetadataPatch, NewItem, ProbeResult};
 use crate::error::StoreError;
-use crate::store::Store;
+use crate::store::PublicationStore;
 
 /// Still-image extensions, recognized **only** in home libraries — a poster
 /// JPEG sitting next to a movie must stay invisible, exactly as today.
@@ -53,7 +53,7 @@ pub struct Placed {
 /// Mirror the directory chain above `path` and find-or-create the item for
 /// the file itself.
 pub async fn place(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     path: &Path,
 ) -> Result<Option<Placed>, StoreError> {
@@ -102,7 +102,7 @@ pub async fn place(
 /// still empty. Returns whether a sidecar was consumed; problems are appended
 /// to `problems`.
 pub async fn after_record(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     placed: Placed,
     path: &Path,
     probe: &ProbeResult,
@@ -147,7 +147,7 @@ pub async fn after_record(
 /// `nfo_seeded_at` is set the sidecar is dead to plurx: a rewritten NFO
 /// changes nothing, so a hand edit can never be clobbered by one.
 pub async fn seed_from_nfo(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     item: &Item,
     path: &Path,
     problems: &mut Vec<String>,
@@ -262,7 +262,7 @@ fn relative_dirs(library: &Library, path: &Path) -> Option<Vec<String>> {
 /// Folder identity is (library, parent, kind, name). Multiple roots therefore
 /// merge at the top level by folder name — the same rule shows already use.
 async fn find_or_create_folder(
-    store: &dyn Store,
+    store: &PublicationStore<'_>,
     library: &Library,
     parent: Option<i64>,
     name: &str,

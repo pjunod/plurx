@@ -43,9 +43,10 @@ use plurx_core::error::StoreError;
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    ApiKeyStore, CoordinationStore, HiqliteAuthStore, LibraryStore, MediaStore,
-    OfflinePackageStore, PlaybackTelemetryStore, ReadingStore, SettingsStore, TraktStore,
-    UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
+    ApiKeyStore, CoordinationStore, FencedPublicationStore, HiqliteAuthStore, LibraryStore,
+    MediaStore, OfflinePackageStore, PlaybackTelemetryStore, ReadingStore, SettingsStore,
+    TraktStore, TranscodeCacheStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -253,6 +254,21 @@ const NETWORK_PRIOR_METHODS: &[&str] = &[
     "prune_network_priors",
 ];
 const COORDINATION_METHODS: &[&str] = &["acquire_lease", "renew_lease", "release_lease"];
+const FENCED_PUBLICATION_METHODS: &[&str] = &[
+    "put_setting_fenced",
+    "mark_library_scanned_fenced",
+    "insert_item_fenced",
+    "apply_metadata_fenced",
+    "apply_book_metadata_fenced",
+    "set_nfo_seeded_fenced",
+    "upsert_file_fenced",
+    "ensure_library_root_fingerprint_fenced",
+    "reconcile_library_fenced",
+    "claim_cache_entry_fenced",
+    "touch_cache_claim_fenced",
+    "complete_cache_entry_fenced",
+    "forget_cache_entry_fenced",
+];
 
 struct StoreFixture {
     name: &'static str,
@@ -505,6 +521,488 @@ async fn monotone_lease_contract_runs_through_dyn_store() {
     .await;
 }
 
+#[tokio::test]
+async fn fenced_publication_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Fenced Contract Library".to_owned(),
+                kind: LibraryKind::Books,
+                paths: vec![PathBuf::from("/contract/fenced")],
+                anime: false,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: create library: {error}"));
+        let first = acquired(
+            store
+                .acquire_lease("scan:library:fenced", "node-a", 100, 200)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: acquire publication lease: {error}")),
+            backend,
+        );
+        store
+            .put_setting_fenced("contract.fenced", "first", &first, 150)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: valid publication: {error}"));
+        let baseline_book = store
+            .insert_item_fenced(
+                &NewItem {
+                    library_id: library.id,
+                    kind: ItemKind::Book,
+                    parent_id: None,
+                    title: "Baseline Book".to_owned(),
+                    year: Some(2025),
+                    season_number: None,
+                    episode_number: None,
+                },
+                &first,
+                151,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: baseline fenced insert: {error}"));
+        let baseline_file = store
+            .upsert_file_fenced(
+                baseline_book,
+                "/contract/fenced/baseline.epub",
+                42,
+                7,
+                &ProbeResult::default(),
+                &first,
+                152,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: baseline fenced file: {error}"));
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint_fenced(
+                    library.id,
+                    "fenced-root",
+                    true,
+                    &first,
+                    153,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: baseline fenced root: {error}")),
+            RootFingerprintStatus::Established
+        );
+        assert!(
+            store
+                .claim_cache_entry_fenced(
+                    "contract-fenced-cache",
+                    baseline_file,
+                    1,
+                    "node-a",
+                    "contract/fenced-cache/f1",
+                    &first,
+                    154,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: baseline cache claim: {error}")),
+            "{backend}: baseline cache claim must be new"
+        );
+
+        let renewed = store
+            .renew_lease(&first, 160, 300)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: renew publication lease: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: publication lease must renew"));
+        macro_rules! assert_stale {
+            ($future:expr, $operation:literal) => {
+                assert!(
+                    matches!($future.await, Err(StoreError::FenceRejected { .. })),
+                    "{}: stale {} publication must reject",
+                    backend,
+                    $operation
+                );
+            };
+        }
+        assert_stale!(
+            store.put_setting_fenced("contract.fenced", "stale-revision", &first, 170),
+            "setting"
+        );
+        assert_stale!(
+            store.mark_library_scanned_fenced(library.id, true, &first, 170),
+            "scan stamp"
+        );
+        assert_stale!(
+            store.insert_item_fenced(
+                &NewItem {
+                    library_id: library.id,
+                    kind: ItemKind::Book,
+                    parent_id: None,
+                    title: "Stale Insert".to_owned(),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                },
+                &first,
+                170,
+            ),
+            "item insert"
+        );
+        assert_stale!(
+            store.apply_metadata_fenced(
+                baseline_book,
+                &MetadataPatch {
+                    overview: Some("stale overview".to_owned()),
+                    ..MetadataPatch::default()
+                },
+                &first,
+                170,
+            ),
+            "metadata"
+        );
+        assert_stale!(
+            store.apply_book_metadata_fenced(
+                baseline_book,
+                &BookMetadataPatch {
+                    title: None,
+                    author: Some("Stale Author".to_owned()),
+                    work_id: Some("stale-work".to_owned()),
+                    edition_id: None,
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+                &first,
+                170,
+            ),
+            "book metadata"
+        );
+        assert_stale!(
+            store.set_nfo_seeded_fenced(baseline_book, &first, 170),
+            "nfo stamp"
+        );
+        assert_stale!(
+            store.upsert_file_fenced(
+                baseline_book,
+                "/contract/fenced/baseline.epub",
+                999,
+                99,
+                &ProbeResult::default(),
+                &first,
+                170,
+            ),
+            "file upsert"
+        );
+        assert_stale!(
+            store.ensure_library_root_fingerprint_fenced(
+                library.id,
+                "stale-root",
+                true,
+                &first,
+                170,
+            ),
+            "root fingerprint"
+        );
+        assert_stale!(
+            store.reconcile_library_fenced(
+                library.id,
+                "fenced-root",
+                &[baseline_file],
+                1,
+                &first,
+                170,
+            ),
+            "reconcile"
+        );
+        assert_stale!(
+            store.claim_cache_entry_fenced(
+                "stale-cache-claim",
+                baseline_file,
+                1,
+                "node-a",
+                "contract/stale-cache/f1",
+                &first,
+                170,
+            ),
+            "cache claim"
+        );
+        assert_stale!(
+            store.touch_cache_claim_fenced("contract-fenced-cache", "node-a", &first, 170,),
+            "cache claim heartbeat"
+        );
+        assert_stale!(
+            store.complete_cache_entry_fenced(
+                "contract-fenced-cache",
+                "node-a",
+                "contract/fenced-cache/stale",
+                999,
+                &first,
+                170,
+            ),
+            "cache completion"
+        );
+        assert_stale!(
+            store.forget_cache_entry_fenced(
+                "contract-fenced-cache",
+                "node-a",
+                "local",
+                &first,
+                170,
+            ),
+            "cache forget"
+        );
+        assert_eq!(
+            store
+                .get_setting("contract.fenced")
+                .await
+                .expect("read first fenced value"),
+            Some("first".to_owned()),
+            "{backend}: same-fence stale revision must not mutate"
+        );
+        let library_after_stale = store
+            .get_library(library.id)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read stale library: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: stale library disappeared"));
+        assert_eq!(library_after_stale.last_scan_at, None, "{backend}");
+        assert_eq!(library_after_stale.last_refresh_at, None, "{backend}");
+        let books_after_stale = store
+            .book_items(library.id, None)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read stale books: {error}"));
+        assert_eq!(books_after_stale.len(), 1, "{backend}: stale insert leaked");
+        let baseline_after_stale = store
+            .get_item(baseline_book)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read stale item: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: baseline item disappeared"));
+        assert_eq!(baseline_after_stale.overview, None, "{backend}");
+        assert_eq!(baseline_after_stale.author, None, "{backend}");
+        assert_eq!(baseline_after_stale.book_work_id, None, "{backend}");
+        assert_eq!(baseline_after_stale.nfo_seeded_at, None, "{backend}");
+        let file_after_stale = store
+            .get_file(baseline_file)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read stale file: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: baseline file disappeared"));
+        assert_eq!(file_after_stale.size, 42, "{backend}");
+        assert_eq!(file_after_stale.mtime, 7, "{backend}");
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(library.id, "fenced-root", false)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: read fenced root: {error}")),
+            RootFingerprintStatus::Matched,
+            "{backend}: stale root mutation leaked"
+        );
+        assert!(
+            store
+                .cache_hit("contract-fenced-cache", "node-a")
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: stale cache hit check: {error}"))
+                .is_none(),
+            "{backend}: stale completion made an incomplete claim serveable"
+        );
+        let cache_rows = store
+            .all_cache_rows("node-a")
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: stale cache rows: {error}"));
+        assert_eq!(cache_rows.len(), 1, "{backend}: stale cache claim leaked");
+        assert_eq!(
+            cache_rows[0].relative_dir, "contract/fenced-cache/f1",
+            "{backend}: stale cache generation replaced the live claim"
+        );
+
+        let successor = acquired(
+            store
+                .acquire_lease("scan:library:fenced", "node-b", 300, 450)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: successor acquire: {error}")),
+            backend,
+        );
+        assert!(
+            store
+                .claim_cache_entry_fenced(
+                    "contract-fenced-cache",
+                    baseline_file,
+                    1,
+                    "node-a",
+                    "contract/fenced-cache/f2",
+                    &successor,
+                    301,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: successor cache takeover: {error}")),
+            "{backend}: successor must take over the incomplete generation"
+        );
+        assert!(matches!(
+            store
+                .forget_cache_entry_fenced(
+                    "contract-fenced-cache",
+                    "node-a",
+                    "local",
+                    &renewed,
+                    302,
+                )
+                .await,
+            Err(StoreError::FenceRejected { .. })
+        ));
+        let takeover_rows = store
+            .all_cache_rows("node-a")
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: read cache takeover: {error}"));
+        assert_eq!(takeover_rows.len(), 1, "{backend}");
+        assert_eq!(
+            takeover_rows[0].relative_dir, "contract/fenced-cache/f2",
+            "{backend}: stale incomplete-generation cleanup removed the successor claim"
+        );
+        assert!(matches!(
+            store
+                .put_setting_fenced("contract.fenced", "stale-owner", &renewed, 301)
+                .await,
+            Err(StoreError::FenceRejected { .. })
+        ));
+        store
+            .put_setting_fenced("contract.fenced", "successor", &successor, 320)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: successor publication: {error}"));
+
+        let book = store
+            .insert_item_fenced(
+                &NewItem {
+                    library_id: library.id,
+                    kind: ItemKind::Book,
+                    parent_id: None,
+                    title: "Fenced Book".to_owned(),
+                    year: Some(2026),
+                    season_number: None,
+                    episode_number: None,
+                },
+                &successor,
+                321,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced insert: {error}"));
+        store
+            .apply_metadata_fenced(
+                book,
+                &MetadataPatch {
+                    overview: Some("published under lease".to_owned()),
+                    ..MetadataPatch::default()
+                },
+                &successor,
+                322,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced metadata: {error}"));
+        store
+            .apply_book_metadata_fenced(
+                book,
+                &BookMetadataPatch {
+                    title: None,
+                    author: Some("Lease Owner".to_owned()),
+                    work_id: Some("work:fenced".to_owned()),
+                    edition_id: Some("edition:fenced".to_owned()),
+                    poster_path: None,
+                    source: BookMetadataSource::Curator,
+                },
+                &successor,
+                323,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced book metadata: {error}"));
+        store
+            .set_nfo_seeded_fenced(book, &successor, 324)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced nfo stamp: {error}"));
+        store
+            .upsert_file_fenced(
+                book,
+                "/contract/fenced/book.epub",
+                42,
+                7,
+                &ProbeResult::default(),
+                &successor,
+                325,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced file upsert: {error}"));
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint_fenced(
+                    library.id,
+                    "fenced-root",
+                    true,
+                    &successor,
+                    326,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: fenced root: {error}")),
+            RootFingerprintStatus::Matched
+        );
+        assert!(matches!(
+            store
+                .reconcile_library_fenced(library.id, "fenced-root", &[], 0, &successor, 327,)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: fenced reconcile: {error}")),
+            ReconcileOutcome::Applied { .. }
+        ));
+        store
+            .mark_library_scanned_fenced(library.id, true, &successor, 328)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: fenced scan stamp: {error}"));
+        assert!(
+            store
+                .claim_cache_entry_fenced(
+                    "contract-fenced-cache",
+                    baseline_file,
+                    1,
+                    "node-a",
+                    "contract/fenced-cache/f2",
+                    &successor,
+                    329,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: successor cache claim: {error}")),
+            "{backend}: successor must take over an incomplete generation"
+        );
+        store
+            .touch_cache_claim_fenced("contract-fenced-cache", "node-a", &successor, 330)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: successor cache touch: {error}"));
+        store
+            .complete_cache_entry_fenced(
+                "contract-fenced-cache",
+                "node-a",
+                "contract/fenced-cache/f2",
+                4242,
+                &successor,
+                331,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: successor cache completion: {error}"));
+        let cache_hit = store
+            .cache_hit("contract-fenced-cache", "node-a")
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: successor cache hit: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: successor cache completion not serveable"));
+        assert_eq!(cache_hit.relative_dir, "contract/fenced-cache/f2");
+        assert_eq!(cache_hit.bytes, 4242);
+        store
+            .forget_cache_entry_fenced("contract-fenced-cache", "node-a", "local", &successor, 332)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: successor cache forget: {error}"));
+        assert!(
+            store
+                .cache_hit("contract-fenced-cache", "node-a")
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: forgotten cache lookup: {error}"))
+                .is_none(),
+            "{backend}: fenced cache forget left a serveable row"
+        );
+        assert_eq!(
+            store
+                .get_setting("contract.fenced")
+                .await
+                .expect("read successor fenced value"),
+            Some("successor".to_owned()),
+            "{backend}: successor wins after stale owner resumes"
+        );
+    })
+    .await;
+}
+
 fn acquired(outcome: LeaseClaim, backend: &str) -> Lease {
     match outcome {
         LeaseClaim::Acquired(lease) => lease,
@@ -696,6 +1194,199 @@ async fn separate_clients_racing_an_expired_lease_choose_one_fenced_owner() {
             .is_none(),
         "a recurring expiry must not recreate an older token across clients"
     );
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_clients_cannot_interleave_cache_takeover_with_stale_cleanup() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let bootstrap = open_contract_hiqlite_store().await;
+    bootstrap
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated cache-takeover state");
+    let library = bootstrap
+        .create_library(&NewLibrary {
+            name: "Cache Takeover Contract".to_owned(),
+            kind: LibraryKind::Movies,
+            paths: vec![PathBuf::from("/contract/cache-takeover")],
+            anime: false,
+        })
+        .await
+        .expect("create cache-takeover library");
+    let item = bootstrap
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: "Cache Takeover".to_owned(),
+            year: Some(2026),
+            season_number: None,
+            episode_number: None,
+        })
+        .await
+        .expect("create cache-takeover item");
+    let file = bootstrap
+        .upsert_file(
+            item,
+            "/contract/cache-takeover/movie.mkv",
+            42,
+            7,
+            &ProbeResult::default(),
+        )
+        .await
+        .expect("create cache-takeover file");
+    let departed = acquired(
+        bootstrap
+            .acquire_lease("candidate:pretranscode", "departed-node", 100, 200)
+            .await
+            .expect("acquire departed cache producer lease"),
+        "hiqlite cache takeover seed",
+    );
+    let observer = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect cache transaction observer");
+    let before_claim = contract_applied_index(&observer).await;
+    assert!(bootstrap
+        .claim_cache_entry_fenced(
+            "cache-takeover-recipe",
+            file,
+            1,
+            "cache-node",
+            "ca/cache-takeover-recipe-f1",
+            &departed,
+            150,
+        )
+        .await
+        .expect("claim departed incomplete generation"));
+    assert_eq!(
+        contract_applied_index(&observer)
+            .await
+            .saturating_sub(before_claim),
+        1,
+        "a fenced cache claim must be one consensus transaction"
+    );
+    assert!(bootstrap
+        .claim_cache_entry_fenced(
+            "cache-forget-transaction-recipe",
+            file,
+            1,
+            "cache-node",
+            "ca/cache-forget-transaction-recipe-f1",
+            &departed,
+            151,
+        )
+        .await
+        .expect("claim cache generation for forget transaction contract"));
+    let before_forget = contract_applied_index(&observer).await;
+    bootstrap
+        .forget_cache_entry_fenced(
+            "cache-forget-transaction-recipe",
+            "cache-node",
+            "local",
+            &departed,
+            152,
+        )
+        .await
+        .expect("forget cache generation in one transaction");
+    assert_eq!(
+        contract_applied_index(&observer)
+            .await
+            .saturating_sub(before_forget),
+        1,
+        "a fenced cache forget must be one consensus transaction"
+    );
+
+    let client_a = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect stale cleanup client");
+    let mut addresses_b = cluster.addresses.clone();
+    addresses_b.rotate_left(1);
+    let client_b = Client::remote(
+        addresses_b,
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect successor claim client");
+    let store_a = HiqliteAuthStore::open(
+        client_a,
+        &cluster._root.path().join("cache-takeover-a-telemetry.db"),
+    )
+    .await
+    .expect("open stale cleanup store");
+    let store_b = HiqliteAuthStore::open(
+        client_b,
+        &cluster._root.path().join("cache-takeover-b-telemetry.db"),
+    )
+    .await
+    .expect("open successor claim store");
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let cleanup_start = Arc::clone(&start);
+    let stale_cleanup = async {
+        cleanup_start.wait().await;
+        store_a
+            .forget_cache_entry_fenced(
+                "cache-takeover-recipe",
+                "cache-node",
+                "local",
+                &departed,
+                199,
+            )
+            .await
+    };
+    let takeover_start = Arc::clone(&start);
+    let successor_claim = async {
+        takeover_start.wait().await;
+        let successor = acquired(
+            store_b
+                .acquire_lease("candidate:pretranscode", "successor-node", 200, 400)
+                .await
+                .expect("acquire successor cache producer lease"),
+            "hiqlite cache takeover successor",
+        );
+        store_b
+            .claim_cache_entry_fenced(
+                "cache-takeover-recipe",
+                file,
+                1,
+                "cache-node",
+                "ca/cache-takeover-recipe-f2",
+                &successor,
+                201,
+            )
+            .await
+    };
+    let (cleanup_result, claim_result) = tokio::join!(stale_cleanup, successor_claim);
+    assert!(
+        cleanup_result.is_ok() || matches!(cleanup_result, Err(StoreError::FenceRejected { .. })),
+        "the old transaction either commits before takeover or rejects after it"
+    );
+    assert!(claim_result.expect("successor cache claim transaction"));
+    let rows = store_b
+        .all_cache_rows("cache-node")
+        .await
+        .expect("read cache rows after concurrent takeover");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].relative_dir, "ca/cache-takeover-recipe-f2");
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -3220,13 +3911,14 @@ fn contract_inventory_matches_every_store_method() {
         TELEMETRY_METHODS,
         NETWORK_PRIOR_METHODS,
         COORDINATION_METHODS,
+        FENCED_PUBLICATION_METHODS,
     ]
     .into_iter()
     .flatten()
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 148, "review the Store method count");
+    assert_eq!(declared.len(), 161, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"

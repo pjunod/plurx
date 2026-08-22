@@ -15,6 +15,7 @@ mod library;
 mod media;
 mod offline;
 mod outbox;
+mod publication;
 mod reading;
 mod telemetry;
 mod trakt;
@@ -29,6 +30,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use super::{keys, SettingsStore};
+use crate::cluster::coordination::Lease;
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
 use crate::store::telemetry::{NETWORK_PRIORS_V2_SCHEMA, PLAYBACK_EVENTS_SCHEMA};
@@ -963,6 +965,56 @@ impl SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+
+    /// Execute a durable job publication only while its exact lease token is
+    /// current. The check and caller mutation share one SQLite transaction.
+    async fn with_fenced_conn<T, F>(
+        &self,
+        lease: &Lease,
+        observed_at_unix_ms: i64,
+        f: F,
+    ) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let lease = lease.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let current: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM job_leases
+                     WHERE resource = ?1 AND owner_node_id = ?2
+                       AND fence = ?3 AND revision = ?4
+                       AND expires_at_ms = ?5 AND expires_at_ms > ?6
+                 )",
+                params![
+                    lease.resource,
+                    lease.owner_node_id,
+                    i64::try_from(lease.fence).map_err(|error| {
+                        StoreError::Database(format!("lease fence is out of range: {error}"))
+                    })?,
+                    i64::try_from(lease.revision).map_err(|error| {
+                        StoreError::Database(format!("lease revision is out of range: {error}"))
+                    })?,
+                    lease.expires_at_unix_ms,
+                    observed_at_unix_ms,
+                ],
+                |row| row.get(0),
+            )?;
+            if !current {
+                return Err(StoreError::FenceRejected {
+                    resource: lease.resource,
+                    owner_node_id: lease.owner_node_id,
+                    fence: lease.fence,
+                });
+            }
+            let value = f(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })
+        .await
     }
 
     /// Like [`with_conn`](Self::with_conn), on a read connection when the

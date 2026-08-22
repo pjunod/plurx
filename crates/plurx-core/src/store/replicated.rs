@@ -141,6 +141,13 @@ pub const SQLITE_TRANSACTION_SITES: &[SqliteTransactionSite] = &[
         shape: TransactionShape::VerbatimBatch,
     },
     SqliteTransactionSite {
+        module: "mod.rs",
+        method: "with_fenced_conn",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
+        shape: TransactionShape::ReadBranchWrite,
+    },
+    SqliteTransactionSite {
         module: "watch.rs",
         method: "set_watched_tree",
         is_async: true,
@@ -352,6 +359,7 @@ mod tests {
         ("mod.rs", include_str!("sqlite/mod.rs")),
         ("offline.rs", include_str!("sqlite/offline.rs")),
         ("outbox.rs", include_str!("sqlite/outbox.rs")),
+        ("publication.rs", include_str!("sqlite/publication.rs")),
         ("reading.rs", include_str!("sqlite/reading.rs")),
         ("telemetry.rs", include_str!("sqlite/telemetry.rs")),
         ("trakt.rs", include_str!("sqlite/trakt.rs")),
@@ -375,10 +383,22 @@ mod tests {
     fn method_source(site: &SqliteTransactionSite) -> &'static str {
         let source = source_for(site.module);
         let keyword = if site.is_async { "async fn" } else { "fn" };
-        let declaration = format!("    {keyword} {}(", site.method);
+        let declaration = format!("    {keyword} {}", site.method);
         let start = source
-            .find(&declaration)
-            .unwrap_or_else(|| panic!("missing {declaration} in {}", site.module));
+            .match_indices(&declaration)
+            .find_map(|(start, _)| {
+                matches!(
+                    source.as_bytes().get(start + declaration.len()),
+                    Some(b'(' | b'<')
+                )
+                .then_some(start)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {declaration}( or {declaration}< in {}",
+                    site.module
+                )
+            });
         let tail = &source[start + declaration.len()..];
         let next_async = tail.find("\n    async fn ");
         let next_sync = tail.find("\n    fn ");
@@ -445,7 +465,7 @@ mod tests {
         methods.sort_unstable();
         methods.dedup();
         assert_eq!(methods.len(), original_len);
-        assert_eq!(methods.len(), 13);
+        assert_eq!(methods.len(), 14);
     }
 
     #[test]
