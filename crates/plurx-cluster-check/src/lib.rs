@@ -713,6 +713,16 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::Flag { value: false } => {}
         response => bail!("a removed voter retained artwork access: {response:?}"),
     }
+    cluster
+        .request(
+            observer,
+            Request::ReuseRemovedArtworkUrl {
+                removed_node_id: target_node.clone(),
+                public_http_url: format!("http://127.0.0.1:{}", 33_000 + target),
+            },
+        )
+        .await?
+        .require_ok()?;
     require_membership_error(
         cluster
             .request(
@@ -1744,6 +1754,10 @@ pub enum Request {
     RejectDuplicateArtworkUrl {
         public_http_url: String,
     },
+    ReuseRemovedArtworkUrl {
+        removed_node_id: String,
+        public_http_url: String,
+    },
     ArtworkPeerAuth {
         filename: String,
     },
@@ -2772,6 +2786,49 @@ async fn handle_request(
             .map(|_| Response::Ok)
             .or_else(|error| Ok(membership_error_response(error)))
         }
+        Request::ReuseRemovedArtworkUrl {
+            removed_node_id,
+            public_http_url,
+        } => {
+            let rejoined_node_id = format!("rejoined-{removed_node_id}");
+            let rejoined_raft_id = launch
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .max()
+                .unwrap_or_default()
+                .saturating_add(100);
+            match membership_manager_with_identity_artwork_url(
+                client,
+                store
+                    .as_ref()
+                    .cloned()
+                    .context("auth store has not been opened")?,
+                launch,
+                rejoined_node_id.clone(),
+                rejoined_raft_id,
+                public_http_url,
+            )
+            .await
+            {
+                Ok(_) => {
+                    for statement in [
+                        "DELETE FROM cluster_node_hostnames WHERE node_id = $1",
+                        "DELETE FROM cluster_node_http WHERE node_id = $1",
+                        "DELETE FROM cluster_nodes WHERE node_id = $1",
+                    ] {
+                        client
+                            .execute(
+                                statement,
+                                hiqlite::macros::params!(rejoined_node_id.as_str()),
+                            )
+                            .await?;
+                    }
+                    Ok(Response::Ok)
+                }
+                Err(error) => Ok(membership_error_response(error)),
+            }
+        }
         Request::ArtworkPeerAuth { ref filename } => membership_ref(membership)?
             .artwork_peer_auth(filename)
             .map(|auth| Response::ArtworkPeerAuth { auth })
@@ -3096,6 +3153,25 @@ async fn membership_manager_with_artwork_url(
     launch: &NodeLaunch,
     artwork_http: String,
 ) -> std::result::Result<MembershipManager, plurx_core::cluster::membership::MembershipError> {
+    membership_manager_with_identity_artwork_url(
+        client,
+        store,
+        launch,
+        format!("node-{}", launch.node_id),
+        launch.node_id,
+        artwork_http,
+    )
+    .await
+}
+
+async fn membership_manager_with_identity_artwork_url(
+    client: &Client,
+    store: Arc<HiqliteAuthStore>,
+    launch: &NodeLaunch,
+    node_id: String,
+    raft_id: u64,
+    artwork_http: String,
+) -> std::result::Result<MembershipManager, plurx_core::cluster::membership::MembershipError> {
     let local = launch
         .nodes
         .iter()
@@ -3111,8 +3187,8 @@ async fn membership_manager_with_artwork_url(
         store,
         ClusterIdentity {
             cluster_id: INSTANCE_ID.to_owned(),
-            node_id: format!("node-{}", launch.node_id),
-            raft_id: launch.node_id,
+            node_id,
+            raft_id,
         },
         ClusterPeer {
             raft_id: local.id,

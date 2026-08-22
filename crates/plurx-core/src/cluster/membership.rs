@@ -733,8 +733,16 @@ impl MembershipManager {
             .execute(
                 "INSERT INTO cluster_node_http (node_id, public_http_url) \
                  SELECT $1, $2 WHERE NOT EXISTS (\
-                   SELECT 1 FROM cluster_node_http \
-                   WHERE public_http_url = $2 AND node_id != $1) \
+                   SELECT 1 FROM cluster_node_http AS owner_http \
+                   WHERE owner_http.public_http_url = $2 \
+                     AND owner_http.node_id != $1 \
+                     AND EXISTS (\
+                       SELECT 1 FROM cluster_nodes AS owner_node \
+                       WHERE owner_node.node_id = owner_http.node_id \
+                         AND owner_node.removed_at IS NULL \
+                         AND NOT EXISTS (\
+                           SELECT 1 FROM cluster_node_removals AS removing \
+                           WHERE removing.node_id = owner_node.node_id))) \
                  ON CONFLICT(node_id) DO UPDATE SET \
                    public_http_url = excluded.public_http_url",
                 params!(inner.identity.node_id.as_str(), inner.artwork_http.as_str()),
