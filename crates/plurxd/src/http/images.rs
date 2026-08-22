@@ -260,19 +260,20 @@ async fn fetch_peer_artwork_with_auth(
     filename: &str,
     auth: &ArtworkPeerAuth,
 ) -> Option<Vec<u8>> {
-    stream::iter(peers.iter().filter_map(|peer| {
-        let Some(url) = peer_artwork_url(peer, filename) else {
-            tracing::warn!(peer, "ignoring invalid artwork peer URL");
-            return None;
-        };
-        // Own every value crossing the async boundary. Borrowing the iterator
-        // item here makes the composed handler future lifetime-specific, which
-        // prevents Axum routes and the reconciliation task from satisfying
-        // their higher-ranked Send bounds.
-        let peer = peer.clone();
+    // Build an owned synchronous request list before constructing any future.
+    // Returning an async block from a borrowed iterator adapter makes the
+    // composed handler lifetime-specific even when the block clones its input.
+    let mut requests = Vec::with_capacity(peers.len());
+    for peer in peers {
+        match peer_artwork_url(peer, filename) {
+            Some(url) => requests.push((peer.clone(), url)),
+            None => tracing::warn!(peer, "ignoring invalid artwork peer URL"),
+        }
+    }
+    stream::iter(requests.into_iter().map(|(peer, url)| {
         let client = client.clone();
         let auth = auth.clone();
-        Some(async move {
+        async move {
             let response = match client
                 .get(url)
                 .header(NODE_ID_HEADER, &auth.node_id)
@@ -321,7 +322,7 @@ async fn fetch_peer_artwork_with_auth(
                 return Some(bytes);
             }
             None
-        })
+        }
     }))
     .buffer_unordered(PEER_RACE_CONCURRENCY)
     .filter_map(futures_util::future::ready)
@@ -510,8 +511,8 @@ async fn materialize_once(
             Ok(true) => {
                 let outcome = state.jobs.refresh_item_artwork(item_id).await;
                 let materialized =
-                    futures_util::future::join_all(filenames.iter().map(|filename| {
-                        let path = state.artwork_dir.join(filename);
+                    futures_util::future::join_all(filenames.into_iter().map(|filename| {
+                        let path = state.artwork_dir.join(&filename);
                         async move {
                             tokio::fs::metadata(path)
                                 .await
