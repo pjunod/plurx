@@ -61,6 +61,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Auth
 argon2 = "0.5"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 # Envelope encryption for durable credentials that must be replayed rather
 # than verified — today only the Trakt bearer pair (CLUSTERING-PLAN §3.2).

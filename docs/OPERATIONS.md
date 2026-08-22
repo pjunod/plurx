@@ -400,6 +400,58 @@ curl -fsS "$PLURX/api/v1/cluster/nodes" \
   -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
 ```
 
+**Update voters one at a time.** A three-voter cluster has a majority of two,
+so an update may stop exactly one voter. Never batch two Cinema restarts and
+never call the leave endpoint as an update hook: leave is permanent membership
+removal, while an update must reopen the same voter and the same data
+directory. Wait for `GET /readyz` to return 200 before advancing to the next
+machine. `/healthz` is insufficient here; it proves that HTTP is alive, not
+that the voter can use replicated storage or sees a leader. The private Ansible
+deployment uses `serial: 1`, fails the whole play on the first node error, and
+now gates each Cinema host on `/readyz`.
+
+**Let artwork converge before relying on a voter for failover.** Item rows name
+poster and backdrop files through Raft, while the image bytes remain in each
+node's local artwork directory. Every voter reconciles those names in the
+background: it pulls a missing file from a reachable peer under a short-lived
+cluster proof and atomically installs it. If no peer retains the file, a
+bounded repair recreates it from the original local/provider source. Requests
+also use the peer path immediately, so a newly joined voter does not show
+broken cards while the first inventory pass is still running. The configured
+`cluster.join_url` (or its default derived from `advertise_host`) must therefore
+be the public HTTP base other voters can reach for that node.
+
+**Recover a temporary quorum loss by restoring the original voters.** With one
+of three voters available, Plurx deliberately commits no writes or membership
+changes. Bring back any second original voter with its existing data directory,
+node identity, and cluster secrets; Raft elects a leader and service recovers
+without an operator reconfiguration. Do not delete Raft state or mint a
+replacement node while the old majority may still exist.
+
+A permanently lost majority has no supported force-reconfigure or
+backup-to-fresh-cluster procedure in this release. A minority cannot safely
+declare itself the new cluster without proving the old majority is dead; doing
+so would create split brain if those machines returned. Preserve every
+surviving data directory and secret, keep the nodes stopped, and recover the
+original majority from host/storage backups. Quorum-aware backup/restore and a
+deterministic one-node disaster-recovery drill remain the explicit M6 work in
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md).
+
+**Gracefully remove the node you are connected to.** Settings → Cluster →
+**Leave this cluster** calls the same admin-only operation. It resolves the
+node's offline work and, if this voter is the leader, elects and confirms a
+successor before committing its own removal. It then drains HTTP and exits.
+The command-line equivalent is:
+
+```bash
+curl -fsS -X POST "$PLURX/api/v1/cluster/leave" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
+```
+
+This is permanent and refuses a 2→1 change. To reuse the machine, discard the
+old Plurx data directory and join it again with a fresh token. Do not use this
+operation for a rolling update or ordinary restart.
+
 **Remove a follower from three or more voters.** Use the node id from the
 roster, not its Raft id. The request refuses the current leader and any change
 that would leave fewer than two voters.
