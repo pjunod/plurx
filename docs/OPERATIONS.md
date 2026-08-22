@@ -345,6 +345,7 @@ raft_bind = "0.0.0.0:32401"
 api_bind = "0.0.0.0:32402"
 advertise_host = "plurx-a.lan"
 join_url = "http://plurx-a.lan:32400"
+artwork_url = "http://plurx-a.lan:32400"
 ```
 
 Raft and the internal cluster API use automatic TLS. Startup refuses a public
@@ -427,8 +428,10 @@ cluster proof and atomically installs it. If no peer retains the file, a
 bounded repair recreates it from the original local/provider source. Requests
 also use the peer path immediately, so a newly joined voter does not show
 broken cards while the first inventory pass is still running. The configured
-`cluster.join_url` (or its default derived from `advertise_host`) must therefore
-be the public HTTP base other voters can reach for that node.
+`cluster.artwork_url` (or its default derived from `advertise_host`) must be a
+node-specific public HTTP base other voters can reach. It deliberately does not
+inherit `cluster.join_url`: the join URL may name a shared load balancer, while
+an artwork request must reach the voter that actually owns the local file.
 
 **Recover a temporary quorum loss by restoring the original voters.** With one
 of three voters available, Plurx deliberately commits no writes or membership
@@ -450,11 +453,19 @@ deterministic one-node disaster-recovery drill remain the explicit M6 work in
 **Leave this cluster** calls the same admin-only operation. It resolves the
 node's offline work and, if this voter is the leader, elects and confirms a
 successor before committing its own removal. It then drains HTTP and exits.
-The command-line equivalent is:
+The command-line equivalent must target one node directly (or use a sticky
+route) for both the roster read and leave POST. The body binds the destructive
+request to the backend that produced `local_node_id`, so a load balancer cannot
+move a confirmed leave to another voter:
 
 ```bash
-curl -fsS -X POST "$PLURX/api/v1/cluster/leave" \
-  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq .
+export PLURX_NODE=http://plurx-a.lan:32400
+LOCAL_NODE_ID=$(curl -fsS "$PLURX_NODE/api/v1/cluster/nodes" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" | jq -er .local_node_id)
+curl -fsS -X POST "$PLURX_NODE/api/v1/cluster/leave" \
+  -H "Authorization: Bearer $PLURX_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -cn --arg node_id "$LOCAL_NODE_ID" '{node_id:$node_id}')" | jq .
 ```
 
 This is permanent and refuses a 2→1 change. To reuse the machine, discard the
@@ -566,6 +577,7 @@ membership addresses and token-file paths are intentionally file-only:
 | — | `cluster.api_bind` | `0.0.0.0:32402` | Authenticated Hiqlite cluster API with automatic TLS. It follows the same loopback-until-opt-in rule |
 | — | `cluster.advertise_host` | empty | Host or IP placed in committed peer records and the explicit membership-listener opt-in. Leave empty for an ordinary one-voter install; set it on every joining node. A sole voter whose committed address differs from this value performs one crash-recoverable local metadata readdress on restart, then settles. Once any peer or remote membership exists, changing the advertised host or either listener port is refused until an online membership-reconfiguration path exists |
 | — | `cluster.join_url` | `http://<advertise_host>:<server port>` | Public plurxd base URL a fresh node uses to redeem/finalize its one-time token. Set the HTTPS proxy URL when applicable |
+| — | `cluster.artwork_url` | `http://<advertise_host>:<server port>` | Node-specific public plurxd base peers use to recover local artwork. Set an explicit per-node URL when `join_url` names a shared proxy or load balancer |
 | — | `cluster.join_token_file` | empty | Owner-only file containing one token on a fresh joining node. Empty bootstraps or reopens; a successful join deletes it |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
 | `PLURX_FFMPEG` | — | `ffmpeg` | ffmpeg binary — point at jellyfin-ffmpeg for best hwaccel |

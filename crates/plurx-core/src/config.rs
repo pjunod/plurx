@@ -86,6 +86,10 @@ pub struct ClusterConfig {
     /// Public plurxd base URL a joining node uses to redeem its one-time
     /// credential. Empty derives `http://<advertise_host>:<server port>`.
     pub join_url: String,
+    /// Node-specific public plurxd base URL peers use for artwork recovery.
+    /// Empty derives `http://<advertise_host>:<server port>` and deliberately
+    /// does not inherit `join_url`, which may name a shared load balancer.
+    pub artwork_url: String,
     /// Single-use join-token file; empty means bootstrap/reopen one voter.
     pub join_token_file: PathBuf,
     /// Required network boundary when inter-node transport is not using TLS.
@@ -110,6 +114,7 @@ impl Default for ClusterConfig {
             api_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_CLUSTER_API_PORT)),
             advertise_host: String::new(),
             join_url: String::new(),
+            artwork_url: String::new(),
             join_token_file: PathBuf::new(),
             trusted_network: String::new(),
             credential_key_file: PathBuf::new(),
@@ -214,6 +219,7 @@ mod tests {
         assert_eq!(config.cluster.raft_bind.port(), DEFAULT_RAFT_PORT);
         assert_eq!(config.cluster.api_bind.port(), DEFAULT_CLUSTER_API_PORT);
         assert!(config.cluster.join_url.is_empty());
+        assert!(config.cluster.artwork_url.is_empty());
     }
 
     #[test]

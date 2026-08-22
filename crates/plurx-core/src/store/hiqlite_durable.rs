@@ -1254,18 +1254,28 @@ impl OfflinePackageStore for HiqliteAuthStore {
         // contract). Once that schema exists, every insert must consult it in
         // the same statement so removal cannot race package creation. If it is
         // absent, there cannot yet be a membership tombstone to fence.
-        let membership_schema_exists = self
+        let schema_bits = self
             .client()
             .query_consistent_map::<ScalarRow, _>(
-                "SELECT COUNT(*) AS value FROM sqlite_master \
-                 WHERE type = 'table' AND name = 'cluster_nodes'",
+                "SELECT \
+                   EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'cluster_nodes') + \
+                   2 * EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'cluster_node_removals') AS value",
                 params!(),
             )
             .await
             .map_err(database_error)?
             .first()
-            .is_some_and(|row| row.value > 0);
-        let tombstone_clause = if membership_schema_exists {
+            .map_or(0, |row| row.value);
+        let membership_schema_exists = schema_bits & 1 != 0;
+        let removal_schema_exists = schema_bits & 2 != 0;
+        let tombstone_clause = if membership_schema_exists && removal_schema_exists {
+            "AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
+                 WHERE node_id = $5 AND removed_at IS NOT NULL) \
+             AND NOT EXISTS (SELECT 1 FROM cluster_node_removals \
+                 WHERE node_id = $5)"
+        } else if membership_schema_exists {
             "AND NOT EXISTS (SELECT 1 FROM cluster_nodes \
                  WHERE node_id = $5 AND removed_at IS NOT NULL)"
         } else {
@@ -1366,11 +1376,18 @@ impl OfflinePackageStore for HiqliteAuthStore {
             // If the INSERT fell through AND no existing package was found, the
             // node may have been removed. Fail early with a legible outcome
             // rather than falling through to "admission changed concurrently".
-            if membership_schema_exists
-                && self
+            if membership_schema_exists {
+                let tombstone_sql = if removal_schema_exists {
+                    "SELECT COALESCE(removed_at, (SELECT started_at \
+                       FROM cluster_node_removals WHERE node_id = $1)) AS removed_at \
+                     FROM cluster_nodes WHERE node_id = $1"
+                } else {
+                    "SELECT removed_at FROM cluster_nodes WHERE node_id = $1"
+                };
+                if self
                     .client()
                     .query_consistent_map::<MembershipTombstoneRow, _>(
-                        "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                        tombstone_sql,
                         hiqlite::macros::params!(package.node_id.as_str()),
                     )
                     .await
@@ -1378,8 +1395,9 @@ impl OfflinePackageStore for HiqliteAuthStore {
                     .first()
                     .and_then(|row| row.removed_at)
                     .is_some()
-            {
-                return Ok(OfflineCreateOutcome::NodeIsTombstone);
+                {
+                    return Ok(OfflineCreateOutcome::NodeIsTombstone);
+                }
             }
 
             let admission = self

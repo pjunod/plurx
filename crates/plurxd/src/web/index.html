@@ -9488,6 +9488,12 @@ function membershipRefusalText(code,message){
       "That node is the cluster's current leader, so another voter cannot remove it remotely. Open Cinema "+
       "on the leader itself and use Leave this cluster; it elects and confirms a successor before committing "+
       "its own removal, and then shuts down.",
+    self_removal_requires_leave:
+      "That row is this server. Use Leave this cluster below so the daemon settles local work, commits its "+
+      "own removal, drains active connections, and shuts down instead of leaving a tombstoned process online.",
+    leave_node_mismatch:
+      "The leave confirmation reached a different backend than the roster you confirmed, so nothing was "+
+      "removed. Refresh this page and retry against the same node; configure sticky admin requests at the proxy.",
     cluster_node_not_found:
       "This node is not in the cluster's current membership — it may already have been removed from "+
       "another browser or another server. The current roster is being refreshed now.",
@@ -9500,7 +9506,7 @@ function membershipRefusalText(code,message){
 }
 // last_seen_at is Unix MILLISECONDS (docs/OPERATIONS.md); fmtAgo takes seconds.
 // Feeding it milliseconds prints a healthy node as decades stale.
-function clusterNodeRow(n){
+function clusterNodeRow(n,localNodeId){
   const voter=n.role==="voter";
   const role=voter
     ? `<span class="pill" style="color:var(--accent);border-color:var(--accent)">voter</span>`
@@ -9510,17 +9516,20 @@ function clusterNodeRow(n){
     : `<span style="color:var(--bad)">not reachable</span>`;
   const seen=n.last_seen_at?esc(fmtAgo(Math.floor(n.last_seen_at/1000))):`<span class="muted">never</span>`;
   const leader=n.is_leader?`<span class="pill clleader">Leader</span>`:"";
+  const local=n.node_id===localNodeId?`<span class="pill">This node</span>`:"";
   const hostname=n.hostname||n.node_id;
   const advertised=n.advertised_host
     ? `<div class="claddr">Advertised host ${esc(n.advertised_host)}</div>`:"";
-  return `<tr><td class="libname clidentity"><div class="clhostline"><span class="clhost">${esc(hostname)}</span>${leader}</div>
+  const action=n.node_id===localNodeId
+    ? `<span class="muted">Use graceful leave below</span>`
+    : `<button class="ghost sm" onclick='removeNode(${esc(JSON.stringify(n.node_id))})'>Remove</button>`;
+  return `<tr><td class="libname clidentity"><div class="clhostline"><span class="clhost">${esc(hostname)}</span>${leader}${local}</div>
       ${advertised}<div class="clid">Node ID ${esc(n.node_id)}</div></td>
     <td data-label="Raft id" class="muted">${esc(String(n.raft_id))}</td>
     <td data-label="Role">${role}</td>
     <td data-label="Reachable">${reach}</td>
     <td data-label="Last seen" class="muted">${seen}</td>
-    <td class="row rowactions" style="justify-content:flex-end">
-      <button class="ghost sm" onclick='removeNode(${esc(JSON.stringify(n.node_id))})'>Remove</button></td></tr>`;
+    <td class="row rowactions" style="justify-content:flex-end">${action}</td></tr>`;
 }
 function clusterPanel(d){
   // Belt and braces: viewSettings already turns a non-admin away at the door,
@@ -9538,7 +9547,7 @@ function clusterPanel(d){
   const replication=(clustered&&cluster.replication)||(d.sys&&d.sys.replication);
   const roster=nodes.length
     ? `<table><thead><tr><th>Host</th><th>Raft id</th><th>Role</th><th>Reachable</th><th>Last seen</th><th></th></tr></thead>
-       <tbody>${nodes.map(clusterNodeRow).join("")}</tbody></table>`
+       <tbody>${nodes.map(node=>clusterNodeRow(node,cluster.local_node_id)).join("")}</tbody></table>`
     : clustered?`<div class="empty">No node records yet.</div>`:"";
   return `<div class="card"><h2 class="section" style="margin-top:0">Cluster</h2>
     <div class="clstate ${state.tone}"><h3>${esc(state.title)}</h3><p>${esc(state.body)}</p></div>
@@ -9547,7 +9556,7 @@ function clusterPanel(d){
       — the same reading as the Server card on the System tab.</div>
     ${statusFailure?`<div class="row" style="margin-top:10px"><button class="ghost sm" onclick="retryCluster()">Retry roster</button></div>`:""}
     ${clusterRefusalHtml()}
-    ${clustered?joinPanel()+leavePanel():""}</div>
+    ${clustered?joinPanel()+leavePanel(cluster.local_node_id):""}</div>
     <div class="card"><h2 class="section" style="margin-top:0">Cluster log</h2>
       <div class="row"><select id="clloglvl" style="max-width:120px" onchange="refreshClusterLogs()">
           <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
@@ -9582,12 +9591,15 @@ function joinPanel(){
     <div class="hint">A join token is single-use and short-lived, and it is shown once. Create it when the
       other machine is ready to start, not before.</div>`;
 }
-function leavePanel(){
+function leavePanel(localNodeId){
   if(CLUSTER_LEAVING) return `<h2 class="section">Remove this node</h2>
     <div class="clstate calm"><h3>Leaving the cluster</h3><p>The membership change committed. This
       Cinema node is draining connections and will shut down.</p></div>`;
+  if(!localNodeId) return `<h2 class="section">Remove this node</h2>
+    <div class="clstate warn"><h3>Local node identity unavailable</h3><p>Refresh the roster before
+      leaving. The server will not guess which backend this destructive action should remove.</p></div>`;
   return `<h2 class="section">Remove this node</h2>
-    <button class="ghost sm" onclick="leaveCluster(this)">Leave this cluster</button>
+    <button class="ghost sm" onclick='leaveCluster(this,${esc(JSON.stringify(localNodeId))})'>Leave this cluster</button>
     <div class="hint">A graceful leave is permanent, not an update or restart action. This node resolves
       its owned offline work and, if it is the leader, elects and confirms a successor before committing its
       own removal. It then drains and shuts down. Rejoining this machine requires a fresh data directory and
@@ -9658,14 +9670,14 @@ async function removeNode(nodeId){
   }
   renderSettings();
 }
-async function leaveCluster(btn){
+async function leaveCluster(btn,nodeId){
   if(!confirm(`Permanently remove this Cinema node from the cluster and shut it down?\n\n`+
     `Do not use this for an update or restart. Rejoining requires discarding this node's old Cinema `+
     `data directory and using a new join token. Media files are not touched.`)) return;
   CLUSTER_REFUSAL=null;
   const was=btn.textContent; btn.disabled=true; btn.textContent="Leaving…";
   try{
-    await api("/cluster/leave",{method:"POST"});
+    await api("/cluster/leave",{method:"POST",body:{node_id:nodeId}});
     CLUSTER_LEAVING=true;
   }catch(e){
     btn.disabled=false; btn.textContent=was;

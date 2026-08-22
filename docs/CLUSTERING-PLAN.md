@@ -122,6 +122,7 @@ raft_bind = "0.0.0.0:32401"      # raft replication, adjacent to public 32400
 api_bind = "0.0.0.0:32402"       # authenticated node-to-node requests
 advertise_host = ""              # empty keeps a never-joined voter on loopback
 join_url = ""                    # empty derives the public API URL above
+artwork_url = ""                 # empty derives a node-specific artwork URL
 join_token_file = ""             # absent bootstraps/reopens one voter
 trusted_network = ""             # required if transport is not TLS
 ```

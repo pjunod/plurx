@@ -59,6 +59,16 @@ use crate::error::StoreError;
 use crate::mediafacts::MediaFacts;
 use crate::secrets::SealedSecret;
 
+/// Narrow catalogue projection used to reconcile node-local artwork bytes.
+/// Large overview and metadata fields never cross the local database boundary
+/// for a pass that needs only ownership and filenames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtworkInventoryItem {
+    pub id: i64,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
 /// The text a backend may write into a durable Trakt bearer column.
 ///
 /// Every store implementation funnels its bearer writes through here, so the
@@ -414,10 +424,10 @@ pub trait MediaStore: Send + Sync + 'static {
     ///
     /// Cluster voters use this as a reconciliation inventory: item rows are
     /// replicated, while the bytes named by `poster_path` and `backdrop_path`
-    /// remain node-local. Returning complete items keeps the owning item id
-    /// available for a provider/local-source repair when no peer still holds
-    /// the named file.
-    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError>;
+    /// remain node-local. This intentionally returns a narrow local projection
+    /// so a periodic node-local pass does not rendezvous at the leader or move
+    /// complete catalogue rows.
+    async fn items_with_artwork(&self) -> Result<Vec<ArtworkInventoryItem>, StoreError>;
     /// One page of a library's grid, optionally narrowed to a single genre.
     ///
     /// The genre is matched against the item's stored list (migration v13),

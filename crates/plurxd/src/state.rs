@@ -108,6 +108,9 @@ pub struct AppState {
     /// Stable identity of the node that owns local transcode/offline bytes.
     pub node_id: String,
     pub artwork_dir: PathBuf,
+    /// Shared peer-artwork HTTP client, per-filename singleflight, and global
+    /// response-buffer bound for request and background reconciliation paths.
+    pub(crate) artwork_fetch: Arc<crate::http::images::ArtworkCoordinator>,
     /// Finished content-addressed transcodes. Offline routes never join a
     /// request-controlled path directly to this root.
     pub cache_dir: PathBuf,
@@ -267,6 +270,7 @@ impl AppState {
             server_name,
             node_id,
             artwork_dir,
+            artwork_fetch: crate::http::images::ArtworkCoordinator::new(),
             cache_dir,
             subs_dir,
             pgs_overlay_enabled: std::env::var("PLURX_PGS_OVERLAY").is_ok_and(|value| {

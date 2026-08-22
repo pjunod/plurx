@@ -521,6 +521,7 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
         identity.clone(),
         local,
         configured_join_url(config)?,
+        configured_artwork_url(config)?,
         JoinSecrets {
             raft: secrets.raft,
             api: secrets.api,
@@ -1333,6 +1334,7 @@ async fn open_active_store_with_key(
         identity.clone(),
         membership_file.local,
         configured_join_url(config)?,
+        configured_artwork_url(config)?,
         JoinSecrets {
             raft: secrets.raft,
             api: secrets.api,
@@ -1938,6 +1940,26 @@ fn configured_join_url(config: &Config) -> Result<String, StoreError> {
         if !(configured.starts_with("http://") || configured.starts_with("https://")) {
             return Err(StoreError::Migration(
                 "cluster.join_url must start with http:// or https://".to_owned(),
+            ));
+        }
+        return Ok(configured.to_owned());
+    }
+    Ok(format!(
+        "http://{}",
+        host_port(
+            &configured_advertise_host(config)?,
+            config.server.bind.port()
+        )
+    ))
+}
+
+#[cfg(feature = "hiqlite-store")]
+fn configured_artwork_url(config: &Config) -> Result<String, StoreError> {
+    let configured = config.cluster.artwork_url.trim().trim_end_matches('/');
+    if !configured.is_empty() {
+        if !(configured.starts_with("http://") || configured.starts_with("https://")) {
+            return Err(StoreError::Migration(
+                "cluster.artwork_url must start with http:// or https://".to_owned(),
             ));
         }
         return Ok(configured.to_owned());

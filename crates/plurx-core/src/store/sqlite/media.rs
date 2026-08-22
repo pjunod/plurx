@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 use crate::mediafacts::{FactsRow, MediaFacts};
-use crate::store::{MediaStore, ReconcileOutcome, RootFingerprintStatus};
+use crate::store::{ArtworkInventoryItem, MediaStore, ReconcileOutcome, RootFingerprintStatus};
 
 /// Build an FTS5 MATCH expression from free text: quoted tokens, prefix
 /// matching on the last one. Returns `None` for queries with no tokens.
@@ -312,16 +312,21 @@ impl MediaStore for SqliteStore {
         .await
     }
 
-    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError> {
+    async fn items_with_artwork(&self) -> Result<Vec<ArtworkInventoryItem>, StoreError> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {i} FROM items i \
-                 WHERE i.poster_path IS NOT NULL OR i.backdrop_path IS NOT NULL \
-                 ORDER BY i.id",
-                i = item_cols("i")
-            ))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, poster_path, backdrop_path FROM items \
+                 WHERE poster_path IS NOT NULL OR backdrop_path IS NOT NULL \
+                 ORDER BY id",
+            )?;
             let items = stmt
-                .query_map([], |row| item_from_row(row, 0))?
+                .query_map([], |row| {
+                    Ok(ArtworkInventoryItem {
+                        id: row.get(0)?,
+                        poster_path: row.get(1)?,
+                        backdrop_path: row.get(2)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })

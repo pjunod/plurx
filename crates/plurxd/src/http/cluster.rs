@@ -23,6 +23,14 @@ pub struct IssueJoinTokenRequest {
     pub expires_in_seconds: Option<u64>,
 }
 
+#[derive(Deserialize)]
+pub struct LeaveRequest {
+    /// The node id shown by the roster that the operator confirmed. Requiring
+    /// it binds the destructive POST to that backend when a non-sticky load
+    /// balancer routes the confirmation and action separately.
+    pub node_id: String,
+}
+
 pub async fn issue_join_token(
     _admin: AdminUser,
     State(state): State<AppState>,
@@ -63,7 +71,11 @@ pub async fn remove_node(
 pub async fn leave(
     _admin: AdminUser,
     State(state): State<AppState>,
+    Json(request): Json<LeaveRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.node_id != state.node_id {
+        return Err(api_error(MembershipError::LeaveNodeMismatch));
+    }
     state.membership.leave_voter().await.map_err(api_error)?;
     state.shutdown.cancel();
     Ok(Json(serde_json::json!({
@@ -109,6 +121,9 @@ fn api_error(error: MembershipError) -> ApiError {
         MembershipError::ReusedToken
         | MembershipError::ReservedToken
         | MembershipError::LeaderRemoval
+        | MembershipError::SelfRemovalRequiresLeave
+        | MembershipError::LeaveNodeMismatch
+        | MembershipError::LocalNodeNotActive
         | MembershipError::QuorumLoss
         | MembershipError::OfflineWork(_) => StatusCode::CONFLICT,
         MembershipError::NodeNotFound => StatusCode::NOT_FOUND,

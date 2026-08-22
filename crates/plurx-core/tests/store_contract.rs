@@ -3319,7 +3319,7 @@ async fn media_contract_runs_through_dyn_store() {
                     author: Some("Curator Author".into()),
                     work_id: Some("curator:work:shared".into()),
                     edition_id: Some("curator:edition:ebook".into()),
-                    poster_path: Some("books/curator-cover.jpg".into()),
+                    poster_path: Some("curator-cover.jpg".into()),
                     source: BookMetadataSource::Curator,
                 },
             )
@@ -3369,10 +3369,7 @@ async fn media_contract_runs_through_dyn_store() {
             enriched.book_edition_id.as_deref(),
             Some("curator:edition:ebook")
         );
-        assert_eq!(
-            enriched.poster_path.as_deref(),
-            Some("books/curator-cover.jpg")
-        );
+        assert_eq!(enriched.poster_path.as_deref(), Some("curator-cover.jpg"));
         assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
         let artwork_items = store
             .items_with_artwork()
@@ -3382,7 +3379,7 @@ async fn media_contract_runs_through_dyn_store() {
         assert_eq!(artwork_items[0].id, ebook, "backend {backend}");
         assert_eq!(
             artwork_items[0].poster_path.as_deref(),
-            Some("books/curator-cover.jpg"),
+            Some("curator-cover.jpg"),
             "backend {backend}"
         );
         assert_eq!(

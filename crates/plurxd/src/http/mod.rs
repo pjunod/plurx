@@ -2599,11 +2599,27 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "membership_unavailable");
 
-        let (status, _) = call(&app, post("/api/v1/cluster/leave", None, Value::Null)).await;
+        let leave_body = json!({ "node_id": "test-node" });
+        let (status, _) = call(
+            &app,
+            post("/api/v1/cluster/leave", None, leave_body.clone()),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, body) = call(
             &app,
-            post("/api/v1/cluster/leave", Some(&admin), Value::Null),
+            post(
+                "/api/v1/cluster/leave",
+                Some(&admin),
+                json!({ "node_id": "another-node" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "leave_node_mismatch");
+        let (status, body) = call(
+            &app,
+            post("/api/v1/cluster/leave", Some(&admin), leave_body),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);

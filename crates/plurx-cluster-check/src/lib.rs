@@ -238,6 +238,8 @@ async fn controller() -> Result<()> {
     run_membership_lifecycle_case().await?;
     println!("cluster-check: current-leader self-leave");
     run_leader_self_leave_case().await?;
+    println!("cluster-check: four-voter leader self-leave with one survivor down");
+    run_degraded_four_voter_leader_self_leave_case().await?;
     println!("cluster-check: follower loss and incompatible-voter guard");
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
@@ -424,7 +426,140 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         }
     }
 
-    let target = leader;
+    let before_heartbeats = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("heartbeat budget missing initial applied index")?
+        }
+        response => bail!("unexpected pre-heartbeat metrics: {response:?}"),
+    };
+    cluster
+        .request(leader, Request::Heartbeat)
+        .await?
+        .require_ok()?;
+    cluster
+        .request(leader, Request::Heartbeat)
+        .await?
+        .require_ok()?;
+    let after_heartbeats = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("heartbeat budget missing final applied index")?
+        }
+        response => bail!("unexpected post-heartbeat metrics: {response:?}"),
+    };
+    if after_heartbeats.saturating_sub(before_heartbeats) != 2 {
+        bail!(
+            "two liveness heartbeats consumed {} Raft entries instead of two",
+            after_heartbeats.saturating_sub(before_heartbeats)
+        );
+    }
+
+    // Four reconciliation loops must not turn one persistent miss into one
+    // Raft write per node. Only the deterministic voter submits the lease CAS;
+    // after that claimant releases and the time bucket advances, a different
+    // voter must be able to take over.
+    let repair_item = 9_001_i64;
+    let repair_lease_ms = 250_u64;
+    let before_repair = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("repair budget missing initial applied index")?
+        }
+        response => bail!("unexpected pre-repair metrics: {response:?}"),
+    };
+    let mut first_winners = Vec::new();
+    for node_id in 1..=3 {
+        match cluster
+            .request(
+                node_id,
+                Request::ClaimArtworkRepair {
+                    item_id: repair_item,
+                    lease_ms: repair_lease_ms,
+                },
+            )
+            .await?
+        {
+            Response::Flag { value: true } => first_winners.push(node_id),
+            Response::Flag { value: false } => {}
+            response => bail!("unexpected artwork repair claim response: {response:?}"),
+        }
+    }
+    if first_winners.len() != 1 {
+        bail!("artwork repair lease had {} winners", first_winners.len());
+    }
+    let after_repair = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("repair budget missing final applied index")?
+        }
+        response => bail!("unexpected post-repair metrics: {response:?}"),
+    };
+    if after_repair.saturating_sub(before_repair) != 1 {
+        bail!(
+            "one artwork repair contention round consumed {} Raft entries instead of one",
+            after_repair.saturating_sub(before_repair)
+        );
+    }
+    let held_index = after_repair;
+    for node_id in 1..=3 {
+        match cluster
+            .request(
+                node_id,
+                Request::ClaimArtworkRepair {
+                    item_id: repair_item,
+                    lease_ms: repair_lease_ms,
+                },
+            )
+            .await?
+        {
+            Response::Flag { value: false } => {}
+            response => bail!("an active repair lease was reclaimed: {response:?}"),
+        }
+    }
+    let held_after = match cluster.request(leader, Request::Metrics).await? {
+        Response::Metrics { applied_index, .. } => {
+            applied_index.context("held repair lease missing applied index")?
+        }
+        response => bail!("unexpected held-lease metrics: {response:?}"),
+    };
+    if held_after != held_index {
+        bail!("failed repair retries wrote inside the active lease");
+    }
+    let mut handoff = None;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(repair_lease_ms + 30)).await;
+        for node_id in 1..=3 {
+            if let Response::Flag { value: true } = cluster
+                .request(
+                    node_id,
+                    Request::ClaimArtworkRepair {
+                        item_id: repair_item,
+                        lease_ms: repair_lease_ms,
+                    },
+                )
+                .await?
+            {
+                cluster
+                    .request(
+                        node_id,
+                        Request::ReleaseArtworkRepair {
+                            item_id: repair_item,
+                        },
+                    )
+                    .await?
+                    .require_ok()?;
+                if node_id != first_winners[0] {
+                    handoff = Some(node_id);
+                    break;
+                }
+            }
+        }
+        if handoff.is_some() {
+            break;
+        }
+    }
+    handoff.context("artwork repair lease did not rotate to another capable voter")?;
+
+    let target = (2..=3)
+        .find(|node_id| *node_id != leader)
+        .context("choose a removable follower")?;
     let observer = (1..=3)
         .find(|node_id| *node_id != target)
         .context("choose a surviving membership observer")?;
@@ -562,6 +697,18 @@ async fn run_membership_lifecycle_case() -> Result<()> {
         Response::Flag { value: false } => {}
         response => bail!("a removed voter retained artwork access: {response:?}"),
     }
+    require_membership_error(
+        cluster
+            .request(
+                target,
+                Request::ClaimArtworkRepair {
+                    item_id: 9_003,
+                    lease_ms: 100,
+                },
+            )
+            .await?,
+        "local_node_not_active",
+    )?;
 
     // Either §6.7 outcome closes it — moved to a survivor, or failed with its
     // reservation released. The outcome this exists to catch is the third one:
@@ -812,10 +959,45 @@ async fn run_leader_self_leave_case() -> Result<()> {
     cluster.wait_for_voters(&[1, 2, 3]).await?;
 
     let departed = cluster.leader().await?;
+    let local_follower = (1..=3)
+        .find(|node_id| *node_id != departed)
+        .context("choose local follower removal refusal")?;
+    require_membership_error(
+        cluster
+            .request(
+                local_follower,
+                Request::RemoveVoter {
+                    node_id: format!("node-{local_follower}"),
+                },
+            )
+            .await?,
+        "self_removal_requires_leave",
+    )?;
     cluster
         .request(departed, Request::LeaveVoter)
         .await?
         .require_ok()?;
+    cluster
+        .request(
+            departed,
+            Request::HeartbeatPreservesTombstone {
+                node_id: format!("node-{departed}"),
+            },
+        )
+        .await?
+        .require_ok()?;
+    require_membership_error(
+        cluster
+            .request(
+                departed,
+                Request::ClaimArtworkRepair {
+                    item_id: 9_002,
+                    lease_ms: 100,
+                },
+            )
+            .await?,
+        "local_node_not_active",
+    )?;
     let remaining = (1..=3)
         .filter(|node_id| *node_id != departed)
         .collect::<Vec<_>>();
@@ -843,6 +1025,45 @@ async fn run_leader_self_leave_case() -> Result<()> {
         bail!("leader self-leave did not publish the converged survivor roster: {status:?}");
     }
 
+    cluster.shutdown_all().await?;
+    Ok(())
+}
+
+/// Four voters still have a three-vote quorum with one nondeparting voter
+/// down. The leader must skip that dead handoff candidate, accept two stable
+/// survivor confirmations, and commit the safer odd 4→3 membership.
+async fn run_degraded_four_voter_leader_self_leave_case() -> Result<()> {
+    let executable = harness_executable()?;
+    let root = tempfile::tempdir().context("degraded four-voter leave data root")?;
+    let (mut cluster, _) = start_cluster_with_port_retry(&executable, root.path(), 4).await?;
+
+    cluster.request(1, Request::Bootstrap).await?.require_ok()?;
+    for node_id in 2..=4 {
+        cluster
+            .request(node_id, Request::Open)
+            .await?
+            .require_ok()?;
+    }
+    cluster.wait_for_voters(&[1, 2, 3, 4]).await?;
+
+    let departed = cluster.leader().await?;
+    let remaining = (1..=4)
+        .filter(|node_id| *node_id != departed)
+        .collect::<Vec<_>>();
+    let unavailable = remaining[0];
+    cluster.kill(unavailable).await?;
+    cluster
+        .request(departed, Request::LeaveVoter)
+        .await?
+        .require_ok()?;
+    cluster.wait_for_voters(&remaining).await?;
+
+    let successor = cluster.leader().await?;
+    if successor == departed || successor == unavailable || !remaining.contains(&successor) {
+        bail!(
+            "degraded four-voter leave did not elect a live successor: departed={departed}, unavailable={unavailable}, successor={successor}, remaining={remaining:?}"
+        );
+    }
     cluster.shutdown_all().await?;
     Ok(())
 }
@@ -1496,6 +1717,14 @@ pub enum Request {
     HeartbeatPreservesTombstone {
         node_id: String,
     },
+    Heartbeat,
+    ClaimArtworkRepair {
+        item_id: i64,
+        lease_ms: u64,
+    },
+    ReleaseArtworkRepair {
+        item_id: i64,
+    },
     RemoveVoter {
         node_id: String,
     },
@@ -1593,6 +1822,7 @@ pub enum Response {
     Metrics {
         leader: Option<u64>,
         voters: Vec<u64>,
+        applied_index: Option<u64>,
     },
     ReplicationStatus {
         status: ReplicationStatus,
@@ -1979,9 +2209,15 @@ impl ClusterProcesses {
     /// original leader, which is commonly voter 1; a removed process is not
     /// required to learn entries committed after its removal.
     pub async fn wait_for_voters(&mut self, expected: &[u64]) -> Result<()> {
-        let observer = *expected
-            .first()
-            .context("cannot observe an empty voter membership")?;
+        let observer = expected
+            .iter()
+            .copied()
+            .find(|node_id| {
+                self.nodes
+                    .get((*node_id - 1) as usize)
+                    .is_some_and(Option::is_some)
+            })
+            .context("cannot observe membership without a running expected voter")?;
         let deadline = Instant::now() + self.convergence_timeout;
         loop {
             if let Ok(Response::Metrics { voters, .. }) =
@@ -2512,13 +2748,30 @@ async fn handle_request(
             membership_ref(membership)?.heartbeat().await?;
             let rows = client
                 .query_consistent_map::<MembershipTombstoneRow, _>(
-                    "SELECT removed_at FROM cluster_nodes WHERE node_id = $1",
+                    "SELECT COALESCE(removed_at, (SELECT started_at \
+                       FROM cluster_node_removals WHERE node_id = $1)) AS removed_at \
+                     FROM cluster_nodes WHERE node_id = $1",
                     hiqlite::macros::params!(node_id),
                 )
                 .await?;
             if rows.first().and_then(|row| row.removed_at).is_none() {
                 bail!("removed node heartbeat cleared its durable tombstone");
             }
+            Ok(Response::Ok)
+        }
+        Request::Heartbeat => {
+            membership_ref(membership)?.heartbeat().await?;
+            Ok(Response::Ok)
+        }
+        Request::ClaimArtworkRepair { item_id, lease_ms } => membership_ref(membership)?
+            .claim_artwork_source_repair(item_id, Duration::from_millis(lease_ms))
+            .await
+            .map(|value| Response::Flag { value })
+            .or_else(|error| Ok(membership_error_response(error))),
+        Request::ReleaseArtworkRepair { item_id } => {
+            membership_ref(membership)?
+                .release_artwork_source_repair(item_id)
+                .await?;
             Ok(Response::Ok)
         }
         Request::RemoveVoter { node_id } => membership_ref(membership)?
@@ -2693,6 +2946,7 @@ async fn handle_request(
             Ok(Response::Metrics {
                 leader: metrics.current_leader,
                 voters,
+                applied_index: metrics.last_applied.as_ref().map(|log| log.index),
             })
         }
         Request::ReplicationStatus => Ok(Response::ReplicationStatus {
@@ -2767,6 +3021,7 @@ async fn membership_manager(
             raft_address: local.raft.clone(),
             api_address: local.api.clone(),
         },
+        "https://shared-join-lb.invalid".to_owned(),
         format!("http://127.0.0.1:{}", 33_000 + launch.node_id),
         JoinSecrets {
             raft: RAFT_SECRET.to_owned(),

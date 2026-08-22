@@ -35,14 +35,16 @@ bump may break compatibility and a **patch** bump never does.
 - **Artwork now follows library rows across the cluster.** Item metadata is
   replicated, but its poster and backdrop bytes live in each node's local
   artwork cache, so a follower inherited a valid filename and returned 404.
-  Each voter now publishes its own public HTTP base inside private membership
-  state and continuously inventories every replicated artwork reference. A
+  Each voter now publishes a node-specific `cluster.artwork_url` inside private
+  membership state (separate from a possibly shared load-balanced join URL)
+  and continuously inventories every replicated artwork reference. A
   missing file is pulled from a reachable peer under a one-minute,
   filename-bound cluster proof, bounded to an image-sized response, and
   atomically materialized; no reusable user bearer crosses between nodes. If
   no peer retains the file, a paced source/provider repair recreates it.
   Requests use the same peer path immediately while the background pass
-  converges, and image bytes still never enter Raft.
+  converges. Peer pulls are singleflight and globally bounded, source repair
+  uses a rotating durable lease, and image bytes still never enter Raft.
 
 - **Repeated authentication no longer appends one Raft entry per request.**
   Login-token and scoped API-key authorization still use authority-consistent

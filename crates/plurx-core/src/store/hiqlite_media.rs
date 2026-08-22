@@ -8,7 +8,9 @@ use hiqlite::macros::params;
 use hiqlite::Row;
 
 use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore, TimedClient};
-use super::{MediaStore, ReconcileOutcome, RootFingerprintStatus, WatchStore};
+use super::{
+    ArtworkInventoryItem, MediaStore, ReconcileOutcome, RootFingerprintStatus, WatchStore,
+};
 use crate::domain::{
     sort_title_for, ArtworkAttempt, BookMetadataPatch, InProgressItem, Item, ItemEdit, ItemKind,
     ItemPage, ItemSort, MediaFile, MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
@@ -61,6 +63,16 @@ struct ItemRow {
     book_work_id: Option<String>,
     book_edition_id: Option<String>,
     book_metadata_source: Option<String>,
+}
+
+impl From<&mut Row<'_>> for ArtworkInventoryItem {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            id: row.get("id"),
+            poster_path: row.get("poster_path"),
+            backdrop_path: row.get("backdrop_path"),
+        }
+    }
 }
 
 impl From<&mut Row<'_>> for ItemRow {
@@ -850,21 +862,16 @@ impl MediaStore for HiqliteAuthStore {
         )
     }
 
-    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError> {
-        items(
-            self.client()
-                .query_consistent_map::<ItemRow, _>(
-                    format!(
-                        "SELECT {i} FROM items i \
-                         WHERE i.poster_path IS NOT NULL OR i.backdrop_path IS NOT NULL \
-                         ORDER BY i.id",
-                        i = item_cols("i")
-                    ),
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-        )
+    async fn items_with_artwork(&self) -> Result<Vec<ArtworkInventoryItem>, StoreError> {
+        self.client()
+            .query_map::<ArtworkInventoryItem, _>(
+                "SELECT id, poster_path, backdrop_path FROM items \
+                 WHERE poster_path IS NOT NULL OR backdrop_path IS NOT NULL \
+                 ORDER BY id",
+                params!(),
+            )
+            .await
+            .map_err(database_error)
     }
 
     async fn list_top_items_in_genre(

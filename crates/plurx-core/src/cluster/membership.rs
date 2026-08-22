@@ -5,7 +5,7 @@
 //! only the small amount of state needed to admit nodes, describe them without
 //! exposing listener ports or secrets, and remove a voter safely.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,19 +68,33 @@ const MEMBERSHIP_SCHEMA: &[&str] = &[
          api_address TEXT NOT NULL, \
          last_seen_at INTEGER NOT NULL, \
          removed_at INTEGER) STRICT",
+    // A distinct, restart-safe fence for the ambiguous interval between the
+    // removal request and a proven uniform Raft configuration. Keeping intent
+    // separate from the final tombstone makes interrupted operations visible
+    // and idempotently resumable.
+    "CREATE TABLE IF NOT EXISTS cluster_node_removals (\
+         node_id TEXT PRIMARY KEY, \
+         started_at INTEGER NOT NULL) STRICT",
     // Kept separate from `cluster_nodes` so this patch is rolling-compatible
     // with M3 binaries that still write the original six-column row. Public
     // HTTP addressing belongs to the node rather than the logical server: it
     // is where another voter can retrieve node-local materialized bytes.
     "CREATE TABLE IF NOT EXISTS cluster_node_http (\
          node_id TEXT PRIMARY KEY, \
-         public_http_url TEXT NOT NULL) STRICT",
+         public_http_url TEXT NOT NULL UNIQUE) STRICT",
     // Additive so a rolling upgrade can teach old membership rows their
     // machine names without rewriting the cluster_nodes table underneath an
     // older voter. Every new daemon creates this table before its heartbeat.
     "CREATE TABLE IF NOT EXISTS cluster_node_hostnames (\
          node_id TEXT PRIMARY KEY, \
          hostname TEXT NOT NULL) STRICT",
+    // Provider/source repair is a replicated side effect. A durable per-item
+    // lease and deterministic voter rotation prevent restarts, elections, or
+    // four independent reconciliation loops from multiplying external work.
+    "CREATE TABLE IF NOT EXISTS cluster_artwork_repairs (\
+         item_id INTEGER PRIMARY KEY, \
+         owner_node_id TEXT NOT NULL, \
+         lease_expires_at INTEGER NOT NULL) STRICT",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +115,12 @@ pub enum MembershipError {
     NodeNotFound,
     #[error("the current Raft leader cannot be removed; retry after leadership moves")]
     LeaderRemoval,
+    #[error("the local voter must use the graceful leave operation")]
+    SelfRemovalRequiresLeave,
+    #[error("the leave request targeted a different local cluster node")]
+    LeaveNodeMismatch,
+    #[error("the local node is no longer an active cluster voter")]
+    LocalNodeNotActive,
     #[error("removal would leave fewer than two voters and lose the reconfiguration quorum")]
     QuorumLoss,
     /// The removal was refused because this node's offline work could not be
@@ -125,6 +145,9 @@ impl MembershipError {
             Self::Incompatible => "join_incompatible",
             Self::NodeNotFound => "cluster_node_not_found",
             Self::LeaderRemoval => "cluster_leader_removal_refused",
+            Self::SelfRemovalRequiresLeave => "self_removal_requires_leave",
+            Self::LeaveNodeMismatch => "leave_node_mismatch",
+            Self::LocalNodeNotActive => "local_node_not_active",
             Self::QuorumLoss => "removal_would_lose_quorum",
             Self::OfflineWork(_) => "node_owns_offline_work",
             Self::Internal(_) => "membership_internal",
@@ -283,6 +306,10 @@ pub enum ClusterAvailability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipStatus {
+    /// The node that produced this roster. Destructive local actions bind to
+    /// this value so a load balancer cannot move a confirmed leave to a
+    /// different backend.
+    pub local_node_id: String,
     pub availability: ClusterAvailability,
     pub nodes: Vec<ClusterNodeRecord>,
     /// The one canonical lag answer introduced by #233.
@@ -312,6 +339,7 @@ struct ReplicatedMembership {
     local: ClusterPeer,
     local_hostname: String,
     bootstrap_http: String,
+    artwork_http: String,
     secrets: JoinSecrets,
     activation_marker: ActivationMarker,
     replication: ReplicationMonitor,
@@ -374,6 +402,7 @@ impl MembershipManager {
         identity: ClusterIdentity,
         local: ClusterPeer,
         bootstrap_http: String,
+        artwork_http: String,
         secrets: JoinSecrets,
         activation_marker: ActivationMarker,
     ) -> Result<Self, MembershipError> {
@@ -390,6 +419,7 @@ impl MembershipManager {
                 local,
                 local_hostname,
                 bootstrap_http,
+                artwork_http,
                 secrets,
                 activation_marker,
                 replication,
@@ -429,7 +459,8 @@ impl MembershipManager {
                 return Err(MembershipError::Incompatible);
             }
         }
-        self.heartbeat().await
+        self.heartbeat().await?;
+        self.publish_http_url().await
     }
 
     pub async fn issue_token(&self, ttl: Duration) -> Result<IssuedJoinToken, MembershipError> {
@@ -683,19 +714,138 @@ impl MembershipManager {
                 ),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Publish this process-constant address once at startup. Rewriting it on
+    /// every ten-second liveness beat would double steady Raft traffic while
+    /// carrying no new information.
+    async fn publish_http_url(&self) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
         inner
             .client
             .execute(
                 "INSERT INTO cluster_node_http (node_id, public_http_url) VALUES ($1, $2) \
                  ON CONFLICT(node_id) DO UPDATE SET \
                    public_http_url = excluded.public_http_url",
-                params!(
-                    inner.identity.node_id.as_str(),
-                    inner.bootstrap_http.as_str()
-                ),
+                params!(inner.identity.node_id.as_str(), inner.artwork_http.as_str()),
             )
             .await?;
         self.upsert_hostname(&inner.identity.node_id, &inner.local_hostname)
+            .await
+    }
+
+    /// Claim the one cluster-wide provider/source repair for an item.
+    ///
+    /// The conditional Raft write is the authority proof: only one voter can
+    /// own the item at a time. Any voter may contend because local sidecars and
+    /// library mounts are not guaranteed to exist on the leader; a failed
+    /// claimant retains its short lease so the next time bucket rotates to a
+    /// different machine without a write storm.
+    pub async fn claim_artwork_source_repair(
+        &self,
+        item_id: i64,
+        lease: Duration,
+    ) -> Result<bool, MembershipError> {
+        let inner = self.replicated_inner()?;
+        if !self.local_node_is_active_voter().await? {
+            return Err(MembershipError::LocalNodeNotActive);
+        }
+        let now = unix_ms()?;
+        let lease_ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX).max(1);
+        let active = inner
+            .client
+            .query_map::<ArtworkRepairLeaseRow, _>(
+                "SELECT owner_node_id, lease_expires_at FROM cluster_artwork_repairs \
+                 WHERE item_id = $1",
+                params!(item_id),
+            )
+            .await?;
+        if active.first().is_some_and(|row| row.lease_expires_at > now) {
+            return Ok(false);
+        }
+
+        // Every voter observes the same committed voter order and time bucket,
+        // so just one contender submits the CAS write. The CAS remains the
+        // final authority across clock skew and a bucket boundary.
+        let metrics = inner.client.metrics_db().await?;
+        let voters = metrics.membership_config.voter_ids().collect::<Vec<_>>();
+        if voters.is_empty() {
+            return Err(MembershipError::LocalNodeNotActive);
+        }
+        let bucket = now.div_euclid(lease_ms) as u64;
+        let selected =
+            voters[(item_id.unsigned_abs().wrapping_add(bucket) % voters.len() as u64) as usize];
+        if selected != inner.identity.raft_id {
+            return Ok(false);
+        }
+        let changed = inner
+            .client
+            .execute(
+                "INSERT INTO cluster_artwork_repairs \
+                 (item_id, owner_node_id, lease_expires_at) \
+                 SELECT $1, $2, $3 WHERE EXISTS (\
+                   SELECT 1 FROM cluster_nodes \
+                   WHERE node_id = $2 AND removed_at IS NULL \
+                     AND NOT EXISTS (SELECT 1 FROM cluster_node_removals \
+                       WHERE node_id = $2)\
+                 ) \
+                 ON CONFLICT(item_id) DO UPDATE SET \
+                   owner_node_id = excluded.owner_node_id, \
+                   lease_expires_at = excluded.lease_expires_at \
+                 WHERE cluster_artwork_repairs.lease_expires_at <= $4",
+                params!(
+                    item_id,
+                    inner.identity.node_id.as_str(),
+                    now.saturating_add(lease_ms),
+                    now
+                ),
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// Whether this process is both present in the committed Raft voter set
+    /// and non-tombstoned in replicated membership state.
+    pub async fn local_node_is_active_voter(&self) -> Result<bool, MembershipError> {
+        let inner = self.replicated_inner()?;
+        if !self.local_node_is_committed_voter().await? {
+            return Ok(false);
+        }
+        let rows = inner
+            .client
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM cluster_nodes \
+                 WHERE node_id = $1 AND removed_at IS NULL \
+                   AND NOT EXISTS (SELECT 1 FROM cluster_node_removals \
+                     WHERE node_id = $1)",
+                params!(inner.identity.node_id.as_str()),
+            )
+            .await?;
+        Ok(rows.first().is_some_and(|row| row.count == 1))
+    }
+
+    pub async fn local_node_is_committed_voter(&self) -> Result<bool, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let metrics = inner.client.metrics_db().await?;
+        Ok(metrics
+            .membership_config
+            .voter_ids()
+            .any(|raft_id| raft_id == inner.identity.raft_id))
+    }
+
+    /// Release a lease owned by this node without disturbing a successor.
+    /// Production failures deliberately retain their lease; the cluster
+    /// acceptance harness uses this only to keep its short-lived fixture tidy.
+    pub async fn release_artwork_source_repair(&self, item_id: i64) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        inner
+            .client
+            .execute(
+                "DELETE FROM cluster_artwork_repairs \
+                 WHERE item_id = $1 AND owner_node_id = $2",
+                params!(item_id, inner.identity.node_id.as_str()),
+            )
             .await?;
         Ok(())
     }
@@ -715,6 +865,8 @@ impl MembershipManager {
                  FROM cluster_node_http http \
                  JOIN cluster_nodes node ON node.node_id = http.node_id \
                  WHERE node.removed_at IS NULL AND node.node_id != $1 \
+                   AND NOT EXISTS (SELECT 1 FROM cluster_node_removals removal \
+                     WHERE removal.node_id = node.node_id) \
                    AND node.last_seen_at >= $2 \
                  ORDER BY node.last_seen_at DESC, node.raft_id",
                 params!(inner.identity.node_id.as_str(), reachable_after),
@@ -767,9 +919,11 @@ impl MembershipManager {
         let reachable_after = now.saturating_sub(NODE_REACHABLE_WINDOW_MS);
         let rows = inner
             .client
-            .query_map::<CountRow, _>(
+            .query_consistent_map::<CountRow, _>(
                 "SELECT COUNT(*) AS count FROM cluster_nodes \
-                 WHERE node_id = $1 AND removed_at IS NULL AND last_seen_at >= $2",
+                 WHERE node_id = $1 AND removed_at IS NULL AND last_seen_at >= $2 \
+                   AND NOT EXISTS (SELECT 1 FROM cluster_node_removals \
+                     WHERE node_id = $1)",
                 params!(auth.node_id.as_str(), reachable_after),
             )
             .await?;
@@ -836,6 +990,7 @@ impl MembershipManager {
             _ => ClusterAvailability::HighAvailability,
         };
         Ok(MembershipStatus {
+            local_node_id: inner.identity.node_id.clone(),
             availability,
             nodes,
             replication: inner.replication.status().await,
@@ -844,21 +999,34 @@ impl MembershipManager {
 
     pub async fn remove_voter(&self, node_id: &str) -> Result<MembershipStatus, MembershipError> {
         let inner = self.replicated_inner()?;
-        let status = self.status().await?;
-        let target = status
-            .nodes
-            .iter()
-            .find(|node| node.node_id == node_id)
-            .ok_or(MembershipError::NodeNotFound)?;
+        if node_id == inner.identity.node_id {
+            return Err(MembershipError::SelfRemovalRequiresLeave);
+        }
         let metrics = inner.client.metrics_db().await?;
+        let target = inner
+            .client
+            .query_consistent_map::<NodeRow, _>(
+                "SELECT node_id, raft_id, api_address, last_seen_at \
+                 FROM cluster_nodes WHERE node_id = $1",
+                params!(node_id),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(MembershipError::NodeNotFound)?;
         let voters = metrics
             .membership_config
             .voter_ids()
             .collect::<BTreeSet<_>>();
-        if !voters.contains(&target.raft_id) {
+        let target_raft_id = target.raft_id as u64;
+        if !voters.contains(&target_raft_id) {
+            if self.node_is_tombstoned(node_id).await? {
+                self.finalize_node_removal(node_id).await;
+                return self.status().await;
+            }
             return Err(MembershipError::NodeNotFound);
         }
-        if metrics.current_leader == Some(target.raft_id) {
+        if metrics.current_leader == Some(target_raft_id) {
             return Err(MembershipError::LeaderRemoval);
         }
         if voters.len() < 3 {
@@ -870,8 +1038,9 @@ impl MembershipManager {
         // activation blocker and which is strictly worse than refusing.
         let mut resolved = self.settle_offline_work(node_id).await?;
         let remaining = voters
-            .into_iter()
-            .filter(|id| *id != target.raft_id)
+            .iter()
+            .copied()
+            .filter(|id| *id != target_raft_id)
             .collect::<BTreeSet<_>>();
         let leader_id = metrics
             .current_leader
@@ -881,14 +1050,35 @@ impl MembershipManager {
             .membership()
             .get_node(&leader_id)
             .ok_or_else(|| MembershipError::Internal("leader has no node record".to_owned()))?;
-        change_membership(&leader.addr_api, &inner.secrets.api, &remaining).await?;
-        inner
-            .client
-            .execute(
-                "UPDATE cluster_nodes SET removed_at = $1 WHERE node_id = $2",
-                params!(unix_ms()?, node_id),
-            )
-            .await?;
+        let membership_nodes = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(raft_id, node)| (*raft_id, node.addr_api.clone()))
+            .collect::<Vec<_>>();
+        self.begin_node_removal(node_id).await?;
+        match change_membership(&leader.addr_api, &inner.secrets.api, &remaining).await {
+            Ok(()) => {}
+            Err(MembershipChangeFailure::Rejected(removal_error)) => {
+                self.rollback_node_removal(node_id).await?;
+                return Err(removal_error);
+            }
+            Err(MembershipChangeFailure::Ambiguous(removal_error)) => {
+                match reconcile_membership_change(&inner.secrets.api, &remaining, &membership_nodes)
+                    .await
+                {
+                    MembershipChangeOutcome::Removed => {
+                        tracing::warn!(%removal_error, %node_id, "voter removal committed after an ambiguous HTTP result");
+                    }
+                    MembershipChangeOutcome::Indeterminate => {
+                        return Err(MembershipError::Internal(format!(
+                        "voter removal outcome is indeterminate after {removal_error}; the target remains fenced"
+                    )));
+                    }
+                }
+            }
+        }
+        self.finalize_node_removal(node_id).await;
         // The membership change has committed, so refusing is no longer an
         // available answer for anything that slipped through the last
         // re-read. Fail it instead of leaving a row owned by a node that is
@@ -920,18 +1110,16 @@ impl MembershipManager {
     pub async fn leave_voter(&self) -> Result<(), MembershipError> {
         let inner = self.replicated_inner()?;
         let node_id = inner.identity.node_id.clone();
-        let status = self.status().await?;
-        let target = status
-            .nodes
-            .iter()
-            .find(|node| node.node_id == node_id)
-            .ok_or(MembershipError::NodeNotFound)?;
         let metrics = inner.client.metrics_db().await?;
         let voters = metrics
             .membership_config
             .voter_ids()
             .collect::<BTreeSet<_>>();
-        if !voters.contains(&target.raft_id) {
+        if !voters.contains(&inner.identity.raft_id) {
+            if self.node_is_tombstoned(&node_id).await? {
+                self.finalize_node_removal(&node_id).await;
+                return Ok(());
+            }
             return Err(MembershipError::NodeNotFound);
         }
         if voters.len() < 3 {
@@ -940,8 +1128,9 @@ impl MembershipManager {
 
         let mut resolved = self.settle_offline_work(&node_id).await?;
         let remaining = voters
-            .into_iter()
-            .filter(|id| *id != target.raft_id)
+            .iter()
+            .copied()
+            .filter(|id| *id != inner.identity.raft_id)
             .collect::<BTreeSet<_>>();
         let leader_id = metrics
             .current_leader
@@ -951,28 +1140,48 @@ impl MembershipManager {
             .membership()
             .get_node(&leader_id)
             .ok_or_else(|| MembershipError::Internal("leader has no node record".to_owned()))?;
-        let survivor_nodes = metrics
+        let membership_nodes = metrics
             .membership_config
             .membership()
             .nodes()
-            .filter(|(raft_id, _)| remaining.contains(raft_id))
             .map(|(raft_id, node)| (*raft_id, node.addr_api.clone()))
+            .collect::<Vec<_>>();
+        let survivor_nodes = membership_nodes
+            .iter()
+            .filter(|(raft_id, _)| remaining.contains(raft_id))
+            .cloned()
             .collect::<Vec<_>>();
         let mut commit_leader_api = leader.addr_api.clone();
 
         // OpenRaft 0.9 has no dedicated transfer-leader call. Triggering an
-        // election on one survivor advances the term and makes this leader
-        // step down before its membership entry is removed. Waiting until
-        // every survivor reports that same leader turns the trigger into a
-        // verified handoff rather than a hopeful delay.
-        if leader_id == target.raft_id {
-            let candidate = survivor_nodes.first().ok_or_else(|| {
-                MembershipError::Internal("cluster has no leadership successor".to_owned())
-            })?;
-            trigger_election(&candidate.1, &inner.secrets.api).await?;
+        // election on a reachable survivor advances the term and makes this
+        // leader step down before its membership entry is removed. Candidates
+        // are tried with bounded I/O because a four-voter cluster can still
+        // safely change 4→3 while one nondeparting voter is unavailable.
+        if leader_id == inner.identity.raft_id {
+            if survivor_nodes.is_empty() {
+                return Err(MembershipError::Internal(
+                    "cluster has no leadership successor".to_owned(),
+                ));
+            }
+            let mut triggered = false;
+            for (_, candidate_api) in &survivor_nodes {
+                if trigger_election(candidate_api, &inner.secrets.api)
+                    .await
+                    .is_ok()
+                {
+                    triggered = true;
+                    break;
+                }
+            }
+            if !triggered {
+                return Err(MembershipError::Internal(
+                    "no surviving voter accepted the bounded leadership handoff".to_owned(),
+                ));
+            }
             let new_leader = self
                 .await_survivor_leader(
-                    target.raft_id,
+                    inner.identity.raft_id,
                     &remaining,
                     &survivor_nodes,
                     &inner.secrets.api,
@@ -986,22 +1195,36 @@ impl MembershipManager {
                     MembershipError::Internal("new leader has no node record".to_owned())
                 })?;
         }
-        change_membership(&commit_leader_api, &inner.secrets.api, &remaining).await?;
-
-        // Membership is already committed, so cleanup failures must not keep
-        // this now-nonmember process serving. The HTTP layer will drain after
-        // this method returns; report cleanup failures loudly and preserve the
-        // one success answer that makes shutdown inevitable.
-        if let Err(error) = inner
-            .client
-            .execute(
-                "UPDATE cluster_nodes SET removed_at = $1 WHERE node_id = $2",
-                params!(unix_ms()?, node_id.as_str()),
-            )
-            .await
-        {
-            tracing::error!(%error, %node_id, "self-removal committed but node tombstone write failed");
+        // Fence while this voter is still inside the old quorum. The separate
+        // pending row survives a crash and keeps the operation retryable while
+        // OpenRaft is in a joint or otherwise indeterminate configuration.
+        self.begin_node_removal(&node_id).await?;
+        match change_membership(&commit_leader_api, &inner.secrets.api, &remaining).await {
+            Ok(()) => {}
+            Err(MembershipChangeFailure::Rejected(removal_error)) => {
+                self.rollback_node_removal(&node_id).await?;
+                return Err(removal_error);
+            }
+            Err(MembershipChangeFailure::Ambiguous(removal_error)) => {
+                match reconcile_membership_change(&inner.secrets.api, &remaining, &membership_nodes)
+                    .await
+                {
+                    MembershipChangeOutcome::Removed => {
+                        tracing::warn!(%removal_error, %node_id, "self-removal committed after an ambiguous HTTP result");
+                    }
+                    MembershipChangeOutcome::Indeterminate => {
+                        return Err(MembershipError::Internal(format!(
+                        "self-removal outcome is indeterminate after {removal_error}; this voter remains fenced"
+                    )));
+                    }
+                }
+            }
         }
+        self.finalize_node_removal(&node_id).await;
+
+        // Membership is committed and the durable fence was already verified, so
+        // cleanup failures must not keep this now-nonmember process serving.
+        // The HTTP layer drains after this method returns.
         match self.fail_offline_work_left_behind(&node_id).await {
             Ok(failed) => resolved.failed += failed,
             Err(error) => tracing::error!(
@@ -1017,6 +1240,74 @@ impl MembershipManager {
             "local voter left the cluster"
         );
         Ok(())
+    }
+
+    async fn begin_node_removal(&self, node_id: &str) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        inner
+            .client
+            .execute(
+                "INSERT INTO cluster_node_removals (node_id, started_at) VALUES ($1, $2) \
+                 ON CONFLICT(node_id) DO NOTHING",
+                params!(node_id, unix_ms()?),
+            )
+            .await?;
+        if !self.node_is_tombstoned(node_id).await? {
+            return Err(MembershipError::Internal(
+                "node removal fence did not become authoritative".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn rollback_node_removal(&self, node_id: &str) -> Result<(), MembershipError> {
+        let inner = self.replicated_inner()?;
+        inner
+            .client
+            .execute(
+                "DELETE FROM cluster_node_removals WHERE node_id = $1",
+                params!(node_id),
+            )
+            .await?;
+        if self.node_is_tombstoned(node_id).await? {
+            return Err(MembershipError::Internal(
+                "node removal fence rollback could not be verified".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn finalize_node_removal(&self, node_id: &str) {
+        let Ok(inner) = self.replicated_inner() else {
+            return;
+        };
+        if let Err(error) = inner
+            .client
+            .execute(
+                "UPDATE cluster_nodes SET removed_at = COALESCE(removed_at, $1) \
+                 WHERE node_id = $2",
+                params!(unix_ms().unwrap_or(i64::MAX), node_id),
+            )
+            .await
+        {
+            // The pending-removal row remains the authoritative durable fence.
+            tracing::error!(%error, %node_id, "could not materialize final node tombstone");
+        }
+    }
+
+    async fn node_is_tombstoned(&self, node_id: &str) -> Result<bool, MembershipError> {
+        let inner = self.replicated_inner()?;
+        let rows = inner
+            .client
+            .query_consistent_map::<CountRow, _>(
+                "SELECT COUNT(*) AS count FROM cluster_nodes \
+                 WHERE node_id = $1 AND (removed_at IS NOT NULL OR EXISTS (\
+                   SELECT 1 FROM cluster_node_removals WHERE node_id = $1\
+                 ))",
+                params!(node_id),
+            )
+            .await?;
+        Ok(rows.first().is_some_and(|row| row.count == 1))
     }
 
     /// Wait long enough to distinguish a committed self-removal from a
@@ -1040,11 +1331,11 @@ impl MembershipManager {
                 "building leader handoff client".to_owned(),
             ));
         };
+        let required = remaining.len() / 2 + 1;
         let mut stable_rounds = 0_u8;
         let mut stable_leader = None;
         for _ in 0..40 {
-            let mut elected = None;
-            let mut all_confirmed = !survivor_nodes.is_empty();
+            let mut confirmations = BTreeMap::<u64, usize>::new();
             for (_, api) in survivor_nodes {
                 let response = client
                     .get(format!("https://{api}/cluster/metrics/sqlite"))
@@ -1060,17 +1351,16 @@ impl MembershipManager {
                         .and_then(|metrics| metrics.current_leader),
                     Err(_) => None,
                 };
-                if !leader.is_some_and(|leader| {
-                    leader != departed
-                        && remaining.contains(&leader)
-                        && elected.is_none_or(|expected| expected == leader)
-                }) {
-                    all_confirmed = false;
-                    break;
+                if let Some(leader) =
+                    leader.filter(|leader| *leader != departed && remaining.contains(leader))
+                {
+                    *confirmations.entry(leader).or_default() += 1;
                 }
-                elected = leader;
             }
-            if all_confirmed {
+            let elected = confirmations
+                .into_iter()
+                .find_map(|(leader, count)| (count >= required).then_some(leader));
+            if elected.is_some() {
                 if elected == stable_leader {
                     stable_rounds += 1;
                 } else {
@@ -1480,15 +1770,93 @@ fn is_join_token_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MembershipChangeOutcome {
+    Removed,
+    Indeterminate,
+}
+
+enum MembershipChangeFailure {
+    /// The request could not be constructed before any proposal was sent, so
+    /// the pending fence may be rolled back.
+    Rejected(MembershipError),
+    /// Transport failure or timeout after send. The proposal may still commit;
+    /// the fence must remain until a retry proves the uniform new membership.
+    Ambiguous(MembershipError),
+}
+
+/// Resolve an ambiguous membership HTTP result from independent survivor
+/// observations. A response timeout is not a failed Raft commit, and an old
+/// membership observation cannot prove that an accepted proposal will not
+/// commit later. Only a uniform new-config quorum resolves the operation.
+async fn reconcile_membership_change(
+    api_secret: &str,
+    remaining: &BTreeSet<u64>,
+    membership_nodes: &[(u64, String)],
+) -> MembershipChangeOutcome {
+    let Ok(client) = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(1))
+        .build()
+    else {
+        return MembershipChangeOutcome::Indeterminate;
+    };
+    let new_quorum = remaining.len() / 2 + 1;
+    let mut stable_rounds = 0_u8;
+    for _ in 0..40 {
+        let observations =
+            futures_util::future::join_all(membership_nodes.iter().map(|(raft_id, api)| {
+                let client = client.clone();
+                let raft_id = *raft_id;
+                async move {
+                    let voters = client
+                        .get(format!("https://{api}/cluster/metrics/sqlite"))
+                        .header("X-API-SECRET", api_secret)
+                        .header(reqwest::header::ACCEPT, "application/json")
+                        .send()
+                        .await
+                        .ok()?
+                        .json::<RemoteMembershipMetrics>()
+                        .await
+                        .ok()
+                        .and_then(RemoteMembershipMetrics::uniform_voters);
+                    (raft_id, voters)
+                }
+            }))
+            .await;
+        let new_confirmations = observations
+            .iter()
+            .filter(|(raft_id, observed)| {
+                remaining.contains(raft_id) && observed.as_ref() == Some(remaining)
+            })
+            .count();
+        if new_confirmations >= new_quorum {
+            stable_rounds += 1;
+        } else {
+            stable_rounds = 0;
+        }
+        if stable_rounds >= 3 {
+            return MembershipChangeOutcome::Removed;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    MembershipChangeOutcome::Indeterminate
+}
+
 async fn change_membership(
     leader_api: &str,
     api_secret: &str,
     voters: &BTreeSet<u64>,
-) -> Result<(), MembershipError> {
+) -> Result<(), MembershipChangeFailure> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(3))
         .build()
-        .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        .map_err(|error| {
+            MembershipChangeFailure::Rejected(MembershipError::Internal(error.to_string()))
+        })?;
     let response = client
         .post(format!("https://{leader_api}/cluster/membership/sqlite"))
         .header("X-API-SECRET", api_secret)
@@ -1496,19 +1864,29 @@ async fn change_membership(
         .json(voters)
         .send()
         .await
-        .map_err(|error| MembershipError::Internal(error.to_string()))?;
+        .map_err(|error| {
+            MembershipChangeFailure::Ambiguous(MembershipError::Internal(error.to_string()))
+        })?;
     if !response.status().is_success() {
-        return Err(MembershipError::Internal(format!(
-            "Hiqlite refused voter reconfiguration with HTTP {}",
-            response.status()
-        )));
+        return Err(membership_response_failure(response.status()));
     }
     Ok(())
+}
+
+fn membership_response_failure(status: reqwest::StatusCode) -> MembershipChangeFailure {
+    // Hiqlite can return an error after OpenRaft has already committed the
+    // joint half of its two-step membership change. No post-send HTTP status
+    // is proof that rollback is safe.
+    MembershipChangeFailure::Ambiguous(MembershipError::Internal(format!(
+        "Hiqlite voter reconfiguration returned HTTP {status}"
+    )))
 }
 
 async fn trigger_election(candidate_api: &str, api_secret: &str) -> Result<(), MembershipError> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(1))
         .build()
         .map_err(|error| MembershipError::Internal(error.to_string()))?;
     let response = client
@@ -1596,6 +1974,12 @@ struct HttpUrlRow {
     public_http_url: String,
 }
 
+struct ArtworkRepairLeaseRow {
+    #[allow(dead_code)]
+    owner_node_id: String,
+    lease_expires_at: i64,
+}
+
 struct CountRow {
     count: i64,
 }
@@ -1603,6 +1987,28 @@ struct CountRow {
 #[derive(Deserialize)]
 struct LeaderMetrics {
     current_leader: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RemoteMembershipMetrics {
+    membership_config: RemoteStoredMembership,
+}
+
+#[derive(Deserialize)]
+struct RemoteStoredMembership {
+    membership: RemoteMembership,
+}
+
+#[derive(Deserialize)]
+struct RemoteMembership {
+    configs: Vec<BTreeSet<u64>>,
+}
+
+impl RemoteMembershipMetrics {
+    fn uniform_voters(mut self) -> Option<BTreeSet<u64>> {
+        (self.membership_config.membership.configs.len() == 1)
+            .then(|| self.membership_config.membership.configs.remove(0))
+    }
 }
 
 impl From<&mut Row<'_>> for CountRow {
@@ -1617,6 +2023,15 @@ impl From<&mut Row<'_>> for HttpUrlRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
             public_http_url: row.get("public_http_url"),
+        }
+    }
+}
+
+impl From<&mut Row<'_>> for ArtworkRepairLeaseRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            owner_node_id: row.get("owner_node_id"),
+            lease_expires_at: row.get("lease_expires_at"),
         }
     }
 }
@@ -1715,6 +2130,20 @@ pub(crate) fn system_short_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_post_send_membership_error_keeps_the_removal_fence() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(matches!(
+                membership_response_failure(status),
+                MembershipChangeFailure::Ambiguous(_)
+            ));
+        }
+    }
 
     fn payload() -> JoinPayload {
         JoinPayload {
