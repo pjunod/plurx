@@ -176,9 +176,12 @@ mod tests {
 
     #[test]
     fn ttl_is_clamped_and_overflow_is_rejected() {
-        assert_eq!(expiry_from(100, Duration::ZERO).unwrap(), 1_100);
         assert_eq!(
-            expiry_from(100, Duration::from_secs(60 * 60)).unwrap(),
+            expiry_from(100, Duration::ZERO).expect("minimum TTL expiry"),
+            1_100
+        );
+        assert_eq!(
+            expiry_from(100, Duration::from_secs(60 * 60)).expect("maximum TTL expiry"),
             300_100
         );
         assert!(expiry_from(i64::MAX, Duration::from_secs(1)).is_err());
