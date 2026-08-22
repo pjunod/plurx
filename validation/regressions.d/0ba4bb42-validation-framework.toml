@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["0ba4bb42"]
+points = ["validation.framework"]
+checks = ["history-regressions"]
+reason = "The corrective-history audit reads this ledger entry and requires the compilation correction to name its retained Rust and three-voter checks. Removing the mapping reproduces the policy failure, so the validation framework prevents a repair to cluster regression coverage from landing without durable evidence."
