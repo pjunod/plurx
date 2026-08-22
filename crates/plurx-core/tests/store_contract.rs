@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hiqlite::tls::ServerTlsConfig;
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::{Client, Node, NodeConfig, Row};
+use plurx_core::cluster::coordination::{Lease, LeaseClaim};
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::cluster::migration::{
     connect_activated_store, prepare_sqlite_import, select_daemon_store, ActivationMarker,
@@ -43,12 +44,10 @@ use plurx_core::domain::{
 use plurx_core::error::StoreError;
 use plurx_core::secrets::CredentialKey;
 #[cfg(feature = "hiqlite-store")]
-use plurx_core::store::OfflinePackageStore;
-#[cfg(feature = "hiqlite-store")]
 use plurx_core::store::{
-    ApiKeyStore, HiqliteAuthStore, LibraryStore, MediaStore, PlaybackTelemetryStore, ReadingStore,
-    SettingsStore, TraktStore, UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE,
-    AUTH_SCHEMA_VERSION,
+    ApiKeyStore, CoordinationStore, HiqliteAuthStore, LibraryStore, MediaStore,
+    OfflinePackageStore, PlaybackTelemetryStore, ReadingStore, SettingsStore, TraktStore,
+    UserStore, WatchStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
 };
 use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 #[cfg(feature = "hiqlite-store")]
@@ -255,6 +254,7 @@ const NETWORK_PRIOR_METHODS: &[&str] = &[
     "network_prior",
     "prune_network_priors",
 ];
+const COORDINATION_METHODS: &[&str] = &["acquire_lease", "renew_lease", "release_lease"];
 
 struct StoreFixture {
     name: &'static str,
@@ -301,6 +301,218 @@ where
     }
 }
 
+#[tokio::test]
+async fn monotone_lease_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let first = acquired(
+            store
+                .acquire_lease("scan:library:7", "node-a", 100, 200)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: acquire absent lease: {error}")),
+            backend,
+        );
+        assert_eq!(first.fence, 1, "{backend}");
+        assert_eq!(first.revision, 1, "{backend}");
+
+        assert_eq!(
+            store
+                .acquire_lease("scan:library:7", "node-b", 150, 250)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: inspect held lease: {error}")),
+            LeaseClaim::Held {
+                owner_node_id: "node-a".to_owned(),
+                fence: 1,
+                expires_at_unix_ms: 200,
+            },
+            "{backend}"
+        );
+
+        let renewed = store
+            .renew_lease(&first, 150, 300)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: renew current lease: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: current lease must renew"));
+        assert_eq!(renewed.expires_at_unix_ms, 300, "{backend}");
+        assert_eq!(renewed.revision, 2, "{backend}");
+
+        assert!(
+            store.renew_lease(&renewed, 160, 300).await.is_err(),
+            "{backend}: renewal must advance the token expiry"
+        );
+        assert!(
+            !store
+                .release_lease(&first, 160)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: delayed release result: {error}")),
+            "{backend}: a pre-renewal token must not release its same-fence successor"
+        );
+        assert!(
+            store
+                .renew_lease(&first, 160, 310)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: delayed renew result: {error}"))
+                .is_none(),
+            "{backend}: a pre-renewal token must not replace its same-fence successor"
+        );
+
+        let latest = store
+            .renew_lease(&renewed, 160, 330)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: second renewal result: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: second renewal must succeed"));
+        assert_eq!(latest.revision, 3, "{backend}");
+        assert!(
+            store
+                .renew_lease(&renewed, 170, 320)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: reordered renewal result: {error}"))
+                .is_none(),
+            "{backend}: a reordered renewal must not regress expiry"
+        );
+        assert!(
+            !store
+                .release_lease(&renewed, 170)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: stale same-fence release: {error}")),
+            "{backend}: a superseded same-fence token must not release the lease"
+        );
+
+        let wrong_fence = Lease {
+            fence: 2,
+            ..latest.clone()
+        };
+        assert!(
+            store
+                .renew_lease(&wrong_fence, 160, 340)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: stale renew result: {error}"))
+                .is_none(),
+            "{backend}: wrong fence must not renew"
+        );
+        assert!(
+            !store
+                .release_lease(&wrong_fence, 160)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: stale release result: {error}")),
+            "{backend}: wrong fence must not release"
+        );
+        assert!(
+            store
+                .release_lease(&latest, 180)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: release current lease: {error}")),
+            "{backend}"
+        );
+        assert!(
+            store
+                .renew_lease(&latest, 190, 340)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: post-release renewal result: {error}"))
+                .is_none(),
+            "{backend}: a delayed renewal must not resurrect a released lease"
+        );
+
+        let second = acquired(
+            store
+                .acquire_lease("scan:library:7", "node-b", 180, 260)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: reacquire released lease: {error}")),
+            backend,
+        );
+        assert_eq!(second.fence, 2, "{backend}");
+        assert_eq!(second.revision, 5, "{backend}");
+        assert!(
+            store
+                .renew_lease(&latest, 190, 350)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: predecessor renew result: {error}"))
+                .is_none(),
+            "{backend}: predecessor must remain stale"
+        );
+
+        let third = acquired(
+            store
+                .acquire_lease("scan:library:7", "node-a", 260, 360)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: expiry-boundary takeover: {error}")),
+            backend,
+        );
+        assert_eq!(third.fence, 3, "{backend}");
+        assert_eq!(third.revision, 6, "{backend}");
+        assert_eq!(third.owner_node_id, "node-a", "{backend}");
+
+        assert!(
+            store
+                .release_lease(&third, 400)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: release expired lease: {error}")),
+            "{backend}: exact expired token should release without extending expiry"
+        );
+        assert!(
+            store
+                .renew_lease(&third, 350, 450)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: renewal after late release: {error}"))
+                .is_none(),
+            "{backend}: a late release must change the same-fence CAS revision"
+        );
+        let fourth = acquired(
+            store
+                .acquire_lease("scan:library:7", "node-b", 380, 480)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: takeover after late release: {error}")),
+            backend,
+        );
+        assert_eq!(fourth.fence, 4, "{backend}");
+        assert_eq!(fourth.revision, 8, "{backend}");
+
+        let aba_first = acquired(
+            store
+                .acquire_lease("aba-release", "node-a", 100, 200)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: acquire ABA fixture: {error}")),
+            backend,
+        );
+        let aba_renewed = store
+            .renew_lease(&aba_first, 150, 300)
+            .await
+            .unwrap_or_else(|error| panic!("{backend}: renew ABA fixture: {error}"))
+            .unwrap_or_else(|| panic!("{backend}: ABA fixture must renew"));
+        assert!(
+            store
+                .release_lease(&aba_renewed, 200)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: release ABA fixture: {error}")),
+            "{backend}"
+        );
+        assert!(
+            store
+                .renew_lease(&aba_first, 150, 350)
+                .await
+                .unwrap_or_else(|error| panic!("{backend}: delayed ABA renewal: {error}"))
+                .is_none(),
+            "{backend}: recurring expiry must not make an older revision current"
+        );
+
+        assert!(
+            store.acquire_lease("", "node-a", 1, 2).await.is_err(),
+            "{backend}: empty resource must fail before a write"
+        );
+        assert!(
+            store.acquire_lease("probe", "node-a", 2, 2).await.is_err(),
+            "{backend}: non-future expiry must fail before a write"
+        );
+    })
+    .await;
+}
+
+fn acquired(outcome: LeaseClaim, backend: &str) -> Lease {
+    match outcome {
+        LeaseClaim::Acquired(lease) => lease,
+        held => panic!("{backend}: expected acquired lease, got {held:?}"),
+    }
+}
+
 #[cfg(feature = "hiqlite-store")]
 async fn open_contract_hiqlite_store() -> HiqliteAuthStore {
     let cluster = contract_cluster();
@@ -329,6 +541,163 @@ async fn contract_applied_index(client: &Client) -> u64 {
         .last_applied
         .expect("replicated store has an applied index")
         .index
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_clients_racing_an_expired_lease_choose_one_fenced_owner() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let bootstrap = open_contract_hiqlite_store().await;
+    bootstrap
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated lease-race state");
+    let seed = acquired(
+        bootstrap
+            .acquire_lease("lease-race", "departed-node", 100, 200)
+            .await
+            .expect("seed expired lease"),
+        "hiqlite seed",
+    );
+    assert_eq!(seed.fence, 1);
+
+    let addresses_a = cluster.addresses.clone();
+    let mut addresses_b = cluster.addresses.clone();
+    addresses_b.rotate_left(1);
+    let client_a = Client::remote(
+        addresses_a,
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect first racing client");
+    let client_b = Client::remote(
+        addresses_b,
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect second racing client");
+    let store_a = HiqliteAuthStore::open(
+        client_a,
+        &cluster._root.path().join("lease-race-a-telemetry.db"),
+    )
+    .await
+    .expect("open first racing store");
+    let store_b = HiqliteAuthStore::open(
+        client_b,
+        &cluster._root.path().join("lease-race-b-telemetry.db"),
+    )
+    .await
+    .expect("open second racing store");
+
+    let (outcome_a, outcome_b) = tokio::join!(
+        store_a.acquire_lease("lease-race", "node-a", 200, 400),
+        store_b.acquire_lease("lease-race", "node-b", 200, 400),
+    );
+    let outcome_a = outcome_a.expect("first race result");
+    let outcome_b = outcome_b.expect("second race result");
+    let winner = match (outcome_a, outcome_b) {
+        (
+            LeaseClaim::Acquired(winner),
+            LeaseClaim::Held {
+                owner_node_id,
+                fence,
+                expires_at_unix_ms,
+            },
+        )
+        | (
+            LeaseClaim::Held {
+                owner_node_id,
+                fence,
+                expires_at_unix_ms,
+            },
+            LeaseClaim::Acquired(winner),
+        ) => {
+            assert_eq!(winner.fence, 2);
+            assert_eq!(owner_node_id, winner.owner_node_id);
+            assert_eq!(fence, winner.fence);
+            assert_eq!(expires_at_unix_ms, winner.expires_at_unix_ms);
+            winner
+        }
+        outcomes => panic!("expected one acquired and one held outcome, got {outcomes:?}"),
+    };
+
+    let renewed = store_a
+        .renew_lease(&winner, 250, 500)
+        .await
+        .expect("renew race winner through first client")
+        .expect("race winner remains current");
+    assert!(
+        !store_b
+            .release_lease(&winner, 300)
+            .await
+            .expect("delayed cross-client release result"),
+        "the pre-renewal token must not release its same-fence successor"
+    );
+    assert!(
+        store_b
+            .renew_lease(&winner, 300, 450)
+            .await
+            .expect("delayed cross-client renewal result")
+            .is_none(),
+        "the pre-renewal token must not replace its same-fence successor"
+    );
+    assert!(
+        store_b
+            .release_lease(&renewed, 600)
+            .await
+            .expect("late cross-client release of exact token"),
+        "an exact expired token can release without extending its expiry"
+    );
+    assert!(
+        store_a
+            .renew_lease(&renewed, 450, 650)
+            .await
+            .expect("delayed renewal after late cross-client release")
+            .is_none(),
+        "the late release must invalidate the same-fence token before takeover"
+    );
+    let successor = acquired(
+        store_a
+            .acquire_lease("lease-race", "successor-node", 550, 700)
+            .await
+            .expect("take over after a release whose clock is ahead"),
+        "hiqlite cross-client release",
+    );
+    assert_eq!(successor.fence, 3);
+
+    let aba_first = acquired(
+        store_a
+            .acquire_lease("lease-aba", "node-a", 100, 200)
+            .await
+            .expect("acquire cross-client ABA fixture"),
+        "hiqlite ABA fixture",
+    );
+    let aba_renewed = store_a
+        .renew_lease(&aba_first, 150, 300)
+        .await
+        .expect("renew cross-client ABA fixture")
+        .expect("cross-client ABA fixture remains current");
+    assert!(store_b
+        .release_lease(&aba_renewed, 200)
+        .await
+        .expect("release cross-client ABA fixture"));
+    assert!(
+        store_a
+            .renew_lease(&aba_first, 150, 350)
+            .await
+            .expect("delayed cross-client ABA renewal")
+            .is_none(),
+        "a recurring expiry must not recreate an older token across clients"
+    );
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -623,7 +992,7 @@ async fn api_key_activity_refresh_is_bounded_and_disabled_keys_do_not_touch() {
 
 #[cfg(feature = "hiqlite-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
+async fn replicated_v5_store_migrates_atomically_through_v8_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
     let cluster = contract_cluster();
     let client = Client::remote(
@@ -652,6 +1021,7 @@ async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
 
     let results = client
         .txn([
+            ("DROP TABLE IF EXISTS job_leases", hiqlite::params!()),
             (
                 "DROP INDEX IF EXISTS idx_items_book_work",
                 hiqlite::params!(),
@@ -699,7 +1069,7 @@ async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
 
     let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
         .await
-        .expect("daemon v5 through v7 migration");
+        .expect("daemon v5 through v8 migration");
     assert_eq!(
         migrated
             .get_setting("migration.proof")
@@ -734,6 +1104,10 @@ async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
              WHERE type = 'index' AND name = 'idx_items_book_work'",
             1,
         ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('job_leases')",
+            6,
+        ),
     ] {
         let rows: Vec<I64Value> = client
             .query_consistent_map(sql, hiqlite::params!())
@@ -746,7 +1120,7 @@ async fn replicated_v5_store_migrates_atomically_through_v7_on_daemon_open() {
 
 #[cfg(feature = "hiqlite-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
+async fn replicated_v6_store_migrates_atomically_to_v8_on_daemon_open() {
     let _case = HIQLITE_CASE.lock().await;
     let cluster = contract_cluster();
     let client = Client::remote(
@@ -774,6 +1148,7 @@ async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
 
     let results = client
         .txn([
+            ("DROP TABLE IF EXISTS job_leases", hiqlite::params!()),
             (
                 "DROP INDEX IF EXISTS idx_items_book_work",
                 hiqlite::params!(),
@@ -816,7 +1191,7 @@ async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
 
     let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
         .await
-        .expect("daemon v6 to v7 migration");
+        .expect("daemon v6 to v8 migration");
     assert_eq!(
         migrated
             .get_setting("migration.v6.proof")
@@ -842,11 +1217,102 @@ async fn replicated_v6_store_migrates_atomically_to_v7_on_daemon_open() {
              WHERE type = 'index' AND name = 'idx_items_book_work'",
             1,
         ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('job_leases')",
+            6,
+        ),
     ] {
         let rows: Vec<I64Value> = client
             .query_consistent_map(sql, hiqlite::params!())
             .await
             .expect("inspect migrated schema");
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].value, expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicated_v7_store_migrates_atomically_to_v8_on_daemon_open() {
+    let _case = HIQLITE_CASE.lock().await;
+    let cluster = contract_cluster();
+    let client = Client::remote(
+        cluster.addresses.clone(),
+        true,
+        true,
+        CONTRACT_API_SECRET.to_owned(),
+        true,
+        None,
+    )
+    .await
+    .expect("connect v7 migration client");
+    let telemetry = cluster
+        ._root
+        .path()
+        .join("schema-v7-migration-telemetry.db");
+    let current = HiqliteAuthStore::bootstrap(client.clone(), CONTRACT_INSTANCE_ID, &telemetry)
+        .await
+        .expect("bootstrap current schema");
+    current
+        .validation_reset_contract_state()
+        .await
+        .expect("empty v7 migration fixture");
+    current
+        .put_setting("migration.v7.proof", "survives")
+        .await
+        .expect("seed unrelated replicated row");
+    drop(current);
+
+    client
+        .txn([
+            ("DROP TABLE job_leases", hiqlite::params!()),
+            (
+                "UPDATE cluster_meta SET schema_version = 7 WHERE singleton = 1",
+                hiqlite::params!(),
+            ),
+        ])
+        .await
+        .expect("construct exact v7 fixture")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("commit exact v7 fixture");
+
+    let strict_error = match HiqliteAuthStore::open(client.clone(), &telemetry).await {
+        Ok(_) => panic!("maintenance open must not own schema migration"),
+        Err(error) => error,
+    };
+    assert!(
+        strict_error
+            .to_string()
+            .contains("schema 7 is incompatible"),
+        "{strict_error}"
+    );
+
+    let migrated = HiqliteAuthStore::open_or_migrate(client.clone(), &telemetry)
+        .await
+        .expect("daemon v7 to v8 migration");
+    assert_eq!(
+        migrated
+            .get_setting("migration.v7.proof")
+            .await
+            .expect("read v7 migration proof")
+            .as_deref(),
+        Some("survives")
+    );
+    for (sql, expected) in [
+        (
+            "SELECT schema_version AS value FROM cluster_meta WHERE singleton = 1",
+            AUTH_SCHEMA_VERSION,
+        ),
+        (
+            "SELECT COUNT(*) AS value FROM pragma_table_info('job_leases')",
+            6,
+        ),
+    ] {
+        let rows: Vec<I64Value> = client
+            .query_consistent_map(sql, hiqlite::params!())
+            .await
+            .expect("inspect migrated v7 schema");
         assert_eq!(rows.len(), 1, "{sql}");
         assert_eq!(rows[0].value, expected, "{sql}");
     }
@@ -1099,6 +1565,9 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
                  VALUES (9, 'fixture-root-fingerprint');
              INSERT INTO scan_reconcile_guards (library_id) VALUES (9);
              INSERT INTO scan_reconcile_items (library_id, item_id) VALUES (9, 10);
+             INSERT INTO job_leases
+                 (resource, owner_node_id, fence, revision, expires_at_ms, updated_at_ms)
+                 VALUES ('imported-lease', 'departed-node', 9, 12, 500, 400);
              INSERT INTO playback_events
                  (at_unix_ms, user_id, file_id, event, detail)
                  VALUES (131000, 7, 30, 'fixture-local-only', 'must not replicate');",
@@ -1336,6 +1805,7 @@ fn populated_v14_import_fixture(data_dir: &std::path::Path) -> PathBuf {
              DROP TABLE playback_events;
              DROP TABLE network_priors;
              DROP TABLE reading_state;
+             DROP TABLE job_leases;
              DROP INDEX idx_items_book_work;
              ALTER TABLE items DROP COLUMN book_metadata_source;
              ALTER TABLE items DROP COLUMN book_edition_id;
@@ -1394,7 +1864,7 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
         .expect("import populated v14 backup");
     assert_eq!(report.source_schema_version, 14);
     assert_eq!(report.backup_sha256, prepared.backup_sha256);
-    assert_eq!(report.tables.len(), 18);
+    assert_eq!(report.tables.len(), 19);
     assert_eq!(report.search_rows, 2);
     assert_eq!(
         report
@@ -1432,6 +1902,7 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
         "library_roots",
         "scan_reconcile_guards",
         "scan_reconcile_items",
+        "job_leases",
     ] {
         assert_eq!(
             report
@@ -1560,6 +2031,7 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
         "library_roots",
         "scan_reconcile_guards",
         "scan_reconcile_items",
+        "job_leases",
     ] {
         assert_eq!(
             report
@@ -1572,6 +2044,14 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
             "{table} must survive a current-schema import"
         );
     }
+    let imported_lease = acquired(
+        store
+            .acquire_lease("imported-lease", "surviving-node", 500, 800)
+            .await
+            .expect("take over imported expired lease"),
+        "current SQLite import",
+    );
+    assert_eq!(imported_lease.fence, 10);
     assert!(
         store
             .playback_events(&PlaybackEventQuery::default())
@@ -2722,13 +3202,14 @@ fn contract_inventory_matches_every_store_method() {
         OFFLINE_METHODS,
         TELEMETRY_METHODS,
         NETWORK_PRIOR_METHODS,
+        COORDINATION_METHODS,
     ]
     .into_iter()
     .flatten()
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 145, "review the Store method count");
+    assert_eq!(declared.len(), 148, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"

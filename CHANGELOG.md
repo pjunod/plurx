@@ -18,6 +18,16 @@ bump may break compatibility and a **patch** bump never does.
   both paths refuse a 2→1 reconfiguration. Routine updates remain in-place
   rolling restarts, not leaves.
 
+- **Cluster work now has one backend-neutral monotone lease primitive.**
+  SQLite and the replicated Hiqlite store agree on acquire, held-owner,
+  renewal, release, expiry takeover, and stale-token behavior. Releasing a
+  reusable resource retains its fence row, so a later owner can never make an
+  old token current again. A dedicated monotone token revision advances on
+  every takeover, renewal, and release, so delayed same-fence operations and
+  recurring expiry values cannot regress or resurrect newer state; the
+  replicated v7 → v8 migration creates the lease table atomically before the
+  daemon opens application work.
+
 - **Android phones and tablets can keep EPUBs inside Cinema for offline
   reading.** A durable profile-scoped catalogue records intent before I/O,
   downloads the authenticated original, reopens the server publication to

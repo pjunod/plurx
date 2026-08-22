@@ -2111,11 +2111,19 @@ fn short_hostname(raw: &str) -> Option<String> {
     let label = hostname.split('.').next().unwrap_or_default().trim();
     if label.is_empty()
         || label.eq_ignore_ascii_case("localhost")
+        || looks_like_container_id(label)
         || label.chars().any(char::is_control)
     {
         return None;
     }
     Some(label.chars().take(63).collect())
+}
+
+/// Docker's default hostname is the container id truncated to twelve hex
+/// digits. It is ephemeral runtime plumbing, not a machine name, and should
+/// never become the primary identity in the cluster roster.
+fn looks_like_container_id(label: &str) -> bool {
+    matches!(label.len(), 12 | 64) && label.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn membership_hostname(reported: &str, api_address: &str) -> String {
@@ -2266,6 +2274,12 @@ mod tests {
         assert_eq!(short_hostname("192.0.2.40"), None);
         assert_eq!(membership_hostname("", "plurx-a.lan:32402"), "plurx-a");
         assert_eq!(membership_hostname("", "127.0.0.1:32402"), "unknown-host");
+    }
+
+    #[test]
+    fn docker_container_ids_are_not_machine_hostnames() {
+        assert_eq!(short_hostname("1cb4bdb624dc"), None);
+        assert_eq!(short_hostname(&"a".repeat(64)), None);
     }
 
     #[test]

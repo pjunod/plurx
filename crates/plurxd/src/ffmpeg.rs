@@ -30,6 +30,21 @@ pub fn ffprobe_bin() -> String {
     resolve_bin(std::env::var("PLURX_FFPROBE").ok(), "ffprobe")
 }
 
+/// The executable and first line it reports from `-version`.
+pub async fn ffmpeg_build() -> String {
+    let bin = ffmpeg_bin();
+    let version = probe_ffmpeg(&["-version"])
+        .await
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "version unavailable".to_owned());
+    format!("{bin} ({version})")
+}
+
 /// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
 /// `-readrate_initial_burst` in 6.1; passing either to an older build is a hard
 /// exit, not a warning, so probe rather than assume. Probed once per process.
@@ -472,7 +487,25 @@ fn pacing_from_probe(probe: Result<String, String>) -> PacingCaps {
 pub async fn pacing_caps() -> PacingCaps {
     *PACING
         .get_or_init(|| async {
-            pacing_from_probe(probe_ffmpeg(&["-hide_banner", "-h", "full"]).await)
+            let help = probe_ffmpeg(&["-hide_banner", "-h", "full"]).await;
+            let mut caps = pacing_from_probe(help);
+            // Some builds (notably ffmpeg 8.0.1) declare the option but
+            // silently ignore it. Check behaviourally when the declaration
+            // looks promising.
+            if caps.initial_burst {
+                let measured = classify_burst(caps, probe_burst().await);
+                if caps.initial_burst && !measured.initial_burst {
+                    let ffmpeg_build = ffmpeg_build().await;
+                    tracing::warn!(
+                        "this ffmpeg build ({ffmpeg_build}) declares -readrate_initial_burst but does not honour it: \
+                         sessions are paced flat from the first byte, so the copy path's publish gate \
+                         fills at the paced rate instead of at I/O speed and every play starts seconds \
+                         slower than it needs to"
+                    );
+                }
+                caps = measured;
+            }
+            caps
         })
         .await
 }
@@ -502,6 +535,54 @@ impl PacingCaps {
             initial_burst: self.initial_burst.then_some(burst).filter(|b| *b > 0.0),
             legacy_re: false,
         }
+    }
+}
+
+/// Check whether this ffmpeg build actually honours `-readrate_initial_burst`.
+///
+/// Some builds (notably ffmpeg 8.0.1-3ubuntu2) declare the option in their
+/// help text but silently ignore it at runtime, so a purely textual probe of
+/// the declaration is insufficient. This runs a short behavioural test.
+///
+/// The test creates a 2-second `testsrc` fixture and runs ffmpeg with a 300 s
+/// burst at 2x readrate. An honoured burst consumes the fixture at I/O speed
+/// (sub-200 ms). An inert burst paces at the readrate and takes ~1 second of
+/// wall time. A 600 ms threshold cleanly separates the two cases.
+fn classify_burst(mut caps: PacingCaps, probe: Result<Duration, String>) -> PacingCaps {
+    caps.initial_burst &= probe.is_ok_and(|elapsed| elapsed < Duration::from_millis(600));
+    caps
+}
+
+fn burst_probe_args() -> [&'static str; 14] {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-readrate_initial_burst",
+        "300",
+        "-readrate",
+        "2",
+        "-i",
+        "testsrc=duration=2:size=2x2:rate=1",
+        "-f",
+        "null",
+        "-",
+    ]
+}
+
+async fn probe_burst() -> Result<Duration, String> {
+    let args = burst_probe_args();
+    let start = std::time::Instant::now();
+    match tokio::process::Command::new(ffmpeg_bin())
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => Ok(start.elapsed()),
+        Ok(out) => Err(format!("exited with {}", out.status)),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -636,6 +717,51 @@ mod tests {
         );
         assert!(!caps.readrate);
         assert!(!caps.initial_burst);
+    }
+
+    #[test]
+    fn burst_probe_classifies_honoured_inert_and_failed_measurements() {
+        let declared = PacingCaps {
+            readrate: true,
+            initial_burst: true,
+        };
+        let honoured = classify_burst(declared, Ok(Duration::from_millis(599)));
+        assert!(honoured.initial_burst);
+        assert_eq!(
+            honoured.resolve(2.0, 90.0, true).args(),
+            vec!["-readrate_initial_burst", "90.0", "-readrate", "2.00"]
+        );
+        for probe in [
+            Ok(Duration::from_millis(600)),
+            Ok(Duration::from_secs(1)),
+            Err("probe failed".to_owned()),
+        ] {
+            let corrected = classify_burst(declared, probe);
+            assert!(!corrected.initial_burst);
+            assert_eq!(
+                corrected.resolve(2.0, 90.0, true).args(),
+                vec!["-readrate", "2.00"]
+            );
+        }
+    }
+
+    #[test]
+    fn burst_probe_applies_pacing_to_the_input() {
+        let args = burst_probe_args();
+        let input = args
+            .iter()
+            .position(|arg| *arg == "-i")
+            .expect("the probe must declare its synthetic input");
+        for option in ["-readrate_initial_burst", "-readrate"] {
+            let option_index = args
+                .iter()
+                .position(|arg| *arg == option)
+                .unwrap_or_else(|| panic!("the probe must pass {option}"));
+            assert!(
+                option_index < input,
+                "{option} is an input option and must precede -i: {args:?}"
+            );
+        }
     }
 
     #[test]

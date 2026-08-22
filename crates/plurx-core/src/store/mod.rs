@@ -23,6 +23,8 @@ mod hiqlite;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_catalog;
 #[cfg(feature = "hiqlite-store")]
+mod hiqlite_coordination;
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite_durable;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_import;
@@ -46,6 +48,7 @@ pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 
 use async_trait::async_trait;
 
+use crate::cluster::coordination::{Lease, LeaseClaim};
 use crate::domain::{
     BookMetadataPatch, CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage,
     ItemSort, Library, MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation,
@@ -1310,6 +1313,35 @@ pub trait NetworkPriorStore: Send + Sync + 'static {
     async fn prune_network_priors(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError>;
 }
 
+/// Monotone, backend-neutral ownership leases for cluster work.
+///
+/// `now_unix_ms` is supplied by the coordinator so competing-node and clock
+/// edge cases are reproducible in the backend contract. Callers must still
+/// validate the returned fence in the same transaction as durable publication.
+/// The monotone revision in a returned [`Lease`] is part of its compare-and-swap
+/// identity: every successful renewal returns a replacement token, and delayed
+/// operations using an older same-fence token fail rather than regressing or
+/// resurrecting it.
+#[async_trait]
+pub trait CoordinationStore: Send + Sync + 'static {
+    async fn acquire_lease(
+        &self,
+        resource: &str,
+        owner_node_id: &str,
+        now_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<LeaseClaim, StoreError>;
+
+    async fn renew_lease(
+        &self,
+        lease: &Lease,
+        now_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<Option<Lease>, StoreError>;
+
+    async fn release_lease(&self, lease: &Lease, now_unix_ms: i64) -> Result<bool, StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -1325,6 +1357,7 @@ pub trait Store:
     + OfflinePackageStore
     + PlaybackTelemetryStore
     + NetworkPriorStore
+    + CoordinationStore
     + Send
     + Sync
     + 'static
@@ -1345,6 +1378,7 @@ impl<T> Store for T where
         + OfflinePackageStore
         + PlaybackTelemetryStore
         + NetworkPriorStore
+        + CoordinationStore
         + Send
         + Sync
         + 'static

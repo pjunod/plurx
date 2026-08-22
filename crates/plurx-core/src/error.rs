@@ -26,6 +26,15 @@ pub enum StoreError {
     /// CLUSTERING-PLAN.md §3.2.
     #[error("credential error: {0}")]
     Credential(String),
+
+    /// A durable mutation presented a lease token that is no longer current.
+    /// Backends return this rather than silently dropping a stale publication.
+    #[error("lease fence rejected for {resource} owned by {owner_node_id} at fence {fence}")]
+    FenceRejected {
+        resource: String,
+        owner_node_id: String,
+        fence: u64,
+    },
 }
 
 impl From<rusqlite::Error> for StoreError {
