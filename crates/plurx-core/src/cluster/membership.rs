@@ -1029,7 +1029,7 @@ impl MembershipManager {
         let target = inner
             .client
             .query_consistent_map::<NodeRow, _>(
-                "SELECT node_id, raft_id, api_address, last_seen_at \
+                "SELECT node_id, raft_id, api_address, last_seen_at, '' AS hostname \
                  FROM cluster_nodes WHERE node_id = $1",
                 params!(node_id),
             )
