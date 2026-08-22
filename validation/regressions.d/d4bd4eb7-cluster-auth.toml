@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["d4bd4eb7"]
+points = ["cluster.auth", "validation.framework"]
+checks = ["cluster-auth", "history-regressions"]
+reason = "The retained separate-process cluster check preserves both follower removal and leader self-leave after rebasing the hardening series, while the history audit pins the rebased evidence fragments to their current correction identities. Reverting this integration commit drops a required removal path from the authoritative replicated-storage job or restores stale regression-ledger filenames."
