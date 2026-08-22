@@ -124,7 +124,10 @@ jobs:
     # Kotlin and Swift diffs compile nothing under crates/, so the cargo lane
     # only runs when the diff can reach it; the merge queue re-runs it always.
     if: needs.scope.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    # Pinned, not floating: this job's playback assertions are written against
+    # one ffmpeg major, and apt on `ubuntu-latest` supplies whichever one that
+    # week's image ships. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -151,13 +154,11 @@ jobs:
       # session to make assertions about. The runner image doesn't ship ffmpeg,
       # so without this those tests fail on `No such file or directory`, which
       # is an absent dependency rather than anything wrong with the tree.
-      - name: Install ffmpeg and browser prerequisites
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
           python3 -m pip install playwright==1.62.0
           python3 -m playwright install --with-deps chromium
       # Keep the portable baseline and focused Linux contracts in this job.
@@ -221,7 +222,9 @@ jobs:
     name: web layout and accessibility
     needs: [scope, preflight]
     if: needs.scope.outputs.web_layout == 'true'
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as `check`: a browser sweep still plays media
+    # through ffmpeg. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -236,13 +239,11 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-1.62.0
-      - name: Install media and browser prerequisites
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
           python3 -m pip install playwright==1.62.0
           python3 -m playwright install --with-deps chromium
       - name: Check every affected web layout
@@ -427,7 +428,9 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    # Same suite as `check`, so the same pinned ffmpeg. See
+    # .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     needs: check
     timeout-minutes: 30
     # PR coverage was a second run of the Rust suite whose result was discarded;
@@ -447,13 +450,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Instrumented or not, this runs the same suite as the check job, so it
       # needs the same ffmpeg.
-      - name: Install ffmpeg
-        run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
       - name: Measure line coverage
         run: cargo llvm-cov --workspace --summary-only --json --output-path cov.json
       - name: Build the shields.io badge JSON

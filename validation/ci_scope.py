@@ -35,7 +35,14 @@ SCOPE_KEYS = (
 # all. It must exercise every routed surface instead of trusting the routing it
 # is in the middle of changing. `runner.py` owns diff resolution, glob
 # matching, and point selection, so it is selector code exactly like this file.
+#
+# A composite action under `.github/actions/**` is here for the neighbouring
+# reason: it does not choose which surfaces run, it chooses what they run
+# against. `.github/actions/ffmpeg` decides the ffmpeg every playback assertion
+# in the gate spawns, and a diff to it touches no crate, so nothing else would
+# select the suites it can break.
 FULL_CI_PATHS = (
+    ".github/actions/**",
     ".github/workflows/ci.yml",
     "validation/ci_scope.py",
     "validation/points.toml",
