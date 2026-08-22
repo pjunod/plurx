@@ -44,6 +44,13 @@ bump may break compatibility and a **patch** bump never does.
   Requests use the same peer path immediately while the background pass
   converges, and image bytes still never enter Raft.
 
+- **Repeated authentication no longer appends one Raft entry per request.**
+  Login-token and scoped API-key authorization still use authority-consistent
+  credential reads, so logout and key revocation remain immediate, but their
+  best-effort activity timestamps now refresh only after a 60-second window.
+  Busy clients therefore preserve the operator-facing activity signal without
+  spending replicated-write latency and log bandwidth on every request.
+
 - **Existing replicated installs now have a real v5 → v6 upgrade path.** The
   ebook reading-state release raised the Hiqlite compatibility marker to v6
   but only defined that schema for fresh bootstrap/import, so an activated v5
