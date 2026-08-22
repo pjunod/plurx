@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["1fae4fb9"]
+points = ["cluster.membership"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The retained three-process membership lifecycle requires every voter to learn the other voters' public artwork bases, accepts a live filename-bound artwork proof, rejects that proof for another filename, rejects it again after the signer gracefully leaves, and exercises a current-leader self-leave through a confirmed successor and converged 3→2 membership. The Rust gate separately drives the real peer HTTP fetch through a loopback server, bounds and atomically materializes the returned image, checks the admin-only leave surface, and runs the backend-neutral artwork-inventory contract, so restoring replicated filenames without node-local byte convergence or restoring leader-removal refusal fails current evidence rather than relying on the historical report."
