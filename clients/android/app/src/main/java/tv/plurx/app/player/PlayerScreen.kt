@@ -7,6 +7,7 @@ import android.app.PictureInPictureParams
 import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.os.Build
+import android.util.Log
 import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -170,68 +171,77 @@ private data class Plan(
     val progressDurationMs: Long get() = itemDurationMs ?: durationMs
 }
 
+internal class PlanLoadException(
+    val stage: String,
+    cause: Throwable,
+) : Exception(cause)
+
+private suspend fun <T> planLoadStage(stage: String, block: suspend () -> T): T = try {
+    block()
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Exception) {
+    throw PlanLoadException(stage, error)
+}
+
 private suspend fun loadPlan(
     vm: AppViewModel,
     itemId: Long,
     fileId: Long,
     tracks: PreplayTracks,
-): Plan? = try {
-    val detail = vm.itemDetail(itemId)
+): Plan {
+    val detail = planLoadStage("item_detail") { vm.itemDetail(itemId) }
     // The pre-play choice reaches the *first* decision, so the plan that comes
     // back already carries it. Starting on the policy default and switching
     // afterwards is what criterion 4 forbids: it is a visible re-buffer to
     // apply something the viewer chose before playback began.
-    val decision: Decision = vm.decision(fileId, tracks)
+    val decision: Decision = planLoadStage("decision") { vm.decision(fileId, tracks) }
     val file = detail.files.firstOrNull { it.id == fileId } ?: detail.files.firstOrNull()
     val mode = decision.delivery?.mode ?: when (decision.method) {
         "direct_play" -> "direct"
         "remux" -> "remux"
         else -> "transcode"
     }
-    Plan(
-        title = detail.item.title,
-        subtitle = playerSubtitle(detail.item),
-        releaseDate = playerDateLabel(detail.item.air_date, detail.item.year),
-        overview = detail.item.overview,
-        durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
-        videoCodec = decision.source?.video_codec ?: file?.video_codec,
-        fileId = fileId,
-        playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
-        mode = mode,
-        // The decision's own reading of the source: the number every height
-        // promise is made of. The item's file row is the fallback for a
-        // server too old to send `source`.
-        sourceHeight = (decision.source?.height ?: file?.height)?.toInt(),
-        aac = decision.delivery?.aac ?: decision.transcode_audio,
-        // Direct delivery has no remux-specific field, but the flattened
-        // decision still says whether these exact source bytes are DV. Keep
-        // that fact so a decoder failure can try a DV-preserving MP4 remux
-        // before the final SDR compatibility transcode.
-        preserveDolbyVision = decision.delivery?.preserve_dolby_vision
-            ?: decision.preserve_dolby_vision,
-        deliveredDynamicRange = decision.delivered_dynamic_range,
-        deliveryAudio = decision.delivery?.audio,
-        markers = decision.markers,
-        reasons = decision.reasons,
-        videoWidth = file?.width?.toInt(),
-        videoHeight = file?.height?.toInt(),
-        source = file,
-        audio = decision.audio,
-        subtitles = decision.subtitles,
-        ladder = decision.ladder,
-        declaredOffsetMs = decision.declared_offset_ms,
-        progressOffsetMs = if (detail.item.isAudiobook) file?.part_offset_ms ?: 0L else 0L,
-        itemDurationMs = if (detail.item.isAudiobook) detail.item.runtime_ms else null,
-        nextAudiobookPartId = if (detail.item.isAudiobook) {
-            nextAudiobookPartId(detail.files, fileId)
-        } else null,
-    )
-} catch (cancelled: CancellationException) {
-    // A superseded load (Retry, or a new file) unwinding. Returning null here
-    // would report "Couldn't start playback" for the attempt that replaced it.
-    throw cancelled
-} catch (_: Exception) {
-    null
+    return planLoadStage("plan") {
+        Plan(
+            title = detail.item.title,
+            subtitle = playerSubtitle(detail.item),
+            releaseDate = playerDateLabel(detail.item.air_date, detail.item.year),
+            overview = detail.item.overview,
+            durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
+            videoCodec = decision.source?.video_codec ?: file?.video_codec,
+            fileId = fileId,
+            playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
+            mode = mode,
+            // The decision's own reading of the source: the number every height
+            // promise is made of. The item's file row is the fallback for a
+            // server too old to send `source`.
+            sourceHeight = (decision.source?.height ?: file?.height)?.toInt(),
+            aac = decision.delivery?.aac ?: decision.transcode_audio,
+            // Direct delivery has no remux-specific field, but the flattened
+            // decision still says whether these exact source bytes are DV. Keep
+            // that fact so a decoder failure can try a DV-preserving MP4 remux
+            // before the final SDR compatibility transcode.
+            preserveDolbyVision = decision.delivery?.preserve_dolby_vision
+                ?: decision.preserve_dolby_vision,
+            deliveredDynamicRange = decision.delivered_dynamic_range,
+            deliveryAudio = decision.delivery?.audio,
+            markers = decision.markers,
+            reasons = decision.reasons,
+            videoWidth = file?.width?.toInt(),
+            videoHeight = file?.height?.toInt(),
+            source = file,
+            audio = decision.audio,
+            subtitles = decision.subtitles,
+            ladder = decision.ladder,
+            declaredOffsetMs = decision.declared_offset_ms,
+            progressOffsetMs = if (detail.item.isAudiobook) file?.part_offset_ms ?: 0L else 0L,
+            itemDurationMs = if (detail.item.isAudiobook) detail.item.runtime_ms else null,
+            nextAudiobookPartId = if (detail.item.isAudiobook) {
+                nextAudiobookPartId(detail.files, fileId)
+            } else null,
+        )
+    }
 }
 
 internal fun audiobookGlobalPosition(localPositionMs: Long, partOffsetMs: Long): Long =
@@ -415,13 +425,30 @@ fun PlayerScreen(
         // Android equivalent of the web click timestamp, not merely decoder
         // preparation latency.
         attemptOpenedAtMs = monotonicNowMs()
-        val loaded = loadPlan(
-            vm,
-            itemId,
-            fileId,
-            PreplayTracks(audio = playbackAudio, subtitle = playbackSubtitle),
-        )
-        if (loaded == null) failed = true else plan = loaded
+        try {
+            plan = loadPlan(
+                vm,
+                itemId,
+                fileId,
+                PreplayTracks(audio = playbackAudio, subtitle = playbackSubtitle),
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val failure = error as? PlanLoadException
+            val cause = failure?.cause ?: error
+            val stage = failure?.stage ?: "unknown"
+            postPlaybackClientLog(
+                this,
+                planLoadFailureEvent(fileId, startReason, stage, cause),
+            )
+            Log.w(
+                "plurx-playback",
+                "file=$fileId playback plan failed stage=$stage type=${cause.javaClass.simpleName}",
+                cause,
+            )
+            failed = true
+        }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -943,7 +970,7 @@ private fun PlayerContent(
             TvButton(
                 onClick = { controller.seekTo(activeMarker.end_ms); poke() },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = 112.dp),
-            ) { Text(activeMarker.label, fontWeight = FontWeight.SemiBold) }
+            ) { Text(activeMarker.displayLabel, fontWeight = FontWeight.SemiBold) }
         }
 
         if (!isInPip && controlsVisible) {

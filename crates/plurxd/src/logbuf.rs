@@ -13,6 +13,42 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
+/// The two operator-facing log surfaces. Cluster chatter has its own bounded
+/// ring so replication detail cannot evict playback and library diagnostics.
+#[derive(Clone)]
+pub struct LogBuffers {
+    pub general: Arc<LogBuffer>,
+    pub cluster: Arc<LogBuffer>,
+}
+
+impl Default for LogBuffers {
+    fn default() -> Self {
+        Self {
+            general: Arc::new(LogBuffer::default()),
+            cluster: Arc::new(LogBuffer::default()),
+        }
+    }
+}
+
+/// Targets emitted by plurx membership plus its Raft/replication dependencies.
+/// Keeping this centralized makes the console and both UI rings agree about
+/// which surface owns an event.
+pub fn is_cluster_target(target: &str) -> bool {
+    [
+        "plurx::cluster",
+        "plurx_core::cluster",
+        "hiqlite",
+        "openraft",
+    ]
+    .iter()
+    .any(|prefix| {
+        target == *prefix
+            || target
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    })
+}
+
 /// One captured log event.
 #[derive(Clone, Debug, Serialize)]
 pub struct LogEntry {
@@ -199,5 +235,46 @@ mod tests {
         assert!(all[0].ts_ms >= 0);
         // The default buffer is a large, empty ring.
         assert!(LogBuffer::default().tail("trace", 1).is_empty());
+    }
+
+    #[test]
+    fn cluster_targets_cover_membership_and_raft_without_claiming_other_logs() {
+        assert!(is_cluster_target("plurx::cluster"));
+        assert!(is_cluster_target("plurx_core::cluster::membership"));
+        assert!(is_cluster_target("hiqlite::store"));
+        assert!(is_cluster_target("openraft::core"));
+        assert!(!is_cluster_target("plurxd::transcode"));
+        assert!(!is_cluster_target("plurx_core::store"));
+    }
+
+    #[test]
+    fn scoped_layers_keep_cluster_events_out_of_the_general_ring() {
+        use tracing_subscriber::filter::filter_fn;
+        use tracing_subscriber::prelude::*;
+
+        let logs = LogBuffers {
+            general: Arc::new(LogBuffer::new(10)),
+            cluster: Arc::new(LogBuffer::new(10)),
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                BufferLayer(Arc::clone(&logs.general))
+                    .with_filter(filter_fn(|meta| !is_cluster_target(meta.target()))),
+            )
+            .with(
+                BufferLayer(Arc::clone(&logs.cluster))
+                    .with_filter(filter_fn(|meta| is_cluster_target(meta.target()))),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "plurxd::transcode", "ordinary");
+            tracing::info!(target: "plurx_core::cluster::membership", "membership");
+            tracing::debug!(target: "openraft::core", "raft detail");
+        });
+
+        assert_eq!(logs.general.tail("trace", 10)[0].message, "ordinary");
+        let cluster = logs.cluster.tail("trace", 10);
+        assert_eq!(cluster.len(), 2);
+        assert_eq!(cluster[0].message, "membership");
+        assert_eq!(cluster[1].message, "raft detail");
     }
 }

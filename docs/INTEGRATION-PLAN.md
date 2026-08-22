@@ -102,7 +102,8 @@ a credential that can trigger scans and *nothing else*.
 - New extractor beside `AuthUser`/`AdminUser` — e.g.
   `Scoped<const S: &'static str>` or a runtime
   `ScopedKey(scope)` guard — that accepts `Authorization: Bearer
-  plx_…` only, checks the scope, bumps `last_used_at`. User tokens do
+  plx_…` only, checks the scope, and refreshes `last_used_at` when it is
+  more than 60 seconds old. User tokens do
   **not** pass key-scoped routes, and keys do not pass user routes:
   two credential kinds, two doors.
 - Routes per §1, admin-gated, plus a Keys section in the settings UI

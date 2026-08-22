@@ -6,8 +6,9 @@
 //! backend; backend completeness alone is not permission to skip that gate.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -26,10 +27,16 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 
-// v5 is a fresh-bootstrap/import schema. There is deliberately no in-place
-// replicated v4 migration here: existing clusters must fail compatibility
-// until the clustering upgrade protocol owns that transition.
-pub const AUTH_SCHEMA_VERSION: i64 = 5;
+// v6 adds revision-bound ebook reading state; v7 adds first-class book facts.
+// Both additive steps are applied through Raft before the daemon opens the
+// store. v5 remains a supported direct-upgrade source so an offline node is
+// not forced to install every intermediate Cinema release; older or future
+// schemas still fail closed.
+pub const AUTH_SCHEMA_VERSION: i64 = 7;
+/// Oldest schema this binary can advance through the complete migration chain.
+pub const AUTH_SCHEMA_MIGRATION_SOURCE: i64 = 5;
+const READING_SCHEMA_VERSION: i64 = 6;
+const BOOK_SCHEMA_MIGRATION_SOURCE: i64 = READING_SCHEMA_VERSION;
 pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,6 +102,74 @@ pub struct HiqliteAuthStore {
     client: TimedClient,
     clock: Arc<dyn Clock>,
     telemetry: NodeLocalTelemetry,
+    activity_refreshes: Arc<ActivityRefreshGate>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ActivityCredential {
+    Token(String),
+    ApiKey(i64),
+}
+
+#[derive(Default)]
+struct ActivityRefreshGate {
+    reservations: Mutex<HashMap<ActivityCredential, i64>>,
+}
+
+impl ActivityRefreshGate {
+    fn try_reserve(
+        self: &Arc<Self>,
+        credential: ActivityCredential,
+        now: i64,
+    ) -> Option<ActivityRefreshReservation> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reservations
+            .retain(|_, reserved_at| !crate::auth::activity_refresh_due(Some(*reserved_at), now));
+        if reservations.contains_key(&credential) {
+            return None;
+        }
+        reservations.insert(credential.clone(), now);
+        Some(ActivityRefreshReservation {
+            gate: Arc::clone(self),
+            credential,
+            reserved_at: now,
+            retained: false,
+        })
+    }
+
+    fn release(&self, credential: &ActivityCredential, reserved_at: i64) {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reservations.get(credential) == Some(&reserved_at) {
+            reservations.remove(credential);
+        }
+    }
+}
+
+struct ActivityRefreshReservation {
+    gate: Arc<ActivityRefreshGate>,
+    credential: ActivityCredential,
+    reserved_at: i64,
+    retained: bool,
+}
+
+impl ActivityRefreshReservation {
+    fn retain(mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for ActivityRefreshReservation {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.gate.release(&self.credential, self.reserved_at);
+        }
+    }
 }
 
 /// The only application-facing path to hiqlite. Keeping the timeout at this
@@ -237,6 +312,33 @@ impl HiqliteAuthStore {
         instance_id: &str,
         telemetry_path: &Path,
     ) -> Result<Self, StoreError> {
+        Self::bootstrap_with_clock(client, instance_id, telemetry_path, Arc::new(SystemClock)).await
+    }
+
+    /// Bootstrap with a fixed clock for deterministic separate-process
+    /// replicated-store validation. Production callers use [`Self::bootstrap`].
+    #[doc(hidden)]
+    pub async fn validation_bootstrap_at(
+        client: Client,
+        instance_id: &str,
+        telemetry_path: &Path,
+        now: i64,
+    ) -> Result<Self, StoreError> {
+        Self::bootstrap_with_clock(
+            client,
+            instance_id,
+            telemetry_path,
+            Arc::new(FixedClock(now)),
+        )
+        .await
+    }
+
+    async fn bootstrap_with_clock(
+        client: Client,
+        instance_id: &str,
+        telemetry_path: &Path,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, StoreError> {
         validate_sql(AUTH_SCHEMA)?;
         let results = timeout_store(client.batch(AUTH_SCHEMA)).await?;
         for result in results {
@@ -245,11 +347,7 @@ impl HiqliteAuthStore {
         super::hiqlite_catalog::install_schema(&client).await?;
         super::hiqlite_durable::install_schema(&client).await?;
 
-        let store = Self::with_clock(
-            client,
-            Arc::new(SystemClock),
-            NodeLocalTelemetry::open(telemetry_path)?,
-        );
+        let store = Self::with_clock(client, clock, NodeLocalTelemetry::open(telemetry_path)?);
         let now = store.now()?;
         store
             .execute(
@@ -291,6 +389,96 @@ impl HiqliteAuthStore {
             .verify_compatibility(ClusterCompatibility::CURRENT)
             .await?;
         Ok(store)
+    }
+
+    /// Open the daemon's already-activated cluster, applying every supported
+    /// additive schema step through the replicated state machine first.
+    ///
+    /// This path is intentionally separate from [`open`]: maintenance clients
+    /// attach to a running voter and must never become a second migration
+    /// coordinator. Every version step is one Raft transaction: a crash leaves
+    /// either the prior version or a complete next version, and the next boot
+    /// resumes the chain from the durable marker.
+    pub async fn open_or_migrate(
+        client: Client,
+        telemetry_path: &Path,
+    ) -> Result<Self, StoreError> {
+        let store = Self::with_clock(
+            client,
+            Arc::new(SystemClock),
+            NodeLocalTelemetry::open(telemetry_path)?,
+        );
+        store.migrate_schema().await?;
+        store
+            .verify_compatibility(ClusterCompatibility::CURRENT)
+            .await?;
+        Ok(store)
+    }
+
+    async fn migrate_schema(&self) -> Result<(), StoreError> {
+        loop {
+            let sql = "SELECT schema_version, protocol_min, protocol_max \
+                       FROM cluster_meta WHERE singleton = 1";
+            let rows = self
+                .client()
+                .query_consistent_map::<CompatibilityRow, _>(sql, params!())
+                .await?;
+            match schema_migration_action(&rows, ClusterCompatibility::CURRENT)? {
+                SchemaMigrationAction::Current => return Ok(()),
+                SchemaMigrationAction::MigrateFrom(AUTH_SCHEMA_MIGRATION_SOURCE) => {
+                    let now = self.now()?;
+                    let results = self
+                        .client()
+                        .txn([
+                            (
+                                super::hiqlite_catalog::READING_STATE_TABLE_SCHEMA,
+                                params!(),
+                            ),
+                            (
+                                super::hiqlite_catalog::READING_STATE_INDEX_SCHEMA,
+                                params!(),
+                            ),
+                            (
+                                "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
+                                 WHERE singleton = 1 AND schema_version = $3",
+                                params!(READING_SCHEMA_VERSION, now, AUTH_SCHEMA_MIGRATION_SOURCE),
+                            ),
+                        ])
+                        .await?;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error)?;
+                }
+                SchemaMigrationAction::MigrateFrom(BOOK_SCHEMA_MIGRATION_SOURCE) => {
+                    let now = self.now()?;
+                    let results = self
+                        .client()
+                        .txn([
+                            (super::hiqlite_catalog::BOOK_AUTHOR_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_WORK_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_EDITION_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_SOURCE_SCHEMA, params!()),
+                            (super::hiqlite_catalog::BOOK_WORK_INDEX_SCHEMA, params!()),
+                            (
+                                "UPDATE cluster_meta SET schema_version = $1, migrated_at = $2 \
+                                 WHERE singleton = 1 AND schema_version = $3",
+                                params!(AUTH_SCHEMA_VERSION, now, BOOK_SCHEMA_MIGRATION_SOURCE),
+                            ),
+                        ])
+                        .await?;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error)?;
+                }
+                SchemaMigrationAction::MigrateFrom(version) => {
+                    return Err(StoreError::Migration(format!(
+                        "cluster schema {version} has no migration implementation"
+                    )));
+                }
+            }
+        }
     }
 
     /// Run the compatibility guard through a remote client *before* starting
@@ -358,6 +546,7 @@ impl HiqliteAuthStore {
             "DELETE FROM watched_outbox",
             "DELETE FROM trakt_auth",
             "DELETE FROM watch_state",
+            "DELETE FROM reading_state",
             "DELETE FROM scan_reconcile_items",
             "DELETE FROM scan_reconcile_guards",
             "DELETE FROM library_roots",
@@ -391,7 +580,8 @@ impl HiqliteAuthStore {
             (statements[15].to_owned(), params!()),
             (statements[16].to_owned(), params!()),
             (statements[17].to_owned(), params!()),
-            (statements[18].to_owned(), params!(keys::INSTANCE_ID)),
+            (statements[18].to_owned(), params!()),
+            (statements[19].to_owned(), params!(keys::INSTANCE_ID)),
         ]))
         .await?
         .into_iter()
@@ -475,11 +665,99 @@ impl HiqliteAuthStore {
             client: TimedClient::new(client),
             clock,
             telemetry,
+            activity_refreshes: Arc::new(ActivityRefreshGate::default()),
         }
     }
 
     pub(super) fn now(&self) -> Result<i64, StoreError> {
         self.clock.now()
+    }
+
+    async fn refresh_token_activity_if_due(
+        &self,
+        token_hash: &str,
+        observed_last_seen_at: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if !crate::auth::activity_refresh_due(Some(observed_last_seen_at), now) {
+            return Ok(());
+        }
+        let credential = ActivityCredential::Token(token_hash.to_owned());
+        let Some(reservation) = self.activity_refreshes.try_reserve(credential, now) else {
+            return Ok(());
+        };
+
+        let outcome = async {
+            let rows = self
+                .client()
+                .query_consistent_map::<ActivityTimestampRow, _>(
+                    "SELECT last_seen_at AS last_activity_at \
+                     FROM tokens WHERE token_hash = $1",
+                    params!(token_hash),
+                )
+                .await?;
+            let Some(current) = rows.into_iter().next() else {
+                return Ok(());
+            };
+            if crate::auth::activity_refresh_due(current.last_activity_at, now) {
+                self.execute(
+                    "UPDATE tokens SET last_seen_at = $1 \
+                     WHERE token_hash = $2 AND last_seen_at < $3",
+                    params!(
+                        now,
+                        token_hash,
+                        now.saturating_sub(crate::auth::ACTIVITY_REFRESH_SECS)
+                    ),
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if outcome.is_ok() {
+            reservation.retain();
+        }
+        outcome
+    }
+
+    async fn refresh_api_key_activity(&self, id: i64, now: i64) -> Result<(), StoreError> {
+        let credential = ActivityCredential::ApiKey(id);
+        let Some(reservation) = self.activity_refreshes.try_reserve(credential, now) else {
+            return Ok(());
+        };
+
+        let outcome = async {
+            let rows = self
+                .client()
+                .query_consistent_map::<ActivityTimestampRow, _>(
+                    "SELECT last_used_at AS last_activity_at \
+                     FROM api_keys WHERE id = $1 AND disabled = 0",
+                    params!(id),
+                )
+                .await?;
+            let Some(current) = rows.into_iter().next() else {
+                return Ok(());
+            };
+            if crate::auth::activity_refresh_due(current.last_activity_at, now) {
+                self.execute(
+                    "UPDATE api_keys SET last_used_at = $1 \
+                     WHERE id = $2 AND disabled = 0 \
+                       AND (last_used_at IS NULL OR last_used_at < $3)",
+                    params!(
+                        now,
+                        id,
+                        now.saturating_sub(crate::auth::ACTIVITY_REFRESH_SECS)
+                    ),
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if outcome.is_ok() {
+            reservation.retain();
+        }
+        outcome
     }
 
     pub(super) async fn execute(
@@ -549,13 +827,13 @@ impl NetworkPriorStore for HiqliteAuthStore {
 
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError> {
         self.telemetry
             .prior(
-                user_id,
+                credential_generation.to_owned(),
                 client_class.to_owned(),
                 network_fingerprint.to_owned(),
             )
@@ -791,24 +1069,23 @@ impl UserStore for HiqliteAuthStore {
     }
 
     async fn user_for_token(&self, token_hash: &str) -> Result<Option<User>, StoreError> {
-        let user = self
-            .user_optional(
-                "SELECT u.id, u.username, u.password_hash, u.is_admin, u.created_at \
+        let sql = "SELECT u.id, u.username, u.password_hash, u.is_admin, u.created_at, \
+                          t.last_seen_at \
                  FROM users u JOIN tokens t ON t.user_id = u.id \
-                 WHERE t.token_hash = $1",
-                params!(token_hash),
-            )
-            .await?;
-        if user.is_some() {
+                 WHERE t.token_hash = $1";
+        validate_sql(sql)?;
+        let mut rows = timeout_store(
+            self.client()
+                .query_consistent_map::<TokenUserRow, _>(sql, params!(token_hash)),
+        )
+        .await?;
+        let row = rows.pop();
+        if let Some(row) = row.as_ref() {
             let now = self.now()?;
-            self.execute(
-                "UPDATE tokens SET last_seen_at = $1 \
-                 WHERE token_hash = $2 AND last_seen_at < $3",
-                params!(now, token_hash, now.saturating_sub(60)),
-            )
-            .await?;
+            self.refresh_token_activity_if_due(token_hash, row.last_seen_at, now)
+                .await?;
         }
-        Ok(user)
+        Ok(row.map(Into::into))
     }
 
     async fn delete_token(&self, token_hash: &str) -> Result<bool, StoreError> {
@@ -872,12 +1149,7 @@ impl ApiKeyStore for HiqliteAuthStore {
 
     async fn touch_api_key(&self, id: i64) -> Result<(), StoreError> {
         let now = self.now()?;
-        self.execute(
-            "UPDATE api_keys SET last_used_at = $1 WHERE id = $2",
-            params!(now, id),
-        )
-        .await?;
-        Ok(())
+        self.refresh_api_key_activity(id, now).await
     }
 
     async fn delete_api_key(&self, id: i64) -> Result<bool, StoreError> {
@@ -900,6 +1172,14 @@ impl ApiKeyStore for HiqliteAuthStore {
 
 trait Clock: Send + Sync {
     fn now(&self) -> Result<i64, StoreError>;
+}
+
+struct FixedClock(i64);
+
+impl Clock for FixedClock {
+    fn now(&self) -> Result<i64, StoreError> {
+        Ok(self.0)
+    }
 }
 
 struct SystemClock;
@@ -1039,6 +1319,40 @@ fn one_count(rows: Vec<CountRow>) -> Result<i64, StoreError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchemaMigrationAction {
+    Current,
+    MigrateFrom(i64),
+}
+
+fn schema_migration_action(
+    rows: &[CompatibilityRow],
+    supported: ClusterCompatibility,
+) -> Result<SchemaMigrationAction, StoreError> {
+    let [meta] = rows else {
+        return Err(StoreError::Migration(format!(
+            "cluster compatibility metadata returned {} rows",
+            rows.len()
+        )));
+    };
+    if !(meta.protocol_min..=meta.protocol_max).contains(&supported.protocol_version) {
+        return Err(StoreError::Migration(format!(
+            "cluster protocol range {}..={} excludes voter protocol {}",
+            meta.protocol_min, meta.protocol_max, supported.protocol_version
+        )));
+    }
+    match meta.schema_version {
+        version if version == supported.schema_version => Ok(SchemaMigrationAction::Current),
+        AUTH_SCHEMA_MIGRATION_SOURCE | BOOK_SCHEMA_MIGRATION_SOURCE => {
+            Ok(SchemaMigrationAction::MigrateFrom(meta.schema_version))
+        }
+        version => Err(StoreError::Migration(format!(
+            "cluster schema {version} cannot migrate to voter schema {}",
+            supported.schema_version
+        ))),
+    }
+}
+
 fn verify_compatibility_rows(
     rows: Vec<CompatibilityRow>,
     supported: ClusterCompatibility,
@@ -1148,6 +1462,39 @@ struct UserRow {
     password_hash: String,
     is_admin: bool,
     created_at: i64,
+}
+
+struct TokenUserRow {
+    user: UserRow,
+    last_seen_at: i64,
+}
+
+impl From<&mut Row<'_>> for TokenUserRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        let last_seen_at = row.get("last_seen_at");
+        Self {
+            user: UserRow::from(&mut *row),
+            last_seen_at,
+        }
+    }
+}
+
+impl From<TokenUserRow> for User {
+    fn from(row: TokenUserRow) -> Self {
+        row.user.into()
+    }
+}
+
+struct ActivityTimestampRow {
+    last_activity_at: Option<i64>,
+}
+
+impl From<&mut Row<'_>> for ActivityTimestampRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            last_activity_at: row.get("last_activity_at"),
+        }
+    }
 }
 
 impl From<&mut Row<'_>> for UserRow {
@@ -1267,6 +1614,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unfinished_activity_reservation_is_released_for_retry() {
+        let gate = Arc::new(ActivityRefreshGate::default());
+        let credential = ActivityCredential::Token("token-hash".to_owned());
+
+        {
+            let _unfinished = gate
+                .try_reserve(credential.clone(), 1_000)
+                .expect("first reservation");
+            assert!(gate.try_reserve(credential.clone(), 1_000).is_none());
+        }
+        let retained = gate
+            .try_reserve(credential.clone(), 1_000)
+            .expect("dropped reservation must permit retry");
+        retained.retain();
+        assert!(gate.try_reserve(credential.clone(), 1_060).is_none());
+        assert!(gate.try_reserve(credential, 1_061).is_some());
+    }
+
+    #[test]
     fn replicated_store_modules_cannot_bypass_the_timed_client_accessor() {
         for (name, source) in [
             ("catalog", include_str!("hiqlite_catalog.rs")),
@@ -1373,7 +1739,7 @@ mod tests {
             protocol_max: AUTH_PROTOCOL_VERSION,
         };
         let error = verify_compatibility_rows(vec![existing_v4], ClusterCompatibility::CURRENT)
-            .expect_err("fresh-bootstrap v5 must not imply an in-place v4 upgrade");
+            .expect_err("the strict open path must never migrate");
         assert!(error.to_string().contains("schema 4 is incompatible"));
 
         let old_protocol = ClusterCompatibility {
@@ -1390,5 +1756,60 @@ mod tests {
         )
         .expect_err("old protocol must refuse");
         assert!(error.to_string().contains("excludes"));
+    }
+
+    #[test]
+    fn daemon_schema_gate_accepts_the_complete_supported_chain() {
+        assert_eq!(
+            AUTH_SCHEMA_MIGRATION_SOURCE + 2,
+            AUTH_SCHEMA_VERSION,
+            "this implementation contains the v5→v6 and v6→v7 steps"
+        );
+        let row = |schema_version| CompatibilityRow {
+            schema_version,
+            protocol_min: AUTH_PROTOCOL_VERSION,
+            protocol_max: AUTH_PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            schema_migration_action(&[row(AUTH_SCHEMA_VERSION)], ClusterCompatibility::CURRENT)
+                .expect("current schema"),
+            SchemaMigrationAction::Current
+        );
+        assert_eq!(
+            schema_migration_action(
+                &[row(AUTH_SCHEMA_MIGRATION_SOURCE)],
+                ClusterCompatibility::CURRENT,
+            )
+            .expect("oldest supported predecessor"),
+            SchemaMigrationAction::MigrateFrom(AUTH_SCHEMA_MIGRATION_SOURCE)
+        );
+        assert_eq!(
+            schema_migration_action(
+                &[row(BOOK_SCHEMA_MIGRATION_SOURCE)],
+                ClusterCompatibility::CURRENT,
+            )
+            .expect("immediate predecessor"),
+            SchemaMigrationAction::MigrateFrom(BOOK_SCHEMA_MIGRATION_SOURCE)
+        );
+
+        for rows in [Vec::new(), vec![row(4)], vec![row(6), row(6)]] {
+            let error = schema_migration_action(&rows, ClusterCompatibility::CURRENT)
+                .expect_err("ambiguous or unsupported state must fail before writes");
+            assert!(
+                error.to_string().contains("cannot migrate")
+                    || error.to_string().contains("metadata returned"),
+                "{error}"
+            );
+        }
+
+        let incompatible_protocol = CompatibilityRow {
+            schema_version: AUTH_SCHEMA_MIGRATION_SOURCE,
+            protocol_min: AUTH_PROTOCOL_VERSION + 1,
+            protocol_max: AUTH_PROTOCOL_VERSION + 1,
+        };
+        let error =
+            schema_migration_action(&[incompatible_protocol], ClusterCompatibility::CURRENT)
+                .expect_err("protocol drift must fail before migration");
+        assert!(error.to_string().contains("excludes"), "{error}");
     }
 }

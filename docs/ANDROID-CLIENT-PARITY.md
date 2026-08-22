@@ -45,6 +45,15 @@ for that viewer and keeps server administration out of the comparison.
 > Task Manager and timeout stops persist as an explicit Resume state. An active
 > build-24 transfer cannot be retroactively given a persisted UIDT registration
 > after upgrade without a foreground user action, so it needs one Resume tap.
+>
+> Build 34 adds app-managed offline EPUB reading on phones and tablets. The
+> download owner is separate from Media3, records intent before I/O, verifies
+> the exact publication revision after transferring the original, and
+> atomically publishes only bounded declared resources. The local WebView has
+> no bearer or network fallback: every request to its synthetic HTTPS origin is
+> intercepted from packaged assets or app-private files, and all other origins
+> receive a local denial. JVM, lint, instrumentation-build, and APK-asset checks
+> are green; the physical airplane-mode/reconnect drill remains unclaimed.
 
 ## Viewer surface
 
@@ -58,17 +67,19 @@ for that viewer and keeps server administration out of the comparison.
 | Movie/show/season/episode hierarchy | Native detail and episode rows |
 | Home-video folders and photos | Folder navigation and photo viewer |
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
+| In-app EPUB Read/Resume | Phone/tablet detail opens the shared bounded reader in an isolated same-origin WebView; television surfaces expose no action |
+| App-managed offline EPUB | Profile/revision catalogue, atomic private publication, token-free synthetic-origin reader, process-death reconciliation, and newest-dated exact-edition replay |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
 | Audio/subtitle choice | Embedded tracks are native; tracks the server marks `native` arrive as HLS renditions, and everything else burns on a session |
 | Detail-screen track facts | Every audio and subtitle track with language, format, and forced/SDH markers, the server's default markers, and its five-state preferred-language verdict |
 | Pre-play audio/subtitle choice | Both are chosen on the detail screen and applied on the first session open, with any burn-in cost disclosed before playback starts |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
-| Bound stall downgrade | Server contract available: one `request_id` can name its predecessor and typed stall cause, with the normalized height replayed. Android does not yet reopen from its passive stall detector. Adopting it requires sending `quality_auto` — `sessionHeight` posts the source height for any burn before it consults quality, so an Auto viewer with a burned subtitle is otherwise read as a sticky manual pick — plus a client-side retry budget, which the server deliberately does not bound at the ladder floor. |
-| Intro/credits markers | Manual skip or automatic skip |
+| Bound stall downgrade | Android detects stalls via `PlaybackTelemetry`'s passive buffering-stall beacon and reopens the session with `previous_session_id`, `reopen_reason: "stall"`, and the server's normalized `StartResponse.height`. An Auto viewer with a burned subtitle sends `quality_auto: true` so the promise-height does not make the session sticky. The client enforces a retry budget of 3 consecutive reopen attempts at the ladder floor; at that point the session keeps playing at the floor rung without further reopen attempts. A seek, quality switch, or track change resets the budget. |
+| Intro/credits markers | Manual skip or automatic skip; estimated credits markers are visibly labelled while chapter-derived markers keep their exact label |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
 | Playback decision/stats | In-player information panel, including a "Dynamic range" row |
-| Durable playback telemetry | TTFF, passive buffering-stall, and playback-error beacons with attempt/session context |
+| Durable playback telemetry | TTFF, passive buffering-stall, Media3 playback-error beacons with attempt/session context, and redacted pre-Media3 plan-load or session-create failures that name the failed stage and exception type; HTTP session failures also retain their status code |
 | Source-vs-delivered media badges | Dynamic-range chip dims and names what is on screen (`DV → HDR10`) |
 | Classic, Terminal, noirr | Matching palettes, shapes, and typography |
 | System, light, dark appearance | Independent appearance preference |
@@ -97,6 +108,10 @@ implemented and pinned by `PlaybackPolicyTest`:
   back to a codec table only for a server that predates the field, and never on
   `text`. A 2160p WEB-DL MP4 with 23 `mov_text` tracks is what the distinction
   costs when it is missing: every track offered, every explicit pick a 400.
+- The HDR burn guard follows `delivered_dynamic_range`. When an HDR source is
+  already tone-mapped to SDR by the base plan, the burn body includes
+  `subtitle_burn_sdr: true`; the server accepts the forced subtitle without
+  treating it as permission to downgrade a genuinely HDR delivery.
 - On direct play those same tracks are free — the player reads the container's
   own track, and `/files/{id}/subs/{index}.vtt` would extract either format if
   asked, since that endpoint turns away only bitmaps

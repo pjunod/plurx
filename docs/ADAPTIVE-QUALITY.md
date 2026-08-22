@@ -52,16 +52,23 @@ rungs, and the player builds both its menu and Auto policy from those rows.
 
 | Rung | Height | Video cap | Audio | ~Total |
 |---|---|---|---|---|
+| 2160p | 2160 | 20 Mb/s | AAC 160 kb/s | 20.2 Mb/s |
 | 1080p | 1080 | 8 Mb/s | AAC 160 kb/s | 8.2 Mb/s |
 | 720p | 720 | 4 Mb/s | AAC 160 kb/s | 4.2 Mb/s |
 | 480p | 480 | 2 Mb/s | AAC 160 kb/s | 2.2 Mb/s |
 | 360p | 360 | 1.2 Mb/s | AAC 160 kb/s | 1.4 Mb/s |
 
-Rungs at or above the source height are dropped (a 720p file offers 720p and
-below). 4K output rungs are deliberately absent: a browser session that can
-take 20 Mb/s sustained is better served by direct play or remux — transcoding
-4K→4K burns GPU for nothing. "Original" (direct play / remux) sits above the
-ladder and is not adaptive; see "Adjacent wins" for its rescue path.
+Rungs above the source height are dropped (a 720p file offers 720p and below).
+Direct play or remux remains the first choice at 4K, but codec incompatibility
+can make a 4K-to-4K transcode necessary: an AV1 source does not become a 1080p
+source because the client needs H.264. Hardware-backed SDR Auto therefore
+starts at 2160p when the source geometry is known. A node-local network prior
+may select a lower rung; no prior means no evidence for a downgrade. Software
+Auto remains capped at 720p, and HDR output remains capped at the 1080p point
+the production tone-map probe actually exercises. "Original" (direct play /
+remux) is not adaptive; see "Adjacent wins" for its rescue path. The 2160p
+rung is added only to a live session after that capability resolution; the
+shared decision/offline ladder remains 1080p and below.
 
 ## Phase 1 — the ladder made real (revised 2026-07-28: the menu already exists)
 
@@ -76,12 +83,14 @@ carries `-maxrate` (1.5×) / `-bufsize` (2×), and the startup probe encodes
 with the production argument set so a driver that accepts the encoder and
 refuses its rate control is caught at boot rather than on a viewer's first
 press of play ([PERF-PLAN.md](PERF-PLAN.md) §4.6). Auto also became a real
-policy rather than a constant: `min(source, 1080)` on hardware, 720p on
-software, decided server-side because only the server knows which encoder won
-(§4.7). Session creation now snaps stray heights, and decision/session
-responses return the source-filtered ladder with nominal and advertised-peak
-kb/s. The advertised per-rung bandwidth covers the *measured* peak, not the
-nominal target.
+policy rather than a constant: known SDR follows the source up to 2160p on
+hardware, known HDR follows the measured 1080p output point, and software
+follows the source up to 720p. A node-local network prior may lower that
+starting choice. The server owns this decision because only it knows which
+encoder and pipeline won (§4.7). Session creation snaps stray lower heights,
+and decision/session responses return the source- and capability-filtered
+ladder with nominal and advertised-peak kb/s. The advertised per-rung
+bandwidth covers the *measured* peak, not the nominal target.
 
 *Client*: complete. The player consumes the server ladder instead of a
 hardcoded quality list, so 360p and any later server rung appear without a
@@ -252,8 +261,13 @@ therefore **the client's**. The Apple client implements one
 strictly lower rung end in the ordinary stall failure; an unstated height —
 `0`, or absent — counts as no step down; and a minute of recovered film starts
 a fresh episode, so one blip cannot disable recovery for the rest of a title).
-Android has not adopted the wire yet, so a client without that bound will keep
-being answered at the floor.
+Android client implements one too (`StallReopenBudget`: three consecutive
+reopens at the same resolved rung exhaust the budget; an explicit strict
+downgrade — a server response whose height is strictly lower than the
+predecessor — resets the count; a user-initiated seek, quality switch, or
+track change resets the budget; a 400 (bad request) fires an unbound retry
+with a fresh request id; and `quality_auto: true` is sent for an Auto viewer
+with a burned subtitle so the server does not make that session sticky).
 
 The floor is the predecessor's own rung, not 360. Auto is not
 ladder-constrained below 360 — a sub-360 source resolves there, and a starved
@@ -275,8 +289,8 @@ fields and keep their existing behavior. A client must therefore treat that
 `400` as fall-back-to-unbound-create rather than a playback failure: a
 retryable error that fires *after* the claim was normalized replays as
 `invalid stall reopen` for the same `request_id`, so the retry has to drop the
-binding and mint a fresh id. Apple does this; Android adoption remains a
-separate client change, and until then this endpoint addition is inert there.
+binding and mint a fresh id. Both Apple and Android do this;
+the unbound retry replaces an invalid reopen without a terminal failure.
 
 ## Phase 3 — seamless switching (optional, the majors' UX)
 

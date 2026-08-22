@@ -6,6 +6,49 @@ import org.junit.Test
 class CapsPolicyTest {
 
     @Test
+    fun videoCapsKeepTheBestHeightForEachCodec() {
+        val caps = videoCodecCaps(
+            listOf(
+                VideoDecoderLimit("hevc", 1080),
+                VideoDecoderLimit("H264", 2160),
+                VideoDecoderLimit("hevc", 2160),
+                VideoDecoderLimit("av1", 1080),
+                VideoDecoderLimit("unknown", 4320),
+                VideoDecoderLimit("vp9", 0),
+            ),
+        )
+
+        assertEquals(listOf("h264", "hevc", "av1"), caps.codecs)
+        assertEquals(mapOf("h264" to 2160, "hevc" to 2160, "av1" to 1080), caps.maxHeights)
+        assertEquals(
+            mapOf(
+                "vcodec" to "h264,hevc,av1",
+                "vmaxheight" to "h264:2160,hevc:2160,av1:1080",
+            ),
+            caps.queryParams(),
+        )
+    }
+
+    @Test
+    fun softwareDecoderClaimsStopAtHdUnlessHardwareProvesMore() {
+        val softwareOnly = videoCodecCaps(
+            listOf(
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = false),
+                VideoDecoderLimit("hevc", 2160, hardwareAccelerated = true),
+            ),
+        )
+        assertEquals(mapOf("hevc" to 2160, "av1" to 1080), softwareOnly.maxHeights)
+
+        val withHardwareAv1 = videoCodecCaps(
+            listOf(
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = false),
+                VideoDecoderLimit("av1", 2160, hardwareAccelerated = true),
+            ),
+        )
+        assertEquals(2160, withHardwareAv1.maxHeights["av1"])
+    }
+
+    @Test
     fun capabilityDiagnosticsExplainWhyDolbyVisionWasNotClaimed() {
         assertEquals(
             "display-no-dv",

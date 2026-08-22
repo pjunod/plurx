@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::extract::ScopedKey;
-use crate::state::{AppState, IdHints, ScanRequest};
+use crate::state::{AppState, BookHints, IdHints, ScanRequest};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Ids {
@@ -26,21 +26,39 @@ pub struct Ids {
     pub imdb: Option<String>,
 }
 
+/// Explicit metadata for a Curator-managed book edition. These fields are
+/// facts Curator already has at import time; carrying them avoids a second
+/// provider match and, importantly, gives Cinema proof for relating ebook and
+/// audiobook editions without guessing from title + author.
+#[derive(Debug, Deserialize)]
+pub struct BookMetadataBody {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub medium: String,
+    pub work_id: String,
+    pub edition_id: String,
+    pub cover_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ScanRequestBody {
     /// Absolute path — a directory or a single file.
     pub path: String,
     #[serde(default)]
     pub ids: Option<Ids>,
-    /// `movie` | `episode` | `season`. Advisory: the library's own kind
-    /// decides how a file is parsed, so this is only used to pick which
-    /// item an id applies to.
+    /// `movie` | `episode` | `season` | `book`. Advisory: the library's own kind
+    /// decides how a file is parsed, so this is only used to pick which item an
+    /// id applies to. Exact Curator book identity travels in `book`, not here.
     #[serde(default)]
     pub hint: Option<String>,
     /// For episodes, the id of the SHOW — an episode's own tmdb id is not
     /// what identifies the series it belongs to.
     #[serde(default)]
     pub series: Option<Ids>,
+    /// Present on paired Curator book imports. Omitted by older Curator builds
+    /// and by every non-book caller.
+    #[serde(default)]
+    pub book: Option<BookMetadataBody>,
     /// Echoed back and logged, so one grep reconstructs a transfer across
     /// every application it passed through.
     #[serde(default)]
@@ -97,6 +115,13 @@ pub async fn scan(
         })));
     };
 
+    let book = body.book.as_ref().map(validate_book_hints).transpose()?;
+    if book.is_some() && library.kind != plurx_core::domain::LibraryKind::Books {
+        return Err(ApiError::BadRequest(
+            "`book` metadata is accepted only for a Books library path".to_owned(),
+        ));
+    }
+
     let request_id = format!("sr-{}", uuid::Uuid::new_v4().simple());
     // The ids ride ON the request so the job applies them, whether it runs
     // now or is drained from the pending queue later. An endpoint that
@@ -120,6 +145,7 @@ pub async fn scan(
         library_id: library.id,
         path: path.clone(),
         ids,
+        book,
         correlation_id: body.correlation_id.clone(),
         source: body.source.clone(),
     };
@@ -155,6 +181,67 @@ pub async fn scan(
         }
         Err(TargetError::Store(e)) => Err(ApiError::from(e)),
     }
+}
+
+fn validate_book_hints(body: &BookMetadataBody) -> Result<BookHints, ApiError> {
+    let medium = match body.medium.as_str() {
+        "ebook" => plurx_core::domain::ItemKind::Book,
+        "audiobook" => plurx_core::domain::ItemKind::Audiobook,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "`book.medium` must be `ebook` or `audiobook`".to_owned(),
+            ))
+        }
+    };
+    let text = |field: &str, value: &str, max: usize| -> Result<String, ApiError> {
+        let value = value.trim();
+        if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(format!(
+                "`book.{field}` must be 1..={max} non-control UTF-8 bytes"
+            )));
+        }
+        Ok(value.to_owned())
+    };
+    let id = |field: &str, value: &str| -> Result<String, ApiError> {
+        let value = text(field, value, 256)?;
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":._-/".contains(&byte))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "`book.{field}` contains an unsupported identifier character"
+            )));
+        }
+        Ok(value)
+    };
+    let cover_url = body
+        .cover_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    if cover_url.is_some_and(|url| {
+        url.len() > 2_048 || plurx_core::metadata::book::allowed_curator_cover_url(url).is_none()
+    }) {
+        return Err(ApiError::BadRequest(
+            "`book.cover_url` must be an Open Library HTTPS cover URL".to_owned(),
+        ));
+    }
+    Ok(BookHints {
+        title: body
+            .title
+            .as_deref()
+            .map(|value| text("title", value, 512))
+            .transpose()?,
+        author: body
+            .author
+            .as_deref()
+            .map(|value| text("author", value, 512))
+            .transpose()?,
+        medium,
+        work_id: id("work_id", &body.work_id)?,
+        edition_id: id("edition_id", &body.edition_id)?,
+        cover_url: cover_url.map(str::to_owned),
+    })
 }
 
 /// GET /api/v1/scan/requests/{id} (scope `status:read`)

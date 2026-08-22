@@ -92,8 +92,8 @@ struct PlurxAPI {
         return try await run(req)
     }
 
-    private func deleteNoContent(_ path: String) async throws {
-        guard let url = makeURL(path) else { throw APIError.badURL }
+    private func deleteNoContent(_ path: String, query: [URLQueryItem] = []) async throws {
+        guard let url = makeURL(path, query: query) else { throw APIError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         Session.shared.authorize(&req)
@@ -185,6 +185,52 @@ struct PlurxAPI {
     func hubs() async throws -> Hubs { try await get("hubs") }
     func comingSoon() async throws -> ComingSoonResponse { try await get("coming-soon") }
     func item(_ id: Int) async throws -> ItemDetail { try await get("items/\(id)") }
+
+    func readingState(itemId: Int, fileId: Int) async throws -> ReadingStateResponse {
+        try await get("items/\(itemId)/reading-state", query: [
+            URLQueryItem(name: "file_id", value: String(fileId)),
+        ])
+    }
+
+    func openPublication(fileId: Int) async throws -> OpenPublicationResponse {
+        try await post("files/\(fileId)/publication")
+    }
+
+    func closePublication(sessionId: String) async throws {
+        try await deleteNoContent("publication/\(sessionId)")
+    }
+
+    func bookContentRequest(
+        fileId: Int,
+        accept: String = "application/epub+zip"
+    ) throws -> URLRequest {
+        guard let url = makeURL("files/\(fileId)/content") else { throw APIError.badURL }
+        var request = URLRequest(url: url)
+        Session.shared.authorize(&request)
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        return request
+    }
+
+    func publicationResourceRequest(base: String, path: String) throws -> URLRequest {
+        guard let root = URL(string: origin),
+              let baseURL = URL(string: base, relativeTo: root),
+              let url = URL(string: path, relativeTo: baseURL)?.absoluteURL,
+              url.scheme == root.scheme, url.host == root.host, url.port == root.port
+        else { throw APIError.badURL }
+        var request = URLRequest(url: url)
+        request.setValue("no-referrer", forHTTPHeaderField: "Referrer-Policy")
+        return request
+    }
+
+    func putReadingState(itemId: Int, state: PutReadingStateRequest) async throws -> ReadingState {
+        try await put("items/\(itemId)/reading-state", body: state)
+    }
+
+    func deleteReadingState(itemId: Int, fileId: Int) async throws {
+        try await deleteNoContent("items/\(itemId)/reading-state", query: [
+            URLQueryItem(name: "file_id", value: String(fileId)),
+        ])
+    }
 
     func setWatched(itemId: Int, watched: Bool) async throws -> MutationResponse {
         try await post("items/\(itemId)/\(watched ? "scrobble" : "unscrobble")")

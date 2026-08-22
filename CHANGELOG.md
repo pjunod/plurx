@@ -8,7 +8,59 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Cluster voters can now leave cleanly from their own Settings page or the
+  admin API.** A graceful leave applies the existing offline-work settlement
+  rules and, when the local voter is leader, elects and confirms a successor
+  before committing a membership that excludes itself. Only after that commit
+  does the daemon drain and stop. Remote removal still refuses the leader, and
+  both paths refuse a 2→1 reconfiguration. Routine updates remain in-place
+  rolling restarts, not leaves.
+
+- **Android phones and tablets can keep EPUBs inside Cinema for offline
+  reading.** A durable profile-scoped catalogue records intent before I/O,
+  downloads the authenticated original, reopens the server publication to
+  verify the exact revision and manifest, materializes only bounded declared
+  resources, and atomically publishes the app-private copy. The local WebView
+  serves packaged reader assets and publication bytes through an intercepted
+  synthetic HTTPS origin with no account bearer, DNS fallback, redirects,
+  file/content access, mixed content, or publisher network loads. Local
+  locator changes survive process death and the newest dated state for the
+  exact edition replays after reconnect. Android TV and Google TV remain
+  deliberately excluded.
+
 ### Fixed
+
+- **Artwork now follows library rows across the cluster.** Item metadata is
+  replicated, but its poster and backdrop bytes live in each node's local
+  artwork cache, so a follower inherited a valid filename and returned 404.
+  Each voter now publishes its own public HTTP base inside private membership
+  state and continuously inventories every replicated artwork reference. A
+  missing file is pulled from a reachable peer under a one-minute,
+  filename-bound cluster proof, bounded to an image-sized response, and
+  atomically materialized; no reusable user bearer crosses between nodes. If
+  no peer retains the file, a paced source/provider repair recreates it.
+  Requests use the same peer path immediately while the background pass
+  converges, and image bytes still never enter Raft.
+
+- **Repeated authentication no longer appends one Raft entry per request.**
+  Login-token and scoped API-key authorization still use authority-consistent
+  credential reads, so logout and key revocation remain immediate, but their
+  best-effort activity timestamps now refresh only after a 60-second window.
+  Busy clients therefore preserve the operator-facing activity signal without
+  spending replicated-write latency and log bandwidth on every request.
+
+- **Existing replicated installs now have a real v5 → v6 upgrade path.** The
+  ebook reading-state release raised the Hiqlite compatibility marker to v6
+  but only defined that schema for fresh bootstrap/import, so an activated v5
+  install failed before the daemon could do anything about it. Daemon startup
+  now accepts that one predecessor and commits the `reading_state` table, its
+  index, and the v6 cluster marker in one Raft transaction before any producer
+  or HTTP listener starts. It then atomically advances each node's activation
+  marker; either crash boundary converges on the next boot. Maintenance
+  commands remain strict clients of a running daemon and cannot initiate the
+  migration. Replicated v4 and future schemas still fail closed.
 
 - **Recording a regression mapping no longer conflicts every other open pull
   request.** Every corrective change used to append a `[[coverage]]` block to

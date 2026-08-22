@@ -28,6 +28,8 @@ mod hiqlite_durable;
 mod hiqlite_import;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_reading;
 
 pub mod replicated;
 
@@ -35,7 +37,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
-    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_MIGRATION_SOURCE,
+    AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};
@@ -44,12 +47,12 @@ pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 use async_trait::async_trait;
 
 use crate::domain::{
-    CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
-    MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation, NewItem,
-    NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
+    BookMetadataPatch, CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage,
+    ItemSort, Library, MediaFile, MediaShape, MetadataPatch, NetworkPrior, NetworkPriorObservation,
+    NewItem, NewLibrary, NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome,
     OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats, OfflineRemovalPlanEntry,
-    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, RecentItem, TraktAuth,
-    User, WatchRollup, WatchState,
+    OfflineRemovalReport, PlaybackEvent, PlaybackEventQuery, ProbeResult, ReadingState,
+    ReadingStateWrite, RecentItem, TraktAuth, User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -407,6 +410,14 @@ pub trait MediaStore: Send + Sync + 'static {
     // --- browse ---
     async fn get_item(&self, id: i64) -> Result<Option<Item>, StoreError>;
     async fn get_item_children(&self, parent_id: i64) -> Result<Vec<Item>, StoreError>;
+    /// Every item that names at least one materialized artwork file.
+    ///
+    /// Cluster voters use this as a reconciliation inventory: item rows are
+    /// replicated, while the bytes named by `poster_path` and `backdrop_path`
+    /// remain node-local. Returning complete items keeps the owning item id
+    /// available for a provider/local-source repair when no peer still holds
+    /// the named file.
+    async fn items_with_artwork(&self) -> Result<Vec<Item>, StoreError>;
     /// One page of a library's grid, optionally narrowed to a single genre.
     ///
     /// The genre is matched against the item's stored list (migration v13),
@@ -445,6 +456,29 @@ pub trait MediaStore: Send + Sync + 'static {
 
     // --- metadata enrichment ---
     async fn apply_metadata(&self, item_id: i64, patch: &MetadataPatch) -> Result<(), StoreError>;
+    /// Apply first-class facts for one book with source precedence enforced by
+    /// the backend. A Curator handoff outranks EPUB package metadata; title +
+    /// author alone never creates a work relation.
+    async fn apply_book_metadata(
+        &self,
+        item_id: i64,
+        patch: &BookMetadataPatch,
+    ) -> Result<(), StoreError>;
+    /// Book rows in one library, optionally narrowed to the exact ids a
+    /// targeted scan placed. `Some(&[])` means no rows.
+    async fn book_items(
+        &self,
+        library_id: i64,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<Item>, StoreError>;
+    /// Other text/audio editions carrying the same proven work id. The
+    /// current row is excluded, and a missing work id is represented by the
+    /// caller not asking at all—not by fuzzy title/author matching.
+    async fn related_book_editions(
+        &self,
+        item_id: i64,
+        work_id: &str,
+    ) -> Result<Vec<Item>, StoreError>;
     /// Movies and shows to enrich: normally those no provider has answered
     /// for yet, which is *not* the same as "those with no TMDB id" — an item
     /// can arrive carrying an id from another application (a monarr scan
@@ -763,6 +797,46 @@ pub trait WatchStore: Send + Sync + 'static {
         position_ms: i64,
         duration_ms: Option<i64>,
         updated_at: i64,
+    ) -> Result<(), StoreError>;
+}
+
+/// Per-user text-publication state. It is separate from [`WatchStore`]
+/// because a reflowable locator is not timed playback and completion is an
+/// explicit reader action rather than a 95% threshold.
+#[async_trait]
+pub trait ReadingStore: Send + Sync + 'static {
+    /// Read the row for one edition, including a stale revision retained for
+    /// diagnosis. The HTTP boundary compares its revision to the current
+    /// file before offering a resume action.
+    async fn reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Newest state whose snapshotted revision still matches the current file.
+    /// Item detail uses this one query instead of looking up every edition.
+    async fn current_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+    ) -> Result<Option<ReadingState>, StoreError>;
+    /// Persist a locator. A dated offline write older than the durable row
+    /// returns the winner without rewinding it; an undated online write uses
+    /// the server clock and is authoritative now. A different file revision
+    /// begins a fresh ordering epoch because the previous locator is stale.
+    async fn put_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        state: &ReadingStateWrite,
+    ) -> Result<ReadingState, StoreError>;
+    /// Clear one edition's progress. Idempotent so Start over can be retried.
+    async fn delete_reading_state(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        file_id: i64,
     ) -> Result<(), StoreError>;
 }
 
@@ -1219,7 +1293,7 @@ pub trait NetworkPriorStore: Send + Sync + 'static {
     ) -> Result<NetworkPrior, StoreError>;
     async fn network_prior(
         &self,
-        user_id: i64,
+        credential_generation: &str,
         client_class: &str,
         network_fingerprint: &str,
     ) -> Result<Option<NetworkPrior>, StoreError>;
@@ -1234,6 +1308,7 @@ pub trait Store:
     + LibraryStore
     + MediaStore
     + WatchStore
+    + ReadingStore
     + TraktStore
     + WatchedOutboxStore
     + TranscodeCacheStore
@@ -1253,6 +1328,7 @@ impl<T> Store for T where
         + LibraryStore
         + MediaStore
         + WatchStore
+        + ReadingStore
         + TraktStore
         + WatchedOutboxStore
         + TranscodeCacheStore

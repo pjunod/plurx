@@ -305,6 +305,10 @@ pub struct LogsQuery {
     pub level: String,
     #[serde(default = "default_log_limit")]
     pub limit: usize,
+    /// `general` is Settings → System; `cluster` is the isolated membership
+    /// and Raft ring on Settings → Cluster.
+    #[serde(default)]
+    pub scope: String,
 }
 
 fn default_log_level() -> String {
@@ -320,7 +324,12 @@ pub async fn logs(
     State(state): State<AppState>,
     Query(q): Query<LogsQuery>,
 ) -> Json<Vec<crate::logbuf::LogEntry>> {
-    Json(state.logs.tail(&q.level, q.limit.min(2000)))
+    let buffer = if q.scope == "cluster" {
+        &state.cluster_logs
+    } else {
+        &state.logs
+    };
+    Json(buffer.tail(&q.level, q.limit.min(2000)))
 }
 
 #[derive(Deserialize)]
@@ -590,6 +599,38 @@ impl ClientLogLimiter {
 static CLIENT_LOG_LIMITER: std::sync::LazyLock<std::sync::Mutex<ClientLogLimiter>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(ClientLogLimiter::new()));
 
+#[cfg(test)]
+struct ClientLogCaptureHook {
+    message: &'static str,
+    captured: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CLIENT_LOG_CAPTURE_HOOK: std::sync::Mutex<Option<ClientLogCaptureHook>> =
+    std::sync::Mutex::new(None);
+
+/// Pause one client-log request after its authenticated network identity has
+/// been captured but before the detached telemetry work is started.
+#[cfg(test)]
+pub(super) fn pause_next_client_log_after_capture(
+    message: &'static str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *CLIENT_LOG_CAPTURE_HOOK
+        .lock()
+        .expect("client-log hook lock") = Some(ClientLogCaptureHook {
+        message,
+        captured: captured_tx,
+        release: release_rx,
+    });
+    (captured_rx, release_tx)
+}
+
 /// POST /api/v1/client-log — any signed-in user. Records one browser playback
 /// error into the server log ring so it surfaces in `Settings → Logs`. Bounded
 /// by per-field clipping and by a global rate limit (this is diagnostics, not an
@@ -625,7 +666,31 @@ pub async fn client_log(
     let event = client_playback_event(&ev, user.id);
     // Deliberately not `ev.ua`: the class must come from the same input the
     // read paths use, or the prior is written under a key nothing reads.
-    let network = super::network::identity(&headers, remote);
+    let mut network = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = network {
+        id.user_id = Some(user.id);
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
+    }
+    #[cfg(test)]
+    let capture_hook = {
+        let mut hook = CLIENT_LOG_CAPTURE_HOOK
+            .lock()
+            .expect("client-log hook lock");
+        if hook.as_ref().is_some_and(|hook| hook.message == ev.message) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    #[cfg(test)]
+    if let Some(hook) = capture_hook {
+        let _ = hook.captured.send(());
+        let _ = hook.release.await;
+    }
     let transcode = Arc::clone(&state.transcode);
     let store = Arc::clone(&state.store);
     tokio::spawn(async move {

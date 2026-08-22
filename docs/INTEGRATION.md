@@ -158,6 +158,14 @@ whichever header the secret arrived in.
 {"path":"/media/movies/Some Film (1999)","hint":"movie",
  "ids":{"tmdb":603,"imdb":"tt0133093"},
  "correlation_id":"t-43-b1e207","source":"monarr"}
+
+// a book: the path identifies local bytes; Curator supplies exact relations
+{"path":"/media/books/Andy Weir/Project Hail Mary","hint":"book",
+ "book":{"title":"Project Hail Mary","author":"Andy Weir","medium":"ebook",
+         "work_id":"curator:openlibrary:OL20631799W",
+         "edition_id":"curator:item:44:ebook",
+         "cover_url":"https://covers.openlibrary.org/b/olid/OL12345M-L.jpg"},
+ "correlation_id":"t-44-c4d812","source":"monarr"}
 ```
 
 `path` is absolute and must resolve **under a configured library root** — a
@@ -167,7 +175,13 @@ unresolvable path and counts the rejection as a pass).
 
 `hint` is advisory. The library's own kind decides how a file is parsed; the
 hint only picks which item an id applies to. For an episode, `series.tmdb` is
-the **show's** id — an episode's own id does not identify the series.
+the **show's** id — an episode's own id does not identify the series. A book
+request may add a `book` object. `medium` is `ebook` or `audiobook`; `work_id`
+and `edition_id` are bounded opaque Curator keys; `cover_url`, when present,
+must be an HTTPS Open Library cover URL. Cinema accepts this object only below
+a Books root and never invents a relation from title plus author. Older callers
+may omit it; the Books library still derives local file identity from disk and
+standalone EPUBs contribute bounded package metadata.
 
 `correlation_id` is monarr's transfer id (`t-<downloadID>-<hex>`), echoed back
 in the response and written to the log, so one grep across three applications
@@ -272,7 +286,8 @@ key too. The other tell is the first-run setup screen reappearing.
 **How to read it.** `last_used_at` on the listing is the cheapest proof that
 monarr is really using the key you think it is. A key that has never been used
 and a monarr that reports successful deliveries means monarr is holding a
-*different* key.
+*different* key. The timestamp refreshes no more than once per minute, so it
+is an activity signal rather than an exact request counter.
 
 Note what the listing does **not** return: `key_hash`. Listing keys is a
 routine, frequently-open screen; the stored hash has no business on it, and

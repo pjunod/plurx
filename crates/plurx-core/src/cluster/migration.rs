@@ -38,7 +38,7 @@ use crate::secrets::{self, CredentialKey, SealedRowCensus};
 #[cfg(feature = "hiqlite-store")]
 use crate::store::{
     HiqliteAuthStore, SettingsStore, SqliteImportReport, SqliteImportTableDigest, SqliteStore,
-    Store, TraktStore, AUTH_SCHEMA_VERSION,
+    Store, TraktStore, AUTH_SCHEMA_MIGRATION_SOURCE, AUTH_SCHEMA_VERSION,
 };
 #[cfg(feature = "hiqlite-store")]
 use hiqlite::tls::ServerTlsConfig;
@@ -81,6 +81,29 @@ const HIQLITE_READDRESS_BACKUP_DIRNAME: &str = "hiqlite.before-readdress";
 const HIQLITE_READDRESS_MARKER_FILENAME: &str = "hiqlite-readdress.json";
 #[cfg(feature = "hiqlite-store")]
 const HIQLITE_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Hiqlite Raft WAL segment size used by every plurx voter.
+///
+/// Hiqlite 0.14 accepts one serialized Raft entry up to `wal_size - 34` bytes:
+/// its WAL writer subtracts the fixed segment metadata before checking each
+/// entry independently. The 16 MiB segment therefore leaves 16,777,182 usable
+/// bytes. OpenRaft's configured `max_payload_entries = 128` limits the number
+/// of entries in one append request, not the size of an individual entry, and
+/// Hiqlite carries that request in a WebSocket binary frame whose length field
+/// supports this size without a smaller application cap.
+///
+/// Import transactions deliberately stay far below the usable entry capacity
+/// at the replication-time ceiling measured before this headroom increase.
+/// Keep all voters and import bounds tied to this constant so a retune cannot
+/// make the contract exercise a different limit than production.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+/// Bytes Hiqlite WAL 0.14 reserves before one serialized log entry.
+#[cfg(feature = "hiqlite-store")]
+const HIQLITE_WAL_SEGMENT_RESERVED_BYTES: usize = 34;
+/// Largest serialized Raft entry accepted by the configured production WAL.
+#[cfg(feature = "hiqlite-store")]
+pub const HIQLITE_WAL_USABLE_PAYLOAD_BYTES: usize =
+    HIQLITE_WAL_SIZE_BYTES as usize - HIQLITE_WAL_SEGMENT_RESERVED_BYTES;
 #[cfg(feature = "hiqlite-store")]
 const ACTIVATION_MARKER_VERSION: u32 = 1;
 #[cfg(feature = "hiqlite-store")]
@@ -370,11 +393,11 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
     let token = read_join_token_file(&config.cluster.join_token_file)?;
     let payload = decode_join_token(&token)
         .map_err(|error| StoreError::Migration(format!("{}: {}", error.code(), error)))?;
-    if payload.expires_at <= unix_time_millis()? {
-        return Err(StoreError::Migration(
-            "join_token_expired: join token expired before it was redeemed".to_owned(),
-        ));
-    }
+    // The coordinator owns the expiry verdict. Locally, an unused expired
+    // token and an interrupted join already reserved to this node have the
+    // same payload; only the replicated token record can distinguish them.
+    // Rechecking the embedded timestamp here would strand an identity-bound
+    // voter that failed after redemption and restarted after the token TTL.
     if payload.schema_version != AUTH_SCHEMA_VERSION
         || payload.protocol_version != crate::store::AUTH_PROTOCOL_VERSION
     {
@@ -439,6 +462,7 @@ async fn join_fresh_store(config: &Config, daemon_lock: File) -> Result<Selected
             token_digest,
             raft_id: payload.raft_id,
             node_id: identity.node_id.clone(),
+            hostname: super::membership::system_short_hostname().unwrap_or_default(),
             raft_address: local.raft_address.clone(),
             api_address: local.api_address.clone(),
             http_base: configured_join_url(config)?,
@@ -673,15 +697,6 @@ struct JoinApiError {
     message: String,
 }
 
-#[cfg(feature = "hiqlite-store")]
-fn unix_time_millis() -> Result<i64, StoreError> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| StoreError::Database(error.to_string()))?
-        .as_millis();
-    i64::try_from(millis).map_err(|_| StoreError::Database("clock overflow".to_owned()))
-}
-
 /// Connect a maintenance command to an already-running activated voter.
 ///
 /// This path never imports and never starts a second local voter. It is safe
@@ -848,7 +863,7 @@ impl ActivationMarker {
     }
 
     fn validate(&self) -> Result<(), StoreError> {
-        if self.marker_version != ACTIVATION_MARKER_VERSION {
+        if self.marker_version == 0 || self.marker_version > ACTIVATION_MARKER_VERSION {
             return Err(StoreError::Migration(format!(
                 "unsupported Hiqlite activation marker version {}",
                 self.marker_version
@@ -856,7 +871,8 @@ impl ActivationMarker {
         }
         if self.cluster_id.trim().is_empty()
             || self.source_schema_version <= 0
-            || self.replicated_schema_version != AUTH_SCHEMA_VERSION
+            || !(AUTH_SCHEMA_MIGRATION_SOURCE..=AUTH_SCHEMA_VERSION)
+                .contains(&self.replicated_schema_version)
             || !is_sha256(&self.source_backup_sha256)
             || self.table_hashes.is_empty()
         {
@@ -1220,7 +1236,7 @@ async fn open_active_store_with_key(
 ) -> Result<SelectedStore, StoreError> {
     let active = config.storage.data_dir.join(HIQLITE_ACTIVE_DIRNAME);
     require_real_directory(&active)?;
-    let marker = read_activation_marker(&active)?;
+    let mut marker = read_activation_marker(&active)?;
     let mut local_membership = read_local_membership(&config.storage.data_dir)?;
     let mut identity = super::initialize_identity(&config.storage.data_dir, &marker.cluster_id)?;
     if let Some(membership) = &local_membership {
@@ -1243,10 +1259,17 @@ async fn open_active_store_with_key(
         force_loopback,
     )
     .await?;
-    let store = match HiqliteAuthStore::open(client.clone(), &active.join("telemetry.db")).await {
-        Ok(store) => store,
-        Err(error) => return Err(error),
-    };
+    let store =
+        match HiqliteAuthStore::open_or_migrate(client.clone(), &active.join("telemetry.db")).await
+        {
+            Ok(store) => store,
+            Err(error) => return Err(error),
+        };
+    if marker.replicated_schema_version != AUTH_SCHEMA_VERSION {
+        marker.replicated_schema_version = AUTH_SCHEMA_VERSION;
+        write_activation_marker(&active, &marker)?;
+        sync_directory(&active)?;
+    }
     if let Err(error) = verify_store_identity(&store, &marker.cluster_id).await {
         drop(store);
         return Err(error);
@@ -1605,7 +1628,7 @@ async fn start_voter(
     nodes.push(local.clone());
     nodes.sort_by_key(|peer| peer.raft_id);
     nodes.dedup_by_key(|peer| peer.raft_id);
-    let nodes = nodes.iter().map(Node::from).collect::<Vec<_>>();
+    let nodes = hiqlite_nodes_for_voter(&nodes, local.raft_id)?;
 
     // The daemon lock guards one data directory, but these ports are host-wide
     // and default to fixed values, so two data directories on one host collide.
@@ -1633,7 +1656,7 @@ async fn start_voter(
         tls_raft: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: active_transport.then_some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 2 * 1024 * 1024,
+        wal_size: HIQLITE_WAL_SIZE_BYTES,
         raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     };
@@ -1681,6 +1704,30 @@ async fn start_voter(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok((client, local))
+}
+
+/// Build Hiqlite's connection roster without treating durable Raft ids as
+/// vector positions.
+#[cfg(feature = "hiqlite-store")]
+fn hiqlite_nodes_for_voter(
+    peers: &[ClusterPeer],
+    local_raft_id: u64,
+) -> Result<Vec<Node>, StoreError> {
+    if !peers.iter().any(|peer| peer.raft_id == local_raft_id) {
+        return Err(StoreError::Identity(format!(
+            "local Raft id {local_raft_id} is absent from the configured peer list"
+        )));
+    }
+
+    let mut ids = BTreeSet::new();
+    if let Some(duplicate) = peers.iter().find(|peer| !ids.insert(peer.raft_id)) {
+        return Err(StoreError::Identity(format!(
+            "configured peer list contains duplicate Raft id {}",
+            duplicate.raft_id
+        )));
+    }
+
+    Ok(peers.iter().map(Node::from).collect())
 }
 
 #[cfg(feature = "hiqlite-store")]
@@ -2744,6 +2791,97 @@ mod tests {
     #[cfg(feature = "hiqlite-store")]
     const SECOND_DAEMON_VERDICT: &str = "another plurxd process already owns the data directory";
 
+    /// Raft ids are durable identities, not positions in the bootstrap vector.
+    /// A live token can reserve id 2 while id 3 joins first, so Hiqlite must
+    /// accept the unique sparse roster rather than requiring a duplicate pad.
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn hiqlite_accepts_a_unique_sparse_node_roster() {
+        let peers = [
+            ClusterPeer {
+                raft_id: 1,
+                raft_address: "127.0.0.1:32401".to_owned(),
+                api_address: "127.0.0.1:32402".to_owned(),
+            },
+            ClusterPeer {
+                raft_id: 3,
+                raft_address: "127.0.0.1:32501".to_owned(),
+                api_address: "127.0.0.1:32502".to_owned(),
+            },
+        ];
+        let nodes = hiqlite_nodes_for_voter(&peers, 3).expect("build sparse connection roster");
+        let config = NodeConfig {
+            node_id: 3,
+            nodes,
+            secret_raft: "0123456789abcdef".to_owned(),
+            secret_api: "fedcba9876543210".to_owned(),
+            ..NodeConfig::default()
+        };
+
+        config
+            .is_valid()
+            .expect("sparse Raft ids must be selected by id");
+        assert_eq!(
+            config.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the compatibility path must not duplicate a connection target"
+        );
+    }
+
+    #[cfg(feature = "hiqlite-store")]
+    #[test]
+    fn activation_marker_accepts_only_the_supported_upgrade_window() {
+        let marker = |replicated_schema_version| ActivationMarker {
+            marker_version: ACTIVATION_MARKER_VERSION,
+            cluster_id: "cluster-a".to_owned(),
+            source_backup_sha256: "0".repeat(64),
+            source_schema_version: 20,
+            replicated_schema_version,
+            imported_rows: 0,
+            table_hashes: vec![SqliteImportTableDigest {
+                table: "settings".to_owned(),
+                row_count: 0,
+                sha256: "0".repeat(64),
+            }],
+        };
+        marker(AUTH_SCHEMA_MIGRATION_SOURCE)
+            .validate()
+            .expect("v5 marker must reach the complete daemon migration chain");
+        marker(AUTH_SCHEMA_MIGRATION_SOURCE + 1)
+            .validate()
+            .expect("v6 marker must reach the book-facts migration");
+        marker(AUTH_SCHEMA_VERSION)
+            .validate()
+            .expect("current marker");
+        for unsupported in [AUTH_SCHEMA_MIGRATION_SOURCE - 1, AUTH_SCHEMA_VERSION + 1] {
+            let error = marker(unsupported)
+                .validate()
+                .expect_err("unsupported marker must fail before voter startup");
+            assert!(error.to_string().contains("incomplete"), "{error}");
+        }
+
+        // Version 0 has never been a valid writer-produced marker format.
+        {
+            let zero = ActivationMarker {
+                marker_version: 0,
+                cluster_id: "cluster-a".to_owned(),
+                source_backup_sha256: "0".repeat(64),
+                source_schema_version: 20,
+                replicated_schema_version: AUTH_SCHEMA_VERSION,
+                imported_rows: 0,
+                table_hashes: vec![SqliteImportTableDigest {
+                    table: "settings".to_owned(),
+                    row_count: 0,
+                    sha256: "0".repeat(64),
+                }],
+            };
+            let error = zero
+                .validate()
+                .expect_err("marker version 0 must fail closed");
+            assert!(error.to_string().contains("unsupported"), "{error}");
+        }
+    }
+
     /// A predecessor still closing its handle is not a second daemon.
     ///
     /// Regression for #374. `acquire_daemon_lock` took the advisory lock
@@ -3411,18 +3549,55 @@ mod tests {
         );
         assert!(!expired_dir.path().join(HIQLITE_ACTIVE_DIRNAME).exists());
 
-        let issued = coordinator
+        // A still-live token may reserve the next Raft id while another
+        // machine starts first. OpenRaft permits that sparse membership, and
+        // the production daemon must not confuse the assigned id with the
+        // length of its bootstrap vector (Hiqlite 0.14 does exactly that
+        // without the compatibility adapter in `start_voter`).
+        let held_gap = coordinator
             .issue_token(Duration::from_secs(120))
             .await
+            .expect("reserve the preceding Raft id");
+        let issued = coordinator
+            .issue_token(Duration::from_secs(1))
+            .await
             .expect("issue daemon join token");
+        assert_eq!(
+            issued.raft_id,
+            held_gap.raft_id + 1,
+            "daemon join fixture must exercise a sparse assigned id"
+        );
         let joining_dir = tempfile::tempdir().expect("joining data dir");
         let token_path = joining_dir.path().join("join.token");
         std::fs::write(&token_path, format!("{}\n", issued.token)).expect("joining token file");
         let mut joining_config = membership_test_config(joining_dir.path());
         joining_config.cluster.join_token_file = token_path.clone();
+        let staged_identity = crate::cluster::initialize_join_identity(
+            joining_dir.path(),
+            &cluster_id,
+            issued.raft_id,
+        )
+        .expect("stage the joining node identity");
+        let staged_local = configured_local_peer(&joining_config, issued.raft_id)
+            .expect("configure the staged peer");
+        let issued_digest = join_token_digest(&issued.token);
+        coordinator
+            .redeem(&RedeemJoinRequest {
+                token_digest: issued_digest.clone(),
+                raft_id: issued.raft_id,
+                node_id: staged_identity.node_id,
+                hostname: "joining-test-node".to_owned(),
+                raft_address: staged_local.raft_address,
+                api_address: staged_local.api_address,
+                schema_version: AUTH_SCHEMA_VERSION,
+                protocol_version: crate::store::AUTH_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("reserve the token to the staged node before its failed start");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         let joined = select_daemon_store(&joining_config)
             .await
-            .expect("join through daemon store selection");
+            .expect("resume an expired identity-bound join through daemon store selection");
         assert_eq!(joined.identity.cluster_id, cluster_id);
         assert_eq!(joined.identity.raft_id, issued.raft_id);
         assert!(
@@ -3432,7 +3607,6 @@ mod tests {
         let local = read_local_membership(joining_dir.path())
             .expect("read joined local membership")
             .expect("joined node persists local membership");
-        let issued_digest = join_token_digest(&issued.token);
         assert_eq!(
             local.join_token_digest.as_deref(),
             Some(issued_digest.as_str())

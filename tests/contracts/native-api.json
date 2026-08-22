@@ -90,7 +90,8 @@
       }
     ],
     "children": [],
-    "ancestors": []
+    "ancestors": [],
+    "reading": null
   },
   "audiobook_detail": {
     "item": {
@@ -104,6 +105,10 @@
       "updated_at": 1785733260,
       "tags": [],
       "genres": [],
+      "author": "A. Contract",
+      "book_work_id": "curator:work:contract",
+      "book_edition_id": "curator:edition:audiobook",
+      "book_metadata_source": "curator",
       "watch": {
         "position_ms": 75000,
         "duration_ms": 480000,
@@ -181,7 +186,20 @@
       }
     ],
     "children": [],
-    "ancestors": []
+    "ancestors": [],
+    "editions": [
+      {
+        "id": 45,
+        "library_id": 8,
+        "kind": "book",
+        "title": "The Contract Ebook",
+        "author": "A. Contract",
+        "book_work_id": "curator:work:contract",
+        "book_edition_id": "curator:edition:ebook",
+        "book_metadata_source": "curator"
+      }
+    ],
+    "reading": null
   },
   "page": {
     "items": [

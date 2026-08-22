@@ -56,13 +56,19 @@ CREATE TABLE IF NOT EXISTS items (
     metadata_at          INTEGER,
     artwork_attempted_at INTEGER,
     artwork_error        TEXT,
-    genres               TEXT NOT NULL DEFAULT '[]'
+    genres               TEXT NOT NULL DEFAULT '[]',
+    author               TEXT,
+    book_work_id         TEXT,
+    book_edition_id      TEXT,
+    book_metadata_source TEXT CHECK (book_metadata_source IN ('epub', 'curator'))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_items_library_kind ON items(library_id, kind);
 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
 CREATE INDEX IF NOT EXISTS idx_items_added ON items(added_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_missing_artwork ON items(artwork_attempted_at)
     WHERE poster_path IS NULL;
+CREATE INDEX IF NOT EXISTS idx_items_book_work ON items(book_work_id)
+    WHERE book_work_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS files (
     id               INTEGER PRIMARY KEY,
@@ -136,10 +142,42 @@ CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, overview, tags 
 END;
 "#;
 
+// Kept as individual statements because replicated migrations execute schema
+// changes and their cluster_meta bump in one Raft transaction. Fresh bootstrap
+// uses these exact strings too, so the two paths cannot drift.
+pub(super) const READING_STATE_TABLE_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS reading_state (
+    user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    file_id            INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    file_size          INTEGER NOT NULL,
+    file_mtime         INTEGER NOT NULL,
+    locator_json       TEXT NOT NULL,
+    progression_millis INTEGER NOT NULL CHECK (progression_millis BETWEEN 0 AND 1000000),
+    completed          INTEGER NOT NULL CHECK (completed IN (0, 1)),
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (user_id, item_id, file_id)
+) STRICT"#;
+
+pub(super) const READING_STATE_INDEX_SCHEMA: &str = r#"CREATE INDEX IF NOT EXISTS idx_reading_updated
+    ON reading_state(user_id, updated_at DESC)"#;
+
+pub(super) const BOOK_AUTHOR_SCHEMA: &str = "ALTER TABLE items ADD COLUMN author TEXT";
+pub(super) const BOOK_WORK_SCHEMA: &str = "ALTER TABLE items ADD COLUMN book_work_id TEXT";
+pub(super) const BOOK_EDITION_SCHEMA: &str = "ALTER TABLE items ADD COLUMN book_edition_id TEXT";
+pub(super) const BOOK_SOURCE_SCHEMA: &str =
+    "ALTER TABLE items ADD COLUMN book_metadata_source TEXT \
+    CHECK (book_metadata_source IN ('epub', 'curator'))";
+pub(super) const BOOK_WORK_INDEX_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS idx_items_book_work \
+    ON items(book_work_id) WHERE book_work_id IS NOT NULL";
+
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
     validate_sql(CATALOG_SCHEMA)?;
     for result in timeout_store(client.batch(CATALOG_SCHEMA)).await? {
         result.map_err(database_error)?;
+    }
+    for sql in [READING_STATE_TABLE_SCHEMA, READING_STATE_INDEX_SCHEMA] {
+        validate_sql(sql)?;
+        timeout_store(client.execute(sql, params!())).await?;
     }
     Ok(())
 }
@@ -172,6 +210,7 @@ struct CatalogDump {
     items: Vec<String>,
     files: Vec<String>,
     watch_state: Vec<String>,
+    reading_state: Vec<String>,
     library_roots: Vec<String>,
     scan_reconcile_guards: Vec<String>,
     scan_reconcile_items: Vec<String>,
@@ -185,6 +224,7 @@ struct CatalogTruthDump {
     items: Vec<String>,
     files: Vec<String>,
     watch_state: Vec<String>,
+    reading_state: Vec<String>,
     library_roots: Vec<String>,
     scan_reconcile_guards: Vec<String>,
     scan_reconcile_items: Vec<String>,
@@ -222,6 +262,13 @@ async fn authoritative_dump(client: &TimedClient) -> Result<CatalogTruthDump, St
              AS value FROM watch_state ORDER BY user_id, item_id",
         )
         .await?,
+        reading_state: rows(
+            client,
+            "SELECT json_array(user_id, item_id, file_id, file_size, file_mtime, \
+                    locator_json, progression_millis, completed, updated_at) \
+             AS value FROM reading_state ORDER BY user_id, item_id, file_id",
+        )
+        .await?,
         library_roots: rows(
             client,
             "SELECT json_array(library_id, fingerprint) AS value \
@@ -255,6 +302,7 @@ pub(super) async fn local_catalog_digest(client: &TimedClient) -> Result<String,
         items: truth.items,
         files: truth.files,
         watch_state: truth.watch_state,
+        reading_state: truth.reading_state,
         library_roots: truth.library_roots,
         scan_reconcile_guards: truth.scan_reconcile_guards,
         scan_reconcile_items: truth.scan_reconcile_items,

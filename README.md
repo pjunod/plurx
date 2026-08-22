@@ -56,11 +56,21 @@ out, so the next attempt starts where the last one stopped. If you run plurx
 beside monarr,
 [docs/INTEGRATION.md](docs/INTEGRATION.md) documents every seam between them —
 what each does, where you watch it, and the command that proves it works.
+[docs/EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md) finishes the Books loop:
+Curator's import handoff, Cinema-owned reading state, the EPUB renderer,
+phone/tablet clients, and offline originals, each behind an acceptance gate.
 Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md), with
 [docs/CLUSTERING-PLAN.md](docs/CLUSTERING-PLAN.md) turning Phase 4 into ordered
-milestones and acceptance checks; client strategy in
+milestones and acceptance checks, with
+[docs/CLUSTER-PERFORMANCE-PLAN.md](docs/CLUSTER-PERFORMANCE-PLAN.md) defining
+the post-membership topology, consistency classes, observability, and ordered
+work that turns additional nodes into measured read and application capacity,
+and
+[docs/CLUSTER-MEDIA-POOL-PLAN.md](docs/CLUSTER-MEDIA-POOL-PLAN.md) defining how
+those voters become one capability-aware transcode, cache, and failover pool;
+client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md), with
 [docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md](docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md)
 recording what the Apple native-subtitle work shipped, why each choice was
@@ -291,10 +301,17 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [x] **Home video & photos.** A `home` library kind: mirrored folder trees,
   filename-verbatim titles, capture dates, seed-once `.nfo` sidecars, photo
   lightbox, local frame-grab artwork, and in-UI metadata editing.
-- [x] **Books.** A `books` library kind with separate ebook and audiobook
+- [~] **Books.** A `books` library kind with separate ebook and audiobook
   items, multipart audiobook grouping, chapter/codec/container/duration facts,
   authenticated ebook opening, and cross-client audio playback with one global
-  resume/progress timeline.
+  resume/progress timeline are shipped. Revision-bound, replicated ebook
+  reading state and its authenticated API are also shipped. The bounded,
+  capability-scoped EPUB publication layer and built-in web/iOS/Android online
+  readers are complete. App-managed offline EPUB copies now ship on iPhone,
+  iPad, and Android phones/tablets; televisions remain deliberately excluded.
+  Metadata enrichment and the physical airplane-mode acceptance matrix remain
+  in [EBOOK-READER-PLAN.md](docs/EBOOK-READER-PLAN.md). M0–M3 are complete and
+  M4 implementation is complete with device acceptance in progress.
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.

@@ -29,6 +29,25 @@ def workflow_job_blocks(path: str) -> dict[str, str]:
 
 
 class OperationsContractCase(unittest.TestCase):
+    def test_browser_validation_never_claims_host_audio_or_media_controls(self):
+        for path in ("scripts/playback-lab", "scripts/ui-baseline"):
+            with self.subTest(path=path):
+                script = read(path)
+                self.assertIn('"--mute-audio"', script)
+                self.assertIn("HardwareMediaKeyHandling", script)
+
+    def test_rust_test_artifacts_omit_replicated_debug_information(self):
+        cargo = read("Cargo.toml")
+        profile = cargo.split("[profile.test]", 1)[1].split("[", 1)[0]
+
+        self.assertRegex(profile, r"(?m)^debug = 0$")
+
+        spike = read("spikes/hiqlite-m0/Cargo.toml")
+        for name in ("dev", "test"):
+            with self.subTest(workspace="hiqlite-m0", profile=name):
+                profile = spike.split(f"[profile.{name}]", 1)[1].split("[", 1)[0]
+                self.assertRegex(profile, r"(?m)^debug = 0$")
+
     def test_swarm_runtime_keeps_network_quota_and_role_boundaries_explicit(self):
         config = json.loads(read("swarm/config.json"))
 
@@ -207,9 +226,9 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.android_device == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.web_layout == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.release_build == 'true'", workflow)
-        self.assertIn("if: needs.scope.outputs.hiqlite_spike == 'true'", workflow)
-        self.assertIn("if: needs.scope.outputs.cluster_auth == 'true'", workflow)
-        self.assertIn("name: three-voter replicated store contracts", workflow)
+        self.assertIn("needs.scope.outputs.hiqlite_spike == 'true'", workflow)
+        self.assertIn("needs.scope.outputs.cluster_auth == 'true'", workflow)
+        self.assertIn("name: replicated storage contracts", workflow)
         self.assertIn("if: needs.scope.outputs.rust == 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
@@ -217,18 +236,34 @@ class OperationsContractCase(unittest.TestCase):
             "MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}",
             workflow,
         )
-        self.assertIn("HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}", workflow)
         self.assertIn("CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}", workflow)
         pr_gate = workflow.split("  pr_gate:", 1)[1]
         self.assertIn("      - mobile_version", pr_gate)
-        self.assertIn("      - hiqlite_spike", pr_gate)
         self.assertIn("      - cluster_auth", pr_gate)
+        self.assertNotIn("      - hiqlite_spike", pr_gate)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
 
         mobile = workflow.split("  mobile_version:", 1)[1].split("\n  preflight:", 1)[0]
         self.assertIn("needs: scope", mobile)
         self.assertNotIn("needs: [scope, preflight]", mobile)
+
+        # The recorded base sha is the target tip at event time. Comparing build
+        # counters against it keeps a branch green after an unrelated release
+        # bump lands the same counter on the target, because identical literals
+        # auto-merge with no conflict. The counter baseline must be re-fetched
+        # at job time; the recorded base stays, but only to scope the diff.
+        self.assertIn("+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF", mobile)
+        self.assertIn('MERGE_TARGET=origin/$BASE_REF" >> "$GITHUB_ENV"', mobile)
+        self.assertIn('PLURX_VALIDATION_MERGE_TARGET="$MERGE_TARGET"', mobile)
+        self.assertIn(
+            "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+            mobile,
+        )
+        self.assertLess(
+            mobile.index("Resolve the current merge target"),
+            mobile.index("Check mobile release hygiene"),
+        )
         apple = workflow.split("\n  apple:\n", 1)[1].split(
             "\n  android_device:\n", 1
         )[0]
@@ -250,16 +285,33 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release -p plurxd --target ${{ matrix.target }}",
             workflow,
         )
-        self.assertEqual(
-            workflow.count(
-                "s|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g",
-            ),
-            4,
-        )
-        self.assertEqual(
-            workflow.count("sudo apt-get -o Acquire::Retries=3"),
-            8,
-        )
+        # apt on a hosted image points at a mirror list that fails often enough
+        # to matter on a required gate, so every apt use rewrites it to the
+        # archive and retries. Counting invocations rather than asserting a
+        # fixed total keeps this true as jobs move: the ffmpeg lanes now satisfy
+        # it once inside ./.github/actions/ffmpeg instead of per job.
+        for name in (
+            ".github/workflows/ci.yml",
+            ".github/actions/ffmpeg/action.yml",
+        ):
+            with self.subTest(source=name):
+                source = read(name)
+                self.assertIn(
+                    "s|mirror+file:/etc/apt/apt-mirrors.txt"
+                    "|https://archive.ubuntu.com/ubuntu|g",
+                    source,
+                )
+                self.assertEqual(
+                    [],
+                    [
+                        line.strip()
+                        for line in source.splitlines()
+                        if "apt-get" in line
+                        and not line.lstrip().startswith("#")
+                        and "-o Acquire::Retries=3" not in line
+                    ],
+                    f"{name} runs apt-get without the retry policy",
+                )
         self.assertNotIn("sudo apt-get update", workflow)
         self.assertNotIn("sudo apt-get install", workflow)
         self.assertNotIn(
@@ -319,9 +371,15 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("key: avd-35-google_apis-pixel_7_pro", workflow)
         self.assertIn("-no-snapshot-save", workflow)
 
-        # The spike workspace's target dir must be inside its cache mapping,
-        # or its 400-crate build runs cold every time.
-        self.assertIn("spikes/hiqlite-m0 -> spikes/hiqlite-m0/target", workflow)
+        # The semantic proof reuses the cluster job's root target instead of
+        # compiling the same Hiqlite/OpenRaft dependency graph a second time.
+        cluster = workflow.split("  cluster_auth:", 1)[1].split(
+            "\n  web_layout:", 1
+        )[0]
+        self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/target", cluster)
+        self.assertIn("run: make cluster-check", cluster)
+        self.assertIn("run: make hiqlite-spike", cluster)
+        self.assertNotIn("spikes/hiqlite-m0/target", workflow)
 
         # The docker smoke build keeps the GHA layer cache wired so the
         # ffmpeg runtime layers stop re-downloading on every run.
@@ -363,6 +421,67 @@ class OperationsContractCase(unittest.TestCase):
                     and "\n    uses:" not in block
                 ]
                 self.assertEqual([], missing, f"jobs without timeouts in {path}")
+
+    def test_every_ffmpeg_lane_pins_the_build_it_asserts_against(self):
+        # An unpinned `apt-get install -y ffmpeg` on `ubuntu-latest` made the
+        # gate's ffmpeg whichever build GitHub promoted that week — which is why
+        # ffmpeg 8 dropping the `-readrate_initial_burst` behaviour (#380) was
+        # invisible to CI and would have arrived on `main` as a green-to-red
+        # flip with no diff to blame. The pin is only worth as much as this
+        # test: it is what keeps a change of ffmpeg build a reviewable diff.
+        action = read(".github/actions/ffmpeg/action.yml")
+        self.assertIn("apt-get -o Acquire::Retries=3 install -y ffmpeg", action)
+        self.assertIn("WANT_MAJOR", action)
+        self.assertIn('GITHUB_STEP_SUMMARY', action)
+        self.assertIn('if [ "$got" != "$WANT_MAJOR" ]', action)
+
+        workflow_paths = sorted(
+            path.relative_to(ROOT).as_posix()
+            for pattern in ("*.yml", "*.yaml")
+            for path in (ROOT / ".github/workflows").glob(pattern)
+        )
+        # Discover workflows rather than maintaining an allowlist: a newly
+        # added workflow must not be able to reintroduce a direct ffmpeg install
+        # merely because this test predates it. Keep one formerly unlisted file
+        # explicit as regression evidence for that failure mode.
+        self.assertIn(".github/workflows/fix-evidence.yml", workflow_paths)
+
+        majors = set()
+        for path in workflow_paths:
+            with self.subTest(path=path):
+                self.assertNotRegex(
+                    read(path),
+                    r"(?m)^\s*[^#\n]*apt-get[^\n]*install[^\n]*\bffmpeg\b",
+                    f"{path} installs ffmpeg outside ./.github/actions/ffmpeg",
+                )
+                for name, block in workflow_job_blocks(path).items():
+                    if "uses: ./.github/actions/ffmpeg" not in block:
+                        continue
+                    major = re.search(r'(?m)^ +major: "(\d+)"$', block)
+                    self.assertIsNotNone(
+                        major, f"{path}:{name} provisions ffmpeg without naming a major"
+                    )
+                    majors.add(major.group(1))
+                    # A named major is a claim about the environment, so the
+                    # environment has to be nameable too: a concrete runner
+                    # image, or a container tag that overrides it.
+                    self.assertTrue(
+                        "runs-on: ubuntu-latest" not in block
+                        or "\n    container:" in block,
+                        f"{path}:{name} asserts an ffmpeg major on a floating image",
+                    )
+
+        # Both sides of the #380 split stay covered: the gate lanes on the major
+        # their timing assumptions were written against, and a nightly lane on
+        # the one every worker host already runs. Changing this set is allowed
+        # and is the point — it is how a decision to move the fleet's ffmpeg
+        # arrives as a reviewed diff rather than as a Tuesday.
+        self.assertEqual(
+            {"6", "8"},
+            majors,
+            "the ffmpeg majors CI covers changed; update docs/VALIDATION.md's "
+            "'Which ffmpeg the profiles assume' in the same commit",
+        )
 
     def test_ci_flake_ledger_records_real_job_outcomes_and_durations(self):
         script = ROOT / "scripts/ci-flake-report"
@@ -409,6 +528,13 @@ class OperationsContractCase(unittest.TestCase):
         report = "\n".join(lines)
         self.assertIn("1 transcode · 1 copy-video", report)
         self.assertIn("most recent copy-video command", report)
+
+    def test_android_player_renders_the_marker_display_label(self):
+        player = read(
+            "clients/android/app/src/main/java/tv/plurx/app/player/PlayerScreen.kt"
+        )
+
+        self.assertIn("Text(activeMarker.displayLabel", player)
 
 
 if __name__ == "__main__":

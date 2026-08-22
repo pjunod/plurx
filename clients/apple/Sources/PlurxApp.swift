@@ -59,6 +59,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @ObservedObject private var downloads = OfflineDownloadManager.shared
+    @ObservedObject private var bookDownloads = OfflineBookManager.shared
     #endif
     #if DEBUG
     private let playbackAcceptance = PlaybackAcceptanceLaunch.current()
@@ -70,10 +71,12 @@ struct RootView: View {
             switch model.phase {
             case .loading:
                 #if os(iOS)
-                if downloads.items.isEmpty {
+                if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ProgressView().tint(Palette.accent)
                 } else {
-                    NavigationStack { DownloadsView() }
+                    // Keep Downloads inside the shared shell. A durable failed
+                    // row must not hide Home's session-recovery controls.
+                    HomeView(initialTab: HomeLayoutPolicy.offlineLaunchTab)
                 }
                 #else
                 ProgressView().tint(Palette.accent)
@@ -84,10 +87,12 @@ struct RootView: View {
                 LoginView()
             case .reconnectFailed:
                 #if os(iOS)
-                if downloads.items.isEmpty {
+                if downloads.items.isEmpty && bookDownloads.books.isEmpty {
                     ReconnectView()
                 } else {
-                    NavigationStack { DownloadsView() }
+                    // Start in the local library without making it a dead-end
+                    // root when the saved server is still unreachable.
+                    HomeView(initialTab: HomeLayoutPolicy.offlineLaunchTab)
                 }
                 #else
                 ReconnectView()
@@ -116,10 +121,12 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task { await downloads.resumePendingPreparation() }
+            Task { await bookDownloads.syncPendingProgress() }
         }
         .onChange(of: model.phase) { _, phase in
             guard phase == .ready else { return }
             Task { await downloads.resumePendingPreparation() }
+            Task { await bookDownloads.syncPendingProgress() }
         }
         #endif
     }

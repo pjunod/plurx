@@ -1,0 +1,41 @@
+/* Full-screen web reader. Publication typography is injected by reader.js
+   inside the sandboxed frame; these rules style Cinema's trusted controls. */
+.reader-shell{position:fixed;inset:0;z-index:240;background:var(--bg);color:var(--text);display:grid;grid-template-rows:auto 1fr auto;min-width:0;min-height:0}
+.reader-top{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel);min-width:0}
+.reader-top h1{font-size:15px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.reader-top .reader-progress{font-size:12px;color:var(--muted);white-space:nowrap}
+.reader-spacer{flex:1}
+.reader-body{display:grid;grid-template-columns:minmax(220px,280px) minmax(0,1fr);min-height:0;min-width:0}
+.reader-panel{border-right:1px solid var(--line);background:var(--panel);min-height:0;overflow:auto;padding:12px}
+.reader-panel[hidden]{display:none}
+.reader-panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:4px 4px 10px}
+.reader-toc,.reader-search-results{display:grid;gap:3px}
+.reader-toc button,.reader-search-results button{appearance:none;border:0;background:transparent;color:var(--text);font:inherit;text-align:left;border-radius:6px;padding:8px;cursor:pointer}
+.reader-toc button:hover,.reader-toc button:focus-visible,.reader-search-results button:hover,.reader-search-results button:focus-visible{background:var(--panel2);outline:2px solid transparent}
+.reader-toc button[aria-current=true]{background:var(--panel2);font-weight:700}
+.reader-search{display:flex;gap:6px;margin-bottom:10px}
+.reader-search input{min-width:0;width:100%;padding:8px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)}
+.reader-result-title{display:block;font-weight:700;font-size:12px;margin-bottom:3px}
+.reader-result-snippet{display:block;color:var(--muted);font-size:12px;line-height:1.35}
+.reader-stage{position:relative;min-height:0;min-width:0;background:#777}
+.reader-frame{display:block;width:100%;height:100%;border:0;background:#fff}
+.reader-loading,.reader-error{position:absolute;inset:0;display:grid;place-content:center;gap:12px;text-align:center;padding:28px;background:var(--bg);z-index:2}
+.reader-loading[hidden],.reader-error[hidden]{display:none}
+.reader-error{color:var(--text)}
+.reader-error p{max-width:46rem;color:var(--muted);margin:0 auto}
+.reader-bottom{display:flex;align-items:center;justify-content:center;gap:10px;padding:8px 14px;border-top:1px solid var(--line);background:var(--panel)}
+.reader-bottom .reader-location{min-width:120px;text-align:center;color:var(--muted);font-size:12px}
+.reader-pop{position:absolute;right:12px;top:54px;z-index:4;width:min(330px,calc(100vw - 24px));padding:14px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);box-shadow:0 12px 38px rgba(0,0,0,.28)}
+.reader-pop[hidden]{display:none}
+.reader-pref-grid{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:center}
+.reader-pref-grid label{font-size:12px;color:var(--muted)}
+.reader-pref-grid select,.reader-pref-grid input{min-width:0;width:100%}
+.reader-pref-grid output{font-size:12px;color:var(--muted)}
+.reader-status{position:absolute;left:50%;bottom:12px;translate:-50% 0;padding:7px 10px;border-radius:999px;background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);font-size:12px;opacity:0;pointer-events:none;transition:opacity .15s}
+.reader-status.on{opacity:1}
+@media(max-width:720px){
+  .reader-top{padding:8px}.reader-top h1{font-size:13px}.reader-top .reader-progress{display:none}
+  .reader-body{grid-template-columns:1fr}.reader-panel{position:absolute;inset:0 auto 0 0;width:min(86vw,320px);z-index:5;box-shadow:10px 0 30px rgba(0,0,0,.35)}
+  .reader-bottom{padding:6px}.reader-bottom .reader-location{min-width:74px}
+}
+@media(prefers-reduced-motion:reduce){.reader-status{transition:none}}

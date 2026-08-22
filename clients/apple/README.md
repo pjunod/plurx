@@ -12,10 +12,25 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `67` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `76` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 67 gives stall recovery somewhere to go: a
+> same regression suite. Build 76 carries the explicit delivered-SDR
+> acknowledgement required for a forced bitmap-subtitle session over an HDR
+> source, without allowing an unplanned HDR downgrade. Build 75 adds online PDFKit reading on iPhone and
+> iPad with exact-revision temporary bytes, page resume, local search, and
+> protected-document refusal. Build 74 consumes Cinema's server-owned ebook
+> format/action registry so detected-but-external formats cannot acquire a
+> false **Read** or offline action. Build 73 keeps reconnect and Settings
+> reachable when an offline download opens first. Build 72 displays bounded book author metadata and
+> exact work-linked editions on browse and detail surfaces. Build 71 keeps pending offline reading state separate
+> for each exact item/file/revision edition. Build 70 adds profile-scoped, atomically published
+> offline EPUB reading and newest-locator replay on iPhone and iPad, with no
+> tvOS action. Build 69 adds in-app online EPUB reading on iPhone
+> and iPad with an isolated, same-origin WebView, memory-only authentication,
+> cross-device locator resume, and no tvOS reader action. Build 68 adds the
+> revision-bound ebook reading-state wire models and authenticated API routes.
+> Build 67 gives stall recovery somewhere to go: a
 > reopen on a growing HLS session now names its exact predecessor with
 > `reopen_reason: "stall"`, so the server answers one rung *down* rather than
 > rebuilding the rung that just starved, states `quality_auto` so a subtitle
@@ -106,6 +121,24 @@ only what this hardware genuinely can't play.
   Another signed-in profile cannot play the saved title but can remove its
   device storage from the Other Profiles section. tvOS exposes none of these
   controls.
+- **App-managed offline EPUB reading on iPhone and iPad.** Cinema downloads the
+  authenticated original, proves the same revision again after transfer,
+  writes the bounded publication into a staging directory, and publishes it
+  with one atomic rename. The Downloads catalogue opens before the server
+  reconnects. Its private-scheme WebView has no bearer or network origin,
+  blocks remote publisher resources, preserves type/layout preferences, and
+  replays only the newest dated locator when the profile reconnects.
+  Interrupted transfers become explicit **Download again** rows; removal
+  touches only the app-private copy. tvOS exposes no reader or ebook-download
+  action.
+- **Online PDF reading on iPhone and iPad.** Cinema downloads the authenticated
+  original into an app-private temporary directory, requires the exact
+  server-advertised revision, and renders it with PDFKit. Page navigation,
+  pinch zoom, selection, local search, explicit completion, and cross-device
+  page resume are built in. Cross-origin redirects, password-protected files,
+  accessibility-restricted files, editions above 1 GiB, and changed byte counts
+  fail closed; the temporary file is removed when the reader closes. Offline
+  PDF and tvOS remain external handoff surfaces.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's

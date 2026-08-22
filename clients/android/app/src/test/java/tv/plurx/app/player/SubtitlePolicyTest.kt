@@ -6,6 +6,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.ReopenReason
 import tv.plurx.app.data.SubTrack
 
 /**
@@ -333,18 +334,6 @@ class SubtitlePolicyTest {
         assertNull(body.subtitle_burn)
     }
 
-    @Test
-    fun heightIsAPromiseForBurnsAndOriginalAndARungOtherwise() {
-        assertEquals(2160, sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160))
-        assertEquals(2160, sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.Burn, 2160))
-        assertEquals(2160, sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Plan, 2160))
-        assertNull(sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Plan, 2160))
-        assertEquals(720, sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.NativeSession, 2160))
-        // An unknown source height leaves the promise unmade rather than
-        // inventing a rung the server would then snap.
-        assertNull(sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Burn, null))
-    }
-
     // ---- unifying the server row and the embedded row ----------------------
 
     @Test
@@ -386,6 +375,196 @@ class SubtitlePolicyTest {
         // has nowhere to land, and landing it on the first would show the
         // wrong cues under a row that claims to be the other track.
         assertNull(embeddedTextTrackIndex(1, listOf(srt(0), srt(1)), listOf("en")))
+    }
+
+    // ---- stall reopen fields and quality_auto -----------------------------------
+
+    @Test
+    fun stallReopenCarriesPreviousSessionIdAndReopenReason() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Plan, subtitleIndex = null,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+            previousSessionId = "prev-session-42",
+            reopenReason = ReopenReason.Stall,
+        )
+        assertEquals("prev-session-42", body.previous_session_id)
+        assertEquals(ReopenReason.Stall, body.reopen_reason)
+    }
+
+    @Test
+    fun ordinarySeekOmitsStallFields() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Plan, subtitleIndex = null,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+        )
+        assertNull("no previous_session_id on a seek", body.previous_session_id)
+        assertNull("no reopen_reason on a seek", body.reopen_reason)
+    }
+
+    @Test
+    fun autoBurnSendsQualityAutoTrue() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Burn, subtitleIndex = 1,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+            deliveredDynamicRange = "sdr",
+        )
+        assertEquals(true, body.quality_auto)
+        assertNull("an existing transcode keeps the server's Auto rung", body.height)
+        assertEquals(
+            "the forced PGS track does not downgrade an already-SDR plan",
+            true,
+            body.subtitle_burn_sdr,
+        )
+    }
+
+    @Test
+    fun otherwiseCopyableAutoBurnPreservesSourceHeight() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Burn, subtitleIndex = 1,
+            copyableVideo = true, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+        )
+        assertEquals(2160, body.height)
+        assertEquals(true, body.quality_auto)
+        assertNull("an unacknowledged HDR delivery stays protected", body.subtitle_burn_sdr)
+    }
+
+    @Test
+    fun explicitQualityBurnOmitQualityAuto() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Burn, subtitleIndex = 1,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Q720, sourceHeight = 2160,
+        )
+        assertNull("manual quality burn does not need quality_auto", body.quality_auto)
+    }
+
+    @Test
+    fun autoPlanSessionWithoutBurnOmitQualityAuto() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Plan, subtitleIndex = null,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+        )
+        assertNull("no height sent means no quality_auto needed", body.quality_auto)
+    }
+
+    @Test
+    fun qualityAutoIsFalseForAutoPlanWithExplicitRung() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.NativeSession, subtitleIndex = 2,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Q1080, sourceHeight = 2160,
+        )
+        assertNull("explicit 1080p rung is not a promise-height", body.quality_auto)
+    }
+
+    @Test
+    fun stallReopenWithBurnSendsQualityAutoAndStallFields() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq-stall", startSeconds = 4.0,
+            delivery = SubtitleDelivery.Burn, subtitleIndex = 1,
+            copyableVideo = false, aac = false, preserveDolbyVision = false,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+            previousSessionId = "prev-session-99",
+            reopenReason = ReopenReason.Stall,
+        )
+        assertEquals("prev-session-99", body.previous_session_id)
+        assertEquals(ReopenReason.Stall, body.reopen_reason)
+        assertEquals(true, body.quality_auto)
+    }
+
+    // ---- qualityAuto helper tests -------------------------------------------
+
+    @Test
+    fun qualityAutoIsTrueForAutoBurn() {
+        assertEquals(true, qualityAuto(PlaybackQuality.Auto, SubtitleDelivery.Burn))
+    }
+
+    @Test
+    fun qualityAutoIsFalseForManualBurn() {
+        assertEquals(false, qualityAuto(PlaybackQuality.Q720, SubtitleDelivery.Burn))
+    }
+
+    @Test
+    fun qualityAutoIsFalseForAutoPlan() {
+        assertEquals(false, qualityAuto(PlaybackQuality.Auto, SubtitleDelivery.Plan))
+    }
+
+    @Test
+    fun qualityAutoIsFalseForAutoNativeSession() {
+        assertEquals(false, qualityAuto(PlaybackQuality.Auto, SubtitleDelivery.NativeSession))
+    }
+
+    @Test
+    fun qualityAutoIsFalseForOriginalPlan() {
+        assertEquals(false, qualityAuto(PlaybackQuality.Original, SubtitleDelivery.Plan))
+    }
+
+    @Test
+    fun qualityAutoIsFalseForOriginalBurn() {
+        // Original is not Auto; it is its own special mode that does not need
+        // the flag because the server already treats Original specially.
+        assertEquals(false, qualityAuto(PlaybackQuality.Original, SubtitleDelivery.Burn))
+    }
+
+    @Test
+    fun heightPromiseDistinguishesCopyableBurnFromExistingTranscode() {
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160, copyableVideo = true),
+        )
+        assertNull(
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Burn, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Q720, SubtitleDelivery.Burn, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            2160,
+            sessionHeight(PlaybackQuality.Original, SubtitleDelivery.Plan, 2160, copyableVideo = false),
+        )
+        assertNull(
+            sessionHeight(PlaybackQuality.Auto, SubtitleDelivery.Plan, 2160, copyableVideo = false),
+        )
+        assertEquals(
+            720,
+            sessionHeight(
+                PlaybackQuality.Q720,
+                SubtitleDelivery.NativeSession,
+                2160,
+                copyableVideo = false,
+            ),
+        )
+        // An unknown source height leaves the promise unmade rather than
+        // inventing a rung the server would then snap.
+        assertNull(
+            sessionHeight(
+                PlaybackQuality.Original,
+                SubtitleDelivery.Burn,
+                null,
+                copyableVideo = false,
+            ),
+        )
     }
 
     @Test

@@ -818,7 +818,10 @@ func continueWatchingTimeRemaining(_ item: Item) -> String? {
 /// watch carries the genuinely useful remaining time.
 func cardShelfMetadata(_ item: Item) -> String {
     var parts: [String] = []
-    if let season = item.seasonNumber, let episode = item.episodeNumber {
+    if let author = item.author, !author.isEmpty,
+       item.isBook || item.isAudiobook {
+        parts.append(author)
+    } else if let season = item.seasonNumber, let episode = item.episodeNumber {
         parts.append("S\(season) E\(episode)")
     } else if let year = item.year {
         parts.append(String(year))

@@ -64,6 +64,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The recorded base sha is the target tip at event time, not now. Two
+      # branches that write the same build counter auto-merge with no conflict
+      # and no BEHIND signal in this job, so a branch bumped to N stays green
+      # forever once an unrelated release bump lands N on the target. Re-fetch
+      # the target here so the counter is compared against what the target
+      # actually ships, while the recorded base still scopes which release
+      # inputs this branch touched.
+      - name: Resolve the current merge target
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          echo "MERGE_TARGET=origin/$BASE_REF" >> "$GITHUB_ENV"
       - name: Check mobile release hygiene
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -72,6 +87,7 @@ jobs:
             && git cat-file -e "$VALIDATION_BASE^{commit}" 2>/dev/null; then
             PLURX_VALIDATION_MODE=changed-from \
               PLURX_VALIDATION_BASE="$VALIDATION_BASE" \
+              PLURX_VALIDATION_MERGE_TARGET="$MERGE_TARGET" \
               python3 -m validation.mobile_versions
           else
             python3 -m validation.mobile_versions
@@ -108,7 +124,10 @@ jobs:
     # Kotlin and Swift diffs compile nothing under crates/, so the cargo lane
     # only runs when the diff can reach it; the merge queue re-runs it always.
     if: needs.scope.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    # Pinned, not floating: this job's playback assertions are written against
+    # one ffmpeg major, and apt on `ubuntu-latest` supplies whichever one that
+    # week's image ships. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -120,22 +139,32 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Functionality-point selection can include real-browser contracts (for
+      # example the EPUB reader) in this job. Keep this provisioning beside
+      # the validator rather than relying on the parallel web-layout job: each
+      # selected check must be runnable in the process that claims it.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.62.0
       # plurxd shells out to ffmpeg, and the transcode and stream tests drive
       # that far enough to spawn it — they don't need it to succeed on the
       # placeholder fixtures, they need a child process to exist so there is a
       # session to make assertions about. The runner image doesn't ship ffmpeg,
       # so without this those tests fail on `No such file or directory`, which
       # is an absent dependency rather than anything wrong with the tree.
-      - name: Install ffmpeg
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
+          python3 -m pip install playwright==1.62.0
+          python3 -m playwright install --with-deps chromium
       # Keep the portable baseline and focused Linux contracts in this job.
-      # Browser and Android JVM checks are selected by the same impact graph,
-      # but delegated to parallel jobs below instead of serializing the gate.
+      # The large UI-golden sweep and Android JVM checks are selected by the
+      # same impact graph, but delegated to parallel jobs below instead of
+      # serializing the gate. Focused browser contracts run here when selected.
       - name: Validate functionality points
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -158,37 +187,19 @@ jobs:
           path: target/validation
           if-no-files-found: warn
 
-  hiqlite_spike:
-    name: hiqlite M0 semantic proof
-    needs: [scope, preflight]
-    if: needs.scope.outputs.hiqlite_spike == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: hiqlite-spike
-          # The spike is its own workspace with its own lockfile and target
-          # dir; without this line its 400-crate build lands outside the cache
-          # and every run pays it cold.
-          workspaces: |
-            . -> target
-            spikes/hiqlite-m0 -> spikes/hiqlite-m0/target
-      - name: Compile and lint the isolated harness
-        run: cargo clippy --locked --manifest-path spikes/hiqlite-m0/Cargo.toml --all-targets -- -D warnings
-      - name: Run the three-voter semantic proof
-        run: make hiqlite-spike
-
   cluster_auth:
-    name: three-voter replicated store contracts
+    name: replicated storage contracts
     needs: [scope, preflight]
-    if: needs.scope.outputs.cluster_auth == 'true'
+    if: >-
+      needs.scope.outputs.cluster_auth == 'true' ||
+      needs.scope.outputs.hiqlite_spike == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    env:
+      # The M0 proof has its own manifest, but not its own dependency build.
+      # Sharing the root target lets it reuse the Hiqlite/OpenRaft graph that
+      # cluster-check just compiled instead of paying for ~400 crates twice.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -198,13 +209,22 @@ jobs:
         with:
           key: hiqlite-cluster-auth
       - name: Run separate-process replica and failure contracts
+        if: needs.scope.outputs.cluster_auth == 'true'
         run: make cluster-check
+      - name: Lint the isolated semantic harness
+        if: needs.scope.outputs.hiqlite_spike == 'true'
+        run: cargo clippy --locked --manifest-path spikes/hiqlite-m0/Cargo.toml --tests --no-deps -- -D warnings
+      - name: Run the three-voter semantic proof
+        if: needs.scope.outputs.hiqlite_spike == 'true'
+        run: make hiqlite-spike
 
   web_layout:
     name: web layout and accessibility
     needs: [scope, preflight]
     if: needs.scope.outputs.web_layout == 'true'
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as `check`: a browser sweep still plays media
+    # through ffmpeg. See .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -219,13 +239,11 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-1.62.0
-      - name: Install media and browser prerequisites
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
+      - name: Install browser prerequisites
         run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
           python3 -m pip install playwright==1.62.0
           python3 -m playwright install --with-deps chromium
       - name: Check every affected web layout
@@ -410,7 +428,9 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    # Same suite as `check`, so the same pinned ffmpeg. See
+    # .github/actions/ffmpeg.
+    runs-on: ubuntu-24.04
     needs: check
     timeout-minutes: 30
     # PR coverage was a second run of the Rust suite whose result was discarded;
@@ -430,13 +450,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Instrumented or not, this runs the same suite as the check job, so it
       # needs the same ffmpeg.
-      - name: Install ffmpeg
-        run: |
-          sudo sed -i \
-            's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y ffmpeg
+      - uses: ./.github/actions/ffmpeg
+        with:
+          major: "6"
       - name: Measure line coverage
         run: cargo llvm-cov --workspace --summary-only --json --output-path cov.json
       - name: Build the shields.io badge JSON
@@ -564,7 +580,6 @@ jobs:
       - mobile_version
       - preflight
       - check
-      - hiqlite_spike
       - cluster_auth
       - web_layout
       - android_jvm
@@ -581,7 +596,6 @@ jobs:
           MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           CHECK_RESULT: ${{ needs.check.result }}
-          HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}
           CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}
           WEB_LAYOUT_RESULT: ${{ needs.web_layout.result }}
           ANDROID_JVM_RESULT: ${{ needs.android_jvm.result }}
@@ -593,7 +607,7 @@ jobs:
           for result in \
             "$SCOPE_RESULT" "$MOBILE_VERSION_RESULT" \
             "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
-            "$HIQLITE_SPIKE_RESULT" "$CLUSTER_AUTH_RESULT" \
+            "$CLUSTER_AUTH_RESULT" \
             "$WEB_LAYOUT_RESULT" \
             "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \
             "$BUILD_RESULT" "$DOCKER_RESULT"; do

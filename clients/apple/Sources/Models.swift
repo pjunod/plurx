@@ -60,6 +60,10 @@ struct Item: Codable, Identifiable, Hashable {
     var airDate: String?
     var recordedAt: String?
     var tags: [String]?
+    var author: String? = nil
+    var bookWorkId: String? = nil
+    var bookEditionId: String? = nil
+    var bookMetadataSource: String? = nil
     var resolution: Int?
     var media: ItemMedia?
     var childCount: Int?
@@ -324,6 +328,53 @@ struct MediaFile: Codable, Identifiable {
     var partOffsetMs: Int? = nil
     var chapters: [BookChapter]? = nil
     var available: Bool? = true
+    /// The server's format/action registry for this exact file. Optional for
+    /// compatibility with servers that predate the registry.
+    var reader: ReaderCapability? = nil
+    /// Exact edition identity required by a native document reader when it
+    /// saves a locator. Older servers omit it and never advertise PDF Read.
+    var readerRevision: ReadingRevision? = nil
+
+    var isEpub: Bool {
+        container?.lowercased() == "epub"
+            || filename?.lowercased().hasSuffix(".epub") == true
+    }
+}
+
+enum ReaderAction: String, Codable, Equatable {
+    case read
+    case openIn = "open_in"
+    case unavailable
+}
+
+struct ReaderSurfaceCapability: Codable, Equatable {
+    let online: ReaderAction
+    let offline: ReaderAction
+}
+
+struct ReaderCapability: Codable, Equatable {
+    let format: String
+    let web: ReaderSurfaceCapability
+    let apple: ReaderSurfaceCapability
+    let android: ReaderSurfaceCapability
+    let television: ReaderSurfaceCapability
+}
+
+enum BookReaderPolicy {
+    static func canRead(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader {
+            guard reader.apple.online == .read else { return false }
+            return reader.format != "pdf" || file.readerRevision != nil
+        }
+        return file.isEpub
+    }
+
+    static func canDownload(_ file: MediaFile, onTelevision: Bool) -> Bool {
+        guard !onTelevision, file.available != false else { return false }
+        if let reader = file.reader { return reader.apple.offline == .read }
+        return file.isEpub
+    }
 }
 
 /// One subtitle stream exactly as item detail reports it (`FileDto`'s
@@ -416,11 +467,115 @@ struct BookChapter: Codable, Hashable {
     let endMs: Int
 }
 
+struct ReadingRevision: Codable, Hashable {
+    let size: Int
+    let mtime: Int
+}
+
+struct ReadingLocations: Codable, Hashable {
+    var fragments: [String]?
+    var progression: Double?
+    var totalProgression: Double?
+    var position: Int?
+}
+
+struct ReadingText: Codable, Hashable {
+    var before: String?
+    var highlight: String?
+    var after: String?
+}
+
+struct ReadingCinemaLocator: Codable, Hashable {
+    var path: [Int]?
+    var text: String?
+}
+
+struct ReadingLocator: Codable, Hashable {
+    let version: Int
+    let href: String
+    var type: String?
+    var title: String?
+    var locations: ReadingLocations?
+    var text: ReadingText?
+    var cinema: ReadingCinemaLocator?
+}
+
+struct PublicationMetadata: Codable, Hashable {
+    let title: String
+    var author: String?
+    var identifier: String?
+    var language: String?
+}
+
+struct PublicationLink: Codable, Hashable {
+    let href: String
+    let type: String
+    var title: String?
+}
+
+struct PublicationTocLink: Codable, Hashable {
+    let href: String
+    let title: String
+    var children: [PublicationTocLink]
+}
+
+struct PublicationManifest: Codable, Hashable {
+    let metadata: PublicationMetadata
+    let readingOrder: [PublicationLink]
+    let resources: [PublicationLink]
+    let toc: [PublicationTocLink]
+}
+
+struct PublicationLimits: Codable, Hashable {
+    let entries: Int
+    let totalUncompressedBytes: Int64
+    let resourceBytes: Int64
+    let markupBytes: Int64
+    let compressionRatio: Int64
+    let concurrentResourceReads: Int
+    let resourceChunkBytes: Int
+}
+
+struct OpenPublicationResponse: Codable, Hashable {
+    let sessionId: String
+    let resourceBase: String
+    let expiresIn: Int
+    let fileId: Int
+    let revision: ReadingRevision
+    let publication: PublicationManifest
+    let limits: PublicationLimits
+}
+
+struct ReadingState: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    let updatedAt: Int
+}
+
+struct ReadingStateResponse: Codable, Hashable {
+    let state: ReadingState?
+    let stale: Bool
+}
+
+struct PutReadingStateRequest: Codable, Hashable {
+    let fileId: Int
+    let revision: ReadingRevision
+    let locator: ReadingLocator
+    let progression: Double
+    let completed: Bool
+    var recordedAt: Int?
+}
+
 struct ItemDetail: Codable {
     let item: Item
     var files: [MediaFile]?
     var children: [Item]?
     var ancestors: [Item]?
+    var reading: ReadingState?
+    var editions: [Item]? = nil
 }
 
 struct Marker: Codable, Hashable {
@@ -648,6 +803,10 @@ struct CreateSessionRequest: Codable {
     var audio: Int?
     /// A bitmap or styled-text subtitle the server must draw into the video.
     var subtitleBurn: Int?
+    /// True only when the selected plan already delivers SDR. This lets an
+    /// HDR source keep a forced bitmap subtitle on an existing tone-map
+    /// without authorizing an HDR delivery to be silently downgraded.
+    var subtitleBurnSDR: Bool?
     /// Ask for an HLS master containing native WebVTT subtitle renditions.
     var nativeSubtitles: Bool?
     /// The initial native media-selection option. It does not alter video.

@@ -38,14 +38,22 @@ uuid = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 quick-xml = { workspace = true }
+zip = { workspace = true }
+# Select zip's already-used pure-Rust DEFLATE backend when plurx-core is
+# tested alone (plurxd also depends on flate2, but feature unification must not
+# be the reason EPUB parsing works).
+flate2 = { workspace = true }
 kamadak-exif = { workspace = true }
 # Metadata
 reqwest = { workspace = true }
+futures-util = { workspace = true }
 # Auth
 argon2 = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
+libc = { workspace = true }
 # Envelope encryption for the Trakt bearer credential (CLUSTERING-PLAN §3.2).
 # Already in the tree via hiqlite's cryptr, so this adds no new compiled crate.
 chacha20poly1305 = { workspace = true }

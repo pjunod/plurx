@@ -178,13 +178,58 @@ inside one Books library while keeping their actions and metadata honest.
   library cards and details. The web player also provides one cross-part
   scrubber; native scrubbers seek within the current physical part and advance
   automatically at its end.
+- **Ebook reading state is durable and profile-scoped.** Cinema stores a
+  versioned publication locator against the exact file revision, replicates it
+  through Hiqlite, rejects stale offline rewinds, and exposes authenticated
+  get/save/clear routes to web and native clients. Replacing an edition cannot
+  resume into the wrong text.
+- **EPUB publication serving is bounded and capability-scoped.** Cinema parses
+  EPUB 2 NCX and EPUB 3 navigation into one normalized manifest, then serves
+  only declared resources through a short-lived, revision-bound capability and
+  a bounded streaming decompressor rather than buffering whole child files.
+  Archive traversal, encryption, decompression bombs, scripts, and remote
+  publication network loads fail closed.
+- **Web EPUB reading is built in.** An available EPUB exposes **Read** or
+  **Resume reading** on non-TV web surfaces. The reader provides authored TOC
+  navigation, paginated/scrolled layouts, type/theme controls, bounded local
+  search, explicit finish/unfinish, revision-bound resume, and **Open in…** /
+  **Download original** fallbacks. Publication scripts and remote requests
+  stay inert inside the sandboxed frame.
+- **Native online EPUB reading is built in.** iPhone, iPad, and Android
+  phone/tablet details expose the same **Read**, **Resume reading**, and **Read
+  again** states, then host the proven web publication core in an isolated
+  WebView. The account bearer stays in memory, native navigation is restricted
+  to the Cinema origin and publication capability, closing flushes the newest
+  locator, and a profile or server change dismisses the book. tvOS and
+  Google TV deliberately expose no reader action.
+- **Native online PDF reading is built in on iPhone and iPad.** PDFKit renders
+  authenticated originals from an app-private temporary directory, page
+  changes save revision-bound locators, and local search never leaves the
+  device. The loader rejects an edition whose byte count changed, PDFs above
+  1 GiB, password-protected documents, and files that prohibit accessibility
+  extraction. The temporary copy is removed on close. Web, Android, offline,
+  and television PDF actions remain **Open in…** or unavailable as the support
+  registry states.
+- **Cinema-managed EPUB downloads are built in on iPhone, iPad, and Android
+  phone/tablet.** Each app
+  records a recoverable intent before transfer, downloads the authenticated
+  original, reopens the publication to prove its exact size/mtime revision,
+  materializes only the server-bounded declared resources, and atomically
+  publishes the app-private result. Downloads opens with plurxd stopped; its
+  token-free private-scheme or synthetic-origin reader blocks all HTTP(S)
+  publication loads and queues the newest dated locator for reconnect. The
+  automated storage, reader, and sync contracts are green; the physical
+  airplane-mode/reconnect matrix remains an unclaimed release check.
 - **Audiobook offline packages are not shipped yet.** Native clients hide the
   existing video-only download action for audiobooks; playback currently needs
   access to the server even when the source would otherwise direct-play.
-- **No book metadata provider or built-in ebook renderer.** Titles/authors come
-  from the file/folder layout and audio facts from the container. The client
-  hands an ebook to the browser/platform viewer. DRM-protected books are not
-  decrypted, and cover extraction is not yet implemented.
+- **Book facts and covers are durable.** Standalone EPUBs contribute bounded
+  package title, author, identifier, and embedded cover data without expanding
+  the archive; covers land only in Cinema's artwork cache. A paired Curator
+  handoff has higher precedence and supplies exact work/edition keys. Only a
+  shared explicit work key relates text and audio editions—title plus author
+  is never enough. **Open in…** remains available, and DRM-protected books are
+  not decrypted.
 
 **How to read it:** a numbered set of audio tracks inside one title directory
 is one audiobook, not several editions. Chapter rows only appear when chapters
@@ -204,8 +249,10 @@ the physical Apple/Android device matrix remains a release acceptance step.
   shows filenames and no posters.
 - **AniList** agent for anime, **no key required**: absolute-numbering ordering,
   title variants, artwork.
-- **Books are local-only:** no provider lookup or guessed artwork. Audiobook
-  technical metadata and chapters come from the stored scan-time probe.
+- **Books use bounded local package facts or an explicit Curator handoff:** no
+  fuzzy provider lookup or guessed relation. Artwork is cached under Cinema's
+  data directory; media library paths remain read-only. Audiobook technical
+  metadata and chapters still come from the stored scan-time probe.
 - **Artwork cached locally** (posters, backdrops, season posters); provider JSON
   cached too. Once enriched, a library works **offline forever** — no provider
   is contacted to browse or play.
@@ -405,17 +452,27 @@ decoding shows what the file is versus what your browser is actually rendering.
 - **Skip Intro / Skip Credits** buttons appear when playback enters a marked
   region. Markers come from real **chapters** (MakeMKV, anime OP/ED, hand-
   authored titles), read from the scan-time probe rather than by re-probing the
-  file every time you press Play; a conservative duration-based end-credits
-  estimate is the fallback when a file has no chapters. Skipping credits that
-  run to the end finishes the item.
+  file every time you press Play — and a chapter has to sit where its title
+  claims, so a scene called "Closing Time" halfway through an episode does not
+  become a Skip Credits button. When no chapter title names the credits, the
+  window is inferred: from the file's final chapter boundary when that lands in
+  a plausible tail, and from the runtime alone when it does not — about 2.5% of
+  it, so a 22-minute episode gets roughly the last 30 seconds and a two-hour
+  film three minutes, which is where it caps. The inference errs late on
+  purpose: a button that opens a little way into the credits costs you a few
+  seconds, one that opens early interrupts the show. Skipping credits that run
+  to the end finishes the item.
 - **Auto-skip** intro & credits — an opt-in, per-user, persisted toggle in the
   preferences menu (default off).
 - **Method-aware seek:** direct play seeks natively; remux and transcode restart
   the server stream at the new offset.
 
-**How to read it:** a "Skip Credits" button that reads as an estimate exists
-because that file had no end-credits chapter — it's a guess and the timeline
-knows it. Chapter-derived buttons are exact.
+**How to read it:** a "Skip Credits · Estimated" button exists
+because no chapter in that file was *titled* as the end credits — where it
+starts is inferred, and the timeline knows it. That holds even when the start
+came from a real final chapter boundary and is exact to the frame: the boundary
+is real, what it contains was never confirmed. Buttons drawn from a chapter that
+names itself are exact in both senses.
 
 **How to read the Server block:** encode speed below 1× means the server
 cannot produce the stream as fast as you are watching it, and a stall is only
@@ -670,8 +727,8 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   owns those fields and would overwrite them on the next refresh. Manual
   fix-match is a separate, planned feature.
 - **Does not fingerprint or ML-guess intros.** Skip markers come from chapters
-  (plus one honest duration-based credits estimate). A wrong "Skip Intro" that
-  jumps into a scene is worse than none.
+  (plus one honest credits inference, from the final chapter boundary or the
+  runtime). A wrong "Skip Intro" that jumps into a scene is worse than none.
 - **Does not transcode by default or pre-bake renditions.** Transcode is on
   demand, only when a device forces it. There is no "optimize library."
 - **Does not run a cluster yet.** HA is decided and spiked (§8) but Phase 4;

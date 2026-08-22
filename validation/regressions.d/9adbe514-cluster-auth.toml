@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["9adbe514"]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The retained fixed-clock three-voter store contracts synchronize 120 token and API-key requests behind one process gate, distribute 120 token requests across three independent gates, and assert exact applied-index budgets; restoring the unreserved read-then-update path exceeds those bounds, while disabled and deleted API keys prove authorization failures append no activity entry."
