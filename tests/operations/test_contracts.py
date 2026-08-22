@@ -74,6 +74,10 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn('${PLURX_GDM_PORT:-32414}:32414/udp', compose)
         self.assertIn('user: "${PUID:-1000}:${PGID:-1000}"', compose)
         self.assertIn('PLURX_BUILD_REF: ${PLURX_BUILD_REF:-}', compose)
+        self.assertIn(
+            'PLURX_NODE_HOSTNAME: "${PLURX_NODE_HOSTNAME:-${HOSTNAME:-}}"',
+            compose,
+        )
 
     def test_discovery_uses_host_network_without_stealing_it_from_the_server(self):
         compose = read("deploy/docker-compose.yml")
@@ -95,8 +99,13 @@ class OperationsContractCase(unittest.TestCase):
         )
         command = result.stdout
         self.assertIn("cd deploy && PLURX_BUILD_REF=", command)
+        self.assertIn("PLURX_NODE_HOSTNAME=", command)
         self.assertIn("docker compose up -d --build", command)
         self.assertNotIn("-f deploy/docker-compose.yml", command)
+
+        makefile = read("Makefile")
+        self.assertIn("HOST_SHORTNAME := $(shell hostname -s", makefile)
+        self.assertIn('PLURX_NODE_HOSTNAME="$(HOST_SHORTNAME)"', makefile)
 
         dockerfile = read("Dockerfile")
         compose = read("deploy/docker-compose.yml")

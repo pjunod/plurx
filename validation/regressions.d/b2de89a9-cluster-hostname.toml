@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["b2de89a9"]
+points = ["cluster.membership", "operations.packaging"]
+checks = ["rust-gate", "operations-contract"]
+reason = "The retained Rust regression rejects both Docker's ordinary twelve-character hostname and its full sixty-four-character container id, so ephemeral runtime identity cannot become the cluster roster's primary machine name again. The operations contract separately pins the deploy path: `make docker-up` must derive and pass `HOST_SHORTNAME`, and direct Compose must retain the host-environment fallback. Together those checks cover both accepting only real short hostnames and actually delivering the physical host name into a container."
