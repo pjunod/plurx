@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["c764d6f5"]
+points = ["cluster.membership", "web.experience", "operations.packaging"]
+checks = ["rust-gate", "cluster-auth", "web-membership", "operations-contract", "resource-bounds"]
+reason = "The retained cluster harness proves node-specific artwork addressing even when the join URL is shared, one-write rotating repair contention, removal-fence revocation, tombstone-preserving heartbeats, follower removal, leader self-leave, and degraded 4→3 handoff. Rust and web regressions cover singleflight/global fetch bounds, filename-bound peer proofs, short-hostname-safe local-node leave binding, and refusal rendering, while the operations contract pins the node-specific artwork URL and same-backend JSON leave procedure. Reverting the correction restores replicated-write amplification, load-balancer ambiguity, or a removed voter that can keep using cluster-side effects."
