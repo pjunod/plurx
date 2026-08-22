@@ -717,7 +717,7 @@
   .specs .trk{border:1px solid var(--line);border-radius:999px;padding:2px 9px;line-height:1.5}
   .specs .trk.on{border-color:var(--accent);color:var(--accent)}
   .specs .trk .tdef{font-weight:600}
-  /* Large subtitle inventories stay out of the way until they are wanted.
+  /* Large track inventories stay out of the way until they are wanted.
      Native details/summary keeps the disclosure keyboard-accessible without
      adding another page-level state machine. The server-selected track is the
      one line that remains visible while the disclosure is closed. */
@@ -4261,7 +4261,7 @@ function trackFactRow(label, tracks, selectedIndex, chip, note, collapse=false){
   if(tracks.length){
     if(collapse&&tracks.length>1){
       // Lead with what actually plays, rather than assuming the container's
-      // first subtitle is the useful one. The remaining source-ordered tracks
+      // first track is the useful one. The remaining source-ordered tracks
       // stay present in the document and are one click/tap away.
       const primary=tracks.find(t=>t.index===selectedIndex)||tracks[0];
       const rest=tracks.filter(t=>t!==primary);
@@ -4284,7 +4284,7 @@ function specBlock(f){
   // emptier than it was.
   const audRow=ad
     ? trackFactRow("Audio", auds, ad.selected_index==null?-1:ad.selected_index,
-        (a,on)=>trackChip(audioFactLabel(a),on), preferredLanguageNote("audio",ad))
+        (a,on)=>trackChip(audioFactLabel(a),on), preferredLanguageNote("audio",ad), true)
     : `<dt>Audio</dt><dd>${esc(auds.map(audioLabel).filter(Boolean).join("  /  ")||"—")}</dd>`;
   // Subtitles were previously not on this page at all: the only way to learn a
   // file's subtitles was to start playback and open the CC menu. A file with
