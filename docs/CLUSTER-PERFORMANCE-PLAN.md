@@ -499,11 +499,14 @@ documented discontinuity behavior.
 
 Membership PRs #490 and #491 own overlapping changes in
 `crates/plurx-cluster-check/src/lib.rs`, `crates/plurx-core/tests/store_contract.rs`,
-`docs/CLUSTERING-PLAN.md`, and `docs/OPERATIONS.md`. P0 waits for both and
-rebases before extending the harness or operations contract. P1 may develop in
-parallel, but it rebases after #490 before merge because its physical-entry
-test shares `store_contract.rs`. Later milestones extend the merged M5/M6
-contracts rather than copying them into a second harness or document.
+`docs/CLUSTERING-PLAN.md`, and `docs/OPERATIONS.md`. At this plan revision #491
+has landed and #490 remains open. P0 waits for #490 and rebases before extending
+its harness or operations contract. P1 may develop in parallel with #490
+because it has no semantic dependency, but the two share `store_contract.rs`:
+whichever becomes merge-ready first may land, then the other rebases, resolves
+the shared contract deliberately, and reruns its required CI. Later milestones
+extend the merged M5/M6 contracts rather than copying them into a second
+harness or document.
 
 Before opening each PR, compare its path list with every open cluster PR. One
 branch owns a shared contract at a time; another either waits, moves an
