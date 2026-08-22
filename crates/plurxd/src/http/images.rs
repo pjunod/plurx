@@ -265,6 +265,13 @@ async fn fetch_peer_artwork_with_auth(
             tracing::warn!(peer, "ignoring invalid artwork peer URL");
             return None;
         };
+        // Own every value crossing the async boundary. Borrowing the iterator
+        // item here makes the composed handler future lifetime-specific, which
+        // prevents Axum routes and the reconciliation task from satisfying
+        // their higher-ranked Send bounds.
+        let peer = peer.clone();
+        let client = client.clone();
+        let auth = auth.clone();
         Some(async move {
             let response = match client
                 .get(url)

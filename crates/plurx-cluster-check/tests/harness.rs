@@ -696,9 +696,10 @@ fn the_request_and_response_encoding_is_stable() {
         serde_json::to_string(&Response::Metrics {
             leader: Some(1),
             voters: vec![1, 2, 3],
+            applied_index: None,
         })
         .expect("encode"),
-        r#"{"Metrics":{"leader":1,"voters":[1,2,3]}}"#
+        r#"{"Metrics":{"leader":1,"voters":[1,2,3],"applied_index":null}}"#
     );
 
     let decoded: Request =
