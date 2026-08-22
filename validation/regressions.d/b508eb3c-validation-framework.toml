@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["b508eb3c"]
+points = ["validation.framework"]
+checks = ["catalog-contract", "history-regressions"]
+reason = "The retained catalog contract requires the isolated cluster spike paths to belong to their current behavior point, and the history audit requires the lockfile correction to remain attached to the cluster-auth check that exercises `cargo clippy --locked` before the three-voter proof."

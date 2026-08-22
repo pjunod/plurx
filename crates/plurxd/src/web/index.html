@@ -9398,6 +9398,7 @@ let CLUSTER_LOADED=false;
 // The last removal refusal, held so its sentence stays readable. A toast is
 // 2.2 seconds and these answers are paragraphs.
 let CLUSTER_REFUSAL=null;
+let CLUSTER_LEAVING=false;
 // A minted join token lives here and nowhere else — never localStorage, never
 // the URL, never a log. Until it is redeemed or expires it is the complete
 // authority to join a node to this cluster (docs/SECURITY.md), so it is held
@@ -9479,9 +9480,9 @@ function membershipRefusalText(code,message){
       "downloads here, then retry the removal. plurx will move work only when a surviving node proves "+
       "it can read the source; otherwise it fails the package cleanly so the client can request it again.",
     cluster_leader_removal_refused:
-      "This node is the cluster's current leader, and a leader cannot remove itself. Leadership moves to "+
-      "another voter on its own when this node restarts or stops being reachable; wait for that, then "+
-      "try the removal again.",
+      "That node is the cluster's current leader, so another voter cannot remove it remotely. Open Cinema "+
+      "on the leader itself and use Leave this cluster; it elects and confirms a successor before committing "+
+      "its own removal, and then shuts down.",
     cluster_node_not_found:
       "This node is not in the cluster's current membership — it may already have been removed from "+
       "another browser or another server. The current roster is being refreshed now.",
@@ -9539,7 +9540,7 @@ function clusterPanel(d){
       — the same reading as the Server card on the System tab.</div>
     ${statusFailure?`<div class="row" style="margin-top:10px"><button class="ghost sm" onclick="retryCluster()">Retry roster</button></div>`:""}
     ${clusterRefusalHtml()}
-    ${clustered?joinPanel():""}</div>`;
+    ${clustered?joinPanel()+leavePanel():""}</div>`;
 }
 function retryCluster(){
   CLUSTER_LOADED=false;
@@ -9565,6 +9566,17 @@ function joinPanel(){
       <button onclick="mintJoinToken(this)">Create a join token</button></div>
     <div class="hint">A join token is single-use and short-lived, and it is shown once. Create it when the
       other machine is ready to start, not before.</div>`;
+}
+function leavePanel(){
+  if(CLUSTER_LEAVING) return `<h2 class="section">Remove this node</h2>
+    <div class="clstate calm"><h3>Leaving the cluster</h3><p>The membership change committed. This
+      Cinema node is draining connections and will shut down.</p></div>`;
+  return `<h2 class="section">Remove this node</h2>
+    <button class="ghost sm" onclick="leaveCluster(this)">Leave this cluster</button>
+    <div class="hint">A graceful leave is permanent, not an update or restart action. This node resolves
+      its owned offline work and, if it is the leader, elects and confirms a successor before committing its
+      own removal. It then drains and shuts down. Rejoining this machine requires a fresh data directory and
+      a new join token.</div>`;
 }
 // Deliberately loud. Anyone holding the complete token can join a node to this
 // cluster until it is redeemed or expires, so this says that plainly rather
@@ -9628,6 +9640,21 @@ async function removeNode(nodeId){
     // render below start a fresh read immediately instead of telling the
     // operator to act on stale rows.
     if(e.code==="cluster_node_not_found") CLUSTER_LOADED=false;
+  }
+  renderSettings();
+}
+async function leaveCluster(btn){
+  if(!confirm(`Permanently remove this Cinema node from the cluster and shut it down?\n\n`+
+    `Do not use this for an update or restart. Rejoining requires discarding this node's old Cinema `+
+    `data directory and using a new join token. Media files are not touched.`)) return;
+  CLUSTER_REFUSAL=null;
+  const was=btn.textContent; btn.disabled=true; btn.textContent="Leaving…";
+  try{
+    await api("/cluster/leave",{method:"POST"});
+    CLUSTER_LEAVING=true;
+  }catch(e){
+    btn.disabled=false; btn.textContent=was;
+    CLUSTER_REFUSAL={node_id:"This node",code:e.code,message:e.message};
   }
   renderSettings();
 }

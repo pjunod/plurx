@@ -135,6 +135,7 @@ const MEDIA_METHODS: &[&str] = &[
     "episodes_for_show",
     "items_needing_artwork",
     "items_missing_artwork",
+    "items_with_artwork",
     "items_missing_genres",
     "update_item_fields",
     "set_nfo_seeded",
@@ -2727,7 +2728,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 144, "review the Store method count");
+    assert_eq!(declared.len(), 145, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -3373,6 +3374,17 @@ async fn media_contract_runs_through_dyn_store() {
             Some("books/curator-cover.jpg")
         );
         assert_eq!(enriched.book_metadata_source.as_deref(), Some("curator"));
+        let artwork_items = store
+            .items_with_artwork()
+            .await
+            .expect("inventory artwork references");
+        assert_eq!(artwork_items.len(), 1, "backend {backend}");
+        assert_eq!(artwork_items[0].id, ebook, "backend {backend}");
+        assert_eq!(
+            artwork_items[0].poster_path.as_deref(),
+            Some("books/curator-cover.jpg"),
+            "backend {backend}"
+        );
         assert_eq!(
             store
                 .find_book(
