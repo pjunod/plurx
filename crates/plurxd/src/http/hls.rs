@@ -140,6 +140,12 @@ pub struct CreateSession {
     /// cannot render itself — a bitmap track (PGS/VobSub) has no text to send,
     /// so the only way to show it is to draw it into the frames.
     pub subtitle_burn: Option<i64>,
+    /// Explicit acknowledgement that the already-selected playback plan
+    /// delivers SDR. This distinguishes a forced bitmap subtitle added to an
+    /// existing HDR-to-SDR transcode from a subtitle that would silently
+    /// downgrade an otherwise-HDR delivery. Absent stays fail-closed for old
+    /// clients.
+    pub subtitle_burn_sdr: Option<bool>,
     /// Advertise the source's lossless WebVTT-convertible tracks in an HLS
     /// master playlist. Native Apple clients opt in; older HLS consumers keep
     /// receiving the media playlist shape they already understand.
@@ -215,12 +221,17 @@ const HDR_SUBTITLE_BURN_REFUSAL: &str =
     "That subtitle requires an SDR burn-in. HDR playback was kept unchanged.";
 
 /// Old clients can still post `subtitle_burn` without first applying the
-/// native clients' HDR guard. Session creation has no trustworthy copy of the
-/// client's prior delivery plan, so a known HDR source must fail closed: an
-/// explicit burn is never permission to replace DV, HDR10, or HLG with SDR.
-/// SDR and unprobed sources keep the existing burn path.
-fn hdr_subtitle_burn_is_refused(source: Option<&MediaFile>, subtitle_burn: Option<i64>) -> bool {
+/// native clients' HDR guard. A known HDR source therefore fails closed unless
+/// the client explicitly acknowledges that its selected plan already delivers
+/// SDR. That acknowledgement is safe for an existing tone-map and remains
+/// absent when the burn would replace DV, HDR10, or HLG with SDR.
+fn hdr_subtitle_burn_is_refused(
+    source: Option<&MediaFile>,
+    subtitle_burn: Option<i64>,
+    subtitle_burn_sdr: Option<bool>,
+) -> bool {
     subtitle_burn.is_some_and(|index| index >= 0)
+        && subtitle_burn_sdr != Some(true)
         && source.is_some_and(|file| {
             matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"))
         })
@@ -271,7 +282,7 @@ pub async fn create(
     // response, and the snap's source-height escape. One read, from the read
     // pool.
     let source = state.store.get_file(id).await?;
-    if hdr_subtitle_burn_is_refused(source.as_ref(), req.subtitle_burn) {
+    if hdr_subtitle_burn_is_refused(source.as_ref(), req.subtitle_burn, req.subtitle_burn_sdr) {
         return Err(ApiError::Unprocessable(serde_json::json!({
             "code": "hdr_subtitle_burn_refused",
             "error": HDR_SUBTITLE_BURN_REFUSAL,
@@ -282,9 +293,17 @@ pub async fn create(
         .transcode
         .capability_height_ceiling(source.as_ref())
         .await;
-    let identity = super::network::identity(&headers, remote);
+    let mut identity = super::network::identity(&headers, remote);
+    if let Some(ref mut id) = identity {
+        id.user_id = Some(user.id);
+        id.credential_generation = Some(plurx_core::domain::CredentialGeneration::derive(
+            user.id,
+            user.created_at,
+            &user.password_hash,
+        ));
+    }
     let network_prior =
-        super::network::stored_prior(state.store.as_ref(), user.id, identity.as_ref()).await?;
+        super::network::stored_prior(state.store.as_ref(), identity.as_ref()).await?;
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately
@@ -444,6 +463,7 @@ pub async fn start(
         // wire-presence inference it has always had.
         quality_auto: None,
         subtitle_burn: None, // the deprecated GET bridge never offered a burn
+        subtitle_burn_sdr: None,
         native_subtitles: None,
         subtitle: None,
         start: q.start,
@@ -2319,6 +2339,7 @@ mod tests {
             height: None,
             quality_auto: None,
             subtitle_burn: None,
+            subtitle_burn_sdr: None,
             native_subtitles: None,
             subtitle: None,
             start: Some(12.0),
@@ -2345,6 +2366,7 @@ mod tests {
             height: Some(2160),
             quality_auto: None,
             subtitle_burn: Some(5),
+            subtitle_burn_sdr: None,
             native_subtitles: Some(true),
             subtitle: None,
             start: None,
@@ -2364,18 +2386,27 @@ mod tests {
     }
 
     #[test]
-    fn server_refuses_hdr_burns_without_blocking_sdr() {
+    fn server_refuses_hdr_burns_unless_the_plan_is_already_sdr() {
         let mut file = hls_file(vec![]);
         for hdr in ["dolby_vision", "hdr10", "hlg"] {
             file.hdr = Some(hdr.into());
-            assert!(hdr_subtitle_burn_is_refused(Some(&file), Some(5)));
+            assert!(hdr_subtitle_burn_is_refused(Some(&file), Some(5), None));
+            assert!(hdr_subtitle_burn_is_refused(
+                Some(&file),
+                Some(5),
+                Some(false)
+            ));
+            assert!(
+                !hdr_subtitle_burn_is_refused(Some(&file), Some(5), Some(true)),
+                "an existing HDR-to-SDR plan may keep its forced subtitle"
+            );
         }
 
         file.hdr = None;
-        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(5)));
-        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(-1)));
-        assert!(!hdr_subtitle_burn_is_refused(Some(&file), None));
-        assert!(!hdr_subtitle_burn_is_refused(None, Some(5)));
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(5), None));
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(-1), None));
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), None, None));
+        assert!(!hdr_subtitle_burn_is_refused(None, Some(5), None));
     }
 
     /// The session's answer is the one that wins once playback attaches, so

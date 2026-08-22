@@ -1,0 +1,7 @@
+version = 1
+
+[[coverage]]
+commits = ["4795a046"]
+points = ["persistence.upgrades", "cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The vendored `interrupted_metadata_replacement_keeps_the_previous_record_readable` regression writes a valid vote and purge record, stages its replacement, and simulates termination before publication. The authoritative `meta.hql` must remain readable with its original bytes until one atomic rename publishes the replacement; restoring remove-then-create exposes the zero-length startup failure observed on the authoritative voter before any intact WAL can be read."

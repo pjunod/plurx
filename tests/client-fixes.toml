@@ -404,3 +404,51 @@ source = "clients/apple/Sources/HomeView.swift"
 source_anchor = "static let offlineLaunchTab: HomeTab = .downloads"
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testIOSExposesDownloadsAndUsesConservativeDefaults"
+
+[[fixes]]
+id = "android.per-codec-video-height-caps"
+commits = ["58fc89ea"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
+source_anchor = "internal data class VideoDecoderLimit("
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "videoCapsKeepTheBestHeightForEachCodec"
+
+[[fixes]]
+id = "android.software-video-decoder-ceiling"
+commits = ["5af63e13"]
+source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
+source_anchor = "val hardwareAccelerated: Boolean = true"
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "softwareDecoderClaimsStopAtHdUnlessHardwareProvesMore"
+
+[[fixes]]
+id = "android.transcode-output-remains-server-owned"
+commits = ["37008d1d"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "internal fun subtitleSessionBody("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "aPlanSessionCarriesNoSubtitleFieldsAtAll"
+
+[[fixes]]
+id = "android.sdr-subtitle-burn-acknowledgement"
+commits = ["71edaf7c"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "subtitle_burn_sdr = true.takeIf {"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "autoBurnSendsQualityAutoTrue"
+
+[[fixes]]
+id = "android.pre-media3-failure-telemetry"
+commits = ["1eda4e22"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackTelemetry.kt"
+source_anchor = "internal fun redactedFailureDetail("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackTelemetryTest.kt"
+test_anchor = "preMediaFailureNamesItsStageWithoutLeakingExceptionText"
+
+[[fixes]]
+id = "android.saved-session-unreachable-resume"
+commits = ["1014af35"]
+source = "clients/android/app/src/main/java/tv/plurx/app/ui/AppViewModel.kt"
+source_anchor = "A persisted bearer is enough to restore the app shell."
+test = "clients/android/app/src/androidTest/java/tv/plurx/app/ui/SavedSessionResumeTest.kt"
+test_anchor = "savedSessionPaintsHomeBeforeAnUnreachableServerFinishesValidation"

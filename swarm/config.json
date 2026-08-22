@@ -29,7 +29,6 @@
     "directory": ".swarm",
     "heartbeat_seconds": 30,
     "stuck_after_seconds": 900,
-    "clone_root": "..",
     "worker_network_access": true
   },
   "providers": {
