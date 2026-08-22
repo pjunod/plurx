@@ -402,8 +402,38 @@
   .statshd{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:10px;
     padding:7px 7px 7px 13px;border-bottom:1px solid rgba(255,255,255,.1);
     font:600 10.5px/1 ui-sans-serif,system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.55)}
+  .statsmodes{display:flex;gap:4px;margin-left:auto}
+  .statsmodes button{border:0;border-radius:999px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.58);
+    padding:6px 10px;font:650 10px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.02em;cursor:pointer;text-transform:none}
+  .statsmodes button.on{background:var(--accent);color:#fff}
+  .statsmodes button:focus-visible{outline:2px solid #fff;outline-offset:2px}
   .statsx{background:transparent;border:0;color:rgba(255,255,255,.6);font-size:13px;line-height:1;cursor:pointer;padding:6px 8px;border-radius:6px}
   .statsx:hover{background:rgba(255,255,255,.1);color:#fff}
+  /* The three levels intentionally match the native clients. Mini leaves the
+     picture legible, Standard is the glanceable Source/Playing/Server view,
+     and Debug retains the exhaustive browser readout below. */
+  .statsov[data-mode=mini]{left:auto;right:20px;width:min(760px,calc(100vw - 40px));max-height:none}
+  .statsov[data-mode=standard]{width:min(1120px,calc(100vw - 40px))}
+  .statsov[data-mode=debug]{width:min(1180px,calc(100vw - 40px))}
+  .statsov[data-mode=mini] .statsbody,.statsov[data-mode=standard] .statsbody{columns:auto}
+  .statsmini{display:grid;grid-template-columns:minmax(160px,1.3fr) repeat(3,minmax(110px,1fr));gap:12px;align-items:center}
+  .statsmini .smethod{font:700 15px/1.3 ui-sans-serif,system-ui,sans-serif;color:#fff}
+  .statsmini .spos{margin-top:2px;color:rgba(255,255,255,.55)}
+  .statsmini .sfact{min-width:0}
+  .statsmini .slab{font:700 9px/1.2 ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;color:rgba(255,255,255,.4);text-transform:uppercase}
+  .statsmini .sval{margin-top:2px;color:#fff;font:650 12px/1.35 ui-sans-serif,system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .statsstandard{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+  .statsstandard .scard{padding:14px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:10px}
+  .statsstandard .scard h3{margin:0 0 10px;color:rgba(255,255,255,.5);font:750 10px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;text-transform:uppercase}
+  .statsstandard .scard>div{margin-top:8px}
+  .statsstandard .scard b{display:block;font:550 10px/1.25 ui-sans-serif,system-ui,sans-serif}
+  .statsstandard .scard span{display:block;margin-top:1px;color:#fff;font:650 13px/1.35 ui-sans-serif,system-ui,sans-serif;overflow-wrap:anywhere}
+  .statsstandard .sreason{grid-column:1/-1;color:rgba(255,255,255,.72);font:500 12px/1.45 ui-sans-serif,system-ui,sans-serif}
+  @media(max-width:720px){
+    .statsmini{grid-template-columns:1fr 1fr}.statsmini .smethodwrap{grid-column:1/-1}
+    .statsstandard{grid-template-columns:1fr}
+    .statsstandard .sreason{grid-column:auto}
+  }
   /* Multi-column rather than a grid: the sections have very different
      heights (Network is three rows, Now decoding can be ten), and grid rows
      align to the tallest item in each row, which would reintroduce as much
@@ -492,6 +522,9 @@
     /* the synopsis strip and the stats panel both want the lower half — the
        one you just asked for wins */
     .player.statson .pinfo{display:none}
+  }
+  @media(pointer:coarse){
+    .statsov[data-mode=mini]{left:auto;right:12px}
   }
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
@@ -2490,7 +2523,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov"><div class="statshd"><span>Playback info</span><button class="statsx" aria-label="Close playback info" title="Close (i)" onclick="toggleStats()">✕</button></div><div class="statsbody" id="statsbody"></div></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov" data-mode="standard"><div class="statshd"><span>Playback info</span><div class="statsmodes" role="radiogroup" aria-label="Playback info size"><button type="button" data-stats-mode="mini" role="radio" onclick="setStatsMode('mini')">Mini</button><button type="button" data-stats-mode="standard" role="radio" onclick="setStatsMode('standard')">Standard</button><button type="button" data-stats-mode="debug" role="radio" onclick="setStatsMode('debug')">Debug</button></div><button class="statsx" aria-label="Close playback info" title="Close (i)" onclick="toggleStats()">✕</button></div><div class="statsbody" id="statsbody"></div></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/playback-policy.js"></script>
@@ -8284,6 +8317,28 @@ async function switchAudio(idx){
 
 // ---- playback stats overlay (press i, or the Stats button) ----------------
 let STATS_TIMER=null;
+let STATS_MODE="standard";
+try{
+  const saved=localStorage.getItem("plurx_stats_mode");
+  if(["mini","standard","debug"].includes(saved)) STATS_MODE=saved;
+}catch(e){}
+function applyStatsMode(){
+  const ov=document.getElementById("statsov"); if(!ov) return;
+  ov.dataset.mode=STATS_MODE;
+  ov.querySelectorAll("[data-stats-mode]").forEach(button=>{
+    const selected=button.dataset.statsMode===STATS_MODE;
+    button.classList.toggle("on",selected);
+    button.setAttribute("aria-checked",selected?"true":"false");
+  });
+}
+function setStatsMode(mode){
+  if(!["mini","standard","debug"].includes(mode)) return;
+  STATS_MODE=mode;
+  try{ localStorage.setItem("plurx_stats_mode",mode); }catch(e){}
+  applyStatsMode();
+  updateStats();
+  positionStats();
+}
 function toggleStats(){
   const ov=document.getElementById("statsov"); if(!ov) return;
   const on=!ov.classList.contains("on");
@@ -8296,7 +8351,7 @@ function toggleStats(){
   const pl=document.getElementById("player"); if(pl) pl.classList.toggle("statson",on);
   const sb=document.getElementById("statsbtn"); if(sb) sb.classList.toggle("on",on);
   clearInterval(STATS_TIMER); STATS_TIMER=null;
-  if(on){ updateStats(); positionStats(); STATS_TIMER=setInterval(updateStats,1000); }
+  if(on){ applyStatsMode(); updateStats(); positionStats(); STATS_TIMER=setInterval(updateStats,1000); }
   else { ov.style.top=""; ov.style.maxHeight=""; }
   // The panel that just appeared (or left) changes where the menu belongs, and
   // a menu open across that change is anchored to the old geometry — same
@@ -8496,7 +8551,7 @@ function updateStats(){
   const autoLog=((PLAYER.abr&&PLAYER.abr.switches)||[]).map(entry=>
     `<div><b>Auto log</b><span>${clockFromSec(entry.position)} · ${esc(entry.from)} → `+
     `${esc(entry.to)} · ${esc(entry.reason)}</span></div>`).join("");
-  body.innerHTML=
+  const debugHtml=
     sec(
     // **Which build this is, in the place people photograph.**
     //
@@ -8621,6 +8676,48 @@ function updateStats(){
     , "Now decoding")+
     sec(net, "Network")+
     sec(srv, "Server");
+
+  const rangeBadge=dynamicRangeBadge(PLAYER.source||{}, PLAYER.deliveredRange, displayIsHdr());
+  const rangeText=rangeBadge?rangeBadge.panel:"—";
+  const selectedSub=PLAYER.curSub>=0
+    ? subLabelFor((PLAYER.subs||[]).find(track=>track.index===PLAYER.curSub),PLAYER.curSub)
+    : "Off";
+  const clientRate=PLAYER.health&&PLAYER.health.delivered_bps!=null
+    ? fmtMbps(PLAYER.health.delivered_bps)
+    : PLAYER.hls&&PLAYER.hls.bandwidthEstimate
+      ? fmtMbps(PLAYER.hls.bandwidthEstimate)
+      : "Measuring";
+  const health=PLAYER.health;
+  const serverState=PLAYER.vod?"Served from cache"
+    : health?(health.suspended?"Holding buffer":"Active")
+    : "No server-side session";
+  const serverRate=health&&((health.recent_speed!=null)?health.recent_speed:health.speed);
+  const cardRow=(label,value)=>`<div><b>${label}</b><span>${value}</span></div>`;
+  const reason=(PLAYER.reasons&&PLAYER.reasons.length)?esc(PLAYER.reasons.join(" · ")):"";
+  const miniHtml=`<div class="statsmini">
+    <div class="smethodwrap"><div class="smethod">${esc(method)}</div>
+      <div class="spos">${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}</div></div>
+    <div class="sfact"><div class="slab">Playing</div><div class="sval">${esc(tgtRes)} · ${esc(rangeText)}</div></div>
+    <div class="sfact"><div class="slab">Buffer</div><div class="sval">${esc(buf)}</div></div>
+    <div class="sfact"><div class="slab">Network</div><div class="sval">${esc(clientRate)}</div></div>
+  </div>`;
+  const standardHtml=`<div class="statsstandard">
+    <section class="scard"><h3>Source</h3>
+      ${cardRow("Resolution",esc(srcRes))}${cardRow("Video",esc(srcVideo))}
+      ${cardRow("Container",esc(srcCont))}${cardRow("Bitrate",esc(srcBr))}${cardRow("Audio",esc(aLine))}</section>
+    <section class="scard"><h3>Playing</h3>
+      ${cardRow("Resolution",esc(tgtRes))}${cardRow("Dynamic range",esc(rangeText))}
+      ${cardRow("Buffer",esc(buf))}${cardRow("Dropped / total",esc(dropped+" frames"))}
+      ${cardRow("Subtitles",esc(selectedSub))}</section>
+    <section class="scard"><h3>Server</h3>
+      ${cardRow("Status",esc(serverState))}
+      ${(health&&health.encoder)||PLAYER.encoder?cardRow("Encoder",esc((health&&health.encoder)||PLAYER.encoder)):""}
+      ${serverRate!=null?cardRow("Encode speed",esc(serverRate.toFixed(2)+"×")):""}
+      ${health&&health.ahead_seconds!=null?cardRow("Ahead",esc(Math.max(0,health.ahead_seconds)+" s")):""}
+      ${cardRow("Delivery",esc(clientRate))}</section>
+    ${reason?`<div class="sreason">${reason}</div>`:""}
+  </div>`;
+  body.innerHTML=STATS_MODE==="mini"?miniHtml:STATS_MODE==="debug"?debugHtml:standardHtml;
 }
 // Poll the session's server-side health while the stats overlay is open, and
 // only then: this is a diagnostic readout, not telemetry the server needs, and

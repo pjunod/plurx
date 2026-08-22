@@ -6,6 +6,14 @@ import tv.plurx.app.data.Item
 
 class PlaybackInfoTest {
     @Test
+    fun playbackInfoUsesTheSharedThreeModeContract() {
+        assertEquals(
+            listOf("Mini", "Standard", "Debug"),
+            PlaybackStatsMode.entries.map { it.label },
+        )
+    }
+
+    @Test
     fun playMenuCarriesTheWebMetadataHierarchy() {
         val episode = Item(
             id = 7,

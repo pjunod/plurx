@@ -78,7 +78,7 @@ for that viewer and keeps server administration out of the comparison.
 | Intro/credits markers | Manual skip or automatic skip; estimated credits markers are visibly labelled while chapter-derived markers keep their exact label |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
-| Playback decision/stats | In-player information panel, including a "Dynamic range" row |
+| Playback decision/stats | Shared Mini, Standard, and Debug modes. Mini keeps playback visible, Standard groups source/playing/server facts, and Debug adds the build, transport, player, network, and live HLS-session fields. |
 | Durable playback telemetry | TTFF, passive buffering-stall, Media3 playback-error beacons with attempt/session context, and redacted pre-Media3 plan-load or session-create failures that name the failed stage and exception type; HTTP session failures also retain their status code |
 | Source-vs-delivered media badges | Dynamic-range chip dims and names what is on screen (`DV → HDR10`) |
 | Classic, Terminal, noirr | Matching palettes, shapes, and typography |

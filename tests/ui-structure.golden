@@ -1365,7 +1365,9 @@ catalog|player@1280x860|dom|div.row > button#subsbtn.pbtn[text]|1
 catalog|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@1280x860|dom|div.row > button.pbtn[text]|1
 catalog|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
+catalog|player@1280x860|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 catalog|player@1280x860|dom|div.statshd > span[text]|1
+catalog|player@1280x860|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 catalog|player@1280x860|dom|div.trks > span.on.trk[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
@@ -1529,7 +1531,9 @@ catalog|player@390x780|dom|div.row > button#subsbtn.pbtn[text]|1
 catalog|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
 catalog|player@390x780|dom|div.row > button.pbtn[text]|1
 catalog|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
+catalog|player@390x780|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 catalog|player@390x780|dom|div.statshd > span[text]|1
+catalog|player@390x780|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 catalog|player@390x780|dom|div.trks > span.on.trk[text]|1
 catalog|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
 catalog|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
@@ -3071,7 +3075,9 @@ classic|player@1280x860|dom|div.row > button#subsbtn.pbtn[text]|1
 classic|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
 classic|player@1280x860|dom|div.row > button.pbtn[text]|1
 classic|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
+classic|player@1280x860|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 classic|player@1280x860|dom|div.statshd > span[text]|1
+classic|player@1280x860|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 classic|player@1280x860|dom|div.topctl > div|4
 classic|player@1280x860|dom|div.trks > span.on.trk[text]|1
 classic|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
@@ -3206,7 +3212,9 @@ classic|player@390x780|dom|div.row > button#subsbtn.pbtn[text]|1
 classic|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
 classic|player@390x780|dom|div.row > button.pbtn[text]|1
 classic|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
+classic|player@390x780|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 classic|player@390x780|dom|div.statshd > span[text]|1
+classic|player@390x780|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 classic|player@390x780|dom|div.topctl > div|4
 classic|player@390x780|dom|div.trks > span.on.trk[text]|1
 classic|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
@@ -4709,7 +4717,9 @@ theater|player@1280x860|dom|div.row > button#subsbtn.pbtn[text]|1
 theater|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
 theater|player@1280x860|dom|div.row > button.pbtn[text]|1
 theater|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
+theater|player@1280x860|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 theater|player@1280x860|dom|div.statshd > span[text]|1
+theater|player@1280x860|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 theater|player@1280x860|dom|div.th-ctl > div.th-pop|4
 theater|player@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
 theater|player@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1
@@ -4848,7 +4858,9 @@ theater|player@390x780|dom|div.row > button#subsbtn.pbtn[text]|1
 theater|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
 theater|player@390x780|dom|div.row > button.pbtn[text]|1
 theater|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
+theater|player@390x780|dom|div.statshd > div.statsmodes[role=radiogroup aria-label=*]|1
 theater|player@390x780|dom|div.statshd > span[text]|1
+theater|player@390x780|dom|div.statsmodes[role=radiogroup aria-label=*] > button[role=radio type=button text]|3
 theater|player@390x780|dom|div.th-ctl > div.th-pop|4
 theater|player@390x780|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
 theater|player@390x780|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1

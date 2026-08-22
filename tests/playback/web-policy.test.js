@@ -83,6 +83,18 @@ function test(name, run) {
   }
 }
 
+test("playback info exposes and remembers the shared three-mode contract", () => {
+  for (const mode of ["mini", "standard", "debug"]) {
+    assert.match(
+      SHIPPED_UI,
+      new RegExp(`data-stats-mode=["']${mode}["']`),
+      `${mode} must remain selectable in the shipped player`,
+    );
+  }
+  assert.match(SHIPPED_UI, /localStorage\.setItem\("plurx_stats_mode",mode\)/);
+  assert.match(SHIPPED_UI, /STATS_MODE==="debug"\?debugHtml:standardHtml/);
+});
+
 test("estimated skip markers are hedged without rebuilding each tick", () => {
   let writes = 0;
   const skip = {

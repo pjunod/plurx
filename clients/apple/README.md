@@ -12,10 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `77` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `78` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 77 carries the explicit delivered-SDR
+> same regression suite. Build 78 keeps the tvOS dashboard as Standard and
+> adds shared Mini and full Debug playback-info modes on iOS and tvOS. Build
+> 77 carries the explicit delivered-SDR
 > acknowledgement required for a forced bitmap-subtitle session over an HDR
 > source, without allowing an unplanned HDR downgrade. Build 75 adds online PDFKit reading on iPhone and
 > iPad with exact-revision temporary bytes, page resume, local search, and

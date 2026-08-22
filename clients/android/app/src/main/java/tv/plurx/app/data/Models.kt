@@ -578,6 +578,37 @@ data class HlsStart(
     val delivered_dynamic_range: String? = null,
 )
 
+/** Live HLS telemetry shared by the web, Apple, and Android stats views. */
+@Serializable
+data class PlaybackSessionStatus(
+    val id: String,
+    val file_id: Long? = null,
+    val target_height: Long? = null,
+    val encoder: String? = null,
+    val speed: Double? = null,
+    val recent_speed: Double? = null,
+    val out_time_ms: Long? = null,
+    val progress_idle_ms: Long? = null,
+    val published_end_ms: Long? = null,
+    val fetched_end_ms: Long? = null,
+    val fetched_segment: Long? = null,
+    val first_retained_segment: Long? = null,
+    val playlist_shape: String? = null,
+    val ahead_seconds: Long? = null,
+    val ahead_bytes: Long? = null,
+    val hold_reason: String? = null,
+    val resume_below_seconds: Long? = null,
+    val resume_below_bytes: Long? = null,
+    val delivered_bytes: Long? = null,
+    val delivered_bps: Long? = null,
+    val delivered_idle_ms: Long? = null,
+    val readrate: Double? = null,
+    val suspended: Boolean? = null,
+    val suspend_count: Long? = null,
+    val last_request: String? = null,
+    val idle_seconds: Long? = null,
+)
+
 /**
  * Why a session is being reopened — typed so the server can tell a stall
  * downgrade from an ordinary seek. See docs/ADAPTIVE-QUALITY.md §"Native

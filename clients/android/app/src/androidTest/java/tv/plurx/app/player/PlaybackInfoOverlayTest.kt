@@ -39,6 +39,8 @@ class PlaybackInfoOverlayTest {
                         subtitles = "Off",
                     ),
                     reasons = listOf("Device supports the source video and audio codecs"),
+                    mode = PlaybackStatsMode.Standard,
+                    onMode = {},
                     onDismiss = {},
                 )
             }
