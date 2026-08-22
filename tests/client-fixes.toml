@@ -452,3 +452,11 @@ source = "clients/android/app/src/main/java/tv/plurx/app/ui/AppViewModel.kt"
 source_anchor = "A persisted bearer is enough to restore the app shell."
 test = "clients/android/app/src/androidTest/java/tv/plurx/app/ui/SavedSessionResumeTest.kt"
 test_anchor = "savedSessionPaintsHomeBeforeAnUnreachableServerFinishesValidation"
+
+[[fixes]]
+id = "apple.tv-playback-info-presentation"
+commits = ["05d276f5"]
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "enum TVPlaybackInfoPresentation"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testTVPlaybackInfoUsesTenFootScaleAndPlainHealthLabels"
