@@ -13,8 +13,17 @@ use plurx_core::tracks::{
 use serde::{Deserialize, Serialize};
 
 /// Build the API URL for a cached artwork filename.
-fn image_url(filename: &Option<String>) -> Option<String> {
-    filename.as_ref().map(|f| format!("/api/v1/images/{f}"))
+///
+/// Artwork filenames historically contain only the item id, so importing a
+/// catalog or refreshing a poster can put different bytes behind the same
+/// path. Native image loaders and browsers are then entitled to keep the old
+/// response for its full cache lifetime. The replicated item revision changes
+/// with every metadata/artwork patch and makes that mutable filename a new
+/// cache identity without exposing node-local filesystem state in the API.
+fn image_url(filename: &Option<String>, revision: i64) -> Option<String> {
+    filename
+        .as_ref()
+        .map(|f| format!("/api/v1/images/{f}?v={revision}"))
 }
 
 #[derive(Serialize)]
@@ -226,8 +235,8 @@ impl From<Item> for ItemDto {
             book_metadata_source: item.book_metadata_source,
             tmdb_id: item.tmdb_id,
             imdb_id: item.imdb_id,
-            poster: image_url(&item.poster_path),
-            backdrop: image_url(&item.backdrop_path),
+            poster: image_url(&item.poster_path, item.updated_at),
+            backdrop: image_url(&item.backdrop_path, item.updated_at),
             resolution: None,
             media: None,
             child_count: None,
@@ -255,7 +264,7 @@ impl ItemDto {
     /// and is still used on the season page (which builds DTOs without this).
     pub fn with_season_poster(mut self, season_poster: Option<String>) -> Self {
         if season_poster.is_some() {
-            self.poster = image_url(&season_poster);
+            self.poster = image_url(&season_poster, self.updated_at);
         }
         self
     }

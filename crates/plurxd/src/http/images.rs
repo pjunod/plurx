@@ -126,7 +126,10 @@ fn artwork_response(path: &FsPath, bytes: Vec<u8>) -> Response {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "public, max-age=604800".to_owned()),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=604800, immutable".to_owned(),
+            ),
         ],
         bytes,
     )
